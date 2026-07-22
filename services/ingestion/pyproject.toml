@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "weather-platform-ingestion"
+version = "0.1.0"
+description = "Meteorological data ingestion worker service"
+authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
+packages = [{ include = "ingestion", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+xarray = "^2024.3.0"
+cfgrib = "^0.9.12.1"
+netcdf4 = "^1.6.5"
+boto3 = "^1.34.69"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

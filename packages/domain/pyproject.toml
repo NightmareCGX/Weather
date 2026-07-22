@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "weather-platform-domain"
+version = "0.1.0"
+description = "Core domain logic for weather forecasting platform"
+authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
+packages = [{ include = "domain", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+numpy = "^1.26.4"
+xarray = "^2024.3.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

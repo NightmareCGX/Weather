@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "weather-platform-config"
+version = "0.1.0"
+description = "Centralized environment configuration and validation"
+authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
+packages = [{ include = "config", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pydantic-settings = "^2.2.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

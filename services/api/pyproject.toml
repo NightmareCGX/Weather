@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "weather-platform-api"
+version = "0.1.0"
+description = "FastAPI serving layer"
+authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
+packages = [{ include = "api", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.110.0"
+uvicorn = "^0.28.0"
+sqlalchemy = "^2.0.28"
+psycopg2-binary = "^2.9.9"
+redis = "^5.0.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

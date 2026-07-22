@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "weather-platform-types"
+version = "0.1.0"
+description = "Shared Pydantic contracts and schemas"
+authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
+packages = [{ include = "types", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pydantic = "^2.6.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
