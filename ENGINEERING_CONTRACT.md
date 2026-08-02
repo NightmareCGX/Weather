@@ -139,7 +139,7 @@ Correctness is preferred over autonomous decision making.
 
 ---
 
-### 15. Git Rules
+## 15. Git Rules
 1. One milestone equals one Git commit.
 2. Use Conventional Commits.
 3. Stage only files related to the current milestone.
@@ -155,3 +155,15 @@ Correctness is preferred over autonomous decision making.
 - refactor(domain): simplify ensemble calculations
 - docs(api): update probability endpoint
 - test(domain): add probability engine tests
+
+---
+
+##16. Host Environment
+- Implementation should stay inside the project workspace.
+- Do not inspect the host operating system unless it is strictly required.
+- Assume required developer tools are already installed unless the user explicitly asks for environment diagnostics.
+- Never explore unrelated directories such as:
+  1. C:\Users
+  2. C:\Program Files
+  3. C:\Windows
+  unless necessary for the current milestone.
