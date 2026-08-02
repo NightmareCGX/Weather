@@ -3,7 +3,9 @@ name = "weather-platform-api"
 version = "0.1.0"
 description = "FastAPI serving layer"
 authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
-packages = [{ include = "api", from = "src" }]
+packages = [
+    { include = "api", from = "src" }
+]
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -11,7 +13,15 @@ fastapi = "^0.110.0"
 uvicorn = "^0.28.0"
 sqlalchemy = "^2.0.28"
 psycopg2-binary = "^2.9.9"
+geoalchemy2 = "^0.14.3"
+alembic = "^1.13.1"
 redis = "^5.0.2"
+pydantic-settings = "^2.2.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.1.1"
+pytest-asyncio = "^0.23.5"
+httpx = "^0.27.0"
 
 [build-system]
 requires = ["poetry-core"]
