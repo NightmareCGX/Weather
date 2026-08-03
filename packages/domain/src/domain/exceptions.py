@@ -20,3 +20,19 @@ class InvalidGridError(DomainError, ValueError):
 
 class PointOutsideGridError(DomainError, ValueError):
     """Raised when a geographic point lies outside a grid's bounds."""
+
+
+class EmptyEnsembleError(DomainError, ValueError):
+    """Raised when an ensemble member sequence is empty."""
+
+
+class InvalidEnsembleError(DomainError, ValueError):
+    """Raised when ensemble members are not a 1-D numeric sequence of finite values."""
+
+
+class InvalidPercentileError(DomainError, ValueError):
+    """Raised when a requested percentile is outside the valid [0, 100] range."""
+
+
+class InvalidThresholdError(DomainError, ValueError):
+    """Raised when a probability threshold is invalid (e.g. upper below lower)."""
