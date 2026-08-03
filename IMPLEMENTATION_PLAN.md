@@ -83,9 +83,11 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 - **Scope**: `packages/domain/src/models/`, `packages/domain/src/geo/`, and spatial interpolation helpers.
 - **Out of Scope**: HTTP handlers and database queries.
 - **Deliverables**:
-  - Domain dataclasses for forecast points and variables.
-  - Spatial coordinate mapping utilities.
+  - Domain dataclasses for forecast points (`ForecastPoint`, `GridPoint`) and regular grid definitions (`RegularGrid`).
+  - Spatial coordinate mapping utilities (`domain/geo/coordinates.py`, `domain/geo/grid.py`).
+  - Bilinear interpolation helper (`domain/geo/interpolation.py`).
   - Comprehensive unit tests for domain math.
+  - *Note (approved scope refinement): the `ForecastVariable` catalog vocabulary is deferred and may be introduced later.*
 - **Dependencies**: Milestone 1.
 - **Acceptance Criteria**: All unit tests in `packages/domain` pass with zero external dependencies.
 - **Testing Requirements**: 100% unit test coverage for domain calculation modules.

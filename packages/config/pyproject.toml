@@ -6,7 +6,7 @@ authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
 packages = [{ include = "config", from = "src" }]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = "^3.12"
 pydantic-settings = "^2.2.1"
 
 [build-system]

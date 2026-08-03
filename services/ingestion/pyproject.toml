@@ -6,7 +6,7 @@ authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
 packages = [{ include = "ingestion", from = "src" }]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = "^3.12"
 xarray = "^2024.3.0"
 cfgrib = "^0.9.12.1"
 netcdf4 = "^1.6.5"
