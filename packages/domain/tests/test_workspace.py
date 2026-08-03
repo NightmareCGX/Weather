@@ -8,9 +8,9 @@ class TestMilestone1Workspace(unittest.TestCase):
         import domain
         self.assertEqual(domain.__version__, "0.1.0")
 
-    def test_types_module(self):
-        import types
-        self.assertEqual(types.__version__, "0.1.0")
+    def test_contracts_module(self):
+        import contracts
+        self.assertEqual(contracts.__version__, "0.1.0")
 
     def test_config_module(self):
         import config

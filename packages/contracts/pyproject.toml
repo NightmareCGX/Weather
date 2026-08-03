@@ -1,9 +1,9 @@
 [tool.poetry]
-name = "weather-platform-types"
+name = "weather-platform-contracts"
 version = "0.1.0"
 description = "Shared Pydantic contracts and schemas"
 authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
-packages = [{ include = "types", from = "src" }]
+packages = [{ include = "contracts", from = "src" }]
 
 [tool.poetry.dependencies]
 python = "^3.12"

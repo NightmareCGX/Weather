@@ -17,7 +17,7 @@ This document outlines the testing strategy, layers, and fixtures for the Global
 - **Environment**: Automatically executed against local ephemeral containers (`postgres`, `redis`, `minio`) via Docker Compose.
 
 ### 1.3 Contract Tests
-- **Scope**: Validates that all FastAPI response payloads adhere strictly to shared Pydantic schemas in `packages/types`.
+- **Scope**: Validates that all FastAPI response payloads adhere strictly to shared Pydantic schemas in `packages/contracts`.
 - **Mechanism**: Automated assertions comparing API responses against OpenAPI specifications.
 
 ---

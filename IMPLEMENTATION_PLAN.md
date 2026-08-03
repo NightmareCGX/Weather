@@ -6,7 +6,7 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 
 ## Milestone 1: Project Bootstrap & Workspace Setup
 - **Goal**: Establish the monorepo structure, Python workspace configuration, dependency management, and local developer environment.
-- **Scope**: Root workspace files, `pyproject.toml`, shared package directories (`packages/domain`, `packages/types`, `packages/config`), and basic service stubs.
+- **Scope**: Root workspace files, `pyproject.toml`, shared package directories (`packages/domain`, `packages/contracts`, `packages/config`), and basic service stubs.
 - **Out of Scope**: Database migrations, API routers, ingestion workers, and frontend code.
 - **Deliverables**: 
   - Monorepo directory structure matching REPOSITORY.md.
