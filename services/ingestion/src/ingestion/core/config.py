@@ -15,6 +15,12 @@ class IngestionSettings(BaseSettings):
     DOWNLOAD_RETRIES: int = 3
     RETRY_BACKOFF_SECONDS: float = 1.0
 
+    MINIO_ENDPOINT: str = "localhost:9000"
+    MINIO_ACCESS_KEY: str = "minio_admin"
+    MINIO_SECRET_KEY: str = "minio_password"
+    MINIO_SECURE: bool = False
+    MINIO_BUCKET_NAME: str = "weather-data"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
