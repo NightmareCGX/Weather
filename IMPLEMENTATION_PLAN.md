@@ -35,7 +35,7 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 
 ## Milestone 3: Database Migrations & Schema Initialization
 - **Goal**: Establish relational persistence by applying the frozen database schema via Alembic migrations.
-- **Scope**: SQLAlchemy base configuration, Alembic migration setup, and initial migration script for all 14 database tables defined in `docs/DATABASE.md`.
+- **Scope**: SQLAlchemy base configuration, Alembic migration setup, and initial migration script for the 13 database tables defined in `docs/DATABASE.md` (the 14-table relationship map in DATABASE.md is a high-level illustration; the implemented schema and its constraints are authoritative).
 - **Out of Scope**: Application-level DB queries and seed data.
 - **Deliverables**:
   - `services/api/src/core/database.py` (SQLAlchemy engine & session factory).
@@ -137,6 +137,8 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 - **Acceptance Criteria**: `GET /v1/points` successfully resolves coordinates, cities, or ski resorts, slices Zarr data, and returns hourly forecasts adhering to `docs/API.md`.
 - **Testing Requirements**: End-to-end integration tests combining PostGIS, MinIO Zarr stores, and FastAPI.
 - **Estimated Complexity**: High
+
+> **Milestone 9 approved scope notes**: As delivered, `/v1/points` serves a **single model** per request (default `gfs`); the multi-model response contract is not defined and multi-model requests are rejected with `422`. Address geocoding is **not implemented**; clients resolve locations through `/v1/search` first and then query `/v1/points` with coordinates or a platform id. See `docs/API.md` section 2.1.
 
 ---
 

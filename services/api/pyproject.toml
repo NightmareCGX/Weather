@@ -23,6 +23,12 @@ pytest = "^8.1.1"
 pytest-asyncio = "^0.23.5"
 httpx = "^0.27.0"
 
+# Test files prepend src to sys.path before importing api modules (required so
+# pytest can resolve package imports from the repo layout). This is intentional
+# and E402 is ignored for tests only.
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["E402"]
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

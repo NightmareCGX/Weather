@@ -2,6 +2,8 @@
 
 A production-grade, global probabilistic weather forecasting platform combining operational numerical weather prediction (NWP) models (NOAA, ECMWF, ECCC), a custom neural AI downscaling pipeline (25km to 3km/1km), Multi-Model Ensemble (MME) calibration, and high-performance point and spatial APIs.
 
+> **Implementation status**: Milestones 1–9 are complete and approved (see [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)). The live surface today is: NOAA GFS/GEFS ingestion (GRIB2 → Zarr), the FastAPI `/v1` catalog/points/search surface, PostGIS + Redis caching, and the domain ensemble/geo math engine. The AI downscaling, MME calibration, ECMWF/Canada providers, and the frontend map viewer are future milestones (10–18) and are **not yet implemented**.
+
 ---
 
 ## Architecture Overview
@@ -48,9 +50,10 @@ A production-grade, global probabilistic weather forecasting platform combining 
 ## Documentation Index
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Complete system architecture, component breakdown, and data flow.
-- [ROADMAP.md](docs/ROADMAP.md) — Phased implementation roadmap from Phase 1 to Phase 6.
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — Master milestone roadmap (Milestones 1–18).
 - [API.md](docs/API.md) — REST API specifications, endpoints, request/response models, and error handling.
 - [DATABASE.md](docs/DATABASE.md) — PostgreSQL + PostGIS schema design, spatial indexing, and caching strategy.
+- [TESTING.md](docs/TESTING.md) — Testing strategy, layers, and fixtures.
 - [MODELS.md](docs/MODELS.md) — Operational weather model integrations (NOAA GFS/GEFS, ECMWF IFS/AIFS, ECCC GDPS/GEPS).
 - [AI_PLAN.md](docs/AI_PLAN.md) — Custom AI downscaling architecture, training data pipeline, and inference strategy.
 - [DEPLOYMENT.md](docs/DEPLOYMENT.md) — Cloud-native deployment architecture, Docker Compose, Kubernetes, and CI/CD pipelines.
@@ -62,25 +65,28 @@ A production-grade, global probabilistic weather forecasting platform combining 
 
 ```text
 weather-platform/
-├── .github/
-│   └── workflows/                # CI/CD pipelines (Lint, Test, Docker Build, Deploy)
-├── docker/                       # Dockerfiles & compose setups for dev/prod
-├── docs/                         # Comprehensive project documentation
+├── CLAUDE.md                     # Project instructions for AI-assisted development
+├── ENGINEERING_CONTRACT.md       # Engineering standards and development rules
+├── IMPLEMENTATION_PLAN.md        # Master milestone roadmap (Milestones 1–18)
+├── docs/                         # Authoritative project documentation
 │   ├── ARCHITECTURE.md
-│   ├── ROADMAP.md
 │   ├── API.md
 │   ├── DATABASE.md
+│   ├── TESTING.md
 │   ├── MODELS.md
 │   ├── AI_PLAN.md
 │   ├── DEPLOYMENT.md
 │   └── CONTRIBUTING.md
-├── infra/                        # Terraform / Kubernetes manifests (Helm charts)
-├── packages/                     # Shared packages / TypeScript types / UI components
+├── packages/                     # Shared Python packages
+│   ├── domain/                   # Core business logic, ensemble math, spatial interpolation
+│   ├── contracts/                # Shared Pydantic contracts (placeholder)
+│   └── config/                   # Centralized configuration (placeholder)
 ├── services/
-│   ├── ingestion/                # GRIB2 downloaders, workers, schedulers
-│   ├── processing/               # AI downscaling, MME calibration, spatial interpolation
-│   ├── api/                      # FastAPI core service
-│   └── frontend/                 # Next.js / React client application
+│   ├── api/                      # FastAPI core service (v1 catalog/points/search, PostGIS, Redis cache)
+│   ├── ingestion/                # GRIB2 downloaders, decoders, Zarr storage
+│   └── frontend/                 # Next.js / React client application (scaffold)
+├── docker-compose.yml            # Local PostgreSQL + PostGIS, Redis, MinIO
+├── .env.example                  # Environment variable template
 ├── pyproject.toml                # Python workspace configuration
 └── README.md
 ```

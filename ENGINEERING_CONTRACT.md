@@ -1,7 +1,7 @@
 # CLAUDE.md: Engineering Standards & Development Rules
 
 This document defines the strict engineering standards, architectural rules, and development workflow for the Global Probabilistic Weather Forecasting Platform. All implementation, code generation, refactoring,
-documentation updates, and architectural decisions must conform to this document and the frozen source-of-truth documentation (`docs/ARCHITECTURE.md`, `docs/API.md`, `docs/DATABASE.md`, `docs/ROADMAP.md`).
+documentation updates, and architectural decisions must conform to this document and the frozen source-of-truth documentation (`docs/ARCHITECTURE.md`, `docs/API.md`, `docs/DATABASE.md`, `IMPLEMENTATION_PLAN.md`).
 
 ---
 

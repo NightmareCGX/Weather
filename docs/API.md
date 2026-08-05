@@ -28,6 +28,8 @@ Our API design is modeled after industry standards set by Stripe, GitHub, and Op
   `Authorization: Bearer wp_live_xxxxxxxxxxxxxxxxxxxx`
 - **Scopes & Roles**: API keys are bound to commercial subscription tiers, enforcing rate limits and access privileges (e.g., `points:read`, `maps:read`, `ensemble:read`, `admin:write`).
 
+> **Deferred**: Authentication and rate limiting are **not yet enforced** on the current API surface (Milestones 1–9). The bearer-token format and scope model are documented for forward compatibility and will be activated with API-key management and tiered rate limiting (see IMPLEMENTATION_PLAN.md, Milestone 18).
+
 ### 2.3 Response Envelope Policy
 - **Universal Envelope**: **All** successful API responses (including single objects, lists, and metadata) strictly wrap their payload data inside the standard envelope:
   ```json
@@ -66,9 +68,9 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 
 ### 2.7 Caching, ETags, & Request IDs
 - **Caching**: Endpoints return `Cache-Control` headers reflecting model update intervals (e.g., `public, max-age=1800` for 30 minutes).
-- **ETags**: Responses include `ETag` headers for conditional GET requests (`If-None-Match`).
+- **ETags**: *Deferred.* Responses do not currently emit `ETag` headers; conditional `If-None-Match` support is a future enhancement.
 - **Request IDs**: Every response includes `X-Request-Id` for debugging and customer support tracing.
-- **Idempotency**: State-changing endpoints support `Idempotency-Key` headers.
+- **Idempotency**: *Deferred.* No state-changing endpoints exist on the current surface; `Idempotency-Key` support will accompany them when added.
 
 ---
 
@@ -254,9 +256,9 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **HTTP Method**: `GET`
 - **Endpoint**: `/v1/points`
 - **Purpose**: Return hourly aggregated forecasts indexed by `lead_time_hours` for a specific geographic location.
-- **Required Parameters**: Exactly one spatial specifier (`lat` & `lon`, `city_id`, `resort_id`, or `address`).
+- **Required Parameters**: Exactly one spatial specifier (`lat` & `lon`, `city_id`, or `resort_id`). *Address geocoding is **not implemented** and is deferred: clients resolve a location through `/v1/search` first, then query `/v1/points` with the resolved coordinates or a platform id.*
 - **Optional Parameters**: 
-  - `models` (comma-separated string; **MVP Default**: `gfs,gefs`)
+  - `models` (single model identifier; **Default**: `gfs`). *Multi-model point forecasts are **not implemented** — the response contract for multiple models is not defined by this specification. Requests that pass more than one identifier are rejected with `422`.*
   - `variables` (comma-separated string, e.g., `temperature_2m,precipitation_rate`)
   - `units` (`metric` or `imperial`, default `metric`)
   - `start_lead_time_hours` / `end_lead_time_hours` (integer offsets)
@@ -269,18 +271,17 @@ Errors return standard HTTP status codes along with a structured machine-readabl
       "location": {
         "latitude": 39.1911,
         "longitude": -106.8175,
-        "elevation_m": 3417,
+        "elevation_m": null,
         "resolved_via": "coordinates"
       },
-      "generated_at": "2026-07-21T06:00:00Z",
+      "generated_at": "2026-07-21T00:00:00Z",
       "model": "gfs",
       "forecasts": [
         {
           "lead_time_hours": 6,
           "valid_time": "2026-07-21T06:00:00Z",
           "temperature_2m": 15.0,
-          "precipitation_mm": 0.0,
-          "wind_speed_kmh": 14.2
+          "precipitation_rate": 0.0
         }
       ]
     },
@@ -288,7 +289,8 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `400 Bad Request`, `404 Not Found`, `429 Too Many Requests`.
+  *Notes*: `generated_at` is the selected model run's `cycle_time` (the forecast dataset generation time, keeping payloads deterministic). `valid_time` is derived as `cycle_time + lead_time_hours` (DATABASE.md section 1). `elevation_m` is returned when the resolved record defines it (e.g. ski resorts) and is `null` otherwise. Forecast entries carry the requested `forecast_variables` catalog codes (e.g. `temperature_2m`, `precipitation_rate`) as keys.
+- **HTTP Status Codes**: `200 OK`, `404 Not Found`, `422 Unprocessable Entity`. *`400 Bad Request` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=1800` (30 minutes).
 
 ---
@@ -423,7 +425,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `400 Bad Request`.
+- **HTTP Status Codes**: `200 OK`, `422 Unprocessable Entity` (missing/empty `q`, invalid `type`). *`400 Bad Request` applies once authentication is enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=86400`.
 
 ---

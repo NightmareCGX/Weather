@@ -14,11 +14,11 @@ This document outlines the testing strategy, layers, and fixtures for the Global
 ### 1.2 Integration Tests (`pytest` + `Docker Compose`)
 - **Location**: `services/api/tests/`, `services/ingestion/tests/`
 - **Scope**: End-to-end flows involving FastAPI test clients, PostgreSQL + PostGIS spatial queries, and Zarr dataset reads/writes.
-- **Environment**: Automatically executed against local ephemeral containers (`postgres`, `redis`, `minio`) via Docker Compose.
+- **Environment**: Executed against local containers (`postgres`, `redis`, `minio`) via Docker Compose. The API and ingestion suites **skip** gracefully when their backing services are unreachable; the S3/MinIO Zarr round-trip is additionally gated behind `WEATHER_TEST_MINIO=1`.
 
 ### 1.3 Contract Tests
-- **Scope**: Validates that all FastAPI response payloads adhere strictly to shared Pydantic schemas in `packages/contracts`.
-- **Mechanism**: Automated assertions comparing API responses against OpenAPI specifications.
+- **Scope**: Validates that all FastAPI response payloads adhere strictly to the response envelope and resource schemas defined in `docs/API.md` (the API service owns its response schemas in `api/schemas.py`; the `packages/contracts` package is currently a placeholder).
+- **Mechanism**: Automated assertions in `services/api/tests/` comparing serialized API responses against the documented `docs/API.md` shapes.
 
 ---
 

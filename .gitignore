@@ -44,3 +44,8 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+
+# --- cfgrib / eccodes index cache artifacts ---
+# cfgrib writes a per-GRIB2 "*.idx" file next to the source when decoding;
+# it embeds an absolute path and is regenerated deterministically on demand.
+*.idx
