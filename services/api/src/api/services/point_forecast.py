@@ -1,0 +1,501 @@
+"""Point forecast construction: Zarr slicing, grid interpolation, and units.
+
+This service builds a ``PointForecastData`` for an already-resolved
+location. It does not geocode addresses: locations are resolved by the
+``/v1/search`` endpoint or provided directly as coordinates or platform ids
+(see the ``/v1/points`` router).
+
+The grid geometry is derived from the forecast dataset's own
+``latitude``/``longitude`` coordinate arrays (origin, step, row/column
+counts), assuming a regular, uniformly spaced rectilinear grid. The schema
+stores only ``resolution_km``; the approved design documents do not define
+grid origin/dimensions, so deriving them from the data avoids introducing
+undocumented platform conventions. Non-uniform or non-surface data is out
+of scope for Milestone 9 and raises a clear error.
+"""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, cast
+
+import numpy as np
+import xarray as xr
+from domain.exceptions import (
+    InvalidCoordinatesError,
+    InvalidGridError,
+    PointOutsideGridError,
+)
+from domain.geo.coordinates import validate_coordinates
+from domain.geo.grid import RegularGrid
+from domain.geo.interpolation import bilinear_interpolate
+from fastapi import HTTPException
+from ingestion.core.zarr_writer import read_dataset
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from api.models.entities import (
+    City,
+    ForecastVariable,
+    Model,
+    ModelRun,
+    ModelVersion,
+    SkiResort,
+)
+from api.schemas import ForecastLocationOut, ForecastSeries, PointForecastData
+
+#: ``resolved_via`` value for a location resolved from raw coordinates.
+RESOLVED_VIA_COORDINATES = "coordinates"
+#: ``resolved_via`` value for a location resolved from a city record.
+RESOLVED_VIA_CITY = "city"
+#: ``resolved_via`` value for a location resolved from a ski resort record.
+RESOLVED_VIA_RESORT = "resort"
+
+
+@dataclass(frozen=True)
+class ResolvedLocation:
+    """A geographic location resolved from a point-forecast spatial specifier.
+
+    Attributes:
+        latitude: Latitude in decimal degrees.
+        longitude: Longitude in decimal degrees.
+        elevation_m: Elevation in meters, when the resolved record defines one.
+        resolved_via: How the location was resolved (coordinates, city, or
+            resort).
+        id: Stable identity of the resolved location record (the ``cities``
+            or ``ski_resorts`` primary key), or ``None`` when resolved from
+            raw coordinates. Used as a cache-key discriminator so distinct
+            records that share coordinates cannot collide.
+    """
+
+    latitude: float
+    longitude: float
+    elevation_m: float | None
+    resolved_via: str
+    id: str | None = None
+
+
+#: SI -> imperial conversions applied when ``units=imperial`` (API.md 2.6).
+#: Conversion applies only when the variable's registered unit matches a
+#: known pair; unknown units are returned unconverted.
+_SI_TO_IMPERIAL: dict[str, tuple[str, Callable[[float], float]]] = {
+    "°C": ("°F", lambda celsius: celsius * 9.0 / 5.0 + 32.0),
+    "mm/h": ("in/h", lambda mm: mm / 25.4),
+    "km/h": ("km/h", lambda kmh: kmh * 0.621371),
+}
+
+
+def resolve_location(
+    db: Session,
+    *,
+    lat: float | None = None,
+    lon: float | None = None,
+    city_id: str | None = None,
+    resort_id: str | None = None,
+) -> ResolvedLocation:
+    """Resolve exactly one spatial specifier to a geographic location.
+
+    The specifier must be exactly one of: a ``lat``/``lon`` pair, a
+    ``city_id``, or a ``resort_id``. Providing none, more than one, or a
+    partial coordinate pair is rejected. ``address`` is intentionally not
+    accepted: this endpoint serves forecasts for already-resolved locations
+    (API.md section 2.1 lists ``address`` but the schema has no geocoding
+    table; see the milestone spec gap).
+
+    Args:
+        db: Database session.
+        lat: Latitude (required with ``lon``).
+        lon: Longitude (required with ``lat``).
+        city_id: A ``cities.id`` primary key.
+        resort_id: A ``ski_resorts.id`` primary key.
+
+    Returns:
+        The resolved location.
+
+    Raises:
+        HTTPException: 422 for an invalid or ambiguous specifier, 404 if a
+            referenced city or ski resort does not exist.
+    """
+    if (lat is None) != (lon is None):
+        raise HTTPException(
+            status_code=422,
+            detail="lat and lon must be provided together.",
+        )
+    specifier_count = (
+        int(lat is not None and lon is not None)
+        + int(city_id is not None)
+        + int(resort_id is not None)
+    )
+    if specifier_count == 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Exactly one spatial specifier is required: lat and lon, "
+                "city_id, or resort_id."
+            ),
+        )
+    if specifier_count > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Provide exactly one spatial specifier: lat and lon, "
+                "city_id, or resort_id."
+            ),
+        )
+
+    if lat is not None and lon is not None:
+        try:
+            validate_coordinates(lat, lon)
+        except InvalidCoordinatesError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return ResolvedLocation(
+            latitude=lat,
+            longitude=lon,
+            elevation_m=None,
+            resolved_via=RESOLVED_VIA_COORDINATES,
+        )
+
+    if city_id is not None:
+        return _resolve_city(db, city_id)
+
+    # The specifier_count guard above guarantees resort_id is non-None when we
+    # reach here (it is the only remaining specifier that could count to 1).
+    # Assert to narrow the type and document the invariant without a type-ignore.
+    assert resort_id is not None
+    return _resolve_ski_resort(db, resort_id)
+
+
+def _resolve_city(db: Session, city_id: str) -> ResolvedLocation:
+    row = db.execute(
+        select(City, func.ST_X(City.geom), func.ST_Y(City.geom)).where(
+            City.id == city_id
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"City '{city_id}' was not found.")
+    return ResolvedLocation(
+        latitude=float(row[2]),
+        longitude=float(row[1]),
+        # Cities have no elevation column in the Milestone 3 schema.
+        elevation_m=None,
+        resolved_via=RESOLVED_VIA_CITY,
+        id=row[0].id,
+    )
+
+
+def _resolve_ski_resort(db: Session, resort_id: str) -> ResolvedLocation:
+    row = db.execute(
+        select(SkiResort, func.ST_X(SkiResort.geom), func.ST_Y(SkiResort.geom)).where(
+            SkiResort.id == resort_id
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"Ski resort '{resort_id}' was not found."
+        )
+    return ResolvedLocation(
+        latitude=float(row[2]),
+        longitude=float(row[1]),
+        elevation_m=row[0].summit_elevation_m,
+        resolved_via=RESOLVED_VIA_RESORT,
+        id=row[0].id,
+    )
+
+
+def build_point_forecast(
+    db: Session,
+    *,
+    location: ResolvedLocation,
+    model: str,
+    variables: list[str] | None,
+    units: str,
+    start_lead_time_hours: int | None,
+    end_lead_time_hours: int | None,
+) -> PointForecastData:
+    """Build a point forecast payload for a resolved location and model.
+
+    The newest ``status='ready'`` run with a non-null ``zarr_store_path`` is
+    selected for the model (via ``model_versions``). The run's Zarr dataset
+    is sliced at each requested ``lead_time_hours`` and the variable field is
+    bilinearly interpolated to the location. ``valid_time`` is derived as
+    ``cycle_time + lead_time_hours`` (DATABASE.md section 1) and
+    ``generated_at`` is the run's ``cycle_time`` (the forecast dataset
+    generation time), keeping payloads deterministic.
+
+    Args:
+        db: Database session.
+        location: The resolved location.
+        model: A single model identifier.
+        variables: Requested variable codes, or ``None`` to return the
+            documented ``forecast_variables`` catalog entries present in the
+            dataset.
+        units: ``metric`` (default) or ``imperial``.
+        start_lead_time_hours: Inclusive lower bound of the lead-time window.
+        end_lead_time_hours: Inclusive upper bound of the lead-time window.
+
+    Returns:
+        The point forecast payload.
+
+    Raises:
+        HTTPException: 404 when no ready run, no data for the location, or an
+            unknown variable is encountered; 422/500 for invalid data.
+    """
+    run = _resolve_run(db, model)
+    assert run.zarr_store_path is not None
+    dataset = read_dataset(run.zarr_store_path)
+
+    lead_times = _resolve_lead_times(dataset, start_lead_time_hours, end_lead_time_hours)
+    var_codes = _resolve_variables(db, dataset, variables)
+    units_by_code = _variable_units(db, var_codes)
+
+    forecasts: list[ForecastSeries] = []
+    run_cycle_time = cast(datetime, run.cycle_time)
+    for lead in lead_times:
+        entry: dict[str, Any] = {
+            "lead_time_hours": lead,
+            "valid_time": run_cycle_time + timedelta(hours=lead),
+        }
+        for var_code in var_codes:
+            value = _interpolate_variable(
+                dataset, var_code, lead, location.latitude, location.longitude
+            )
+            entry[var_code] = _convert_value(value, units_by_code[var_code], units)
+        forecasts.append(ForecastSeries(**entry))
+
+    return PointForecastData(
+        location=ForecastLocationOut(
+            latitude=location.latitude,
+            longitude=location.longitude,
+            elevation_m=location.elevation_m,
+            resolved_via=location.resolved_via,
+        ),
+        generated_at=run_cycle_time,
+        model=model,
+        forecasts=forecasts,
+    )
+
+
+def _resolve_run(db: Session, model_id: str) -> ModelRun:
+    stmt = (
+        select(ModelRun)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model_id)
+        .where(ModelRun.status == "ready")
+        .where(ModelRun.zarr_store_path.isnot(None))
+        .order_by(ModelRun.cycle_time.desc())
+        .limit(1)
+    )
+    run = db.execute(stmt).scalars().first()
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No ready forecast run with data was found for model "
+                f"'{model_id}'."
+            ),
+        )
+    return run
+
+
+def _resolve_lead_times(
+    dataset: xr.Dataset,
+    start: int | None,
+    end: int | None,
+) -> list[int]:
+    if "lead_time_hours" not in dataset.coords:
+        raise HTTPException(
+            status_code=404,
+            detail="The forecast dataset has no lead_time_hours coordinate.",
+        )
+    coord = dataset.coords["lead_time_hours"].values
+    if np.ndim(coord) == 0:
+        available = [int(coord)]
+    else:
+        available = [int(value) for value in coord]
+    selected = [
+        lead
+        for lead in sorted(available)
+        if (start is None or lead >= start) and (end is None or lead <= end)
+    ]
+    if not selected:
+        raise HTTPException(
+            status_code=404,
+            detail="No forecast data is available for the requested lead-time range.",
+        )
+    return selected
+
+
+def _resolve_variables(
+    db: Session,
+    dataset: xr.Dataset,
+    variables: list[str] | None,
+) -> list[str]:
+    """Resolve the requested variable codes.
+
+    When ``variables`` is ``None`` the default set is the documented
+    ``forecast_variables`` catalog intersected with the variables present in
+    the dataset. This explicit allowlist ensures auxiliary or non-surface
+    dataset variables are never accidentally exposed or interpolated (API.md
+    does not define a default variable list; the catalog is the platform's
+    documented forecast-variable vocabulary). Provided codes are validated
+    against the ``forecast_variables`` catalog.
+    """
+    if variables is None:
+        catalog = _catalog_variable_codes(db)
+        return sorted(catalog.intersection(str(name) for name in dataset.data_vars))
+    missing = _missing_catalog_variables(db, variables)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown variable(s): {', '.join(sorted(missing))}.",
+        )
+    return list(variables)
+
+
+def _catalog_variable_codes(db: Session) -> set[str]:
+    """Return the set of documented forecast variable codes."""
+    stmt = select(ForecastVariable.variable_code)
+    return set(db.execute(stmt).scalars().all())
+
+
+def _missing_catalog_variables(db: Session, variables: list[str]) -> list[str]:
+    stmt = select(ForecastVariable.variable_code).where(
+        ForecastVariable.variable_code.in_(variables)
+    )
+    known = set(db.execute(stmt).scalars().all())
+    return [code for code in variables if code not in known]
+
+
+def _variable_units(
+    db: Session, var_codes: list[str]
+) -> dict[str, str | None]:
+    if not var_codes:
+        return {}
+    stmt = select(ForecastVariable.variable_code, ForecastVariable.unit).where(
+        ForecastVariable.variable_code.in_(var_codes)
+    )
+    units: dict[str, str | None] = {}
+    for code, unit in db.execute(stmt).all():
+        units[code] = unit
+    return {code: units.get(code) for code in var_codes}
+
+
+def _interpolate_variable(
+    dataset: xr.Dataset,
+    var_code: str,
+    lead: int,
+    latitude: float,
+    longitude: float,
+) -> float:
+    if var_code not in dataset.data_vars:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Variable '{var_code}' is not available in the forecast dataset.",
+        )
+    field = dataset[var_code]
+    if "lead_time_hours" in field.dims:
+        field = field.sel(lead_time_hours=lead)
+    if field.ndim != 2:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Variable '{var_code}' is not a 2-D surface field; "
+                "vertical-level variables are not supported."
+            ),
+        )
+    grid, lat_descending, lon_descending = _derive_grid(dataset)
+    values = _field_values(field, lat_descending, lon_descending)
+    try:
+        return float(bilinear_interpolate(grid, values, latitude, longitude))
+    except PointOutsideGridError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No forecast data covers the requested location: {exc}"
+            ),
+        ) from exc
+    except InvalidGridError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="The forecast dataset grid is invalid.",
+        ) from exc
+
+
+def _derive_grid(
+    dataset: xr.Dataset,
+) -> tuple[RegularGrid, bool, bool]:
+    """Derive a regular grid from the dataset's coordinate arrays.
+
+    Returns the grid along with flags indicating whether the latitude and
+    longitude axes were stored in descending order and therefore must be
+    reversed to align with the domain's ascending-row/column convention.
+    """
+    lat_raw = _axis_values(dataset, "latitude")
+    lon_raw = _axis_values(dataset, "longitude")
+    latitudes, lat_descending = _ascending(lat_raw)
+    longitudes, lon_descending = _ascending(lon_raw)
+    if len(latitudes) < 2 or len(longitudes) < 2:
+        raise HTTPException(
+            status_code=500,
+            detail="The forecast dataset grid must have at least two points per axis.",
+        )
+    lat_step = (latitudes[-1] - latitudes[0]) / (len(latitudes) - 1)
+    lon_step = (longitudes[-1] - longitudes[0]) / (len(longitudes) - 1)
+    if lat_step <= 0.0 or lon_step <= 0.0:
+        raise HTTPException(
+            status_code=500,
+            detail="The forecast dataset grid must be uniformly spaced.",
+        )
+    grid = RegularGrid(
+        lat_start=latitudes[0],
+        lon_start=longitudes[0],
+        lat_step=lat_step,
+        lon_step=lon_step,
+        rows=len(latitudes),
+        cols=len(longitudes),
+    )
+    return grid, lat_descending, lon_descending
+
+
+def _axis_values(dataset: xr.Dataset, name: str) -> list[float]:
+    if name not in dataset.coords:
+        raise HTTPException(
+            status_code=500,
+            detail=f"The forecast dataset has no '{name}' coordinate.",
+        )
+    return [float(value) for value in dataset.coords[name].values]
+
+
+def _ascending(values: list[float]) -> tuple[list[float], bool]:
+    """Return an ascending copy of an axis and whether it was reversed."""
+    if values[-1] < values[0]:
+        return list(reversed(values)), True
+    return list(values), False
+
+
+def _field_values(
+    field: xr.DataArray,
+    lat_descending: bool,
+    lon_descending: bool,
+) -> list[list[float]]:
+    if lat_descending:
+        field = field.isel(latitude=slice(None, None, -1))
+    if lon_descending:
+        field = field.isel(longitude=slice(None, None, -1))
+    return np.asarray(field.values, dtype=float).tolist()
+
+
+def _convert_value(value: float, si_unit: str | None, units: str) -> float:
+    """Convert a value to imperial units when requested and supported.
+
+    Conversion is applied only when ``units=imperial`` and the variable's
+    registered unit matches a known SI/imperial pair; otherwise the value is
+    returned unconverted.
+    """
+    if units != "imperial" or si_unit is None:
+        return value
+    conversion = _SI_TO_IMPERIAL.get(si_unit)
+    if conversion is None:
+        return value
+    return float(conversion[1](value))

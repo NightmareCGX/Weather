@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from api.errors import install_exception_handlers
 from api.middleware import RequestIDMiddleware
 from api.routers.catalog import router as catalog_router
+from api.routers.points import router as points_router
+from api.routers.search import router as search_router
 
 #: Application title reported in the OpenAPI schema.
 APP_TITLE = "Global Probabilistic Weather Forecasting Platform API"
@@ -21,6 +23,8 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestIDMiddleware)
     install_exception_handlers(app)
     app.include_router(catalog_router, prefix="/v1")
+    app.include_router(search_router, prefix="/v1")
+    app.include_router(points_router, prefix="/v1")
     return app
 
 

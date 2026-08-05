@@ -8,7 +8,7 @@ no weather calculations or database access live here.
 from datetime import datetime, timezone
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, ConfigDict, field_serializer
 
 
 def format_datetime_utc(value: datetime) -> str:
@@ -108,3 +108,83 @@ class ErrorEnvelope(BaseModel):
     """The wrapper around :class:`ErrorDetail` returned on failure."""
 
     error: ErrorDetail
+
+
+class ForecastLocationOut(BaseModel):
+    """The resolved location of a point forecast (API.md section 2.1)."""
+
+    latitude: float
+    longitude: float
+    elevation_m: float | None = None
+    resolved_via: str
+
+
+class ForecastSeries(BaseModel):
+    """A single forecast entry indexed by lead time (API.md section 2.1).
+
+    Requested forecast variables are attached as additional top-level keys
+    (e.g. ``temperature_2m``), matching the dynamic keyed shape shown in
+    API.md. Variable keys are captured through ``extra="allow"``.
+    """
+
+    lead_time_hours: int
+    valid_time: datetime
+
+    model_config = ConfigDict(extra="allow")
+
+    @field_serializer("valid_time")
+    def _serialize_valid_time(self, value: datetime) -> str:
+        return format_datetime_utc(value)
+
+
+class PointForecastData(BaseModel):
+    """The payload of a point forecast (API.md section 2.1).
+
+    ``generated_at`` is the forecast dataset generation time -- the selected
+    model run's ``cycle_time`` -- so that identical forecast data produces
+    identical payloads and deterministic cache behavior.
+    """
+
+    location: ForecastLocationOut
+    generated_at: datetime
+    model: str
+    forecasts: list[ForecastSeries]
+
+    @field_serializer("generated_at")
+    def _serialize_generated_at(self, value: datetime) -> str:
+        return format_datetime_utc(value)
+
+
+class PointForecastEnvelope(BaseModel):
+    """The point forecast response envelope (API.md sections 2.1 and 2.3).
+
+    Only the documented single-model ``point_forecast`` envelope is
+    implemented in Milestone 9. The multi-model response format is not
+    defined by the approved design documents and is therefore a recorded
+    specification gap; multi-model requests are rejected (see the
+    ``/v1/points`` router).
+    """
+
+    object: Literal["point_forecast"] = "point_forecast"
+    data: PointForecastData
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+class SearchResultOut(BaseModel):
+    """A location search result (API.md section 6.1).
+
+    The ``object`` field distinguishes the source table: ``city``,
+    ``ski_resort``, or ``station``. Type-specific fields (``region``,
+    ``country``, ``elevation_m``) are optional because not every source
+    table defines them.
+    """
+
+    id: str
+    object: str
+    name: str
+    region: str | None = None
+    country: str | None = None
+    elevation_m: float | None = None
+    latitude: float
+    longitude: float

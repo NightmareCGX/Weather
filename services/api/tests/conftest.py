@@ -12,19 +12,24 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from geoalchemy2 import WKTElement
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
 from api.main import app
 from api.models.entities import (
+    City,
     ForecastCenter,
     ForecastGrid,
     ForecastVariable,
     Model,
     ModelRun,
     ModelVersion,
+    SkiResort,
+    Station,
 )
+from tests.fixtures import write_forecast_zarr
 
 
 @pytest.fixture(scope="session")
@@ -45,10 +50,16 @@ def db_engine():
     engine.dispose()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def migrated_db(db_engine):
     """Apply the Alembic schema to a clean database, following the existing
-    ``test_migrations.py`` reset-and-upgrade convention."""
+    ``test_migrations.py`` reset-and-upgrade convention.
+
+    Module-scoped so that each DB-consuming test module re-migrates its own
+    clean schema. ``test_migrations.py`` destructively drops and downgrades
+    the shared schema to ``base``; keeping the fixtures module-scoped makes
+    every module independent of that and immune to cross-module corruption.
+    """
     api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     alembic_cfg = Config(os.path.join(api_dir, "alembic.ini"))
     alembic_cfg.set_main_option("sqlalchemy.url", str(db_engine.url))
@@ -65,8 +76,87 @@ def migrated_db(db_engine):
 
 
 @pytest.fixture(scope="session")
-def seed_data(migrated_db):
-    """Seed deterministic catalog rows used by the contract tests."""
+def tmp_zarr_stores(tmp_path_factory):
+    """Write local on-disk Zarr fixture stores for the seeded model runs.
+
+    Returns a mapping of model id to the local Zarr store directory. The
+    stores are written once per session and referenced by the seeded
+    ``model_runs.zarr_store_path`` rows so the point-forecast integration
+    tests slice real datasets without requiring MinIO/S3.
+    """
+    base = tmp_path_factory.mktemp("zarr")
+    gfs_store = str(base / "gfs")
+    gefs_store = str(base / "gefs")
+    write_forecast_zarr(gfs_store)
+    write_forecast_zarr(gefs_store)
+    return {"gfs": gfs_store, "gefs": gefs_store}
+
+
+def _seed_locations(session: Session) -> None:
+    """Seed PostGIS location records used by the search and point tests.
+
+    Coordinates are chosen inside the fixture Zarr grid
+    (latitude 38.0-38.75, longitude -107.0 to -106.25).
+    """
+    session.add_all(
+        [
+            City(
+                id="city_denver",
+                city_name="Denver",
+                region="Colorado",
+                country="USA",
+                population=700000,
+                geom=WKTElement("POINT(-106.82 38.19)", srid=4326),
+            ),
+            City(
+                id="city_aspen",
+                city_name="Aspen",
+                region="Colorado",
+                country="USA",
+                population=6700,
+                geom=WKTElement("POINT(-106.82 38.19)", srid=4326),
+            ),
+            SkiResort(
+                id="resort_aspen_mountain",
+                resort_name="Aspen Mountain",
+                region="Colorado",
+                country="USA",
+                summit_elevation_m=3417.0,
+                geom=WKTElement("POINT(-106.82 38.19)", srid=4326),
+            ),
+            # A second resort at the exact same coordinates as Aspen Mountain
+            # but with a different elevation, to exercise cache-key uniqueness
+            # for same-type records that resolve to the same point.
+            SkiResort(
+                id="resort_aspen_buttermilk",
+                resort_name="Buttermilk",
+                region="Colorado",
+                country="USA",
+                summit_elevation_m=2450.0,
+                geom=WKTElement("POINT(-106.82 38.19)", srid=4326),
+            ),
+            SkiResort(
+                id="resort_denver_ski",
+                resort_name="Denver Ski Area",
+                region="Colorado",
+                country="USA",
+                summit_elevation_m=2500.0,
+                geom=WKTElement("POINT(-106.5 38.5)", srid=4326),
+            ),
+            Station(
+                id="station_aspen_co",
+                station_code="KASE",
+                name="Aspen Station",
+                elevation_m=2380.0,
+                geom=WKTElement("POINT(-106.82 38.22)", srid=4326),
+            ),
+        ]
+    )
+
+
+@pytest.fixture(scope="module")
+def seed_data(migrated_db, tmp_zarr_stores):
+    """Seed deterministic catalog and location rows used by the contract tests."""
     with Session(migrated_db) as session:
         noaa = ForecastCenter(
             id="center_noaa",
@@ -92,12 +182,14 @@ def seed_data(migrated_db):
         )
         version_gfs = ModelVersion(id="version_gfs_v1", model_id="gfs", version_string="v1.0")
         version_gefs = ModelVersion(id="version_gefs_v1", model_id="gefs", version_string="v1.0")
+        # zarr_store_path points at local on-disk Zarr fixture stores so the
+        # point-forecast integration tests run without MinIO/S3.
         run_gfs_00 = ModelRun(
             id="run_2026072100_gfs",
             model_version_id="version_gfs_v1",
             cycle_time=datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc),
             status="ready",
-            zarr_store_path="s3://weather-data/gfs/2026-07-21/00Z",
+            zarr_store_path=tmp_zarr_stores["gfs"],
         )
         run_gfs_12 = ModelRun(
             id="run_2026072112_gfs",
@@ -111,7 +203,7 @@ def seed_data(migrated_db):
             model_version_id="version_gefs_v1",
             cycle_time=datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc),
             status="ready",
-            zarr_store_path="s3://weather-data/gefs/2026-07-21/00Z",
+            zarr_store_path=tmp_zarr_stores["gefs"],
         )
         temperature = ForecastVariable(
             id="var_temperature_2m",
@@ -153,13 +245,18 @@ def seed_data(migrated_db):
                 downscaled_grid,
             ]
         )
+        _seed_locations(session)
         session.commit()
     yield
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def client(migrated_db, seed_data):
-    """TestClient bound to the test database via a ``get_db`` override."""
+    """TestClient bound to the test database via a ``get_db`` override.
+
+    Module-scoped (matching ``migrated_db``/``seed_data``) so each test
+    module gets its own clean migrated + seeded schema.
+    """
 
     def override_get_db():
         db = Session(migrated_db)
