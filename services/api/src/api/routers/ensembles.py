@@ -45,6 +45,11 @@ def get_ensemble_statistics(
     model: Annotated[
         str, Query(description="A single ensemble model identifier.")
     ] = "gefs",
+    # ``lead_time_hours`` defaults to 0 (the model run's cycle time) even
+    # though API.md section 5.1 documents it as required with no default. The
+    # default is intentionally kept for backward compatibility with the
+    # initial /v1/ensembles release; the documented contract treats the
+    # parameter as required.
     lead_time_hours: Annotated[
         int, Query(ge=0, description="Forecast offset hours from cycle time.")
     ] = 0,

@@ -11,7 +11,13 @@ import math
 
 import pytest
 
-from tests.fixtures import LAT_START, LON_START
+from tests.fixtures import (
+    LAT_START,
+    LON_START,
+    MEMBER_INDICES,
+    ensemble_precipitation_at,
+    ensemble_temperature_at,
+)
 
 #: Test point at the center of a fixture grid cell (the analytic fields are
 #: linear, so bilinear interpolation reproduces the analytic values exactly).
@@ -45,9 +51,27 @@ def _wilson(probability, sample_size):
     return max(0.0, center - margin), min(1.0, center + margin)
 
 
+def _precipitation_members():
+    """precipitation_rate member values at the test point and lead time."""
+    return [ensemble_precipitation_at(member, LEAD) for member in MEMBER_INDICES]
+
+
+def _temperature_members():
+    """temperature_2m member values at the test point and lead time."""
+    return [ensemble_temperature_at(member, LAT, LON, LEAD) for member in MEMBER_INDICES]
+
+
+def _empirical_probability_above(members, threshold):
+    """Expected strict-exceedance probability derived from the member values."""
+    return sum(1.0 for value in members if value > threshold) / len(members)
+
+
 def test_probability_gt_contract(client):
     # precipitation_rate members at lead 6 are [3, 4, 5, 6, 7]; strict >4
     # matches {5, 6, 7} -> p = 0.6.
+    members = _precipitation_members()
+    expected_probability = _empirical_probability_above(members, 4.0)
+
     resp = client.get(
         f"/v1/probabilities?lat={LAT}&lon={LON}"
         f"&variable=precipitation_rate&threshold=4&operator=gt"
@@ -63,14 +87,14 @@ def test_probability_gt_contract(client):
     assert data["threshold"] == 4.0
     assert data["operator"] == "gt"
     assert data["lead_time_hours"] == LEAD
-    assert data["probability"] == pytest.approx(0.6)
+    assert data["probability"] == pytest.approx(expected_probability)
     assert data["location"]["latitude"] == pytest.approx(LAT)
     assert data["location"]["longitude"] == pytest.approx(LON)
 
     lower, upper = data["confidence_interval_95"]
     assert isinstance(lower, float) and isinstance(upper, float)
     assert 0.0 <= lower <= data["probability"] <= upper <= 1.0
-    expected_lower, expected_upper = _wilson(0.6, 5)
+    expected_lower, expected_upper = _wilson(expected_probability, len(members))
     assert lower == pytest.approx(expected_lower)
     assert upper == pytest.approx(expected_upper)
     # The response must match the API.md gt/lt shape exactly (no threshold_max).
@@ -112,13 +136,14 @@ def test_probability_between_contract(client):
 def test_probability_temperature_contract(client):
     # temperature_2m members at lead 6 are [15.5, 17.5, 19.5, 21.5, 23.5];
     # strict >20 matches {21.5, 23.5} -> p = 0.4.
+    expected_probability = _empirical_probability_above(_temperature_members(), 20.0)
     resp = client.get(
         f"/v1/probabilities?lat={LAT}&lon={LON}"
         f"&variable=temperature_2m&threshold=20&operator=gt"
         f"&lead_time_hours={LEAD}"
     )
     assert resp.status_code == 200
-    assert resp.json()["data"]["probability"] == pytest.approx(0.4)
+    assert resp.json()["data"]["probability"] == pytest.approx(expected_probability)
 
 
 def test_probability_deterministic(client):

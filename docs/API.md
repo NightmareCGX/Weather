@@ -366,7 +366,8 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **HTTP Method**: `GET`
 - **Endpoint**: `/v1/ensembles`
 - **Purpose**: Return statistical dispersion (mean, spread, P10, P25, P50, P75, P90) across ensemble perturbation members for a given `lead_time_hours`.
-- **Required Parameters**: `lat`, `lon`, `variable`, `model` (default `gefs`), `lead_time_hours`.
+- **Required Parameters**: `lat`, `lon`, `variable`, `model` (default `gefs`).
+- **Optional Parameters**: `lead_time_hours` (integer offset hours from cycle time; **Default**: `0`). When omitted, the initial forecast at the 0-hour lead is returned.
 - **Example Request**: `GET /v1/ensembles?lat=39.19&lon=-106.81&variable=temperature_2m&model=gefs&lead_time_hours=18`
 - **Example Response**:
   ```json

@@ -6,11 +6,17 @@ deterministic ensemble fixture, and error envelopes. When PostgreSQL is
 unreachable they skip, following the existing convention.
 """
 
-import math
-
+import numpy as np
 import pytest
 
-from tests.fixtures import LAT_START, LON_START
+from tests.fixtures import (
+    LAT_START,
+    LON_START,
+    MEMBER_COUNT,
+    MEMBER_INDICES,
+    ensemble_precipitation_at,
+    ensemble_temperature_at,
+)
 
 #: Test point at the center of a fixture grid cell (the analytic fields are
 #: linear, so bilinear interpolation reproduces the analytic values exactly).
@@ -25,8 +31,31 @@ def _assert_envelope(body):
     assert body["next_cursor"] is None
 
 
+def _expected_statistics(member_values: list[float]) -> dict[str, float]:
+    """Expected ensemble statistics derived from the analytic member values.
+
+    Mirrors the domain convention: mean/median via NumPy, population spread
+    (``ddof=0``), and linear percentiles (P10/P25/P50/P75/P90).
+    """
+    return {
+        "mean": float(np.mean(member_values)),
+        "median": float(np.median(member_values)),
+        "spread": float(np.std(member_values, ddof=0)),
+        "p10": float(np.percentile(member_values, 10, method="linear")),
+        "p25": float(np.percentile(member_values, 25, method="linear")),
+        "p50": float(np.percentile(member_values, 50, method="linear")),
+        "p75": float(np.percentile(member_values, 75, method="linear")),
+        "p90": float(np.percentile(member_values, 90, method="linear")),
+    }
+
+
 def test_ensembles_temperature_contract(client):
     # temperature_2m(member) = 15.5 + 2*member -> [15.5, 17.5, 19.5, 21.5, 23.5].
+    expected_members = [
+        ensemble_temperature_at(member, LAT, LON, LEAD) for member in MEMBER_INDICES
+    ]
+    expected = _expected_statistics(expected_members)
+
     resp = client.get(
         f"/v1/ensembles?lat={LAT}&lon={LON}"
         f"&variable=temperature_2m&lead_time_hours={LEAD}"
@@ -39,21 +68,26 @@ def test_ensembles_temperature_contract(client):
     data = body["data"]
     assert data["model"] == "gefs"
     assert data["lead_time_hours"] == LEAD
-    assert data["member_count"] == 5
+    assert data["member_count"] == MEMBER_COUNT
 
     stats = data["statistics"]
-    assert stats["mean"] == pytest.approx(19.5)
-    assert stats["median"] == pytest.approx(19.5)
-    assert stats["spread"] == pytest.approx(math.sqrt(8.0))
-    assert stats["p10"] == pytest.approx(16.3)
-    assert stats["p25"] == pytest.approx(17.5)
-    assert stats["p50"] == pytest.approx(19.5)
-    assert stats["p75"] == pytest.approx(21.5)
-    assert stats["p90"] == pytest.approx(22.7)
+    assert stats["mean"] == pytest.approx(expected["mean"])
+    assert stats["median"] == pytest.approx(expected["median"])
+    assert stats["spread"] == pytest.approx(expected["spread"])
+    assert stats["p10"] == pytest.approx(expected["p10"])
+    assert stats["p25"] == pytest.approx(expected["p25"])
+    assert stats["p50"] == pytest.approx(expected["p50"])
+    assert stats["p75"] == pytest.approx(expected["p75"])
+    assert stats["p90"] == pytest.approx(expected["p90"])
 
 
 def test_ensembles_precipitation_contract(client):
     # precipitation_rate(member) = 3 + member -> [3, 4, 5, 6, 7].
+    expected_members = [
+        ensemble_precipitation_at(member, LEAD) for member in MEMBER_INDICES
+    ]
+    expected = _expected_statistics(expected_members)
+
     resp = client.get(
         f"/v1/ensembles?lat={LAT}&lon={LON}"
         f"&variable=precipitation_rate&lead_time_hours={LEAD}"
@@ -63,17 +97,17 @@ def test_ensembles_precipitation_contract(client):
     _assert_envelope(body)
     data = body["data"]
     assert data["model"] == "gefs"
-    assert data["member_count"] == 5
+    assert data["member_count"] == MEMBER_COUNT
 
     stats = data["statistics"]
-    assert stats["mean"] == pytest.approx(5.0)
-    assert stats["median"] == pytest.approx(5.0)
-    assert stats["spread"] == pytest.approx(math.sqrt(2.0))
-    assert stats["p10"] == pytest.approx(3.4)
-    assert stats["p25"] == pytest.approx(4.0)
-    assert stats["p50"] == pytest.approx(5.0)
-    assert stats["p75"] == pytest.approx(6.0)
-    assert stats["p90"] == pytest.approx(6.6)
+    assert stats["mean"] == pytest.approx(expected["mean"])
+    assert stats["median"] == pytest.approx(expected["median"])
+    assert stats["spread"] == pytest.approx(expected["spread"])
+    assert stats["p10"] == pytest.approx(expected["p10"])
+    assert stats["p25"] == pytest.approx(expected["p25"])
+    assert stats["p50"] == pytest.approx(expected["p50"])
+    assert stats["p75"] == pytest.approx(expected["p75"])
+    assert stats["p90"] == pytest.approx(expected["p90"])
 
 
 def test_ensembles_deterministic(client):

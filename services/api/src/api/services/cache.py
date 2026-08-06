@@ -16,7 +16,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 import redis as redis_lib
 from pydantic import BaseModel, ValidationError
@@ -86,10 +86,10 @@ class PointCache:
         self,
         cache_key: str,
         *,
-        # mypy cannot unify the TEnvelope typevar default with a concrete
-        # envelope type (documented limitation); callers pass the concrete
-        # model_type explicitly, so the default is unused in practice.
-        model_type: type[TEnvelope] = PointForecastEnvelope,  # type: ignore[assignment]
+        # The default's static type is widened to ``type[BaseModel]`` so mypy
+        # accepts the concrete default without a type-ignore; callers pass the
+        # concrete ``model_type`` explicitly and its value type is preserved.
+        model_type: type[BaseModel] = PointForecastEnvelope,
     ) -> _CacheRead[TEnvelope]:
         """Read the cache for a key, reporting how the read resolved.
 
@@ -120,7 +120,9 @@ class PointCache:
         if raw is None:
             return _CacheRead[TEnvelope](hit=False, envelope=None)
         try:
-            envelope = model_type.model_validate_json(raw)
+            # ``model_type`` is widened to ``type[BaseModel]`` for the default;
+            # the caller-supplied concrete type is preserved by the cast.
+            envelope = cast(TEnvelope, model_type.model_validate_json(raw))
         except (ValueError, TypeError, json.JSONDecodeError, ValidationError):
             # Malformed JSON, a schema-incompatible payload, or a Pydantic
             # validation failure is a cache miss: delete the corrupt entry
@@ -143,7 +145,9 @@ class PointCache:
         query_params: str,
         compute: Callable[[], TEnvelope],
         *,
-        model_type: type[TEnvelope] = PointForecastEnvelope,  # type: ignore[assignment]
+        # See the note on ``get`` for why the default's static type is widened
+        # to ``type[BaseModel]``.
+        model_type: type[BaseModel] = PointForecastEnvelope,
     ) -> TEnvelope:
         """Return a cached response or compute, store, and return it.
 
@@ -164,7 +168,9 @@ class PointCache:
         Returns:
             The response.
         """
-        read = self.get(cache_key, model_type=model_type)
+        read: _CacheRead[TEnvelope] = self.get(
+            cache_key, model_type=model_type
+        )
         if read.hit and read.envelope is not None:
             return read.envelope
 

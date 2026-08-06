@@ -13,6 +13,8 @@ but only the documented 95% level is supported for now.
 
 import math
 
+import numpy as np
+
 from domain.exceptions import InvalidEnsembleError, InvalidThresholdError
 
 #: Standard normal critical value for a two-sided 95% interval (z_{0.975}).
@@ -49,7 +51,7 @@ def probability_confidence_interval(
         InvalidEnsembleError: If ``sample_size`` is not a positive integer.
     """
     if isinstance(probability, bool) or not isinstance(
-        probability, (int, float)
+        probability, (int, float, np.integer, np.floating)
     ):
         raise InvalidThresholdError(
             "probability must be a numeric value, "
@@ -61,7 +63,9 @@ def probability_confidence_interval(
         raise InvalidThresholdError(
             f"probability must be between 0 and 1, got {probability}"
         )
-    if isinstance(sample_size, bool) or not isinstance(sample_size, int):
+    if isinstance(sample_size, bool) or not isinstance(
+        sample_size, (int, np.integer)
+    ):
         raise InvalidEnsembleError(
             "sample_size must be a positive integer, "
             f"got {type(sample_size).__name__}"
@@ -70,7 +74,9 @@ def probability_confidence_interval(
         raise InvalidEnsembleError(
             f"sample_size must be at least 1, got {sample_size}"
         )
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+    if isinstance(confidence, bool) or not isinstance(
+        confidence, (int, float, np.integer, np.floating)
+    ):
         raise InvalidThresholdError(
             f"confidence must be a numeric value, got {type(confidence).__name__}"
         )

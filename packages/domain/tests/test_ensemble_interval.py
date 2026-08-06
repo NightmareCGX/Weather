@@ -2,6 +2,8 @@
 
 import math
 
+import numpy as np
+import numpy.typing as npt
 import pytest
 from domain.ensemble import probability_confidence_interval
 from domain.exceptions import InvalidEnsembleError, InvalidThresholdError
@@ -54,6 +56,19 @@ class TestProbabilityConfidenceInterval:
         lower, upper = probability_confidence_interval(0.6, 5)
         assert isinstance(lower, float)
         assert isinstance(upper, float)
+
+    def test_accepts_numpy_scalars(self) -> None:
+        # Consistent with the sibling domain helpers, numpy scalar numerics are
+        # accepted for every numeric parameter.
+        probability: npt.NDArray[np.float64] = np.float64(0.6)
+        size: npt.NDArray[np.int64] = np.int64(5)
+        confidence: npt.NDArray[np.float64] = np.float64(0.95)
+        lower, upper = probability_confidence_interval(
+            probability, size, confidence=confidence
+        )
+        expected_lower, expected_upper = probability_confidence_interval(0.6, 5)
+        assert lower == pytest.approx(expected_lower)
+        assert upper == pytest.approx(expected_upper)
 
     @pytest.mark.parametrize(
         "bad_probability",

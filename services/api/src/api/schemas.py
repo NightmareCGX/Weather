@@ -8,7 +8,7 @@ no weather calculations or database access live here.
 from datetime import datetime, timezone
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, field_serializer, model_serializer
 
 
 def format_datetime_utc(value: datetime) -> str:
@@ -200,9 +200,10 @@ class ProbabilityLocation(BaseModel):
 class ProbabilityForecastData(BaseModel):
     """The payload of a probability forecast (API.md section 3.1).
 
-    ``threshold_max`` (the upper bound of the ``between`` operator) is emitted
-    only when present, through ``extra="allow"``, so ``gt``/``lt`` payloads
-    contain exactly the documented fields.
+    ``threshold_max`` is the upper bound of the ``between`` operator. It is
+    serialized only when the operator is ``between``, so ``gt``/``lt``
+    payloads contain exactly the documented fields and never a ``null``
+    ``threshold_max``.
     """
 
     location: ProbabilityLocation
@@ -212,8 +213,23 @@ class ProbabilityForecastData(BaseModel):
     lead_time_hours: int
     probability: float
     confidence_interval_95: list[float]
+    threshold_max: float | None = None
 
-    model_config = ConfigDict(extra="allow")
+    @model_serializer
+    def _serialize_threshold_max(self) -> dict[str, object]:
+        """Omit ``threshold_max`` unless the operator is ``between``."""
+        payload: dict[str, object] = {
+            "location": self.location,
+            "variable": self.variable,
+            "threshold": self.threshold,
+            "operator": self.operator,
+            "lead_time_hours": self.lead_time_hours,
+            "probability": self.probability,
+            "confidence_interval_95": self.confidence_interval_95,
+        }
+        if self.operator == "between" and self.threshold_max is not None:
+            payload["threshold_max"] = self.threshold_max
+        return payload
 
 
 class ProbabilityForecastEnvelope(BaseModel):
