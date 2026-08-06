@@ -103,3 +103,91 @@ def temperature_at(latitude: float, longitude: float, lead: int) -> float:
 def precipitation_at(lead: int) -> float:
     """Expected metric precipitation value at a lead time."""
     return 0.5 * lead
+
+
+#: Number of ensemble members in the ensemble fixture dataset.
+MEMBER_COUNT = 5
+#: Member coordinate values of the ensemble fixture dataset.
+MEMBER_INDICES = list(range(MEMBER_COUNT))
+
+
+def build_ensemble_dataset() -> xr.Dataset:
+    """Build a deterministic ensemble dataset with surface variables.
+
+    The dataset mirrors :func:`build_forecast_dataset` but adds a ``member``
+    dimension so ensemble statistics and exceedance probabilities can be
+    exercised. Values follow analytic fields so expected statistics are exact:
+
+    * ``temperature_2m(member, lat, lon, lead) = 10 + 10*(lat - LAT_START)
+      + 10*(lon - LON_START) + 0.5*lead + 2*member``
+    * ``precipitation_rate(member, lead) = 0.5*lead + 1.0*member``
+
+    Returns:
+        The deterministic ensemble dataset with dimensions
+        ``(member, lead_time_hours, latitude, longitude)``.
+    """
+    member = np.asarray(MEMBER_INDICES, dtype=float)
+    lat = np.asarray(LATITUDES, dtype=float)
+    lon = np.asarray(LONGITUDES, dtype=float)
+    lead = np.asarray(LEAD_TIMES, dtype=float)
+    member_grid, lead_grid, lat_grid, lon_grid = np.meshgrid(
+        member, lead, lat, lon, indexing="ij"
+    )
+
+    temperature = (
+        10.0
+        + 10.0 * (lat_grid - LAT_START)
+        + 10.0 * (lon_grid - LON_START)
+        + 0.5 * lead_grid
+        + 2.0 * member_grid
+    )
+    precipitation = 0.5 * lead_grid + 1.0 * member_grid
+
+    return xr.Dataset(
+        data_vars={
+            "temperature_2m": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                temperature,
+            ),
+            "precipitation_rate": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                precipitation,
+            ),
+        },
+        coords={
+            "member": MEMBER_INDICES,
+            "lead_time_hours": LEAD_TIMES,
+            "latitude": LATITUDES,
+            "longitude": LONGITUDES,
+        },
+    )
+
+
+def write_ensemble_zarr(store: str) -> str:
+    """Write the deterministic ensemble fixture dataset to a local Zarr store.
+
+    Args:
+        store: Local directory path for the Zarr store.
+
+    Returns:
+        The store path (for reporting).
+    """
+    return write_dataset(build_ensemble_dataset(), store)
+
+
+def ensemble_temperature_at(
+    member: int, latitude: float, longitude: float, lead: int
+) -> float:
+    """Expected metric ensemble temperature at a member, point, and lead time."""
+    return (
+        10.0
+        + 10.0 * (latitude - LAT_START)
+        + 10.0 * (longitude - LON_START)
+        + 0.5 * lead
+        + 2.0 * member
+    )
+
+
+def ensemble_precipitation_at(member: int, lead: int) -> float:
+    """Expected metric ensemble precipitation at a member and lead time."""
+    return 0.5 * lead + 1.0 * member

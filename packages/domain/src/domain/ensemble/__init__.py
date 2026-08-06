@@ -1,6 +1,7 @@
-"""Ensemble statistics and exceedance probability calculation modules.
+"""Ensemble statistics, exceedance probability, and confidence interval modules.
 
-Public API (all functions return primitive ``float`` values):
+Public API (all functions return primitive ``float`` values except
+``probability_confidence_interval`` which returns a ``(lower, upper)`` tuple):
 
 - ``ensemble_mean``
 - ``ensemble_median``
@@ -9,10 +10,12 @@ Public API (all functions return primitive ``float`` values):
 - ``probability_above_threshold``
 - ``probability_below_threshold``
 - ``probability_between_thresholds``
+- ``probability_confidence_interval``
 
 Shared input validation and internal helpers are private and not exported.
 """
 
+from domain.ensemble.interval import probability_confidence_interval
 from domain.ensemble.probability import (
     probability_above_threshold,
     probability_below_threshold,
@@ -33,4 +36,5 @@ __all__ = [
     "probability_above_threshold",
     "probability_below_threshold",
     "probability_between_thresholds",
+    "probability_confidence_interval",
 ]

@@ -1,12 +1,14 @@
-"""Redis-primary point-query cache with a PostgreSQL fallback audit ledger.
+"""Redis-primary response cache with a PostgreSQL fallback audit ledger.
 
-Point forecast responses are cached in Redis with a TTL aligned to the
-model update cadence (``public, max-age=1800`` per API.md section 2.1).
-Redis is a best-effort accelerator: when it is unavailable the response is
-computed directly and a ``point_query_fallback_audit`` row records the
-fallback (the table's purpose per DATABASE.md section 2). The cache key is a
-deterministic canonical string derived from the normalized request, so
-identical requests always map to the same key.
+Forecast responses are cached in Redis with a TTL aligned to the model
+update cadence and the cache policy of the caching endpoint (``public,
+max-age=1800`` for point forecasts and ensemble statistics, ``public,
+max-age=3600`` for probabilities, per API.md). Redis is a best-effort
+accelerator: when it is unavailable the response is computed directly and a
+``point_query_fallback_audit`` row records the fallback (the table's purpose
+per DATABASE.md section 2). The cache key is a deterministic canonical string
+derived from the normalized request, so identical requests always map to the
+same key.
 """
 
 import hashlib
@@ -14,14 +16,18 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Generic, TypeVar
 
 import redis as redis_lib
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
 from api.core.config import settings
 from api.models.entities import PointQueryFallbackAudit
 from api.schemas import PointForecastEnvelope
+
+#: Envelope model type stored in the cache.
+TEnvelope = TypeVar("TEnvelope", bound=BaseModel)
 
 #: Cache TTL in seconds, aligned to the ``public, max-age=1800`` cache policy.
 POINT_CACHE_TTL_SECONDS = 1800
@@ -42,8 +48,8 @@ FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE = (
 
 
 @dataclass(frozen=True)
-class _CacheRead:
-    """Result of reading the point cache for a key.
+class _CacheRead(Generic[TEnvelope]):
+    """Result of reading the cache for a key.
 
     Attributes:
         hit: Whether a valid cached response was found.
@@ -53,7 +59,7 @@ class _CacheRead:
     """
 
     hit: bool
-    envelope: PointForecastEnvelope | None
+    envelope: TEnvelope | None
     fallback_reason: str | None = None
 
 
@@ -76,7 +82,15 @@ class PointCache:
             self._redis_url, decode_responses=True
         )
 
-    def get(self, cache_key: str) -> _CacheRead:
+    def get(
+        self,
+        cache_key: str,
+        *,
+        # mypy cannot unify the TEnvelope typevar default with a concrete
+        # envelope type (documented limitation); callers pass the concrete
+        # model_type explicitly, so the default is unused in practice.
+        model_type: type[TEnvelope] = PointForecastEnvelope,  # type: ignore[assignment]
+    ) -> _CacheRead[TEnvelope]:
         """Read the cache for a key, reporting how the read resolved.
 
         Redis errors and unparseable cached payloads (malformed JSON or a
@@ -88,6 +102,8 @@ class PointCache:
 
         Args:
             cache_key: The deterministic cache key.
+            model_type: The envelope model the cached payload is validated
+                against. Defaults to :class:`PointForecastEnvelope`.
 
         Returns:
             A ``_CacheRead`` describing whether the read was a hit, a clean
@@ -96,15 +112,15 @@ class PointCache:
         try:
             raw = self._client.get(cache_key)
         except redis_lib.RedisError:
-            return _CacheRead(
+            return _CacheRead[TEnvelope](
                 hit=False,
                 envelope=None,
                 fallback_reason=FALLBACK_REASON_REDIS_READ_UNAVAILABLE,
             )
         if raw is None:
-            return _CacheRead(hit=False, envelope=None)
+            return _CacheRead[TEnvelope](hit=False, envelope=None)
         try:
-            envelope = PointForecastEnvelope.model_validate_json(raw)
+            envelope = model_type.model_validate_json(raw)
         except (ValueError, TypeError, json.JSONDecodeError, ValidationError):
             # Malformed JSON, a schema-incompatible payload, or a Pydantic
             # validation failure is a cache miss: delete the corrupt entry
@@ -113,27 +129,28 @@ class PointCache:
             # explicitly (its ValueError inheritance is not guaranteed across
             # Pydantic versions).
             self._delete(cache_key)
-            return _CacheRead(
+            return _CacheRead[TEnvelope](
                 hit=False,
                 envelope=None,
                 fallback_reason=FALLBACK_REASON_CORRUPT_CACHE_ENTRY,
             )
-        return _CacheRead(hit=True, envelope=envelope)
+        return _CacheRead[TEnvelope](hit=True, envelope=envelope)
 
     def compute_or_retrieve(
         self,
         db: Session,
         cache_key: str,
         query_params: str,
-        compute: Callable[[], PointForecastEnvelope],
-    ) -> PointForecastEnvelope:
+        compute: Callable[[], TEnvelope],
+        *,
+        model_type: type[TEnvelope] = PointForecastEnvelope,  # type: ignore[assignment]
+    ) -> TEnvelope:
         """Return a cached response or compute, store, and return it.
 
         When Redis is unavailable on either the read or write path, or the
         cached payload is corrupt, the response is computed directly and a
         best-effort ``point_query_fallback_audit`` row records the fallback
-        with a reason. No point forecast is ever lost because of a Redis
-        outage.
+        with a reason. No forecast is ever lost because of a Redis outage.
 
         Args:
             db: Database session used to record fallback audit rows.
@@ -141,11 +158,13 @@ class PointCache:
             query_params: The normalized query parameter string recorded on
                 fallback.
             compute: Callable producing the response on a cache miss.
+            model_type: The envelope model the cached payload is validated
+                against. Defaults to :class:`PointForecastEnvelope`.
 
         Returns:
-            The point forecast response.
+            The response.
         """
-        read = self.get(cache_key)
+        read = self.get(cache_key, model_type=model_type)
         if read.hit and read.envelope is not None:
             return read.envelope
 
@@ -261,3 +280,58 @@ def build_point_cache_key(
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "point:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_probability_cache_key(
+    *,
+    model: str,
+    latitude: float,
+    longitude: float,
+    variable: str,
+    threshold: float,
+    operator: str,
+    lead_time_hours: int,
+    threshold_max: float | None,
+) -> str:
+    """Build a deterministic cache key for a probability forecast request.
+
+    The key is a SHA-256 digest of a canonical JSON payload, following the
+    same convention as :func:`build_point_cache_key`. ``operator`` and both
+    thresholds are included because they change the computed probability.
+    """
+    payload = {
+        "model": model,
+        "latitude": latitude,
+        "longitude": longitude,
+        "variable": variable,
+        "threshold": threshold,
+        "operator": operator,
+        "lead_time_hours": lead_time_hours,
+        "threshold_max": threshold_max,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "probability:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_ensemble_cache_key(
+    *,
+    model: str,
+    latitude: float,
+    longitude: float,
+    variable: str,
+    lead_time_hours: int,
+) -> str:
+    """Build a deterministic cache key for an ensemble statistics request.
+
+    The key is a SHA-256 digest of a canonical JSON payload, following the
+    same convention as :func:`build_point_cache_key`.
+    """
+    payload = {
+        "model": model,
+        "latitude": latitude,
+        "longitude": longitude,
+        "variable": variable,
+        "lead_time_hours": lead_time_hours,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "ensemble:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

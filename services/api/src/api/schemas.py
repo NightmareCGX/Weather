@@ -188,3 +188,99 @@ class SearchResultOut(BaseModel):
     elevation_m: float | None = None
     latitude: float
     longitude: float
+
+
+class ProbabilityLocation(BaseModel):
+    """The location of a probability forecast (API.md section 3.1)."""
+
+    latitude: float
+    longitude: float
+
+
+class ProbabilityForecastData(BaseModel):
+    """The payload of a probability forecast (API.md section 3.1).
+
+    ``threshold_max`` (the upper bound of the ``between`` operator) is emitted
+    only when present, through ``extra="allow"``, so ``gt``/``lt`` payloads
+    contain exactly the documented fields.
+    """
+
+    location: ProbabilityLocation
+    variable: str
+    threshold: float
+    operator: Literal["gt", "lt", "between"]
+    lead_time_hours: int
+    probability: float
+    confidence_interval_95: list[float]
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ProbabilityForecastEnvelope(BaseModel):
+    """The probability forecast response envelope (API.md sections 3.1 and 2.3)."""
+
+    object: Literal["probability_forecast"] = "probability_forecast"
+    data: ProbabilityForecastData
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+class SpatialLayerLegend(BaseModel):
+    """The legend of a spatial layer (API.md section 4.1)."""
+
+    unit: str
+    stops: list[list[float | str]]
+
+
+class SpatialLayerData(BaseModel):
+    """The payload of a spatial layer (API.md section 4.1).
+
+    ``tile_url_template`` is a self-referential template for a future tile
+    endpoint; map tile generation is out of scope for Milestone 10.
+    """
+
+    tile_url_template: str
+    min_zoom: int
+    max_zoom: int
+    lead_time_hours: int
+    legend: SpatialLayerLegend
+
+
+class SpatialLayerEnvelope(BaseModel):
+    """The spatial layer response envelope (API.md sections 4.1 and 2.3)."""
+
+    object: Literal["spatial_layer"] = "spatial_layer"
+    data: SpatialLayerData
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+class EnsembleStatistics(BaseModel):
+    """Ensemble dispersion statistics (API.md section 5.1)."""
+
+    mean: float
+    median: float
+    spread: float
+    p10: float
+    p25: float
+    p50: float
+    p75: float
+    p90: float
+
+
+class EnsembleStatisticsData(BaseModel):
+    """The payload of ensemble statistics (API.md section 5.1)."""
+
+    model: str
+    lead_time_hours: int
+    member_count: int
+    statistics: EnsembleStatistics
+
+
+class EnsembleStatisticsEnvelope(BaseModel):
+    """The ensemble statistics response envelope (API.md sections 5.1 and 2.3)."""
+
+    object: Literal["ensemble_statistics"] = "ensemble_statistics"
+    data: EnsembleStatisticsData
+    has_more: bool = False
+    next_cursor: str | None = None

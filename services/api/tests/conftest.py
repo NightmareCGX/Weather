@@ -9,17 +9,18 @@ if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
 import pytest
-from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from geoalchemy2 import WKTElement
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from alembic import command
 from api.core.database import get_db
 from api.main import app
 from api.models.entities import (
     City,
+    EnsembleMember,
     ForecastCenter,
     ForecastGrid,
     ForecastVariable,
@@ -29,7 +30,11 @@ from api.models.entities import (
     SkiResort,
     Station,
 )
-from tests.fixtures import write_forecast_zarr
+from tests.fixtures import (
+    MEMBER_INDICES,
+    write_ensemble_zarr,
+    write_forecast_zarr,
+)
 
 
 @pytest.fixture(scope="session")
@@ -88,7 +93,10 @@ def tmp_zarr_stores(tmp_path_factory):
     gfs_store = str(base / "gfs")
     gefs_store = str(base / "gefs")
     write_forecast_zarr(gfs_store)
-    write_forecast_zarr(gefs_store)
+    # The gefs store is an ensemble dataset with a ``member`` dimension so the
+    # /v1/ensembles and /v1/probabilities integration tests slice real
+    # per-member data.
+    write_ensemble_zarr(gefs_store)
     return {"gfs": gfs_store, "gefs": gefs_store}
 
 
@@ -205,6 +213,15 @@ def seed_data(migrated_db, tmp_zarr_stores):
             status="ready",
             zarr_store_path=tmp_zarr_stores["gefs"],
         )
+        ensemble_members = [
+            EnsembleMember(
+                id=f"member_{i}_gefs",
+                run_id="run_2026072100_gefs",
+                member_index=i,
+                member_name=f"gefs_member_{i}",
+            )
+            for i in MEMBER_INDICES
+        ]
         temperature = ForecastVariable(
             id="var_temperature_2m",
             variable_code="temperature_2m",
@@ -239,6 +256,7 @@ def seed_data(migrated_db, tmp_zarr_stores):
                 run_gfs_00,
                 run_gfs_12,
                 run_gefs_00,
+                *ensemble_members,
                 temperature,
                 precipitation,
                 global_grid,
