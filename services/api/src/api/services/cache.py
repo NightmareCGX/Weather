@@ -20,6 +20,7 @@ from typing import Generic, TypeVar, cast
 
 import redis as redis_lib
 from pydantic import BaseModel, ValidationError
+from redis import Redis
 from sqlalchemy.orm import Session
 
 from api.core.config import settings
@@ -85,7 +86,11 @@ class PointCache:
     ) -> None:
         self._redis_url = redis_url or settings.REDIS_URL
         self._ttl_seconds = ttl_seconds
-        self._client = redis_lib.from_url(
+        # ``redis_lib.from_url`` is untyped in the redis stubs (no ``no-untyped-
+        # call``-free alternative exists at this public boundary), so the single
+        # untyped call is allowed and the concrete ``redis.Redis`` type is
+        # asserted on the attribute so the client's methods are type-checked.
+        self._client: Redis = redis_lib.from_url(  # type: ignore[no-untyped-call]
             self._redis_url,
             decode_responses=True,
             socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
@@ -120,7 +125,11 @@ class PointCache:
             miss, or a fallback (Redis unavailable / corrupt entry).
         """
         try:
-            raw = self._client.get(cache_key)
+            # The redis stub types ``.get`` as ``Awaitable[Any] | Any`` even
+            # for a synchronous client; with ``decode_responses=True`` the
+            # value is a ``str | None`` at runtime. ``cast`` narrows the union
+            # so the payload is validated as JSON text.
+            raw = cast(str | None, self._client.get(cache_key))
         except redis_lib.RedisError:
             return _CacheRead[TEnvelope](
                 hit=False,

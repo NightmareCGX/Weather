@@ -65,7 +65,7 @@ def _cursor_value(item: Any, cursor_column: Any) -> str:
 
 def paginate(
     db: Session,
-    stmt: Select,
+    stmt: Select[Any],
     cursor_column: Any,
     pagination: PaginationParams,
 ) -> Page:

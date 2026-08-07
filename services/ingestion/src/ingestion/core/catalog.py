@@ -29,12 +29,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import cast
 
 import numpy as np
 import xarray as xr
 from sqlalchemy import (
     Boolean,
     Column,
+    ColumnElement,
     DateTime,
     Float,
     ForeignKey,
@@ -231,9 +233,9 @@ class RunCatalogSpec:
 def _get_or_create(
     db: Session,
     model: type[CatalogBase],
-    where,
+    where: ColumnElement[bool],
     create_kwargs: dict[str, object],
-):
+) -> CatalogBase:
     """Return the row matching ``where`` or create it with ``create_kwargs``.
 
     The row is flushed so its primary key and foreign-key targets are
@@ -340,24 +342,36 @@ def record_run(
             "version_string": spec.version_string,
         },
     )
-    run = _get_or_create(
-        db,
+    # ``_get_or_create`` is typed over ``CatalogBase``; the caller knows the
+    # concrete ``ModelRunRecord`` type (the ``model`` argument), so ``cast``
+    # restores it so ``run.status``/``run.zarr_store_path`` assignments and the
+    # ``ModelRunRecord`` return are type-checked. Making ``_get_or_create``
+    # generic would require typing the ORM constructor ``model(**kwargs)``
+    # return, which is ``Any`` by design.
+    run = cast(
         ModelRunRecord,
-        (ModelRunRecord.model_version_id == version.id)
-        & (ModelRunRecord.cycle_time == cycle_time),
-        {
-            "id": f"run_{cycle_time.strftime('%Y%m%d%H%M')}_{spec.model_id}",
-            "model_version_id": version.id,
-            "cycle_time": cycle_time,
-            "status": "ready",
-            "zarr_store_path": spec.zarr_store_path,
-        },
+        _get_or_create(
+            db,
+            ModelRunRecord,
+            (ModelRunRecord.model_version_id == version.id)
+            & (ModelRunRecord.cycle_time == cycle_time),
+            {
+                "id": f"run_{cycle_time.strftime('%Y%m%d%H%M')}_{spec.model_id}",
+                "model_version_id": version.id,
+                "cycle_time": cycle_time,
+                "status": "ready",
+                "zarr_store_path": spec.zarr_store_path,
+            },
+        ),
     )
     # An existing row is refreshed to ready and the current store path so a
     # re-ingested run (upsert) is immediately discoverable and serveable.
-    run.status = "ready"
+    # ``setattr`` is used (as in ``record_ingested_dataset``) because the ORM
+    # ``Column``-typed class attributes are not instrumented for mypy's
+    # assignment checking under strict mode.
+    setattr(run, "status", "ready")
     if spec.zarr_store_path is not None:
-        run.zarr_store_path = spec.zarr_store_path
+        setattr(run, "zarr_store_path", spec.zarr_store_path)
 
     grid = _get_or_create(
         db,

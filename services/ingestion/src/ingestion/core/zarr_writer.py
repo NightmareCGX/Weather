@@ -88,7 +88,11 @@ def _resolve_s3_store(
         secret=conn_settings.MINIO_SECRET_KEY,
         client_kwargs={"endpoint_url": _endpoint_url(conn_settings)},
     )
-    return fs.get_mapper(rest)  # type: ignore[return-value]
+    # ``get_mapper`` is untyped in the s3fs stub (import-untyped), so mypy
+    # sees ``Any``. Narrowing through a ``MutableMapping[str, bytes]``-typed
+    # intermediate enforces the declared return type instead of suppressing it.
+    mapper: MutableMapping[str, bytes] = fs.get_mapper(rest)
+    return mapper
 
 
 def _endpoint_url(conn_settings: IngestionSettings) -> str:
@@ -159,7 +163,11 @@ def read_dataset(store: str | PathLike[str] | Mapping[str, bytes]) -> xr.Dataset
         The dataset read back from the Zarr store.
     """
     resolved = _resolve_store(store)
-    return xr.open_zarr(resolved)
+    # ``xr.open_zarr`` is overloaded and infers ``Any`` for the ``Any``-typed
+    # store; the value is always a concrete ``Dataset`` at runtime, so narrow
+    # through a typed intermediate to satisfy the declared return type.
+    dataset: xr.Dataset = xr.open_zarr(resolved)
+    return dataset
 
 
 def store_exists(store: str | PathLike[str] | Mapping[str, bytes]) -> bool:

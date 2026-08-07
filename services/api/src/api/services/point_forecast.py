@@ -533,7 +533,12 @@ def _field_values(
         field = field.isel(latitude=slice(None, None, -1))
     if lon_descending:
         field = field.isel(longitude=slice(None, None, -1))
-    return np.asarray(field.values, dtype=float).tolist()
+    # ``numpy.asarray(...).tolist()`` is typed ``Any`` (numpy's ``Any``
+    # overloads), which would trip ``no-any-return`` under strict mode. The
+    # runtime value is always a nested ``list[float]``, so narrow it through a
+    # typed intermediate.
+    values: list[list[float]] = np.asarray(field.values, dtype=float).tolist()
+    return values
 
 
 def _convert_value(value: float, si_unit: str | None, units: str) -> float:

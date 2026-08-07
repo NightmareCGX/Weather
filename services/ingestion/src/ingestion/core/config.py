@@ -5,7 +5,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class IngestionSettings(BaseSettings):  # type: ignore[misc] # pydantic BaseSettings is untyped
+class IngestionSettings(BaseSettings):
     """Environment-driven settings for the ingestion service.
 
     Mirrors the configuration pattern of ``services/api``.

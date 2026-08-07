@@ -3,7 +3,8 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(BaseSettings):  # type: ignore[misc] # pydantic BaseSettings is untyped
+class Settings(BaseSettings):
+    """Environment-driven settings for the API service (Pydantic BaseSettings)."""
     """Environment-driven settings for the API service (Pydantic BaseSettings)."""
 
     # mypy sees ``Any`` for the attribute types below because pydantic
