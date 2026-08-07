@@ -23,9 +23,15 @@ class ForecastCenter(Base):
     center_id = Column(String, unique=True, nullable=False, index=True)
     name = Column(String, nullable=False)
     country = Column(String, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
-    models = relationship("Model", back_populates="center", cascade="all, delete-orphan")
+    models = relationship(
+        "Model", back_populates="center", cascade="all, delete-orphan"
+    )
 
 
 class Model(Base):
@@ -37,10 +43,16 @@ class Model(Base):
     center_id = Column(String, ForeignKey("forecast_centers.center_id"), nullable=False)
     is_ensemble = Column(Boolean, default=False, nullable=False)
     resolution_km = Column(Float, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
     center = relationship("ForecastCenter", back_populates="models")
-    versions = relationship("ModelVersion", back_populates="model", cascade="all, delete-orphan")
+    versions = relationship(
+        "ModelVersion", back_populates="model", cascade="all, delete-orphan"
+    )
 
 
 class ModelVersion(Base):
@@ -49,14 +61,20 @@ class ModelVersion(Base):
     id = Column(String, primary_key=True)
     model_id = Column(String, ForeignKey("models.model_id"), nullable=False)
     version_string = Column(String, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
     __table_args__ = (
         UniqueConstraint("model_id", "version_string", name="uq_model_version"),
     )
 
     model = relationship("Model", back_populates="versions")
-    runs = relationship("ModelRun", back_populates="model_version", cascade="all, delete-orphan")
+    runs = relationship(
+        "ModelRun", back_populates="model_version", cascade="all, delete-orphan"
+    )
 
 
 class ModelRun(Base):
@@ -67,7 +85,11 @@ class ModelRun(Base):
     cycle_time = Column(DateTime(timezone=True), nullable=False)
     status = Column(String, nullable=False, default="processing")
     zarr_store_path = Column(String, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
     __table_args__ = (
         UniqueConstraint("model_version_id", "cycle_time", name="uq_model_run_cycle"),
@@ -75,8 +97,12 @@ class ModelRun(Base):
     )
 
     model_version = relationship("ModelVersion", back_populates="runs")
-    ensemble_members = relationship("EnsembleMember", back_populates="run", cascade="all, delete-orphan")
-    forecast_products = relationship("ForecastProduct", back_populates="run", cascade="all, delete-orphan")
+    ensemble_members = relationship(
+        "EnsembleMember", back_populates="run", cascade="all, delete-orphan"
+    )
+    forecast_products = relationship(
+        "ForecastProduct", back_populates="run", cascade="all, delete-orphan"
+    )
 
 
 class EnsembleMember(Base):
@@ -117,7 +143,9 @@ class ForecastProduct(Base):
 
     id = Column(String, primary_key=True)
     run_id = Column(String, ForeignKey("model_runs.id"), nullable=False)
-    variable_id = Column(String, ForeignKey("forecast_variables.variable_code"), nullable=False)
+    variable_id = Column(
+        String, ForeignKey("forecast_variables.variable_code"), nullable=False
+    )
     grid_id = Column(String, ForeignKey("forecast_grids.grid_code"), nullable=False)
     product_type = Column(String, nullable=False)
     lead_time_hours = Column(Integer, nullable=False)
@@ -147,13 +175,17 @@ class Station(Base):
     station_code = Column(String, unique=True, nullable=False, index=True)
     name = Column(String, nullable=False)
     elevation_m = Column(Float, nullable=False)
-    geom = Column(Geometry(geometry_type="POINT", srid=4326, spatial_index=False), nullable=False)
-
-    __table_args__ = (
-        Index("idx_stations_geom", "geom", postgresql_using="gist"),
+    geom = Column(
+        Geometry(geometry_type="POINT", srid=4326, spatial_index=False), nullable=False
     )
 
-    observations = relationship("VerificationObservation", back_populates="station", cascade="all, delete-orphan")
+    __table_args__ = (Index("idx_stations_geom", "geom", postgresql_using="gist"),)
+
+    observations = relationship(
+        "VerificationObservation",
+        back_populates="station",
+        cascade="all, delete-orphan",
+    )
 
 
 class City(Base):
@@ -164,11 +196,11 @@ class City(Base):
     region = Column(String, nullable=False)
     country = Column(String, nullable=False)
     population = Column(Integer, nullable=True)
-    geom = Column(Geometry(geometry_type="POINT", srid=4326, spatial_index=False), nullable=False)
-
-    __table_args__ = (
-        Index("idx_cities_geom", "geom", postgresql_using="gist"),
+    geom = Column(
+        Geometry(geometry_type="POINT", srid=4326, spatial_index=False), nullable=False
     )
+
+    __table_args__ = (Index("idx_cities_geom", "geom", postgresql_using="gist"),)
 
 
 class SkiResort(Base):
@@ -180,11 +212,11 @@ class SkiResort(Base):
     country = Column(String, nullable=False)
     summit_elevation_m = Column(Float, nullable=False)
     # Note: SkiResort geom is represented as a Point geometry for MVP point queries and spatial lookups.
-    geom = Column(Geometry(geometry_type="POINT", srid=4326, spatial_index=False), nullable=False)
-
-    __table_args__ = (
-        Index("idx_ski_resorts_geom", "geom", postgresql_using="gist"),
+    geom = Column(
+        Geometry(geometry_type="POINT", srid=4326, spatial_index=False), nullable=False
     )
+
+    __table_args__ = (Index("idx_ski_resorts_geom", "geom", postgresql_using="gist"),)
 
 
 class VerificationObservation(Base):
@@ -197,7 +229,9 @@ class VerificationObservation(Base):
     observed_value = Column(Float, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("station_id", "valid_time", "variable_code", name="uq_station_observation"),
+        UniqueConstraint(
+            "station_id", "valid_time", "variable_code", name="uq_station_observation"
+        ),
         Index("idx_verification_station_time", "station_id", valid_time.desc()),
     )
 
@@ -209,10 +243,12 @@ class PointQueryFallbackAudit(Base):
 
     cache_key = Column(String, primary_key=True)
     query_params = Column(String, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    expires_at = Column(DateTime(timezone=True), nullable=False)
     fallback_reason = Column(String, nullable=False)
 
-    __table_args__ = (
-        Index("idx_point_query_fallback_expires", "expires_at"),
-    )
+    __table_args__ = (Index("idx_point_query_fallback_expires", "expires_at"),)

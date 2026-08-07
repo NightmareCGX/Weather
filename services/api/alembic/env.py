@@ -27,6 +27,27 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def include_object(
+    object: object,  # noqa: A002 - alembic's callback signature
+    name: str,
+    type_: str,
+    reflected: bool,
+    compare_to: object | None,
+) -> bool:
+    """Exclude PostGIS-owned objects from autogenerate comparisons.
+
+    ``CREATE EXTENSION postgis`` installs its own tables (e.g.
+    ``spatial_ref_sys``) in the ``public`` schema. They are not part of the
+    application metadata, so Alembic autogenerate/``check`` would otherwise
+    always report them as orphaned/removed tables and fail CI. The extension
+    is created by the migration itself (``001_initial_schema``), so these
+    tables are expected and must be ignored when comparing metadata.
+    """
+    if type_ == "table" and name == "spatial_ref_sys":
+        return False
+    return True
+
+
 def get_url():
     return os.getenv(
         "DATABASE_URL",
@@ -40,6 +61,7 @@ def run_migrations_offline() -> None:
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
+        include_object=include_object,
         dialect_opts={"server_version_info": (16, 0)},
     )
 
@@ -61,6 +83,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
+            include_object=include_object,
         )
 
         with context.begin_transaction():
