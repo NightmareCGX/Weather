@@ -9,6 +9,7 @@ in-memory SQLite database so no live PostgreSQL is required.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from ingestion.core.base import LeadTimeMismatchError
 from ingestion.core.catalog import (
     CatalogBase,
     CenterRecord,
@@ -185,6 +187,58 @@ def test_ingest_grib_file_corrupt_raises(session: Session, tmp_path) -> None:
             str(tmp_path / "x.zarr"),
         )
     assert session.query(ModelRunRecord).count() == 0
+
+
+def test_ingest_grib_file_requested_lead_matches_succeeds(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A requested lead matching the fixture's decoded lead ingests normally."""
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        return record_run(session, spec, dataset)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    # The fixture decodes to lead 6 (its GRIB step is +6h).
+    run = ingest_grib_file(
+        _spec(store_path),
+        FIXTURE,
+        store_path,
+        requested_lead_time_hours=6,
+    )
+    assert run.status == "ready"
+    assert session.query(ModelRunRecord).count() == 1
+
+
+def test_ingest_grib_file_requested_lead_mismatch_aborts(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A requested lead differing from the fixture's lead aborts, writes nothing."""
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        return record_run(session, spec, dataset)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    with pytest.raises(LeadTimeMismatchError) as excinfo:
+        ingest_grib_file(
+            _spec(store_path),
+            FIXTURE,
+            store_path,
+            requested_lead_time_hours=12,  # fixture is lead 6
+        )
+    message = str(excinfo.value)
+    assert "6" in message and "12" in message
+
+    # The mismatch aborts before any Zarr write or catalog row.
+    assert session.query(ModelRunRecord).count() == 0
+    assert not os.path.isdir(store_path)
 
 
 def test_ingest_grib_file_merges_leads_into_cycle_store(

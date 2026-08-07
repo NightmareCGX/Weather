@@ -21,6 +21,17 @@ class DownloadFailedError(IngestionError):
     """Raised when the upstream provider fails to serve a requested file."""
 
 
+class LeadTimeMismatchError(IngestionError):
+    """Raised when a downloaded GRIB2 file's lead time disagrees with the run.
+
+    The requested ``--lead-time-hours`` is used to build the download URL, but
+    the file's actual lead is authoritative (derived from the GRIB ``step``
+    coordinate by the parser). A mismatch indicates the file is not the
+    forecast the caller asked for (e.g. a stale or mislabeled upstream file),
+    so ingestion must abort rather than silently re-ingest or mislabel a lead.
+    """
+
+
 class BaseConnector(ABC):
     """Base interface implemented by all upstream model connectors.
 

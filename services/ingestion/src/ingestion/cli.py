@@ -16,6 +16,12 @@ NOMADS serves one GRIB2 file per lead, so invoke this CLI once per lead of the
 cycle, passing the **same** ``--store`` each time; each lead is merged into
 that store.
 
+The requested ``--lead-time-hours`` is used to build the download URL. After
+the file is parsed, ingestion fails fast if the file's decoded lead differs
+from the requested lead (the file is the source of truth and is never
+relabeled), so a stale or mislabeled upstream file aborts instead of silently
+ingesting an unexpected lead.
+
 Usage:
 
     python -m ingestion.cli ingest --model gfs --cycle-date 2026-07-21 \\
@@ -194,7 +200,12 @@ def _run_ingest(args: argparse.Namespace) -> int:
                 args.lead_time_hours,
                 destination,
             )
-        record = ingest_grib_file(spec, destination, args.store)
+        record = ingest_grib_file(
+            spec,
+            destination,
+            args.store,
+            requested_lead_time_hours=args.lead_time_hours,
+        )
         print(
             f"Ingested run {record.id} ({record.status}) -> {args.store}"
         )

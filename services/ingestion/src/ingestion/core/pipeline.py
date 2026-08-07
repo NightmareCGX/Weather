@@ -25,8 +25,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import xarray as xr
 
+from ingestion.core.base import LeadTimeMismatchError
 from ingestion.core.catalog import (
     ModelRunRecord,
     RunCatalogSpec,
@@ -71,6 +73,8 @@ def ingest_grib_file(
     spec: RunCatalogSpec,
     grib_path: str | Path,
     store_path: str,
+    *,
+    requested_lead_time_hours: int | None = None,
 ) -> ModelRunRecord:
     """Parse a GRIB2 file, write it to a Zarr store, and record it in the catalog.
 
@@ -84,10 +88,15 @@ def ingest_grib_file(
         1. ``parse_grib2`` decodes and normalizes the GRIB2 file.
         2. Data variables are renamed to the platform vocabulary (per
            ``spec.variables``).
-        3. The single-lead dataset is merged into the cycle store along
+        3. When ``requested_lead_time_hours`` is given and differs from the
+           file's parsed lead, the ingest is aborted with a
+           :class:`LeadTimeMismatchError` instead of silently merging or
+           overwriting a lead the caller did not ask for (the file's decoded
+           lead is authoritative and is never overridden by the request).
+        4. The single-lead dataset is merged into the cycle store along
            ``lead_time_hours`` (re-ingesting a lead replaces it).
-        4. ``write_dataset`` persists the merged dataset to the store.
-        5. ``record_ingested_dataset`` upserts the run (and its catalog rows)
+        5. ``write_dataset`` persists the merged dataset to the store.
+        6. ``record_ingested_dataset`` upserts the run (and its catalog rows)
            with ``status='ready'`` so the API serving tier can serve it.
 
     Args:
@@ -96,20 +105,60 @@ def ingest_grib_file(
         grib_path: Path to the downloaded GRIB2 file.
         store_path: Zarr store path/URL of the run's cycle. All leads of a
             cycle share this store.
+        requested_lead_time_hours: The lead the caller requested (e.g. the
+            CLI's ``--lead-time-hours``). When provided, ingestion fails
+            fast if it does not match the file's parsed lead.
 
     Returns:
         The recorded :class:`ModelRunRecord` in the ``ready`` state.
 
     Raises:
         GribParsingError: If the GRIB2 file cannot be decoded.
+        LeadTimeMismatchError: If ``requested_lead_time_hours`` is provided
+            and does not match the file's parsed lead.
         ValueError: If the Zarr store target is unsupported.
         sqlalchemy error: If the catalog write fails (no row is committed).
     """
     dataset = parse_grib2(grib_path)
     dataset = _apply_variable_mapping(dataset, spec.variables)
+    _validate_requested_lead(dataset, requested_lead_time_hours)
     dataset = _merge_lead(dataset, store_path)
     write_dataset(dataset, store_path)
     return record_ingested_dataset(spec, dataset, effective_store_path=store_path)
+
+
+def _validate_requested_lead(
+    dataset: xr.Dataset,
+    requested_lead_time_hours: int | None,
+) -> None:
+    """Fail fast when a requested lead disagrees with the parsed dataset.
+
+    The GRIB file's decoded lead is the source of truth (``parser.py`` derives
+    ``lead_time_hours`` from the ``step`` coordinate), so a mismatch with the
+    requested lead aborts ingestion rather than silently re-ingesting an
+    unexpected file or overwriting a lead the caller did not ask for.
+
+    Args:
+        dataset: The normalized parsed dataset.
+        requested_lead_time_hours: The lead the caller requested, or ``None``
+            when no request bound is asserted (library callers without a lead
+            concept).
+
+    Raises:
+        LeadTimeMismatchError: When the requested lead is provided and does
+            not match the dataset's parsed lead.
+    """
+    if requested_lead_time_hours is None:
+        return
+    lead_values = dataset["lead_time_hours"].values
+    parsed = int(lead_values[0] if np.ndim(lead_values) != 0 else lead_values)
+    if parsed != requested_lead_time_hours:
+        raise LeadTimeMismatchError(
+            f"Downloaded GRIB2 file decodes to lead time {parsed}h, but the "
+            f"requested lead time is {requested_lead_time_hours}h. The file "
+            "does not match the requested forecast; aborting instead of "
+            "ingesting an unexpected lead."
+        )
 
 
 def _merge_lead(dataset: xr.Dataset, store_path: str) -> xr.Dataset:
