@@ -14,16 +14,38 @@ zarr = "^2.18"
 s3fs = "^2026.7"
 boto3 = "^1.34.69"
 httpx = "^0.27.0"
+sqlalchemy = "^2.0.28"
+psycopg2-binary = "^2.9.9"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
 pytest-asyncio = "^0.23.5"
 respx = "^0.21.1"
 
+[tool.poetry.scripts]
+weather-ingest = "ingestion.cli:main"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["src"]
+pythonpath = ["src", "../api/src"]
 testpaths = ["tests"]
+
+# test_catalog_postgres.py prepends api/ingestion src to sys.path before
+# importing api modules (required for the ingestion->catalog integration test),
+# so E402 is ignored for tests only.
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/ingestion"]
+# The SQLAlchemy declarative base (``declarative_base()``) is a runtime-factory
+# function whose return type is ``Any``; every ORM class subclasses it. mypy
+# reports each subclass as an error ("Class cannot subclass Base (has type
+# Any)") under strict mode, so the single untyped base is allowed and the typed
+# ORM attribute usage below remains fully checked.
+disable_error_code = ["misc"]
 
 [build-system]
 requires = ["poetry-core"]

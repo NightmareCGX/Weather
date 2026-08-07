@@ -29,6 +29,17 @@ httpx = "^0.27.0"
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["E402"]
 
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/api"]
+# The SQLAlchemy declarative base (``declarative_base()``) is a runtime-factory
+# function whose return type is ``Any``; every ORM class subclasses it. mypy
+# reports each subclass as an error ("Class cannot subclass Base (has type
+# Any)") under strict mode, so the single untyped base is allowed and the typed
+# ORM attribute usage below remains fully checked.
+disable_error_code = ["misc"]
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

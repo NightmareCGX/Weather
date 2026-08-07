@@ -55,7 +55,7 @@ must always produce identical outputs.
 - **Formatting & Linting**: Code must conform to `ruff` formatting and linting rules.
 - **Docstrings**: Public functions and classes require clear Google-style docstrings.
 - **Error Handling**: Use explicit domain exceptions mapped to RFC 7807 problem details in the API layer. Never swallow exceptions silently.
-- **Configuration**: Use Pydantic BaseSettings in `packages/config` for centralized environment management.
+- **Configuration**: Use Pydantic `BaseSettings` for environment management. Settings live **per-service** under each service's own `core/config.py` (e.g. `services/api/src/api/core/config.py`, `services/ingestion/src/ingestion/core/config.py`) so each independently deployable service owns its configuration surface; `packages/config` is a thin shared package for versioning and cross-package constants, not the home of service settings.
 
 ---
 
