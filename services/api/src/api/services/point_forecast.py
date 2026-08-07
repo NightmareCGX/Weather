@@ -14,6 +14,7 @@ undocumented platform conventions. Non-uniform or non-surface data is out
 of scope for Milestone 9 and raises a clear error.
 """
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -30,10 +31,10 @@ from domain.geo.coordinates import validate_coordinates
 from domain.geo.grid import RegularGrid
 from domain.geo.interpolation import bilinear_interpolate
 from fastapi import HTTPException
-from ingestion.core.zarr_writer import read_dataset
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from api.core.zarr import read_dataset
 from api.models.entities import (
     City,
     ForecastVariable,
@@ -43,6 +44,8 @@ from api.models.entities import (
     SkiResort,
 )
 from api.schemas import ForecastLocationOut, ForecastSeries, PointForecastData
+
+logger = logging.getLogger(__name__)
 
 #: ``resolved_via`` value for a location resolved from raw coordinates.
 RESOLVED_VIA_COORDINATES = "coordinates"
@@ -214,10 +217,12 @@ def build_point_forecast(
 ) -> PointForecastData:
     """Build a point forecast payload for a resolved location and model.
 
-    The newest ``status='ready'`` run with a non-null ``zarr_store_path`` is
-    selected for the model (via ``model_versions``). The run's Zarr dataset
-    is sliced at each requested ``lead_time_hours`` and the variable field is
-    bilinearly interpolated to the location. ``valid_time`` is derived as
+    The newest ``status='ready'`` run with a non-null ``zarr_store_path``
+    whose Zarr dataset opens is selected for the model (via
+    ``model_versions``); a run whose store cannot be read is skipped in favor
+    of the next-newest readable run. The run's Zarr dataset is sliced at each
+    requested ``lead_time_hours`` and the variable field is bilinearly
+    interpolated to the location. ``valid_time`` is derived as
     ``cycle_time + lead_time_hours`` (DATABASE.md section 1) and
     ``generated_at`` is the run's ``cycle_time`` (the forecast dataset
     generation time), keeping payloads deterministic.
@@ -240,11 +245,11 @@ def build_point_forecast(
         HTTPException: 404 when no ready run, no data for the location, or an
             unknown variable is encountered; 422/500 for invalid data.
     """
-    run = _resolve_run(db, model)
-    assert run.zarr_store_path is not None
-    dataset = read_dataset(run.zarr_store_path)
+    run, dataset = _resolve_ready_dataset(db, model)
 
-    lead_times = _resolve_lead_times(dataset, start_lead_time_hours, end_lead_time_hours)
+    lead_times = _resolve_lead_times(
+        dataset, start_lead_time_hours, end_lead_time_hours
+    )
     var_codes = _resolve_variables(db, dataset, variables)
     units_by_code = _variable_units(db, var_codes)
 
@@ -275,7 +280,29 @@ def build_point_forecast(
     )
 
 
-def _resolve_run(db: Session, model_id: str) -> ModelRun:
+def _resolve_ready_dataset(
+    db: Session, model_id: str
+) -> tuple[ModelRun, xr.Dataset]:
+    """Return the newest ready run for a model whose Zarr store opens.
+
+    Ready runs are ordered newest-first; each candidate's store is opened in
+    turn and the first one that reads successfully is returned with its
+    dataset. A corrupted, truncated, or momentarily-unreachable store on the
+    newest run therefore falls through to the next-newest readable run instead
+    of failing the request. The store is re-probed per request, so a broken
+    run is skipped only for requests while it remains unreadable.
+
+    Args:
+        db: Database session.
+        model_id: A single model identifier.
+
+    Returns:
+        A ``(run, dataset)`` pair for the first readable ready run.
+
+    Raises:
+        HTTPException: 404 when no ready run exists or none of the ready runs
+            has a readable store.
+    """
     stmt = (
         select(ModelRun)
         .join(ModelRun.model_version)
@@ -284,18 +311,34 @@ def _resolve_run(db: Session, model_id: str) -> ModelRun:
         .where(ModelRun.status == "ready")
         .where(ModelRun.zarr_store_path.isnot(None))
         .order_by(ModelRun.cycle_time.desc())
-        .limit(1)
     )
-    run = db.execute(stmt).scalars().first()
-    if run is None:
+    runs = list(db.execute(stmt).scalars().all())
+    if not runs:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"No ready forecast run with data was found for model "
-                f"'{model_id}'."
+                f"No ready forecast run with data was found for model '{model_id}'."
             ),
         )
-    return run
+    for run in runs:
+        assert run.zarr_store_path is not None
+        try:
+            dataset = read_dataset(run.zarr_store_path)
+        except Exception as exc:  # noqa: BLE001 - probe store, fall through
+            logger.warning(
+                "Skipping unreadable Zarr store for run %s (%s): %s",
+                run.id,
+                run.zarr_store_path,
+                exc,
+            )
+            continue
+        return run, dataset
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No readable forecast run with data was found for model '{model_id}'."
+        ),
+    )
 
 
 def _resolve_lead_times(
@@ -367,9 +410,7 @@ def _missing_catalog_variables(db: Session, variables: list[str]) -> list[str]:
     return [code for code in variables if code not in known]
 
 
-def _variable_units(
-    db: Session, var_codes: list[str]
-) -> dict[str, str | None]:
+def _variable_units(db: Session, var_codes: list[str]) -> dict[str, str | None]:
     if not var_codes:
         return {}
     stmt = select(ForecastVariable.variable_code, ForecastVariable.unit).where(
@@ -411,9 +452,7 @@ def _interpolate_variable(
     except PointOutsideGridError as exc:
         raise HTTPException(
             status_code=404,
-            detail=(
-                f"No forecast data covers the requested location: {exc}"
-            ),
+            detail=(f"No forecast data covers the requested location: {exc}"),
         ) from exc
     except InvalidGridError as exc:
         raise HTTPException(
@@ -443,6 +482,17 @@ def _derive_grid(
     lat_step = (latitudes[-1] - latitudes[0]) / (len(latitudes) - 1)
     lon_step = (longitudes[-1] - longitudes[0]) / (len(longitudes) - 1)
     if lat_step <= 0.0 or lon_step <= 0.0:
+        raise HTTPException(
+            status_code=500,
+            detail="The forecast dataset grid must be uniformly spaced.",
+        )
+    # The step is derived from the endpoints only; a genuinely non-uniform
+    # axis (e.g. a Gaussian latitude grid) would otherwise silently
+    # interpolate against a false uniform step. Verify the interior spacing
+    # matches before building the grid.
+    if not np.allclose(np.diff(latitudes), lat_step) or not np.allclose(
+        np.diff(longitudes), lon_step
+    ):
         raise HTTPException(
             status_code=500,
             detail="The forecast dataset grid must be uniformly spaced.",

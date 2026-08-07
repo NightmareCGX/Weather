@@ -8,6 +8,9 @@ in ``docs/DATABASE.md``:
   an absolute ``valid_time``, keeping products idempotent across cycles.
 * ``time``, ``latitude``, ``longitude`` (and the level coordinate) are
   retained as the primary dimensions and coordinates.
+* The GEFS ensemble dimension is normalized from cfgrib's ``number`` name to
+  the platform's ``member`` convention, so the rest of the pipeline and the
+  API uniformly expose "ensemble member".
 """
 
 from pathlib import Path
@@ -80,6 +83,13 @@ def normalize(dataset: xr.Dataset) -> xr.Dataset:
 
     step_value = step.values.item()
     lead_time_hours = int(np.timedelta64(step_value, "ns") / np.timedelta64(1, "h"))
+
+    # cfgrib decodes the GRIB ``number`` key (the GEFS perturbation number) as
+    # a dataset dimension/coordinate named ``number``. The platform convention
+    # is ``member`` (the API and catalog key on it), so normalize the name here
+    # and keep the rest of the pipeline uniformly on ``member``.
+    if "number" in dataset.dims or "number" in dataset.coords:
+        dataset = dataset.rename({"number": "member"})
 
     normalized = dataset.drop_vars(["step", "valid_time"], errors="ignore")
     normalized = normalized.assign_coords(lead_time_hours=lead_time_hours)

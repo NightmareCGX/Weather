@@ -160,3 +160,29 @@ def read_dataset(store: str | PathLike[str] | Mapping[str, bytes]) -> xr.Dataset
     """
     resolved = _resolve_store(store)
     return xr.open_zarr(resolved)
+
+
+def store_exists(store: str | PathLike[str] | Mapping[str, bytes]) -> bool:
+    """Return whether a readable Zarr store already exists at ``store``.
+
+    Used by the ingestion orchestration to decide whether a write is a fresh
+    ingest (the target may be written in place) or a re-ingest (the target is
+    already served by a ``ready`` catalog row and must not be truncated until
+    the new store is known-good). A store that exists but fails to open is
+    treated as absent so it is never written over destructively.
+
+    Args:
+        store: A local path, ``s3://`` URL, or mapping.
+
+    Returns:
+        True when a store can be opened at ``store``, False otherwise.
+    """
+    resolved = _resolve_store(store)
+    if isinstance(resolved, str):
+        return os.path.exists(resolved)
+    try:
+        dataset = xr.open_zarr(resolved)
+    except Exception:
+        return False
+    dataset.close()
+    return True

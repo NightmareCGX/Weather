@@ -50,6 +50,33 @@ def test_normalize_rejects_missing_step() -> None:
         normalize(ds)
 
 
+def test_normalize_renames_number_dimension_to_member() -> None:
+    """A GEFS dataset decoded with the ``number`` dimension is normalized to
+    the platform's ``member`` convention (cfgrib exposes GEFS as ``number``)."""
+    import numpy as np
+
+    ds = xr.Dataset(
+        {"t": (("number", "latitude", "longitude"), np.ones((2, 2, 2)))},
+        coords={
+            "number": [0, 1],
+            "step": np.array([6 * 3600 * 10**9], dtype="timedelta64[ns]"),
+            "time": np.array(["2026-07-21T00:00:00"], dtype="datetime64[ns]"),
+            "valid_time": np.array(["2026-07-21T06:00:00"], dtype="datetime64[ns]"),
+            "latitude": [0.0, 1.0],
+            "longitude": [0.0, 1.0],
+        },
+    )
+    normalized = normalize(ds)
+    assert "member" in normalized.dims
+    assert "number" not in normalized.dims
+    assert "member" in normalized.coords
+    assert "number" not in normalized.coords
+    # step/valid_time are dropped and lead_time_hours is set.
+    assert "step" not in normalized.coords
+    assert "valid_time" not in normalized.coords
+    assert int(normalized["lead_time_hours"].values) == 6
+
+
 def test_parse_grib2_raises_on_corrupt_file(tmp_path: Path) -> None:
     """A corrupt file raises GribParsingError."""
     corrupt = tmp_path / "corrupt.grib2"

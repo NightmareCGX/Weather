@@ -38,7 +38,6 @@ from domain.exceptions import (
 from domain.geo.coordinates import validate_coordinates
 from domain.geo.interpolation import bilinear_interpolate
 from fastapi import HTTPException
-from ingestion.core.zarr_writer import read_dataset
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -53,7 +52,7 @@ from api.services.point_forecast import (
     _derive_grid,
     _field_values,
     _resolve_lead_times,
-    _resolve_run,
+    _resolve_ready_dataset,
     _resolve_variables,
 )
 
@@ -75,9 +74,7 @@ def _validate_coordinates(latitude: float, longitude: float) -> None:
     try:
         validate_coordinates(latitude, longitude)
     except InvalidCoordinatesError as exc:
-        raise HTTPException(
-            status_code=_STATUS_INVALID_INPUT, detail=str(exc)
-        ) from exc
+        raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
 
 
 def build_probability_forecast(
@@ -122,23 +119,15 @@ def build_probability_forecast(
     """
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    run = _resolve_run(db, model)
-    assert run.zarr_store_path is not None
-    dataset = read_dataset(run.zarr_store_path)
+    _run, dataset = _resolve_ready_dataset(db, model)
     leads = _resolve_lead_times(dataset, lead_time_hours, lead_time_hours)
     _resolve_variables(db, dataset, [variable])
 
-    members = _ensemble_member_values(
-        dataset, variable, leads[0], latitude, longitude
-    )
+    members = _ensemble_member_values(dataset, variable, leads[0], latitude, longitude)
     probability = _probability(members, threshold, operator, threshold_max)
-    lower, upper = probability_confidence_interval(
-        probability, len(members)
-    )
+    lower, upper = probability_confidence_interval(probability, len(members))
     data: dict[str, Any] = {
-        "location": ProbabilityLocation(
-            latitude=latitude, longitude=longitude
-        ),
+        "location": ProbabilityLocation(latitude=latitude, longitude=longitude),
         "variable": variable,
         "threshold": threshold,
         "operator": operator,
@@ -186,15 +175,11 @@ def build_ensemble_statistics(
     """
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    run = _resolve_run(db, model)
-    assert run.zarr_store_path is not None
-    dataset = read_dataset(run.zarr_store_path)
+    _run, dataset = _resolve_ready_dataset(db, model)
     leads = _resolve_lead_times(dataset, lead_time_hours, lead_time_hours)
     _resolve_variables(db, dataset, [variable])
 
-    members = _ensemble_member_values(
-        dataset, variable, leads[0], latitude, longitude
-    )
+    members = _ensemble_member_values(dataset, variable, leads[0], latitude, longitude)
     return EnsembleStatisticsData(
         model=model,
         lead_time_hours=lead_time_hours,
@@ -214,13 +199,11 @@ def build_ensemble_statistics(
 
 def _require_ensemble_model(db: Session, model: str) -> None:
     """Reject deterministic models that have no member axis."""
-    model_row = db.execute(
-        select(Model).where(Model.model_id == model)
-    ).scalars().one_or_none()
+    model_row = (
+        db.execute(select(Model).where(Model.model_id == model)).scalars().one_or_none()
+    )
     if model_row is None:
-        raise HTTPException(
-            status_code=404, detail=f"Model '{model}' was not found."
-        )
+        raise HTTPException(status_code=404, detail=f"Model '{model}' was not found.")
     if not model_row.is_ensemble:
         raise HTTPException(
             status_code=422,
@@ -253,9 +236,7 @@ def _probability(
         if threshold_max is None:
             raise HTTPException(
                 status_code=_STATUS_INVALID_INPUT,
-                detail=(
-                    "threshold_max is required when operator is 'between'."
-                ),
+                detail=("threshold_max is required when operator is 'between'."),
             )
         return probability_between_thresholds(members, threshold, threshold_max)
     except (
@@ -264,9 +245,7 @@ def _probability(
         InvalidThresholdError,
         InvalidPercentileError,
     ) as exc:
-        raise HTTPException(
-            status_code=_STATUS_INVALID_INPUT, detail=str(exc)
-        ) from exc
+        raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
 
 
 def _ensemble_member_values(
@@ -317,9 +296,7 @@ def _ensemble_member_values(
                     "vertical-level variables are not supported."
                 ),
             )
-        member_values = _field_values(
-            member_field, lat_descending, lon_descending
-        )
+        member_values = _field_values(member_field, lat_descending, lon_descending)
         try:
             values.append(
                 float(bilinear_interpolate(grid, member_values, latitude, longitude))
