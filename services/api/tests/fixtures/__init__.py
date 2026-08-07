@@ -4,15 +4,19 @@ Provides helpers to generate deterministic, tiny Zarr forecast datasets on
 disk for the point-forecast integration tests, and to build PostGIS location
 records (cities, ski resorts, stations) for the search and point-resolution
 tests. The Zarr stores are written to a temporary directory at test time by
-:func:`build_forecast_dataset` + the ``ingestion.core.zarr_writer`` module;
-no binary fixtures are committed. See ``README.md`` for details.
+:func:`build_forecast_dataset` + the test-only ``tests._zarr_writer`` module
+(an API-local Zarr writer so the API service never imports the ingestion
+package); no binary fixtures are committed. See ``README.md`` for details.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import xarray as xr
-from ingestion.core.zarr_writer import write_dataset
+
+from tests._zarr_writer import (
+    write_dataset,
+)  # test-only Zarr writer (no ingestion import)
 
 #: Fixture grid geometry (a regular 0.25 degree grid that fits the
 #: deterministic dataset generated below).
@@ -88,6 +92,129 @@ def write_forecast_zarr(store: str) -> str:
         The store path (for reporting).
     """
     return write_dataset(build_forecast_dataset(), store)
+
+
+def _longitudes_0_360() -> np.ndarray:
+    """A compact 0-360 longitude axis (0, 20, ..., 340) covering the western hemisphere.
+
+    The axis starts at 0 (valid WGS84), so the derived :class:`RegularGrid`
+    origin passes validation, and spans past 180 so serving aligns
+    western-hemisphere queries into the ``[0, 360]`` convention.
+    """
+    return np.arange(0.0, 360.0, 20.0)
+
+
+def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
+    """Build a deterministic 0-360 longitude-convention dataset.
+
+    Mirrors :func:`build_forecast_dataset` / :func:`build_ensemble_dataset`
+    but stores longitude in the native GFS ``[0, 360]`` convention. The
+    temperature field uses ``lon360 - (LON_START + 360)`` which equals the
+    standard ``lon - LON_START`` for equivalent geographic points, so expected
+    values computed with :func:`temperature_at` /
+    :func:`ensemble_temperature_at` are exact for western-hemisphere queries.
+
+    Args:
+        with_member: Whether to add an ensemble ``member`` dimension.
+
+    Returns:
+        The deterministic dataset with longitude coordinates in ``[0, 360]``.
+    """
+    lon_0_360 = _longitudes_0_360()
+    lat = np.asarray(LATITUDES, dtype=float)
+    lead = np.asarray(LEAD_TIMES, dtype=float)
+
+    if with_member:
+        member = np.asarray(MEMBER_INDICES, dtype=float)
+        member_grid, lead_grid, lat_grid, lon_grid = np.meshgrid(
+            member, lead, lat, lon_0_360, indexing="ij"
+        )
+        temperature = (
+            10.0
+            + 10.0 * (lat_grid - LAT_START)
+            + 10.0 * (lon_grid - (LON_START + 360.0))
+            + 0.5 * lead_grid
+            + 2.0 * member_grid
+        )
+        precipitation = 0.5 * lead_grid + 1.0 * member_grid
+        return xr.Dataset(
+            data_vars={
+                "temperature_2m": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    temperature,
+                ),
+                "precipitation_rate": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    precipitation,
+                ),
+            },
+            coords={
+                "member": MEMBER_INDICES,
+                "lead_time_hours": LEAD_TIMES,
+                "latitude": LATITUDES,
+                "longitude": lon_0_360,
+            },
+        )
+
+    lead_grid, lat_grid, lon_grid = np.meshgrid(lead, lat, lon_0_360, indexing="ij")
+    temperature = (
+        10.0
+        + 10.0 * (lat_grid - LAT_START)
+        + 10.0 * (lon_grid - (LON_START + 360.0))
+        + 0.5 * lead_grid
+    )
+    precipitation = 0.5 * lead_grid
+    return xr.Dataset(
+        data_vars={
+            "temperature_2m": (
+                ("lead_time_hours", "latitude", "longitude"),
+                temperature,
+            ),
+            "precipitation_rate": (
+                ("lead_time_hours", "latitude", "longitude"),
+                precipitation,
+            ),
+        },
+        coords={
+            "lead_time_hours": LEAD_TIMES,
+            "latitude": LATITUDES,
+            "longitude": lon_0_360,
+        },
+    )
+
+
+def build_forecast_dataset_0_360() -> xr.Dataset:
+    """Build a deterministic 0-360 longitude-convention forecast dataset."""
+    return _build_0_360_dataset(with_member=False)
+
+
+def write_forecast_zarr_0_360(store: str) -> str:
+    """Write the deterministic 0-360 fixture dataset to a local Zarr store.
+
+    Args:
+        store: Local directory path for the Zarr store.
+
+    Returns:
+        The store path (for reporting).
+    """
+    return write_dataset(build_forecast_dataset_0_360(), store)
+
+
+def build_ensemble_dataset_0_360() -> xr.Dataset:
+    """Build a deterministic 0-360 longitude-convention ensemble dataset."""
+    return _build_0_360_dataset(with_member=True)
+
+
+def write_ensemble_zarr_0_360(store: str) -> str:
+    """Write the deterministic 0-360 ensemble fixture dataset to a Zarr store.
+
+    Args:
+        store: Local directory path for the Zarr store.
+
+    Returns:
+        The store path (for reporting).
+    """
+    return write_dataset(build_ensemble_dataset_0_360(), store)
 
 
 def temperature_at(latitude: float, longitude: float, lead: int) -> float:

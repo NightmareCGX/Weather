@@ -7,8 +7,9 @@ does **not** contain committed binary fixtures.
 
 The point-forecast integration tests write a tiny, deterministic
 `xarray.Dataset` (see `__init__.py`) to a **local on-disk Zarr store** at
-test time via the Milestone 5 `ingestion.core.zarr_writer.write_dataset`
-module. Seeded `model_runs.zarr_store_path` rows point at these local
+test time via the API-local test writer `tests._zarr_writer.write_dataset`
+(kept separate so the API service never imports the ingestion package).
+Seeded `model_runs.zarr_store_path` rows point at these local
 stores, so the full end-to-end slice + interpolate path runs against the
 local test PostgreSQL **without** requiring MinIO/S3.
 
