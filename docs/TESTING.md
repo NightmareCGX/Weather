@@ -13,7 +13,7 @@ This document outlines the testing strategy, layers, and fixtures for the Global
 
 ### 1.2 Integration Tests (`pytest` + `Docker Compose`)
 - **Location**: `services/api/tests/`, `services/ingestion/tests/`
-- **Scope**: End-to-end flows involving FastAPI test clients, PostgreSQL + PostGIS spatial queries, and Zarr dataset reads/writes.
+- **Scope**: End-to-end flows involving FastAPI test clients, PostgreSQL + PostGIS spatial queries, Zarr dataset reads/writes, and the ingestion→catalog→serving pipeline (`services/ingestion/tests/test_catalog_postgres.py` writes a run to the catalog and serves it through `/v1/points`, including a test that drives the real `weather-ingest` CLI production entrypoint with a mocked download).
 - **Environment**: Executed against local containers (`postgres`, `redis`, `minio`) via Docker Compose. The API and ingestion suites **skip** gracefully when their backing services are unreachable; the S3/MinIO Zarr round-trip is additionally gated behind `WEATHER_TEST_MINIO=1`.
 
 ### 1.3 Contract Tests

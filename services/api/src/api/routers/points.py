@@ -14,15 +14,13 @@ Specification gaps (not implemented in Milestone 9):
   and then query ``/v1/points`` with ``lat``/``lon``, ``city_id``, or
   ``resort_id``.
 
-* **Multi-model responses.** API.md documents ``models`` as a comma-separated
-  string with default ``gfs,gefs`` but defines no response format for
-  multiple models. This endpoint exposes an unambiguous single-model contract
-  instead: ``models`` accepts exactly one identifier (default ``gfs``).
-  Requests that pass more than one identifier are rejected with HTTP 422 and
-  a clear message. The documented multi-model default is intentionally not
-  used because it would make the default request always fail; multi-model
-  responses are recorded as a specification gap to resolve in a future
-  contract update.
+* **Multi-model responses.** API.md documents ``models`` as a single model
+  identifier (default ``gfs``) and defines no response format for multiple
+  models. This endpoint exposes an unambiguous single-model contract:
+  ``models`` accepts exactly one identifier (default ``gfs``). Requests that
+  pass more than one identifier are rejected with HTTP 422 and a clear
+  message; multi-model responses are recorded as a specification gap to
+  resolve in a future contract update.
 """
 
 from typing import Annotated, Literal
@@ -62,9 +60,7 @@ def get_point_forecast(
     lon: Annotated[float | None, Query()] = None,
     city_id: Annotated[str | None, Query()] = None,
     resort_id: Annotated[str | None, Query()] = None,
-    models: Annotated[
-        str, Query(description="A single model identifier.")
-    ] = "gfs",
+    models: Annotated[str, Query(description="A single model identifier.")] = "gfs",
     variables: Annotated[str | None, Query()] = None,
     units: Annotated[Literal["metric", "imperial"], Query()] = "metric",
     start_lead_time_hours: Annotated[int | None, Query(ge=0)] = None,

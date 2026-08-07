@@ -38,7 +38,7 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 - **Scope**: SQLAlchemy base configuration, Alembic migration setup, and initial migration script for the 13 database tables defined in `docs/DATABASE.md` (the 14-table relationship map in DATABASE.md is a high-level illustration; the implemented schema and its constraints are authoritative).
 - **Out of Scope**: Application-level DB queries and seed data.
 - **Deliverables**:
-  - `services/api/src/core/database.py` (SQLAlchemy engine & session factory).
+  - `services/api/src/api/core/database.py` (SQLAlchemy engine & session factory).
   - Alembic configuration (`alembic.ini` and `env.py`).
   - Initial migration script creating all tables, indexes, and GIST spatial constraints.
 - **Dependencies**: Milestone 2.
@@ -53,7 +53,7 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 - **Scope**: `services/ingestion/src/providers/noaa/` adapter, network request handling, and upstream mocking via `respx`.
 - **Out of Scope**: GRIB2 parsing and Zarr writing.
 - **Deliverables**:
-  - `services/ingestion/src/core/base.py` (Base model connector interface).
+  - `services/ingestion/src/ingestion/core/base.py` (Base model connector interface).
   - `services/ingestion/src/providers/noaa/connector.py` (NOAA NOMADS client).
   - Unit tests with mocked HTTP responses.
 - **Dependencies**: Milestone 1.
@@ -80,7 +80,7 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 
 ## Milestone 6: Internal Forecast Domain Model
 - **Goal**: Implement core meteorological business logic, coordinate transformation helpers, and forecast data structures in `packages/domain`.
-- **Scope**: `packages/domain/src/models/`, `packages/domain/src/geo/`, and spatial interpolation helpers.
+- **Scope**: `packages/domain/src/domain/models/`, `packages/domain/src/domain/geo/`, and spatial interpolation helpers.
 - **Out of Scope**: HTTP handlers and database queries.
 - **Deliverables**:
   - Domain dataclasses for forecast points (`ForecastPoint`, `GridPoint`) and regular grid definitions (`RegularGrid`).

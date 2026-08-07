@@ -2,7 +2,7 @@
 
 A production-grade, global probabilistic weather forecasting platform combining operational numerical weather prediction (NWP) models (NOAA, ECMWF, ECCC), a custom neural AI downscaling pipeline (25km to 3km/1km), Multi-Model Ensemble (MME) calibration, and high-performance point and spatial APIs.
 
-> **Implementation status**: Milestones 1–9 are complete and approved (see [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)). The live surface today is: NOAA GFS/GEFS ingestion (GRIB2 → Zarr), the FastAPI `/v1` catalog/points/search surface, PostGIS + Redis caching, and the domain ensemble/geo math engine. The AI downscaling, MME calibration, ECMWF/Canada providers, and the frontend map viewer are future milestones (10–18) and are **not yet implemented**.
+> **Implementation status**: Milestones 1–10 are complete and approved (see [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)). The live surface today is: NOAA GFS/GEFS ingestion (GRIB2 → Zarr → PostgreSQL catalog), the FastAPI `/v1` catalog / points / search / probabilities / maps / ensembles surface, PostGIS + Redis caching, and the domain ensemble/geo math engine. The AI downscaling, MME calibration, ECMWF/Canada providers, and the frontend map viewer are future milestones (11–18) and are **not yet implemented**.
 
 ---
 
@@ -82,8 +82,8 @@ weather-platform/
 │   ├── contracts/                # Shared Pydantic contracts (placeholder)
 │   └── config/                   # Centralized configuration (placeholder)
 ├── services/
-│   ├── api/                      # FastAPI core service (v1 catalog/points/search, PostGIS, Redis cache)
-│   ├── ingestion/                # GRIB2 downloaders, decoders, Zarr storage
+│   ├── api/                      # FastAPI core service (v1 catalog/points/search/probabilities/maps/ensembles, PostGIS, Redis cache)
+│   ├── ingestion/                # GRIB2 downloaders, decoders, Zarr storage, PostgreSQL catalog writer (weather-ingest CLI)
 │   └── frontend/                 # Next.js / React client application (scaffold)
 ├── docker-compose.yml            # Local PostgreSQL + PostGIS, Redis, MinIO
 ├── .env.example                  # Environment variable template

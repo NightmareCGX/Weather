@@ -34,7 +34,7 @@ Our API design is modeled after industry standards set by Stripe, GitHub, and Op
 - **Universal Envelope**: **All** successful API responses (including single objects, lists, and metadata) strictly wrap their payload data inside the standard envelope:
   ```json
   {
-    "object": "list" | "point_forecast" | "spatial_layer" | "verification" | "model" | "center" | "run" | "variable" | "grid",
+    "object": "list" | "point_forecast" | "probability_forecast" | "ensemble_statistics" | "spatial_layer" | "model" | "center" | "run" | "variable" | "grid" | "city" | "ski_resort" | "station",
     "data": { ... },
     "has_more": false,
     "next_cursor": null
@@ -117,7 +117,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `401 Unauthorized`.
+- **HTTP Status Codes**: `200 OK`, `422 Unprocessable Entity` (pagination validation: out-of-range `limit`, mutually-exclusive cursors). *`401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=86400` (24 hours).
 
 #### 1.2 List Models
@@ -153,7 +153,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `401 Unauthorized`, `429 Too Many Requests`.
+- **HTTP Status Codes**: `200 OK`, `422 Unprocessable Entity` (pagination validation: out-of-range `limit`, mutually-exclusive cursors). *`401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=86400` (24 hours).
 
 #### 1.3 List Model Runs
@@ -212,7 +212,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `401 Unauthorized`.
+- **HTTP Status Codes**: `200 OK`, `422 Unprocessable Entity` (pagination validation: out-of-range `limit`, mutually-exclusive cursors). *`401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=86400` (24 hours).
 
 #### 1.5 List Forecast Grids
@@ -244,7 +244,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `401 Unauthorized`.
+- **HTTP Status Codes**: `200 OK`, `422 Unprocessable Entity` (pagination validation: out-of-range `limit`, mutually-exclusive cursors). *`401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=86400` (24 hours).
 
 ---
@@ -289,7 +289,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-  *Notes*: `generated_at` is the selected model run's `cycle_time` (the forecast dataset generation time, keeping payloads deterministic). `valid_time` is derived as `cycle_time + lead_time_hours` (DATABASE.md section 1). `elevation_m` is returned when the resolved record defines it (e.g. ski resorts) and is `null` otherwise. Forecast entries carry the requested `forecast_variables` catalog codes (e.g. `temperature_2m`, `precipitation_rate`) as keys.
+  *Notes*: `generated_at` is the selected model run's `cycle_time` (the forecast dataset generation time, keeping payloads deterministic). `valid_time` is derived as `cycle_time + lead_time_hours` (DATABASE.md section 1). `elevation_m` is returned when the resolved record defines it (e.g. ski resorts) and is `null` otherwise. Forecast entries carry the requested `forecast_variables` catalog codes (e.g. `temperature_2m`, `precipitation_rate`) as keys. Longitude queries are accepted in WGS84 `[-180, 180]`; datasets stored in the native GFS `[0, 360]` longitude convention are aligned automatically (a western-hemisphere longitude such as `-106.82` is mapped into a `0..360` store).
 - **HTTP Status Codes**: `200 OK`, `404 Not Found`, `422 Unprocessable Entity`. *`400 Bad Request` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=1800` (30 minutes).
 
@@ -302,8 +302,8 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **HTTP Method**: `GET`
 - **Endpoint**: `/v1/probabilities`
 - **Purpose**: Calculate the statistical probability that a variable will exceed a given threshold based on ensemble spread.
-- **Required Parameters**: `lat`, `lon`, `variable`, `threshold`, `operator` (`gt`, `lt`, `between`), `lead_time_hours`.
-- **Optional Parameters**: `model` (default `gefs`).
+- **Required Parameters**: `lat`, `lon`, `variable`, `threshold`, `operator` (`gt`, `lt`, `between`), `lead_time_hours`. When `operator=between`, the additional `threshold_max` query parameter is **required** as the upper bound (and is rejected for `gt`/`lt`).
+- **Optional Parameters**: `model` (default `gefs`), `threshold_max` (upper bound of the `between` operator; required only when `operator=between`).
 - **Example Request**: `GET /v1/probabilities?lat=45.0&lon=-122.0&variable=precipitation_rate&threshold=10.0&operator=gt&lead_time_hours=24`
 - **Example Response**:
   ```json
@@ -322,7 +322,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `400 Bad Request`, `422 Unprocessable Entity`.
+- **HTTP Status Codes**: `200 OK`, `404 Not Found` (unknown model/variable, no ready run, location outside grid), `422 Unprocessable Entity` (validation, non-ensemble model, inverted `between` thresholds). *`400 Bad Request` / `401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=3600`.
 
 ---
@@ -341,7 +341,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
   {
     "object": "spatial_layer",
     "data": {
-      "tile_url_template": "https://tiles.weatherplatform.com/v1/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=12",
+      "tile_url_template": "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=12",
       "min_zoom": 0,
       "max_zoom": 9,
       "lead_time_hours": 12,
@@ -354,7 +354,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `400 Bad Request`.
+- **HTTP Status Codes**: `200 OK`, `404 Not Found` (unknown model/variable, no ready run, location outside grid), `422 Unprocessable Entity` (validation, non-ensemble model, unsupported `level`). *`400 Bad Request` / `401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=3600`.
 
 ---
@@ -392,7 +392,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `400 Bad Request`.
+- **HTTP Status Codes**: `200 OK`, `404 Not Found` (unknown model/variable, no ready run, location outside grid, lead time unavailable), `422 Unprocessable Entity` (validation, non-ensemble model). *`400 Bad Request` / `401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=1800`.
 
 ---

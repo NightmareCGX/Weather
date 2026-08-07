@@ -21,6 +21,10 @@ In numerical weather prediction (NWP) and ensemble forecasting systems, storing 
   ```
 - **`point_query_fallback_audit` Table**: Explicitly designated as a Redis-fallback and point-query audit ledger. Optimized with `cache_key` as primary key and a dedicated `BTREE` index on `expires_at` for background TTL cleanup workers.
 
+### Catalog write path
+
+Ingestion populates the PostgreSQL catalog automatically. The production orchestration entrypoint is the `weather-ingest` CLI (`services/ingestion/src/ingestion/cli.py`, exposing `ingestion.core.pipeline.ingest_grib_file`). It downloads a GRIB2 file (NOAA NOMADS), parses it, writes the dataset to a Zarr store, and then upserts the center, model, model version, model run, grid, forecast variables, forecast products (one per variable × lead time), and ensemble members (one per `member` index) via `services/ingestion/src/ingestion/core/catalog.py`. The model run is recorded as `status='ready'` with its `zarr_store_path`, so the API serving tier (`_resolve_run`) discovers and serves it. No manual database seeding is required.
+
 ---
 
 ## 3. Final Relationship Map
@@ -75,4 +79,4 @@ In numerical weather prediction (NWP) and ensemble forecasting systems, storing 
    * *Mitigation*: PostgreSQL stores *metadata, catalogs, and pointers* (`model_runs.zarr_store_path`), while heavy numerical grids reside in cloud-optimized Zarr stores on object storage (MinIO/S3).
 2. **Time-Series Growth**:
    * *Concern*: As verification observations and forecast product catalogs grow across multiple models (NOAA, ECMWF, Canada) and AI downscaling, table sizes will expand rapidly.
-   * *Mitigation*: The schema is partitioned with future-ready table boundaries, and time-range partitioning on `verification_observations` and `model_runs` can be applied without architectural refactoring.
+   * *Mitigation*: The schema is partition-ready with future table boundaries, and time-range partitioning on `verification_observations` and `model_runs` can be applied without architectural refactoring.
