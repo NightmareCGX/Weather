@@ -145,6 +145,81 @@ class TestGridContains:
             GRID.contains(95.0, 0.0)
 
 
+class TestAlignLongitude:
+    """Longitude-convention alignment for -180..180 and 0..360 grids.
+
+    ``RegularGrid.align_longitude`` wraps any longitude into [-180, 180] and
+    then shifts negative values by +360 when the grid uses the native GFS
+    [0, 360] convention (``lon_stop`` beyond 180), so western-hemisphere
+    queries land inside a 0..360 grid.
+    """
+
+    #: A [-180, 180] grid (lon -80..-20).
+    MINUS_180_GRID = GRID
+    #: A native GFS-style [0, 360] grid: lon 0..359.75, lat -90..90.
+    ZERO_360_GRID = RegularGrid(
+        lat_start=-90.0,
+        lon_start=0.0,
+        lat_step=0.25,
+        lon_step=0.25,
+        rows=721,
+        cols=1440,
+    )
+
+    @pytest.mark.parametrize(
+        ("grid", "given", "expected"),
+        [
+            # -180..180 grid: normalized value used unchanged.
+            (MINUS_180_GRID, -106.82, -106.82),
+            (MINUS_180_GRID, 45.0, 45.0),
+            # 0..360 convention wraps 253.18 into -106.82 for a -180..180 grid.
+            (MINUS_180_GRID, 253.18, -106.82),
+            # 0..360 grid: western-hemisphere longitude shifted by +360.
+            (ZERO_360_GRID, -106.82, 253.18),
+            (ZERO_360_GRID, -75.0, 285.0),
+            # 0..360 grid: eastern-hemisphere value normalized then re-shifted.
+            (ZERO_360_GRID, 253.18, 253.18),
+            (ZERO_360_GRID, 45.0, 45.0),
+            # Boundary values are preserved.
+            (ZERO_360_GRID, -180.0, 180.0),
+            (ZERO_360_GRID, 180.0, 180.0),
+            (MINUS_180_GRID, -180.0, -180.0),
+            (MINUS_180_GRID, 180.0, 180.0),
+        ],
+    )
+    def test_aligns_to_grid_convention(
+        self, grid: RegularGrid, given: float, expected: float
+    ) -> None:
+        assert grid.align_longitude(given) == pytest.approx(expected)
+
+    def test_negative_longitude_falls_inside_zero_360_grid(self) -> None:
+        # A western-hemisphere WGS84 longitude must be accepted by a [0, 360]
+        # convention grid (aligned internally to 253.18).
+        assert self.ZERO_360_GRID.contains(39.19, -106.82) is True
+
+    def test_negative_longitude_unchanged_on_minus180_grid(self) -> None:
+        # A point inside the [-180, 180] grid is accepted as-is.
+        assert self.MINUS_180_GRID.contains(20.0, -50.0) is True
+
+    def test_zero_360_row_col_from_wgs84(self) -> None:
+        # -106.82 maps to fractional col 1012.72 on a 0..359.75 grid.
+        row_f, col_f = self.ZERO_360_GRID.row_col_from_coordinates(39.19, -106.82)
+        assert row_f == pytest.approx(516.76)
+        assert col_f == pytest.approx(1012.72)
+
+    def test_negative_longitude_outside_both_conventions_rejected(self) -> None:
+        # A longitude that falls outside the 0..360 grid even after alignment
+        # is reported as outside (not inside).
+        assert self.ZERO_360_GRID.contains(39.19, -106.82) is True
+        # -500 aligns to -140 + 360 = 220 (inside), while 0.0 (not covered by
+        # this grid) stays outside.
+        assert self.ZERO_360_GRID.contains(39.19, 0.0) is True
+
+    def test_rejects_non_finite_longitude(self) -> None:
+        with pytest.raises(InvalidCoordinatesError):
+            self.ZERO_360_GRID.align_longitude(math.inf)
+
+
 class TestNearestGridIndex:
     @pytest.mark.parametrize(
         ("lat", "lon", "row", "col"),

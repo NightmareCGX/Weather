@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 
 from domain.exceptions import InvalidGridError, PointOutsideGridError
-from domain.geo.coordinates import validate_coordinates
+from domain.geo.coordinates import normalize_longitude, validate_coordinates
 
 #: Absolute tolerance in degrees applied when comparing against grid bounds so
 #: that boundary points affected by floating-point error are not rejected.
@@ -125,15 +125,41 @@ class RegularGrid:
             InvalidCoordinatesError: If the coordinates are invalid.
         """
         validate_coordinates(latitude, longitude)
+        aligned_longitude = self.align_longitude(longitude)
         return (
             self.lat_start - GRID_BOUNDS_TOLERANCE
             <= latitude
             <= self.lat_stop + GRID_BOUNDS_TOLERANCE
         ) and (
             self.lon_start - GRID_BOUNDS_TOLERANCE
-            <= longitude
+            <= aligned_longitude
             <= self.lon_stop + GRID_BOUNDS_TOLERANCE
         )
+
+    def align_longitude(self, longitude: float) -> float:
+        """Return ``longitude`` expressed in this grid's coordinate convention.
+
+        The query longitude is first wrapped into the closed interval
+        ``[-180, 180]`` via :func:`domain.geo.coordinates.normalize_longitude`.
+        When the grid stores longitudes in the ``[0, 360]`` convention (e.g.
+        native GFS ``0..359.75`` grids, where ``lon_stop`` exceeds 180), a
+        negative normalized longitude is shifted by ``+360`` so the point
+        falls inside the grid (e.g. ``-106.82 -> 253.18``). For ``[-180, 180]``
+        grids the normalized value is used unchanged.
+
+        Args:
+            longitude: Longitude in decimal degrees (any finite value).
+
+        Returns:
+            The longitude expressed in this grid's coordinate convention.
+
+        Raises:
+            InvalidCoordinatesError: If the longitude is not finite.
+        """
+        normalized = normalize_longitude(longitude)
+        if self.lon_stop > 180.0 and normalized < 0.0:
+            return normalized + 360.0
+        return normalized
 
     def nearest_grid_index(self, latitude: float, longitude: float) -> GridPoint:
         """Return the grid node whose center is nearest to a geographic point.
@@ -156,8 +182,11 @@ class RegularGrid:
             )
         # ``round`` applies banker's rounding (round(0.5) == 0); use half-up so
         # the nearest node is picked deterministically for exact midpoints.
+        aligned_longitude = self.align_longitude(longitude)
         row = math.floor((latitude - self.lat_start) / self.lat_step + 0.5)
-        col = math.floor((longitude - self.lon_start) / self.lon_step + 0.5)
+        col = math.floor(
+            (aligned_longitude - self.lon_start) / self.lon_step + 0.5
+        )
         # Guard against rounding overshoot at the far edges of the grid.
         row = min(max(row, 0), self.rows - 1)
         col = min(max(col, 0), self.cols - 1)
@@ -202,8 +231,9 @@ class RegularGrid:
                 f"Point ({latitude}, {longitude}) is outside grid bounds "
                 f"[{self.lat_start}, {self.lat_stop}] x [{self.lon_start}, {self.lon_stop}]."
             )
+        aligned_longitude = self.align_longitude(longitude)
         row_f = (latitude - self.lat_start) / self.lat_step
-        col_f = (longitude - self.lon_start) / self.lon_step
+        col_f = (aligned_longitude - self.lon_start) / self.lon_step
         # Clamp so boundary points within tolerance map onto the grid.
         row_f = min(max(row_f, 0.0), float(self.rows - 1))
         col_f = min(max(col_f, 0.0), float(self.cols - 1))
