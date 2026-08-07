@@ -42,9 +42,16 @@ FALLBACK_REASON_CORRUPT_CACHE_ENTRY = "corrupt_cache_entry"
 #: paths for the same request. Because the audit row's ``cache_key`` is the
 #: primary key (one row per request), both failures are combined into a
 #: single reason so neither signal is lost.
-FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE = (
-    "redis_read_and_write_unavailable"
-)
+FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE = "redis_read_and_write_unavailable"
+
+#: Socket connect timeout in seconds for the Redis client. A stalled
+#: connection (e.g. a network partition where the connect is accepted but
+#: never answered) must not block a request thread indefinitely: the
+#: fallback path only triggers on ``redis.RedisError``, and redis-py raises
+#: ``TimeoutError`` (a ``RedisError`` subclass) when these timeouts fire.
+REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 2.0
+#: Socket read/command timeout in seconds for the Redis client.
+REDIS_SOCKET_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -79,7 +86,10 @@ class PointCache:
         self._redis_url = redis_url or settings.REDIS_URL
         self._ttl_seconds = ttl_seconds
         self._client = redis_lib.from_url(
-            self._redis_url, decode_responses=True
+            self._redis_url,
+            decode_responses=True,
+            socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
         )
 
     def get(
@@ -168,9 +178,7 @@ class PointCache:
         Returns:
             The response.
         """
-        read: _CacheRead[TEnvelope] = self.get(
-            cache_key, model_type=model_type
-        )
+        read: _CacheRead[TEnvelope] = self.get(cache_key, model_type=model_type)
         if read.hit and read.envelope is not None:
             return read.envelope
 
@@ -178,9 +186,7 @@ class PointCache:
 
         write_fallback = False
         try:
-            self._client.setex(
-                cache_key, self._ttl_seconds, response.model_dump_json()
-            )
+            self._client.setex(cache_key, self._ttl_seconds, response.model_dump_json())
         except redis_lib.RedisError:
             # Redis is unreachable on the write path; the forecast response
             # is still returned.
