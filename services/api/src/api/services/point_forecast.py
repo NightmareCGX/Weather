@@ -469,11 +469,15 @@ def _derive_grid(
     Returns the grid along with flags indicating whether the latitude and
     longitude axes were stored in descending order and therefore must be
     reversed to align with the domain's ascending-row/column convention.
+    Longitudes are normalized into the WGS84 ``[-180, 180]`` range where the
+    stored axis is a fully-western ``0..360`` axis (see
+    :func:`_normalize_grid_longitudes`).
     """
     lat_raw = _axis_values(dataset, "latitude")
     lon_raw = _axis_values(dataset, "longitude")
     latitudes, lat_descending = _ascending(lat_raw)
     longitudes, lon_descending = _ascending(lon_raw)
+    longitudes = _normalize_grid_longitudes(longitudes)
     if len(latitudes) < 2 or len(longitudes) < 2:
         raise HTTPException(
             status_code=500,
@@ -506,6 +510,36 @@ def _derive_grid(
         cols=len(longitudes),
     )
     return grid, lat_descending, lon_descending
+
+
+def _normalize_grid_longitudes(longitudes: list[float]) -> list[float]:
+    """Map a fully-western 0-360 longitude axis into the WGS84 [-180, 180] range.
+
+    GRIB decoding (``cfgrib``) always exposes a valid grid's longitudes in the
+    native ``[0, 360]`` convention regardless of how the file stores them. A
+    grid confined to the western hemisphere (e.g. a small GFS subset covering
+    ``lon 250..259``) therefore arrives as a ``0..360`` axis whose origin
+    exceeds 180. ``RegularGrid`` validates longitude against ``[-180, 180]``,
+    so such an axis cannot be represented directly. Subtracting 360 from every
+    coordinate maps the axis into ``[-180, 180]`` without changing the grid
+    geometry (a uniform axis stays uniform; ordering and spacing are exact).
+
+    Only a *fully* western axis (every longitude greater than 180) is shifted.
+    A global axis that spans the antimeridian (e.g. ``0..340``) is left
+    unchanged so ``RegularGrid.align_longitude`` can map western-hemisphere
+    query longitudes into the ``0..360`` store as documented in API.md section
+    2.1. An axis already in ``[-180, 180]`` is returned unchanged.
+
+    Args:
+        longitudes: The grid's longitude axis in ascending order.
+
+    Returns:
+        The axis mapped into the WGS84 ``[-180, 180]`` convention where
+        possible, preserving order and spacing.
+    """
+    if longitudes and all(value > 180.0 for value in longitudes):
+        return [value - 360.0 for value in longitudes]
+    return longitudes
 
 
 def _axis_values(dataset: xr.Dataset, name: str) -> list[float]:

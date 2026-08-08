@@ -12,13 +12,22 @@ the network.
 |---|---|
 | Model / product | GFS-like, 2-m temperature (`paramId 167`, `2t`) |
 | Grid | Regular lat/lon, `10 x 5` points |
-| Latitudes | `44.0, 43.0, 42.0, 41.0, 0.0` (north→south; last row rounds to 0° on the sample grid) |
-| Longitudes | `-120.0, -103.33, -86.67, ..., 13.33, 30.0` (10 native GRIB points, ~16.67° spacing) |
+| Latitudes | `40.0, 39.0, 38.0, 37.0, 36.0` (north→south, uniform 1° step) |
+| Longitudes | `250.0, 251.0, ..., 259.0` (10 native GRIB points, uniform 1° step, decoded in the `0..360` convention; `250..259` = `-110..-101`) |
 | Step | `+6 h` (`stepRange=6`, `stepUnits=h`, instant) |
 | Cycle | `20260721 00Z` (`dataDate=20260721`, `dataTime=0`) |
 | Level | Surface |
 | Data | Linear ramp `280.0..300.0` K (float32) |
 | Size | 329 bytes |
+
+> The original committed fixture was internally inconsistent: its grid
+> metadata declared `latitudeOfFirstGridPointInDegrees=44.0`,
+> `jDirectionIncrementInDegrees=1.0`, `Nj=5` (implying a last latitude of
+> `40.0`) but stored `latitudeOfLastGridPointInDegrees=0.0`. `cfgrib`
+> decoded that contradiction into a non-uniform latitude axis
+> (`[44, 43, 42, 41, 0]`), which the API serving tier correctly rejects
+> ("grid must be uniformly spaced"). The corrected fixture sets consistent
+> first/last grid points so the decoded axis is uniformly spaced.
 
 ### Regeneration
 This fixture can be regenerated deterministically with:
@@ -51,8 +60,10 @@ with OUT.open("wb") as f:
     codes_set(msg, "gridType", "regular_ll")
     codes_set(msg, "Ni", Ni)
     codes_set(msg, "Nj", Nj)
-    codes_set(msg, "latitudeOfFirstGridPointInDegrees", 44.0)
-    codes_set(msg, "longitudeOfFirstGridPointInDegrees", -120.0)
+    codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+    codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+    codes_set(msg, "latitudeOfLastGridPointInDegrees", 36.0)
+    codes_set(msg, "longitudeOfLastGridPointInDegrees", 259.0)
     codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
     codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
     codes_set_values(msg, values)
@@ -61,5 +72,6 @@ with OUT.open("wb") as f:
 ```
 
 > Note: eccodes rejects a negative `jDirectionIncrement` on the sample
-> grid, so the fixture uses `lat0=44.0` with a positive increment, which
-> `cfgrib` decodes as a north→south latitude axis.
+> grid, so the fixture uses `lat0=40.0` with a positive increment, which
+> `cfgrib` decodes as a north→south latitude axis. Both the first and last
+> grid points must be set so the decoded axis is uniformly spaced.

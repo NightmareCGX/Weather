@@ -276,3 +276,40 @@ def test_probabilities_western_hemisphere_on_0_360_store(longitude_client):
     lower, upper = data["confidence_interval_95"]
     assert 0.0 <= lower <= data["probability"] <= upper <= 1.0
     assert len(members) == MEMBER_COUNT
+
+
+def test_normalize_grid_longitudes_fully_western_0_360_axis():
+    """A 0-360 axis confined to the western hemisphere maps to -180..180.
+
+    cfgrib decodes every valid GRIB grid in the native 0..360 convention. A
+    western-subset store (e.g. a small GFS grid covering lon 250..259) therefore
+    arrives with an origin above 180, which RegularGrid cannot represent. The
+    serving tier must shift such an axis into [-180, 180] while preserving
+    order and spacing.
+    """
+    from api.services.point_forecast import _normalize_grid_longitudes
+
+    western = [250.0, 251.0, 252.0, 253.0, 254.0, 255.0, 256.0, 257.0, 258.0, 259.0]
+    normalized = _normalize_grid_longitudes(western)
+    assert normalized[0] == pytest.approx(-110.0)
+    assert normalized[-1] == pytest.approx(-101.0)
+    # Order and uniform spacing are preserved by the exact 360-degree shift.
+    assert normalized == pytest.approx([-110.0, -109.0, -108.0, -107.0, -106.0,
+                                        -105.0, -104.0, -103.0, -102.0, -101.0])
+
+
+def test_normalize_grid_longitudes_leaves_other_conventions_unchanged():
+    """Axes that are not fully western are not shifted.
+
+    A global 0..360 axis (origin 0) and an already -180..180 axis must pass
+    through unchanged so ``RegularGrid.align_longitude`` maps western queries
+    into the 0..360 store as documented.
+    """
+    from api.services.point_forecast import _normalize_grid_longitudes
+
+    global_axis = list(range(0, 360, 20))
+    assert _normalize_grid_longitudes(global_axis) == global_axis
+    minus_180_axis = [-107.0, -106.0, -105.0, -104.0]
+    assert _normalize_grid_longitudes(minus_180_axis) == minus_180_axis
+    # An empty axis is returned unchanged.
+    assert _normalize_grid_longitudes([]) == []

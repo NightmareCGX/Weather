@@ -5,19 +5,17 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-# Ensure absolute path to services/api/src is added
+# Ensure absolute path to services/api/src is added. This must happen before
+# the api.* imports below, so Alembic can resolve the application models no
+# matter what working directory it is invoked from. The imports are therefore
+# deliberately not at module top level (ruff E402 is suppressed for them).
 current_dir = os.path.dirname(__file__)
 src_dir = os.path.abspath(os.path.join(current_dir, "src"))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-# Also explicitly add root package path if needed
-workspace_src = os.path.abspath(os.path.join(current_dir, "..", "src"))
-if workspace_src not in sys.path:
-    sys.path.insert(0, workspace_src)
-
-from api.core.database import Base
-from api.models import *  # noqa
+from api.core.database import Base  # noqa: E402
+from api.models import *  # noqa: E402,F403  # noqa: E402 - import ordering; F403 - star import required for Alembic metadata
 
 config = context.config
 

@@ -44,6 +44,29 @@ GRIB_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures",
                             "gfs.t00z.pgrb2.0p25.f006.grib2")
 
 
+@pytest.fixture(autouse=True)
+def _flush_redis():
+    """Clear Redis before every test in this module.
+
+    The point-forecast endpoints cache responses in Redis keyed by a SHA-256
+    digest of the normalized request. Several tests here ingest a ``gfs`` run
+    and query the same ``(lat, lon)`` point, so they share the exact same cache
+    key; without clearing Redis, an earlier test's cached response can satisfy
+    a later test without the later test's own ingestion path being exercised.
+    Flushing Redis per test guarantees each test starts from a clean cache and
+    genuinely executes its own pipeline (see the Milestone 1-11 remediation of
+    the CLI production-entrypoint integration test).
+    """
+    import redis as redis_lib
+
+    from api.core.config import settings
+
+    client = redis_lib.from_url(settings.REDIS_URL)
+    client.flushall()
+    client.close()
+    yield
+
+
 def _build_dataset() -> xr.Dataset:
     """A deterministic dataset matching the API fixture grid geometry.
 

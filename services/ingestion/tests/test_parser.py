@@ -10,7 +10,9 @@ import xarray as xr
 
 from ingestion.providers.noaa.parser import GribParsingError, normalize, parse_grib2
 
-EXPECTED_LAT = np.array([44.0, 43.0, 42.0, 41.0, 0.0])
+EXPECTED_LAT = np.array([40.0, 39.0, 38.0, 37.0, 36.0])
+#: Longitudes decode in the GRIB native 0..360 convention (250..259 = -110..-101).
+EXPECTED_LON = np.array([250.0, 251.0, 252.0, 253.0, 254.0, 255.0, 256.0, 257.0, 258.0, 259.0])
 
 
 def test_parse_grib2_decodes_normalized_dataset(grib_fixture: Path) -> None:
@@ -25,9 +27,16 @@ def test_parse_grib2_decodes_normalized_dataset(grib_fixture: Path) -> None:
     assert "latitude" in ds.coords
     assert "longitude" in ds.coords
 
-    # Latitude axis matches the fixture's north-to-south grid.
+    # Latitude axis matches the fixture's uniform north-to-south grid.
     assert np.allclose(ds.latitude.values, EXPECTED_LAT)
     assert ds.latitude.values[0] > ds.latitude.values[-1]
+    # The axis must be uniformly spaced so the serving tier can derive a
+    # RegularGrid (a non-uniform axis is rejected as HTTP 500).
+    assert np.allclose(np.diff(ds.latitude.values), ds.latitude.values[1] - ds.latitude.values[0])
+
+    # Longitude decodes in the GRIB native 0..360 convention, uniformly spaced.
+    assert np.allclose(ds.longitude.values, EXPECTED_LON)
+    assert np.allclose(np.diff(ds.longitude.values), ds.longitude.values[1] - ds.longitude.values[0])
 
     # The raw GRIB step / valid_time coords are dropped.
     assert "step" not in ds.coords

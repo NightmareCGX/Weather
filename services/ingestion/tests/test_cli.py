@@ -9,7 +9,6 @@ catalog write is routed to an in-memory SQLite database.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
