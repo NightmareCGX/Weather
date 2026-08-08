@@ -23,12 +23,14 @@ from api.models.entities import (
     EnsembleMember,
     ForecastCenter,
     ForecastGrid,
+    ForecastProduct,
     ForecastVariable,
     Model,
     ModelRun,
     ModelVersion,
     SkiResort,
     Station,
+    VerificationObservation,
 )
 from tests.fixtures import (
     MEMBER_INDICES,
@@ -98,6 +100,64 @@ def tmp_zarr_stores(tmp_path_factory):
     # per-member data.
     write_ensemble_zarr(gefs_store)
     return {"gfs": gfs_store, "gefs": gefs_store}
+
+
+def _seed_verification_observations(session: Session) -> None:
+    """Seed forecast products and verification observations for the gfs run.
+
+    The ready gfs run ``run_2026072100_gfs`` cycles at 2026-07-21T00:00Z and
+    its fixture Zarr store carries lead times [0, 6, 12, 18]. Forecast product
+    rows are seeded for ``temperature_2m`` and ``precipitation_rate`` across
+    those leads so ``/v1/verifications`` can pair observations with forecast
+    values. Each observation below has a valid time matching exactly one
+    product (2026-07-21T06:00Z = 00Z+6h; 2026-07-21T18:00Z = 00Z+18h), so it
+    yields a single forecast/observation pair.
+    """
+    lead_times = [0, 6, 12, 18]
+    session.add_all(
+        [
+            ForecastProduct(
+                id=f"product_gfs_temperature_2m_{lead}",
+                run_id="run_2026072100_gfs",
+                variable_id="temperature_2m",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=lead,
+            )
+            for lead in lead_times
+        ]
+    )
+    session.add_all(
+        [
+            ForecastProduct(
+                id=f"product_gfs_precipitation_rate_{lead}",
+                run_id="run_2026072100_gfs",
+                variable_id="precipitation_rate",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=lead,
+            )
+            for lead in lead_times
+        ]
+    )
+    session.add_all(
+        [
+            VerificationObservation(
+                id="obs_20260721_06z_temperature_2m",
+                station_id="KASE",
+                valid_time=datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc),
+                variable_code="temperature_2m",
+                observed_value=20.0,
+            ),
+            VerificationObservation(
+                id="obs_20260721_18z_precipitation_rate",
+                station_id="KASE",
+                valid_time=datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc),
+                variable_code="precipitation_rate",
+                observed_value=12.0,
+            ),
+        ]
+    )
 
 
 def _seed_locations(session: Session) -> None:
@@ -264,6 +324,7 @@ def seed_data(migrated_db, tmp_zarr_stores):
             ]
         )
         _seed_locations(session)
+        _seed_verification_observations(session)
         session.commit()
     yield
 

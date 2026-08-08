@@ -459,6 +459,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
   ```
 - **HTTP Status Codes**: `200 OK`, `400 Bad Request`.
 - **Cache Policy**: `public, max-age=86400`.
+  *Notes (implemented interpretation of unspecified behavior)*: The contract does not specify how multiple forecast cycles / lead times are aggregated into the flat per-variable metrics, nor what is returned when a valid request has no forecast/observation pairs. Two deterministic implementation decisions resolve this (approved for Milestone 11): **(1) pool-all aggregation** — every ready forecast product of the requested model whose `cycle_time + lead_time_hours` equals an observation's `valid_time` contributes one `(observed, forecast)` pair, and RMSE/bias/MAE are computed per variable over the pooled sample of all such pairs across the window (no single cycle or lead time is selected); **(2) empty result** — a valid request with no forecast/observation pairs returns `200 OK` with `metrics: {}`.
 
 ---
 

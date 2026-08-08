@@ -5,7 +5,7 @@ These models reproduce the response envelope and resource shapes defined in
 no weather calculations or database access live here.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, field_serializer, model_serializer
@@ -298,5 +298,62 @@ class EnsembleStatisticsEnvelope(BaseModel):
 
     object: Literal["ensemble_statistics"] = "ensemble_statistics"
     data: EnsembleStatisticsData
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+class VerificationPeriod(BaseModel):
+    """The verification date window (API.md section 7.1).
+
+    ``start`` and ``end`` are inclusive calendar dates (the window spans
+    ``[start 00:00:00Z, end + 1 day)``).
+    """
+
+    start: date
+    end: date
+
+
+class VerificationReportData(BaseModel):
+    """The payload of a verification report (API.md section 7.1).
+
+    ``metrics`` maps a flat per-variable key (``{variable}_rmse``,
+    ``{variable}_bias``, ``{variable}_mae``) to its value. A variable with no
+    valid forecast/observation pairs in the window contributes no keys, so
+    ``metrics`` may be empty.
+    """
+
+    model: str
+    period: VerificationPeriod
+    metrics: dict[str, float]
+
+
+class VerificationReportEnvelope(BaseModel):
+    """The verification report response envelope (API.md sections 7.1 and 2.3)."""
+
+    object: Literal["verification_report"] = "verification_report"
+    data: VerificationReportData
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+class HealthCheckData(BaseModel):
+    """The payload of a system health check (API.md section 8.1).
+
+    ``status`` is ``healthy`` when every dependency is connected and
+    ``degraded`` otherwise. ``version`` is the API contract version.
+    """
+
+    status: str
+    version: str
+    database: str
+    redis: str
+    object_storage: str
+
+
+class HealthCheckEnvelope(BaseModel):
+    """The health check response envelope (API.md sections 8.1 and 2.3)."""
+
+    object: Literal["health_check"] = "health_check"
+    data: HealthCheckData
     has_more: bool = False
     next_cursor: str | None = None
