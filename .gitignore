@@ -49,3 +49,16 @@ Thumbs.db
 # cfgrib writes a per-GRIB2 "*.idx" file next to the source when decoding;
 # it embeds an absolute path and is regenerated deterministically on demand.
 *.idx
+
+# --- Node.js / Next.js (Milestone 12) ---
+# package-lock.json is intentionally NOT ignored: it is committed so npm
+# installs are reproducible.
+node_modules/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
