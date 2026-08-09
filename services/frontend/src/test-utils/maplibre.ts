@@ -12,6 +12,9 @@
 /** Instances of {@link MockMap} created since the last {@link clearInstances}. */
 const instances: MockMap[] = [];
 
+/** Markers created since the last {@link clearMarkers}. */
+const markers: MockMarker[] = [];
+
 export function clearInstances(): void {
   instances.length = 0;
 }
@@ -20,16 +23,27 @@ export function getInstances(): MockMap[] {
   return instances;
 }
 
+export function clearMarkers(): void {
+  markers.length = 0;
+}
+
+export function getMarkers(): MockMarker[] {
+  return markers;
+}
+
 export class MockMap {
   options: Record<string, unknown>;
-  handlers = new Map<string, () => void>();
+  handlers = new Map<string, (payload?: unknown) => void>();
   sources = new Set<string>();
   layers = new Set<string>();
   removed = false;
   isLoaded = true;
 
-  on = jest.fn((event: string, handler: () => void) => {
+  on = jest.fn((event: string, handler: (payload?: unknown) => void) => {
     this.handlers.set(event, handler);
+  });
+  off = jest.fn((event: string) => {
+    this.handlers.delete(event);
   });
   addControl = jest.fn();
   addSource = jest.fn((id: string) => {
@@ -56,10 +70,38 @@ export class MockMap {
     instances.push(this);
   }
 
-  /** Invoke a registered event handler (e.g. the `load` handler). */
-  fire(event: string): void {
+  /**
+   * Invoke a registered event handler with an optional payload (e.g. a click
+   * event carrying `lngLat`).
+   */
+  fire(event: string, payload?: unknown): void {
     const handler = this.handlers.get(event);
-    handler?.();
+    handler?.(payload);
+  }
+}
+
+/** A mock of the MapLibre `Marker` class (used by `WeatherMap`). */
+export class MockMarker {
+  options: Record<string, unknown>;
+  coordinates: unknown = null;
+  addedTo: MockMap | null = null;
+  removed = false;
+
+  setLngLat = jest.fn((lngLat: unknown) => {
+    this.coordinates = lngLat;
+    return this;
+  });
+  addTo = jest.fn((map: MockMap) => {
+    this.addedTo = map;
+    return this;
+  });
+  remove = jest.fn(() => {
+    this.removed = true;
+  });
+
+  constructor(options: Record<string, unknown> = {}) {
+    this.options = options;
+    markers.push(this);
   }
 }
 

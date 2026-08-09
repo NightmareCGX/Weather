@@ -6,6 +6,7 @@ const createJestConfig = nextJest({
 
 const customJestConfig = {
   testEnvironment: "jsdom",
+  testMatch: ["<rootDir>/src/**/*.{test,spec}.{ts,tsx}"],
   setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
   moduleNameMapper: {
     "^maplibre-gl$": "<rootDir>/__mocks__/maplibre-gl.ts",

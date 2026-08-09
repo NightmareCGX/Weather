@@ -365,11 +365,13 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 #### 5.1 Get Ensemble Statistics & Spread
 - **HTTP Method**: `GET`
 - **Endpoint**: `/v1/ensembles`
-- **Purpose**: Return statistical dispersion (mean, spread, P10, P25, P50, P75, P90) across ensemble perturbation members for a given `lead_time_hours`.
+- **Purpose**: Return statistical dispersion (mean, spread, P10, P25, P50, P75, P90) across ensemble perturbation members for a given `lead_time_hours`. When `include_members=true`, the response additionally carries the genuine raw ensemble-member forecast values for detailed distribution inspection (e.g. histogram / member-dot visualization).
 - **Required Parameters**: `lat`, `lon`, `variable`, `model` (default `gefs`).
-- **Optional Parameters**: `lead_time_hours` (integer offset hours from cycle time; **Default**: `0`). When omitted, the initial forecast at the 0-hour lead is returned.
-- **Example Request**: `GET /v1/ensembles?lat=39.19&lon=-106.81&variable=temperature_2m&model=gefs&lead_time_hours=18`
-- **Example Response**:
+- **Optional Parameters**:
+  - `lead_time_hours` (integer offset hours from cycle time; **Default**: `0`). When omitted, the initial forecast at the 0-hour lead is returned.
+  - `include_members` (boolean; **Default**: `false`). When `true`, the response includes the `members` array of raw ensemble-member forecast values for the requested model, location, variable, and lead time.
+- **Example Request (statistics only)**: `GET /v1/ensembles?lat=39.19&lon=-106.81&variable=temperature_2m&model=gefs&lead_time_hours=18`
+- **Example Response (statistics only)**:
   ```json
   {
     "object": "ensemble_statistics",
@@ -392,8 +394,34 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
+- **Example Request (distribution)**: `GET /v1/ensembles?lat=39.19&lon=-106.81&variable=temperature_2m&model=gefs&lead_time_hours=18&include_members=true`
+- **Example Response (distribution)**:
+  ```json
+  {
+    "object": "ensemble_statistics",
+    "data": {
+      "model": "gefs",
+      "lead_time_hours": 18,
+      "member_count": 31,
+      "statistics": {
+        "mean": 15.1,
+        "median": 15.0,
+        "spread": 2.7,
+        "p10": 12.4,
+        "p25": 13.8,
+        "p50": 15.0,
+        "p75": 16.5,
+        "p90": 17.8
+      },
+      "members": [12.4, 13.2, 14.0, 14.8, 15.0, 15.1, 16.5, 17.0, 17.8]
+    },
+    "has_more": false,
+    "next_cursor": null
+  }
+  ```
+- **`members` semantics**: each element is one genuine ensemble member's interpolated forecast value for the requested model, latitude/longitude, variable, and lead time, in the dataset's `member`-coordinate order. Member-level data is **opt-in** (`include_members=true`) because it is intended for detailed distribution inspection; the statistics-only default keeps multi-lead timeline requests lightweight. When `include_members=true`, the invariant `member_count == len(members)` holds, and the returned `statistics` (mean, median, spread, P10–P90) are computed from that exact same member array. The `members` key is omitted entirely when `include_members=false` (or omitted).
 - **HTTP Status Codes**: `200 OK`, `404 Not Found` (unknown model/variable, no ready run, location outside grid, lead time unavailable), `422 Unprocessable Entity` (validation, non-ensemble model). *`400 Bad Request` / `401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
-- **Cache Policy**: `public, max-age=1800`.
+- **Cache Policy**: `public, max-age=1800`. The cache key distinguishes `include_members=true` from `false`, so a statistics-only cached response can never satisfy a distribution request and vice versa.
 
 ---
 

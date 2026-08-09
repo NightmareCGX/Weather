@@ -285,12 +285,34 @@ class EnsembleStatistics(BaseModel):
 
 
 class EnsembleStatisticsData(BaseModel):
-    """The payload of ensemble statistics (API.md section 5.1)."""
+    """The payload of ensemble statistics (API.md section 5.1).
+
+    ``members`` carries the raw ensemble-member forecast values (in dataset
+    ``member``-coordinate order) for the requested model, location, variable,
+    and lead time. It is an opt-in field returned only when the request sets
+    ``include_members=true``; it is serialized only when present so a
+    statistics-only response never exposes a ``null`` ``members`` key (API.md
+    section 5.1, additive opt-in extension).
+    """
 
     model: str
     lead_time_hours: int
     member_count: int
     statistics: EnsembleStatistics
+    members: list[float] | None = None
+
+    @model_serializer
+    def _serialize_members(self) -> dict[str, object]:
+        """Omit ``members`` unless present (include_members=true)."""
+        payload: dict[str, object] = {
+            "model": self.model,
+            "lead_time_hours": self.lead_time_hours,
+            "member_count": self.member_count,
+            "statistics": self.statistics,
+        }
+        if self.members is not None:
+            payload["members"] = self.members
+        return payload
 
 
 class EnsembleStatisticsEnvelope(BaseModel):

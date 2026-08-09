@@ -51,12 +51,20 @@ def get_ensemble_statistics(
     lead_time_hours: Annotated[
         int, Query(ge=0, description="Forecast offset hours from cycle time.")
     ] = 0,
+    # ``include_members`` is an opt-in additive extension (API.md section 5.1):
+    # when true, the response additionally carries the raw ensemble-member
+    # forecast values for the Ensemble Distribution View. Statistics-only
+    # requests (the default) stay lightweight and omit the member array.
+    include_members: Annotated[
+        bool, Query(description="Return raw ensemble-member forecast values.")
+    ] = False,
     db: Session = DB,
 ) -> EnsembleStatisticsEnvelope:
     """Return ensemble dispersion statistics for a forecast variable.
 
     The ensemble model (default ``gefs``) must exist and be an ensemble model;
-    member values are interpolated at the requested point and lead time.
+    member values are interpolated at the requested point and lead time. When
+    ``include_members=true`` the genuine raw member values are attached.
     """
     cache_key = build_ensemble_cache_key(
         model=model,
@@ -64,17 +72,20 @@ def get_ensemble_statistics(
         longitude=lon,
         variable=variable,
         lead_time_hours=lead_time_hours,
+        include_members=include_members,
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&model={model}"
-        f"&lead_time_hours={lead_time_hours}"
+        f"&lead_time_hours={lead_time_hours}&include_members={include_members}"
     )
 
     envelope = _cache.compute_or_retrieve(
         db,
         cache_key,
         query_params,
-        lambda: _compute(db, lat, lon, variable, model, lead_time_hours),
+        lambda: _compute(
+            db, lat, lon, variable, model, lead_time_hours, include_members
+        ),
         model_type=EnsembleStatisticsEnvelope,
     )
     response.headers["Cache-Control"] = CACHE_CONTROL_ENSEMBLE
@@ -88,6 +99,7 @@ def _compute(
     variable: str,
     model: str,
     lead_time_hours: int,
+    include_members: bool,
 ) -> EnsembleStatisticsEnvelope:
     data = build_ensemble_statistics(
         db,
@@ -96,5 +108,6 @@ def _compute(
         variable=variable,
         model=model,
         lead_time_hours=lead_time_hours,
+        include_members=include_members,
     )
     return EnsembleStatisticsEnvelope(data=data)

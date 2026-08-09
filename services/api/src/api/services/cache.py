@@ -341,11 +341,15 @@ def build_ensemble_cache_key(
     longitude: float,
     variable: str,
     lead_time_hours: int,
+    include_members: bool = False,
 ) -> str:
     """Build a deterministic cache key for an ensemble statistics request.
 
     The key is a SHA-256 digest of a canonical JSON payload, following the
-    same convention as :func:`build_point_cache_key`.
+    same convention as :func:`build_point_cache_key`. ``include_members`` is
+    part of the key so a statistics-only cached response (which omits the
+    member array) can never satisfy a distribution request, and a member-heavy
+    response can never satisfy a statistics-only request.
     """
     payload = {
         "model": model,
@@ -353,6 +357,7 @@ def build_ensemble_cache_key(
         "longitude": longitude,
         "variable": variable,
         "lead_time_hours": lead_time_hours,
+        "include_members": include_members,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "ensemble:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

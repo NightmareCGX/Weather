@@ -4,6 +4,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import "./globals.css";
 
 import { MapConfigProvider } from "@/context/map-config";
+import { SelectedLocationProvider } from "@/context/selected-location";
 
 export const metadata: Metadata = {
   title: "Weather Platform",
@@ -14,7 +15,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
-        <MapConfigProvider>{children}</MapConfigProvider>
+        <MapConfigProvider>
+          <SelectedLocationProvider>{children}</SelectedLocationProvider>
+        </MapConfigProvider>
       </body>
     </html>
   );

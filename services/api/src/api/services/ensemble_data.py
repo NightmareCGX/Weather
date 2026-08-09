@@ -148,6 +148,7 @@ def build_ensemble_statistics(
     variable: str,
     model: str,
     lead_time_hours: int,
+    include_members: bool = False,
 ) -> EnsembleStatisticsData:
     """Build ensemble statistics for a resolved point.
 
@@ -157,6 +158,12 @@ def build_ensemble_statistics(
     median, population spread, and P10/P25/P50/P75/P90 percentiles are
     computed by ``domain.ensemble``.
 
+    When ``include_members`` is true, the genuine raw member values (the exact
+    same array the statistics are computed from, in dataset ``member``-
+    coordinate order) are attached to the payload. This is an opt-in,
+    additive extension for the Ensemble Distribution View: statistics-only
+    requests (the default) stay lightweight and omit the member array.
+
     Args:
         db: Database session.
         latitude: Latitude in decimal degrees.
@@ -164,6 +171,8 @@ def build_ensemble_statistics(
         variable: A documented ``forecast_variables`` catalog code.
         model: A single ensemble model identifier.
         lead_time_hours: Forecast offset hours from the run's cycle time.
+        include_members: Whether to attach the raw member values used to
+            compute the statistics.
 
     Returns:
         The ensemble statistics payload.
@@ -194,6 +203,7 @@ def build_ensemble_statistics(
             p75=ensemble_percentile(members, 75),
             p90=ensemble_percentile(members, 90),
         ),
+        members=members if include_members else None,
     )
 
 

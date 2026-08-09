@@ -176,3 +176,112 @@ def test_ensembles_bad_coordinates_422(client):
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_ensembles_default_omits_members(client):
+    """The default request returns the existing statistics contract only."""
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m"
+        f"&lead_time_hours={LEAD}"
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert "members" not in data
+    assert data["member_count"] == MEMBER_COUNT
+    assert set(data["statistics"]) == {
+        "mean",
+        "median",
+        "spread",
+        "p10",
+        "p25",
+        "p50",
+        "p75",
+        "p90",
+    }
+
+
+def test_ensembles_explicit_false_omits_members(client):
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m"
+        f"&lead_time_hours={LEAD}&include_members=false"
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert "members" not in data
+    assert data["member_count"] == MEMBER_COUNT
+
+
+def test_ensembles_include_members_returns_genuine_values(client):
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m"
+        f"&lead_time_hours={LEAD}&include_members=true"
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+
+    expected_members = [
+        ensemble_temperature_at(member, LAT, LON, LEAD) for member in MEMBER_INDICES
+    ]
+    assert data["members"] == pytest.approx(expected_members)
+    assert data["member_count"] == len(data["members"])
+
+
+def test_ensembles_members_match_statistics(client):
+    """Statistics are computed from the exact member array returned."""
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m"
+        f"&lead_time_hours={LEAD}&include_members=true"
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    members = data["members"]
+
+    expected = _expected_statistics(members)
+    stats = data["statistics"]
+    assert data["member_count"] == len(members)
+    assert stats["mean"] == pytest.approx(expected["mean"])
+    assert stats["median"] == pytest.approx(expected["median"])
+    assert stats["spread"] == pytest.approx(expected["spread"])
+    assert stats["p10"] == pytest.approx(expected["p10"])
+    assert stats["p25"] == pytest.approx(expected["p25"])
+    assert stats["p50"] == pytest.approx(expected["p50"])
+    assert stats["p75"] == pytest.approx(expected["p75"])
+    assert stats["p90"] == pytest.approx(expected["p90"])
+
+
+def test_ensembles_cache_separates_members_flag(client):
+    """include_members=true and false must not collide in the cache.
+
+    A statistics-only cached response (no members) must never satisfy a
+    distribution request, and vice versa. Two requests that differ only in the
+    flag must produce distinct payloads (members present vs. absent) even when
+    served from the cache on the second call.
+    """
+    stats_url = (
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m"
+        f"&lead_time_hours={LEAD}"
+    )
+    dist_url = stats_url + "&include_members=true"
+
+    resp_stats = client.get(stats_url)
+    resp_dist = client.get(dist_url)
+    assert resp_stats.status_code == 200
+    assert resp_dist.status_code == 200
+
+    stats_data = resp_stats.json()["data"]
+    dist_data = resp_dist.json()["data"]
+    assert "members" not in stats_data
+    assert "members" in dist_data
+
+    # Second call on each URL must be served (cache hit) and still be distinct.
+    resp_stats2 = client.get(stats_url)
+    resp_dist2 = client.get(dist_url)
+    assert "members" not in resp_stats2.json()["data"]
+    assert "members" in resp_dist2.json()["data"]
+    assert resp_stats2.json()["data"]["statistics"] == stats_data["statistics"]
+    assert resp_dist2.json()["data"]["statistics"] == dist_data["statistics"]

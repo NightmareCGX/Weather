@@ -1,4 +1,13 @@
-import { ApiError, getMapLayer, listModels } from "@/lib/api/client";
+import {
+  ApiError,
+  getEnsembleStatistics,
+  getMapLayer,
+  getPointForecast,
+  listModels,
+  listVariables,
+  RequestAbortedError,
+  searchLocations,
+} from "@/lib/api/client";
 
 const mockFetch = jest.fn<Promise<Response>, [RequestInfo | URL, RequestInit?]>();
 
@@ -136,5 +145,267 @@ describe("getMapLayer", () => {
       param: "level",
       requestId: "req_123",
     });
+  });
+});
+
+function envelopeList(body: unknown) {
+  return jsonResponse({ object: "list", data: body, has_more: false, next_cursor: null });
+}
+
+describe("searchLocations", () => {
+  it("requests /v1/search with q, default type=all, and returns results", async () => {
+    mockFetch.mockResolvedValueOnce(
+      envelopeList([
+        {
+          id: "city_aspen",
+          object: "city",
+          name: "Aspen",
+          region: "Colorado",
+          country: "USA",
+          elevation_m: null,
+          latitude: 38.19,
+          longitude: -106.82,
+        },
+      ])
+    );
+
+    const results = await searchLocations({ q: "Aspen" });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/search?q=Aspen&type=all",
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/json" }) })
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].id).toBe("city_aspen");
+    expect(results[0].object).toBe("city");
+  });
+
+  it("passes type and limit and an abort signal", async () => {
+    mockFetch.mockResolvedValueOnce(envelopeList([]));
+    const controller = new AbortController();
+
+    await searchLocations({ q: "Aspen", type: "resort", limit: 5, signal: controller.signal });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/search?q=Aspen&type=resort&limit=5",
+      expect.objectContaining({ signal: controller.signal })
+    );
+  });
+});
+
+describe("getPointForecast", () => {
+  it("queries by coordinates with models and units", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        object: "point_forecast",
+        data: {
+          location: {
+            latitude: 38.19,
+            longitude: -106.82,
+            elevation_m: null,
+            resolved_via: "coordinates",
+          },
+          generated_at: "2026-07-21T00:00:00Z",
+          model: "gfs",
+          forecasts: [
+            { lead_time_hours: 6, valid_time: "2026-07-21T06:00:00Z", temperature_2m: 15.0 },
+          ],
+        },
+        has_more: false,
+        next_cursor: null,
+      })
+    );
+
+    const forecast = await getPointForecast({
+      location: { type: "coordinates", latitude: 38.19, longitude: -106.82 },
+      variables: ["temperature_2m"],
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/points?models=gfs&units=metric&lat=38.19&lon=-106.82&variables=temperature_2m",
+      expect.any(Object)
+    );
+    expect(forecast.model).toBe("gfs");
+    expect(forecast.forecasts[0].temperature_2m).toBe(15.0);
+  });
+
+  it("uses city_id / resort_id specifiers and lead-time window", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        object: "point_forecast",
+        data: {
+          location: {
+            latitude: 38.19,
+            longitude: -106.82,
+            elevation_m: 3417,
+            resolved_via: "resort",
+          },
+          generated_at: "2026-07-21T00:00:00Z",
+          model: "gfs",
+          forecasts: [],
+        },
+        has_more: false,
+        next_cursor: null,
+      })
+    );
+
+    await getPointForecast({
+      location: { type: "resort", resortId: "resort_aspen_mountain" },
+      startLeadTimeHours: 0,
+      endLeadTimeHours: 18,
+    });
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/points?models=gfs&units=metric&resort_id=resort_aspen_mountain&start_lead_time_hours=0&end_lead_time_hours=18",
+      expect.any(Object)
+    );
+
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        object: "point_forecast",
+        data: {
+          location: {
+            latitude: 38.19,
+            longitude: -106.82,
+            elevation_m: null,
+            resolved_via: "city",
+          },
+          generated_at: "2026-07-21T00:00:00Z",
+          model: "gfs",
+          forecasts: [],
+        },
+        has_more: false,
+        next_cursor: null,
+      })
+    );
+    await getPointForecast({ location: { type: "city", cityId: "city_aspen" } });
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/points?models=gfs&units=metric&city_id=city_aspen",
+      expect.any(Object)
+    );
+  });
+});
+
+describe("getEnsembleStatistics", () => {
+  it("requests /v1/ensembles with lat/lon/variable/model/lead and returns stats", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        object: "ensemble_statistics",
+        data: {
+          model: "gefs",
+          lead_time_hours: 6,
+          member_count: 5,
+          statistics: {
+            mean: 17.5,
+            median: 17.5,
+            spread: 3.16,
+            p10: 13.9,
+            p25: 15.5,
+            p50: 17.5,
+            p75: 19.5,
+            p90: 21.1,
+          },
+        },
+        has_more: false,
+        next_cursor: null,
+      })
+    );
+
+    const data = await getEnsembleStatistics({
+      latitude: 38.19,
+      longitude: -106.82,
+      variable: "temperature_2m",
+      leadTimeHours: 6,
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&lead_time_hours=6",
+      expect.any(Object)
+    );
+    expect(data.member_count).toBe(5);
+    expect(data.statistics.p50).toBe(17.5);
+    // The statistics-only default omits members.
+    expect(data.members).toBeUndefined();
+  });
+
+  it("requests include_members=true when opted in and returns members", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        object: "ensemble_statistics",
+        data: {
+          model: "gefs",
+          lead_time_hours: 6,
+          member_count: 5,
+          statistics: {
+            mean: 17.5,
+            median: 17.5,
+            spread: 3.16,
+            p10: 13.9,
+            p25: 15.5,
+            p50: 17.5,
+            p75: 19.5,
+            p90: 21.1,
+          },
+          members: [15.5, 17.5, 19.5, 21.5, 23.5],
+        },
+        has_more: false,
+        next_cursor: null,
+      })
+    );
+
+    const data = await getEnsembleStatistics({
+      latitude: 38.19,
+      longitude: -106.82,
+      variable: "temperature_2m",
+      leadTimeHours: 6,
+      includeMembers: true,
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&lead_time_hours=6&include_members=true",
+      expect.any(Object)
+    );
+    expect(data.members).toEqual([15.5, 17.5, 19.5, 21.5, 23.5]);
+    expect(data.members?.length).toBe(5);
+  });
+});
+
+describe("listVariables", () => {
+  it("requests /v1/variables and returns catalog resources", async () => {
+    mockFetch.mockResolvedValueOnce(
+      envelopeList([
+        { id: "temperature_2m", object: "variable", name: "2-Meter Temperature", unit: "°C" },
+      ])
+    );
+
+    const variables = await listVariables();
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/variables",
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/json" }) })
+    );
+    expect(variables[0].unit).toBe("°C");
+  });
+});
+
+describe("request cancellation", () => {
+  it("throws RequestAbortedError when the fetch aborts", async () => {
+    mockFetch.mockImplementationOnce(() =>
+      Promise.reject(new DOMException("Aborted", "AbortError"))
+    );
+
+    const error = await searchLocations({ q: "x", signal: new AbortController().signal }).catch(
+      (err: unknown) => err
+    );
+
+    expect(error).toBeInstanceOf(RequestAbortedError);
+  });
+
+  it("throws ApiError with status 0 on a genuine network failure", async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    const error = await searchLocations({ q: "x" }).catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 0, type: "network_error" });
   });
 });
