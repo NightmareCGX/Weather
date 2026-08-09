@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from api.middleware import REQUEST_ID_HEADER
 from api.schemas import ErrorDetail, ErrorEnvelope
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,15 @@ def _error_response(
             request_id=request_id,
         )
     ).model_dump(mode="json")
-    return JSONResponse(status_code=status_code, content=payload)
+    response = JSONResponse(status_code=status_code, content=payload)
+    # API.md section 2.7 requires ``X-Request-Id`` on every response. For
+    # unhandled 500s the generic ``Exception`` handler runs on Starlette's
+    # outermost ServerErrorMiddleware, outside ``RequestIDMiddleware``, so the
+    # middleware's post-``call_next`` header assignment never executes. Set the
+    # header here so every RFC 7807 error response carries it consistently.
+    if request_id is not None:
+        response.headers[REQUEST_ID_HEADER] = request_id
+    return response
 
 
 async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
