@@ -495,6 +495,23 @@ jobs:
           curl -sf http://127.0.0.1:8000/docs >/dev/null || { echo "API /docs FAILED"; docker logs api-smoke; exit 1; }
           docker rm -f api-smoke
 
+      # The API serving tier calls ``xr.open_zarr`` (api/core/zarr.py) in
+      # production, which lazily imports the ``zarr``/``numcodecs`` runtime
+      # stack. Prove the image actually ships that stack by opening a real Zarr
+      # store through the API's production reader path — an import-only smoke
+      # would not catch a missing runtime dependency. The store is created and
+      # read using the image's own venv (no host Python deps needed).
+      - name: Smoke test API Zarr-serving (xr.open_zarr)
+        run: |
+          docker run --rm \
+            --entrypoint python \
+            -e MINIO_ENDPOINT=localhost:9000 \
+            -e MINIO_ACCESS_KEY=minio_admin \
+            -e MINIO_SECRET_KEY=minio_password \
+            -e MINIO_SECURE=false \
+            -v /tmp/api-zarr-smoke:/store \
+            weather-api:ci -c "import os, numpy as np, xarray as xr; os.makedirs('/store', exist_ok=True); ds = xr.Dataset({'temperature_2m': (('lead_time_hours','latitude','longitude'), np.zeros((1,2,2)))}, coords={'lead_time_hours':[6],'latitude':[38.0,39.0],'longitude':[-107.0,-106.0]}); ds.to_zarr('/store/store.zarr', mode='w'); import sys; sys.path.insert(0, '/app/services/api/src'); from api.core.zarr import read_dataset; back = read_dataset('/store/store.zarr'); assert 'temperature_2m' in back.data_vars; print('API Zarr-serving OK; vars', list(back.data_vars))" || { echo "API Zarr-serving smoke FAILED"; exit 1; }
+
       - name: Smoke test frontend (/)
         run: |
           docker run -d --name fe-smoke -p 3000:3000 weather-frontend:ci
@@ -507,7 +524,17 @@ jobs:
           curl -sf http://127.0.0.1:3000/ >/dev/null || { echo "frontend / FAILED"; docker logs fe-smoke; exit 1; }
           docker rm -f fe-smoke
 
-      - name: Smoke test ingestion (--help)
+      # The ingestion image's core purpose is GRIB2 decoding, so the smoke test
+      # must actually decode a real GRIB file inside the container. ``--help``
+      # never loads cfgrib/ecCodes, so it cannot prove the native libeccodes
+      # dependency is present. Decode the committed fixture via the image's venv
+      # and fail if ecCodes cannot load or the decode does not yield the expected
+      # variable. (The fixture path is inside the build context; the runtime
+      # stage's working directory is /app/services/ingestion.)
+      - name: Smoke test ingestion (real GRIB2 decode)
         run: |
-          docker run --rm weather-ingestion:ci --help || { echo "ingestion --help FAILED"; exit 1; }
-          echo "ingestion --help OK"
+          docker run --rm \
+            --entrypoint python \
+            -v "$PWD/services/ingestion/tests/fixtures/gfs.t00z.pgrb2.0p25.f006.grib2":/fixture.grib2 \
+            weather-ingestion:ci -c "import sys; sys.path.insert(0, '/app/services/ingestion/src'); import xarray as xr; ds = xr.open_dataset('/fixture.grib2', engine='cfgrib'); assert 't' in ds.data_vars, 'cfgrib decode produced no t variable'; print('GRIB decode OK; t range', float(ds.t.min()), float(ds.t.max()))" || { echo "ingestion GRIB decode FAILED"; exit 1; }
+          echo "ingestion GRIB decode OK"

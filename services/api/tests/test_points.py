@@ -252,6 +252,15 @@ def test_convert_value_metric_noop():
     assert _convert_value(15.0, "°C", "metric") == 15.0
 
 
+def test_convert_kmh_to_mph_label():
+    """The km/h imperial entry converts the value and labels it mph."""
+    from api.services.point_forecast import _SI_TO_IMPERIAL
+
+    label, convert = _SI_TO_IMPERIAL["km/h"]
+    assert label == "mph"
+    assert convert(10.0) == pytest.approx(6.21371, abs=1e-9)
+
+
 def _make_key():
     return build_point_cache_key(
         model="gfs",

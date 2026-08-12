@@ -84,7 +84,9 @@ class ResolvedLocation:
 _SI_TO_IMPERIAL: dict[str, tuple[str, Callable[[float], float]]] = {
     "°C": ("°F", lambda celsius: celsius * 9.0 / 5.0 + 32.0),
     "mm/h": ("in/h", lambda mm: mm / 25.4),
-    "km/h": ("km/h", lambda kmh: kmh * 0.621371),
+    # km/h → mph. No km/h variable is currently implemented, but the entry must
+    # label the converted value as mph (the conversion factor is applied).
+    "km/h": ("mph", lambda kmh: kmh * 0.621371),
 }
 
 

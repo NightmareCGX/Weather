@@ -39,6 +39,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/app/services/ingestion/.venv/bin:$PATH"
 WORKDIR /app
+# cfgrib needs the native ecCodes C library to decode GRIB2. The `eccodes`
+# Python wheel bundles the native library only on Windows (see
+# ci.yml ingestion-tests comment); on Linux the pure-Python wheel requires the
+# system libeccodes, exactly as CI installs. Install the Debian package that
+# provides the runtime `libeccodes.so` so the production image can decode GRIB.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libeccodes-dev \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --create-home --uid 1001 appuser
 COPY --from=builder /app/services/ingestion/.venv /app/services/ingestion/.venv
 COPY --from=builder /app/services/ingestion/src /app/services/ingestion/src

@@ -31,7 +31,12 @@ from ingestion.core.catalog import (
     VariableSpec,
     record_run,
 )
-from ingestion.core.pipeline import _apply_variable_mapping, ingest_grib_file
+from ingestion.core.pipeline import (
+    UnitNormalizationError,
+    _apply_variable_mapping,
+    _normalize_canonical_units,
+    ingest_grib_file,
+)
 from ingestion.providers.noaa.parser import GribParsingError
 
 #: Path to the committed GRIB2 fixture, resolved from this file so the tests
@@ -110,6 +115,117 @@ def test_apply_variable_mapping_renames_source_to_platform() -> None:
     )
     renamed = _apply_variable_mapping(dataset, _spec("/tmp/x").variables)
     assert set(renamed.data_vars) == {"temperature_2m", "precipitation_rate"}
+
+
+def _dataset_with_units(
+    variable_code: str, values, *, source_unit: str
+):
+    """Build a minimal dataset whose data variable carries a GRIB ``units`` attr.
+
+    Mirrors the real GRIB decode shape (``units`` attribute present) so the
+    canonical-unit normalization can be exercised without a binary fixture.
+    ``values`` must be a 2×2 nested list matching the coordinate grid.
+    """
+    import xarray as xr
+
+    return xr.Dataset(
+        {
+            variable_code: (
+                ("latitude", "longitude"),
+                values,
+                {"units": source_unit},
+            )
+        },
+        coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0]},
+    )
+
+
+def test_normalize_temperature_kelvin_to_celsius() -> None:
+    """GRIB Kelvin temperature is converted to the canonical °C at ingestion.
+
+    A representative source value of 280 K must become approximately
+    6.85 °C (the exact conversion is ``value - 273.15``).
+    """
+    dataset = _dataset_with_units(
+        "temperature_2m", [[280.0, 280.0], [280.0, 280.0]], source_unit="K"
+    )
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    normalized = _normalize_canonical_units(dataset, variables)
+    value = float(normalized["temperature_2m"].values[0, 0])
+    assert value == pytest.approx(6.85, abs=1e-9)
+    assert normalized["temperature_2m"].attrs["units"] == "°C"
+
+
+def test_normalize_temperature_real_fixture_is_celsius() -> None:
+    """The real GRIB fixture (native Kelvin) is stored as Celsius.
+
+    The committed fixture decodes to ``t`` values of 280.0..300.0 K. After
+    mapping and canonicalization, the Zarr store must hold Celsius values with
+    a ``units`` attribute of ``°C`` — never raw Kelvin mislabeled as °C.
+    """
+    dataset = _dataset_with_units(
+        "temperature_2m", [[280.0, 285.0], [290.0, 300.0]], source_unit="K"
+    )
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    normalized = _normalize_canonical_units(dataset, variables)
+    values = normalized["temperature_2m"].values
+    assert float(values.min()) == pytest.approx(280.0 - 273.15, abs=1e-9)
+    assert float(values.max()) == pytest.approx(300.0 - 273.15, abs=1e-9)
+    assert normalized["temperature_2m"].attrs["units"] == "°C"
+
+
+def test_normalize_precipitation_rate_kg_m2_s_to_mm_h() -> None:
+    """GFS ``prate`` (kg m-2 s-1) is converted to the canonical mm/h at ingestion.
+
+    For liquid water, 1 kg m-2 == 1 mm water-equivalent depth, so the rate
+    conversion is ``value × 3600`` (seconds → hours). A representative source
+    value of 0.0003 kg m-2 s-1 must become approximately 1.08 mm/h.
+    """
+    dataset = _dataset_with_units(
+        "precipitation_rate",
+        [[0.0003, 0.0003], [0.0003, 0.0003]],
+        source_unit="kg m-2 s-1",
+    )
+    variables = (VariableSpec("precipitation_rate", "Precipitation Rate", "mm/h", "prate"),)
+    normalized = _normalize_canonical_units(dataset, variables)
+    value = float(normalized["precipitation_rate"].values[0, 0])
+    assert value == pytest.approx(1.08, abs=1e-9)
+    assert normalized["precipitation_rate"].attrs["units"] == "mm/h"
+
+
+def test_normalize_leaves_already_canonical_values_unchanged() -> None:
+    """A variable already in the canonical unit is left numerically untouched."""
+    dataset = _dataset_with_units(
+        "temperature_2m", [[15.0, 15.0], [15.0, 15.0]], source_unit="°C"
+    )
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    normalized = _normalize_canonical_units(dataset, variables)
+    assert float(normalized["temperature_2m"].values[0, 0]) == 15.0
+    assert normalized["temperature_2m"].attrs["units"] == "°C"
+
+
+def test_normalize_unknown_source_unit_rejected() -> None:
+    """An unsupported source unit fails clearly instead of a silent mislabel."""
+    dataset = _dataset_with_units(
+        "temperature_2m", [[15.0, 15.0], [15.0, 15.0]], source_unit="°F"
+    )
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    with pytest.raises(UnitNormalizationError):
+        _normalize_canonical_units(dataset, variables)
+
+
+def test_normalize_without_units_attr_is_noop() -> None:
+    """A synthetic dataset with no GRIB units provenance is left untouched."""
+    import xarray as xr
+
+    dataset = xr.Dataset(
+        {"temperature_2m": (("latitude", "longitude"), [[15.0, 15.0], [15.0, 15.0]])},
+        coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0]},
+    )
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    normalized = _normalize_canonical_units(dataset, variables)
+    assert float(normalized["temperature_2m"].values[0, 0]) == 15.0
+    assert "units" not in normalized["temperature_2m"].attrs
 
 
 def test_ingest_grib_file_parses_writes_and_records(

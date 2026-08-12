@@ -23,12 +23,14 @@ worker (e.g. a future Celery task) can call; the console entrypoint
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 import xarray as xr
 
-from ingestion.core.base import LeadTimeMismatchError
+from ingestion.core.base import IngestionError, LeadTimeMismatchError
 from ingestion.core.catalog import (
     ModelRunRecord,
     RunCatalogSpec,
@@ -37,6 +39,50 @@ from ingestion.core.catalog import (
 )
 from ingestion.core.zarr_writer import read_dataset, store_exists, write_dataset
 from ingestion.providers.noaa.parser import parse_grib2
+
+
+class UnitNormalizationError(IngestionError):
+    """Raised when a source GRIB unit cannot be safely canonicalized.
+
+    A mapped variable whose source ``units`` attribute is neither already equal
+    to the target canonical unit nor a known source unit for that target is
+    rejected rather than silently stored under a possibly-wrong label.
+    """
+
+
+def _unit_token(unit: str) -> str:
+    """Return a whitespace/power-symbol normalized token for a unit string.
+
+    GRIB ``units`` strings vary in spelling across producers and eccodes
+    versions (e.g. ``"kg m-2 s-1"`` vs ``"kg m**-2 s**-1"`` vs
+    ``"kg m^-2 s^-1"``). Stripping spaces, ``**``, and ``^`` maps equivalent
+    spellings to one token for table lookup.
+
+    Args:
+        unit: A unit string (e.g. ``"kg m-2 s-1"``).
+
+    Returns:
+        A normalized token (e.g. ``"kgm-2s-1"``).
+    """
+    return unit.replace(" ", "").replace("**", "").replace("^", "").lower()
+
+
+#: Source GRIB unit → canonical (target) unit value transforms.
+#: Keyed by the target canonical unit string (the ``VariableSpec.unit``), then
+#: by the normalized source ``units`` token. Each transform maps a source-unit
+#: array to the equivalent canonical-unit array. Only the currently implemented
+#: platform mappings are present (ENGINEERING_CONTRACT: no speculative units).
+_SOURCE_TO_CANONICAL: dict[
+    str, dict[str, Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]]]
+] = {
+    # GRIB 2-metre temperature ``t`` is Kelvin; canonical is Celsius.
+    "°C": {"k": lambda array: array - 273.15},
+    # GFS ``prate`` is a precipitation rate in kg m-2 s-1; canonical is mm/h.
+    # For liquid water 1 kg m-2 == 1 mm water-equivalent depth, so the
+    # rate conversion is a pure ×3600 (s-1 → h-1). This is a rate conversion,
+    # not an accumulation conversion.
+    "mm/h": {"kgm-2s-1": lambda array: array * 3600.0},
+}
 
 
 def _apply_variable_mapping(
@@ -69,6 +115,66 @@ def _apply_variable_mapping(
     return dataset.rename(rename)
 
 
+def _normalize_canonical_units(
+    dataset: xr.Dataset,
+    variables: tuple[VariableSpec, ...],
+) -> xr.Dataset:
+    """Convert each mapped variable's values to the platform canonical unit.
+
+    The platform stores canonical units in Zarr (Model A, ``docs/API.md``
+    section 2.6 / ``docs/MODELS.md`` section 3): GRIB ``K`` temperature becomes
+    ``°C`` and GFS ``prate`` (``kg m-2 s-1``) becomes ``mm/h``. The conversion
+    is driven by the *actual* GRIB ``units`` attribute on each mapped data
+    variable (not by the variable name alone), so a variable that already
+    carries the canonical unit is left numerically untouched.
+
+    For each mapped variable present in the dataset:
+
+    * if the ``units`` attribute is absent, the variable is left untouched
+      (synthetic in-memory datasets have no GRIB provenance to convert);
+    * if the source unit equals the target canonical unit, values are kept and
+      the ``units`` attribute is normalized to the canonical string;
+    * if the source unit is a known source for the target canonical unit, the
+      values are transformed and the ``units`` attribute set to the canonical;
+    * otherwise the mapping is rejected with :class:`UnitNormalizationError`
+      rather than silently storing values under a possibly-wrong label.
+
+    Args:
+        dataset: The mapped dataset (platform variable names).
+        variables: The run's :class:`VariableSpec` catalog metadata.
+
+    Returns:
+        The dataset with canonical-unit values and ``units`` attributes.
+
+    Raises:
+        UnitNormalizationError: If a mapped variable's source unit is present
+            but is neither the canonical unit nor a known source for it.
+    """
+    for variable in variables:
+        code = variable.code
+        if code not in dataset.data_vars:
+            continue
+        data_array = dataset[code]
+        source_unit = data_array.attrs.get("units")
+        if source_unit is None:
+            continue
+        source_token = _unit_token(str(source_unit))
+        target_unit = variable.unit
+        if source_token == _unit_token(target_unit):
+            data_array.attrs["units"] = target_unit
+            continue
+        transforms = _SOURCE_TO_CANONICAL.get(target_unit)
+        if transforms is None or source_token not in transforms:
+            raise UnitNormalizationError(
+                f"Cannot canonicalize variable '{code}' from source unit "
+                f"'{source_unit}' to canonical unit '{target_unit}': no "
+                "supported conversion is defined."
+            )
+        data_array.values = transforms[source_token](data_array.values)
+        data_array.attrs["units"] = target_unit
+    return dataset
+
+
 def ingest_grib_file(
     spec: RunCatalogSpec,
     grib_path: str | Path,
@@ -88,15 +194,19 @@ def ingest_grib_file(
         1. ``parse_grib2`` decodes and normalizes the GRIB2 file.
         2. Data variables are renamed to the platform vocabulary (per
            ``spec.variables``).
-        3. When ``requested_lead_time_hours`` is given and differs from the
+        3. Values are normalized to the platform canonical units (e.g. GRIB
+           Kelvin temperature to ``°C``, GFS ``prate`` in ``kg m-2 s-1`` to
+           ``mm/h``) and each variable's ``units`` attribute is set to the
+           canonical unit (Model A, ``docs/API.md`` section 2.6).
+        4. When ``requested_lead_time_hours`` is given and differs from the
            file's parsed lead, the ingest is aborted with a
            :class:`LeadTimeMismatchError` instead of silently merging or
            overwriting a lead the caller did not ask for (the file's decoded
            lead is authoritative and is never overridden by the request).
-        4. The single-lead dataset is merged into the cycle store along
+        5. The single-lead dataset is merged into the cycle store along
            ``lead_time_hours`` (re-ingesting a lead replaces it).
-        5. ``write_dataset`` persists the merged dataset to the store.
-        6. ``record_ingested_dataset`` upserts the run (and its catalog rows)
+        6. ``write_dataset`` persists the merged dataset to the store.
+        7. ``record_ingested_dataset`` upserts the run (and its catalog rows)
            with ``status='ready'`` so the API serving tier can serve it.
 
     Args:
@@ -114,6 +224,8 @@ def ingest_grib_file(
 
     Raises:
         GribParsingError: If the GRIB2 file cannot be decoded.
+        UnitNormalizationError: If a mapped variable's source unit cannot be
+            safely canonicalized.
         LeadTimeMismatchError: If ``requested_lead_time_hours`` is provided
             and does not match the file's parsed lead.
         ValueError: If the Zarr store target is unsupported.
@@ -121,6 +233,7 @@ def ingest_grib_file(
     """
     dataset = parse_grib2(grib_path)
     dataset = _apply_variable_mapping(dataset, spec.variables)
+    dataset = _normalize_canonical_units(dataset, spec.variables)
     _validate_requested_lead(dataset, requested_lead_time_hours)
     dataset = _merge_lead(dataset, store_path)
     write_dataset(dataset, store_path)

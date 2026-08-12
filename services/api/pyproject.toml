@@ -25,18 +25,21 @@ pydantic-settings = "^2.2.1"
 xarray = "^2024.3.0"
 s3fs = "^2026.7"
 numpy = "^1.26.4"
+# The API serving tier reads forecast Zarr stores in production
+# (api/core/zarr.py ``xr.open_zarr``), which lazily imports ``zarr`` and needs a
+# ``numcodecs`` codec stack. Both must be runtime (main) dependencies so the
+# production API image can serve forecasts, not dev-only test fixtures.
+# numcodecs is aligned with the ingestion writer's resolved version (0.15.x):
+# the ingestion lock resolves 0.15.1, whose ``Zstd`` serializes a ``checksum``
+# config key that numcodecs <0.14 cannot parse. This range also satisfies
+# ``zarr 2.18``'s own numcodecs constraint (``>0.14.1,<0.16``).
+zarr = "^2.18"
+numcodecs = "^0.15.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
 pytest-asyncio = "^0.23.5"
 httpx = "^0.27.0"
-# Required by the API test Zarr writer (tests/_zarr_writer.py ``from numcodecs
-# import Zstd``). Test-only dependency; not part of the production serving path.
-numcodecs = "^0.12.0"
-# Required by the API test fixtures and fallback test, which write local Zarr
-# stores via xarray's ``to_zarr`` backend (tests/_zarr_writer.py,
-# tests/test_ready_run_fallback.py). Test-only dependency.
-zarr = "^2.18"
 
 # Test files prepend src to sys.path before importing api modules (required so
 # pytest can resolve package imports from the repo layout). This is intentional
