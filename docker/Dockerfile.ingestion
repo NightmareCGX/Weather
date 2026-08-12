@@ -1,0 +1,48 @@
+# Milestone 14 — Ingestion worker production image
+#
+# Multi-stage build for the one-shot ingestion CLI (weather-ingest).
+#   - builder: installs runtime deps (per the committed services/ingestion
+#     poetry.lock) into an in-project venv.
+#   - runtime: python:3.12-slim, non-root, copies the self-contained venv +
+#     ingestion source; entrypoint is the `weather-ingest` console script.
+#
+# This is a CLI container, not a daemon. Orchestration passes the args, e.g.:
+#   docker run <image> ingest --model gfs --cycle-date 2026-07-21 --cycle-hour 0 \
+#       --lead-time-hours 6 --store s3://weather-data/gfs/2026-07-21/00/cycle.zarr
+#
+# Default CMD `--help` prints usage and exits 0 — a dependency-free smoke.
+#
+# Build context: repository root (docker build -f docker/Dockerfile.ingestion .)
+
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS builder
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    POETRY_VERSION=2.4.1 \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
+    POETRY_NO_INTERACTION=1
+RUN python -m pip install --no-cache-dir "poetry==${POETRY_VERSION}"
+WORKDIR /app
+
+# 1) Manifests (committed lockfile -> reproducible install).
+COPY services/ingestion/pyproject.toml services/ingestion/poetry.lock /app/services/ingestion/
+RUN cd /app/services/ingestion && poetry install --only main --no-root
+
+# 2) Add the ingestion source, install the root package (creates the
+#    `weather-ingest` console script entrypoint).
+COPY services/ingestion/src /app/services/ingestion/src
+RUN cd /app/services/ingestion && poetry install --only main
+
+FROM python:3.12-slim AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/services/ingestion/.venv/bin:$PATH"
+WORKDIR /app
+RUN useradd --system --create-home --uid 1001 appuser
+COPY --from=builder /app/services/ingestion/.venv /app/services/ingestion/.venv
+COPY --from=builder /app/services/ingestion/src /app/services/ingestion/src
+USER appuser
+WORKDIR /app/services/ingestion
+ENTRYPOINT ["weather-ingest"]
+CMD ["--help"]

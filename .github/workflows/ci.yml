@@ -1,0 +1,490 @@
+# Milestone 14 — End-to-End Integration & CI/CD Pipelines
+#
+# GitHub Actions CI for the Global Probabilistic Weather Forecasting Platform.
+#
+# Job graph (8 jobs):
+#   Leaf jobs (no `needs`, run in parallel):
+#     python-quality       — Ruff + MyPy (domain/api/ingestion) + contracts/config install/import validation
+#     domain-tests         — pytest (offline, 100% coverage gate)
+#     api-tests            — pytest with isolated PostgreSQL + Redis service containers
+#     ingestion-tests      — pytest with isolated PostgreSQL + Redis + MinIO, WEATHER_TEST_MINIO=1
+#     frontend-unit        — npm ci + Jest
+#     frontend-lint-build  — lint + typecheck + format:check + next build
+#   Dependent jobs:
+#     frontend-e2e         — needs: [frontend-lint-build]; Playwright chromium, npm run e2e
+#     container-builds     — needs: [python-quality, domain-tests, api-tests, ingestion-tests,
+#                                   frontend-unit, frontend-lint-build, frontend-e2e]
+#
+# The API and ingestion suites both run `DROP SCHEMA public CASCADE` and
+# `FLUSHALL` on the same DATABASE_URL/REDIS_URL in their tests. Each job owns
+# its own per-job service containers, so they never share a physical
+# PostgreSQL/Redis instance — the suites are safe to run in parallel.
+#
+# No registry publication, no deployment, no Kubernetes. Images are built and
+# smoke-tested only.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Python quality: Ruff + MyPy per package, plus contracts/config validation.
+  # ruff/mypy must run from each package cwd so each package's own config is
+  # read (root has none; domain uses line-length=100 + explicit selects).
+  # ---------------------------------------------------------------------------
+  python-quality:
+    name: Python quality (ruff + mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry, Ruff, MyPy
+        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.9.0
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: |
+          cd packages/domain && poetry install --no-interaction
+          cd packages/contracts && poetry install --no-interaction
+          cd packages/config && poetry install --no-interaction
+          cd services/api && poetry install --no-interaction
+          cd services/ingestion && poetry install --no-interaction
+
+      - name: Ruff check (domain)
+        run: cd packages/domain && ruff check .
+      - name: Ruff check (api)
+        run: cd services/api && ruff check .
+      - name: Ruff check (ingestion)
+        run: cd services/ingestion && ruff check .
+
+      - name: MyPy (domain)
+        run: cd packages/domain && mypy --python-executable "$(poetry env info --path)/bin/python"
+      - name: MyPy (api)
+        run: cd services/api && mypy --python-executable "$(poetry env info --path)/bin/python"
+      - name: MyPy (ingestion)
+        run: cd services/ingestion && mypy --python-executable "$(poetry env info --path)/bin/python"
+
+      # Placeholder shared packages have no lintable logic, no tests, and no
+      # ruff/mypy config. They receive lightweight install/import validation so
+      # M14's "across all packages and services" is not left ambiguous.
+      - name: Validate placeholder packages (contracts, config)
+        run: |
+          cd packages/contracts && poetry run python -c "import contracts; assert contracts.__version__"
+          cd packages/config && poetry run python -c "import config; assert config.__version__"
+
+  # ---------------------------------------------------------------------------
+  # Domain unit tests: offline, no services, 100% coverage gate.
+  # ---------------------------------------------------------------------------
+  domain-tests:
+    name: Domain tests (pytest, 100% coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: python -m pip install poetry==2.4.1
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-
+
+      - name: Install domain dependencies
+        run: cd packages/domain && poetry install --no-interaction
+
+      - name: Run domain tests
+        run: cd packages/domain && poetry run pytest
+
+  # ---------------------------------------------------------------------------
+  # API integration tests: isolated PostgreSQL + Redis service containers.
+  # The api package also needs its runtime deps (installed via poetry).
+  # ---------------------------------------------------------------------------
+  api-tests:
+    name: API tests (PostgreSQL + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: weather_user
+          POSTGRES_PASSWORD: weather_password
+          POSTGRES_DB: weather_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U weather_user -d weather_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://weather_user:weather_password@localhost:5432/weather_db
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: python -m pip install poetry==2.4.1
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-
+
+      - name: Install API dependencies
+        run: cd services/api && poetry install --no-interaction
+
+      - name: Run API tests
+        run: cd services/api && poetry run pytest
+
+  # ---------------------------------------------------------------------------
+  # Ingestion integration tests: isolated PostgreSQL + Redis + MinIO.
+  # test_catalog_postgres.py imports the api package (api.main TestClient), so
+  # both api and ingestion main deps must be installed into the same venv.
+  # The real MinIO S3 Zarr round-trip (test_s3_store_roundtrip) is opt-in and
+  # requires the weather-data bucket to pre-exist.
+  # ---------------------------------------------------------------------------
+  ingestion-tests:
+    name: Ingestion tests (PostgreSQL + Redis + MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: weather_user
+          POSTGRES_PASSWORD: weather_password
+          POSTGRES_DB: weather_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U weather_user -d weather_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: minio_admin
+          MINIO_ROOT_PASSWORD: minio_password
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://weather_user:weather_password@localhost:5432/weather_db
+      REDIS_URL: redis://localhost:6379/0
+      MINIO_ENDPOINT: localhost:9000
+      MINIO_ACCESS_KEY: minio_admin
+      MINIO_SECRET_KEY: minio_password
+      MINIO_SECURE: 'false'
+      MINIO_BUCKET_NAME: weather-data
+      WEATHER_TEST_MINIO: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: python -m pip install poetry==2.4.1
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-
+
+      # Install api main deps first (so test_catalog_postgres.py can import
+      # api.main), then ingestion deps (with dev group, incl. minio). Poetry
+      # installs into the same active venv.
+      - name: Install API + Ingestion dependencies
+        run: |
+          cd services/api && poetry install --only main --no-interaction
+          cd services/ingestion && poetry install --no-interaction
+
+      - name: Create MinIO bucket
+        run: |
+          cd services/ingestion && poetry run python - <<'PY'
+          import time
+          import boto3
+          for _ in range(30):
+              try:
+                  s3 = boto3.client(
+                      "s3",
+                      endpoint_url="http://localhost:9000",
+                      aws_access_key_id="minio_admin",
+                      aws_secret_access_key="minio_password",
+                  )
+                  s3.create_bucket(Bucket="weather-data")
+                  print("bucket ready")
+                  break
+              except Exception as exc:  # noqa: BLE001 - retry loop
+                  print("waiting for minio:", exc)
+                  time.sleep(2)
+          else:
+              raise SystemExit("MinIO not ready")
+          PY
+
+      # Run the full suite ONCE (includes the real MinIO S3 Zarr round-trip and
+      # test_catalog_postgres.py). JUnit report provides pytest-native evidence.
+      - name: Run ingestion tests (with JUnit report)
+        run: cd services/ingestion && poetry run pytest --junitxml=ingestion-junit.xml
+
+      # Prove the approved MinIO round-trip executed and PASSED (not skipped)
+      # from the pytest-native JUnit report — no stdout parsing.
+      - name: Verify MinIO round-trip ran and passed (not skipped)
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("services/ingestion/ingestion-junit.xml").getroot()
+          test = root.find(".//testcase[@name='test_s3_store_roundtrip_preserves_data']")
+          assert test is not None, "MinIO round-trip testcase not found in pytest report"
+          assert test.find("failure") is None and test.find("error") is None, \
+              "MinIO round-trip FAILED: found <failure>/<error> in pytest report"
+          assert test.find("skipped") is None, \
+              "MinIO round-trip was SKIPPED: <skipped> present in pytest report"
+          print("MinIO round-trip executed and passed (not skipped)")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Frontend unit tests: Jest (jsdom, offline; maplibre mocked).
+  # ---------------------------------------------------------------------------
+  frontend-unit:
+    name: Frontend unit (Jest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: services/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: services/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Jest
+        run: npm run test -- --ci
+
+  # ---------------------------------------------------------------------------
+  # Frontend lint + typecheck + format + production build.
+  # The explicit `next build` validates `output: "standalone"` early (in
+  # parallel with the e2e job's implicit build).
+  # ---------------------------------------------------------------------------
+  frontend-lint-build:
+    name: Frontend lint/typecheck/format/build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: services/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: services/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Production build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Frontend E2E: Playwright (offline-mocked API; no backend needed).
+  # Depends on frontend-lint-build to fail fast before paying for Chromium/build.
+  # ---------------------------------------------------------------------------
+  frontend-e2e:
+    name: Frontend E2E (Playwright)
+    needs: [frontend-lint-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: services/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: services/frontend/package-lock.json
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('services/frontend/package-lock.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright E2E
+        run: npm run e2e
+
+  # ---------------------------------------------------------------------------
+  # Container builds: build + runtime smoke-test all three images.
+  # Only runs after every quality/test gate has passed.
+  # ---------------------------------------------------------------------------
+  container-builds:
+    name: Container builds + smoke tests
+    needs:
+      - python-quality
+      - domain-tests
+      - api-tests
+      - ingestion-tests
+      - frontend-unit
+      - frontend-lint-build
+      - frontend-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          target: runtime
+          tags: weather-api:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build ingestion image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ingestion
+          target: runtime
+          tags: weather-ingestion:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/frontend
+          file: docker/Dockerfile.frontend
+          target: runtime
+          tags: weather-frontend:ci
+          load: true
+          build-args: |
+            API_PROXY_TARGET=http://127.0.0.1:8000
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- Runtime smoke tests (no external services required) ---
+      - name: Smoke test API (/docs)
+        run: |
+          docker run -d --name api-smoke -p 8000:8000 weather-api:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/docs >/dev/null 2>&1; then
+              echo "API /docs OK"; break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8000/docs >/dev/null || { echo "API /docs FAILED"; docker logs api-smoke; exit 1; }
+          docker rm -f api-smoke
+
+      - name: Smoke test frontend (/)
+        run: |
+          docker run -d --name fe-smoke -p 3000:3000 weather-frontend:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/ >/dev/null 2>&1; then
+              echo "frontend / OK"; break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:3000/ >/dev/null || { echo "frontend / FAILED"; docker logs fe-smoke; exit 1; }
+          docker rm -f fe-smoke
+
+      - name: Smoke test ingestion (--help)
+        run: |
+          docker run --rm weather-ingestion:ci --help || { echo "ingestion --help FAILED"; exit 1; }
+          echo "ingestion --help OK"

@@ -29,7 +29,11 @@ class IngestionSettings(BaseSettings):
     MINIO_ENDPOINT: Any = "localhost:9000"
     MINIO_ACCESS_KEY: Any = "minio_admin"
     MINIO_SECRET_KEY: Any = "minio_password"
-    MINIO_SECURE: Any = False
+    # Typed ``bool`` so a ``MINIO_SECURE=false`` env var (documented in
+    # .env.example) is coerced to False by pydantic-settings. An untyped
+    # ``Any``/str default would resolve to the truthy string ``'false'`` and
+    # force HTTPS to a plain-HTTP endpoint (M14 fix).
+    MINIO_SECURE: bool = False
     MINIO_BUCKET_NAME: Any = "weather-data"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

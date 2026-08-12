@@ -1,0 +1,47 @@
+# Milestone 14 — Frontend production image
+#
+# Multi-stage build for the Next.js client using `output: "standalone"`.
+#   - deps:   node:20-alpine, npm ci (reproducible from committed lockfile)
+#   - builder: next build with output: standalone; API_PROXY_TARGET is a
+#     BUILD ARG because Next.js bakes rewrite destinations into
+#     .next/routes-manifest.json at build time.
+#   - runtime: node:20-alpine, non-root, copies .next/standalone + .next/static
+#     + public; runs `node server.js`.
+#
+# Deployment constraint: changing the proxied API target requires rebuilding
+# this image with the new `API_PROXY_TARGET` build arg. Setting the variable at
+# `docker run` time has NO effect on routing (the standalone server reads the
+# baked manifest, not next.config at runtime).
+#
+# Build context: services/frontend (docker build -f docker/Dockerfile.frontend .)
+
+# syntax=docker/dockerfile:1
+FROM node:20-alpine AS deps
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+ARG API_PROXY_TARGET=http://127.0.0.1:8000
+ENV API_PROXY_TARGET=$API_PROXY_TARGET
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000
+RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+USER nextjs
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "server.js"]

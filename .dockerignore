@@ -1,0 +1,42 @@
+# Root .dockerignore — applies to the API and ingestion builds
+# (build context = repository root, used by docker/Dockerfile.api and
+# docker/Dockerfile.ingestion).
+
+# VCS
+.git
+.github
+.claude
+
+# Python caches / artifacts
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/.venv
+**/*.egg-info
+build
+dist
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Node / Next (not needed by api/ingestion images)
+node_modules
+**/node_modules
+**/.next
+**/test-results
+**/playwright-report
+**/coverage
+**/*.tsbuildinfo
+services/frontend
+
+# Placeholder shared packages (no runtime value in these images)
+packages/contracts
+packages/config
+
+# Tests and fixtures (not shipped in runtime images)
+**/tests

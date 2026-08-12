@@ -1,0 +1,24 @@
+# services/frontend/.dockerignore — applies to the frontend build
+# (build context = services/frontend, used by docker/Dockerfile.frontend).
+
+node_modules
+.next
+.swc
+test-results
+playwright-report
+coverage
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+npm-debug.log*
+
+# Test / tooling files not needed by the Next.js build
+README.md
+e2e
+__mocks__
+jest.config.js
+jest.setup.ts
+playwright.config.ts
+src/**/__tests__
