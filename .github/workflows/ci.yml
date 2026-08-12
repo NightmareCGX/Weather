@@ -253,6 +253,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ecCodes native C-library system dependency (Linux). The `eccodes`
+      # Python wheel bundles the native library only on Windows; on Linux it
+      # requires the ecCodes C-library from a system package (`eccodeslib` is
+      # not actually published to PyPI). cfgrib's documented Linux install is
+      # `apt-get install libeccodes-dev` (which pulls the runtime libeccodes0).
+      - name: Install ecCodes system dependency
+        run: sudo apt-get update && sudo apt-get install -y libeccodes-dev
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
