@@ -267,12 +267,11 @@ jobs:
           key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-
 
-      # Install api main deps first (so test_catalog_postgres.py can import
-      # api.main), then ingestion deps (with dev group, incl. minio). Poetry
-      # installs into the same active venv.
-      - name: Install api dependencies
-        working-directory: services/api
-        run: poetry install --only main --no-interaction
+      # Install ingestion deps (with dev group, incl. minio + the API-owned
+      # test deps that test_catalog_postgres.py needs to import api.main).
+      # API source is reached via the ingestion pyproject's pythonpath
+      # (``pythonpath = ["src", "../api/src"]``); the ingestion Poetry venv is
+      # self-contained, so no separate API install is required here.
       - name: Install ingestion dependencies
         working-directory: services/ingestion
         run: poetry install --no-interaction

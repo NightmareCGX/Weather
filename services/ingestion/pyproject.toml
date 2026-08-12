@@ -31,6 +31,17 @@ respx = "^0.21.1"
 # Required by the approved MinIO/S3 Zarr round-trip integration test
 # (tests/conftest.py ``from minio import Minio``). Test-only dependency.
 minio = "^7.2.7"
+# The ingestion integration test test_catalog_postgres.py imports the API
+# serving tier (api.main, api.models.entities, api.core.database) and runs
+# Alembic migrations directly, so its test environment must provide the API's
+# own runtime deps and the shared domain package. These are test-only for
+# ingestion (ingestion production source never imports api.*/domain); they are
+# declared here so ``poetry run pytest`` is self-contained and reproducible.
+alembic = "^1.13.1"
+fastapi = "^0.110.0"
+redis = "^5.0.2"
+geoalchemy2 = "^0.14.3"
+weather-platform-domain = { path = "../../packages/domain" }
 
 [tool.poetry.scripts]
 weather-ingest = "ingestion.cli:main"
