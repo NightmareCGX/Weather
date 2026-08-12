@@ -64,13 +64,21 @@ jobs:
           key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-
 
-      - name: Install Python dependencies
-        run: |
-          cd packages/domain && poetry install --no-interaction
-          cd packages/contracts && poetry install --no-interaction
-          cd packages/config && poetry install --no-interaction
-          cd services/api && poetry install --no-interaction
-          cd services/ingestion && poetry install --no-interaction
+      - name: Install domain dependencies
+        working-directory: packages/domain
+        run: poetry install --no-interaction
+      - name: Install contracts dependencies
+        working-directory: packages/contracts
+        run: poetry install --no-interaction
+      - name: Install config dependencies
+        working-directory: packages/config
+        run: poetry install --no-interaction
+      - name: Install api dependencies
+        working-directory: services/api
+        run: poetry install --no-interaction
+      - name: Install ingestion dependencies
+        working-directory: services/ingestion
+        run: poetry install --no-interaction
 
       - name: Ruff check (domain)
         run: cd packages/domain && ruff check .
@@ -89,10 +97,12 @@ jobs:
       # Placeholder shared packages have no lintable logic, no tests, and no
       # ruff/mypy config. They receive lightweight install/import validation so
       # M14's "across all packages and services" is not left ambiguous.
-      - name: Validate placeholder packages (contracts, config)
-        run: |
-          cd packages/contracts && poetry run python -c "import contracts; assert contracts.__version__"
-          cd packages/config && poetry run python -c "import config; assert config.__version__"
+      - name: Validate contracts package
+        working-directory: packages/contracts
+        run: poetry run python -c "import contracts; assert contracts.__version__"
+      - name: Validate config package
+        working-directory: packages/config
+        run: poetry run python -c "import config; assert config.__version__"
 
   # ---------------------------------------------------------------------------
   # Domain unit tests: offline, no services, 100% coverage gate.
@@ -216,7 +226,11 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       minio:
-        image: minio/minio:latest
+        # Pinned release (not :latest) for deterministic CI. The image's
+        # default CMD is `minio` with no args, which prints help and exits;
+        # the explicit `server /data` command keeps the container running.
+        image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+        command: server /data --console-address ":9001"
         env:
           MINIO_ROOT_USER: minio_admin
           MINIO_ROOT_PASSWORD: minio_password
@@ -256,10 +270,12 @@ jobs:
       # Install api main deps first (so test_catalog_postgres.py can import
       # api.main), then ingestion deps (with dev group, incl. minio). Poetry
       # installs into the same active venv.
-      - name: Install API + Ingestion dependencies
-        run: |
-          cd services/api && poetry install --only main --no-interaction
-          cd services/ingestion && poetry install --no-interaction
+      - name: Install api dependencies
+        working-directory: services/api
+        run: poetry install --only main --no-interaction
+      - name: Install ingestion dependencies
+        working-directory: services/ingestion
+        run: poetry install --no-interaction
 
       - name: Create MinIO bucket
         run: |
