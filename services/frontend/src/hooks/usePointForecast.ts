@@ -19,21 +19,24 @@ export interface UsePointForecastResult {
  *
  * The request is cancelled when the selection changes, and stale responses are
  * guarded by a sequence token, so a slow response for a previous selection can
- * never render over a newer one. The deterministic model (default `gfs`) is
- * pinned: `/v1/points` serves a single model and rejects ensemble models
- * (API.md section 2.1).
+ * never render over a newer one. ``model`` is the deterministic model to
+ * request (database-driven — never hard-coded); `/v1/points` serves a single
+ * model and rejects ensemble models (API.md section 2.1), so the dashboard
+ * only passes deterministic models here. When ``model`` is null the hook stays
+ * idle so the caller can render a "no deterministic forecast model" empty
+ * state instead of requesting a non-existent model.
  */
 export function usePointForecast(
   location: SelectedLocation | null,
-  options: { model?: string; units?: "metric" | "imperial" } = {}
+  options: { model: string | null; units?: "metric" | "imperial" }
 ): UsePointForecastResult {
-  const { model = "gfs", units = "metric" } = options;
+  const { model, units = "metric" } = options;
   const [forecast, setForecast] = useState<PointForecast | null>(null);
   const [status, setStatus] = useState<FetchStatus>("idle");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (location === null) {
+    if (location === null || model === null) {
       setForecast(null);
       setStatus("idle");
       setError(null);

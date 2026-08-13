@@ -3,6 +3,7 @@ import type {
   Envelope,
   ErrorDetail,
   ErrorEnvelope,
+  ForecastAvailability,
   Model,
   PointForecast,
   SearchResult,
@@ -122,6 +123,9 @@ export interface GetMapLayerParams {
   variable: string;
   level?: "surface";
   leadTimeHours: number;
+  /** ISO 8601 UTC cycle time pinning the model run (optional). */
+  initialTime?: string;
+  signal?: AbortSignal;
 }
 
 export async function getMapLayer({
@@ -129,6 +133,8 @@ export async function getMapLayer({
   variable,
   level = "surface",
   leadTimeHours,
+  initialTime,
+  signal,
 }: GetMapLayerParams): Promise<SpatialLayer> {
   const params = new URLSearchParams({
     model,
@@ -136,7 +142,14 @@ export async function getMapLayer({
     level,
     lead_time_hours: String(leadTimeHours),
   });
-  return request<SpatialLayer>(`/maps?${params.toString()}`);
+  if (initialTime !== undefined) {
+    params.set("initial_time", initialTime);
+  }
+  return request<SpatialLayer>(`/maps?${params.toString()}`, { signal });
+}
+
+export async function getForecastAvailability(signal?: AbortSignal): Promise<ForecastAvailability> {
+  return request<ForecastAvailability>(`/forecast/availability`, { signal });
 }
 
 export interface SearchLocationsOptions {

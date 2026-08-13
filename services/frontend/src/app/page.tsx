@@ -7,40 +7,32 @@ import { LayerControls } from "@/components/map/LayerControls";
 import { Legend } from "@/components/map/Legend";
 import { LocationSearch } from "@/components/search/LocationSearch";
 import { ForecastDashboard } from "@/components/forecast/ForecastDashboard";
-import { useMapConfig } from "@/context/map-config";
+import { useForecastSelection } from "@/context/forecast-selection";
 import { useSelectedLocation } from "@/context/selected-location";
-import { useMapData } from "@/hooks/useMapData";
+import { useMapLayer } from "@/hooks/useMapLayer";
 
 const WeatherMap = dynamic(() => import("@/components/map/WeatherMap").then((m) => m.WeatherMap), {
   ssr: false,
 });
 
 /**
- * Frontend shell for Milestone 12 + Milestone 13.
+ * Frontend shell for the data-driven forecast explorer.
  *
- * Milestone 12 provided the MapLibre map, model/variable/lead-time controls,
- * and legend, driven by `/v1/models` and `/v1/maps` metadata. Milestone 13
- * adds location search, map point selection, and the point forecast dashboard
- * — all sharing one selected-location state.
+ * The map layer configuration (model / variable / initial time / lead time)
+ * is owned by {@link ForecastSelectionProvider}; this page reads the shared
+ * selection and fetches the map layer metadata for it. Selecting a location
+ * opens the point forecast dashboard. The base map, search, and legend are
+ * preserved.
  */
 export default function HomePage() {
-  const { model, variable, leadTimeHours, setModel, setVariable, setLeadTimeHours } =
-    useMapConfig();
-  const { models, layer, loading, error } = useMapData();
+  const { validTime } = useForecastSelection();
+  const { layer, loading, error } = useMapLayer();
   const { selectedLocation, selectLocation } = useSelectedLocation();
 
   return (
     <div className="flex h-full flex-col">
       <Header />
-      <LayerControls
-        models={models}
-        model={model}
-        variable={variable}
-        leadTimeHours={leadTimeHours}
-        onModelChange={setModel}
-        onVariableChange={setVariable}
-        onLeadTimeChange={setLeadTimeHours}
-      />
+      <LayerControls />
 
       <div className="flex min-h-0 flex-1">
         <main className="relative min-w-0 flex-1">
@@ -65,6 +57,7 @@ export default function HomePage() {
             <WeatherMap
               layer={layer}
               selectedLocation={selectedLocation}
+              validTime={validTime}
               onSelect={selectLocation}
             />
           )}

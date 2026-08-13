@@ -12,8 +12,8 @@ export interface UseEnsembleResult {
   byLead: Map<number, EnsembleStatisticsData>;
   status: EnsembleStatus;
   error: string | null;
-  /** The active model (default `gefs`). */
-  model: string;
+  /** The active model. */
+  model: string | null;
 }
 
 /**
@@ -21,25 +21,28 @@ export interface UseEnsembleResult {
  * location's point forecast.
  *
  * `/v1/ensembles` answers one `lead_time_hours` per request, so the hook fans
- * out one request per lead in the point forecast (defaulting to a single
- * 0-hour request when no forecast is available yet). Individual lead failures
- * are tolerated: the successfully fetched leads are still surfaced, and a
- * fully-failed fan-out surfaces a single aggregated error so the ensemble
- * panel can degrade independently of the core point forecast.
+ * out one request per lead in the point forecast. ``model`` is the selected
+ * model and must be an ensemble model (the dashboard only calls this hook for
+ * an ensemble model; deterministic models have no member axis). When ``model``
+ * is null the hook stays idle so the caller can render an ensemble empty state.
+ * Individual lead failures are tolerated: the successfully fetched leads are
+ * still surfaced, and a fully-failed fan-out surfaces a single aggregated
+ * error so the ensemble panel can degrade independently of the core point
+ * forecast.
  */
 export function useEnsemble(
   location: SelectedLocation | null,
   leads: number[],
   variable: string,
-  options: { model?: string } = {}
+  options: { model: string | null }
 ): UseEnsembleResult {
-  const { model = "gefs" } = options;
+  const { model } = options;
   const [byLead, setByLead] = useState<Map<number, EnsembleStatisticsData>>(new Map());
   const [status, setStatus] = useState<EnsembleStatus>("idle");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (location === null) {
+    if (location === null || model === null) {
       setByLead(new Map());
       setStatus("idle");
       setError(null);

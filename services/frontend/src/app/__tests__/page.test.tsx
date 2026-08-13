@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import HomePage from "@/app/page";
-import { MapConfigProvider } from "@/context/map-config";
+import { ForecastSelectionProvider } from "@/context/forecast-selection";
 import { SelectedLocationProvider } from "@/context/selected-location";
 
 // The real WeatherMap uses `next/dynamic(..., { ssr: false })`, which resolves
@@ -17,11 +17,11 @@ jest.mock("../../components/map/WeatherMap", () => {
 
 function renderPage() {
   return render(
-    <MapConfigProvider>
+    <ForecastSelectionProvider>
       <SelectedLocationProvider>
         <HomePage />
       </SelectedLocationProvider>
-    </MapConfigProvider>
+    </ForecastSelectionProvider>
   );
 }
 
@@ -46,8 +46,39 @@ const searchResult = {
   longitude: -106.82,
 };
 
+const availabilityPayload = {
+  object: "forecast_availability",
+  data: {
+    models: [
+      {
+        id: "gfs",
+        name: "Global Forecast System",
+        is_ensemble: false,
+        variables: [
+          {
+            id: "temperature_2m",
+            name: "2-Meter Temperature",
+            unit: "°C",
+            initial_times: [
+              {
+                value: "2026-08-13T00:00:00Z",
+                lead_time_hours: [6],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+  has_more: false,
+  next_cursor: null,
+};
+
 function routeFetch(input: RequestInfo | URL) {
   const url = String(input);
+  if (url.startsWith("/v1/forecast/availability")) {
+    return Promise.resolve(jsonResponse(availabilityPayload));
+  }
   if (url.startsWith("/v1/models")) {
     return Promise.resolve(
       jsonResponse({
@@ -73,10 +104,10 @@ function routeFetch(input: RequestInfo | URL) {
         object: "spatial_layer",
         data: {
           tile_url_template:
-            "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=12",
+            "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=6&initial_time=2026-08-13T00:00:00Z",
           min_zoom: 0,
           max_zoom: 9,
-          lead_time_hours: 12,
+          lead_time_hours: 6,
           legend: { unit: "°C", stops: [[-40, "#0000ff"]] },
         },
         has_more: false,
@@ -120,7 +151,6 @@ function routeFetch(input: RequestInfo | URL) {
           generated_at: "2026-07-21T00:00:00Z",
           model: "gfs",
           forecasts: [
-            { lead_time_hours: 0, valid_time: "2026-07-21T00:00:00Z", temperature_2m: 10 },
             { lead_time_hours: 6, valid_time: "2026-07-21T06:00:00Z", temperature_2m: 13 },
           ],
         },
@@ -134,17 +164,17 @@ function routeFetch(input: RequestInfo | URL) {
       jsonResponse({
         object: "ensemble_statistics",
         data: {
-          model: "gefs",
-          lead_time_hours: 0,
-          member_count: 5,
+          model: "gfs",
+          lead_time_hours: 6,
+          member_count: 1,
           statistics: {
-            mean: 10,
-            median: 10,
-            spread: 2,
-            p10: 7,
-            p25: 9,
-            p50: 10,
-            p75: 11,
+            mean: 13,
+            median: 13,
+            spread: 0,
+            p10: 13,
+            p25: 13,
+            p50: 13,
+            p75: 13,
             p90: 13,
           },
         },
@@ -165,7 +195,7 @@ beforeEach(() => {
 });
 
 describe("HomePage", () => {
-  it("renders the header, layer controls, and search after loading model and layer metadata", async () => {
+  it("renders the header, layer controls, and search after loading availability", async () => {
     renderPage();
 
     expect(screen.getByRole("heading", { name: "Weather Platform" })).toBeInTheDocument();
@@ -183,11 +213,11 @@ describe("HomePage", () => {
     });
   });
 
-  it("fetches /v1/models and /v1/maps on load", async () => {
+  it("fetches availability and map metadata on load", async () => {
     renderPage();
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith("/v1/models", expect.any(Object));
+      expect(mockFetch).toHaveBeenCalledWith("/v1/forecast/availability", expect.any(Object));
     });
     await waitFor(() => {
       expect(mockFetch).toHaveBeenCalledWith(
@@ -195,6 +225,19 @@ describe("HomePage", () => {
         expect.any(Object)
       );
     });
+  });
+
+  it("shows the Initial Time and Lead Time controls derived from availability", async () => {
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Initial time")).toBeInTheDocument();
+    });
+    expect(screen.getByText("2026-08-13 00Z")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Lead time")).toBeInTheDocument();
+    });
+    expect(screen.getByText("+6h")).toBeInTheDocument();
   });
 
   it("selecting a search result opens the forecast dashboard and fetches /v1/points", async () => {

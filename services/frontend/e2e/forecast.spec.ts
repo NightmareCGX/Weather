@@ -72,26 +72,43 @@ test("map click → forecast: selecting a coordinate opens the dashboard", async
   await expect(page.getByText(/-?\d+\.\d+, -?\d+\.\d+/)).toBeVisible();
 });
 
-test("ensemble statistics: percentile fan renders over lead time", async ({ page }) => {
+test("ensemble statistics: deterministic selected model shows ensemble empty state", async ({
+  page,
+}) => {
   await page.goto("/");
 
   const input = page.getByLabel(/Search for a city/);
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
-  // The ensemble statistics section renders the fan chart.
+  // The availability mock's default selected model is GFS (deterministic), so
+  // the ensemble panel shows the honest empty state instead of requesting a
+  // hard-coded ensemble model that may not exist in the database.
+  await expect(page.getByText(/Ensemble Statistics \(GFS\)/)).toBeVisible();
+  await expect(
+    page.getByText("No ensemble data available for the selected forecast.")
+  ).toBeVisible();
+});
+
+test("selecting an ensemble model renders the percentile fan and member histogram", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  // Select the GEFS model (present in the availability mock, is_ensemble=true).
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // The ensemble statistics section renders the fan chart for the selected
+  // ensemble model.
   await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
   await expect(
     page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
   ).toBeVisible();
-});
-
-test("ensemble distribution: member histogram renders from raw members", async ({ page }) => {
-  await page.goto("/");
-
-  const input = page.getByLabel(/Search for a city/);
-  await input.fill("Aspen");
-  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // The mock returns members for /v1/ensembles, so the Distribution View shows
   // a genuine member histogram.

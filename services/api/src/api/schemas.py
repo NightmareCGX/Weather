@@ -94,6 +94,84 @@ class ListEnvelope(BaseModel, Generic[T]):
     next_cursor: str | None = None
 
 
+class InitialTimeAvailability(BaseModel):
+    """One available forecast initialization (cycle time) of a variable.
+
+    Attributes:
+        value: The run's ``cycle_time`` in ISO 8601 UTC. ``valid_time`` for a
+            given lead is derived as ``value + lead_time_hours``
+            (DATABASE.md section 1).
+        lead_time_hours: The forecast offset hours available for this
+            model/variable/initial time, ascending.
+    """
+
+    value: datetime
+    lead_time_hours: list[int]
+
+    @field_serializer("value")
+    def _serialize_value(self, value: datetime) -> str:
+        return format_datetime_utc(value)
+
+
+class VariableAvailability(BaseModel):
+    """A forecast variable and the initial times available for it.
+
+    Attributes:
+        id: The ``forecast_variables.variable_code`` (e.g.
+            ``temperature_2m``).
+        name: Human-readable variable name.
+        unit: The registered SI unit string (e.g. ``°C``).
+        initial_times: The initial times with data for this
+            model/variable, newest first.
+    """
+
+    id: str
+    name: str
+    unit: str
+    initial_times: list[InitialTimeAvailability]
+
+
+class ModelAvailability(BaseModel):
+    """A forecast model and the variables available for it.
+
+    Attributes:
+        id: The ``models.model_id`` (e.g. ``gfs``).
+        name: Human-readable model name.
+        is_ensemble: Whether the model is an ensemble product.
+        variables: The variables with ready forecast data for this model,
+            ordered by variable code.
+    """
+
+    id: str
+    name: str
+    is_ensemble: bool
+    variables: list[VariableAvailability]
+
+
+class ForecastAvailabilityData(BaseModel):
+    """The payload of the forecast availability endpoint.
+
+    Models are ordered by model id; only models that have at least one
+    ``ready`` run with forecast product rows are included, so the list
+    reflects exactly what the platform can serve.
+    """
+
+    models: list[ModelAvailability]
+
+
+class ForecastAvailabilityEnvelope(BaseModel):
+    """The forecast availability response envelope.
+
+    ``object`` is ``forecast_availability`` (a new resource shape that is a
+    non-breaking addition to the v1 surface per API.md section 1.3).
+    """
+
+    object: Literal["forecast_availability"] = "forecast_availability"
+    data: ForecastAvailabilityData
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
 class ErrorDetail(BaseModel):
     """The RFC 7807-style error body (API.md section 2.4)."""
 

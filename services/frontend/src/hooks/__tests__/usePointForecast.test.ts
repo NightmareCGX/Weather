@@ -57,14 +57,21 @@ beforeEach(() => {
 
 describe("usePointForecast", () => {
   it("is idle with no selection", () => {
-    const { result } = renderHook(() => usePointForecast(null));
+    const { result } = renderHook(() => usePointForecast(null, { model: "gfs" }));
     expect(result.current.status).toBe("idle");
     expect(result.current.forecast).toBeNull();
   });
 
+  it("stays idle when no deterministic model is available", () => {
+    const { result } = renderHook(() => usePointForecast(aspen, { model: null }));
+    expect(result.current.status).toBe("idle");
+    expect(result.current.forecast).toBeNull();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("fetches via the city id specifier", async () => {
     mockFetch.mockResolvedValueOnce(forecastResponse(38.19, -106.82));
-    const { result } = renderHook(() => usePointForecast(aspen));
+    const { result } = renderHook(() => usePointForecast(aspen, { model: "gfs" }));
 
     expect(result.current.status).toBe("loading");
     await waitFor(() => expect(result.current.status).toBe("success"));
@@ -82,7 +89,7 @@ describe("usePointForecast", () => {
     );
     mockFetch.mockResolvedValueOnce(forecastResponse(40, -105));
 
-    const { result, rerender } = renderHook(({ loc }) => usePointForecast(loc), {
+    const { result, rerender } = renderHook(({ loc }) => usePointForecast(loc, { model: "gfs" }), {
       initialProps: { loc: aspen },
     });
 
@@ -106,7 +113,7 @@ describe("usePointForecast", () => {
 
   it("surfaces an error when the fetch fails", async () => {
     mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
-    const { result } = renderHook(() => usePointForecast(aspen));
+    const { result } = renderHook(() => usePointForecast(aspen, { model: "gfs" }));
     await waitFor(() => expect(result.current.status).toBe("error"));
     expect(result.current.forecast).toBeNull();
   });

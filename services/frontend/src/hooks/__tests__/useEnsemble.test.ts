@@ -59,7 +59,9 @@ describe("useEnsemble", () => {
     mockFetch.mockResolvedValueOnce(statsResponse(6));
     mockFetch.mockResolvedValueOnce(statsResponse(12));
 
-    const { result } = renderHook(() => useEnsemble(location, [0, 6, 12], "temperature_2m"));
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6, 12], "temperature_2m", { model: "gefs" })
+    );
 
     await waitFor(() => expect(result.current.status).toBe("success"));
     expect(mockFetch).toHaveBeenCalledTimes(3);
@@ -73,7 +75,9 @@ describe("useEnsemble", () => {
     mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
     mockFetch.mockResolvedValueOnce(statsResponse(12));
 
-    const { result } = renderHook(() => useEnsemble(location, [0, 6, 12], "temperature_2m"));
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6, 12], "temperature_2m", { model: "gefs" })
+    );
 
     await waitFor(() => expect(result.current.status).toBe("success"));
     expect(result.current.byLead.has(0)).toBe(true);
@@ -84,7 +88,9 @@ describe("useEnsemble", () => {
   it("errors when every lead fails", async () => {
     mockFetch.mockRejectedValue(new TypeError("Failed to fetch"));
 
-    const { result } = renderHook(() => useEnsemble(location, [0], "temperature_2m"));
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0], "temperature_2m", { model: "gefs" })
+    );
 
     await waitFor(() => expect(result.current.status).toBe("error"));
     expect(result.current.byLead.size).toBe(0);
@@ -94,7 +100,9 @@ describe("useEnsemble", () => {
   it("defaults to a single 0-hour request when no leads are provided", async () => {
     mockFetch.mockResolvedValueOnce(statsResponse(0));
 
-    const { result } = renderHook(() => useEnsemble(location, [], "temperature_2m"));
+    const { result } = renderHook(() =>
+      useEnsemble(location, [], "temperature_2m", { model: "gefs" })
+    );
 
     await waitFor(() => expect(result.current.status).toBe("success"));
     expect(mockFetch).toHaveBeenCalledTimes(1);
@@ -102,5 +110,15 @@ describe("useEnsemble", () => {
       "/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&lead_time_hours=0",
       expect.any(Object)
     );
+  });
+
+  it("stays idle when no ensemble model is selected", async () => {
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6], "temperature_2m", { model: null })
+    );
+
+    expect(result.current.status).toBe("idle");
+    expect(result.current.byLead.size).toBe(0);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });

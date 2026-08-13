@@ -19,7 +19,9 @@ export interface UseEnsembleDistributionResult {
  * This is the focused request behind the Ensemble Distribution View: it
  * requests `/v1/ensembles` with `include_members=true` for exactly one
  * location / variable / model / lead time and receives the genuine raw member
- * values. It is deliberately separate from {@link useEnsemble}, which fans out
+ * values. ``model`` must be an ensemble model (the dashboard only calls this
+ * for an ensemble model); when it is null the hook stays idle. It is
+ * deliberately separate from {@link useEnsemble}, which fans out
  * statistics-only requests (no `include_members`) across leads for the
  * percentile timeline. A stale selection is cancelled and ignored so a slow
  * response for a previous lead can never render over a newer one.
@@ -28,15 +30,15 @@ export function useEnsembleDistribution(
   location: SelectedLocation | null,
   leadTimeHours: number,
   variable: string,
-  options: { model?: string } = {}
+  options: { model: string | null }
 ): UseEnsembleDistributionResult {
-  const { model = "gefs" } = options;
+  const { model } = options;
   const [data, setData] = useState<EnsembleStatisticsData | null>(null);
   const [status, setStatus] = useState<DistributionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (location === null) {
+    if (location === null || model === null) {
       setData(null);
       setStatus("idle");
       setError(null);

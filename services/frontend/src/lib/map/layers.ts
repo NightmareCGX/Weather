@@ -14,12 +14,7 @@ import type { SpatialLayer } from "@/lib/api/types";
  * blocker.
  */
 export function applyWeatherLayer(map: Map, layer: SpatialLayer): void {
-  if (map.getSource("weather") !== undefined) {
-    if (map.getLayer("weather") !== undefined) {
-      map.removeLayer("weather");
-    }
-    map.removeSource("weather");
-  }
+  removeWeatherLayer(map);
 
   map.addSource("weather", {
     type: "raster",
@@ -34,4 +29,21 @@ export function applyWeatherLayer(map: Map, layer: SpatialLayer): void {
     source: "weather",
     paint: { "raster-opacity": 0.6 },
   });
+}
+
+/**
+ * Remove the weather raster layer/source if present.
+ *
+ * Called before applying a new layer (re-apply) and when a selection yields no
+ * layer (e.g. the metadata fetch fails or the selection is cleared), so a
+ * stale forecast field never lingers over the base map.
+ */
+export function removeWeatherLayer(map: Map): void {
+  if (map.getSource("weather") === undefined) {
+    return;
+  }
+  if (map.getLayer("weather") !== undefined) {
+    map.removeLayer("weather");
+  }
+  map.removeSource("weather");
 }

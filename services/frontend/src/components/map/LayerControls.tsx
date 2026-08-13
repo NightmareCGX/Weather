@@ -1,50 +1,84 @@
 "use client";
 
-import type { Model } from "@/lib/api/types";
-
-interface LayerControlsProps {
-  models: Model[];
-  model: string;
-  variable: string;
-  leadTimeHours: number;
-  onModelChange: (model: string) => void;
-  onVariableChange: (variable: string) => void;
-  onLeadTimeChange: (leadTimeHours: number) => void;
-}
-
-const VARIABLES = [
-  { value: "temperature_2m", label: "Temperature (2 m)" },
-  { value: "precipitation_rate", label: "Precipitation Rate" },
-];
-
-const LEAD_TIMES = [0, 6, 12, 24, 48, 72];
+import { useForecastSelection } from "@/context/forecast-selection";
+import { formatInitialTimeLabel } from "@/lib/forecast/labels";
+import { formatLeadTimeHours } from "@/lib/forecast/time";
 
 /**
- * Presentation-only controls for the map layer configuration. All state and
- * callbacks are passed as props (ENGINEERING_CONTRACT section 7).
+ * Presentation-only forecast selection controls for the map layer.
+ *
+ * All options are derived from the shared forecast-selection context (which is
+ * database-driven via `/v1/forecast/availability`): the Model dropdown lists
+ * exactly the models in the database, Variable lists the selected model's
+ * variables, Initial Time lists the selected variable's initial times, and
+ * Lead Time lists the selected initial time's lead times. Nothing here is
+ * hard-coded.
  */
-export function LayerControls({
-  models,
-  model,
-  variable,
-  leadTimeHours,
-  onModelChange,
-  onVariableChange,
-  onLeadTimeChange,
-}: LayerControlsProps) {
+export function LayerControls() {
+  const {
+    availability,
+    status,
+    error,
+    selection,
+    options,
+    validTime,
+    setModel,
+    setVariable,
+    setInitialTime,
+    setLeadTimeHours,
+    retry,
+  } = useForecastSelection();
+
+  if (status === "loading" || status === "idle") {
+    return (
+      <div
+        className="border-b border-slate-200 bg-white px-4 py-2 text-sm text-slate-500"
+        role="status"
+      >
+        Loading forecast options…
+      </div>
+    );
+  }
+
+  if (status === "error" || availability === null) {
+    return (
+      <div
+        className="flex flex-wrap items-center gap-2 border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700"
+        role="alert"
+      >
+        <span>Unable to load forecast data.</span>
+        <button
+          type="button"
+          onClick={retry}
+          className="rounded border border-red-300 px-2 py-0.5 text-xs font-medium hover:bg-red-100"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (availability.models.length === 0 || selection === null) {
+    return (
+      <div className="border-b border-slate-200 bg-white px-4 py-2 text-sm text-slate-500">
+        No forecast data available.
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-wrap items-center gap-4 border-b border-slate-200 bg-white px-4 py-2">
       <label className="flex items-center gap-2 text-sm text-slate-700">
         Model
         <select
           className="rounded border border-slate-300 px-2 py-1"
-          value={model}
-          onChange={(event) => onModelChange(event.target.value)}
+          value={selection.model}
+          onChange={(event) => setModel(event.target.value)}
           aria-label="Model"
         >
-          {models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.name}
+          {options.models.map((model) => (
+            <option key={model.id} value={model.id}>
+              {model.name}
             </option>
           ))}
         </select>
@@ -54,13 +88,29 @@ export function LayerControls({
         Variable
         <select
           className="rounded border border-slate-300 px-2 py-1"
-          value={variable}
-          onChange={(event) => onVariableChange(event.target.value)}
+          value={selection.variable}
+          onChange={(event) => setVariable(event.target.value)}
           aria-label="Variable"
         >
-          {VARIABLES.map((v) => (
-            <option key={v.value} value={v.value}>
-              {v.label}
+          {options.variables.map((variable) => (
+            <option key={variable.id} value={variable.id}>
+              {variable.name}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className="flex items-center gap-2 text-sm text-slate-700">
+        Initial Time
+        <select
+          className="rounded border border-slate-300 px-2 py-1"
+          value={selection.initialTime}
+          onChange={(event) => setInitialTime(event.target.value)}
+          aria-label="Initial time"
+        >
+          {options.initialTimes.map((entry) => (
+            <option key={entry.value} value={entry.value}>
+              {formatInitialTimeLabel(entry.value)}
             </option>
           ))}
         </select>
@@ -70,17 +120,23 @@ export function LayerControls({
         Lead time
         <select
           className="rounded border border-slate-300 px-2 py-1"
-          value={leadTimeHours}
-          onChange={(event) => onLeadTimeChange(Number(event.target.value))}
+          value={selection.leadTimeHours}
+          onChange={(event) => setLeadTimeHours(Number(event.target.value))}
           aria-label="Lead time"
         >
-          {LEAD_TIMES.map((lead) => (
+          {options.leadTimes.map((lead) => (
             <option key={lead} value={lead}>
-              +{lead}h
+              {formatLeadTimeHours(lead)}
             </option>
           ))}
         </select>
       </label>
+
+      {validTime !== null && (
+        <span className="text-sm text-slate-500" data-testid="valid-time">
+          Valid {formatInitialTimeLabel(validTime)}
+        </span>
+      )}
     </div>
   );
 }

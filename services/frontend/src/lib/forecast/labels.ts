@@ -1,5 +1,18 @@
 import type { VariableResource } from "@/lib/api/types";
 
+/** Format an ISO 8601 UTC time as a compact "2026-08-13 00Z" label. */
+export function formatInitialTimeLabel(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) {
+    return iso;
+  }
+  const year = parsed.getUTCFullYear();
+  const month = String(parsed.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getUTCDate()).padStart(2, "0");
+  const hour = String(parsed.getUTCHours()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hour}Z`;
+}
+
 /**
  * Variable display metadata and value formatting.
  *
