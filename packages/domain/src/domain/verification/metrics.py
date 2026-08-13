@@ -86,6 +86,36 @@ def bias(
     return float(np.mean(fcst - obs))
 
 
+def _is_numeric_scalar(value: object) -> bool:
+    """Return whether *value* is a numeric scalar (not a bool or string).
+
+    Booleans are excluded even though Python treats ``bool`` as a subclass of
+    ``int``; ``True``/``False`` are not valid forecast/observed values.
+    """
+    return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(
+        value, (bool, np.bool_)
+    )
+
+
+def _has_only_numeric_elements(
+    values: Sequence[object] | npt.NDArray[np.float64],
+) -> bool:
+    """Return whether every element of ``values`` is a numeric scalar.
+
+    String, byte, boolean, and arbitrary-object elements are rejected so the
+    element-type check runs *before* the ``float64`` conversion, preventing
+    silent coercion of values such as ``"1.5"`` or ``True``.
+    """
+    if isinstance(values, np.ndarray):
+        if values.dtype == np.bool_:
+            return False
+        if np.issubdtype(values.dtype, np.number):
+            return True
+        # Non-numeric dtype (e.g. object/string): validate each element.
+        return all(_is_numeric_scalar(value) for value in values.flat)
+    return all(_is_numeric_scalar(value) for value in values)
+
+
 def _coerce_pair_sequence(
     values: Sequence[float | int] | npt.NDArray[np.float64],
     name: str,
@@ -101,22 +131,23 @@ def _coerce_pair_sequence(
 
     Raises:
         VerificationError: If the input is not a one-dimensional numeric
-            sequence, is empty, or contains non-finite values.
+            sequence, is empty, contains non-numeric (e.g. boolean or string)
+            elements, or contains non-finite values.
     """
     if not isinstance(values, np.ndarray) and (
-        not isinstance(values, Sequence)
-        or isinstance(values, (str, bytes, bytearray))
+        not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray))
     ):
         raise VerificationError(
             f"{name} must be a sequence of numeric values, got {type(values).__name__}"
         )
 
-    try:
-        array = np.asarray(values, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
+    if not _has_only_numeric_elements(values):
         raise VerificationError(
-            f"{name} must be a sequence of numeric values"
-        ) from exc
+            f"{name} must be a sequence of numeric values, got elements of a "
+            "non-numeric type (e.g. bool or string)"
+        )
+
+    array = np.asarray(values, dtype=np.float64)
 
     if array.ndim != 1:
         raise VerificationError(

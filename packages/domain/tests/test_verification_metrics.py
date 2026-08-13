@@ -131,6 +131,25 @@ class TestSharedValidation:
     @pytest.mark.parametrize(
         "bad_values",
         [
+            # Numeric strings that ``np.float64`` would otherwise coerce.
+            ["1.5", "2.5"],
+            ["1", 2.0],
+            # Booleans are not observed/forecast values.
+            [True, False],
+            [False, 1.0],
+            # Numpy boolean / string / object arrays.
+            np.asarray([True, False]),
+            np.asarray(["1.5"]),
+            np.asarray([1.0, "x"], dtype=object),
+        ],
+    )
+    def test_silent_coercion_rejected(self, bad_values: object) -> None:
+        with pytest.raises(VerificationError):
+            root_mean_squared_error(bad_values, [1.0, 2.0])  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "bad_values",
+        [
             [1.0, math.nan, 3.0],
             [1.0, math.inf, 3.0],
             [1.0, -math.inf, 3.0],

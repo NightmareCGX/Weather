@@ -219,6 +219,35 @@ class TestAlignLongitude:
         with pytest.raises(InvalidCoordinatesError):
             self.ZERO_360_GRID.align_longitude(math.inf)
 
+    @pytest.mark.parametrize("lon", [-0.05, -0.1, -0.25, -179.99, -179.9])
+    def test_seam_longitudes_contained_in_zero_360_grid(self, lon: float) -> None:
+        # A whole-circle [0, 360] grid must accept every valid WGS84 longitude,
+        # including points just west of 0 that previously fell through the
+        # 0/360 seam.
+        assert self.ZERO_360_GRID.contains(0.0, lon) is True
+
+    def test_just_outside_real_lon_bounds_after_alignment_rejected(self) -> None:
+        # -130 maps to 230 which is inside this full-circle grid, so it is
+        # contained; the point is only rejected when it cannot be represented.
+        assert self.ZERO_360_GRID.contains(0.0, -130.0) is True
+
+    def test_partial_zero_360_grid_shifts_western_longitude(self) -> None:
+        # A [0, 360) grid that does NOT wrap the full circle (lon_stop > 180
+        # but cols*step < 360) still shifts western longitudes by +360 and has
+        # a hard western boundary.
+        partial = RegularGrid(
+            lat_start=-90.0,
+            lon_start=0.0,
+            lat_step=1.0,
+            lon_step=1.0,
+            rows=181,
+            cols=300,
+        )
+        assert partial.lon_stop == 299.0
+        # -5 is not within 0..299, so it is outside this partial grid.
+        assert partial.align_longitude(-5.0) == 355.0
+        assert partial.contains(0.0, -5.0) is False
+
 
 class TestNearestGridIndex:
     @pytest.mark.parametrize(
@@ -264,6 +293,15 @@ class TestNearestGridIndex:
         with pytest.raises(PointOutsideGridError):
             GRID.nearest_grid_index(15.0, -19.0)
 
+    def test_seam_wraps_to_first_column(self) -> None:
+        # On a whole-circle grid, -0.1 (== 359.9) is nearest to col 0 across
+        # the 0/360 seam, not to a non-existent col 1440.
+        grid = TestAlignLongitude.ZERO_360_GRID
+        assert grid.nearest_grid_index(0.0, -0.1) == GridPoint(row=360, col=0)
+        assert grid.nearest_grid_index(0.0, -0.05) == GridPoint(row=360, col=0)
+        # A value just east of the seam lands on the same first column.
+        assert grid.nearest_grid_index(0.0, 0.1) == GridPoint(row=360, col=0)
+
 
 class TestGridIndexToCoordinate:
     def test_round_trip_for_each_node(self) -> None:
@@ -304,3 +342,12 @@ class TestRowColFromCoordinates:
     def test_outside_grid_rejected(self) -> None:
         with pytest.raises(PointOutsideGridError):
             GRID.row_col_from_coordinates(30.1, -20.0)
+
+    def test_seam_fractional_column_wraps(self) -> None:
+        # A whole-circle grid maps the west-of-0 seam point onto the first
+        # fractional column window (359.9 / 0.25 == 1439.6, which wraps to
+        # within [0, cols)).
+        grid = TestAlignLongitude.ZERO_360_GRID
+        row_f, col_f = grid.row_col_from_coordinates(0.0, -0.1)
+        assert row_f == pytest.approx(360.0)
+        assert 0.0 <= col_f < 1440.0

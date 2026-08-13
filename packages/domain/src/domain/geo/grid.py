@@ -78,6 +78,16 @@ class RegularGrid:
         """Longitude of the final grid column."""
         return self.lon_start + (self.cols - 1) * self.lon_step
 
+    def _is_full_circle(self) -> bool:
+        """Return whether the grid wraps the entire 360 degrees in longitude.
+
+        A grid whose columns span (or exceed) a full revolution has no hard
+        longitudinal boundary: the first and last columns are adjacent across
+        the ``0/360`` seam. Such grids accept any valid longitude and column
+        indices wrap around.
+        """
+        return self.cols * self.lon_step >= 360.0 - GRID_BOUNDS_TOLERANCE
+
     def row_latitude(self, row: int) -> float:
         """Return the latitude of a grid row.
 
@@ -112,7 +122,9 @@ class RegularGrid:
         """Return whether a geographic point lies within the grid bounds.
 
         Boundary points within ``GRID_BOUNDS_TOLERANCE`` of the edges are
-        considered inside.
+        considered inside. A grid that wraps the full 360 degrees of longitude
+        accepts any valid longitude; the ``0/360`` seam between the last and
+        first columns is covered by the wrap.
 
         Args:
             latitude: Latitude in decimal degrees.
@@ -125,19 +137,23 @@ class RegularGrid:
             InvalidCoordinatesError: If the coordinates are invalid.
         """
         validate_coordinates(latitude, longitude)
-        aligned_longitude = self.align_longitude(longitude)
+        if self._is_full_circle():
+            longitude_is_inside = True
+        else:
+            aligned = self.align_longitude(longitude)
+            longitude_is_inside = (
+                self.lon_start - GRID_BOUNDS_TOLERANCE
+                <= aligned
+                <= self.lon_stop + GRID_BOUNDS_TOLERANCE
+            )
         return (
             self.lat_start - GRID_BOUNDS_TOLERANCE
             <= latitude
             <= self.lat_stop + GRID_BOUNDS_TOLERANCE
-        ) and (
-            self.lon_start - GRID_BOUNDS_TOLERANCE
-            <= aligned_longitude
-            <= self.lon_stop + GRID_BOUNDS_TOLERANCE
-        )
+        ) and longitude_is_inside
 
     def align_longitude(self, longitude: float) -> float:
-        """Return ``longitude`` expressed in this grid's coordinate convention.
+        """Return ``longitude`` expressed in the grid coordinate convention.
 
         The query longitude is first wrapped into the closed interval
         ``[-180, 180]`` via :func:`domain.geo.coordinates.normalize_longitude`.
@@ -147,16 +163,23 @@ class RegularGrid:
         falls inside the grid (e.g. ``-106.82 -> 253.18``). For ``[-180, 180]``
         grids the normalized value is used unchanged.
 
+        For a grid that wraps the full 360 degrees, the value is expressed in
+        the single-revolution interval ``[lon_start, lon_start + 360)`` using
+        modular arithmetic, so a point near the ``0`` seam is not pushed beyond
+        the final column (e.g. ``-0.1 -> 359.9`` stays within the grid).
+
         Args:
             longitude: Longitude in decimal degrees (any finite value).
 
         Returns:
-            The longitude expressed in this grid's coordinate convention.
+            The longitude expressed in this grid coordinate convention.
 
         Raises:
             InvalidCoordinatesError: If the longitude is not finite.
         """
         normalized = normalize_longitude(longitude)
+        if self._is_full_circle():
+            return self.lon_start + ((normalized - self.lon_start) % 360.0)
         if self.lon_stop > 180.0 and normalized < 0.0:
             return normalized + 360.0
         return normalized
@@ -180,7 +203,7 @@ class RegularGrid:
                 f"Point ({latitude}, {longitude}) is outside grid bounds "
                 f"[{self.lat_start}, {self.lat_stop}] x [{self.lon_start}, {self.lon_stop}]."
             )
-        # ``round`` applies banker's rounding (round(0.5) == 0); use half-up so
+        # ``round`` applies banker rounding (round(0.5) == 0); use half-up so
         # the nearest node is picked deterministically for exact midpoints.
         aligned_longitude = self.align_longitude(longitude)
         row = math.floor((latitude - self.lat_start) / self.lat_step + 0.5)
@@ -189,11 +212,17 @@ class RegularGrid:
         )
         # Guard against rounding overshoot at the far edges of the grid.
         row = min(max(row, 0), self.rows - 1)
-        col = min(max(col, 0), self.cols - 1)
+        # On a whole-circle grid the column index wraps around the 0/360 seam
+        # (e.g. -0.1 aligns to col 0, not a non-existent col 1440).
+        col = (
+            col % self.cols
+            if self._is_full_circle()
+            else min(max(col, 0), self.cols - 1)
+        )
         return GridPoint(row=row, col=col)
 
     def grid_index_to_coordinate(self, point: GridPoint) -> tuple[float, float]:
-        """Return the ``(latitude, longitude)`` of a grid node's center.
+        """Return the ``(latitude, longitude)`` of a grid node center.
 
         Args:
             point: Grid index.
@@ -234,9 +263,12 @@ class RegularGrid:
         aligned_longitude = self.align_longitude(longitude)
         row_f = (latitude - self.lat_start) / self.lat_step
         col_f = (aligned_longitude - self.lon_start) / self.lon_step
-        # Clamp so boundary points within tolerance map onto the grid.
+        if self._is_full_circle():
+            col_f = col_f % float(self.cols)
+        else:
+            # Clamp so boundary points within tolerance map onto the grid.
+            col_f = min(max(col_f, 0.0), float(self.cols - 1))
         row_f = min(max(row_f, 0.0), float(self.rows - 1))
-        col_f = min(max(col_f, 0.0), float(self.cols - 1))
         return row_f, col_f
 
     def _validate_index(self, index: int, size: int, name: str) -> None:
