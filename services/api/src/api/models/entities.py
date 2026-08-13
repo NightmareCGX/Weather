@@ -250,5 +250,11 @@ class PointQueryFallbackAudit(Base):
     )
     expires_at = Column(DateTime(timezone=True), nullable=False)
     fallback_reason = Column(String, nullable=False)
+    #: Cumulative number of fallbacks recorded for this key. Concurrency-safe
+    #: upserts increment this counter instead of dropping a row on a PK
+    #: conflict, so the audit ledger never loses a fallback event.
+    fallback_count = Column(
+        Integer, nullable=False, server_default="1", default=1
+    )
 
     __table_args__ = (Index("idx_point_query_fallback_expires", "expires_at"),)

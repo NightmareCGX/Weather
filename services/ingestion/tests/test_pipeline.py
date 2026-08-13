@@ -9,6 +9,7 @@ in-memory SQLite database so no live PostgreSQL is required.
 
 from __future__ import annotations
 
+import glob
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ from ingestion.core.catalog import (
     record_run,
 )
 from ingestion.core.pipeline import (
+    MissingVariableError,
     UnitNormalizationError,
     _apply_variable_mapping,
     _normalize_canonical_units,
@@ -68,6 +70,32 @@ def _spec(zarr_store_path: str) -> RunCatalogSpec:
         ),
     )
 
+
+def _surface_spec(zarr_store_path: str) -> RunCatalogSpec:
+    """A spec for fixtures that decode to only ``temperature_2m``.
+
+    The single-lead GRIB2 fixture (and the synthetic single-lead datasets built
+    for merge/re-ingest tests) contains only the 2-metre temperature field,
+    so the declared variables must match what the parser actually selects or
+    the variable-presence fail-fast guard rejects the ingest.
+    """
+    return RunCatalogSpec(
+        center_id="noaa",
+        center_name="National Oceanic and Atmospheric Administration",
+        center_country="USA",
+        model_id="gfs",
+        model_name="Global Forecast System",
+        is_ensemble=False,
+        resolution_km=25.0,
+        version_string="v1.0",
+        cycle_time=datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc),
+        grid_id="global_025deg",
+        grid_name="Global 0.25 Degree Grid",
+        grid_resolution_km=25.0,
+        product_type="surface",
+        zarr_store_path=zarr_store_path,
+        variables=(VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),),
+    )
 
 def _dataset_for_lead(lead: int):
     """A normalized single-lead dataset for a given lead time.
@@ -248,7 +276,7 @@ def test_ingest_grib_file_parses_writes_and_records(
         "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
     )
 
-    run = ingest_grib_file(_spec(store_path), FIXTURE, store_path)
+    run = ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)
 
     assert run.status == "ready"
     assert len(recorded) == 1
@@ -267,10 +295,10 @@ def test_ingest_grib_file_parses_writes_and_records(
     assert session.query(CenterRecord).count() == 1
     assert session.query(GridRecord).count() == 1
     # The catalog records the spec's platform variables (a registry), and one
-    # product row per (variable x lead). The fixture has one lead and the spec
-    # declares two variables.
-    assert session.query(VariableRecord).count() == 2
-    assert session.query(ProductRecord).count() == 2
+    # product row per (variable x lead). The single-lead surface spec
+    # declares one variable (temperature_2m), so one row of each.
+    assert session.query(VariableRecord).count() == 1
+    assert session.query(ProductRecord).count() == 1
 
 
 def test_ingest_grib_file_store_uses_platform_variable(tmp_path) -> None:
@@ -376,7 +404,7 @@ def test_ingest_grib_file_requested_lead_matches_succeeds(
 
     # The fixture decodes to lead 6 (its GRIB step is +6h).
     run = ingest_grib_file(
-        _spec(store_path),
+        _surface_spec(store_path),
         FIXTURE,
         store_path,
         requested_lead_time_hours=6,
@@ -400,7 +428,7 @@ def test_ingest_grib_file_requested_lead_mismatch_aborts(
 
     with pytest.raises(LeadTimeMismatchError) as excinfo:
         ingest_grib_file(
-            _spec(store_path),
+            _surface_spec(store_path),
             FIXTURE,
             store_path,
             requested_lead_time_hours=12,  # fixture is lead 6
@@ -441,8 +469,8 @@ def test_ingest_grib_file_merges_leads_into_cycle_store(
     monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
 
     # Ingest the same cycle store for two different leads.
-    first = ingest_grib_file(_spec(store_path), FIXTURE, store_path)
-    second = ingest_grib_file(_spec(store_path), FIXTURE, store_path)
+    first = ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)
+    second = ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)
 
     # Both leads share one run row and one store path.
     assert first.id == second.id
@@ -482,10 +510,10 @@ def test_ingest_grib_file_reingest_lead_replaces_in_store(
     )
     monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
 
-    ingest_grib_file(_spec(store_path), FIXTURE, store_path)  # lead 6
-    ingest_grib_file(_spec(store_path), FIXTURE, store_path)  # lead 12
+    ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)  # lead 6
+    ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)  # lead 12
     # Re-ingest lead 6 a second time: still exactly two leads in the store.
-    ingest_grib_file(_spec(store_path), FIXTURE, store_path)  # lead 6 again
+    ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)  # lead 6 again
 
     import os
     import xarray as xr
@@ -493,3 +521,411 @@ def test_ingest_grib_file_reingest_lead_replaces_in_store(
     assert os.path.isdir(store_path)
     restored = xr.open_zarr(store_path)
     assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6, 12]
+
+
+def test_ingest_grib_file_missing_custom_variable_fails_fast(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A requested variable absent from the file aborts before any write.
+
+    Regression for N1: a custom ``--variable`` (e.g. a 10 m wind field not
+    among ``SURFACE_FIELD_FILTERS``) previously produced a catalog row with
+    no data in the store. It must now fail with
+    :class:`MissingVariableError` and record nothing.
+    """
+    import xarray as xr
+
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _winds_only(path):
+        return xr.Dataset(
+            {"some_other_field": (("latitude", "longitude"), [[1.0]])},
+            coords={
+                "latitude": [0.0],
+                "longitude": [0.0],
+                "lead_time_hours": 6,
+            },
+        )
+
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _winds_only)
+
+
+    spec = RunCatalogSpec(
+        center_id="noaa",
+        center_name="National Oceanic and Atmospheric Administration",
+        center_country="USA",
+        model_id="gfs",
+        model_name="Global Forecast System",
+        is_ensemble=False,
+        resolution_km=25.0,
+        version_string="v1.0",
+        cycle_time=datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc),
+        grid_id="global_025deg",
+        grid_name="Global 0.25 Degree Grid",
+        grid_resolution_km=25.0,
+        product_type="surface",
+        zarr_store_path=store_path,
+        variables=(
+            VariableSpec("wind_u_10m", "10-Meter Wind U", "m/s", "10u"),
+        ),
+    )
+
+    with pytest.raises(MissingVariableError) as excinfo:
+        ingest_grib_file(spec, "x.grib2", store_path)
+    message = str(excinfo.value)
+    assert "wind_u_10m" in message
+    assert "wind_u_10m" in message.split("Available variables:")[0]
+
+    # Nothing recorded and no store was written.
+    assert session.query(ModelRunRecord).count() == 0
+    assert session.query(ProductRecord).count() == 0
+    assert not os.path.isdir(store_path)
+
+
+def test_ingest_grib_file_write_failure_preserves_old_store(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A mid-write crash preserves the old store and skips the catalog update.
+
+    Regression for L2-C1: a failure while writing the staging store must not
+    truncate the previously-served store, must leave no ``.staging`` residue,
+    and must not record the failed run.
+    """
+    import xarray as xr
+
+    store_path = str(tmp_path / "gfs.zarr")
+    recorded: list = []
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        run = record_run(session, spec, dataset)
+        recorded.append(run)
+        return run
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    _call = {"n": 0}
+    _leads = [6, 12]
+
+    def _fake_parse(path):
+        lead = _leads[_call["n"] % len(_leads)]
+        _call["n"] += 1
+        return _dataset_for_lead(lead)
+
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
+
+    # First ingest succeeds (lead 6).
+    first = ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)
+    assert first.status == "ready"
+    assert len(recorded) == 1
+
+    # Second ingest crashes while writing the staging store.
+    import ingestion.core.zarr_writer as zw
+
+    def _boom(dataset, resolved, chunks):
+        raise RuntimeError("simulated crash mid-write")
+
+    monkeypatch.setattr(zw, "_write_zarr", _boom)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)
+
+    # Old store still intact and readable; no staging residue; no extra catalog
+    # write for the failed attempt.
+    assert len(recorded) == 1
+    assert not glob.glob(store_path + ".staging*")
+    restored = xr.open_zarr(store_path)
+    assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6]
+
+
+def test_ingest_grib_file_reingest_atomic_no_residue(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A successful re-ingest leaves both leads and no ``.old``/``.staging``.
+
+    Regression for L2-C1: the atomic swap must promote the merged store and
+    clean up its staging and superseded directories.
+    """
+    import os
+    import xarray as xr
+    import ingestion.core.zarr_writer as zw
+
+    store_path = str(tmp_path / "gfs.zarr")
+    recorded: list = []
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        run = record_run(session, spec, dataset)
+        recorded.append(run)
+        return run
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    _call = {"n": 0}
+    _leads = [6, 12]
+
+    def _fake_parse(path):
+        lead = _leads[_call["n"] % len(_leads)]
+        _call["n"] += 1
+        return _dataset_for_lead(lead)
+
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
+
+    first = ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)
+    second = ingest_grib_file(_surface_spec(store_path), FIXTURE, store_path)
+
+    assert first.id == second.id
+    assert len(recorded) == 2
+    assert not glob.glob(store_path + ".staging*")
+    assert not os.path.exists(zw._old_path(store_path))
+    restored = xr.open_zarr(store_path)
+    assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6, 12]
+
+
+def test_ingest_grib_file_partial_variables_record_present_subset(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """Only the requested variables present in the file are recorded.
+
+    Regression for MAJOR-3: a spec declaring temperature_2m + precipitation_rate
+    against a file that decodes only temperature_2m must succeed and record
+    only the present variable (the parser deliberately skips absent fields: a
+    GEFS pgrb2b product legitimately omits prate).
+    """
+    import xarray as xr
+
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _temp_only(path):
+        return xr.Dataset(
+            {"t2m": (("latitude", "longitude"), [[280.0]])},
+            coords={"latitude": [0.0], "longitude": [0.0], "lead_time_hours": 6},
+        )
+
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _temp_only)
+
+    recorded: list[ModelRunRecord] = []
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        run = record_run(session, spec, dataset)
+        recorded.append(run)
+        return run
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    # _spec declares temperature_2m AND precipitation_rate; only t2m is present.
+    run = ingest_grib_file(_spec(store_path), "x.grib2", store_path)
+
+    assert run.status == "ready"
+    assert len(recorded) == 1
+    codes = {code for (code,) in session.query(VariableRecord.variable_code).all()}
+    assert codes == {"temperature_2m"}
+    assert session.query(ProductRecord).count() == 1
+
+
+def test_ingest_grib_file_corrupt_store_refused(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A corrupt existing store fails loudly instead of being rebuilt.
+
+    Regression for MAJOR-2: a store that exists but cannot be opened must not
+    be silently replaced by a store containing only the current lead (which
+    would drop previously ingested leads while the catalog still advertises
+    them as ready).
+    """
+    import os
+    import xarray as xr
+
+    from ingestion.core.zarr_writer import CorruptStoreError
+
+    store_path = str(tmp_path / "gfs.zarr")
+    os.makedirs(store_path, exist_ok=True)
+    with open(os.path.join(store_path, ".zgroup"), "w") as handle:
+        handle.write("{not-valid-json")
+
+    def _temp_only(path):
+        return xr.Dataset(
+            {"t2m": (("latitude", "longitude"), [[280.0]])},
+            coords={"latitude": [0.0], "longitude": [0.0], "lead_time_hours": 6},
+        )
+
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _temp_only)
+
+    with pytest.raises(CorruptStoreError):
+        ingest_grib_file(_surface_spec(store_path), "x.grib2", store_path)
+
+    # The corrupt directory is left untouched and nothing was recorded.
+    assert os.path.exists(os.path.join(store_path, ".zgroup"))
+    assert session.query(ModelRunRecord).count() == 0
+
+
+def test_store_lock_serializes_concurrent_merge_writes(tmp_path) -> None:
+    """Concurrent workers ingesting leads of one cycle store stay consistent.
+
+    Regression for MAJOR-1: without the store lock, workers racing on the
+    shared staging directory and read-merge-write cycle lost leads. Under
+    store_lock every lead must be present afterwards with no staging/old
+    residue.
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    import numpy as np
+    import xarray as xr
+
+    from ingestion.core.zarr_writer import store_lock, store_status, write_dataset
+
+    store_path = str(tmp_path / "cycle.zarr")
+
+    def _lead_dataset(lead: int) -> xr.Dataset:
+        return xr.Dataset(
+            {
+                "temperature_2m": (
+                    ("lead_time_hours", "latitude", "longitude"),
+                    np.full((1, 2, 2), float(lead)),
+                )
+            },
+            coords={
+                "lead_time_hours": [lead],
+                "latitude": [0.0, 1.0],
+                "longitude": [0.0, 1.0],
+            },
+        )
+
+    def _merge_write(lead: int) -> None:
+        dataset = _lead_dataset(lead)
+        with store_lock(store_path):
+            status = store_status(store_path)
+            if status == "readable":
+                existing = xr.open_zarr(store_path)
+                if "lead_time_hours" in existing.dims:
+                    keep = (existing["lead_time_hours"] != lead).values
+                    dataset = xr.concat(
+                        [existing.isel(lead_time_hours=keep), dataset],
+                        dim="lead_time_hours",
+                        coords="minimal",
+                    )
+                    dataset = dataset.sortby("lead_time_hours")
+            write_dataset(dataset, store_path)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(_merge_write, [0, 6, 12, 18]))
+
+    final = xr.open_zarr(store_path)
+    assert sorted(final["lead_time_hours"].values.tolist()) == [0, 6, 12, 18]
+    assert not glob.glob(store_path + ".staging*")
+    assert not os.path.exists(store_path + ".old")
+
+
+def test_swap_local_rolls_back_previous_store_on_rename_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """If promoting the staged store fails, the previous store is restored.
+
+    The atomicity guarantee of the two-rename exchange: a failure on the
+    second rename must roll the old store back into place, never leaving the
+    final path empty or half-written.
+    """
+    import os
+
+    import numpy as np
+    import xarray as xr
+
+    import ingestion.core.zarr_writer as zw
+    from ingestion.core.zarr_writer import write_dataset
+
+    store_path = str(tmp_path / "cycle.zarr")
+    staging = zw._staging_path(store_path)
+
+    def _lead_dataset(lead: int) -> xr.Dataset:
+        return xr.Dataset(
+            {
+                "temperature_2m": (
+                    ("lead_time_hours", "latitude", "longitude"),
+                    np.full((1, 2, 2), float(lead)),
+                )
+            },
+            coords={
+                "lead_time_hours": [lead],
+                "latitude": [0.0, 1.0],
+                "longitude": [0.0, 1.0],
+            },
+        )
+
+    write_dataset(_lead_dataset(0), store_path)
+    _lead_dataset(6).to_zarr(staging, mode="w")
+
+    real_rename = os.rename
+    calls = {"count": 0}
+
+    def _flaky_rename(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated second-rename failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", _flaky_rename)
+
+    with pytest.raises(OSError):
+        zw._swap_local(store_path, staging)
+
+    # The previous store (lead 0) was rolled back into place.
+    restored = xr.open_zarr(store_path)
+    assert restored["lead_time_hours"].values.tolist() == [0]
+
+
+
+def test_reingest_variable_flip_drops_missing_variable(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """Re-ingesting without a previously-present variable drops it.
+
+    Regression for MAJOR-3: if an earlier file provided prate and a later
+    file (e.g. a GEFS pgrb2b product) omits it, the lead merge must drop the
+    variable instead of NaN-filling it while the catalog keeps advertising
+    it.
+    """
+    import numpy as np
+    import xarray as xr
+
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _both_fields(path):
+        return xr.Dataset(
+            {
+                "t2m": (("latitude", "longitude"), np.full((2, 2), 280.0)),
+                "prate": (("latitude", "longitude"), np.full((2, 2), 0.0003)),
+            },
+            coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0], "lead_time_hours": 6},
+        )
+
+    def _temp_only(path):
+        return xr.Dataset(
+            {"t2m": (("latitude", "longitude"), np.full((2, 2), 281.0))},
+            coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0], "lead_time_hours": 12},
+        )
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        return record_run(session, spec, dataset)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    # First ingest provides both variables at lead 6.
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _both_fields)
+    ingest_grib_file(_spec(store_path), "a.grib2", store_path)
+
+    # Second ingest (lead 12) omits prate: the store must drop it entirely.
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _temp_only)
+    ingest_grib_file(_spec(store_path), "b.grib2", store_path)
+
+    import xarray as xr_open
+
+    restored = xr_open.open_zarr(store_path)
+    assert set(restored.data_vars) == {"temperature_2m"}
+    assert "precipitation_rate" not in restored.data_vars
+    assert sorted(restored["lead_time_hours"].values.tolist()) == [6, 12]
+    # No NaN-fill: both leads carry real temperature values.
+    assert bool(np.isfinite(restored["temperature_2m"].values).all())

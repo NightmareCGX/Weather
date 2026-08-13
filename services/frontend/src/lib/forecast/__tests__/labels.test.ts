@@ -56,11 +56,16 @@ describe("selection", () => {
       longitude: -106.82,
     } as const;
     const selected = searchResultToSelectedLocation(result);
-    expect(selected).toMatchObject({
+    expect(selected).toEqual({
       object: "city",
       resolvedVia: "city",
       id: "city_aspen",
       name: "Aspen",
+      region: "Colorado",
+      country: "USA",
+      elevation_m: null,
+      latitude: 38.19,
+      longitude: -106.82,
     });
     expect(toPointSpecifier(selected)).toEqual({ type: "city", cityId: "city_aspen" });
   });

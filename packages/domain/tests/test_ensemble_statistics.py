@@ -170,6 +170,27 @@ class TestSharedValidation:
     @pytest.mark.parametrize(
         "bad_members",
         [
+            # Numeric strings that ``np.float64`` would otherwise coerce.
+            ["1.5", "2.5"],
+            ["1", 2, 3],
+            # Booleans are not member values even though bool is an int.
+            [True, False, True],
+            [False, 1.0],
+            # Numpy boolean / string / object arrays.
+            np.asarray([True, False]),
+            np.asarray(["1.5", "2.5"]),
+            np.asarray([1.0, "x", 3.0], dtype=object),
+            # Bytes are treated like strings (silently convertible).
+            [b"1.5", b"2.5"],
+        ],
+    )
+    def test_silent_coercion_rejected(self, bad_members: object) -> None:
+        with pytest.raises(InvalidEnsembleError):
+            ensemble_mean(bad_members)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "bad_members",
+        [
             [1.0, math.nan, 3.0],
             [1.0, math.inf, 3.0],
             [1.0, -math.inf, 3.0],
@@ -192,3 +213,25 @@ class TestSharedValidation:
     def test_scalar_members_rejected(self, bad_members: object) -> None:
         with pytest.raises(InvalidEnsembleError):
             ensemble_mean(bad_members)  # type: ignore[arg-type]
+
+    def test_numpy_scalar_members_accepted(self) -> None:
+        # Int/float numpy scalars remain valid member values.
+        members = [np.float64(1.5), np.int32(2), 3.0]
+        assert ensemble_mean(members) == pytest.approx((1.5 + 2.0 + 3.0) / 3.0)
+
+    def test_numeric_object_dtype_array_accepted(self) -> None:
+        # An object-dtype array holding numeric scalars is not silently
+        # coerced and is accepted.
+        array = np.asarray([np.float64(1.0), np.int32(2.0)], dtype=object)
+        assert ensemble_mean(array) == pytest.approx(1.5)
+
+
+
+def test_complex_members_rejected() -> None:
+    """Complex numbers are not ensemble members: converting them to float64
+    would silently drop the imaginary part (review finding MINOR-complex).
+    """
+    with pytest.raises(InvalidEnsembleError):
+        ensemble_mean(np.array([1.0 + 2.0j, 3.0 + 4.0j]))
+    with pytest.raises(InvalidEnsembleError):
+        ensemble_mean([1.0 + 2.0j, 3.0 + 4.0j])

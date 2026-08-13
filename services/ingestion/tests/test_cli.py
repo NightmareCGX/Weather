@@ -100,6 +100,8 @@ def test_cli_ingest_end_to_end(session: Session, tmp_path, monkeypatch) -> None:
             store,
             "--download-dir",
             str(tmp_path / "dl"),
+            "--variable",
+            "temperature_2m:2-Meter Temperature:°C:t2m",
         ],
         session,
         monkeypatch,
@@ -204,6 +206,8 @@ def test_cli_lead_time_matches_file_succeeds(
             store,
             "--download-dir",
             str(tmp_path / "dl"),
+            "--variable",
+            "temperature_2m:2-Meter Temperature:°C:t2m",
         ],
         session,
         monkeypatch,
@@ -256,6 +260,8 @@ def test_cli_lead_time_mismatch_aborts(
                 str(tmp_path / "gfs.zarr"),
                 "--download-dir",
                 str(tmp_path / "dl"),
+                "--variable",
+                "temperature_2m:2-Meter Temperature:°C:t2m",
             ]
         )
 

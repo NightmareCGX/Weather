@@ -55,13 +55,17 @@ jobs:
           python-version: '3.12'
 
       - name: Install Poetry, Ruff, MyPy
-        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.9.0
+        # ruff/mypy versions are pinned to exactly what each package's
+        # poetry.lock resolves (packages/*/pyproject.toml declare the same
+        # exact pins), so CI and local `poetry run ruff`/`poetry run mypy`
+        # always run the identical toolchain (review finding L5-C2).
+        run: python -m pip install poetry==2.4.1 ruff==0.3.7 mypy==1.20.2
 
       - name: Cache Poetry
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/poetry.lock', 'packages/contracts/poetry.lock', 'packages/config/poetry.lock', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-
 
       - name: Install domain dependencies
@@ -125,7 +129,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/poetry.lock', 'packages/contracts/poetry.lock', 'packages/config/poetry.lock', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-
 
       - name: Install domain dependencies
@@ -182,7 +186,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/poetry.lock', 'packages/contracts/poetry.lock', 'packages/config/poetry.lock', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-
 
       - name: Install API dependencies
@@ -272,7 +276,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/poetry.lock', 'packages/contracts/poetry.lock', 'packages/config/poetry.lock', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-
 
       # Install ingestion deps (with dev group, incl. minio + the API-owned

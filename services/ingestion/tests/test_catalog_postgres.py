@@ -268,6 +268,10 @@ def test_cli_production_entrypoint_ingests_and_serves(
             "--lead-time-hours", "6",
             "--store", store,
             "--download-dir", download_dir,
+            # Default variables (temperature_2m + precipitation_rate) are
+            # requested; the committed single-message fixture decodes only
+            # t2m, so partial presence must degrade to recording the present
+            # subset (missing prate is logged, not fatal).
         ]
     )
     assert code == 0

@@ -87,7 +87,14 @@ def _database_connected() -> bool:
     Returns:
         True when the database answers the probe, False otherwise.
     """
-    engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+    # A stalled connection (e.g. a network partition) must not block a
+    # request thread for tens of seconds: apply a 2s connect timeout so the
+    # probe fails fast, matching the Redis probe's timeout behavior.
+    engine = create_engine(
+        settings.DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 2},
+    )
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))

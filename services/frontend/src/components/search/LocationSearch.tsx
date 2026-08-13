@@ -4,6 +4,7 @@ import { useEffect, useId, useRef, useState } from "react";
 
 import { useSearch } from "@/hooks/useSearch";
 import type { SelectedLocation } from "@/lib/api/types";
+import { searchResultToSelectedLocation } from "@/lib/forecast/selection";
 
 interface LocationSearchProps {
   onSelect: (location: SelectedLocation) => void;
@@ -38,22 +39,7 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
   const selectIndex = (index: number) => {
     const result = results[index];
     if (result === undefined) return;
-    onSelect({
-      name: result.name,
-      object: result.object,
-      latitude: result.latitude,
-      longitude: result.longitude,
-      elevation_m: result.elevation_m,
-      region: result.region,
-      country: result.country,
-      id: result.id,
-      resolvedVia:
-        result.object === "city"
-          ? "city"
-          : result.object === "ski_resort"
-            ? "resort"
-            : "coordinates",
-    });
+    onSelect(searchResultToSelectedLocation(result));
     setQuery("");
     setOpen(false);
     setHighlighted(-1);

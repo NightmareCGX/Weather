@@ -12,14 +12,23 @@ management lives here.
 
 from __future__ import annotations
 
+import fcntl
+import glob
+import json
 import os
+import shutil
+import time
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from os import PathLike
-from typing import Hashable, Mapping, MutableMapping
+from typing import Any, Hashable, Mapping, MutableMapping
 
 import s3fs  # type: ignore[import-untyped]
 import xarray as xr
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
+from ingestion.core.base import IngestionError
 from ingestion.core.config import IngestionSettings, settings
 
 #: Default chunks applied per dimension when none are provided.
@@ -101,32 +110,88 @@ def _endpoint_url(conn_settings: IngestionSettings) -> str:
     return f"{scheme}://{conn_settings.MINIO_ENDPOINT}"
 
 
-def write_dataset(
-    dataset: xr.Dataset,
-    store: str | PathLike[str] | Mapping[str, bytes],
-    *,
-    chunks: Mapping[str, int] | None = None,
-) -> str:
-    """Write a normalized dataset to a Zarr store.
+class ZarrWriteError(IngestionError):
+    """Raised when a Zarr store cannot be written, validated, or committed.
 
-    Chunk sizes default to :data:`DEFAULT_CHUNKS` (falling back to the
-    full extent of any dimension not covered) and every data variable is
-    stored with ``Zstd`` compression. No dask backend is required; the
-    chunk grid and compressor are recorded in the Zarr metadata.
+    The atomic write path raises this when a staged store fails to validate or
+    cannot be swapped into place, so a half-written store is never exposed at
+    the final path.
+    """
+
+
+class CorruptStoreError(IngestionError):
+    """Raised when an existing Zarr store cannot be opened.
+
+    A store that physically exists but fails to open (a half-written or
+    corrupt store) must fail ingestion loudly instead of being silently
+    rebuilt from the current single lead, which would drop every previously
+    ingested lead while the catalog still advertises them as ready (review
+    finding MAJOR-2).
+    """
+
+
+#: Sibling-path suffix for the in-progress staging store of an atomic write.
+_STAGING_SUFFIX = ".staging"
+#: Sibling-path suffix a superseded store is moved to during an atomic swap.
+_OLD_SUFFIX = ".old"
+
+
+def _staging_path(path: str) -> str:
+    """Return a writer-unique sibling staging path for an atomic write.
+
+    The staging target (``{path}.staging-<uuid>``) holds the dataset being
+    written so a partially-written or corrupt store is never exposed at the
+    final ``path`` before it is known-good and atomically swapped in. The
+    unique suffix prevents concurrent writers from racing on a shared
+    staging directory (review finding MAJOR-1).
 
     Args:
-        dataset: Normalized dataset (e.g. from
-            :func:`ingestion.providers.noaa.parser.parse_grib2`).
-        store: Local path, ``s3://`` URL, or a mutable mapping.
-        chunks: Optional per-dimension chunk sizes.
+        path: The final local path or ``s3://`` URL.
 
     Returns:
-        The store target as a string (for reporting).
-
-    Raises:
-        ValueError: If the store target is unsupported.
+        The writer-unique sibling staging path.
     """
-    resolved = _resolve_store(store)
+    return f"{path}{_STAGING_SUFFIX}-{uuid.uuid4().hex[:8]}"
+
+
+def _old_path(path: str) -> str:
+    """Return the sibling ``.old`` path a superseded store is moved to.
+
+    Args:
+        path: The final local path or ``s3://`` URL.
+
+    Returns:
+        The sibling superseded path.
+    """
+    return f"{path}{_OLD_SUFFIX}"
+
+
+def _remove_path_if_exists(path: str) -> None:
+    """Remove a staging/old directory, ignoring a missing target.
+
+    Args:
+        path: The directory to remove.
+    """
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+
+def _write_zarr(
+    dataset: xr.Dataset,
+    resolved: str | PathLike[str] | MutableMapping[str, bytes],
+    chunks: Mapping[str, int] | None,
+) -> None:
+    """Write ``dataset`` to ``resolved`` with platform chunking and Zstd.
+
+    Chunk sizes default to :data:`DEFAULT_CHUNKS` (falling back to the full
+    extent of any dimension not covered) and every data variable is stored
+    with ``Zstd`` compression. No dask backend is required.
+
+    Args:
+        dataset: The normalized dataset to persist.
+        resolved: An xarray-compatible store target.
+        chunks: Optional per-dimension chunk sizes.
+    """
     defaults = chunks or DEFAULT_CHUNKS
 
     def _chunk_sizes(name: Hashable) -> tuple[int, ...]:
@@ -145,7 +210,321 @@ def write_dataset(
         for name in dataset.data_vars
     }
     dataset.to_zarr(resolved, mode="w", encoding=encoding)
-    return os.fspath(store) if isinstance(store, PathLike) else str(store)
+
+
+def _require_readable(
+    resolved: str | PathLike[str] | MutableMapping[str, bytes],
+) -> None:
+    """Open and close a Zarr store, failing loudly if it cannot be read.
+
+    Args:
+        resolved: The store target to validate.
+
+    Raises:
+        ZarrWriteError: If the store cannot be opened.
+    """
+    try:
+        dataset = xr.open_zarr(resolved)
+    except Exception as exc:
+        raise ZarrWriteError(
+            f"Just-written Zarr store {resolved!r} cannot be opened: {exc}"
+        ) from exc
+    dataset.close()
+
+
+def _swap_local(path: str, staging: str) -> None:
+    """Atomically replace ``path`` with the staged ``staging`` store.
+
+    The previous store at ``path`` is first renamed to ``{path}.old``, then
+    the staged store is renamed into ``path``, then ``.old`` is removed. Both
+    renames are atomic on a single filesystem, so at every intermediate point
+    either the old store or the new store is present at ``path`` — never a
+    half-written directory. On failure the previous store is rolled back.
+
+    Args:
+        path: The final store directory.
+        staging: The fully-written staging directory to promote.
+    """
+    old = _old_path(path)
+    old_moved = False
+    try:
+        if os.path.exists(path):
+            _remove_path_if_exists(old)
+            os.rename(path, old)
+            old_moved = True
+        os.rename(staging, path)
+    except BaseException:
+        if old_moved and os.path.exists(old) and not os.path.exists(path):
+            # Roll the previous store back into place and leave ``staging``
+            # for best-effort cleanup by the caller; ``path`` now holds the
+            # original store or nothing at all, never a partial write.
+            try:
+                os.rename(old, path)
+            except Exception:
+                pass
+        raise
+    # The swap succeeded; best-effort removal of the superseded ``.old``.
+    if old_moved:
+        try:
+            _remove_path_if_exists(old)
+        except Exception:
+            pass
+
+
+def _remove_leftover_staging_local(path: str) -> None:
+    """Remove leftover staging directories of previous crashed writers.
+
+    Callers hold the store lock, so any staging directory present is a
+    crashed attempt and is safe to remove.
+
+    Args:
+        path: The final store path.
+    """
+    for leftover in glob.glob(f"{path}{_STAGING_SUFFIX}*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+def _s3_remove_leftover_staging(fs: Any, key: str) -> None:
+    """Remove leftover S3 staging prefixes of previous crashed writers.
+
+    Callers hold the store lock, so any staging prefix present is a crashed
+    attempt and is safe to remove.
+
+    Args:
+        fs: An ``s3fs.S3FileSystem`` instance.
+        key: The ``bucket/prefix`` key of the final store.
+    """
+    for leftover in fs.glob(f"{key}{_STAGING_SUFFIX}*"):
+        fs.rm(leftover, recursive=True)
+
+def _write_local_atomic(
+    dataset: xr.Dataset,
+    path: str,
+    chunks: Mapping[str, int] | None,
+) -> None:
+    """Write ``dataset`` to ``path`` atomically via a sibling staging store.
+
+    The dataset is written to ``{path}.staging``, verified readable, then
+    atomically swapped into ``path`` by :func:`_swap_local`. A crash on the
+    write or validation leaves only a discarded ``.staging`` (removed) and
+    the previous ``path`` intact.
+
+    Args:
+        path: The final local directory path.
+        chunks: Optional per-dimension chunk sizes.
+    """
+    _remove_leftover_staging_local(path)
+    staging = _staging_path(path)
+    try:
+        _write_zarr(dataset, staging, chunks)
+        _require_readable(staging)
+        _swap_local(path, staging)
+    except BaseException:
+        # A failed write/validation/swap must not leave the staging copy
+        # behind (review finding MAJOR-2): the previous store was either
+        # never moved or rolled back into place by _swap_local.
+        _remove_path_if_exists(staging)
+        raise
+
+
+def _make_s3_fs() -> Any:
+    """Build the S3 filesystem configured from ingestion settings.
+
+    Returns:
+        An ``s3fs.S3FileSystem`` (typed ``Any`` because s3fs is imported
+        untyped).
+    """
+    return s3fs.S3FileSystem(
+        key=settings.MINIO_ACCESS_KEY,
+        secret=settings.MINIO_SECRET_KEY,
+        client_kwargs={"endpoint_url": _endpoint_url(settings)},
+    )
+
+
+def _fs_key(url: str) -> str:
+    """Return the ``bucket/prefix`` filesystem key for an ``s3://`` URL.
+
+    Args:
+        url: An ``s3://bucket/prefix`` URL.
+
+    Returns:
+        The ``bucket/prefix`` key used by s3fs.
+
+    Raises:
+        ValueError: If the URL has no bucket/prefix.
+    """
+    rest = url[len("s3://") :].strip("/")
+    if not rest:
+        raise ValueError(f"Invalid S3 store URL: {url!r}")
+    return rest
+
+
+def _s3_remove_if_exists(fs: Any, key: str) -> None:
+    """Recursively remove an S3 prefix, ignoring a missing target.
+
+    Args:
+        fs: An ``s3fs.S3FileSystem`` instance.
+        key: The ``bucket/prefix`` key to remove.
+    """
+    if fs.exists(key):
+        fs.rm(key, recursive=True)
+
+
+def _s3_move_prefix(fs: Any, src_key: str, dst_key: str) -> None:
+    """Move an S3 prefix object-by-object.
+
+    s3fs' directory-level mv raises FileNotFoundError on MinIO (verified
+    empirically: both slash and no-slash forms fail), so the swap is
+    performed per object: each object is moved (copy + delete) under the
+    destination prefix, then the source prefix is removed. Single-object
+    moves are individually atomic on S3.
+
+    Args:
+        fs: An s3fs.S3FileSystem instance.
+        src_key: The bucket/prefix key of the source store.
+        dst_key: The bucket/prefix key of the destination store.
+    """
+    dst_prefix = dst_key.rstrip("/") + "/"
+    # walk() enumerates the prefix recursively, separating directories from
+    # files (ls() is single-level and would treat nested directories as unit
+    # entries, dropping the chunk objects; find(withdirs=False) is broken on
+    # s3fs/MinIO).
+    for dirpath, _dirnames, filenames in fs.walk(src_key):
+        rel_dir = dirpath[len(src_key) :].lstrip("/")
+        dir_prefix = dst_prefix + (rel_dir + "/" if rel_dir else "")
+        for name in filenames:
+            fs.mv(dirpath.rstrip("/") + "/" + name, dir_prefix + name)
+    try:
+        fs.rm(src_key, recursive=True)
+    except FileNotFoundError:
+        # The per-object moves already emptied the source prefix; an empty
+        # prefix has nothing left to remove.
+        pass
+
+def _swap_s3(fs: Any, url: str, staging: str) -> None:
+    """Promote a staged S3 prefix to the final URL as best-effort-atomic.
+
+    s3fs ``mv`` is a copy-then-delete, so S3 has no true directory-level
+    atomic rename. The previous prefix is first moved aside to ``.old`` and
+    the staged prefix renamed into place; on failure the previous prefix is
+    rolled back. This narrows the failure window to the ``mv`` operations
+    themselves (see :func:`_write_s3_atomic`).
+
+    Args:
+        url: The final ``s3://bucket/prefix`` URL.
+        staging: The fully-written staging URL to promote.
+    """
+    key = _fs_key(url)
+    staging_key = _fs_key(staging)
+    old_key = _fs_key(_old_path(url))
+    old_moved = False
+    try:
+        if fs.exists(key):
+            _s3_remove_if_exists(fs, old_key)
+            _s3_move_prefix(fs, key, old_key)
+            old_moved = True
+        _s3_move_prefix(fs, staging_key, key)
+    except BaseException:
+        if old_moved and fs.exists(old_key) and not fs.exists(key):
+            # Roll the previous store back into place.
+            try:
+                _s3_move_prefix(fs, old_key, key)
+            except Exception:
+                pass
+        raise
+    if old_moved:
+        try:
+            _s3_remove_if_exists(fs, old_key)
+        except Exception:
+            pass
+
+
+def _write_s3_atomic(
+    dataset: xr.Dataset,
+    path: str,
+    chunks: Mapping[str, int] | None,
+) -> None:
+    """Write ``dataset`` to an ``s3://`` store as best-effort-atomic.
+
+    S3 has no directory-level atomic rename, so the staging swap for remote
+    stores cannot be as strong as the local two-``os.rename`` exchange:
+    ``s3fs`` ``mv`` is a copy-then-delete, so there is a brief window during
+    which the store prefix is absent. To avoid ever serving a corrupt store,
+    the dataset is written to a temporary sibling prefix, verified readable,
+    and only then swapped into place while the previous prefix is preserved.
+    If any step fails the staging prefix is removed and the previously-served
+    store is left intact — the writer prefers raising over overwriting a
+    known-good store with an unverified one.
+
+    Args:
+        path: The final ``s3://bucket/prefix`` URL.
+        chunks: Optional per-dimension chunk sizes.
+
+    Raises:
+        ZarrWriteError: If the staged store cannot be validated.
+    """
+    fs = _make_s3_fs()
+    key = _fs_key(path)
+    _s3_remove_leftover_staging(fs, key)
+    staging = _staging_path(path)
+    try:
+        _write_zarr(dataset, _resolve_s3_store(staging, settings), chunks)
+        _require_readable(_resolve_s3_store(staging, settings))
+        _swap_s3(fs, path, staging)
+    except BaseException:
+        # Never leave the staging prefix behind (review finding MAJOR-2).
+        _s3_remove_if_exists(fs, _fs_key(staging))
+        raise
+
+
+def write_dataset(
+    dataset: xr.Dataset,
+    store: str | PathLike[str] | Mapping[str, bytes],
+    *,
+    chunks: Mapping[str, int] | None = None,
+) -> str:
+    """Write a normalized dataset to a Zarr store, atomically.
+
+    Chunk sizes default to :data:`DEFAULT_CHUNKS` (falling back to the full
+    extent of any dimension not covered) and every data variable is stored
+    with ``Zstd`` compression. The dataset is first written to a sibling
+    staging target and verified readable, then atomically swapped into the
+    final ``store`` so a crash mid-write never exposes a half-written store
+    — the previous store (if any) is preserved until the new one is known-good.
+
+    Args:
+        dataset: Normalized dataset (e.g. from
+            :func:`ingestion.providers.noaa.parser.parse_grib2`).
+        store: Local path, ``s3://`` URL, or a mutable mapping (a mapping
+            target has no directory semantics and is written in place).
+        chunks: Optional per-dimension chunk sizes.
+
+    Returns:
+        The store target as a string (for reporting).
+
+    Raises:
+        ValueError: If an ``s3://`` URL is malformed.
+        ZarrWriteError: If the staged store cannot be validated.
+    """
+    if isinstance(store, MutableMapping):
+        # A mutable mapping is written in place: the caller's mapping receives
+        # the store bytes. Copying it with dict(store) would silently write
+        # to a throwaway copy and drop the data (review finding MAJOR-4).
+        _write_zarr(dataset, store, chunks)
+        return str(store)
+    if isinstance(store, Mapping):
+        raise TypeError(
+            "read-only Mapping store targets cannot be written in place; "
+            "pass a mutable mapping (e.g. a dict) or a path/URL"
+        )
+    path = os.fspath(store)
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+    if path.startswith("s3://"):
+        _write_s3_atomic(dataset, path, chunks)
+        return path
+    _write_local_atomic(dataset, path, chunks)
+    return path
 
 
 def read_dataset(store: str | PathLike[str] | Mapping[str, bytes]) -> xr.Dataset:
@@ -177,7 +556,11 @@ def store_exists(store: str | PathLike[str] | Mapping[str, bytes]) -> bool:
     ingest (the target may be written in place) or a re-ingest (the target is
     already served by a ``ready`` catalog row and must not be truncated until
     the new store is known-good). A store that exists but fails to open is
-    treated as absent so it is never written over destructively.
+    treated as absent so it is never written over destructively (L2-M3).
+
+    Both local and remote targets are verified by actually attempting to open
+    the Zarr store — checking only that a directory exists would treat a
+    corrupt or half-written store as present and reuse it.
 
     Args:
         store: A local path, ``s3://`` URL, or mapping.
@@ -186,11 +569,156 @@ def store_exists(store: str | PathLike[str] | Mapping[str, bytes]) -> bool:
         True when a store can be opened at ``store``, False otherwise.
     """
     resolved = _resolve_store(store)
-    if isinstance(resolved, str):
-        return os.path.exists(resolved)
+    if isinstance(resolved, str) and not os.path.exists(resolved):
+        return False
     try:
         dataset = xr.open_zarr(resolved)
     except Exception:
         return False
     dataset.close()
     return True
+
+
+
+def store_status(
+    store: str | PathLike[str] | Mapping[str, bytes],
+) -> str:
+    """Classify an existing store target as "missing", "readable", or "corrupt".
+
+    Unlike :func:`store_exists`, this distinguishes a never-written target
+    (missing) from one that exists but cannot be opened (corrupt). The
+    ingestion orchestration treats a corrupt store as a hard failure — a
+    half-written store must never be silently rebuilt from the current single
+    lead (that would drop every previously ingested lead while the catalog
+    still advertises them as ready).
+
+    Args:
+        store: A local path, ``s3://`` URL, or mapping.
+
+    Returns:
+        One of "missing", "readable", "corrupt".
+    """
+    resolved = _resolve_store(store)
+    if isinstance(resolved, str):
+        if not os.path.exists(resolved):
+            return "missing"
+        try:
+            dataset = xr.open_zarr(resolved)
+        except Exception:
+            return "corrupt"
+        dataset.close()
+        return "readable"
+    # Mutable mapping / fsspec mapping (e.g. an S3 mapper): probe the
+    # single .zgroup key instead of listing the whole store (a full listing
+    # is a network walk on an S3 mapper). A store without .zgroup was never
+    # written; one whose .zgroup cannot be opened is corrupt.
+    if isinstance(resolved, Mapping):
+        try:
+            resolved[".zgroup"]
+        except KeyError:
+            return "missing"
+    try:
+        dataset = xr.open_zarr(resolved)
+    except Exception:
+        return "corrupt"
+    dataset.close()
+    return "readable"
+
+
+_S3_LOCK_TTL_SECONDS = 600.0
+#: Poll interval while waiting to acquire or verify the S3 advisory lock.
+_S3_LOCK_RETRY_SECONDS = 0.2
+
+
+@contextmanager
+def _s3_advisory_lock(fs: Any, key: str) -> Iterator[None]:
+    """Hold a best-effort advisory lock on an S3 store prefix.
+
+    S3 has no atomic compare-and-set, so this lock is advisory: a claim
+    writes a ``{key}.lock`` object carrying a writer token and a timestamp,
+    then re-reads it to verify the claim; a stale lock (older than
+    ``_S3_LOCK_TTL_SECONDS``) is reclaimed. This serializes the common
+    interleaved-start case and breaks deadlocks after a crashed writer, but
+    it cannot guarantee mutual exclusion under pathological object-store
+    timing. The scheduler should still serialize per-cycle writers where
+    strictness matters.
+
+    Args:
+        fs: An ``s3fs.S3FileSystem`` instance.
+        key: The ``bucket/prefix`` key of the final store.
+    """
+    lock_key = key + ".lock"
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
+    acquired = False
+    while not acquired:
+        try:
+            with fs.open(lock_key, "rb") as handle:
+                payload = json.loads(handle.read().decode("utf-8"))
+            if payload.get("token") == token:
+                acquired = True
+                break
+            if time.time() - float(payload.get("t", 0.0)) < _S3_LOCK_TTL_SECONDS:
+                time.sleep(_S3_LOCK_RETRY_SECONDS)
+                continue
+            # Stale lock: fall through to reclaim it.
+        except FileNotFoundError:
+            pass
+        # Claim the lock (best-effort: two writers may both pass here; the
+        # re-read below keeps at most one owner).
+        try:
+            with fs.open(lock_key, "wb") as handle:
+                handle.write(json.dumps({"token": token, "t": time.time()}).encode("utf-8"))
+        except Exception:
+            continue
+        time.sleep(_S3_LOCK_RETRY_SECONDS)
+        try:
+            with fs.open(lock_key, "rb") as handle:
+                payload = json.loads(handle.read().decode("utf-8"))
+            if payload.get("token") == token:
+                acquired = True
+        except FileNotFoundError:
+            continue
+    try:
+        yield
+    finally:
+        try:
+            with fs.open(lock_key, "rb") as handle:
+                payload = json.loads(handle.read().decode("utf-8"))
+            if payload.get("token") == token:
+                fs.rm(lock_key)
+        except Exception:
+            pass
+
+
+@contextmanager
+def store_lock(store: str | PathLike[str]) -> Iterator[None]:
+    """Serialize read-merge-write cycles on a local Zarr store path.
+
+    Multiple workers ingesting the same cycle run concurrently (one worker
+    per lead) share the store. Without mutual exclusion the shared staging
+    directory races (one worker removes another's in-flight staging) and the
+    read-merge-write cycle suffers lost updates. ``flock`` provides
+    process-level mutual exclusion keyed by a sibling ``{path}.lock`` file.
+
+    ``s3://`` targets have no filesystem lock primitive; the caller (the
+    scheduler/CLI) must serialize writers for a shared S3 store.
+
+    Args:
+        store: The local store path (or ``s3://`` URL, which yields without
+            locking).
+    """
+    path = os.fspath(store)
+    if path.startswith("s3://"):
+        # Best-effort advisory lock via a {key}.lock object (S3 has no
+        # filesystem lock primitive).
+        fs = _make_s3_fs()
+        with _s3_advisory_lock(fs, _fs_key(path)):
+            yield
+        return
+    lock_fd = open(path + ".lock", "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()

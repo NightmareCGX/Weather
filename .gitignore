@@ -68,3 +68,11 @@ test-results/
 playwright-report/
 blob-report/
 playwright/.cache/
+
+# --- Local sandbox environment artifacts (no-root native libs / tool caches) ---
+.local-libs/
+.local-env.sh
+.npm-cache/
+.poetry-cache/
+.pip-cache/
+.poetry-config/

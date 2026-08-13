@@ -41,6 +41,12 @@ class GribParsingError(IngestionError):
 #: deliberately narrow: temperature is pinned to ``heightAboveGround`` level 2
 #: and precipitation rate to ``surface`` level 0 with ``stepType=instant`` (a
 #: ``pgrb2`` file carries both instant and time-averaged ``prate`` messages).
+#: WARNING — every new platform surface variable MUST be registered here in
+#: addition to the catalog/CLI ``VariableSpec`` metadata. ``parse_grib2`` only
+#: decodes the fields listed below, so an unregistered variable (e.g. a 10 m
+#: wind selected via a custom ``--variable``) would be absent from the
+#: dataset and correctly rejected by the pipeline's variable-missing guard.
+
 SURFACE_FIELD_FILTERS: dict[str, dict[str, object]] = {
     # GRIB shortName ``2t`` = "2 metre temperature" (paramId 167), K.
     "t2m": {

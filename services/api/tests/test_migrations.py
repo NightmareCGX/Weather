@@ -78,6 +78,13 @@ def test_postgres_alembic_migration_smoke(postgres_engine):
         assert "cities" in spatial_tables
         assert "ski_resorts" in spatial_tables
 
+        # 3b. Migration 002 adds the cumulative fallback_count audit column
+        audit_columns = {
+            col["name"]: col for col in inspector.get_columns("point_query_fallback_audit")
+        }
+        assert "fallback_count" in audit_columns
+        assert audit_columns["fallback_count"]["nullable"] is False
+
         # 4. GIST index presence check
         indexes_check = conn.execute(
             text(

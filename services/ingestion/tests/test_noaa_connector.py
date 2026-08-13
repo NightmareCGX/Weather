@@ -182,6 +182,76 @@ async def test_download_retries_transient_5xx_then_succeeds(tmp_path: Path) -> N
 
 
 @respx.mock
+async def test_download_retries_429_rate_limit_then_succeeds(
+    tmp_path: Path,
+) -> None:
+    """A 429 Too Many Requests is transient and is retried to success.
+
+    Regression for L2-M1: a rate-limit response was previously raised as a
+    non-retryable ``DownloadFailedError``. It must instead enter the retry
+    loop like other transient statuses, so a 429 followed by a 200 downloads
+    the file successfully.
+    """
+    content = b"rate-limited-then-ok"
+    route = respx.get(GFS_006_URL).mock(
+        side_effect=[
+            httpx.Response(429),  # transient rate limit
+            httpx.Response(200, content=content),
+        ]
+    )
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        destination = await connector.download(
+            "gfs", CYCLE, 0, 6, tmp_path / "rate_limited.grib2"
+        )
+    assert route.call_count == 2
+    assert destination.read_bytes() == content
+
+
+@respx.mock
+async def test_download_429_exhausts_retries_to_download_failed(tmp_path: Path) -> None:
+    """A persistent 429 eventually fails as a ``DownloadFailedError``."""
+    route = respx.get(GFS_006_URL).mock(return_value=httpx.Response(429))
+    with pytest.raises(DownloadFailedError, match="HTTP 429"):
+        async with NOAAConnector(
+            conn_settings=_settings(DOWNLOAD_RETRIES=2)
+        ) as connector:
+            await connector.download("gfs", CYCLE, 0, 6, tmp_path / "rate.grib2")
+    assert route.call_count == 3  # initial attempt + 2 retries
+    assert not (tmp_path / "rate.grib2").exists()
+
+
+@respx.mock
+async def test_download_retry_honors_retry_after(monkeypatch, tmp_path: Path) -> None:
+    """``Retry-After`` on a 429 extends the retry delay beyond linear backoff."""
+    content = b"ok-after-wait"
+    sleeps: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    route = respx.get(GFS_006_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "30"}),
+            httpx.Response(200, content=content),
+        ]
+    )
+    import ingestion.providers.noaa.connector as connector_mod
+
+    monkeypatch.setattr(connector_mod.asyncio, "sleep", _fake_sleep)
+    async with NOAAConnector(
+        conn_settings=_settings(RETRY_BACKOFF_SECONDS=2.0)
+    ) as connector:
+        destination = await connector.download(
+            "gfs", CYCLE, 0, 6, tmp_path / "retry_after.grib2"
+        )
+    assert route.call_count == 2
+    assert destination.read_bytes() == content
+    # The first retry delay is max(2.0 * 1, 30) = 30 seconds, honoring the
+    # upstream rate-limit hint rather than waiting only the linear backoff.
+    assert sleeps == [30.0]
+
+
+@respx.mock
 async def test_download_5xx_exhausts_retries(tmp_path: Path) -> None:
     route = respx.get(GFS_006_URL).mock(return_value=httpx.Response(500))
     with pytest.raises(DownloadFailedError, match="HTTP 500"):

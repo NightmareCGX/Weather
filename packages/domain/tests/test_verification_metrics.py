@@ -131,6 +131,25 @@ class TestSharedValidation:
     @pytest.mark.parametrize(
         "bad_values",
         [
+            # Numeric strings that ``np.float64`` would otherwise coerce.
+            ["1.5", "2.5"],
+            ["1", 2.0],
+            # Booleans are not observed/forecast values.
+            [True, False],
+            [False, 1.0],
+            # Numpy boolean / string / object arrays.
+            np.asarray([True, False]),
+            np.asarray(["1.5"]),
+            np.asarray([1.0, "x"], dtype=object),
+        ],
+    )
+    def test_silent_coercion_rejected(self, bad_values: object) -> None:
+        with pytest.raises(VerificationError):
+            root_mean_squared_error(bad_values, [1.0, 2.0])  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "bad_values",
+        [
             [1.0, math.nan, 3.0],
             [1.0, math.inf, 3.0],
             [1.0, -math.inf, 3.0],
@@ -155,3 +174,14 @@ class TestSharedValidation:
             bias([1.0], [1.0, 2.0])
         with pytest.raises(VerificationError):
             mean_absolute_error([1.0], [])
+
+
+
+def test_complex_observation_pairs_rejected() -> None:
+    """Complex observations are not verification data: float64 conversion
+    would silently drop the imaginary part (review finding MINOR-complex).
+    """
+    with pytest.raises(VerificationError):
+        root_mean_squared_error(np.array([1.0 + 2.0j, 2.0 + 1.0j]), np.array([1.0, 2.0]))
+    with pytest.raises(VerificationError):
+        root_mean_squared_error([1.0 + 2.0j, 2.0 + 1.0j], [1.0, 2.0])

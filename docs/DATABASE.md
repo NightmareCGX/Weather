@@ -19,7 +19,7 @@ In numerical weather prediction (NWP) and ensemble forecasting systems, storing 
   ```sql
   UNIQUE (run_id, variable_id, grid_id, product_type, lead_time_hours)
   ```
-- **`point_query_fallback_audit` Table**: Explicitly designated as a Redis-fallback and point-query audit ledger. Optimized with `cache_key` as primary key and a dedicated `BTREE` index on `expires_at` for background TTL cleanup workers.
+- **`point_query_fallback_audit` Table**: Explicitly designated as a Redis-fallback and point-query audit ledger. Keyed by `cache_key` as primary key, with a dedicated `BTREE` index on `expires_at` for background TTL cleanup workers and a cumulative `fallback_count` column (default `1`) recording how many times each `cache_key` has fallen back. Concurrent fallbacks for the same key are merged via a PostgreSQL upsert (`INSERT ... ON CONFLICT`) that increments `fallback_count` and refreshes `expires_at`, so the ledger never drops a fallback event during a Redis outage.
 
 ### Catalog write path
 
