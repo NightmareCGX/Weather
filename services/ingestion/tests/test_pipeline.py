@@ -63,7 +63,7 @@ def _spec(zarr_store_path: str) -> RunCatalogSpec:
         product_type="surface",
         zarr_store_path=zarr_store_path,
         variables=(
-            VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),
+            VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),
             VariableSpec("precipitation_rate", "Precipitation Rate", "mm/h", "prate"),
         ),
     )
@@ -103,12 +103,12 @@ def session() -> Session:
 
 
 def test_apply_variable_mapping_renames_source_to_platform() -> None:
-    """Raw GRIB2 shortNames (t, prate) are renamed to platform codes."""
+    """cfgrib-emitted variable names (t2m, prate) map to platform codes."""
     import xarray as xr
 
     dataset = xr.Dataset(
         {
-            "t": (("latitude", "longitude"), [[1.0]]),
+            "t2m": (("latitude", "longitude"), [[1.0]]),
             "prate": (("latitude", "longitude"), [[2.0]]),
         },
         coords={"latitude": [0.0], "longitude": [0.0]},
@@ -149,7 +149,7 @@ def test_normalize_temperature_kelvin_to_celsius() -> None:
     dataset = _dataset_with_units(
         "temperature_2m", [[280.0, 280.0], [280.0, 280.0]], source_unit="K"
     )
-    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),)
     normalized = _normalize_canonical_units(dataset, variables)
     value = float(normalized["temperature_2m"].values[0, 0])
     assert value == pytest.approx(6.85, abs=1e-9)
@@ -166,7 +166,7 @@ def test_normalize_temperature_real_fixture_is_celsius() -> None:
     dataset = _dataset_with_units(
         "temperature_2m", [[280.0, 285.0], [290.0, 300.0]], source_unit="K"
     )
-    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),)
     normalized = _normalize_canonical_units(dataset, variables)
     values = normalized["temperature_2m"].values
     assert float(values.min()) == pytest.approx(280.0 - 273.15, abs=1e-9)
@@ -198,7 +198,7 @@ def test_normalize_leaves_already_canonical_values_unchanged() -> None:
     dataset = _dataset_with_units(
         "temperature_2m", [[15.0, 15.0], [15.0, 15.0]], source_unit="°C"
     )
-    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),)
     normalized = _normalize_canonical_units(dataset, variables)
     assert float(normalized["temperature_2m"].values[0, 0]) == 15.0
     assert normalized["temperature_2m"].attrs["units"] == "°C"
@@ -209,7 +209,7 @@ def test_normalize_unknown_source_unit_rejected() -> None:
     dataset = _dataset_with_units(
         "temperature_2m", [[15.0, 15.0], [15.0, 15.0]], source_unit="°F"
     )
-    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),)
     with pytest.raises(UnitNormalizationError):
         _normalize_canonical_units(dataset, variables)
 
@@ -222,7 +222,7 @@ def test_normalize_without_units_attr_is_noop() -> None:
         {"temperature_2m": (("latitude", "longitude"), [[15.0, 15.0], [15.0, 15.0]])},
         coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0]},
     )
-    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t"),)
+    variables = (VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),)
     normalized = _normalize_canonical_units(dataset, variables)
     assert float(normalized["temperature_2m"].values[0, 0]) == 15.0
     assert "units" not in normalized["temperature_2m"].attrs
@@ -288,7 +288,63 @@ def test_ingest_grib_file_store_uses_platform_variable(tmp_path) -> None:
 
     restored = xr.open_zarr(store_path)
     assert set(restored.data_vars) == {"temperature_2m"}
+    assert "t2m" not in restored.data_vars
     assert "t" not in restored.data_vars
+
+
+#: Path to the committed multi-typeOfLevel regression fixture.
+MULTI_FIXTURE = str(Path(__file__).parent / "fixtures" / "gfs_multi_typeoflevel.grib2")
+
+
+def test_ingest_grib_file_multi_typeoflevel_end_to_end(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """The realistic multi-typeOfLevel fixture runs end-to-end to Zarr + catalog.
+
+    Regression for the production failure: an unfiltered open of a real GFS
+    ``pgrb2`` file raises ``DatasetBuildError``. The compact multi-typeOfLevel
+    fixture reproduces that structure. After the fix, the full ingest path
+    (parse -> variable mapping -> canonical units -> Zarr write -> catalog
+    metadata) must produce the two platform variables in canonical units.
+    """
+    store_path = str(tmp_path / "gfs_multi.zarr")
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        return record_run(session, spec, dataset)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    run = ingest_grib_file(_spec(store_path), MULTI_FIXTURE, store_path)
+
+    assert run.status == "ready"
+    assert session.query(ModelRunRecord).count() == 1
+    # Two declared variables -> two VariableRecord + two ProductRecord rows.
+    assert session.query(VariableRecord).count() == 2
+    assert session.query(ProductRecord).count() == 2
+
+    # The Zarr store holds both platform variables in canonical units.
+    import xarray as xr
+
+    restored = xr.open_zarr(store_path)
+    assert set(restored.data_vars) == {"temperature_2m", "precipitation_rate"}
+
+    # temperature_2m: K -> °C. Fixture t2m = 280.0 K -> 6.85 °C. The values
+    # are stored as float32 in Zarr, so allow float32 rounding tolerance.
+    assert restored["temperature_2m"].attrs["units"] == "°C"
+    assert float(restored["temperature_2m"].values.flat[0]) == pytest.approx(
+        280.0 - 273.15, abs=1e-4
+    )
+
+    # precipitation_rate: kg m-2 s-1 -> mm/h. Fixture instant prate = 0.0003.
+    assert restored["precipitation_rate"].attrs["units"] == "mm/h"
+    assert float(restored["precipitation_rate"].values.flat[0]) == pytest.approx(
+        0.0003 * 3600.0, rel=1e-6
+    )
+
+    # lead_time_hours survives the merge.
+    assert int(restored["lead_time_hours"].values[0]) == 6
 
 
 def test_ingest_grib_file_corrupt_raises(session: Session, tmp_path) -> None:

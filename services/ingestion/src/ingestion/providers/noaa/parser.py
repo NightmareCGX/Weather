@@ -11,6 +11,15 @@ in ``docs/DATABASE.md``:
 * The GEFS ensemble dimension is normalized from cfgrib's ``number`` name to
   the platform's ``member`` convention, so the rest of the pipeline and the
   API uniformly expose "ensemble member".
+
+Operational NOAA GFS/GEFS ``pgrb2`` products are large multi-message files
+spanning many vertical levels and ``typeOfLevel`` values. cfgrib treats
+``typeOfLevel`` (and several other keys) as *unique* per dataset, so opening
+the whole file as one unfiltered ``xr.Dataset`` raises
+``DatasetBuildError: multiple values for unique key 'typeOfLevel'``. The
+parser therefore selects each platform-required surface field with an
+explicit ``filter_by_keys`` selection, normalizes each selected field, and
+merges the results into a single dataset.
 """
 
 from pathlib import Path
@@ -25,8 +34,40 @@ class GribParsingError(IngestionError):
     """Raised when a GRIB2 file cannot be decoded or normalized."""
 
 
+#: cfgrib ``filter_by_keys`` selections for each platform-required surface
+#: field. Each entry maps the cfgrib-emitted data-variable name (the GRIB
+#: ``cfVarName``) to the exact GRIB metadata that uniquely selects that field
+#: from an operational multi-message GFS/GEFS ``pgrb2`` file. The selectors are
+#: deliberately narrow: temperature is pinned to ``heightAboveGround`` level 2
+#: and precipitation rate to ``surface`` level 0 with ``stepType=instant`` (a
+#: ``pgrb2`` file carries both instant and time-averaged ``prate`` messages).
+SURFACE_FIELD_FILTERS: dict[str, dict[str, object]] = {
+    # GRIB shortName ``2t`` = "2 metre temperature" (paramId 167), K.
+    "t2m": {
+        "shortName": "2t",
+        "typeOfLevel": "heightAboveGround",
+        "level": 2,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``prate`` = "Precipitation rate" (paramId 7), kg m-2 s-1.
+    "prate": {
+        "shortName": "prate",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "instant",
+    },
+}
+
+
 def parse_grib2(path: str | Path) -> xr.Dataset:
     """Decode a single GRIB2 file into a normalized, in-memory Dataset.
+
+    Each platform-required surface field is selected from the file with an
+    explicit :data:`SURFACE_FIELD_FILTERS` selection, normalized, and merged
+    into the returned dataset. Fields not present in the product (e.g. a GEFS
+    ``pgrb2b`` file that omits a variable) are skipped rather than failing the
+    whole parse. The GEFS ensemble ``number`` dimension is preserved through
+    the normalization step and becomes the platform ``member`` dimension.
 
     The returned dataset is fully loaded into memory and its file handle
     closed before the method returns. Coordinates are normalized so the
@@ -43,16 +84,41 @@ def parse_grib2(path: str | Path) -> xr.Dataset:
         A normalized ``xarray.Dataset``.
 
     Raises:
-        GribParsingError: If the file cannot be opened, decoded, or the
-            ``step`` coordinate is missing.
+        GribParsingError: If the file cannot be opened, decoded, the
+            ``step`` coordinate is missing, or none of the platform-required
+            surface fields can be selected.
     """
-    try:
-        with xr.open_dataset(path, engine="cfgrib") as raw:
-            dataset = raw.load()
-    except Exception as exc:  # cfgrib/eccodes raise varied exceptions
-        raise GribParsingError(f"Failed to decode GRIB2 file {path!s}: {exc}") from exc
+    selected: list[xr.Dataset] = []
+    for variable_name, filter_by_keys in SURFACE_FIELD_FILTERS.items():
+        try:
+            with xr.open_dataset(
+                path,
+                engine="cfgrib",
+                backend_kwargs={"filter_by_keys": filter_by_keys},
+            ) as raw:
+                dataset = raw.load()
+        except Exception as exc:  # cfgrib/eccodes raise varied exceptions
+            raise GribParsingError(
+                f"Failed to decode GRIB2 file {path!s}: {exc}"
+            ) from exc
 
-    return normalize(dataset)
+        if not dataset.data_vars:
+            # The field is not present in this product; skip it rather than
+            # failing the whole parse (a zero-match filter returns an empty
+            # dataset, not an error).
+            continue
+
+        selected.append(normalize(dataset))
+
+    if not selected:
+        raise GribParsingError(
+            f"Decoded GRIB2 file {path!s} contains none of the required "
+            "surface fields: " + ", ".join(SURFACE_FIELD_FILTERS) + "."
+        )
+
+    if len(selected) == 1:
+        return selected[0]
+    return xr.merge(selected)
 
 
 def normalize(dataset: xr.Dataset) -> xr.Dataset:

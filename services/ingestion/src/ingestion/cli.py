@@ -50,14 +50,17 @@ from ingestion.providers.noaa.connector import NOAAConnector
 SUPPORTED_MODELS = ("gfs", "gefs")
 
 #: Default platform surface-variable mapping for NOAA GFS/GEFS files. Each
-#: entry maps the raw GRIB2 ``shortName`` (``source_code``) to the platform
-#: ``code`` recorded in ``forecast_variables``.
+#: entry maps the cfgrib-emitted variable name (the GRIB ``cfVarName``, which
+#: for 2-metre temperature is ``t2m`` — not the GRIB ``shortName`` ``2t``) to
+#: the platform ``code`` recorded in ``forecast_variables``. ``source_code``
+#: must equal the *emitted* data-variable name so the pipeline's
+#: ``_apply_variable_mapping`` can match it.
 DEFAULT_VARIABLES: tuple[VariableSpec, ...] = (
     VariableSpec(
         code="temperature_2m",
         name="2-Meter Temperature",
         unit="°C",
-        source_code="t",
+        source_code="t2m",
     ),
     VariableSpec(
         code="precipitation_rate",
@@ -90,7 +93,7 @@ def _parse_variable(spec: str) -> VariableSpec:
     if len(parts) not in (3, 4) or any(not part for part in parts):
         raise argparse.ArgumentTypeError(
             "variable must be CODE:NAME:UNIT[:SOURCE], e.g. "
-            "temperature_2m:2-Meter Temperature:°C:t"
+            "temperature_2m:2-Meter Temperature:°C:t2m"
         )
     code, name, unit = parts[0], parts[1], parts[2]
     source = parts[3] if len(parts) == 4 else None

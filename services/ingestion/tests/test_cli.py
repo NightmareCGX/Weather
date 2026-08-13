@@ -146,7 +146,7 @@ def test_cli_ingest_custom_variables(session: Session, tmp_path, monkeypatch) ->
             "--download-dir",
             str(tmp_path / "dl"),
             "--variable",
-            "temperature_2m:2-Meter Temperature:°C:t",
+            "temperature_2m:2-Meter Temperature:°C:t2m",
         ],
         session,
         monkeypatch,
@@ -221,6 +221,7 @@ def test_cli_lead_time_mismatch_aborts(
     with a ``LeadTimeMismatchError`` and record no catalog rows, rather than
     silently re-ingesting the lead-6 file as if it were lead 12.
     """
+
     async def _fake_download(
         self, model, cycle_date, cycle_hour, lead_time_hours, destination
     ):

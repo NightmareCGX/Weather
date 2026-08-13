@@ -292,7 +292,7 @@ def test_cli_production_entrypoint_ingests_and_serves(
     # the GRIB fixture grid (lat 44..0, lon -120..30) but deliberately differs
     # from the API suite's point-forecast point (38.125, -106.875) so the two
     # suites never share a Redis cache key. The CLI-parsed dataset renames the
-    # raw GRIB2 't' variable to temperature_2m.
+    # raw GRIB2 't2m' variable to temperature_2m.
     resp = client.get(f"/v1/points?lat={LAT}&lon={LON}&models=gfs")
     assert resp.status_code == 200
     data = resp.json()["data"]

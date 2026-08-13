@@ -30,11 +30,12 @@ def test_local_store_roundtrip_preserves_data(
     # Values, coordinates, and attributes are identical.
     xrt.assert_identical(ds, restored)
 
-    # The persisted Zarr chunk grid is restored on read.
-    assert restored.t.encoding.get("chunks") == (5, 10)
+    # The persisted Zarr chunk grid is restored on read. The fixture decodes
+    # to the ``t2m`` variable (the cfgrib ``cfVarName`` for the 2 m field).
+    assert restored.t2m.encoding.get("chunks") == (5, 10)
 
     # Compression is preserved.
-    compressor = restored.t.encoding.get("compressor")
+    compressor = restored.t2m.encoding.get("compressor")
     assert compressor is not None
     assert compressor.codec_id == "zstd"
 
@@ -46,8 +47,8 @@ def test_s3_store_roundtrip_preserves_data(grib_fixture, minio_store: str) -> No
     restored = _roundtrip(ds, minio_store)
 
     xrt.assert_identical(ds, restored)
-    assert restored.t.encoding.get("chunks") == (5, 10)
-    compressor = restored.t.encoding.get("compressor")
+    assert restored.t2m.encoding.get("chunks") == (5, 10)
+    compressor = restored.t2m.encoding.get("compressor")
     assert compressor is not None
     assert compressor.codec_id == "zstd"
 
@@ -73,13 +74,14 @@ def test_api_reads_ingestion_written_store(grib_fixture: Path, tmp_path: Path) -
     write_dataset(ds, store)
 
     # The API production reader must open the ingestion-written store and
-    # recover values, coordinates, and Zstd compressor metadata.
+    # recover values, coordinates, and Zstd compressor metadata. The fixture
+    # decodes to the ``t2m`` variable.
     restored = read_dataset(store)
-    assert "t" in restored.data_vars
-    assert restored.t.shape == ds.t.shape
-    assert float(restored.t.values[0, 0]) == pytest.approx(
-        float(ds.t.values[0, 0]), abs=1e-6
+    assert "t2m" in restored.data_vars
+    assert restored.t2m.shape == ds.t2m.shape
+    assert float(restored.t2m.values[0, 0]) == pytest.approx(
+        float(ds.t2m.values[0, 0]), abs=1e-6
     )
-    compressor = restored.t.encoding.get("compressor")
+    compressor = restored.t2m.encoding.get("compressor")
     assert compressor is not None
     assert compressor.codec_id == "zstd"

@@ -42,14 +42,17 @@ def test_parse_grib2_decodes_normalized_dataset(grib_fixture: Path) -> None:
     assert "step" not in ds.coords
     assert "valid_time" not in ds.coords
 
-    # The temperature data variable is present and 2-D on the grid.
-    assert "t" in ds.data_vars
-    assert ds.t.dims == ("latitude", "longitude")
-    assert ds.t.shape == (5, 10)
-    assert ds.t.dtype == np.float32
+    # The temperature data variable is present and 2-D on the grid. The
+    # fixture decodes to the cfgrib-emitted name ``t2m`` (the GRIB
+    # ``cfVarName`` for the ``2t``/``heightAboveGround``/2 field), which is
+    # what the pipeline's ``DEFAULT_VARIABLES`` mapping matches on.
+    assert "t2m" in ds.data_vars
+    assert ds.t2m.dims == ("latitude", "longitude")
+    assert ds.t2m.shape == (5, 10)
+    assert ds.t2m.dtype == np.float32
 
     # Grid values land in the expected physical range.
-    assert np.allclose(ds.t.values, np.linspace(280.0, 300.0, 50).reshape(5, 10))
+    assert np.allclose(ds.t2m.values, np.linspace(280.0, 300.0, 50).reshape(5, 10))
 
 
 def test_normalize_rejects_missing_step() -> None:
@@ -93,3 +96,198 @@ def test_parse_grib2_raises_on_corrupt_file(tmp_path: Path) -> None:
 
     with pytest.raises(GribParsingError, match="Failed to decode"):
         parse_grib2(corrupt)
+
+
+#: Path to the committed multi-typeOfLevel regression fixture.
+MULTI_FIXTURE = Path(__file__).parent / "fixtures" / "gfs_multi_typeoflevel.grib2"
+
+
+def test_parse_grib2_multi_typeoflevel_succeeds() -> None:
+    """A realistic multi-typeOfLevel file no longer raises DatasetBuildError.
+
+    Regression for the production failure: the parser used to open the whole
+    GRIB2 file as one unfiltered cfgrib dataset, which raised
+    ``DatasetBuildError: multiple values for unique key 'typeOfLevel'`` on
+    real operational GFS ``pgrb2`` files (which mix ``surface``,
+    ``heightAboveGround``, ``isobaricInhPa``, ``meanSea``, etc.). The fixture
+    reproduces that structure.
+    """
+    ds = parse_grib2(MULTI_FIXTURE)
+
+    # The two platform-required surface fields are selected and merged.
+    assert set(ds.data_vars) == {"t2m", "prate"}
+    assert ds.t2m.dims == ("latitude", "longitude")
+    assert ds.prate.dims == ("latitude", "longitude")
+
+    # lead_time_hours is preserved through the merge.
+    assert ds.lead_time_hours.values == 6
+
+    # step / valid_time are dropped per the normalized contract.
+    assert "step" not in ds.coords
+    assert "valid_time" not in ds.coords
+
+
+def test_parse_grib2_temperature_emits_t2m() -> None:
+    """The 2 m temperature field decodes to the cfgrib ``t2m`` variable."""
+    ds = parse_grib2(MULTI_FIXTURE)
+    assert "t2m" in ds.data_vars
+    assert ds.t2m.attrs["units"] == "K"
+    # Representative value: 280.0 K selected from the fixture.
+    assert float(ds.t2m.values.flat[0]) == pytest.approx(280.0)
+
+
+def test_parse_grib2_precipitation_rate_selects_instant() -> None:
+    """The parser deterministically selects the instantaneous prate field.
+
+    The fixture contains both an instant (0.0003 kg m-2 s-1) and an avg
+    (0.0001 kg m-2 s-1) ``prate`` message. A broad ``shortName=prate``
+    selection is ambiguous; the parser must pick the instant one.
+    """
+    ds = parse_grib2(MULTI_FIXTURE)
+    assert "prate" in ds.data_vars
+    assert ds.prate.attrs["units"] == "kg m**-2 s**-1"
+    assert float(ds.prate.values.flat[0]) == pytest.approx(0.0003)
+    # The avg prate message (0.0001) must NOT be selected.
+    assert not np.any(np.isclose(ds.prate.values, 0.0001))
+
+
+def test_parse_grib2_ignores_unrelated_levels() -> None:
+    """Unrelated fields/levels in the file are not part of the result.
+
+    The fixture also carries a ``t`` field at ``isobaricInhPa``/850 and a
+    ``prmsl`` field at ``meanSea``. Only the platform-required surface fields
+    are returned.
+    """
+    ds = parse_grib2(MULTI_FIXTURE)
+    assert "t" not in ds.data_vars  # the isobaric 850 hPa temperature
+    assert "prmsl" not in ds.data_vars
+    assert "isobaricInhPa" not in ds.coords
+    assert "meanSea" not in ds.coords
+
+
+def test_parse_grib2_merged_integrity() -> None:
+    """The merged dataset has compatible coordinates and no duplicate dims."""
+    ds = parse_grib2(MULTI_FIXTURE)
+
+    assert dict(ds.sizes) == {"latitude": 5, "longitude": 10}
+    assert list(ds.dims) == ["latitude", "longitude"]
+
+    # Both fields share the identical grid.
+    for name in ("t2m", "prate"):
+        assert ds[name].dims == ("latitude", "longitude")
+        assert ds[name].shape == (5, 10)
+
+    # Latitude/longitude are uniformly spaced (serving tier requires this).
+    assert np.allclose(
+        np.diff(ds.latitude.values), ds.latitude.values[1] - ds.latitude.values[0]
+    )
+    assert np.allclose(
+        np.diff(ds.longitude.values),
+        ds.longitude.values[1] - ds.longitude.values[0],
+    )
+
+    # No conflicting scalar level coordinates.
+    assert "heightAboveGround" in ds.coords
+    assert "surface" in ds.coords
+    assert float(ds.heightAboveGround) == pytest.approx(2.0)
+    assert float(ds.surface) == pytest.approx(0.0)
+
+
+def test_parse_grib2_empty_file_no_fields_raises(tmp_path: Path) -> None:
+    """A file containing none of the required surface fields raises."""
+    from eccodes import (
+        codes_grib_new_from_samples,
+        codes_release,
+        codes_set,
+        codes_set_values,
+        codes_write,
+    )
+
+    path = tmp_path / "only_levels.grib2"
+    with path.open("wb") as f:
+        msg = codes_grib_new_from_samples("GRIB2")
+        codes_set(msg, "dataDate", 20260812)
+        codes_set(msg, "dataTime", 12)
+        codes_set(msg, "stepType", "instant")
+        codes_set(msg, "stepRange", "6")
+        codes_set(msg, "stepUnits", "h")
+        codes_set(msg, "paramId", 130)
+        codes_set(msg, "shortName", "t")
+        codes_set(msg, "typeOfLevel", "isobaricInhPa")
+        codes_set(msg, "level", 850)
+        codes_set(msg, "gridType", "regular_ll")
+        codes_set(msg, "Ni", 2)
+        codes_set(msg, "Nj", 2)
+        codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+        codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+        codes_set(msg, "latitudeOfLastGridPointInDegrees", 38.0)
+        codes_set(msg, "longitudeOfLastGridPointInDegrees", 252.0)
+        codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
+        codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
+        codes_set_values(msg, np.full((2, 2), 250.0, dtype=np.float32).ravel())
+        codes_write(msg, f)
+        codes_release(msg)
+
+    with pytest.raises(GribParsingError, match="none of the required"):
+        parse_grib2(path)
+
+
+def test_parse_grib2_gefs_preserves_member_dimension(tmp_path: Path) -> None:
+    """Field-selective parsing preserves the GEFS ensemble dimension.
+
+    A GEFS ``pgrb2`` file carries every ensemble member in one file, exposed
+    by cfgrib as a ``number`` dimension. The parser must preserve that
+    dimension through selection and normalization (renamed to ``member``),
+    not collapse or drop it.
+    """
+    from eccodes import (
+        codes_grib_new_from_samples,
+        codes_release,
+        codes_set,
+        codes_set_values,
+        codes_write,
+    )
+
+    def _gefs_t2m(f, member_number: int, value: float) -> None:
+        msg = codes_grib_new_from_samples("GRIB2")
+        codes_set(msg, "dataDate", 20260812)
+        codes_set(msg, "dataTime", 12)
+        codes_set(msg, "stepType", "instant")
+        codes_set(msg, "stepRange", "6")
+        codes_set(msg, "stepUnits", "h")
+        codes_set(msg, "paramId", 167)
+        codes_set(msg, "shortName", "2t")
+        codes_set(msg, "typeOfLevel", "heightAboveGround")
+        codes_set(msg, "level", 2)
+        codes_set(msg, "productDefinitionTemplateNumber", 1)
+        codes_set(msg, "perturbationNumber", member_number)
+        codes_set(msg, "numberOfForecastsInEnsemble", 2)
+        codes_set(msg, "typeOfEnsembleForecast", 3)
+        codes_set(msg, "gridType", "regular_ll")
+        codes_set(msg, "Ni", 10)
+        codes_set(msg, "Nj", 5)
+        codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+        codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+        codes_set(msg, "latitudeOfLastGridPointInDegrees", 36.0)
+        codes_set(msg, "longitudeOfLastGridPointInDegrees", 259.0)
+        codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
+        codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
+        codes_set_values(msg, np.full((5, 10), value, dtype=np.float32).ravel())
+        codes_write(msg, f)
+        codes_release(msg)
+
+    path = tmp_path / "gefs_t2m.grib2"
+    with path.open("wb") as f:
+        _gefs_t2m(f, 0, 280.0)
+        _gefs_t2m(f, 1, 281.0)
+
+    ds = parse_grib2(path)
+
+    # The ensemble dimension is preserved and renamed to the platform member
+    # convention.
+    assert "member" in ds.dims
+    assert "number" not in ds.dims
+    assert list(ds.coords["member"].values) == [0, 1]
+    assert ds.t2m.dims == ("member", "latitude", "longitude")
+    assert ds.t2m.shape == (2, 5, 10)
+    assert ds.lead_time_hours.values == 6
