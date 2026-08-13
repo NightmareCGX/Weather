@@ -679,3 +679,197 @@ def test_ingest_grib_file_reingest_atomic_no_residue(
     assert not os.path.exists(zw._old_path(store_path))
     restored = xr.open_zarr(store_path)
     assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6, 12]
+
+
+def test_ingest_grib_file_partial_variables_record_present_subset(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """Only the requested variables present in the file are recorded.
+
+    Regression for MAJOR-3: a spec declaring temperature_2m + precipitation_rate
+    against a file that decodes only temperature_2m must succeed and record
+    only the present variable (the parser deliberately skips absent fields: a
+    GEFS pgrb2b product legitimately omits prate).
+    """
+    import xarray as xr
+
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _temp_only(path):
+        return xr.Dataset(
+            {"t2m": (("latitude", "longitude"), [[280.0]])},
+            coords={"latitude": [0.0], "longitude": [0.0], "lead_time_hours": 6},
+        )
+
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _temp_only)
+
+    recorded: list[ModelRunRecord] = []
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        run = record_run(session, spec, dataset)
+        recorded.append(run)
+        return run
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    # _spec declares temperature_2m AND precipitation_rate; only t2m is present.
+    run = ingest_grib_file(_spec(store_path), "x.grib2", store_path)
+
+    assert run.status == "ready"
+    assert len(recorded) == 1
+    codes = {code for (code,) in session.query(VariableRecord.variable_code).all()}
+    assert codes == {"temperature_2m"}
+    assert session.query(ProductRecord).count() == 1
+
+
+def test_ingest_grib_file_corrupt_store_refused(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A corrupt existing store fails loudly instead of being rebuilt.
+
+    Regression for MAJOR-2: a store that exists but cannot be opened must not
+    be silently replaced by a store containing only the current lead (which
+    would drop previously ingested leads while the catalog still advertises
+    them as ready).
+    """
+    import os
+    import xarray as xr
+
+    from ingestion.core.zarr_writer import CorruptStoreError
+
+    store_path = str(tmp_path / "gfs.zarr")
+    os.makedirs(store_path, exist_ok=True)
+    with open(os.path.join(store_path, ".zgroup"), "w") as handle:
+        handle.write("{not-valid-json")
+
+    def _temp_only(path):
+        return xr.Dataset(
+            {"t2m": (("latitude", "longitude"), [[280.0]])},
+            coords={"latitude": [0.0], "longitude": [0.0], "lead_time_hours": 6},
+        )
+
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _temp_only)
+
+    with pytest.raises(CorruptStoreError):
+        ingest_grib_file(_surface_spec(store_path), "x.grib2", store_path)
+
+    # The corrupt directory is left untouched and nothing was recorded.
+    assert os.path.exists(os.path.join(store_path, ".zgroup"))
+    assert session.query(ModelRunRecord).count() == 0
+
+
+def test_store_lock_serializes_concurrent_merge_writes(tmp_path) -> None:
+    """Concurrent workers ingesting leads of one cycle store stay consistent.
+
+    Regression for MAJOR-1: without the store lock, workers racing on the
+    shared staging directory and read-merge-write cycle lost leads. Under
+    store_lock every lead must be present afterwards with no staging/old
+    residue.
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    import numpy as np
+    import xarray as xr
+
+    from ingestion.core.zarr_writer import store_lock, store_status, write_dataset
+
+    store_path = str(tmp_path / "cycle.zarr")
+
+    def _lead_dataset(lead: int) -> xr.Dataset:
+        return xr.Dataset(
+            {
+                "temperature_2m": (
+                    ("lead_time_hours", "latitude", "longitude"),
+                    np.full((1, 2, 2), float(lead)),
+                )
+            },
+            coords={
+                "lead_time_hours": [lead],
+                "latitude": [0.0, 1.0],
+                "longitude": [0.0, 1.0],
+            },
+        )
+
+    def _merge_write(lead: int) -> None:
+        dataset = _lead_dataset(lead)
+        with store_lock(store_path):
+            status = store_status(store_path)
+            if status == "readable":
+                existing = xr.open_zarr(store_path)
+                if "lead_time_hours" in existing.dims:
+                    keep = (existing["lead_time_hours"] != lead).values
+                    dataset = xr.concat(
+                        [existing.isel(lead_time_hours=keep), dataset],
+                        dim="lead_time_hours",
+                        coords="minimal",
+                    )
+                    dataset = dataset.sortby("lead_time_hours")
+            write_dataset(dataset, store_path)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(_merge_write, [0, 6, 12, 18]))
+
+    final = xr.open_zarr(store_path)
+    assert sorted(final["lead_time_hours"].values.tolist()) == [0, 6, 12, 18]
+    assert not os.path.exists(store_path + ".staging")
+    assert not os.path.exists(store_path + ".old")
+
+
+def test_swap_local_rolls_back_previous_store_on_rename_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """If promoting the staged store fails, the previous store is restored.
+
+    The atomicity guarantee of the two-rename exchange: a failure on the
+    second rename must roll the old store back into place, never leaving the
+    final path empty or half-written.
+    """
+    import os
+
+    import numpy as np
+    import xarray as xr
+
+    import ingestion.core.zarr_writer as zw
+    from ingestion.core.zarr_writer import write_dataset
+
+    store_path = str(tmp_path / "cycle.zarr")
+    staging = zw._staging_path(store_path)
+
+    def _lead_dataset(lead: int) -> xr.Dataset:
+        return xr.Dataset(
+            {
+                "temperature_2m": (
+                    ("lead_time_hours", "latitude", "longitude"),
+                    np.full((1, 2, 2), float(lead)),
+                )
+            },
+            coords={
+                "lead_time_hours": [lead],
+                "latitude": [0.0, 1.0],
+                "longitude": [0.0, 1.0],
+            },
+        )
+
+    write_dataset(_lead_dataset(0), store_path)
+    _lead_dataset(6).to_zarr(staging, mode="w")
+
+    real_rename = os.rename
+    calls = {"count": 0}
+
+    def _flaky_rename(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated second-rename failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", _flaky_rename)
+
+    with pytest.raises(OSError):
+        zw._swap_local(store_path, staging)
+
+    # The previous store (lead 0) was rolled back into place.
+    restored = xr.open_zarr(store_path)
+    assert restored["lead_time_hours"].values.tolist() == [0]

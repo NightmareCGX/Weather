@@ -224,3 +224,14 @@ class TestSharedValidation:
         # coerced and is accepted.
         array = np.asarray([np.float64(1.0), np.int32(2.0)], dtype=object)
         assert ensemble_mean(array) == pytest.approx(1.5)
+
+
+
+def test_complex_members_rejected() -> None:
+    """Complex numbers are not ensemble members: converting them to float64
+    would silently drop the imaginary part (review finding MINOR-complex).
+    """
+    with pytest.raises(InvalidEnsembleError):
+        ensemble_mean(np.array([1.0 + 2.0j, 3.0 + 4.0j]))
+    with pytest.raises(InvalidEnsembleError):
+        ensemble_mean([1.0 + 2.0j, 3.0 + 4.0j])

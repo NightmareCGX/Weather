@@ -110,7 +110,10 @@ def _has_only_numeric_elements(
         if values.dtype == np.bool_:
             return False
         if np.issubdtype(values.dtype, np.number):
-            return True
+            # Complex values are not verification observations: np.issubdtype
+            # reports complex dtypes as numeric, but converting them to
+            # float64 would silently drop the imaginary part.
+            return not np.issubdtype(values.dtype, np.complexfloating)
         # Non-numeric dtype (e.g. object/string): validate each element.
         return all(_is_numeric_scalar(value) for value in values.flat)
     return all(_is_numeric_scalar(value) for value in values)

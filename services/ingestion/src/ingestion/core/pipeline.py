@@ -23,6 +23,7 @@ worker (e.g. a future Celery task) can call; the console entrypoint
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -37,8 +38,18 @@ from ingestion.core.catalog import (
     VariableSpec,
     record_ingested_dataset,
 )
-from ingestion.core.zarr_writer import read_dataset, store_exists, write_dataset
+from ingestion.core.zarr_writer import (
+    CorruptStoreError,
+    read_dataset,
+    store_exists,
+    store_lock,
+    store_status,
+    write_dataset,
+)
 from ingestion.providers.noaa.parser import parse_grib2
+
+
+logger = logging.getLogger(__name__)
 
 
 class UnitNormalizationError(IngestionError):
@@ -51,13 +62,16 @@ class UnitNormalizationError(IngestionError):
 
 
 class MissingVariableError(IngestionError):
-    """Raised when a requested platform variable is absent from the parsed file.
+    """Raised when *none* of the requested platform variables are present.
 
     ``record_run`` creates a ``forecast_products`` row for every
     ``VariableSpec`` in ``spec.variables``. If a requested variable's source
     field was not selected by the parser, the catalog would advertise a
-    product with no data in the store — silent bad data. Ingestion therefore
-    fails fast before writing anything so no such row is ever recorded.
+    product with no data in the store — silent bad data. When *some* of the
+    requested variables are present, ingestion proceeds and records only the
+    present subset (the parser deliberately skips fields absent from a file:
+    a GEFS ``pgrb2b`` product legitimately omits ``prate``); only when the
+    intersection is empty does ingestion fail fast.
     """
 
 def _unit_token(unit: str) -> str:
@@ -128,8 +142,8 @@ def _apply_variable_mapping(
 def _validate_required_variables(
     dataset: xr.Dataset,
     variables: tuple[VariableSpec, ...],
-) -> None:
-    """Fail fast when a requested variable is absent from the parsed dataset.
+) -> tuple[VariableSpec, ...]:
+    """Return the requested variables present in the mapped dataset.
 
     Every :class:`VariableSpec` in ``variables`` becomes a
     ``forecast_products`` catalog row in :func:`record_run`. A variable whose
@@ -139,26 +153,44 @@ def _validate_required_variables(
     product with no corresponding data in the Zarr store. Validation runs
     after variable mapping, looking up the platform ``code`` (the renamed
     target of the variable's ``source_code``, or the code itself when no
-    source is declared) in the mapped dataset so missing variables abort
-    ingestion before any store or catalog write.
+    source is declared) in the mapped dataset.
+
+    Partial presence degrades gracefully: the parser deliberately skips
+    fields absent from a file (a GEFS ``pgrb2b`` product legitimately omits
+    ``prate``), so when only a subset of the requested variables is present
+    the present subset is returned (the caller records only those products)
+    and the missing ones are logged as a warning. Only when *none* of the
+    requested variables is present does ingestion fail fast.
 
     Args:
         dataset: The mapped dataset (platform variable names).
         variables: The run's :class:`VariableSpec` catalog metadata.
 
+    Returns:
+        The subset of ``variables`` present in the mapped dataset.
+
     Raises:
-        MissingVariableError: If a requested variable is not present in the
-            mapped dataset, listing the missing and available variables.
+        MissingVariableError: If none of the requested variables is present
+            in the mapped dataset, listing the missing and available
+            variables.
     """
-    missing = [variable.code for variable in variables if variable.code not in dataset.data_vars]
-    if not missing:
-        return
-    missing_sorted = ", ".join(sorted(missing))
-    available = ", ".join(sorted(dataset.data_vars)) or "<none>"
-    raise MissingVariableError(
-        "Requested variable(s) not present in the decoded GRIB2 file: "
-        f"{missing_sorted}. Available variables: {available}."
-    )
+    present = [v for v in variables if v.code in dataset.data_vars]
+    missing = [v for v in variables if v.code not in dataset.data_vars]
+    if missing:
+        missing_sorted = ", ".join(sorted(v.code for v in missing))
+        available = ", ".join(sorted(dataset.data_vars)) or "<none>"
+        if not present:
+            raise MissingVariableError(
+                "Requested variable(s) not present in the decoded GRIB2 file: "
+                f"{missing_sorted}. Available variables: {available}."
+            )
+        logger.warning(
+            "Requested variable(s) not present in the decoded GRIB2 file, "
+            "recording only the present subset: missing=%s available=%s",
+            missing_sorted,
+            available,
+        )
+    return tuple(present)
 
 def _normalize_canonical_units(
     dataset: xr.Dataset,
@@ -243,9 +275,10 @@ def ingest_grib_file(
            Kelvin temperature to ``°C``, GFS ``prate`` in ``kg m-2 s-1`` to
            ``mm/h``) and each variable's ``units`` attribute is set to the
            canonical unit (Model A, ``docs/API.md`` section 2.6).
-        4. Every requested variable is verified present in the mapped
-           dataset; a missing variable aborts ingestion with
-           :class:`MissingVariableError` before anything is written.
+        4. Requested variables are verified against the mapped dataset: a
+           completely absent set aborts with :class:`MissingVariableError`;
+           a partial subset records only the present variables (missing ones
+           are logged).
         5. When ``requested_lead_time_hours`` is given and differs from the
            file's parsed lead, the ingest is aborted with a
            :class:`LeadTimeMismatchError` instead of silently merging or
@@ -279,15 +312,35 @@ def ingest_grib_file(
         LeadTimeMismatchError: If ``requested_lead_time_hours`` is provided
             and does not match the file's parsed lead.
         ValueError: If the Zarr store target is unsupported.
+        CorruptStoreError: If an existing cycle store cannot be opened (it is
+            refused rather than silently rebuilt from the current lead).
         sqlalchemy error: If the catalog write fails (no row is committed).
     """
     dataset = parse_grib2(grib_path)
     dataset = _apply_variable_mapping(dataset, spec.variables)
     dataset = _normalize_canonical_units(dataset, spec.variables)
-    _validate_required_variables(dataset, spec.variables)
+    present_variables = _validate_required_variables(dataset, spec.variables)
     _validate_requested_lead(dataset, requested_lead_time_hours)
-    dataset = _merge_lead(dataset, store_path)
-    write_dataset(dataset, store_path)
+    # The read-merge-write cycle on the shared cycle store is serialized by a
+    # process-level flock: concurrent workers ingesting different leads of the
+    # same run would otherwise race on the shared staging directory and lose
+    # updates (review finding MAJOR-1). The corrupt-store check runs inside
+    # the lock so it observes a consistent store state.
+    with store_lock(store_path):
+        status = store_status(store_path)
+        if status == "corrupt":
+            raise CorruptStoreError(
+                f"Existing Zarr store {store_path!r} is corrupt (cannot be "
+                "opened); refusing to rebuild it from the current single "
+                "lead, which would drop previously ingested leads. Remove "
+                "or repair the store before re-ingesting."
+            )
+        dataset = _merge_lead(dataset, store_path)
+        write_dataset(dataset, store_path)
+    if len(present_variables) != len(spec.variables):
+        # Record catalog rows only for the variables actually present in the
+        # store (partial-presence degradation).
+        spec = RunCatalogSpec(**{**vars(spec), "variables": present_variables})
     return record_ingested_dataset(spec, dataset, effective_store_path=store_path)
 
 

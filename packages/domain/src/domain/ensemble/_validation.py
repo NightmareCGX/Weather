@@ -38,7 +38,10 @@ def _has_only_numeric_elements(
         if members.dtype == np.bool_:
             return False
         if np.issubdtype(members.dtype, np.number):
-            return True
+            # Complex values are not ensemble members: np.issubdtype reports
+            # complex dtypes as numeric, but converting them to float64 would
+            # silently drop the imaginary part.
+            return not np.issubdtype(members.dtype, np.complexfloating)
         # Non-numeric dtype (e.g. object/string): validate each element.
         return all(_is_numeric_scalar(value) for value in members.flat)
     return all(_is_numeric_scalar(value) for value in members)

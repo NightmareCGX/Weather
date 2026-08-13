@@ -174,3 +174,14 @@ class TestSharedValidation:
             bias([1.0], [1.0, 2.0])
         with pytest.raises(VerificationError):
             mean_absolute_error([1.0], [])
+
+
+
+def test_complex_observation_pairs_rejected() -> None:
+    """Complex observations are not verification data: float64 conversion
+    would silently drop the imaginary part (review finding MINOR-complex).
+    """
+    with pytest.raises(VerificationError):
+        root_mean_squared_error(np.array([1.0 + 2.0j, 2.0 + 1.0j]), np.array([1.0, 2.0]))
+    with pytest.raises(VerificationError):
+        root_mean_squared_error([1.0 + 2.0j, 2.0 + 1.0j], [1.0, 2.0])

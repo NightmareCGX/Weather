@@ -12,8 +12,11 @@ management lives here.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from os import PathLike
 from typing import Any, Hashable, Mapping, MutableMapping
 
@@ -109,6 +112,17 @@ class ZarrWriteError(IngestionError):
     The atomic write path raises this when a staged store fails to validate or
     cannot be swapped into place, so a half-written store is never exposed at
     the final path.
+    """
+
+
+class CorruptStoreError(IngestionError):
+    """Raised when an existing Zarr store cannot be opened.
+
+    A store that physically exists but fails to open (a half-written or
+    corrupt store) must fail ingestion loudly instead of being silently
+    rebuilt from the current single lead, which would drop every previously
+    ingested lead while the catalog still advertises them as ready (review
+    finding MAJOR-2).
     """
 
 
@@ -425,9 +439,17 @@ def write_dataset(
         ValueError: If an ``s3://`` URL is malformed.
         ZarrWriteError: If the staged store cannot be validated.
     """
-    if isinstance(store, Mapping):
-        _write_zarr(dataset, dict(store), chunks)
+    if isinstance(store, MutableMapping):
+        # A mutable mapping is written in place: the caller's mapping receives
+        # the store bytes. Copying it with dict(store) would silently write
+        # to a throwaway copy and drop the data (review finding MAJOR-4).
+        _write_zarr(dataset, store, chunks)
         return str(store)
+    if isinstance(store, Mapping):
+        raise TypeError(
+            "read-only Mapping store targets cannot be written in place; "
+            "pass a mutable mapping (e.g. a dict) or a path/URL"
+        )
     path = os.fspath(store)
     if path.startswith("file://"):
         path = path[len("file://") :]
@@ -488,3 +510,75 @@ def store_exists(store: str | PathLike[str] | Mapping[str, bytes]) -> bool:
         return False
     dataset.close()
     return True
+
+
+
+def store_status(
+    store: str | PathLike[str] | Mapping[str, bytes],
+) -> str:
+    """Classify an existing store target as "missing", "readable", or "corrupt".
+
+    Unlike :func:`store_exists`, this distinguishes a never-written target
+    (missing) from one that exists but cannot be opened (corrupt). The
+    ingestion orchestration treats a corrupt store as a hard failure — a
+    half-written store must never be silently rebuilt from the current single
+    lead (that would drop every previously ingested lead while the catalog
+    still advertises them as ready).
+
+    Args:
+        store: A local path, ``s3://`` URL, or mapping.
+
+    Returns:
+        One of "missing", "readable", "corrupt".
+    """
+    resolved = _resolve_store(store)
+    if isinstance(resolved, str):
+        if not os.path.exists(resolved):
+            return "missing"
+        try:
+            dataset = xr.open_zarr(resolved)
+        except Exception:
+            return "corrupt"
+        dataset.close()
+        return "readable"
+    # Mutable mapping / fsspec mapping (e.g. an S3 mapper): an empty mapping
+    # means the target was never written; anything else that fails to open
+    # is treated as corrupt.
+    if isinstance(resolved, Mapping) and len(resolved) == 0:
+        return "missing"
+    try:
+        dataset = xr.open_zarr(resolved)
+    except Exception:
+        return "corrupt"
+    dataset.close()
+    return "readable"
+
+
+@contextmanager
+def store_lock(store: str | PathLike[str]) -> Iterator[None]:
+    """Serialize read-merge-write cycles on a local Zarr store path.
+
+    Multiple workers ingesting the same cycle run concurrently (one worker
+    per lead) share the store. Without mutual exclusion the shared staging
+    directory races (one worker removes another's in-flight staging) and the
+    read-merge-write cycle suffers lost updates. ``flock`` provides
+    process-level mutual exclusion keyed by a sibling ``{path}.lock`` file.
+
+    ``s3://`` targets have no filesystem lock primitive; the caller (the
+    scheduler/CLI) must serialize writers for a shared S3 store.
+
+    Args:
+        store: The local store path (or ``s3://`` URL, which yields without
+            locking).
+    """
+    path = os.fspath(store)
+    if path.startswith("s3://"):
+        yield
+        return
+    lock_fd = open(path + ".lock", "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()

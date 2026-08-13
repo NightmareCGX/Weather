@@ -185,3 +185,57 @@ def test_write_dataset_failure_keeps_previous_store(monkeypatch, tmp_path: Path)
     assert not os.path.exists(zw._staging_path(store))
     restored = read_dataset(store)
     assert int(restored["lead_time_hours"].values) == 6
+
+
+def test_write_dataset_mutable_mapping_written_in_place(tmp_path) -> None:
+    """A dict store target receives the written bytes in place.
+
+    Regression for MAJOR-4: copying the mapping with dict(store) would write
+    to a throwaway copy and silently drop the data.
+    """
+    import numpy as np
+    import xarray as xr
+
+    from ingestion.core.zarr_writer import read_dataset, write_dataset
+
+    dataset = xr.Dataset(
+        {"temperature_2m": (("latitude", "longitude"), np.array([[1.0, 2.0]]))},
+        coords={"latitude": [0.0], "longitude": [0.0, 1.0]},
+    )
+    store: dict[str, bytes] = {}
+    write_dataset(dataset, store)
+    assert len(store) > 0
+    restored = read_dataset(store)
+    assert "temperature_2m" in restored.data_vars
+
+
+def test_store_status_classifies_stores(tmp_path) -> None:
+    """store_status distinguishes missing, readable, and corrupt targets.
+
+    Regression for MAJOR-2: a corrupt directory must be classified as
+    corrupt (not missing) so ingestion refuses to silently rebuild it.
+    """
+    import os
+
+    import numpy as np
+    import xarray as xr
+
+    from ingestion.core.zarr_writer import store_status, write_dataset
+
+    dataset = xr.Dataset(
+        {"temperature_2m": (("latitude", "longitude"), np.array([[1.0, 2.0]]))},
+        coords={"latitude": [0.0], "longitude": [0.0, 1.0]},
+    )
+
+    missing = str(tmp_path / "missing.zarr")
+    assert store_status(missing) == "missing"
+
+    readable = str(tmp_path / "ok.zarr")
+    write_dataset(dataset, readable)
+    assert store_status(readable) == "readable"
+
+    corrupt = str(tmp_path / "bad.zarr")
+    os.makedirs(corrupt)
+    with open(os.path.join(corrupt, ".zgroup"), "w") as handle:
+        handle.write("{not-valid-json")
+    assert store_status(corrupt) == "corrupt"
