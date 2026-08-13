@@ -5,7 +5,7 @@ import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
 import type { SelectedLocation, SpatialLayer } from "@/lib/api/types";
 import { buildBaseStyle } from "@/lib/map/baseStyle";
-import { applyWeatherLayer } from "@/lib/map/layers";
+import { applyWeatherLayer, removeWeatherLayer } from "@/lib/map/layers";
 import { coordinatesToSelectedLocation } from "@/lib/forecast/selection";
 
 interface WeatherMapProps {
@@ -13,6 +13,8 @@ interface WeatherMapProps {
   layer: SpatialLayer | null;
   /** The shared selected location; a marker is shown at its coordinates. */
   selectedLocation: SelectedLocation | null;
+  /** The valid time of the current selection; drives layer keying. */
+  validTime: string | null;
   /** Fired with a coordinate location when the user clicks the map. */
   onSelect: (location: SelectedLocation) => void;
 }
@@ -31,7 +33,7 @@ interface WeatherMapProps {
  * the clicked coordinates, and the shared {@link selectedLocation} drives a
  * marker. The map component stays presentation-only (props + callbacks).
  */
-export function WeatherMap({ layer, selectedLocation, onSelect }: WeatherMapProps) {
+export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: WeatherMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const markerRef = useRef<maplibregl.Marker | null>(null);
@@ -90,9 +92,14 @@ export function WeatherMap({ layer, selectedLocation, onSelect }: WeatherMapProp
   useEffect(() => {
     layerRef.current = layer;
     const map = mapRef.current;
-    if (map !== null && layer !== null && map.loaded()) {
-      applyWeatherLayer(map, layer);
+    if (map === null || !map.loaded()) {
+      return;
     }
+    if (layer === null) {
+      removeWeatherLayer(map);
+      return;
+    }
+    applyWeatherLayer(map, layer);
   }, [layer]);
 
   // Keep the selection marker in sync with the shared selected location.

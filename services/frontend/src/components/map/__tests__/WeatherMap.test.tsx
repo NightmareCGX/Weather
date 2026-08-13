@@ -43,9 +43,21 @@ beforeEach(() => {
   clearMarkers();
 });
 
+function renderMap(props: Partial<Parameters<typeof WeatherMap>[0]> = {}) {
+  return render(
+    <WeatherMap
+      layer={layer}
+      selectedLocation={null}
+      validTime={null}
+      onSelect={jest.fn()}
+      {...props}
+    />
+  );
+}
+
 describe("WeatherMap", () => {
   it("creates one map and configures the weather layer from metadata", () => {
-    render(<WeatherMap layer={layer} selectedLocation={null} onSelect={jest.fn()} />);
+    renderMap();
 
     const [map] = getInstances();
     expect(map).toBeInstanceOf(MockMap);
@@ -60,15 +72,14 @@ describe("WeatherMap", () => {
   });
 
   it("re-syncs the weather layer when the metadata changes", () => {
-    const { rerender } = render(
-      <WeatherMap layer={layer} selectedLocation={null} onSelect={jest.fn()} />
-    );
+    const { rerender } = renderMap();
     const [map] = getInstances();
 
     rerender(
       <WeatherMap
         layer={{ ...layer, lead_time_hours: 24 }}
         selectedLocation={null}
+        validTime={null}
         onSelect={jest.fn()}
       />
     );
@@ -78,10 +89,20 @@ describe("WeatherMap", () => {
     expect(map.addSource).toHaveBeenCalledTimes(2);
   });
 
-  it("removes the map on unmount", () => {
-    const { unmount } = render(
-      <WeatherMap layer={layer} selectedLocation={null} onSelect={jest.fn()} />
+  it("removes the weather layer when the layer becomes null (selection cleared/failed)", () => {
+    const { rerender } = renderMap();
+    const [map] = getInstances();
+
+    rerender(
+      <WeatherMap layer={null} selectedLocation={null} validTime={null} onSelect={jest.fn()} />
     );
+
+    expect(map.removeLayer).toHaveBeenCalledWith("weather");
+    expect(map.removeSource).toHaveBeenCalledWith("weather");
+  });
+
+  it("removes the map on unmount", () => {
+    const { unmount } = renderMap();
     const [map] = getInstances();
 
     unmount();
@@ -91,7 +112,7 @@ describe("WeatherMap", () => {
 
   it("fires onSelect with the clicked coordinates", () => {
     const onSelect = jest.fn();
-    render(<WeatherMap layer={layer} selectedLocation={null} onSelect={onSelect} />);
+    renderMap({ onSelect });
     const [map] = getInstances();
 
     // The click listener is only attached after the map loads, matching the
@@ -110,7 +131,7 @@ describe("WeatherMap", () => {
 
   it("ignores click events without resolved coordinates", () => {
     const onSelect = jest.fn();
-    render(<WeatherMap layer={layer} selectedLocation={null} onSelect={onSelect} />);
+    renderMap({ onSelect });
     const [map] = getInstances();
 
     map.fire("load");
@@ -120,7 +141,7 @@ describe("WeatherMap", () => {
   });
 
   it("adds and positions a marker when a location is selected", () => {
-    render(<WeatherMap layer={layer} selectedLocation={coordinates} onSelect={jest.fn()} />);
+    renderMap({ selectedLocation: coordinates });
 
     const [marker] = getMarkers();
     expect(marker).toBeDefined();
@@ -133,25 +154,25 @@ describe("WeatherMap", () => {
   });
 
   it("moves the existing marker when the selection changes", () => {
-    const { rerender } = render(
-      <WeatherMap layer={layer} selectedLocation={coordinates} onSelect={jest.fn()} />
-    );
+    const { rerender } = renderMap({ selectedLocation: coordinates });
     const [marker] = getMarkers();
 
     const other: SelectedLocation = { ...coordinates, latitude: 40, longitude: -105 };
-    rerender(<WeatherMap layer={layer} selectedLocation={other} onSelect={jest.fn()} />);
+    rerender(
+      <WeatherMap layer={layer} selectedLocation={other} validTime={null} onSelect={jest.fn()} />
+    );
 
     expect(getMarkers()).toHaveLength(1);
     expect(marker.setLngLat).toHaveBeenLastCalledWith([-105, 40]);
   });
 
   it("removes the marker when the selection is cleared", () => {
-    const { rerender } = render(
-      <WeatherMap layer={layer} selectedLocation={coordinates} onSelect={jest.fn()} />
-    );
+    const { rerender } = renderMap({ selectedLocation: coordinates });
     const [marker] = getMarkers();
 
-    rerender(<WeatherMap layer={layer} selectedLocation={null} onSelect={jest.fn()} />);
+    rerender(
+      <WeatherMap layer={layer} selectedLocation={null} validTime={null} onSelect={jest.fn()} />
+    );
 
     expect(marker.remove).toHaveBeenCalled();
   });

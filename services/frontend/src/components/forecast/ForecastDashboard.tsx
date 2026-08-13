@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import { SelectedLocationSummary } from "@/components/forecast/SelectedLocationSummary";
 import { Meteogram } from "@/components/charts/Meteogram";
@@ -10,6 +10,7 @@ import { usePointForecast } from "@/hooks/usePointForecast";
 import { useEnsemble } from "@/hooks/useEnsemble";
 import { useEnsembleDistribution } from "@/hooks/useEnsembleDistribution";
 import { useVariablesCatalog } from "@/hooks/useVariablesCatalog";
+import { useForecastSelection } from "@/context/forecast-selection";
 import { forecastLeadTimes, forecastVariableCodes } from "@/lib/forecast/transform";
 import { buildVariableMeta } from "@/lib/forecast/labels";
 import type { SelectedLocation } from "@/lib/api/types";
@@ -19,22 +20,43 @@ interface ForecastDashboardProps {
 }
 
 /**
- * Milestone 13 forecast dashboard for the shared selected location.
+ * Point forecast dashboard for the shared selected location, driven by the
+ * shared forecast selection.
  *
- * The dashboard owns the forecast/ensemble request lifecycle and renders three
- * independently-failing panels:
+ * The dashboard follows the selected model:
  *
- * 1. **Point forecast meteograms** from `/v1/points` (deterministic model).
- * 2. **Ensemble statistics / spread** from `/v1/ensembles` (fan chart over
- *    lead time), required independently of the distribution view.
- * 3. **Ensemble distribution view** from raw member values when the backend
- *    exposes them; an honest "not yet available" state otherwise.
+ * 1. **Point forecast meteograms** from `/v1/points` use a deterministic
+ *    model: the selected model when it is deterministic, otherwise the first
+ *    deterministic model in availability. Ensemble models have no single-
+ *    valued 2-D field for a point, so they are never passed to `/v1/points`.
+ * 2. **Ensemble statistics / spread** from `/v1/ensembles` run only when the
+ *    selected model is an ensemble model. For a deterministic model, the
+ *    panel renders an honest "No ensemble data available for the selected
+ *    forecast." empty state instead of requesting a hard-coded ensemble model
+ *    that may not exist.
+ * 3. **Ensemble distribution view** follows the same model.
  *
- * A failed secondary panel degrades in place without destroying the core
- * point forecast.
+ * Every model here is derived from the database-driven availability response;
+ * nothing is hard-coded. A failed secondary panel degrades in place without
+ * destroying the core point forecast.
  */
 export function ForecastDashboard({ location }: ForecastDashboardProps) {
-  const { forecast, status: pointStatus, error: pointError } = usePointForecast(location);
+  const { selection, options } = useForecastSelection();
+  const selectedModel = selection?.model ?? null;
+  const selectedModelIsEnsemble = options.model?.is_ensemble ?? false;
+  // The deterministic model used for /v1/points (never an ensemble model):
+  // the selected model when it is deterministic, otherwise the first
+  // deterministic model in availability. Both are database-driven.
+  const pointModel =
+    selectedModel !== null && !selectedModelIsEnsemble
+      ? selectedModel
+      : (options.models.find((model) => !model.is_ensemble)?.id ?? null);
+
+  const {
+    forecast,
+    status: pointStatus,
+    error: pointError,
+  } = usePointForecast(location, { model: pointModel });
 
   const variableMeta = useVariablesCatalog();
   const meta = useMemo(() => buildVariableMeta(variableMeta.variables), [variableMeta.variables]);
@@ -49,17 +71,21 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
   );
 
   // The ensemble view is anchored to the first forecast variable so it stays
-  // meaningful even when multiple variables are present. A future milestone may
-  // add a variable switcher here.
+  // meaningful even when multiple variables are present.
   const ensembleVariable = variableCodes[0] ?? "temperature_2m";
 
-  const ensemble = useEnsemble(location, leads, ensembleVariable);
+  // Only run ensemble requests for an actual ensemble model. For a
+  // deterministic model there is no member axis, so the panel shows the empty
+  // state rather than requesting a hard-coded model.
+  const ensembleModel = selectedModelIsEnsemble ? selectedModel : null;
+  const ensemble = useEnsemble(location, leads, ensembleVariable, {
+    model: ensembleModel,
+  });
 
-  // The Ensemble Distribution View is a focused, opt-in request for the
-  // selected lead only (`include_members=true`), kept separate from the
-  // statistics timeline so the fan chart never pays for raw members.
   const distributionLead = leads[0] ?? 0;
-  const distribution = useEnsembleDistribution(location, distributionLead, ensembleVariable);
+  const distribution = useEnsembleDistribution(location, distributionLead, ensembleVariable, {
+    model: ensembleModel,
+  });
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -67,6 +93,11 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
 
       <section aria-label="Point forecast" className="border-b border-slate-200 px-4 py-4">
         <h3 className="mb-2 text-sm font-semibold text-slate-900">Hourly Forecast</h3>
+        {pointModel === null && (
+          <p className="text-sm text-slate-500">
+            No deterministic forecast model is available for this selection.
+          </p>
+        )}
         {pointStatus === "loading" && (
           <p role="status" className="text-sm text-slate-500">
             Loading forecast…
@@ -92,34 +123,44 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
       </section>
 
       <section aria-label="Ensemble statistics" className="border-b border-slate-200 px-4 py-4">
-        <h3 className="mb-1 text-sm font-semibold text-slate-900">Ensemble Statistics (GEFS)</h3>
-        <p className="mb-2 text-xs text-slate-500">
-          {ensembleVariable} · percentile range over lead time
-        </p>
-        {ensemble.status === "loading" && (
-          <p role="status" className="text-sm text-slate-500">
-            Loading ensemble statistics…
+        <h3 className="mb-1 text-sm font-semibold text-slate-900">
+          Ensemble Statistics{selectedModel !== null ? ` (${selectedModel.toUpperCase()})` : ""}
+        </h3>
+        {ensembleModel === null ? (
+          <p className="text-sm text-slate-500">
+            No ensemble data available for the selected forecast.
           </p>
-        )}
-        {ensemble.status === "error" && (
-          <p role="alert" className="text-sm text-red-700">
-            {ensemble.error}
-          </p>
-        )}
-        {ensemble.status === "success" && ensemble.byLead.size > 0 && (
-          <EnsembleChart
-            byLead={ensemble.byLead}
-            variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
-          />
-        )}
+        ) : (
+          <>
+            <p className="mb-2 text-xs text-slate-500">
+              {ensembleVariable} · percentile range over lead time
+            </p>
+            {ensemble.status === "loading" && (
+              <p role="status" className="text-sm text-slate-500">
+                Loading ensemble statistics…
+              </p>
+            )}
+            {ensemble.status === "error" && (
+              <p role="alert" className="text-sm text-red-700">
+                {ensemble.error}
+              </p>
+            )}
+            {ensemble.status === "success" && ensemble.byLead.size > 0 && (
+              <EnsembleChart
+                byLead={ensemble.byLead}
+                variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
+              />
+            )}
 
-        <EnsembleDistribution
-          data={distribution.data}
-          status={distribution.status}
-          error={distribution.error}
-          selectedLead={distributionLead}
-          variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
-        />
+            <EnsembleDistribution
+              data={distribution.data}
+              status={distribution.status}
+              error={distribution.error}
+              selectedLead={distributionLead}
+              variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
+            />
+          </>
+        )}
       </section>
     </div>
   );

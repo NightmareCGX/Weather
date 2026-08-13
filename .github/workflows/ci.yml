@@ -538,12 +538,16 @@ jobs:
       # never loads cfgrib/ecCodes, so it cannot prove the native libeccodes
       # dependency is present. Decode the committed fixture via the image's venv
       # and fail if ecCodes cannot load or the decode does not yield the expected
-      # variable. (The fixture path is inside the build context; the runtime
-      # stage's working directory is /app/services/ingestion.)
+      # variable. The fixture is a GFS 2 m temperature field; cfgrib emits it as
+      # ``t2m`` (GRIB shortName ``2t`` / paramId 167), which is exactly the name
+      # the parser's SURFACE_FIELD_FILTERS selects (parser.py), so the smoke
+      # asserts ``t2m`` — the previous ``t`` only matched the old synthetic
+      # single-message fixture. (The fixture path is inside the build context;
+      # the runtime stage's working directory is /app/services/ingestion.)
       - name: Smoke test ingestion (real GRIB2 decode)
         run: |
           docker run --rm \
             --entrypoint python \
             -v "$PWD/services/ingestion/tests/fixtures/gfs.t00z.pgrb2.0p25.f006.grib2":/fixture.grib2 \
-            weather-ingestion:ci -c "import sys; sys.path.insert(0, '/app/services/ingestion/src'); import xarray as xr; ds = xr.open_dataset('/fixture.grib2', engine='cfgrib'); assert 't' in ds.data_vars, 'cfgrib decode produced no t variable'; print('GRIB decode OK; t range', float(ds.t.min()), float(ds.t.max()))" || { echo "ingestion GRIB decode FAILED"; exit 1; }
+            weather-ingestion:ci -c "import sys; sys.path.insert(0, '/app/services/ingestion/src'); import xarray as xr; ds = xr.open_dataset('/fixture.grib2', engine='cfgrib'); assert 't2m' in ds.data_vars, 'cfgrib decode produced no t2m variable'; print('GRIB decode OK; t2m range', float(ds.t2m.min()), float(ds.t2m.max()))" || { echo "ingestion GRIB decode FAILED"; exit 1; }
           echo "ingestion GRIB decode OK"

@@ -140,6 +140,35 @@ def _seed_verification_observations(session: Session) -> None:
             for lead in lead_times
         ]
     )
+    # The ready gefs run also has forecast products so the availability and map
+    # metadata endpoints advertise it (a ready run without products is not
+    # servable and must not be advertised).
+    session.add_all(
+        [
+            ForecastProduct(
+                id=f"product_gefs_temperature_2m_{lead}",
+                run_id="run_2026072100_gefs",
+                variable_id="temperature_2m",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=lead,
+            )
+            for lead in lead_times
+        ]
+    )
+    session.add_all(
+        [
+            ForecastProduct(
+                id=f"product_gefs_precipitation_rate_{lead}",
+                run_id="run_2026072100_gefs",
+                variable_id="precipitation_rate",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=lead,
+            )
+            for lead in lead_times
+        ]
+    )
     session.add_all(
         [
             VerificationObservation(

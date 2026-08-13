@@ -57,7 +57,9 @@ describe("useEnsembleDistribution", () => {
   it("requests a single lead with include_members=true and returns the data", async () => {
     mockFetch.mockResolvedValueOnce(distResponse(6, [15.5, 17.5, 19.5, 21.5, 23.5]));
 
-    const { result } = renderHook(() => useEnsembleDistribution(location, 6, "temperature_2m"));
+    const { result } = renderHook(() =>
+      useEnsembleDistribution(location, 6, "temperature_2m", { model: "gefs" })
+    );
 
     expect(result.current.status).toBe("loading");
     await waitFor(() => expect(result.current.status).toBe("success"));
@@ -70,14 +72,27 @@ describe("useEnsembleDistribution", () => {
   });
 
   it("is idle with no selection", () => {
-    const { result } = renderHook(() => useEnsembleDistribution(null, 0, "temperature_2m"));
+    const { result } = renderHook(() =>
+      useEnsembleDistribution(null, 0, "temperature_2m", { model: "gefs" })
+    );
     expect(result.current.status).toBe("idle");
     expect(result.current.data).toBeNull();
   });
 
+  it("stays idle when no ensemble model is selected", () => {
+    const { result } = renderHook(() =>
+      useEnsembleDistribution(location, 6, "temperature_2m", { model: null })
+    );
+    expect(result.current.status).toBe("idle");
+    expect(result.current.data).toBeNull();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("surfaces an error when the request fails", async () => {
     mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
-    const { result } = renderHook(() => useEnsembleDistribution(location, 6, "temperature_2m"));
+    const { result } = renderHook(() =>
+      useEnsembleDistribution(location, 6, "temperature_2m", { model: "gefs" })
+    );
     await waitFor(() => expect(result.current.status).toBe("error"));
     expect(result.current.data).toBeNull();
   });

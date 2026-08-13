@@ -119,6 +119,38 @@ export interface EnsembleStatisticsData {
   members?: number[];
 }
 
+/**
+ * One available forecast initialization (cycle time) of a variable.
+ *
+ * `valid_time` for a given lead is derived as `value + lead_time_hours`
+ * (DATABASE.md section 1).
+ */
+export interface InitialTimeAvailability {
+  value: string;
+  lead_time_hours: number[];
+}
+
+/** A forecast variable and the initial times available for it. */
+export interface VariableAvailability {
+  id: string;
+  name: string;
+  unit: string;
+  initial_times: InitialTimeAvailability[];
+}
+
+/** A forecast model and the variables available for it. */
+export interface ModelAvailability {
+  id: string;
+  name: string;
+  is_ensemble: boolean;
+  variables: VariableAvailability[];
+}
+
+/** The payload of the forecast availability endpoint. */
+export interface ForecastAvailability {
+  models: ModelAvailability[];
+}
+
 export type LegendStop = readonly [number, string];
 
 export interface SpatialLayerLegend {

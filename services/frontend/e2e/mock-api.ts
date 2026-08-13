@@ -45,6 +45,73 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
     return;
   }
 
+  // The data-driven forecast explorer sources every selector option from
+  // /v1/forecast/availability. The mock mirrors the repository's API fixtures:
+  // GFS (temperature_2m, precipitation_rate, initial time 2026-08-13T00:00:00Z,
+  // lead [0, 6, 12, 18]).
+  await page.route("**/v1/forecast/availability", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(
+        envelope(
+          {
+            models: [
+              {
+                id: "gfs",
+                name: "Global Forecast System",
+                is_ensemble: false,
+                variables: [
+                  {
+                    id: "temperature_2m",
+                    name: "2-Meter Temperature",
+                    unit: "°C",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                  },
+                  {
+                    id: "precipitation_rate",
+                    name: "Precipitation Rate",
+                    unit: "mm/h",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                  },
+                ],
+              },
+              {
+                id: "gefs",
+                name: "Global Ensemble Forecast System",
+                is_ensemble: true,
+                variables: [
+                  {
+                    id: "temperature_2m",
+                    name: "2-Meter Temperature",
+                    unit: "°C",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+          "forecast_availability"
+        )
+      ),
+    })
+  );
+
   await page.route("**/v1/models", (route) =>
     route.fulfill({
       status: 200,
@@ -78,24 +145,41 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
   await page.route("**/v1/maps?*", (route) => {
     const url = new URL(route.request().url());
     const lead = url.searchParams.get("lead_time_hours") ?? "12";
+    const initial = url.searchParams.get("initial_time") ?? "2026-08-13T00:00:00Z";
+    const variable = url.searchParams.get("variable") ?? "temperature_2m";
+    const isPrecip = variable === "precipitation_rate";
     route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(
         envelope(
           {
-            tile_url_template: `/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=${lead}`,
+            tile_url_template: `/v1/maps/gfs/${variable}/surface/{z}/{x}/{y}.png?lead_time_hours=${lead}&initial_time=${initial}`,
             min_zoom: 0,
             max_zoom: 9,
             lead_time_hours: Number(lead),
-            legend: {
-              unit: "°C",
-              stops: [
-                [-40, "#0000ff"],
-                [0, "#00ff00"],
-                [40, "#ff0000"],
-              ],
-            },
+            legend: isPrecip
+              ? {
+                  unit: "mm/h",
+                  stops: [
+                    [0, "#ffffff"],
+                    [0.5, "#c2e699"],
+                    [2.5, "#31a354"],
+                    [10, "#314e8f"],
+                    [40, "#54278f"],
+                  ],
+                }
+              : {
+                  unit: "°C",
+                  stops: [
+                    [-40, "#313695"],
+                    [-5, "#74add1"],
+                    [5, "#f0f9e8"],
+                    [15, "#fed976"],
+                    [25, "#fe9929"],
+                    [45, "#a50026"],
+                  ],
+                },
           },
           "spatial_layer"
         )
