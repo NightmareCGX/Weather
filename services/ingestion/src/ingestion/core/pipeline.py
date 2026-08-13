@@ -192,6 +192,36 @@ def _validate_required_variables(
         )
     return tuple(present)
 
+def _align_store_variables(
+    dataset: xr.Dataset,
+    present_variables: tuple[VariableSpec, ...],
+) -> xr.Dataset:
+    """Drop store variables that are absent from the current file.
+
+    When a re-ingested file lacks a variable that earlier files provided
+    (e.g. a GEFS ``pgrb2b`` product that omits ``prate``), the lead merge
+    would NaN-fill that variable for the new lead while the catalog kept
+    advertising it — exactly the catalog-claims-data-that-is-not-there
+    state the variable-presence checks are meant to prevent. Dropping the
+    variable keeps the store aligned with what the catalog records.
+
+    Args:
+        dataset: The merged cycle dataset.
+        present_variables: The variables present in the current file.
+
+    Returns:
+        The dataset with variables not present in the current file removed.
+    """
+    present_codes = {variable.code for variable in present_variables}
+    extra = [name for name in dataset.data_vars if name not in present_codes]
+    if not extra:
+        return dataset
+    logger.warning(
+        "Dropping store variable(s) absent from the current file: %s",
+        ", ".join(sorted(str(name) for name in extra)),
+    )
+    return dataset.drop_vars(extra)
+
 def _normalize_canonical_units(
     dataset: xr.Dataset,
     variables: tuple[VariableSpec, ...],
@@ -336,6 +366,7 @@ def ingest_grib_file(
                 "or repair the store before re-ingesting."
             )
         dataset = _merge_lead(dataset, store_path)
+        dataset = _align_store_variables(dataset, present_variables)
         write_dataset(dataset, store_path)
     if len(present_variables) != len(spec.variables):
         # Record catalog rows only for the variables actually present in the

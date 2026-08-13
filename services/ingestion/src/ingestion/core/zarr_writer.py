@@ -13,8 +13,12 @@ management lives here.
 from __future__ import annotations
 
 import fcntl
+import glob
+import json
 import os
 import shutil
+import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from os import PathLike
@@ -133,19 +137,21 @@ _OLD_SUFFIX = ".old"
 
 
 def _staging_path(path: str) -> str:
-    """Return the sibling staging path used for an atomic write.
+    """Return a writer-unique sibling staging path for an atomic write.
 
-    The staging target (``{path}.staging``) holds the dataset being written so
-    a partially-written or corrupt store is never exposed at the final
-    ``path`` before it is known-good and atomically swapped in.
+    The staging target (``{path}.staging-<uuid>``) holds the dataset being
+    written so a partially-written or corrupt store is never exposed at the
+    final ``path`` before it is known-good and atomically swapped in. The
+    unique suffix prevents concurrent writers from racing on a shared
+    staging directory (review finding MAJOR-1).
 
     Args:
         path: The final local path or ``s3://`` URL.
 
     Returns:
-        The sibling staging path.
+        The writer-unique sibling staging path.
     """
-    return f"{path}{_STAGING_SUFFIX}"
+    return f"{path}{_STAGING_SUFFIX}-{uuid.uuid4().hex[:8]}"
 
 
 def _old_path(path: str) -> str:
@@ -265,6 +271,32 @@ def _swap_local(path: str, staging: str) -> None:
             pass
 
 
+def _remove_leftover_staging_local(path: str) -> None:
+    """Remove leftover staging directories of previous crashed writers.
+
+    Callers hold the store lock, so any staging directory present is a
+    crashed attempt and is safe to remove.
+
+    Args:
+        path: The final store path.
+    """
+    for leftover in glob.glob(f"{path}{_STAGING_SUFFIX}*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+def _s3_remove_leftover_staging(fs: Any, key: str) -> None:
+    """Remove leftover S3 staging prefixes of previous crashed writers.
+
+    Callers hold the store lock, so any staging prefix present is a crashed
+    attempt and is safe to remove.
+
+    Args:
+        fs: An ``s3fs.S3FileSystem`` instance.
+        key: The ``bucket/prefix`` key of the final store.
+    """
+    for leftover in fs.glob(f"{key}{_STAGING_SUFFIX}*"):
+        fs.rm(leftover, recursive=True)
+
 def _write_local_atomic(
     dataset: xr.Dataset,
     path: str,
@@ -281,15 +313,18 @@ def _write_local_atomic(
         path: The final local directory path.
         chunks: Optional per-dimension chunk sizes.
     """
+    _remove_leftover_staging_local(path)
     staging = _staging_path(path)
-    _remove_path_if_exists(staging)
     try:
         _write_zarr(dataset, staging, chunks)
         _require_readable(staging)
+        _swap_local(path, staging)
     except BaseException:
+        # A failed write/validation/swap must not leave the staging copy
+        # behind (review finding MAJOR-2): the previous store was either
+        # never moved or rolled back into place by _swap_local.
         _remove_path_if_exists(staging)
         raise
-    _swap_local(path, staging)
 
 
 def _make_s3_fs() -> Any:
@@ -398,16 +433,17 @@ def _write_s3_atomic(
         ZarrWriteError: If the staged store cannot be validated.
     """
     fs = _make_s3_fs()
+    key = _fs_key(path)
+    _s3_remove_leftover_staging(fs, key)
     staging = _staging_path(path)
-    # Clear any leftover staging prefix from a previous crashed attempt.
-    _s3_remove_if_exists(fs, _fs_key(staging))
     try:
         _write_zarr(dataset, _resolve_s3_store(staging, settings), chunks)
         _require_readable(_resolve_s3_store(staging, settings))
+        _swap_s3(fs, path, staging)
     except BaseException:
+        # Never leave the staging prefix behind (review finding MAJOR-2).
         _s3_remove_if_exists(fs, _fs_key(staging))
         raise
-    _swap_s3(fs, path, staging)
 
 
 def write_dataset(
@@ -541,17 +577,86 @@ def store_status(
             return "corrupt"
         dataset.close()
         return "readable"
-    # Mutable mapping / fsspec mapping (e.g. an S3 mapper): an empty mapping
-    # means the target was never written; anything else that fails to open
-    # is treated as corrupt.
-    if isinstance(resolved, Mapping) and len(resolved) == 0:
-        return "missing"
+    # Mutable mapping / fsspec mapping (e.g. an S3 mapper): probe the
+    # single .zgroup key instead of listing the whole store (a full listing
+    # is a network walk on an S3 mapper). A store without .zgroup was never
+    # written; one whose .zgroup cannot be opened is corrupt.
+    if isinstance(resolved, Mapping):
+        try:
+            resolved[".zgroup"]
+        except KeyError:
+            return "missing"
     try:
         dataset = xr.open_zarr(resolved)
     except Exception:
         return "corrupt"
     dataset.close()
     return "readable"
+
+
+_S3_LOCK_TTL_SECONDS = 600.0
+#: Poll interval while waiting to acquire or verify the S3 advisory lock.
+_S3_LOCK_RETRY_SECONDS = 0.2
+
+
+@contextmanager
+def _s3_advisory_lock(fs: Any, key: str) -> Iterator[None]:
+    """Hold a best-effort advisory lock on an S3 store prefix.
+
+    S3 has no atomic compare-and-set, so this lock is advisory: a claim
+    writes a ``{key}.lock`` object carrying a writer token and a timestamp,
+    then re-reads it to verify the claim; a stale lock (older than
+    ``_S3_LOCK_TTL_SECONDS``) is reclaimed. This serializes the common
+    interleaved-start case and breaks deadlocks after a crashed writer, but
+    it cannot guarantee mutual exclusion under pathological object-store
+    timing. The scheduler should still serialize per-cycle writers where
+    strictness matters.
+
+    Args:
+        fs: An ``s3fs.S3FileSystem`` instance.
+        key: The ``bucket/prefix`` key of the final store.
+    """
+    lock_key = key + ".lock"
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
+    acquired = False
+    while not acquired:
+        try:
+            with fs.open(lock_key, "rb") as handle:
+                payload = json.loads(handle.read().decode("utf-8"))
+            if payload.get("token") == token:
+                acquired = True
+                break
+            if time.time() - float(payload.get("t", 0.0)) < _S3_LOCK_TTL_SECONDS:
+                time.sleep(_S3_LOCK_RETRY_SECONDS)
+                continue
+            # Stale lock: fall through to reclaim it.
+        except FileNotFoundError:
+            pass
+        # Claim the lock (best-effort: two writers may both pass here; the
+        # re-read below keeps at most one owner).
+        try:
+            with fs.open(lock_key, "wb") as handle:
+                handle.write(json.dumps({"token": token, "t": time.time()}).encode("utf-8"))
+        except Exception:
+            continue
+        time.sleep(_S3_LOCK_RETRY_SECONDS)
+        try:
+            with fs.open(lock_key, "rb") as handle:
+                payload = json.loads(handle.read().decode("utf-8"))
+            if payload.get("token") == token:
+                acquired = True
+        except FileNotFoundError:
+            continue
+    try:
+        yield
+    finally:
+        try:
+            with fs.open(lock_key, "rb") as handle:
+                payload = json.loads(handle.read().decode("utf-8"))
+            if payload.get("token") == token:
+                fs.rm(lock_key)
+        except Exception:
+            pass
 
 
 @contextmanager
@@ -573,7 +678,11 @@ def store_lock(store: str | PathLike[str]) -> Iterator[None]:
     """
     path = os.fspath(store)
     if path.startswith("s3://"):
-        yield
+        # Best-effort advisory lock via a {key}.lock object (S3 has no
+        # filesystem lock primitive).
+        fs = _make_s3_fs()
+        with _s3_advisory_lock(fs, _fs_key(path)):
+            yield
         return
     lock_fd = open(path + ".lock", "w")
     try:

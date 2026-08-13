@@ -9,6 +9,7 @@ in-memory SQLite database so no live PostgreSQL is required.
 
 from __future__ import annotations
 
+import glob
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -590,7 +591,6 @@ def test_ingest_grib_file_write_failure_preserves_old_store(
     truncate the previously-served store, must leave no ``.staging`` residue,
     and must not record the failed run.
     """
-    import os
     import xarray as xr
 
     store_path = str(tmp_path / "gfs.zarr")
@@ -632,7 +632,7 @@ def test_ingest_grib_file_write_failure_preserves_old_store(
     # Old store still intact and readable; no staging residue; no extra catalog
     # write for the failed attempt.
     assert len(recorded) == 1
-    assert not os.path.exists(zw._staging_path(store_path))
+    assert not glob.glob(store_path + ".staging*")
     restored = xr.open_zarr(store_path)
     assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6]
 
@@ -675,7 +675,7 @@ def test_ingest_grib_file_reingest_atomic_no_residue(
 
     assert first.id == second.id
     assert len(recorded) == 2
-    assert not os.path.exists(zw._staging_path(store_path))
+    assert not glob.glob(store_path + ".staging*")
     assert not os.path.exists(zw._old_path(store_path))
     restored = xr.open_zarr(store_path)
     assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6, 12]
@@ -814,7 +814,7 @@ def test_store_lock_serializes_concurrent_merge_writes(tmp_path) -> None:
 
     final = xr.open_zarr(store_path)
     assert sorted(final["lead_time_hours"].values.tolist()) == [0, 6, 12, 18]
-    assert not os.path.exists(store_path + ".staging")
+    assert not glob.glob(store_path + ".staging*")
     assert not os.path.exists(store_path + ".old")
 
 
@@ -873,3 +873,59 @@ def test_swap_local_rolls_back_previous_store_on_rename_failure(
     # The previous store (lead 0) was rolled back into place.
     restored = xr.open_zarr(store_path)
     assert restored["lead_time_hours"].values.tolist() == [0]
+
+
+
+def test_reingest_variable_flip_drops_missing_variable(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """Re-ingesting without a previously-present variable drops it.
+
+    Regression for MAJOR-3: if an earlier file provided prate and a later
+    file (e.g. a GEFS pgrb2b product) omits it, the lead merge must drop the
+    variable instead of NaN-filling it while the catalog keeps advertising
+    it.
+    """
+    import numpy as np
+    import xarray as xr
+
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _both_fields(path):
+        return xr.Dataset(
+            {
+                "t2m": (("latitude", "longitude"), np.full((2, 2), 280.0)),
+                "prate": (("latitude", "longitude"), np.full((2, 2), 0.0003)),
+            },
+            coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0], "lead_time_hours": 6},
+        )
+
+    def _temp_only(path):
+        return xr.Dataset(
+            {"t2m": (("latitude", "longitude"), np.full((2, 2), 281.0))},
+            coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0], "lead_time_hours": 12},
+        )
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        return record_run(session, spec, dataset)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    # First ingest provides both variables at lead 6.
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _both_fields)
+    ingest_grib_file(_spec(store_path), "a.grib2", store_path)
+
+    # Second ingest (lead 12) omits prate: the store must drop it entirely.
+    monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _temp_only)
+    ingest_grib_file(_spec(store_path), "b.grib2", store_path)
+
+    import xarray as xr_open
+
+    restored = xr_open.open_zarr(store_path)
+    assert set(restored.data_vars) == {"temperature_2m"}
+    assert "precipitation_rate" not in restored.data_vars
+    assert sorted(restored["lead_time_hours"].values.tolist()) == [6, 12]
+    # No NaN-fill: both leads carry real temperature values.
+    assert bool(np.isfinite(restored["temperature_2m"].values).all())
