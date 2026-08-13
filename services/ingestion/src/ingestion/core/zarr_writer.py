@@ -370,6 +370,37 @@ def _s3_remove_if_exists(fs: Any, key: str) -> None:
         fs.rm(key, recursive=True)
 
 
+def _s3_move_prefix(fs: Any, src_key: str, dst_key: str) -> None:
+    """Move an S3 prefix object-by-object.
+
+    s3fs' directory-level mv raises FileNotFoundError on MinIO (verified
+    empirically: both slash and no-slash forms fail), so the swap is
+    performed per object: each object is moved (copy + delete) under the
+    destination prefix, then the source prefix is removed. Single-object
+    moves are individually atomic on S3.
+
+    Args:
+        fs: An s3fs.S3FileSystem instance.
+        src_key: The bucket/prefix key of the source store.
+        dst_key: The bucket/prefix key of the destination store.
+    """
+    dst_prefix = dst_key.rstrip("/") + "/"
+    # walk() enumerates the prefix recursively, separating directories from
+    # files (ls() is single-level and would treat nested directories as unit
+    # entries, dropping the chunk objects; find(withdirs=False) is broken on
+    # s3fs/MinIO).
+    for dirpath, _dirnames, filenames in fs.walk(src_key):
+        rel_dir = dirpath[len(src_key) :].lstrip("/")
+        dir_prefix = dst_prefix + (rel_dir + "/" if rel_dir else "")
+        for name in filenames:
+            fs.mv(dirpath.rstrip("/") + "/" + name, dir_prefix + name)
+    try:
+        fs.rm(src_key, recursive=True)
+    except FileNotFoundError:
+        # The per-object moves already emptied the source prefix; an empty
+        # prefix has nothing left to remove.
+        pass
+
 def _swap_s3(fs: Any, url: str, staging: str) -> None:
     """Promote a staged S3 prefix to the final URL as best-effort-atomic.
 
@@ -390,14 +421,14 @@ def _swap_s3(fs: Any, url: str, staging: str) -> None:
     try:
         if fs.exists(key):
             _s3_remove_if_exists(fs, old_key)
-            fs.mv(key, old_key, recursive=True)
+            _s3_move_prefix(fs, key, old_key)
             old_moved = True
-        fs.mv(staging_key, key, recursive=True)
+        _s3_move_prefix(fs, staging_key, key)
     except BaseException:
         if old_moved and fs.exists(old_key) and not fs.exists(key):
             # Roll the previous store back into place.
             try:
-                fs.mv(old_key, key, recursive=True)
+                _s3_move_prefix(fs, old_key, key)
             except Exception:
                 pass
         raise
