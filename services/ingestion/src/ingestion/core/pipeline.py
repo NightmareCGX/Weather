@@ -50,6 +50,16 @@ class UnitNormalizationError(IngestionError):
     """
 
 
+class MissingVariableError(IngestionError):
+    """Raised when a requested platform variable is absent from the parsed file.
+
+    ``record_run`` creates a ``forecast_products`` row for every
+    ``VariableSpec`` in ``spec.variables``. If a requested variable's source
+    field was not selected by the parser, the catalog would advertise a
+    product with no data in the store — silent bad data. Ingestion therefore
+    fails fast before writing anything so no such row is ever recorded.
+    """
+
 def _unit_token(unit: str) -> str:
     """Return a whitespace/power-symbol normalized token for a unit string.
 
@@ -114,6 +124,41 @@ def _apply_variable_mapping(
         return dataset
     return dataset.rename(rename)
 
+
+def _validate_required_variables(
+    dataset: xr.Dataset,
+    variables: tuple[VariableSpec, ...],
+) -> None:
+    """Fail fast when a requested variable is absent from the parsed dataset.
+
+    Every :class:`VariableSpec` in ``variables`` becomes a
+    ``forecast_products`` catalog row in :func:`record_run`. A variable whose
+    source field the parser did not select (e.g. a custom ``--variable`` for
+    a field such as a 10 m wind that is not among
+    ``SURFACE_FIELD_FILTERS``) would otherwise be silently recorded as a
+    product with no corresponding data in the Zarr store. Validation runs
+    after variable mapping, looking up the platform ``code`` (the renamed
+    target of the variable's ``source_code``, or the code itself when no
+    source is declared) in the mapped dataset so missing variables abort
+    ingestion before any store or catalog write.
+
+    Args:
+        dataset: The mapped dataset (platform variable names).
+        variables: The run's :class:`VariableSpec` catalog metadata.
+
+    Raises:
+        MissingVariableError: If a requested variable is not present in the
+            mapped dataset, listing the missing and available variables.
+    """
+    missing = [variable.code for variable in variables if variable.code not in dataset.data_vars]
+    if not missing:
+        return
+    missing_sorted = ", ".join(sorted(missing))
+    available = ", ".join(sorted(dataset.data_vars)) or "<none>"
+    raise MissingVariableError(
+        "Requested variable(s) not present in the decoded GRIB2 file: "
+        f"{missing_sorted}. Available variables: {available}."
+    )
 
 def _normalize_canonical_units(
     dataset: xr.Dataset,
@@ -198,15 +243,18 @@ def ingest_grib_file(
            Kelvin temperature to ``°C``, GFS ``prate`` in ``kg m-2 s-1`` to
            ``mm/h``) and each variable's ``units`` attribute is set to the
            canonical unit (Model A, ``docs/API.md`` section 2.6).
-        4. When ``requested_lead_time_hours`` is given and differs from the
+        4. Every requested variable is verified present in the mapped
+           dataset; a missing variable aborts ingestion with
+           :class:`MissingVariableError` before anything is written.
+        5. When ``requested_lead_time_hours`` is given and differs from the
            file's parsed lead, the ingest is aborted with a
            :class:`LeadTimeMismatchError` instead of silently merging or
            overwriting a lead the caller did not ask for (the file's decoded
            lead is authoritative and is never overridden by the request).
-        5. The single-lead dataset is merged into the cycle store along
+        6. The single-lead dataset is merged into the cycle store along
            ``lead_time_hours`` (re-ingesting a lead replaces it).
-        6. ``write_dataset`` persists the merged dataset to the store.
-        7. ``record_ingested_dataset`` upserts the run (and its catalog rows)
+        7. ``write_dataset`` persists the merged dataset to the store.
+        8. ``record_ingested_dataset`` upserts the run (and its catalog rows)
            with ``status='ready'`` so the API serving tier can serve it.
 
     Args:
@@ -226,6 +274,8 @@ def ingest_grib_file(
         GribParsingError: If the GRIB2 file cannot be decoded.
         UnitNormalizationError: If a mapped variable's source unit cannot be
             safely canonicalized.
+        MissingVariableError: If a requested variable is absent from the
+            parsed file.
         LeadTimeMismatchError: If ``requested_lead_time_hours`` is provided
             and does not match the file's parsed lead.
         ValueError: If the Zarr store target is unsupported.
@@ -234,6 +284,7 @@ def ingest_grib_file(
     dataset = parse_grib2(grib_path)
     dataset = _apply_variable_mapping(dataset, spec.variables)
     dataset = _normalize_canonical_units(dataset, spec.variables)
+    _validate_required_variables(dataset, spec.variables)
     _validate_requested_lead(dataset, requested_lead_time_hours)
     dataset = _merge_lead(dataset, store_path)
     write_dataset(dataset, store_path)

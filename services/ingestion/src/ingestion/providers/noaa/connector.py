@@ -22,6 +22,30 @@ _MAX_LEAD_TIME_HOURS = 384
 _GEFS_LEAD_TIME_PRODUCT_SPLIT = 240
 
 
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    """Parse the ``Retry-After`` header of a rate-limited response.
+
+    ``Retry-After`` may be a delay in seconds or an absolute HTTP-date.
+    Only the delta-seconds form is honoured (the absolute date form is
+    ignored, falling back to the linear backoff); malformed values are
+    ignored rather than failing the download.
+
+    Args:
+        response: The upstream response to inspect.
+
+    Returns:
+        The delay in seconds, or ``None`` when no usable ``Retry-After``
+        header is present.
+    """
+    value = response.headers.get("Retry-After")
+    if value is None or not value.strip():
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 class NOAAConnector(BaseConnector):
     """Connector for NOAA NOMADS GRIB2 forecast products.
 
@@ -119,9 +143,13 @@ class NOAAConnector(BaseConnector):
     ) -> Path:
         """Download a GRIB2 file to ``destination``.
 
-        Transient failures (network errors and 5xx responses) are retried
-        up to ``DOWNLOAD_RETRIES`` extra attempts with progressive backoff;
-        all other non-2xx responses (including redirects) fail immediately.
+        Transient failures (network errors, 5xx responses, and 429
+        rate-limit responses) are retried up to ``DOWNLOAD_RETRIES`` extra
+        attempts with progressive backoff. When the upstream returns a
+        ``Retry-After`` header on a rate-limited attempt, the delay is
+        raised to honour it (``max`` of the linear backoff and the
+        ``Retry-After`` seconds). All other non-2xx responses (including
+        redirects) fail immediately.
 
         Args:
             model: Model identifier, either ``gfs`` or ``gefs``.
@@ -148,14 +176,22 @@ class NOAAConnector(BaseConnector):
         attempts = self._settings.DOWNLOAD_RETRIES + 1
         last_error: BaseException | None = None
         for attempt in range(1, attempts + 1):
+            retry_after: float | None = None
             try:
                 return await self._download_once(url, destination)
             except httpx.TransportError as exc:
                 last_error = exc
             except httpx.HTTPStatusError as exc:
                 last_error = exc
+                retry_after = _parse_retry_after(exc.response)
             if attempt < attempts:
-                await asyncio.sleep(self._settings.RETRY_BACKOFF_SECONDS * attempt)
+                backoff = self._settings.RETRY_BACKOFF_SECONDS * attempt
+                delay = (
+                    max(backoff, retry_after)
+                    if retry_after is not None
+                    else backoff
+                )
+                await asyncio.sleep(delay)
         assert last_error is not None, "download loop must record a failure"
         if isinstance(last_error, httpx.HTTPStatusError):
             raise DownloadFailedError(
@@ -171,7 +207,10 @@ class NOAAConnector(BaseConnector):
         async with self._client.stream("GET", url) as response:
             if response.status_code == httpx.codes.NOT_FOUND:
                 raise DownloadFailedError(f"Requested file not found: {url}")
-            if response.status_code >= 500:
+            if (
+                response.status_code >= 500
+                or response.status_code == httpx.codes.TOO_MANY_REQUESTS
+            ):
                 raise httpx.HTTPStatusError(
                     f"Upstream returned HTTP {response.status_code}: {url}",
                     request=response.request,

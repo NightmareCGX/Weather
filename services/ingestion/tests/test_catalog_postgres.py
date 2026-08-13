@@ -268,6 +268,12 @@ def test_cli_production_entrypoint_ingests_and_serves(
             "--lead-time-hours", "6",
             "--store", store,
             "--download-dir", download_dir,
+            # The committed single-message GRIB fixture decodes only the
+            # temperature_2m (t2m) surface field, so the run requests exactly
+            # that variable: the parser's field-selective selection plus the
+            # missing-variable fail-fast (MissingVariableError) reject specs
+            # whose fields are absent from the file (review finding N1).
+            "--variable", "temperature_2m:2-Meter Temperature:°C:t2m",
         ]
     )
     assert code == 0
