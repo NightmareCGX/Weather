@@ -40,6 +40,11 @@ numcodecs = "^0.15.0"
 pytest = "^8.1.1"
 pytest-asyncio = "^0.23.5"
 httpx = "^0.27.0"
+# Pinned to the exact versions enforced by CI (python-quality job) so local
+# ``poetry run ruff``/``poetry run mypy`` and CI use the same toolchain
+# (ENGINEERING_CONTRACT review finding L5-C2).
+ruff = "0.3.7"
+mypy = "1.20.2"
 
 # Test files prepend src to sys.path before importing api modules (required so
 # pytest can resolve package imports from the repo layout). This is intentional

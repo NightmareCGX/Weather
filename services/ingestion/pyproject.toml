@@ -28,6 +28,11 @@ pandas = "^2.2.1"
 pytest = "^8.1.1"
 pytest-asyncio = "^0.23.5"
 respx = "^0.21.1"
+# Pinned to the exact versions enforced by CI (python-quality job) so local
+# ``poetry run ruff``/``poetry run mypy`` and CI use the same toolchain
+# (ENGINEERING_CONTRACT review finding L5-C2).
+ruff = "0.3.7"
+mypy = "1.20.2"
 # Required by the approved MinIO/S3 Zarr round-trip integration test
 # (tests/conftest.py ``from minio import Minio``). Test-only dependency.
 minio = "^7.2.7"
