@@ -499,8 +499,14 @@ jobs:
       # production, which lazily imports the ``zarr``/``numcodecs`` runtime
       # stack. Prove the image actually ships that stack by opening a real Zarr
       # store through the API's production reader path — an import-only smoke
-      # would not catch a missing runtime dependency. The store is created and
-      # read using the image's own venv (no host Python deps needed).
+      # would not catch a missing runtime dependency.
+      #
+      # The fixture store is created and read entirely inside the container's own
+      # filesystem under a `tempfile` directory, which is writable by the image's
+      # non-root `appuser`. A host bind-mount of a root-owned path (e.g.
+      # `-v /tmp/...:/store`) is NOT writable by `appuser`, which made
+      # `to_zarr('/store/store.zarr')` fail with PermissionError before the read
+      # path could be exercised. No host mount is used here.
       - name: Smoke test API Zarr-serving (xr.open_zarr)
         run: |
           docker run --rm \
@@ -509,8 +515,7 @@ jobs:
             -e MINIO_ACCESS_KEY=minio_admin \
             -e MINIO_SECRET_KEY=minio_password \
             -e MINIO_SECURE=false \
-            -v /tmp/api-zarr-smoke:/store \
-            weather-api:ci -c "import os, numpy as np, xarray as xr; os.makedirs('/store', exist_ok=True); ds = xr.Dataset({'temperature_2m': (('lead_time_hours','latitude','longitude'), np.zeros((1,2,2)))}, coords={'lead_time_hours':[6],'latitude':[38.0,39.0],'longitude':[-107.0,-106.0]}); ds.to_zarr('/store/store.zarr', mode='w'); import sys; sys.path.insert(0, '/app/services/api/src'); from api.core.zarr import read_dataset; back = read_dataset('/store/store.zarr'); assert 'temperature_2m' in back.data_vars; print('API Zarr-serving OK; vars', list(back.data_vars))" || { echo "API Zarr-serving smoke FAILED"; exit 1; }
+            weather-api:ci -c "import sys, tempfile, numpy as np, xarray as xr; store = tempfile.mkdtemp() + '/store.zarr'; ds = xr.Dataset({'temperature_2m': (('lead_time_hours','latitude','longitude'), np.zeros((1,2,2)))}, coords={'lead_time_hours':[6],'latitude':[38.0,39.0],'longitude':[-107.0,-106.0]}); ds.to_zarr(store, mode='w'); sys.path.insert(0, '/app/services/api/src'); from api.core.zarr import read_dataset; back = read_dataset(store); assert 'temperature_2m' in back.data_vars; print('API Zarr-serving OK; vars', list(back.data_vars))" || { echo "API Zarr-serving smoke FAILED"; exit 1; }
 
       - name: Smoke test frontend (/)
         run: |
