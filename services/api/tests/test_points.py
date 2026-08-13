@@ -16,6 +16,9 @@ from api.schemas import (
     PointForecastData,
     PointForecastEnvelope,
 )
+from sqlalchemy.orm import Session
+
+from api.models.entities import PointQueryFallbackAudit
 from api.services.cache import (
     FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE,
     FALLBACK_REASON_REDIS_READ_UNAVAILABLE,
@@ -346,13 +349,19 @@ def _make_envelope():
 
 
 class _StubDb:
-    """Minimal DB stub recording audit rows without a real session."""
+    """Minimal DB stub recording audit upserts without a real session.
+
+    The cache layer now writes the fallback ledger through a PostgreSQL
+    ``INSERT ... ON CONFLICT`` upsert (``Session.execute``), so the stub
+    captures the compiled statement and exposes its parameters for assertions.
+    """
 
     def __init__(self):
         self.rows = []
 
-    def add(self, row):
-        self.rows.append(row)
+    def execute(self, stmt):
+        self.rows.append(stmt.compile().params)
+        return None
 
     def commit(self):
         pass
@@ -379,7 +388,9 @@ def test_cache_write_unavailable_records_fallback(cache, monkeypatch):
     result = cache.compute_or_retrieve(db, key, "q=1", _compute)
     assert result == _make_envelope()
     assert len(db.rows) == 1
-    assert db.rows[0].fallback_reason == FALLBACK_REASON_REDIS_WRITE_UNAVAILABLE
+    assert db.rows[0]["fallback_reason"] == FALLBACK_REASON_REDIS_WRITE_UNAVAILABLE
+    # New rows start at a count of one fallback for the key.
+    assert db.rows[0]["fallback_count"] == 1
 
 
 def test_cache_read_unavailable_records_fallback(cache, monkeypatch):
@@ -396,7 +407,8 @@ def test_cache_read_unavailable_records_fallback(cache, monkeypatch):
     result = cache.compute_or_retrieve(db, key, "q=1", _compute)
     assert result == _make_envelope()
     assert len(db.rows) == 1
-    assert db.rows[0].fallback_reason == FALLBACK_REASON_REDIS_READ_UNAVAILABLE
+    assert db.rows[0]["fallback_reason"] == FALLBACK_REASON_REDIS_READ_UNAVAILABLE
+    assert db.rows[0]["fallback_count"] == 1
 
 
 def test_cache_read_and_write_unavailable_records_combined(cache, monkeypatch):
@@ -417,4 +429,48 @@ def test_cache_read_and_write_unavailable_records_combined(cache, monkeypatch):
     result = cache.compute_or_retrieve(db, key, "q=1", _compute)
     assert result == _make_envelope()
     assert len(db.rows) == 1
-    assert db.rows[0].fallback_reason == FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE
+    assert db.rows[0]["fallback_reason"] == FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE
+    assert db.rows[0]["fallback_count"] == 1
+
+
+def test_fallback_audit_accrues_count_for_same_key(migrated_db):
+    """Repeated fallbacks for one cache_key accumulate, not drop rows.
+
+    The audit ledger keys a row by cache_key and writes it with a
+    PostgreSQL ``INSERT ... ON CONFLICT DO UPDATE`` upsert, so repeated
+    (and concurrent) fallback events for the same key increment
+    ``fallback_count`` instead of being swallowed on a primary-key
+    conflict. Runs against the real migrated schema (migration 002) via
+    a genuine ORM session.
+    """
+    cache = PointCache()
+    key = _make_key()
+    with Session(migrated_db) as session:
+        cache._record_fallback(session, key, "q=1", FALLBACK_REASON_REDIS_WRITE_UNAVAILABLE)
+        cache._record_fallback(session, key, "q=1", FALLBACK_REASON_REDIS_WRITE_UNAVAILABLE)
+        cache._record_fallback(session, key, "q=2", FALLBACK_REASON_REDIS_READ_UNAVAILABLE)
+
+        row = (
+            session.query(PointQueryFallbackAudit)
+            .filter(PointQueryFallbackAudit.cache_key == key)
+            .one()
+        )
+        # Three fallback events for the same key -> accumulated count of 3.
+        # The upsert only bumps fallback_count and refreshes expires_at; the
+        # first-inserted row's metadata is preserved.
+        assert row.fallback_count == 3
+        assert row.query_params == "q=1"
+        assert row.fallback_reason == FALLBACK_REASON_REDIS_WRITE_UNAVAILABLE
+
+
+def test_fallback_audit_keys_are_isolated(migrated_db):
+    """A distinct cache_key gets its own row; counts do not bleed across keys."""
+    cache = PointCache()
+    with Session(migrated_db) as session:
+        cache._record_fallback(session, "another-key", "q=1", FALLBACK_REASON_REDIS_READ_UNAVAILABLE)
+        row = (
+            session.query(PointQueryFallbackAudit)
+            .filter(PointQueryFallbackAudit.cache_key == "another-key")
+            .one()
+        )
+        assert row.fallback_count == 1

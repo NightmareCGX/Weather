@@ -82,3 +82,25 @@ def test_health_database_probe_live(client, monkeypatch):
     assert data["database"] in ("connected", "disconnected")
     assert data["redis"] == "connected"
     assert data["object_storage"] == "connected"
+
+
+def test_database_probe_passes_connect_timeout(monkeypatch):
+    """The DB health probe applies a 2s connection timeout.
+
+    A stalled Postgres connection (e.g. a network partition) must not
+    block a request thread for tens of seconds, matching the Redis
+    probe timeout. The ``connect_args`` passed to ``create_engine`` are
+    captured so the timeout is verified without depending on a live
+    server.
+    """
+    import sqlalchemy as sa
+
+    captured = {}
+
+    def wrapping_create_engine(url, **kwargs):
+        captured.update(kwargs)
+        return sa.create_engine(url, **kwargs)
+
+    monkeypatch.setattr(admin_router, "create_engine", wrapping_create_engine)
+    _ = admin_router._database_connected()
+    assert captured["connect_args"]["connect_timeout"] == 2

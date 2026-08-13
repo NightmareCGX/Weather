@@ -21,6 +21,7 @@ from typing import Generic, TypeVar, cast
 import redis as redis_lib
 from pydantic import BaseModel, ValidationError
 from redis import Redis
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from api.core.config import settings
@@ -236,14 +237,23 @@ class PointCache:
         query_params: str,
         fallback_reason: str,
     ) -> None:
-        """Record a PostgreSQL fallback audit row for a Redis outage.
+        """Record or accumulate a PostgreSQL fallback audit row.
 
-        The audit row is best-effort metadata and is never a hard dependency
-        for serving the forecast: if writing it fails (e.g. a database error),
-        the error is swallowed so the forecast response is still returned.
+        The row is keyed by ``cache_key`` (the primary key). When Redis is
+        unavailable, concurrent requests for the same key must each be counted
+        in the audit ledger, so the write is a PostgreSQL upsert: an existing
+        row has its ``fallback_count`` incremented and ``expires_at`` refreshed
+        instead of raising a primary-key conflict (which would otherwise be
+        swallowed and drop the event from the ledger).
+
+        The audit write is best-effort metadata and is never a hard dependency
+        for serving the forecast: if it fails (e.g. a database error), the error
+        is swallowed so the forecast response is still returned.
 
         Args:
-            db: Database session used to record the audit row.
+            db: ORM session used to execute the upsert (``execute``/
+                ``commit``/``rollback``). Tests pass a minimal stand-in exposing
+                these methods.
             cache_key: The deterministic cache key of the request.
             query_params: The normalized query parameter string.
             fallback_reason: Why the request fell back to computing the
@@ -251,15 +261,22 @@ class PointCache:
         """
         try:
             now = datetime.now(timezone.utc)
-            db.add(
-                PointQueryFallbackAudit(
-                    cache_key=cache_key,
-                    query_params=query_params,
-                    created_at=now,
-                    expires_at=now + timedelta(seconds=self._ttl_seconds),
-                    fallback_reason=fallback_reason,
-                )
+            stmt = pg_insert(PointQueryFallbackAudit).values(
+                cache_key=cache_key,
+                query_params=query_params,
+                created_at=now,
+                expires_at=now + timedelta(seconds=self._ttl_seconds),
+                fallback_reason=fallback_reason,
+                fallback_count=1,
             )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["cache_key"],
+                set_={
+                    "fallback_count": PointQueryFallbackAudit.fallback_count + 1,
+                    "expires_at": stmt.excluded.expires_at,
+                },
+            )
+            db.execute(stmt)
             db.commit()
         except Exception:  # noqa: BLE001 - best-effort audit write must not fail the forecast
             db.rollback()
