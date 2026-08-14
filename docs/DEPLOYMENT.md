@@ -43,12 +43,19 @@ For local development, all auxiliary services are spun up via Docker Compose:
 ### DEM (terrain elevation)
 - The API reads elevation from `DEM_DATA_PATH` — a global xarray-readable DEM
   store (Zarr or NetCDF) with `latitude`/`longitude` coordinates and an
-  `elevation` data variable in meters. The recommended source is **Copernicus
-  DEM GLO-30** (public COGs on AWS Open Data / Planetary Computer), prepared
-  into a Zarr/NetCDF store on the API's object storage or a mounted volume.
+  `elevation` data variable in meters. The supported source is **local
+  Copernicus 30m DEM data**: the operator downloads the Copernicus DEM
+  (GLO-30 / Copernicus 30m) and prepares it into a Zarr/NetCDF store on the
+  API's object storage or a mounted volume, then points `DEM_DATA_PATH` at it.
+  No Sentinel Hub credentials or online DEM retrieval are used.
+- Expected layout: a global grid with `latitude` (descending or ascending) and
+  `longitude` coordinates and an `elevation` data variable in meters. The
+  provider interpolates bilinearly; no-data (NaN/ocean) cells yield `null`
+  (rendered `unavailable`), never a fabricated value.
 - `ELEVATION_PROVIDER` selects the backend (`dem` default, `google`, or
-  `none`). No DEM configured → elevation renders `unavailable` (never a crash,
-  never a fabricated value).
+  `none`). The elevation provider and its rounded-coordinate cache are created
+  **once per process** and reused across requests (the DEM store is not
+  re-opened per request). No DEM configured → elevation renders `unavailable`.
 
 ### Environment variables
 New optional env vars (defaults in `services/api/src/api/core/config.py`):
@@ -56,6 +63,14 @@ New optional env vars (defaults in `services/api/src/api/core/config.py`):
 `GOOGLE_PLACES_REGION`, `GOOGLE_PLACES_TIMEOUT`, `MAPBOX_TOKEN`,
 `ELEVATION_PROVIDER`, `DEM_DATA_PATH`, `ELEVATION_CACHE_MAX`,
 `ELEVATION_CACHE_DISABLED`. See `.env.example`.
+
+The ingestion worker reads `NOMADS_BASE_URL`, `NOAA_USER_AGENT`,
+`REQUEST_TIMEOUT_SECONDS`, `DOWNLOAD_RETRIES`, `RETRY_BACKOFF_SECONDS` (see
+`services/ingestion/src/ingestion/core/config.py`). GEFS ingestion fetches the
+30 perturbation members (`gep01`..`gep30`) from the NOMADS `pgrb2sp25` layout,
+preserving each member's real identity; the run becomes `READY` only when every
+requested lead and member is committed. Source `.grib2`/`.idx` files are deleted
+after durable per-file commit.
 
 ---
 

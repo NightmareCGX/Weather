@@ -20,16 +20,28 @@ _SUPPORTED_MODELS = frozenset({"gfs", "gefs"})
 _CYCLE_HOURS = frozenset({0, 6, 12, 18})
 _MAX_LEAD_TIME_HOURS = 384
 _GEFS_LEAD_TIME_PRODUCT_SPLIT = 240
+#: GEFS perturbation member range (gep01..gep30). Member identity is the real
+#: upstream perturbation number, never a positional completion index.
+_GEFS_MEMBER_MIN = 1
+_GEFS_MEMBER_MAX = 30
 
 
 class NOAAConnector(BaseConnector):
     """Connector for NOAA NOMADS GRIB2 forecast products.
 
-    Supports the deterministic GFS model and the GEFS ensemble control
-    product for the four daily cycles (00Z, 06Z, 12Z, 18Z). Download URLs
-    are built deterministically from the official NOMADS directory layout:
-    GEFS products split between the ``pgrb2ap25`` (<= 240 h) and
-    ``pgrb2bp25`` (> 240 h) file sets.
+    Supports the deterministic GFS model and the GEFS ensemble perturbation
+    members (``gep01``..``gep30``) for the four daily cycles (00Z, 06Z, 12Z,
+    18Z). Download URLs are built deterministically from the official NOMADS
+    directory layout:
+
+    * GFS: ``gfs.YYYYMMDD/CC/atmos/gfs.tCCz.pgrb2.0p25.fXXX``
+    * GEFS 0.25° (<= 240 h): ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/
+      gepNN.tCCz.pgrb2s.0p25.fXXX``
+    * GEFS 0.50° (> 240 h): ``gefs.YYYYMMDD/CC/atmos/pgrb2ap5/pgrb2bp5/
+      gepNN.tCCz.pgrb2s.0p50.fXXX``
+
+    Only the 30 perturbation members are ingested; the control (``gec00``),
+    ensemble-mean (``geavg``), and spread (``gespr``) files are out of scope.
 
     Downloads are streamed to disk, validated against HTTP status codes,
     and retried with progressive backoff on transient failures (network
@@ -71,6 +83,7 @@ class NOAAConnector(BaseConnector):
         cycle_date: date,
         cycle_hour: int,
         lead_time_hours: int,
+        member: int | None = None,
     ) -> str:
         """Return the deterministic NOMADS download URL for a GRIB2 file.
 
@@ -79,15 +92,29 @@ class NOAAConnector(BaseConnector):
             cycle_date: UTC date of the model run.
             cycle_hour: UTC cycle hour; one of 0, 6, 12, 18.
             lead_time_hours: Forecast lead time in hours (0-384).
+            member: GEFS perturbation member (1..30). Required for GEFS;
+                ignored for GFS.
 
         Returns:
             Absolute NOMADS URL of the requested GRIB2 file.
 
         Raises:
-            InvalidRunError: If the model, cycle hour, or lead time is
+            InvalidRunError: If the model, cycle hour, lead time, or member is
                 unsupported.
         """
         self._validate_run(model, cycle_hour, lead_time_hours)
+        if model == "gefs":
+            if member is None:
+                raise InvalidRunError(
+                    "A GEFS member identity (1..30) is required to build a "
+                    "per-member download URL; the combined "
+                    "'gefs.tCCz.pgrb2a.0p25' product no longer exists on NOMADS."
+                )
+            if not _GEFS_MEMBER_MIN <= member <= _GEFS_MEMBER_MAX:
+                raise InvalidRunError(
+                    f"Invalid GEFS member: {member}; expected "
+                    f"{_GEFS_MEMBER_MIN}-{_GEFS_MEMBER_MAX} (gepNN)."
+                )
         date_str = cycle_date.strftime("%Y%m%d")
         hour_str = f"{cycle_hour:02d}"
         lead_str = f"{lead_time_hours:03d}"
@@ -97,16 +124,18 @@ class NOAAConnector(BaseConnector):
                 f"gfs.{date_str}/{hour_str}/atmos/"
                 f"gfs.t{hour_str}z.pgrb2.0p25.f{lead_str}"
             )
+        # GEFS 0.25 deg short/medium range (<= 240 h): pgrb2sp25/, gepNN.
         if lead_time_hours <= _GEFS_LEAD_TIME_PRODUCT_SPLIT:
             return (
                 f"{self._settings.NOMADS_BASE_URL}/pub/data/nccf/com/gens/prod/"
-                f"gefs.{date_str}/{hour_str}/atmos/pgrb2ap25/"
-                f"gefs.t{hour_str}z.pgrb2a.0p25.f{lead_str}"
+                f"gefs.{date_str}/{hour_str}/atmos/pgrb2sp25/"
+                f"gep{member:02d}.t{hour_str}z.pgrb2s.0p25.f{lead_str}"
             )
+        # GEFS beyond 240 h is 0.5 deg: pgrb2bp5/, gepNN.
         return (
             f"{self._settings.NOMADS_BASE_URL}/pub/data/nccf/com/gens/prod/"
-            f"gefs.{date_str}/{hour_str}/atmos/pgrb2bp25/"
-            f"gefs.t{hour_str}z.pgrb2b.0p25.f{lead_str}"
+            f"gefs.{date_str}/{hour_str}/atmos/pgrb2bp5/"
+            f"gep{member:02d}.t{hour_str}z.pgrb2s.0p50.f{lead_str}"
         )
 
     async def download(
@@ -116,6 +145,7 @@ class NOAAConnector(BaseConnector):
         cycle_hour: int,
         lead_time_hours: int,
         destination: Path,
+        member: int | None = None,
     ) -> Path:
         """Download a GRIB2 file to ``destination``.
 
@@ -130,19 +160,81 @@ class NOAAConnector(BaseConnector):
             lead_time_hours: Forecast lead time in hours (0-384).
             destination: Local path the GRIB2 file is written to; the
                 parent directory is created if missing.
+            member: GEFS perturbation member (1..30). Required for GEFS;
+                ignored for GFS.
 
         Returns:
             The path the file was written to.
 
         Raises:
-            InvalidRunError: If the model, cycle hour, or lead time is
+            InvalidRunError: If the model, cycle hour, lead time, or member is
                 unsupported.
             UpstreamUnavailableError: If the upstream provider cannot be
                 reached after all retry attempts.
             DownloadFailedError: If the upstream provider returns an error
                 status, or keeps returning 5xx after all retry attempts.
         """
-        url = self.build_url(model, cycle_date, cycle_hour, lead_time_hours)
+        url = self.build_url(model, cycle_date, cycle_hour, lead_time_hours, member)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        attempts = self._settings.DOWNLOAD_RETRIES + 1
+        last_error: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._download_once(url, destination)
+            except httpx.TransportError as exc:
+                last_error = exc
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+            if attempt < attempts:
+                await asyncio.sleep(self._settings.RETRY_BACKOFF_SECONDS * attempt)
+        assert last_error is not None, "download loop must record a failure"
+        if isinstance(last_error, httpx.HTTPStatusError):
+            raise DownloadFailedError(
+                f"Upstream returned HTTP {last_error.response.status_code} "
+                f"after {attempts} attempts: {url}"
+            ) from last_error
+        raise UpstreamUnavailableError(
+            f"Upstream unreachable after {attempts} attempts: {url}"
+        ) from last_error
+
+    async def download_idx(
+        self,
+        model: str,
+        cycle_date: date,
+        cycle_hour: int,
+        lead_time_hours: int,
+        destination: Path,
+        member: int | None = None,
+    ) -> Path:
+        """Download the GRIB2 index (``.idx``) file for a forecast product.
+
+        NOMADS serves a ``.idx`` file alongside every GRIB2 product (the
+        wgrib2 index describing the records in the GRIB2 file). The index is a
+        source artifact that is cleaned up together with the GRIB2 file after
+        successful ingestion. Transient failures are retried like the data
+        download.
+
+        Args:
+            model: Model identifier, either ``gfs`` or ``gefs``.
+            cycle_date: UTC date of the model run.
+            cycle_hour: UTC cycle hour; one of 0, 6, 12, 18.
+            lead_time_hours: Forecast lead time in hours (0-384).
+            destination: Local path the ``.idx`` file is written to.
+            member: GEFS perturbation member (1..30). Required for GEFS.
+
+        Returns:
+            The path the file was written to.
+
+        Raises:
+            InvalidRunError: If the run parameters are unsupported.
+            UpstreamUnavailableError: If the upstream provider cannot be
+                reached after all retry attempts.
+            DownloadFailedError: If the upstream provider returns an error
+                status.
+        """
+        url = self.build_url(model, cycle_date, cycle_hour, lead_time_hours, member)
+        url = f"{url}.idx"
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         attempts = self._settings.DOWNLOAD_RETRIES + 1

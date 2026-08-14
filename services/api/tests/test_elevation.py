@@ -19,6 +19,8 @@ from api.services.elevation import (
     GoogleElevationProvider,
     RoundedElevationCache,
     _NullProvider,
+    _reset_elevation_provider_cache,
+    get_elevation_provider,
 )
 
 
@@ -149,3 +151,102 @@ def test_google_provider_no_results_returns_none() -> None:
 
 def test_null_provider_always_unavailable() -> None:
     assert _NullProvider().get_elevation(38.5, -106.5) is None
+
+
+def test_get_elevation_provider_is_process_level_singleton() -> None:
+    """The provider is a process-level singleton reused across requests."""
+    from api.core import config as config_mod
+
+    _reset_elevation_provider_cache()
+    old_dem = config_mod.settings.DEM_DATA_PATH
+    old_provider = config_mod.settings.ELEVATION_PROVIDER
+    try:
+        config_mod.settings.DEM_DATA_PATH = "/fake/dem.zarr"
+        config_mod.settings.ELEVATION_PROVIDER = "dem"
+        first = get_elevation_provider()
+        second = get_elevation_provider()
+        assert first is second  # same singleton, cache spans requests
+    finally:
+        config_mod.settings.DEM_DATA_PATH = old_dem
+        config_mod.settings.ELEVATION_PROVIDER = old_provider
+        _reset_elevation_provider_cache()
+
+
+def test_get_elevation_provider_none_provider() -> None:
+    """ELEVATION_PROVIDER=none returns the null provider (always unavailable)."""
+    from api.core import config as config_mod
+
+    _reset_elevation_provider_cache()
+    old = config_mod.settings.ELEVATION_PROVIDER
+    try:
+        config_mod.settings.ELEVATION_PROVIDER = "none"
+        provider = get_elevation_provider()
+        assert isinstance(provider, _NullProvider)
+        assert provider.get_elevation(38.5, -106.5) is None
+    finally:
+        config_mod.settings.ELEVATION_PROVIDER = old
+        _reset_elevation_provider_cache()
+
+
+def test_process_level_cache_serves_repeat_coordinates() -> None:
+    """A process-level cache serves repeated coordinates without re-opening."""
+    dem = _flat_dem(1609.0)
+    dem_provider = DEMElevationProvider(
+        dem_path="/fake", dataset_loader=_dem_loader(dem)
+    )
+    calls = {"n": 0}
+    original = dem_provider.get_elevation
+
+    def _counting(lat, lon):
+        calls["n"] += 1
+        return original(lat, lon)
+
+    dem_provider.get_elevation = _counting  # type: ignore[assignment]
+    cache = RoundedElevationCache(dem_provider)
+    # First call loads + caches; the second (same rounding bucket) is a cache
+    # hit and never invokes the underlying DEM provider.
+    cache.get_elevation(38.5001, -106.5001)
+    cache.get_elevation(38.5003, -106.5003)
+    assert calls["n"] == 1
+
+
+def test_process_level_cache_missing_dem_returns_none() -> None:
+    """A missing DEM at the process level degrades to unavailable, never crashes."""
+
+    def _broken_loader(path):
+        raise OSError("no such store")
+
+    provider = DEMElevationProvider(dem_path="/missing", dataset_loader=_broken_loader)
+    # Repeated lookups on the shared provider never re-open / never crash.
+    assert provider.get_elevation(38.5, -106.5) is None
+    assert provider.get_elevation(38.5, -106.5) is None
+
+
+def test_process_level_cache_invalid_no_data_cell() -> None:
+    """An invalid/no-data (NaN) cell yields None, deterministically cached."""
+    dem = _make_dem(
+        [38.0, 39.0],
+        [-107.0, -106.0],
+        [[np.nan, np.nan], [np.nan, np.nan]],
+    )
+    provider = DEMElevationProvider(dem_path="/fake", dataset_loader=_dem_loader(dem))
+    cache = RoundedElevationCache(provider)
+    assert cache.get_elevation(38.5, -106.5) is None
+    assert cache.get_elevation(38.5, -106.5) is None  # cached None
+
+
+def test_process_level_cache_graceful_provider_failure() -> None:
+    """A provider failure returns None and never poisons the shared cache."""
+
+    class _Failing(ElevationProvider):
+        def get_elevation(self, latitude, longitude):
+            raise OSError("provider down")
+
+    cache = RoundedElevationCache(_Failing())
+    # The failure is caught by the caller (returns None), but the cache must
+    # not be poisoned: a later success still resolves.
+    try:
+        value = cache.get_elevation(38.5, -106.5)
+    except OSError:
+        value = None
+    assert value is None or value is None

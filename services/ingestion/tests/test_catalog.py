@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from ingestion.core.catalog import (
     CatalogBase,
     CenterRecord,
+    EnsembleMemberProductRecord,
     EnsembleMemberRecord,
     GridRecord,
     ModelRecord,
@@ -252,7 +253,7 @@ def test_record_ingested_dataset_retries_on_integrity_error(
     spec = _spec(zarr_store_path="/tmp/gfs.zarr")
     calls = {"n": 0}
 
-    def _run_with_one_collision(db, s, ds):
+    def _run_with_one_collision(db, s, ds, *, member=None):
         calls["n"] += 1
         if calls["n"] == 1:
             # Simulate a concurrent worker committing the same run between
@@ -261,7 +262,7 @@ def test_record_ingested_dataset_retries_on_integrity_error(
 
             record_run(db, _spec(), ds)  # commits the run row
             raise IntegrityError("stmt", {}, Exception("unique violation"))
-        return record_run(db, s, ds)
+        return record_run(db, s, ds, member=member)
 
     monkeypatch.setattr(
         "ingestion.core.catalog.record_run", _run_with_one_collision
@@ -271,3 +272,112 @@ def test_record_ingested_dataset_retries_on_integrity_error(
     assert run.id == "run_version_gfs_v1.0_202607210000_gfs"
     assert calls["n"] == 2  # first collided, second succeeded
     assert run.zarr_store_path == "/tmp/gfs.zarr"
+
+
+# --- GEFS Cartesian (member x lead) readiness regression (BLOCKING fix) ---
+
+
+def _single_member_lead_dataset(member: int, lead: int) -> xr.Dataset:
+    """A single-member, single-lead normalized dataset (mirrors a gepNN file)."""
+    return xr.Dataset(
+        {
+            "temperature_2m": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                np.ones((1, 1, 2, 2), dtype=float),
+            )
+        },
+        coords={
+            "member": [member],
+            "lead_time_hours": [lead],
+            "time": np.datetime64("2026-07-21T00:00:00"),
+            "latitude": [0.0, 1.0],
+            "longitude": [0.0, 1.0],
+        },
+    )
+
+
+def _gefs_cartesian_spec() -> RunCatalogSpec:
+    """GEFS spec expecting members {1,2,3} x leads {0,6} = 6 pairs."""
+    return _spec(
+        is_ensemble=True,
+        model_id="gefs",
+        expected_lead_time_hours=(0, 6),
+        expected_members=(1, 2, 3),
+    )
+
+
+def _record_pairs(session: Session, spec: RunCatalogSpec, pairs) -> None:
+    """Record each (member, lead) pair via record_run."""
+    for member, lead in pairs:
+        record_run(session, spec, _single_member_lead_dataset(member, lead), member=member)
+
+
+def test_gefs_missing_cartesian_pair_not_ready(session: Session) -> None:
+    """A missing (member, lead) pair keeps the run partial even when the member
+    set and lead set are each independently complete (the blocking defect)."""
+    spec = _gefs_cartesian_spec()
+    # members {1,2,3} and leads {0,6} both complete independently, but (3,6)
+    # is missing.
+    _record_pairs(session, spec, [(1, 0), (1, 6), (2, 0), (2, 6), (3, 0)])
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "partial"
+    # Adding the missing pair completes the Cartesian set -> ready.
+    record_run(session, spec, _single_member_lead_dataset(3, 6), member=3)
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"
+
+
+def test_gefs_complete_cartesian_set_ready(session: Session) -> None:
+    """All 6 expected (member, lead) pairs -> ready."""
+    spec = _gefs_cartesian_spec()
+    _record_pairs(session, spec, [(1, 0), (1, 6), (2, 0), (2, 6), (3, 0), (3, 6)])
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"
+    assert session.query(EnsembleMemberProductRecord).count() == 6
+
+
+def test_gefs_missing_multiple_pairs_not_ready(session: Session) -> None:
+    """Missing multiple (member, lead) pairs cannot produce ready."""
+    spec = _gefs_cartesian_spec()
+    _record_pairs(session, spec, [(1, 0), (1, 6), (2, 0)])  # missing (2,6),(3,0),(3,6)
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "partial"
+
+
+def test_gefs_readiness_independent_of_completion_order(session: Session) -> None:
+    """Readiness depends only on the committed pair set, not the order."""
+    spec = _gefs_cartesian_spec()
+    # Scrambled completion order; still 5/6 -> partial.
+    _record_pairs(session, spec, [(3, 6), (1, 0), (2, 0), (1, 6), (2, 6)])
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "partial"
+    # Complete the last pair -> ready regardless of order.
+    record_run(session, spec, _single_member_lead_dataset(3, 0), member=3)
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"
+
+
+def test_gefs_duplicate_pair_does_not_corrupt_readiness(session: Session) -> None:
+    """Re-committing an already-complete (member, lead) pair stays idempotent."""
+    spec = _gefs_cartesian_spec()
+    _record_pairs(session, spec, [(1, 0), (1, 6), (2, 0), (2, 6), (3, 0), (3, 6)])
+    # Duplicate member 2 lead 6.
+    record_run(session, spec, _single_member_lead_dataset(2, 6), member=2)
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"
+    # No duplicate pair rows.
+    assert session.query(EnsembleMemberProductRecord).count() == 6
+
+
+def test_deterministic_readiness_regression(session: Session) -> None:
+    """Deterministic 3/4 leads -> partial, 4/4 -> ready (unchanged)."""
+    spec = _spec(expected_lead_time_hours=(0, 6, 12, 18))
+    from tests.test_pipeline import _dataset_for_lead  # noqa: PLC0415
+
+    for lead in (0, 6, 12):
+        record_run(session, spec, _dataset_for_lead(lead))
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "partial"
+    record_run(session, spec, _dataset_for_lead(18))
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"

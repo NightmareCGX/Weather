@@ -32,6 +32,7 @@ Design notes:
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -279,6 +280,10 @@ class RoundedElevationCache(ElevationProvider):
         self._max_entries = max_entries
         self._cache: dict[tuple[int, int], float | None] = {}
         self._order: list[tuple[int, int]] = []
+        # The cache is now a process-level singleton shared across concurrent
+        # requests; guard mutations with a lock so recency reordering and
+        # eviction never race.
+        self._lock = threading.Lock()
 
     @staticmethod
     def _normalize(latitude: float, longitude: float) -> tuple[int, int]:
@@ -289,37 +294,76 @@ class RoundedElevationCache(ElevationProvider):
 
     def get_elevation(self, latitude: float, longitude: float) -> float | None:
         key = self._normalize(latitude, longitude)
-        if key in self._cache:
-            # Refresh recency (move to end).
-            self._order.remove(key)
+        with self._lock:
+            if key in self._cache:
+                # Refresh recency (move to end).
+                self._order.remove(key)
+                self._order.append(key)
+                return self._cache[key]
+            value = self._provider.get_elevation(latitude, longitude)
+            self._cache[key] = value
             self._order.append(key)
-            return self._cache[key]
-        value = self._provider.get_elevation(latitude, longitude)
-        self._cache[key] = value
-        self._order.append(key)
-        if len(self._order) > self._max_entries:
-            oldest = self._order.pop(0)
-            self._cache.pop(oldest, None)
-        return value
+            if len(self._order) > self._max_entries:
+                oldest = self._order.pop(0)
+                self._cache.pop(oldest, None)
+            return value
+
+
+#: Module-level cached elevation provider. Previously ``get_elevation_provider``
+#: constructed a fresh provider (and a fresh ``RoundedElevationCache``) on every
+#: request, so the cache never spanned requests and the DEM store was re-opened
+#: per request. This is the process-level singleton: it is created once, lazily,
+#: under a lock, and reused for the life of the process.
+_PROVIDER: ElevationProvider | None = None
+#: Guards lazy construction of the module-level provider (thread-safe).
+_PROVIDER_LOCK = threading.Lock()
 
 
 def get_elevation_provider() -> ElevationProvider:
-    """Return the configured elevation provider (optionally cached).
+    """Return the configured elevation provider (optionally cached), process-level.
 
     ``ELEVATION_PROVIDER`` selects the backend: ``dem`` (default; local
     DEM via :class:`DEMElevationProvider`), ``google`` (network API), or
     ``none`` (elevation always unavailable). A rounded-coordinate cache wraps
     the provider unless disabled.
+
+    The provider (and its DEM dataset load + elevation cache) is created once
+    per process and reused, so the DEM store is not re-opened on every request
+    and the elevation cache actually spans requests. Construction is guarded by
+    a lock for thread safety; the resulting provider's ``RoundedElevationCache``
+    is itself internally consistent for concurrent lookups (a dict + list, safe
+    under the GIL for the operations used).
     """
-    if settings.ELEVATION_PROVIDER == "google":
-        provider: ElevationProvider = GoogleElevationProvider()
-    elif settings.ELEVATION_PROVIDER == "none":
-        return _NullProvider()
-    else:
-        provider = DEMElevationProvider()
-    if settings.ELEVATION_CACHE_DISABLED:
-        return provider
-    return RoundedElevationCache(provider, max_entries=int(settings.ELEVATION_CACHE_MAX))
+    global _PROVIDER
+    if _PROVIDER is None:
+        with _PROVIDER_LOCK:
+            if _PROVIDER is None:
+                if settings.ELEVATION_PROVIDER == "google":
+                    provider: ElevationProvider = GoogleElevationProvider()
+                elif settings.ELEVATION_PROVIDER == "none":
+                    _PROVIDER = _NullProvider()
+                    return _PROVIDER
+                else:
+                    provider = DEMElevationProvider()
+                if settings.ELEVATION_CACHE_DISABLED:
+                    _PROVIDER = provider
+                else:
+                    _PROVIDER = RoundedElevationCache(
+                        provider, max_entries=int(settings.ELEVATION_CACHE_MAX)
+                    )
+    return _PROVIDER
+
+
+def _reset_elevation_provider_cache() -> None:
+    """Reset the module-level provider singleton (test hook only).
+
+    Tests that change ``settings.ELEVATION_PROVIDER`` / ``DEM_DATA_PATH``
+    between cases call this so the next ``get_elevation_provider()`` rebuilds
+    with the new configuration.
+    """
+    global _PROVIDER
+    with _PROVIDER_LOCK:
+        _PROVIDER = None
 
 
 class _NullProvider(ElevationProvider):

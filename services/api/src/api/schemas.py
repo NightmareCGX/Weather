@@ -203,15 +203,28 @@ class ForecastSeries(BaseModel):
     Requested forecast variables are attached as additional top-level keys
     (e.g. ``temperature_2m``), matching the dynamic keyed shape shown in
     API.md. Variable keys are captured through ``extra="allow"``.
+
+    ``cycle_time`` is the source forecast run's cycle/reference time. The point
+    forecast is a **cross-cycle** deterministic time series: entries may come
+    from different cycles (the minimum-lead record for each valid_time), so the
+    source cycle is exposed to make the provenance unambiguous. It is additive
+    and non-breaking.
     """
 
     lead_time_hours: int
     valid_time: datetime
+    cycle_time: datetime | None = None
 
     model_config = ConfigDict(extra="allow")
 
     @field_serializer("valid_time")
     def _serialize_valid_time(self, value: datetime) -> str:
+        return format_datetime_utc(value)
+
+    @field_serializer("cycle_time")
+    def _serialize_cycle_time(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
         return format_datetime_utc(value)
 
 

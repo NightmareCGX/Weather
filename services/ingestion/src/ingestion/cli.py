@@ -150,13 +150,17 @@ def validate_store_path(
 
 @dataclass(frozen=True)
 class RunSpec:
-    """One forecast-run specification: a model + cycle + its leads.
+    """One forecast-run specification: a model + cycle + its leads/members.
 
     Attributes:
         model: A model identifier (``gfs`` or ``gefs``).
         cycle_date: UTC date of the model run.
         cycle_hour: UTC cycle hour.
         lead_time_hours: The leads to ingest for this run.
+        members: GEFS perturbation member identities (``1..30``) to ingest.
+            Empty for deterministic models (GFS ingests all leads of the cycle
+            store). Member identity is the real upstream number, never a
+            positional completion index.
         store: Optional explicit store path (must match the identity unless
             ``allow_custom_store``).
         allow_custom_store: Whether a non-canonical ``store`` is accepted.
@@ -166,6 +170,7 @@ class RunSpec:
     cycle_date: date
     cycle_hour: int
     lead_time_hours: tuple[int, ...]
+    members: tuple[int, ...] = ()
     store: str | None = None
     allow_custom_store: bool = False
 
@@ -230,11 +235,16 @@ def expand_run_specs(
     dates = _as_list(args.cycle_date)
     hours = _as_list(args.cycle_hour)
     leads = tuple(_as_list(args.lead_time_hours))
+    members = tuple(_as_list(getattr(args, "member", None)))
     if not models or not dates or not hours or not leads:
         raise ValueError(
             "At least one --model, --cycle-date, --cycle-hour, and "
             "--lead-time-hours is required."
         )
+    # A GEFS run without an explicit member list defaults to the full
+    # perturbation set gep01..gep30 (member identity preserved per file).
+    if "gefs" in models and not members:
+        members = tuple(range(1, 31))
     # Aligned-zipped expansion: the number of (model, date, hour) triples must
     # match unless a single value is broadcast across the others. A single
     # model/date/hour broadcasts; multiple values must align 1:1.
@@ -245,6 +255,7 @@ def expand_run_specs(
             cycle_date=cycle_date,
             cycle_hour=cycle_hour,
             lead_time_hours=leads,
+            members=members,
             store=args.store,
             allow_custom_store=args.allow_custom_store,
         )
@@ -333,16 +344,22 @@ def _parse_manifest(path: str) -> list[RunSpec]:
             cycle_date = date.fromisoformat(str(entry["cycle_date"]))
             cycle_hour = int(entry["cycle_hour"])
             leads = tuple(int(lead) for lead in entry["lead_time_hours"])
+            raw_members = entry.get("members", [])
+            members = tuple(int(m) for m in raw_members)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Invalid manifest run: {entry!r}") from exc
         if cycle_hour not in (0, 6, 12, 18) or not leads:
             raise ValueError(f"Invalid manifest run: {entry!r}")
+        # GEFS defaults to the full perturbation set when members is omitted.
+        if entry["model"] == "gefs" and not members:
+            members = tuple(range(1, 31))
         specs.append(
             RunSpec(
                 model=entry["model"],
                 cycle_date=cycle_date,
                 cycle_hour=cycle_hour,
                 lead_time_hours=leads,
+                members=members,
             )
         )
     if not specs:
@@ -432,6 +449,13 @@ def _build_parser() -> argparse.ArgumentParser:
              "more. Required unless --manifest is given.",
     )
     ingest.add_argument(
+        "--member", nargs="+", type=int,
+        help="GEFS perturbation member identity/identities (1..30). For GEFS "
+             "each member is downloaded as its own gepNN file and ingested "
+             "independently; member identity is preserved regardless of "
+             "completion order. Ignored for deterministic models.",
+    )
+    ingest.add_argument(
         "--manifest",
         default=None,
         help="Path to a JSON manifest describing an explicit list of runs "
@@ -472,6 +496,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--download-dir", default="downloads",
         help="Local directory the GRIB2 file is downloaded to (created if "
              "missing).",
+    )
+    ingest.add_argument(
+        "--concurrency", type=int, default=4,
+        help="Maximum number of forecast files fetched/ingested concurrently "
+             "per run (default 4). Bounded so NOMADS is not flooded and disk "
+             "staging stays bounded.",
     )
     ingest.add_argument("--center-id", default="noaa")
     ingest.add_argument("--version-string", default="v1.0")
@@ -538,12 +568,76 @@ def _run_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _destination_for(
+    spec: RunSpec, args: argparse.Namespace, *, lead: int, member: int | None = None
+) -> Path:
+    """Return the staged download path for a (member,) lead file.
+
+    The path encodes the model/cycle/lead (and member) so distinct files never
+    collide in the staging directory, and re-ingestion of the same file
+    overwrites its own staged copy.
+
+    Args:
+        spec: The run spec.
+        args: Parsed CLI arguments (download dir).
+        lead: Forecast lead time.
+        member: GEFS member identity, or ``None`` for deterministic.
+
+    Returns:
+        The staging path.
+    """
+    if member is not None:
+        name = (
+            f"gep{member:02d}.t{spec.cycle_hour:02d}z.pgrb2s.0p25."
+            f"f{lead:03d}"
+        )
+    else:
+        name = (
+            f"{spec.model}.t{spec.cycle_hour:02d}z.pgrb2.0p25.f{lead:03d}"
+        )
+    return Path(args.download_dir) / f"{name}.grib2"
+
+
+def _cleanup_source(destination: Path) -> None:
+    """Delete a successfully-ingested source file and its ``.idx``.
+
+    Deletion is best-effort source-artifact cleanup. A failure to delete an
+    already-successfully-ingested file must NOT invalidate the ingested data;
+    the file is left in place for a later cleanup/retry and the failure logged.
+
+    Args:
+        destination: The staged GRIB2 path (the ``.idx`` sibling is also
+            removed when present).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    for path in (destination, Path(str(destination) + ".idx")):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:  # noqa: BLE001 - cleanup must never fail ingest
+            logger.warning(
+                "Failed to delete ingested source artifact %s: %s; data is "
+                "safe, cleanup will be retried.",
+                path,
+                exc,
+            )
+
+
 def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
-    """Download and ingest every lead of a single forecast run.
+    """Download and ingest every lead/member of a single forecast run.
+
+    For a deterministic model every requested lead is fetched and ingested
+    concurrently (bounded by ``--concurrency``). For GEFS, each ``gepNN`` file
+    is fetched and ingested concurrently with its real member identity. Each
+    file flows independently: download -> staging -> decode -> region commit ->
+    catalog -> durable success -> delete source. A failure in one file does not
+    abort the others.
 
     Args:
         spec: The forecast-run specification.
-        args: Parsed CLI arguments (download dir, catalog defaults).
+        args: Parsed CLI arguments (download dir, catalog defaults, max
+            concurrent files).
 
     Raises:
         CycleStoreMismatchError: If a lead's cycle mismatches the store.
@@ -558,33 +652,111 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
         allow_custom_store=spec.allow_custom_store,
     )
     catalog_spec = _build_spec(spec, args, store_path)
+    concurrency = max(1, int(getattr(args, "concurrency", 4)))
+    store_lock = asyncio.Lock()
+    failures: list[str] = []
 
-    async def _download_and_ingest() -> None:
-        async with NOAAConnector() as connector:
-            for lead in sorted(spec.lead_time_hours):
-                destination = Path(args.download_dir) / (
-                    f"{spec.model}.t{spec.cycle_hour:02d}z.pgrb2.0p25."
-                    f"f{lead:03d}.grib2"
-                )
+    # Each (member, lead) work item, or just (lead) for deterministic.
+    if spec.model != "gefs":
+        items: list[tuple[int | None, int]] = [
+            (None, lead) for lead in sorted(spec.lead_time_hours)
+        ]
+    else:
+        items = [
+            (member, lead)
+            for member in sorted(spec.members)
+            for lead in sorted(spec.lead_time_hours)
+        ]
+
+    async def _process_one(
+        connector: NOAAConnector,
+        semaphore: asyncio.Semaphore,
+        member: int | None,
+        lead: int,
+    ) -> None:
+        """Fetch -> stage -> decode -> region commit -> catalog -> cleanup."""
+        destination = _destination_for(
+            spec, args, lead=lead, member=member
+        )
+        # Download is I/O-bound; bounded by the semaphore so NOMADS is not
+        # flooded and disk staging is bounded.
+        async with semaphore:
+            idx_destination = Path(str(destination) + ".idx")
+            try:
                 await connector.download(
                     spec.model,
                     spec.cycle_date,
                     spec.cycle_hour,
                     lead,
                     destination,
+                    member=member,
                 )
+                # The .idx is a source artifact fetched alongside the GRIB2;
+                # a missing .idx does not block ingestion (the GRIB2 carries
+                # all the decoding information).
+                try:
+                    await connector.download_idx(
+                        spec.model,
+                        spec.cycle_date,
+                        spec.cycle_hour,
+                        lead,
+                        idx_destination,
+                        member=member,
+                    )
+                except Exception:  # noqa: BLE001 - idx is optional
+                    idx_destination.unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001 - report this file's failure
+                failures.append(
+                    f"{spec.model} member={member} lead={lead}: {exc}"
+                )
+                return
+
+        # Decode + region commit + catalog. GRIB parsing is CPU-bound and
+        # releases the GIL, so it can run on the event loop; the region commit
+        # (a shared store write) is serialized per run via the store lock so
+        # disjoint-but-unsafe metadata operations never race.
+        try:
+            async with store_lock:
                 record = ingest_grib_file(
                     catalog_spec,
                     destination,
                     store_path,
                     requested_lead_time_hours=lead,
+                    member=member,
                 )
-                print(
-                    f"Ingested {record.id} lead {lead}h "
-                    f"({record.status}) -> {store_path}"
-                )
+        except Exception as exc:  # noqa: BLE001 - report this file's failure
+            failures.append(f"{spec.model} member={member} lead={lead}: {exc}")
+            return
+
+        # File-level durable success: the data is in the store and the catalog
+        # is recorded. The source may be deleted now; a cleanup failure must
+        # not invalidate the committed data.
+        _cleanup_source(destination)
+        print(
+            f"Ingested {record.id} "
+            f"{('member %d ' % member) if member is not None else ''}lead {lead}h "
+            f"({record.status}) -> {store_path}"
+        )
+
+    async def _download_and_ingest() -> None:
+        async with NOAAConnector() as connector:
+            semaphore = asyncio.Semaphore(concurrency)
+            await asyncio.gather(
+                *[
+                    _process_one(connector, semaphore, member, lead)
+                    for member, lead in items
+                ]
+            )
 
     asyncio.run(_download_and_ingest())
+
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)}/{len(items)} file(s) failed for "
+            f"model={spec.model} cycle={spec.cycle_time}: "
+            + "; ".join(failures[:5])
+            + ("; ..." if len(failures) > 5 else "")
+        )
 
 
 def _build_spec(
@@ -617,6 +789,11 @@ def _build_spec(
         product_type="surface",
         zarr_store_path=store_path,
         variables=variables,
+        # The expected lead set is the run's full requested lead list; run-level
+        # readiness compares committed leads against it. For GEFS the expected
+        # member set is the full perturbation set gep01..gep30.
+        expected_lead_time_hours=tuple(spec.lead_time_hours),
+        expected_members=tuple(spec.members),
     )
 
 
