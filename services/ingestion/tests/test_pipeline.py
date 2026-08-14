@@ -47,7 +47,13 @@ from ingestion.providers.noaa.parser import GribParsingError
 FIXTURE = str(Path(__file__).parent / "fixtures" / "gfs.t00z.pgrb2.0p25.f006.grib2")
 
 
-def _spec(zarr_store_path: str) -> RunCatalogSpec:
+def _spec(
+    zarr_store_path: str,
+    *,
+    expected_leads: tuple[int, ...] = (6,),
+    expected_members: tuple[int, ...] = (),
+    **overrides: object,
+) -> RunCatalogSpec:
     return RunCatalogSpec(
         center_id="noaa",
         center_name="National Oceanic and Atmospheric Administration",
@@ -67,6 +73,9 @@ def _spec(zarr_store_path: str) -> RunCatalogSpec:
             VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),
             VariableSpec("precipitation_rate", "Precipitation Rate", "mm/h", "prate"),
         ),
+        expected_lead_time_hours=expected_leads,
+        expected_members=expected_members,
+        **overrides,
     )
 
 
@@ -250,7 +259,7 @@ def test_ingest_grib_file_parses_writes_and_records(
     # Route the catalog write into the in-memory SQLite session instead of the
     # configured engine (pipeline imports record_ingested_dataset at module
     # level, so patch it on the pipeline module).
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
         run = record_run(session, spec, dataset)
         recorded.append(run)
         return run
@@ -320,7 +329,7 @@ def test_ingest_grib_file_multi_typeoflevel_end_to_end(
     """
     store_path = str(tmp_path / "gfs_multi.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
         return record_run(session, spec, dataset)
 
     monkeypatch.setattr(
@@ -378,7 +387,7 @@ def test_ingest_grib_file_requested_lead_matches_succeeds(
     """A requested lead matching the fixture's decoded lead ingests normally."""
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
         return record_run(session, spec, dataset)
 
     monkeypatch.setattr(
@@ -402,7 +411,7 @@ def test_ingest_grib_file_requested_lead_mismatch_aborts(
     """A requested lead differing from the fixture's lead aborts, writes nothing."""
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
         return record_run(session, spec, dataset)
 
     monkeypatch.setattr(
@@ -433,7 +442,7 @@ def test_ingest_grib_file_merges_leads_into_cycle_store(
 
     recorded: list[ModelRunRecord] = []
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
         run = record_run(session, spec, dataset)
         recorded.append(run)
         return run
@@ -451,9 +460,12 @@ def test_ingest_grib_file_merges_leads_into_cycle_store(
     monkeypatch.setattr("ingestion.core.pipeline.record_ingested_dataset", _record_into_session)
     monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
 
-    # Ingest the same cycle store for two different leads.
-    first = ingest_grib_file(_spec(store_path), FIXTURE, store_path)
-    second = ingest_grib_file(_spec(store_path), FIXTURE, store_path)
+    # Ingest the same cycle store for two different leads. The run's expected
+    # lead set is pre-declared so the store is pre-allocated with both leads
+    # (the new region-write architecture pre-allocates before region commits).
+    spec = _spec(store_path, expected_leads=(6, 12))
+    first = ingest_grib_file(spec, FIXTURE, store_path)
+    second = ingest_grib_file(spec, FIXTURE, store_path)
 
     # Both leads share one run row and one store path.
     assert first.id == second.id
@@ -477,7 +489,7 @@ def test_ingest_grib_file_reingest_lead_replaces_in_store(
     """Re-ingesting the same lead replaces that lead's data in the cycle store."""
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
         return record_run(session, spec, dataset)
 
     _call = {"n": 0}
@@ -493,10 +505,11 @@ def test_ingest_grib_file_reingest_lead_replaces_in_store(
     )
     monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
 
-    ingest_grib_file(_spec(store_path), FIXTURE, store_path)  # lead 6
-    ingest_grib_file(_spec(store_path), FIXTURE, store_path)  # lead 12
+    spec = _spec(store_path, expected_leads=(6, 12))
+    ingest_grib_file(spec, FIXTURE, store_path)  # lead 6
+    ingest_grib_file(spec, FIXTURE, store_path)  # lead 12
     # Re-ingest lead 6 a second time: still exactly two leads in the store.
-    ingest_grib_file(_spec(store_path), FIXTURE, store_path)  # lead 6 again
+    ingest_grib_file(spec, FIXTURE, store_path)  # lead 6 again
 
     import os
     import xarray as xr
@@ -589,7 +602,7 @@ def test_store_is_self_describing_after_ingest(
 
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
         return record_run(session, spec, dataset)
 
     monkeypatch.setattr(

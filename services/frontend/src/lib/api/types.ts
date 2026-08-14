@@ -74,8 +74,15 @@ export interface SelectedLocation {
 export interface ForecastEntry {
   lead_time_hours: number;
   valid_time: string;
+  /**
+   * The source forecast run's cycle time. The point forecast is a cross-cycle
+   * deterministic time series: entries may come from different cycles (the
+   * minimum-lead record for each valid_time), so the source cycle is exposed
+   * to make provenance unambiguous.
+   */
+  cycle_time?: string;
   /** Requested forecast variables are attached as dynamic top-level keys. */
-  [variableCode: string]: number | string;
+  [variableCode: string]: number | string | undefined;
 }
 
 /** The resolved location of a point forecast (API.md section 2.1). */

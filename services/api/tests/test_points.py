@@ -289,6 +289,51 @@ def test_cache_key_distinguishes_cycles() -> None:
     assert key_00z == _make_key(cycle_time="2026-08-13T00:00:00Z")
 
 
+def test_cache_key_cross_cycle_separated_from_single_cycle() -> None:
+    """A cross-cycle response never shares a key with a single-cycle response."""
+    key_single = build_point_cache_key(
+        model="gfs",
+        latitude=38.125,
+        longitude=-106.875,
+        resolved_via="coordinates",
+        location_id=None,
+        cycle_time="2026-08-13T00:00:00Z",
+        variables=None,
+        units="metric",
+        start_lead_time_hours=None,
+        end_lead_time_hours=None,
+        cross_cycle=False,
+    )
+    key_cross = build_point_cache_key(
+        model="gfs",
+        latitude=38.125,
+        longitude=-106.875,
+        resolved_via="coordinates",
+        location_id=None,
+        cycle_time="2026-08-13T00:00:00Z",
+        variables=None,
+        units="metric",
+        start_lead_time_hours=None,
+        end_lead_time_hours=None,
+        cross_cycle=True,
+    )
+    assert key_single != key_cross
+    # Deterministic: same cross_cycle -> same key.
+    assert key_cross == build_point_cache_key(
+        model="gfs",
+        latitude=38.125,
+        longitude=-106.875,
+        resolved_via="coordinates",
+        location_id=None,
+        cycle_time="2026-08-13T00:00:00Z",
+        variables=None,
+        units="metric",
+        start_lead_time_hours=None,
+        end_lead_time_hours=None,
+        cross_cycle=True,
+    )
+
+
 def test_cache_key_distinguishes_models() -> None:
     """Distinct models never share a point cache key."""
     from api.services.cache import build_point_cache_key

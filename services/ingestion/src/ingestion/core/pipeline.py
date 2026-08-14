@@ -42,7 +42,12 @@ from ingestion.core.catalog import (
     VariableSpec,
     record_ingested_dataset,
 )
-from ingestion.core.zarr_writer import read_dataset, store_exists, write_dataset_atomic
+from ingestion.core.zarr_writer import (
+    commit_region,
+    prepare_run_store,
+    read_dataset,
+    store_exists,
+)
 from ingestion.providers.noaa.parser import parse_grib2
 
 
@@ -186,46 +191,53 @@ def ingest_grib_file(
     store_path: str,
     *,
     requested_lead_time_hours: int | None = None,
+    member: int | None = None,
 ) -> ModelRunRecord:
     """Parse a GRIB2 file, write it to a Zarr store, and record it in the catalog.
 
     This is the production orchestration call path for an already-downloaded
     forecast file. ``store_path`` is the store of the run's *cycle*: one
     ``model_runs`` row represents a full forecast cycle and its store
-    accumulates every lead (DATABASE.md ``UNIQUE(model_version_id,
-    cycle_time)``). Because a GRIB2 file holds a single lead, each call merges
-    the new lead into the cycle store:
+    accumulates every lead/member (DATABASE.md ``UNIQUE(model_version_id,
+    cycle_time)``).
+
+    Write path: the serving store is pre-allocated (a full store covering the
+    run's expected leads and, for GEFS, members) and each file is committed to
+    its own region:
 
         1. ``parse_grib2`` decodes and normalizes the GRIB2 file.
         2. Data variables are renamed to the platform vocabulary (per
            ``spec.variables``).
-        3. Values are normalized to the platform canonical units (e.g. GRIB
-           Kelvin temperature to ``°C``, GFS ``prate`` in ``kg m-2 s-1`` to
-           ``mm/h``) and each variable's ``units`` attribute is set to the
-           canonical unit (Model A, ``docs/API.md`` section 2.6).
+        3. Values are normalized to the platform canonical units.
         4. When ``requested_lead_time_hours`` is given and differs from the
            file's parsed lead, the ingest is aborted with a
-           :class:`LeadTimeMismatchError` instead of silently merging or
-           overwriting a lead the caller did not ask for (the file's decoded
-           lead is authoritative and is never overridden by the request).
-        5. The single-lead dataset is merged into the cycle store along
-           ``lead_time_hours`` (re-ingesting a lead replaces it).
-        6. ``write_dataset`` persists the merged dataset to the store.
-        7. ``record_ingested_dataset`` upserts the run (and its catalog rows)
-           with ``status='ready'`` so the API serving tier can serve it.
+           :class:`LeadTimeMismatchError` (the file's decoded lead is
+           authoritative).
+        5. The single-lead (and, for GEFS, single-member) dataset is written
+           to the store via a targeted ``region`` write at the coordinate-
+           driven (lead, member) position. Re-ingesting a file replaces only
+           its own region; other leads/members are never read or rewritten.
+        6. ``record_ingested_dataset`` records the file's product/member rows
+           without marking the whole run ready (run-level readiness is decided
+           separately by completeness).
 
     Args:
         spec: The catalog metadata of the run (model, version, cycle, grid,
             variables).
         grib_path: Path to the downloaded GRIB2 file.
-        store_path: Zarr store path/URL of the run's cycle. All leads of a
-            cycle share this store.
+        store_path: Zarr store path/URL of the run's cycle.
         requested_lead_time_hours: The lead the caller requested (e.g. the
             CLI's ``--lead-time-hours``). When provided, ingestion fails
             fast if it does not match the file's parsed lead.
+        member: The upstream GEFS member identity (``1..30``) for a
+            per-member file. ``None`` for deterministic models or combined
+            files. The member identity maps to the store's ``member``
+            coordinate position, so ``gep17`` lands in member 17 regardless of
+            completion order.
 
     Returns:
-        The recorded :class:`ModelRunRecord` in the ``ready`` state.
+        The recorded :class:`ModelRunRecord` (in its current, possibly
+        non-ready, state).
 
     Raises:
         GribParsingError: If the GRIB2 file cannot be decoded.
@@ -245,9 +257,16 @@ def ingest_grib_file(
     # coordinate.
     dataset.attrs["model_id"] = spec.model_id
     _validate_requested_lead(dataset, requested_lead_time_hours)
-    dataset = _merge_lead(dataset, store_path)
-    write_dataset_atomic(dataset, store_path)
-    return record_ingested_dataset(spec, dataset, effective_store_path=store_path)
+    _commit_region(
+        dataset,
+        store_path,
+        member=member,
+        expected_lead_time_hours=spec.expected_lead_time_hours,
+        expected_members=spec.expected_members,
+    )
+    return record_ingested_dataset(
+        spec, dataset, effective_store_path=store_path, member=member
+    )
 
 
 def _validate_requested_lead(
@@ -338,6 +357,99 @@ def _merge_lead(dataset: xr.Dataset, store_path: str) -> xr.Dataset:
     return merged.sortby("lead_time_hours")
 
 
+def _commit_region(
+    dataset: xr.Dataset,
+    store_path: str,
+    *,
+    member: int | None = None,
+    expected_lead_time_hours: tuple[int, ...] = (),
+    expected_members: tuple[int, ...] = (),
+) -> None:
+    """Commit a single-lead (and optional single-member) file to the store.
+
+    The file's ``lead_time_hours`` (and, for a GEFS per-member file, the
+    ``member`` coordinate value) determines the exact region of the
+    pre-allocated serving store that is written. Only that region is touched:
+    existing data in other leads/members is never read or rewritten.
+
+    When the store does not yet exist, it is **pre-allocated** with the full
+    expected coordinate structure (``expected_lead_time_hours`` and, for GEFS,
+    ``expected_members``) so every subsequent file region-commits independently
+    — no whole-store read-modify-write ever happens.
+
+    Args:
+        dataset: The normalized single-lead dataset for this GRIB file.
+        store_path: The cycle store to commit into (may not exist yet).
+        member: The upstream GEFS member identity (``1..30``). ``None`` for
+            deterministic models. When set, the dataset's ``member``
+            coordinate is replaced with ``[member]`` so the region mapping is
+            coordinate-driven.
+        expected_lead_time_hours: The full lead set the run is expected to
+            serve; used to pre-allocate the store on the first write.
+        expected_members: The full GEFS member set; used to pre-allocate the
+            store on the first write.
+
+    Raises:
+        CycleStoreMismatchError: If the store already exists and the incoming
+            cycle differs from the store's cycle.
+        StoreSchemaMismatchError: If the incoming lead/member is structurally
+            incompatible with the store.
+    """
+    # Ensure the lead is a dimension (length 1) so region writes map it
+    # positionally; the parser emits it as a scalar coordinate.
+    if "lead_time_hours" not in dataset.dims:
+        dataset = dataset.expand_dims("lead_time_hours")
+
+    if member is not None:
+        if "member" not in dataset.dims and "member" not in dataset.coords:
+            raise StoreSchemaMismatchError(
+                "A GEFS member identity was supplied but the parsed dataset "
+                "has no member coordinate or dimension."
+            )
+        # Pin the member coordinate to the real upstream identity so the
+        # region mapping below is coordinate-driven (gep17 -> member 17).
+        dataset = dataset.assign_coords(member=[int(member)])
+        # Promote a scalar member coordinate to a length-1 dimension AND
+        # broadcast each data variable onto it, so the region write maps the
+        # member positionally and the data var dims match the store's
+        # ``(member, ...)`` layout.
+        if "member" not in dataset.dims:
+            dataset = dataset.expand_dims("member")
+        # If the data vars still lack the member dim (a scalar-member file
+        # decodes t2m as ``(latitude, longitude)``), broadcast them onto it.
+        need_member = [
+            name
+            for name in dataset.data_vars
+            if "member" not in dataset[name].dims
+        ]
+        if need_member:
+            dataset = dataset.assign(
+                {
+                    name: dataset[name].expand_dims("member")
+                    for name in need_member
+                }
+            )
+
+    if not store_exists(store_path):
+        # First write: pre-allocate the full serving store with the run's
+        # expected leads (and, for GEFS, members), NaN-filled, then commit this
+        # file's own region so the store immediately carries real data.
+        prepare_run_store(
+            dataset,
+            store_path,
+            expected_lead_time_hours=expected_lead_time_hours,
+            expected_members=expected_members,
+        )
+        commit_region(dataset, store_path)
+        return
+
+    existing = read_dataset(store_path)
+    _validate_store_identity(dataset, existing, store_path)
+    _validate_lead_schema(dataset, existing, store_path)
+
+    commit_region(dataset, store_path)
+
+
 def _resolve_cycle_time(dataset: xr.Dataset) -> str | None:
     """Return a dataset's forecast-run cycle/reference time as a UTC string.
 
@@ -412,42 +524,51 @@ def _validate_lead_schema(
     existing: xr.Dataset,
     store_path: str,
 ) -> None:
-    """Validate that a same-cycle lead is structurally compatible with the store.
+    """Validate that a same-cycle lead/member is structurally compatible.
 
-    Same-cycle leads merged into a cycle store must share the same spatial
-    grid (latitude/longitude axes) and, for ensembles, the same member axis;
-    a variable present in both must have the same dimensions. Adding a
-    previously-absent variable is allowed (a lead file may omit a field the
-    parser skips); redefining an existing variable's structure is not.
+    Same-cycle files committed into a cycle store must share the same spatial
+    grid (latitude/longitude axes); a variable present in both must have the
+    same dimensions (except that a GEFS per-member file's ``member`` dimension
+    of length 1 is compatible with a multi-member store — the region write
+    targets exactly one member). Adding a previously-absent variable is
+    allowed (a lead file may omit a field the parser skips); redefining an
+    existing variable's structure is not.
 
     Args:
-        dataset: The incoming single-lead dataset.
+        dataset: The incoming single-lead (optionally single-member) dataset.
         existing: The existing cycle store dataset.
         store_path: The store path (used in the error message).
 
     Raises:
-        StoreSchemaMismatchError: If the incoming lead is incompatible.
+        StoreSchemaMismatchError: If the incoming file is incompatible.
     """
     for axis in ("latitude", "longitude"):
         if axis in existing.coords and axis in dataset.coords:
             if not np.array_equal(existing.coords[axis].values, dataset.coords[axis].values):
                 raise StoreSchemaMismatchError(
-                    f"Refusing to merge into {store_path!r}: the incoming lead's "
+                    f"Refusing to merge into {store_path!r}: the incoming file's "
                     f"'{axis}' axis differs from the store's '{axis}' axis. A "
                     "cycle store must have one consistent grid."
                 )
-    if "member" in existing.dims and "member" in dataset.dims:
-        if existing.sizes["member"] != dataset.sizes["member"]:
-            raise StoreSchemaMismatchError(
-                f"Refusing to merge into {store_path!r}: the incoming lead has "
-                f"{dataset.sizes['member']} ensemble members but the store has "
-                f"{existing.sizes['member']}. A cycle store must have one "
-                "consistent member axis."
-            )
     for code in set(dataset.data_vars) & set(existing.data_vars):
-        if set(dataset[code].dims) != set(existing[code].dims):
+        # A per-member GEFS file has a length-1 member dim; the store has the
+        # full member axis. Allow the member dim to differ (region write
+        # targets one member), but all other dims must match exactly.
+        incoming_dims = set(dataset[code].dims)
+        existing_dims = set(existing[code].dims)
+        if "member" in incoming_dims and "member" not in existing_dims:
             raise StoreSchemaMismatchError(
                 f"Refusing to merge into {store_path!r}: variable '{code}' has "
-                f"dimensions {tuple(dataset[code].dims)} in the incoming lead "
+                f"a member dimension in the incoming file but the store does not."
+            )
+        if "member" in existing_dims and "member" in incoming_dims:
+            # The non-member dims must match; the member axis length differs by
+            # design (single-member file into multi-member store).
+            incoming_dims.discard("member")
+            existing_dims.discard("member")
+        if incoming_dims != existing_dims:
+            raise StoreSchemaMismatchError(
+                f"Refusing to merge into {store_path!r}: variable '{code}' has "
+                f"dimensions {tuple(dataset[code].dims)} in the incoming file "
                 f"but {tuple(existing[code].dims)} in the store."
             )

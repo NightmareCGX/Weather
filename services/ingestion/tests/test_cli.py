@@ -39,21 +39,87 @@ def session() -> Session:
     engine.dispose()
 
 
-async def _fake_download(
-    self, model, cycle_date, cycle_hour, lead_time_hours, destination
-):
-    """Download mock: copy the real GRIB fixture for lead 6, else a lead file.
+def _write_gefs_member_file(path: str, member_number: int, value: float) -> None:
+    """Write a tiny single-member GEFS GRIB file (one perturbation member).
 
-    The committed fixture decodes to lead 6 (its GRIB step is +6h). For other
-    requested leads, copy the fixture anyway — the pipeline's lead-time
+    Mirrors ``test_parser.py``'s runtime GEFS builder: a 2 m temperature field
+    with ``perturbationNumber`` set to the real member identity, so the parser
+    exposes it as the platform ``member`` coordinate value.
+    """
+    import numpy as np
+    from eccodes import (
+        codes_grib_new_from_samples,
+        codes_release,
+        codes_set,
+        codes_set_values,
+        codes_write,
+    )
+
+    with open(path, "wb") as f:
+        msg = codes_grib_new_from_samples("GRIB2")
+        codes_set(msg, "dataDate", 20260721)
+        codes_set(msg, "dataTime", 0)
+        codes_set(msg, "stepType", "instant")
+        codes_set(msg, "stepRange", "6")
+        codes_set(msg, "stepUnits", "h")
+        codes_set(msg, "paramId", 167)
+        codes_set(msg, "shortName", "2t")
+        codes_set(msg, "typeOfLevel", "heightAboveGround")
+        codes_set(msg, "level", 2)
+        codes_set(msg, "productDefinitionTemplateNumber", 1)
+        codes_set(msg, "perturbationNumber", member_number)
+        codes_set(msg, "numberOfForecastsInEnsemble", 30)
+        codes_set(msg, "typeOfEnsembleForecast", 3)
+        codes_set(msg, "gridType", "regular_ll")
+        codes_set(msg, "Ni", 10)
+        codes_set(msg, "Nj", 5)
+        codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+        codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+        codes_set(msg, "latitudeOfLastGridPointInDegrees", 36.0)
+        codes_set(msg, "longitudeOfLastGridPointInDegrees", 259.0)
+        codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
+        codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
+        codes_set_values(msg, np.full((5, 10), value, dtype=np.float32).ravel())
+        codes_write(msg, f)
+        codes_release(msg)
+
+
+async def _fake_download(
+    self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+):
+    """Download mock: copy the real GRIB fixture, or build a GEFS member file.
+
+    The committed GFS fixture decodes to lead 6 (its GRIB step is +6h). For
+    other requested leads, copy the fixture anyway — the pipeline's lead-time
     validation will reject it, which lets tests assert fail-fast behavior.
+    For GEFS, a synthetic single-member file with the real ``gepNN`` identity
+    is built so member-aware ingestion can be exercised without a committed
+    binary fixture.
     """
     import shutil
     from pathlib import Path
 
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(FIXTURE, destination)
+    if model == "gefs":
+        _write_gefs_member_file(str(destination), member or 1, 280.0)
+    else:
+        shutil.copyfile(FIXTURE, destination)
+    return destination
+
+
+async def _fake_download_idx(
+    self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+):
+    """Download mock for the .idx index file (a tiny stub body)."""
+    from pathlib import Path
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        f"1:0:d={cycle_date:%Y%m%d}{cycle_hour:02d}:2mTMP:surface:anl:",
+        encoding="utf-8",
+    )
     return destination
 
 
@@ -65,9 +131,13 @@ def _install_download_and_catalog(
         "ingestion.providers.noaa.connector.NOAAConnector.download",
         _fake_download,
     )
+    monkeypatch.setattr(
+        "ingestion.providers.noaa.connector.NOAAConnector.download_idx",
+        _fake_download_idx,
+    )
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None):
-        run = record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
+        run = record_run(session, spec, dataset, member=member)
         recorded.append(run)
         return run
 
@@ -79,20 +149,20 @@ def _install_download_and_catalog(
 def _install_s3_stubs(monkeypatch):
     """Stub the Zarr writer so batch tests never touch real S3/MinIO.
 
-    Stores are treated as absent (fresh writes) and ``write_dataset_atomic``
-    is a no-op that returns the path. This lets batch/run behavior be tested
+    Stores are treated as absent (fresh writes) and the write/region primitives
+    are no-ops that return the path. This lets batch/run behavior be tested
     without object storage; the Zarr round-trip itself is covered by
     ``test_zarr_roundtrip.py`` and the pipeline tests.
     """
     monkeypatch.setattr(
         "ingestion.core.pipeline.store_exists", lambda _store: False
     )
-
-    def _fake_atomic(dataset, store, **kwargs):
-        return str(store)
-
     monkeypatch.setattr(
-        "ingestion.core.pipeline.write_dataset_atomic", _fake_atomic
+        "ingestion.core.pipeline.prepare_run_store",
+        lambda _ds, store, **kw: str(store),
+    )
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.commit_region", lambda _ds, store, **kw: str(store)
     )
 
 

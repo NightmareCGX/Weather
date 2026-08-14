@@ -15,10 +15,10 @@ of scope for Milestone 9 and raises a clear error.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import xarray as xr
@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 from api.core.zarr import read_dataset
 from api.models.entities import (
     City,
+    ForecastProduct,
     ForecastVariable,
     Model,
     ModelRun,
@@ -231,15 +232,19 @@ def build_point_forecast(
 ) -> PointForecastData:
     """Build a point forecast payload for a resolved location and model.
 
-    The newest ``status='ready'`` run with a non-null ``zarr_store_path``
-    whose Zarr dataset opens is selected for the model (via
-    ``model_versions``); a run whose store cannot be read is skipped in favor
-    of the next-newest readable run. The run's Zarr dataset is sliced at each
-    requested ``lead_time_hours`` and the variable field is bilinearly
-    interpolated to the location. ``valid_time`` is derived as
-    ``cycle_time + lead_time_hours`` (DATABASE.md section 1) and
-    ``generated_at`` is the run's ``cycle_time`` (the forecast dataset
-    generation time), keeping payloads deterministic.
+    This is a **cross-cycle** deterministic time series: for every
+    ``valid_time``, the payload selects the READY deterministic forecast record
+    with the **minimum ``lead_time_hours``** across all READY cycles of the
+    model (DATABASE.md: ``valid_time = cycle_time + lead_time_hours``). Because
+    cycles are 00/06/12/18 and lead differences are multiples of 6, the minimum
+    lead for a fixed valid_time is the newest cycle that covers it.
+
+    The winner selection is done **entirely from catalog metadata** (a
+    ``model_runs`` ⋈ ``forecast_products`` query) — no large Zarr dataset is
+    opened to decide which record wins. Only the winning runs' Zarr stores are
+    opened, one per distinct winning cycle, and reused across their selected
+    leads. Each forecast entry carries its source ``cycle_time`` so the
+    provenance of a mixed-cycle series is unambiguous.
 
     Args:
         db: Database session.
@@ -259,20 +264,62 @@ def build_point_forecast(
         HTTPException: 404 when no ready run, no data for the location, or an
             unknown variable is encountered; 422/500 for invalid data.
     """
-    run, dataset = _resolve_ready_dataset(db, model)
-
-    lead_times = _resolve_lead_times(
-        dataset, start_lead_time_hours, end_lead_time_hours
+    candidates = _select_min_lead_winners(
+        db,
+        model,
+        start_lead_time_hours=start_lead_time_hours,
+        end_lead_time_hours=end_lead_time_hours,
     )
-    var_codes = _resolve_variables(db, dataset, variables)
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No ready forecast run with data was found for model '{model}'."
+            ),
+        )
+
+    # For each valid_time, try the candidate cycles in ascending-lead order and
+    # use the first whose store is readable. A broken newest store therefore
+    # falls back to the next READY readable candidate covering the same
+    # valid_time instead of dropping the record.
+    by_cycle: dict[datetime, xr.Dataset] = {}
+
+    def _open_cycle(cycle_time: datetime) -> xr.Dataset | None:
+        if cycle_time in by_cycle:
+            return by_cycle[cycle_time]
+        try:
+            dataset = _open_run_store(db, model, cycle_time)
+        except HTTPException:
+            return None
+        by_cycle[cycle_time] = dataset
+        return dataset
+
+    resolved: dict[datetime, tuple[datetime, int]] = {}
+    for valid_time, pairs in candidates.items():
+        for cycle_time, lead in pairs:
+            dataset = _open_cycle(cycle_time)
+            if dataset is not None:
+                resolved[valid_time] = (cycle_time, lead)
+                break
+
+    if not resolved:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No readable forecast data was found for model '{model}'.",
+        )
+
+    # Resolve variables from the union of the opened winning stores.
+    var_codes = _resolve_variables(db, _merge_var_sets(by_cycle.values()), variables)
     units_by_code = _variable_units(db, var_codes)
 
     forecasts: list[ForecastSeries] = []
-    run_cycle_time = cast(datetime, run.cycle_time)
-    for lead in lead_times:
+    for valid_time, (cycle_time, lead) in sorted(resolved.items()):
+        dataset = by_cycle[cycle_time]
         entry: dict[str, Any] = {
             "lead_time_hours": lead,
-            "valid_time": run_cycle_time + timedelta(hours=lead),
+            "valid_time": valid_time,
+            # Cross-cycle provenance: the cycle that produced this entry.
+            "cycle_time": cycle_time,
         }
         for var_code in var_codes:
             value = _interpolate_variable(
@@ -281,6 +328,15 @@ def build_point_forecast(
             entry[var_code] = _convert_value(value, units_by_code[var_code], units)
         forecasts.append(ForecastSeries(**entry))
 
+    if not forecasts:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No readable forecast data was found for model '{model}'.",
+        )
+
+    # ``generated_at`` is the newest winning cycle (the "generation time" of the
+    # series), keeping the payload deterministic.
+    newest_cycle = max(by_cycle)
     return PointForecastData(
         location=ForecastLocationOut(
             latitude=location.latitude,
@@ -288,10 +344,180 @@ def build_point_forecast(
             elevation_m=location.elevation_m,
             resolved_via=location.resolved_via,
         ),
-        generated_at=run_cycle_time,
+        generated_at=newest_cycle,
         model=model,
         forecasts=forecasts,
     )
+
+
+def _merge_var_sets(datasets: Iterable[xr.Dataset]) -> xr.Dataset:
+    """Return a minimal dataset whose data-variable names union the inputs.
+
+    Used to resolve the default variable set across multiple winning runs of a
+    cross-cycle series without loading any gridded data.
+
+    Args:
+        datasets: The opened winning run datasets.
+
+    Returns:
+        A dataset exposing the union of the input data-variable names.
+    """
+    names: set[str] = set()
+    for dataset in datasets:
+        names.update(str(name) for name in dataset.data_vars)
+    return xr.Dataset(
+        {name: (("latitude", "longitude"), np.empty((0, 0))) for name in sorted(names)}
+    )
+
+
+def _select_min_lead_winners(
+    db: Session,
+    model: str,
+    *,
+    start_lead_time_hours: int | None = None,
+    end_lead_time_hours: int | None = None,
+) -> dict[datetime, list[tuple[datetime, int]]]:
+    """Return the minimum-lead candidate(s) per valid_time.
+
+    For every READY run of the model with a store, the candidate forecast data
+    is discovered from two sources:
+
+    * ``forecast_products`` rows when present (the fast metadata path); and
+    * the run's Zarr ``lead_time_hours`` coordinate when no product rows exist
+      (a READY run with a readable store remains servable — the legacy
+      contract).
+
+    For each ``valid_time``, the candidates are ordered by ascending lead (the
+    minimum lead is the newest cycle that covers it). ``build_point_forecast``
+    tries them in that order, so a broken newest store falls back to the next
+    READY readable candidate for the same valid_time instead of dropping the
+    record. Only READY runs participate; partial/ingesting/failed runs are never
+    candidates.
+
+    Args:
+        db: Database session.
+        model: A single deterministic model identifier.
+        start_lead_time_hours: Inclusive lower lead bound.
+        end_lead_time_hours: Inclusive upper lead bound.
+
+    Returns:
+        A mapping ``valid_time -> list[(cycle_time, lead_time_hours)]`` ordered
+        by ascending lead (best candidate first).
+    """
+    # Fast path: valid_times derivable from forecast_products metadata.
+    stmt = (
+        select(
+            ModelRun.cycle_time,
+            ForecastProduct.lead_time_hours,
+        )
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .join(ForecastProduct, ForecastProduct.run_id == ModelRun.id)
+        .where(Model.model_id == model)
+        .where(ModelRun.status == "ready")
+        .where(ModelRun.zarr_store_path.isnot(None))
+    )
+    candidates_by_valid: dict[datetime, set[tuple[datetime, int]]] = {}
+    # Cycle times that supplied at least one candidate via forecast_products.
+    product_cycles: set[datetime] = set()
+
+    def _add(cycle_time: datetime, lead: int) -> None:
+        if cycle_time.tzinfo is None:
+            cycle_time = cycle_time.replace(tzinfo=timezone.utc)
+        if start_lead_time_hours is not None and lead < start_lead_time_hours:
+            return
+        if end_lead_time_hours is not None and lead > end_lead_time_hours:
+            return
+        valid_time = cycle_time + timedelta(hours=lead)
+        candidates_by_valid.setdefault(valid_time, set()).add((cycle_time, lead))
+
+    for cycle_time, lead in db.execute(stmt).all():
+        if cycle_time.tzinfo is None:
+            cycle_time = cycle_time.replace(tzinfo=timezone.utc)
+        product_cycles.add(cycle_time)
+        _add(cycle_time, lead)
+
+    # Fallback discovery: READY runs with a store but no forecast_products rows
+    # still serve via their Zarr lead coordinate. Read the store's lead axis
+    # once per distinct cycle (metadata only; cheap) to enumerate candidates.
+    # A cycle is skipped only when it ALREADY contributed product candidates;
+    # a ready run with no products must still be discovered from its store.
+    runs_stmt = (
+        select(ModelRun)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model)
+        .where(ModelRun.status == "ready")
+        .where(ModelRun.zarr_store_path.isnot(None))
+    )
+    for run in db.execute(runs_stmt).scalars().all():
+        cycle_time = run.cycle_time
+        if cycle_time.tzinfo is None:
+            cycle_time = cycle_time.replace(tzinfo=timezone.utc)
+        if cycle_time in product_cycles:
+            # Products already supplied this cycle's candidate leads.
+            continue
+        assert run.zarr_store_path is not None
+        try:
+            dataset = read_dataset(run.zarr_store_path)
+        except Exception as exc:  # noqa: BLE001 - unreadable store
+            logger.warning(
+                "Skipping unreadable Zarr store for run %s: %s", run.id, exc
+            )
+            continue
+        if "lead_time_hours" not in dataset.coords:
+            continue
+        coord = dataset.coords["lead_time_hours"].values
+        if np.ndim(coord) == 0:
+            leads = [int(coord)]
+        else:
+            leads = [int(v) for v in coord]
+        for lead in leads:
+            _add(cycle_time, lead)
+
+    # Order each valid_time's candidates by ascending lead (best first).
+    return {
+        valid_time: sorted(pairs, key=lambda pair: pair[1])
+        for valid_time, pairs in candidates_by_valid.items()
+    }
+
+
+def _open_run_store(db: Session, model: str, cycle_time: datetime) -> xr.Dataset:
+    """Open the Zarr store of the given READY run, or raise 404.
+
+    Args:
+        db: Database session.
+        model: A single deterministic model identifier.
+        cycle_time: The run's cycle time.
+
+    Returns:
+        The opened dataset.
+
+    Raises:
+        HTTPException: 404 if the run does not exist or its store is unreadable.
+    """
+    run = (
+        db.execute(
+            select(ModelRun)
+            .join(ModelRun.model_version)
+            .join(ModelVersion.model)
+            .where(Model.model_id == model)
+            .where(ModelRun.status == "ready")
+            .where(ModelRun.zarr_store_path.isnot(None))
+            .where(ModelRun.cycle_time == cycle_time)
+        )
+        .scalars()
+        .one_or_none()
+    )
+    if run is None or run.zarr_store_path is None:
+        raise HTTPException(status_code=404, detail=f"Run for cycle {cycle_time} not found.")
+    try:
+        return read_dataset(run.zarr_store_path)
+    except Exception as exc:  # noqa: BLE001 - a broken store is "unavailable"
+        logger.warning("Skipping unreadable Zarr store for run %s: %s", run.id, exc)
+        raise HTTPException(
+            status_code=404, detail=f"Run store for cycle {cycle_time} is unreadable."
+        ) from exc
 
 
 def resolve_latest_run_cycle_time(

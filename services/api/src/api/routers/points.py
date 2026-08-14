@@ -88,11 +88,16 @@ def get_point_forecast(
         longitude=location.longitude,
         resolved_via=location.resolved_via,
         location_id=location.id,
+        # The newest READY cycle is the cache discriminator: when a new cycle
+        # becomes READY it may change the minimum-lead selection, so the cached
+        # cross-cycle series must be invalidated. The series itself is built
+        # from all READY cycles.
         cycle_time=resolve_latest_run_cycle_time(db, model_ids[0]),
         variables=tuple(var_codes) if var_codes else None,
         units=units,
         start_lead_time_hours=start_lead_time_hours,
         end_lead_time_hours=end_lead_time_hours,
+        cross_cycle=True,
     )
     query_params = (
         f"lat={lat}&lon={lon}&city_id={city_id}&resort_id={resort_id}"

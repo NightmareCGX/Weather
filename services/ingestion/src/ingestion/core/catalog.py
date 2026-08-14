@@ -125,6 +125,34 @@ class EnsembleMemberRecord(CatalogBase):
     )
 
 
+class EnsembleMemberProductRecord(CatalogBase):
+    """One committed ``(member, lead)`` pair of an ensemble run.
+
+    The catalog's ``forecast_products`` rows record lead completion *without*
+    member identity, and ``ensemble_members`` rows record member presence
+    *without* lead identity. Neither can answer "has member 3 committed lead 6".
+    This table records exactly the committed ``(member_index, lead_time_hours)``
+    pairs, one row per per-file ingest, so run-level readiness can enforce the
+    Cartesian product of expected members × expected leads.
+    """
+
+    __tablename__ = "ensemble_member_products"
+
+    id = Column(String, primary_key=True)
+    run_id = Column(String, ForeignKey("model_runs.id"), nullable=False)
+    member_index = Column(Integer, nullable=False)
+    lead_time_hours = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "member_index",
+            "lead_time_hours",
+            name="uq_ensemble_member_product",
+        ),
+    )
+
+
 class VariableRecord(CatalogBase):
     __tablename__ = "forecast_variables"
 
@@ -228,6 +256,14 @@ class RunCatalogSpec:
     product_type: str = "surface"
     zarr_store_path: str | None = None
     variables: tuple[VariableSpec, ...] = ()
+    #: The complete set of lead times this run is expected to serve. Run-level
+    #: readiness compares the committed lead set against this. Empty means the
+    #: caller makes no completeness claim (the recorded dataset is the truth).
+    expected_lead_time_hours: tuple[int, ...] = ()
+    #: The complete set of GEFS member identities (1..30) this run is expected
+    #: to serve. Empty for deterministic models. Readiness requires every
+    #: expected member to be committed.
+    expected_members: tuple[int, ...] = ()
 
 
 def _get_or_create(
@@ -283,25 +319,34 @@ def record_run(
     db: Session,
     spec: RunCatalogSpec,
     dataset: xr.Dataset,
+    *,
+    member: int | None = None,
 ) -> ModelRunRecord:
     """Create or update the PostgreSQL catalog rows for an ingested run.
 
     Upserts the center, model, model version, model run, grid, variables,
     forecast products (one row per variable x lead time), and ensemble members
-    (one per ``member`` index when the dataset has a member dimension). The
-    run is recorded as ``status='ready'`` so the API serving tier's
-    ``_resolve_run`` discovers it. All writes happen in a single transaction
-    that is committed on success.
+    (one per real upstream ``member`` identity when the dataset has a member
+    dimension). The run's status is derived from completeness: when the
+    committed lead/member sets cover ``spec.expected_lead_time_hours`` /
+    ``spec.expected_members`` the run is ``ready``; when some but not all are
+    committed it is ``partial``; otherwise ``processing``. An individual file's
+    catalog write therefore no longer implies the whole run is ready.
 
     Args:
         db: Database session.
-        spec: The catalog metadata of the run.
+        spec: The catalog metadata of the run (including the expected lead and
+            member sets used to decide readiness).
         dataset: The normalized dataset written to the Zarr store; its
             ``lead_time_hours`` coordinate and ``member`` dimension drive the
             product/member rows.
+        member: The upstream GEFS member identity (``1..30``) being recorded.
+            When provided, exactly one ``ensemble_members`` row for that real
+            member number is created (never a positional index).
 
     Returns:
-        The recorded :class:`ModelRunRecord` (ready).
+        The recorded :class:`ModelRunRecord` (in its completeness-derived
+        status).
     """
     cycle_time = spec.cycle_time
     if cycle_time.tzinfo is None:
@@ -367,17 +412,16 @@ def record_run(
                 ),
                 "model_version_id": version.id,
                 "cycle_time": cycle_time,
-                "status": "ready",
+                "status": "processing",
                 "zarr_store_path": spec.zarr_store_path,
             },
         ),
     )
-    # An existing row is refreshed to ready and the current store path so a
-    # re-ingested run (upsert) is immediately discoverable and serveable.
-    # ``setattr`` is used (as in ``record_ingested_dataset``) because the ORM
+    # An existing row is updated to the current store path. Readiness is
+    # recomputed after the product/member rows are written (see
+    # ``_derive_run_status``). ``setattr`` is used because the ORM
     # ``Column``-typed class attributes are not instrumented for mypy's
     # assignment checking under strict mode.
-    setattr(run, "status", "ready")
     if spec.zarr_store_path is not None:
         setattr(run, "zarr_store_path", spec.zarr_store_path)
 
@@ -432,26 +476,137 @@ def record_run(
                 },
             )
 
-    if "member" in dataset.dims:
-        member_count = int(dataset.sizes["member"])
-        for member_index in range(member_count):
+    # Ensemble member rows keyed by the real upstream member number. When a
+    # per-member file is recorded (``member`` provided), exactly one row for
+    # that number is created. When a combined multi-member dataset is recorded,
+    # one row per member coordinate value is created (the coordinate may be a
+    # dimension or a scalar coordinate — a single-member file decodes member as
+    # a scalar coordinate).
+    has_member = "member" in dataset.dims or "member" in dataset.coords
+    if has_member:
+        if member is not None:
+            member_numbers = [int(member)]
+        else:
+            member_values = dataset.coords["member"].values
+            if np.ndim(member_values) == 0:
+                member_numbers = [int(member_values)]
+            else:
+                member_numbers = [int(value) for value in member_values]
+        for member_number in member_numbers:
             _get_or_create(
                 db,
                 EnsembleMemberRecord,
                 (EnsembleMemberRecord.run_id == run.id)
-                & (EnsembleMemberRecord.member_index == member_index),
+                & (EnsembleMemberRecord.member_index == member_number),
                 {
                     # The id includes the run id so member rows of different
-                    # runs of the same model cannot collide on the PK.
-                    "id": f"member_{member_index}_{run.id}",
+                    # runs of the same model cannot collide on the PK. The
+                    # member_index is the REAL upstream member number, not a
+                    # positional completion index.
+                    "id": f"member_{member_number}_{run.id}",
                     "run_id": run.id,
-                    "member_index": member_index,
-                    "member_name": f"{spec.model_id}_member_{member_index}",
+                    "member_index": member_number,
+                    "member_name": f"{spec.model_id}_member_{member_number}",
                 },
             )
+            # Record each committed (member, lead) pair so run-level readiness
+            # can enforce the Cartesian product of expected members × expected
+            # leads. A single-file ingest carries one member and one (or more)
+            # leads; a combined multi-member file carries every member at each
+            # lead. Duplicate/retry ingestion is idempotent via the unique
+            # (run_id, member_index, lead_time_hours) constraint.
+            for pair_lead in _lead_times(dataset):
+                _get_or_create(
+                    db,
+                    EnsembleMemberProductRecord,
+                    (EnsembleMemberProductRecord.run_id == run.id)
+                    & (EnsembleMemberProductRecord.member_index == member_number)
+                    & (EnsembleMemberProductRecord.lead_time_hours == pair_lead),
+                    {
+                        "id": (
+                            f"member_product_{member_number}_{pair_lead}_{run.id}"
+                        ),
+                        "run_id": run.id,
+                        "member_index": member_number,
+                        "lead_time_hours": pair_lead,
+                    },
+                )
 
+    # Derive run-level readiness from committed vs expected sets. This is the
+    # single decision point: a run becomes READY only when every expected lead
+    # (and, for ensembles, every expected member) has a committed product /
+    # member row.
+    setattr(run, "status", _derive_run_status(db, run, spec))
     db.commit()
     return run
+
+
+def _derive_run_status(
+    db: Session, run: ModelRunRecord, spec: RunCatalogSpec
+) -> str:
+    """Return the run's status from its committed catalog rows vs expectations.
+
+    For a deterministic run (no ensemble), ``ready`` requires every expected
+    lead to have a committed ``forecast_products`` row.
+
+    For an ensemble run, ``ready`` requires the **Cartesian product** of
+    expected members × expected leads to be committed: every
+    ``(member, lead)`` pair must have a committed
+    ``ensemble_member_products`` row. Independent member-set and lead-set
+    completeness is NOT sufficient — a missing pair (e.g. member 3, lead 0)
+    keeps the run ``partial`` even when ``{1,2,3}`` and ``{0,6}`` are each
+    complete.
+
+    ``partial`` when some but not all expected items are committed.
+    ``processing`` when nothing is yet committed or the run declares no
+    expectations (the caller's single write is treated as the whole truth).
+
+    Args:
+        db: Database session.
+        run: The run row.
+        spec: The run's catalog spec (expected lead/member sets).
+
+    Returns:
+        ``ready``, ``partial``, or ``processing``.
+    """
+    committed_leads = set(
+        db.execute(
+            select(ProductRecord.lead_time_hours).where(
+                ProductRecord.run_id == run.id
+            )
+        ).scalars()
+    )
+    expected_leads = set(spec.expected_lead_time_hours)
+    if not expected_leads:
+        # No declared expectations: the recorded dataset is the whole truth.
+        return "ready"
+
+    if not expected_leads.issubset(committed_leads):
+        # Nothing committed yet.
+        if not committed_leads:
+            return "processing"
+        return "partial"
+
+    if spec.is_ensemble and spec.expected_members:
+        # Enforce the Cartesian product: every expected (member, lead) pair must
+        # have a committed ensemble_member_products row. Query the committed
+        # pairs directly from the pair table.
+        rows = db.execute(
+            select(
+                EnsembleMemberProductRecord.member_index,
+                EnsembleMemberProductRecord.lead_time_hours,
+            ).where(EnsembleMemberProductRecord.run_id == run.id)
+        ).all()
+        committed_pairs = {(int(member_num), int(lead_num)) for member_num, lead_num in rows}
+        expected_pairs = {
+            (int(member), int(lead))
+            for member in spec.expected_members
+            for lead in spec.expected_lead_time_hours
+        }
+        if committed_pairs != expected_pairs:
+            return "partial"
+
+    return "ready"
 
 
 def record_ingested_dataset(
@@ -459,12 +614,15 @@ def record_ingested_dataset(
     dataset: xr.Dataset,
     *,
     effective_store_path: str | None = None,
+    member: int | None = None,
 ) -> ModelRunRecord:
     """Record an ingested dataset to the configured PostgreSQL catalog.
 
     Convenience wrapper over :func:`record_run` that opens a session from the
     configured ``DATABASE_URL`` (``IngestionSettings``). A worker calls this
-    immediately after a successful Zarr write.
+    immediately after a successful Zarr write. Run status is derived from
+    completeness inside ``record_run``; an individual file no longer marks the
+    whole run ready.
 
     The write is retried on a concurrent uniqueness collision: two workers
     ingesting the same (model, cycle) run can both miss the SELECT and both
@@ -473,15 +631,18 @@ def record_ingested_dataset(
     re-reads the existing row instead of surfacing an ``IntegrityError``.
 
     Args:
-        spec: The catalog metadata of the run.
+        spec: The catalog metadata of the run (including expected lead/member
+            sets used to decide readiness).
         dataset: The normalized dataset written to the Zarr store.
         effective_store_path: The actual store path the dataset was written
             to. Defaults to ``spec.zarr_store_path``. The orchestration layer
             passes a staged sibling path when it re-ingests an existing run so
             the catalog records exactly the store that was written.
+        member: The upstream GEFS member identity (``1..30``) being recorded.
 
     Returns:
-        The recorded :class:`ModelRunRecord` (ready).
+        The recorded :class:`ModelRunRecord` (in its completeness-derived
+        status).
     """
     if effective_store_path is None:
         effective_store_path = spec.zarr_store_path
@@ -489,7 +650,7 @@ def record_ingested_dataset(
     for _ in range(_MAX_CONCURRENT_WRITE_RETRIES):
         with SessionLocal() as session:
             try:
-                run = record_run(session, spec, dataset)
+                run = record_run(session, spec, dataset, member=member)
                 if effective_store_path is not None:
                     # ``run.zarr_store_path`` is typed as a ``Column`` on the
                     # declarative class; SQLAlchemy instruments instance

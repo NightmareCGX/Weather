@@ -28,21 +28,23 @@ GFS_006_URL = (
 GFS_384_URL = (
     f"{BASE}/pub/data/nccf/com/gfs/prod/gfs.20260721/18/atmos/gfs.t18z.pgrb2.0p25.f384"
 )
+# GEFS per-member perturbation files (gep01..gep30), the actual NOMADS layout.
+# 0.25 deg short/medium range: pgrb2sp25/. Beyond 240 h: pgrb2bp5/ 0.5 deg.
 GEFS_006_URL = (
-    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/00/atmos/pgrb2ap25/"
-    "gefs.t00z.pgrb2a.0p25.f006"
+    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/00/atmos/pgrb2sp25/"
+    "gep01.t00z.pgrb2s.0p25.f006"
 )
 GEFS_240_URL = (
-    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/06/atmos/pgrb2ap25/"
-    "gefs.t06z.pgrb2a.0p25.f240"
+    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/06/atmos/pgrb2sp25/"
+    "gep17.t06z.pgrb2s.0p25.f240"
 )
 GEFS_252_URL = (
-    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/06/atmos/pgrb2bp25/"
-    "gefs.t06z.pgrb2b.0p25.f252"
+    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/06/atmos/pgrb2bp5/"
+    "gep17.t06z.pgrb2s.0p50.f252"
 )
 GEFS_384_URL = (
-    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/12/atmos/pgrb2bp25/"
-    "gefs.t12z.pgrb2b.0p25.f384"
+    f"{BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/12/atmos/pgrb2bp5/"
+    "gep30.t12z.pgrb2s.0p50.f384"
 )
 
 
@@ -73,41 +75,50 @@ class _BrokenBody(httpx.AsyncByteStream):
 
 
 @pytest.mark.parametrize(
-    ("model", "cycle_hour", "lead_time_hours", "expected_url"),
+    ("model", "cycle_hour", "lead_time_hours", "member", "expected_url"),
     [
-        ("gfs", 0, 6, GFS_006_URL),
-        ("gfs", 12, 0, GFS_000_URL),
-        ("gfs", 18, 384, GFS_384_URL),
-        ("gefs", 0, 6, GEFS_006_URL),
-        ("gefs", 6, 240, GEFS_240_URL),
-        ("gefs", 6, 252, GEFS_252_URL),
-        ("gefs", 12, 384, GEFS_384_URL),
+        ("gfs", 0, 6, None, GFS_006_URL),
+        ("gfs", 12, 0, None, GFS_000_URL),
+        ("gfs", 18, 384, None, GFS_384_URL),
+        ("gefs", 0, 6, 1, GEFS_006_URL),
+        ("gefs", 6, 240, 17, GEFS_240_URL),
+        ("gefs", 6, 252, 17, GEFS_252_URL),
+        ("gefs", 12, 384, 30, GEFS_384_URL),
     ],
 )
 def test_build_url_is_deterministic(
-    model: str, cycle_hour: int, lead_time_hours: int, expected_url: str
+    model: str,
+    cycle_hour: int,
+    lead_time_hours: int,
+    member: int | None,
+    expected_url: str,
 ) -> None:
     connector = NOAAConnector(conn_settings=_settings())
     assert (
-        connector.build_url(model, CYCLE, cycle_hour, lead_time_hours) == expected_url
+        connector.build_url(model, CYCLE, cycle_hour, lead_time_hours, member)
+        == expected_url
     )
 
 
 @pytest.mark.parametrize(
-    ("model", "cycle_hour", "lead_time_hours"),
+    ("model", "cycle_hour", "lead_time_hours", "member"),
     [
-        ("ecmwf", 0, 6),
-        ("gfs", 3, 6),
-        ("gfs", 0, -1),
-        ("gfs", 0, 385),
+        ("ecmwf", 0, 6, None),
+        ("gfs", 3, 6, None),
+        ("gfs", 0, -1, None),
+        ("gfs", 0, 385, None),
+        # GEFS requires a member identity and rejects out-of-range members.
+        ("gefs", 0, 6, None),
+        ("gefs", 0, 6, 0),
+        ("gefs", 0, 6, 31),
     ],
 )
 def test_build_url_rejects_invalid_runs(
-    model: str, cycle_hour: int, lead_time_hours: int
+    model: str, cycle_hour: int, lead_time_hours: int, member: int | None
 ) -> None:
     connector = NOAAConnector(conn_settings=_settings())
     with pytest.raises(InvalidRunError):
-        connector.build_url(model, CYCLE, cycle_hour, lead_time_hours)
+        connector.build_url(model, CYCLE, cycle_hour, lead_time_hours, member)
 
 
 @respx.mock
@@ -128,7 +139,43 @@ async def test_download_gefs_beyond_240_hours(tmp_path: Path) -> None:
     respx.get(GEFS_252_URL).mock(return_value=httpx.Response(200, content=content))
     async with NOAAConnector(conn_settings=_settings()) as connector:
         destination = await connector.download(
-            "gefs", CYCLE, 6, 252, tmp_path / "gefs.f252.grib2"
+            "gefs", CYCLE, 6, 252, tmp_path / "gefs.f252.grib2", member=17
+        )
+    assert destination.read_bytes() == content
+
+
+@respx.mock
+async def test_download_gefs_member_file(tmp_path: Path) -> None:
+    """A per-member GEFS file downloads with its real gepNN identity."""
+    content = b"gep17-grib"
+    respx.get(GEFS_240_URL).mock(return_value=httpx.Response(200, content=content))
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        destination = await connector.download(
+            "gefs", CYCLE, 6, 240, tmp_path / "gep17.f240.grib2", member=17
+        )
+    assert destination.read_bytes() == content
+
+
+@respx.mock
+async def test_download_gefs_without_member_rejected(tmp_path: Path) -> None:
+    """A GEFS download without a member identity is refused (no combined file)."""
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        with pytest.raises(InvalidRunError, match="member"):
+            await connector.download(
+                "gefs", CYCLE, 0, 6, tmp_path / "gefs.f006.grib2"
+            )
+
+
+@respx.mock
+async def test_download_idx_fetches_index(tmp_path: Path) -> None:
+    """The .idx index file is fetched from the .grib2 URL + .idx suffix."""
+    content = b"1:0:d=2026072100:2mTMP:surface:anl:"
+    respx.get(f"{GEFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, content=content)
+    )
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        destination = await connector.download_idx(
+            "gefs", CYCLE, 0, 6, tmp_path / "gep01.f006.idx", member=1
         )
     assert destination.read_bytes() == content
 

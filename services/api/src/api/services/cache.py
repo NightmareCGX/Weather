@@ -277,6 +277,7 @@ def build_point_cache_key(
     units: str,
     start_lead_time_hours: int | None,
     end_lead_time_hours: int | None,
+    cross_cycle: bool = False,
 ) -> str:
     """Build a deterministic cache key for a point forecast request.
 
@@ -292,9 +293,13 @@ def build_point_cache_key(
     ``cycle_time`` is the resolved forecast run's cycle/reference time. It is
     part of the key so a cache entry for one cycle (e.g. GFS 2026-08-13 00Z)
     can never satisfy a request for another cycle of the same model at the
-    same location/lead (ACCEPTANCE_REMEDIATION_PLAN §9). A forecast is
-    identified by ``(model, cycle_time, lead, variable)``, never
-    ``(model, lead, variable)``.
+    same location/lead (ACCEPTANCE_REMEDIATION_PLAN §9).
+
+    ``cross_cycle`` discriminates the cross-cycle time-series response (which
+    may combine multiple cycles) from the legacy single-cycle response. A
+    cross-cycle payload must never be served from a single-cycle cache entry
+    (or vice versa) because they are different response shapes even when the
+    resolved cycle is the same.
     """
     payload = {
         "model": model,
@@ -307,6 +312,7 @@ def build_point_cache_key(
         "units": units,
         "start_lead_time_hours": start_lead_time_hours,
         "end_lead_time_hours": end_lead_time_hours,
+        "cross_cycle": cross_cycle,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "point:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

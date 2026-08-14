@@ -69,6 +69,7 @@ class BaseConnector(ABC):
         cycle_date: date,
         cycle_hour: int,
         lead_time_hours: int,
+        member: int | None = None,
     ) -> str:
         """Return the deterministic download URL for a forecast file.
 
@@ -77,6 +78,9 @@ class BaseConnector(ABC):
             cycle_date: UTC date of the model run.
             cycle_hour: UTC hour of the model run.
             lead_time_hours: Forecast lead time offset from cycle time.
+            member: Upstream ensemble member identity (e.g. ``1..30`` for
+                GEFS perturbation members). ``None`` for deterministic models
+                or combined-file products.
 
         Returns:
             Absolute URL of the requested forecast file.
@@ -90,6 +94,7 @@ class BaseConnector(ABC):
         cycle_hour: int,
         lead_time_hours: int,
         destination: Path,
+        member: int | None = None,
     ) -> Path:
         """Download a forecast file to ``destination``.
 
@@ -99,6 +104,9 @@ class BaseConnector(ABC):
             cycle_hour: UTC hour of the model run.
             lead_time_hours: Forecast lead time offset from cycle time.
             destination: Local path the downloaded file is written to.
+            member: Upstream ensemble member identity (e.g. ``1..30`` for
+                GEFS perturbation members). ``None`` for deterministic models
+                or combined-file products.
 
         Returns:
             The path the file was written to.
