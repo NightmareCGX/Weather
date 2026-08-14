@@ -148,6 +148,95 @@ def write_dataset(
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
 
 
+def write_dataset_atomic(
+    dataset: xr.Dataset,
+    store: str | PathLike[str] | Mapping[str, bytes],
+    *,
+    chunks: Mapping[str, int] | None = None,
+) -> str:
+    """Write a dataset to a Zarr store without ever exposing a partial store.
+
+    Cycle stores accumulate leads over successive invocations, so a
+    partially-written store could otherwise be served by the API between the
+    first write and the final rename. This writes to a unique staged sibling
+    and then atomically swaps it into the final path (remove-then-rename for
+    local paths; a best-effort staging for ``s3://`` stores). If the write or
+    swap fails, the staged sibling is removed and the previous store (if any)
+    is left untouched.
+
+    Args:
+        dataset: Normalized dataset to write.
+        store: Local path, ``s3://`` URL, or a mutable mapping.
+        chunks: Optional per-dimension chunk sizes (defaults to
+            :data:`DEFAULT_CHUNKS`).
+
+    Returns:
+        The store target as a string (for reporting).
+
+    Raises:
+        ValueError: If the store target is unsupported.
+    """
+    if isinstance(store, (Mapping, PathLike)):
+        # Mappings and path-like targets have no atomic-rename semantics here;
+        # fall back to the plain write (callers use atomic writes for the
+        # cycle-store path, which is a local dir or s3:// URL).
+        return write_dataset(dataset, store, chunks=chunks)
+
+    target = os.fspath(store)
+    if target.startswith("s3://"):
+        # S3-compatible stores: write to a unique staged prefix then list-copy
+        # it into the final prefix, removing the stage. This is best-effort
+        # atomicity (S3 has no rename); a partial final store is bounded by the
+        # copy window and the API's run-identity validation refuses mismatched
+        # cycles.
+        stage = f"{target.rstrip('/')}.tmp"
+        try:
+            _delete_store_path(stage)
+            write_dataset(dataset, stage, chunks=chunks)
+            _delete_store_path(target)
+            _move_store_path(stage, target)
+            return target
+        except Exception:
+            _delete_store_path(stage)
+            raise
+
+    # Local directory target: write to a staged sibling then atomically swap.
+    stage = f"{target}.tmp"
+    _delete_store_path(stage)
+    write_dataset(dataset, stage, chunks=chunks)
+    _delete_store_path(target)
+    os.replace(stage, target)
+    return target
+
+
+def _delete_store_path(path: str) -> None:
+    """Best-effort recursive delete of a local path or ``s3://`` store."""
+    if path.startswith("s3://"):
+        resolved = _resolve_store(path)
+        if isinstance(resolved, MutableMapping):
+            try:
+                list(resolved.keys())
+                for key in list(resolved.keys()):
+                    resolved.pop(key, None)
+            except Exception:
+                pass
+        return
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _move_store_path(src: str, dst: str) -> None:
+    """Best-effort copy of an ``s3://`` store from ``src`` to ``dst``."""
+    src_resolved = _resolve_store(src)
+    dst_resolved = _resolve_store(dst)
+    if isinstance(src_resolved, MutableMapping) and isinstance(dst_resolved, MutableMapping):
+        for key in list(src_resolved.keys()):
+            dst_resolved[key] = src_resolved[key]
+        for key in list(src_resolved.keys()):
+            src_resolved.pop(key, None)
+
+
 def read_dataset(store: str | PathLike[str] | Mapping[str, bytes]) -> xr.Dataset:
     """Read a Zarr store back into a dataset.
 

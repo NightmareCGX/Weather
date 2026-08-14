@@ -29,6 +29,7 @@ time.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -98,22 +99,6 @@ def _pixel_lonlat(zoom: int, x: int, y: int, px: int, py: int) -> tuple[float, f
     return lon, lat
 
 
-def _native_lon(grid: _TileGrid, lon: float) -> float:
-    """Align a WGS84 longitude into the dataset's native axis convention."""
-    normalized = (lon % 360.0 + 360.0) % 360.0
-    native_min = grid.lon_start
-    native_max = grid.lon_end
-    span = native_max - native_min
-    if span <= 0:
-        return normalized
-    candidate = normalized
-    while candidate > native_max and candidate - 360.0 >= native_min:
-        candidate -= 360.0
-    while candidate < native_min:
-        candidate += 360.0
-    return candidate
-
-
 def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]:
     """Return the (value, RGB) color stops for a variable's display ramp."""
     if variable_code == "precipitation_rate":
@@ -144,26 +129,6 @@ def _data_range(variable_code: str) -> tuple[float, float]:
     if variable_code == "precipitation_rate":
         return (0.0, 25.0)
     return (-40.0, 45.0)
-
-
-def _interpolate_color(
-    stops: list[tuple[float, tuple[int, int, int]]], value: float
-) -> tuple[int, int, int]:
-    """Map a value to an RGB color by linear interpolation between stops."""
-    if value <= stops[0][0]:
-        return stops[0][1]
-    for index in range(len(stops) - 1):
-        lower_value, lower_color = stops[index]
-        upper_value, upper_color = stops[index + 1]
-        if value <= upper_value:
-            span = upper_value - lower_value
-            weight = 0.0 if span <= 0 else (value - lower_value) / span
-            channels: list[int] = [
-                int(round(lower + (upper - lower) * weight))
-                for lower, upper in zip(lower_color, upper_color)
-            ]
-            return channels[0], channels[1], channels[2]
-    return stops[-1][1]
 
 
 def _derive_grid(dataset: xr.Dataset) -> _TileGrid:
@@ -246,6 +211,13 @@ def render_tile_png(
     tile's pixels are sampled nearest-neighbor and colored by the variable's
     ramp.
 
+    The output is cached server-side keyed by the full forecast identity
+    (model, variable, level, lead, cycle, tile coordinates) so identical tile
+    requests are served from memory instead of recomputing the PNG
+    (ACCEPTANCE_REMEDIATION_PLAN §12). The color mapping is fully vectorized
+    (no per-pixel Python loop) and the longitude alignment is vectorized
+    (no ``np.vectorize``), removing the dominant rendering costs.
+
     Args:
         db: Database session.
         model: A model identifier.
@@ -266,6 +238,13 @@ def render_tile_png(
         ValueError: For invalid tile/grid/field input.
     """
     _validate_tile(zoom, x, y)
+    cache_key = _tile_cache_key(
+        model, variable, level, zoom, x, y, lead_time_hours, initial_time
+    )
+    cached = _tile_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     run, dataset, lead = _resolve_run_and_field(
         db,
         model=model,
@@ -278,21 +257,20 @@ def render_tile_png(
     stops = _color_stops(variable)
     data_min, data_max = _data_range(variable)
 
-    # Compute the tile's geographic bounds (pixel centers).
-    pixel_lats: npt.NDArray[np.float64] = np.empty(
-        (TILE_SIZE, TILE_SIZE), dtype=np.float64
+    # Compute the tile's geographic bounds (pixel centers), vectorized.
+    n = 2**zoom
+    px_idx, py_idx = np.meshgrid(
+        np.arange(TILE_SIZE, dtype=np.float64),
+        np.arange(TILE_SIZE, dtype=np.float64),
+        indexing="xy",
     )
-    pixel_lons: npt.NDArray[np.float64] = np.empty(
-        (TILE_SIZE, TILE_SIZE), dtype=np.float64
-    )
-    for py in range(TILE_SIZE):
-        for px in range(TILE_SIZE):
-            pixel_lons[py, px], pixel_lats[py, px] = _pixel_lonlat(zoom, x, y, px, py)
+    pixel_lons = ((x + (px_idx + 0.5) / TILE_SIZE) / n) * 360.0 - 180.0
+    y_merc = y + (py_idx + 0.5) / TILE_SIZE
+    lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
+    pixel_lats = np.degrees(lat_rad)
 
     # Align pixel longitudes into the dataset's native convention up front.
-    lon_native: npt.NDArray[np.float64] = np.vectorize(
-        lambda value: _native_lon(grid, float(value))
-    )(pixel_lons)
+    lon_native = _align_longitudes(grid, pixel_lons)
 
     field, lat_axis, lon_axis = _slice_field(
         dataset, variable, lead, grid, pixel_lats, lon_native
@@ -305,19 +283,108 @@ def render_tile_png(
     valid = _inside_grid(grid, pixel_lats, lon_native)
     values = field[rows, cols]
 
-    pixels = bytearray()
+    # Fully vectorized color mapping: clamp, interpolate across the stop ramp
+    # per RGB channel with ``np.interp``, and build the RGBA scanlines with
+    # NumPy (no 65,536-iteration Python loop).
     finite = np.isfinite(values) & valid
-    flat_values = values.ravel()
-    flat_finite = finite.ravel()
-    for index in range(TILE_SIZE * TILE_SIZE):
-        if not flat_finite[index]:
-            pixels += b"\x00\x00\x00\x00"
-            continue
-        clamped = max(data_min, min(data_max, float(flat_values[index])))
-        red, green, blue = _interpolate_color(stops, clamped)
-        pixels += bytes((red, green, blue, 255))
+    rgba = np.zeros((TILE_SIZE, TILE_SIZE, 4), dtype=np.uint8)
+    rgba[..., 3] = 255
+    if np.any(finite):
+        clamped = np.clip(values[finite], data_min, data_max)
+        stop_values = np.asarray([stop[0] for stop in stops], dtype=np.float64)
+        # ``np.interp`` needs a 1-D fp per call, so interpolate each channel.
+        red = np.interp(clamped, stop_values, np.asarray([s[1][0] for s in stops], dtype=np.float64))
+        green = np.interp(clamped, stop_values, np.asarray([s[1][1] for s in stops], dtype=np.float64))
+        blue = np.interp(clamped, stop_values, np.asarray([s[1][2] for s in stops], dtype=np.float64))
+        rows_f = np.nonzero(finite)[0]
+        cols_f = np.nonzero(finite)[1]
+        rgba[rows_f, cols_f, 0] = red
+        rgba[rows_f, cols_f, 1] = green
+        rgba[rows_f, cols_f, 2] = blue
 
-    return encode_rgba_png(bytes(pixels), TILE_SIZE, TILE_SIZE)
+    png = encode_rgba_png(rgba.tobytes(), TILE_SIZE, TILE_SIZE)
+    _tile_cache_set(cache_key, png)
+    return png
+
+
+def _align_longitudes(grid: _TileGrid, lons: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Vectorized longitude alignment into the dataset's native convention.
+
+    Equivalent to applying :func:`_native_lon` per pixel, but as pure array
+    arithmetic (no ``np.vectorize`` Python loop) and **bounded**: each
+    longitude is shifted by at most one ``±360°`` step so no value can
+    oscillate indefinitely. Pixels whose longitude still falls outside the
+    native region are masked by ``_inside_grid`` as no-data, so a bounded
+    single shift is exactly as correct as the original per-pixel loop for
+    in-range values while never hanging on out-of-range ones (a latent hang in
+    the original ``_native_lon`` for small native regions).
+    """
+    normalized = np.mod(np.mod(lons, 360.0) + 360.0, 360.0)
+    native_min = grid.lon_start
+    native_max = grid.lon_end
+    span = native_max - native_min
+    if span <= 0:
+        return normalized
+    out = normalized.copy()
+    # One -360 step for values above the native max that would still land
+    # within (or near) the region.
+    above = out > native_max
+    candidate = out - 360.0
+    out = np.where(above & (candidate >= native_min), candidate, out)
+    # One +360 step for values below the native min.
+    below = out < native_min
+    out = np.where(below, out + 360.0, out)
+    # Any value still outside the region is left as-is (masked as no-data).
+    return out
+
+
+#: Server-side tile LRU cache: ``model/variable/level/z/x/y/lead/initial_time``
+#: -> PNG bytes. Bounded so the API process does not grow unbounded; the TTL
+#: aligns with the tile ``Cache-Control: max-age=300`` so newly-ingested runs
+#: become visible promptly. The cache key carries the full forecast identity
+#: (including the cycle via ``initial_time``), so a tile for one forecast run
+#: can never satisfy another's request.
+_TILE_CACHE_MAX_ENTRIES = 4096
+_TILE_CACHE_TTL_SECONDS = 300
+_tile_cache: dict[tuple[object, ...], tuple[float, bytes]] = {}
+
+
+def _tile_cache_key(
+    model: str,
+    variable: str,
+    level: str,
+    zoom: int,
+    x: int,
+    y: int,
+    lead_time_hours: int,
+    initial_time: str | None,
+) -> tuple[object, ...]:
+    """Build the tile cache key: the full forecast + spatial identity."""
+    return (model, variable, level, zoom, x, y, lead_time_hours, initial_time)
+
+
+def _tile_cache_get(key: tuple[object, ...]) -> bytes | None:
+    """Return a live cached tile, evicting stale entries."""
+    entry = _tile_cache.get(key)
+    if entry is None:
+        return None
+    created, png = entry
+    if time.monotonic() - created > _TILE_CACHE_TTL_SECONDS:
+        _tile_cache.pop(key, None)
+        return None
+    return png
+
+
+def _tile_cache_set(key: tuple[object, ...], png: bytes) -> None:
+    """Store a tile, evicting the oldest entry when the cache is full."""
+    _tile_cache[key] = (time.monotonic(), png)
+    if len(_tile_cache) > _TILE_CACHE_MAX_ENTRIES:
+        # Evict the oldest-inserted key (approximate LRU via insertion order).
+        try:
+            oldest = next(iter(_tile_cache))
+            _tile_cache.pop(oldest, None)
+        except StopIteration:
+            pass
 
 
 def _slice_field(

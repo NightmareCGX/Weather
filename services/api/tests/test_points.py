@@ -261,18 +261,126 @@ def test_convert_kmh_to_mph_label():
     assert convert(10.0) == pytest.approx(6.21371, abs=1e-9)
 
 
-def _make_key():
+def _make_key(cycle_time: str | None = None):
     return build_point_cache_key(
         model="gfs",
         latitude=38.125,
         longitude=-106.875,
         resolved_via="coordinates",
         location_id=None,
+        cycle_time=cycle_time,
         variables=None,
         units="metric",
         start_lead_time_hours=None,
         end_lead_time_hours=None,
     )
+
+
+def test_cache_key_distinguishes_cycles() -> None:
+    """A cache entry for one forecast cycle never satisfies another cycle.
+
+    GFS 2026-08-13 00Z and GFS 2026-08-13 12Z at the same location/lead are
+    distinct forecast runs and must have distinct cache keys (GAP-1 fix).
+    """
+    key_00z = _make_key(cycle_time="2026-08-13T00:00:00Z")
+    key_12z = _make_key(cycle_time="2026-08-13T12:00:00Z")
+    assert key_00z != key_12z
+    # Same cycle -> same key (deterministic).
+    assert key_00z == _make_key(cycle_time="2026-08-13T00:00:00Z")
+
+
+def test_cache_key_distinguishes_models() -> None:
+    """Distinct models never share a point cache key."""
+    from api.services.cache import build_point_cache_key
+
+    def _key(model: str) -> str:
+        return build_point_cache_key(
+            model=model,
+            latitude=38.125,
+            longitude=-106.875,
+            resolved_via="coordinates",
+            location_id=None,
+            cycle_time="2026-08-13T00:00:00Z",
+            variables=None,
+            units="metric",
+            start_lead_time_hours=None,
+            end_lead_time_hours=None,
+        )
+
+    assert _key("gfs") != _key("gefs")
+
+
+def test_cache_key_distinguishes_leads() -> None:
+    """Different lead times never share a point cache key."""
+    from api.services.cache import build_point_cache_key
+
+    def _key(end_lead: int | None) -> str:
+        return build_point_cache_key(
+            model="gfs",
+            latitude=38.125,
+            longitude=-106.875,
+            resolved_via="coordinates",
+            location_id=None,
+            cycle_time="2026-08-13T00:00:00Z",
+            variables=None,
+            units="metric",
+            start_lead_time_hours=None,
+            end_lead_time_hours=end_lead,
+        )
+
+    assert _key(6) != _key(18)
+
+
+def test_ensemble_cache_key_distinguishes_cycles() -> None:
+    """Ensemble cache keys also carry the forecast-run cycle."""
+    from api.services.cache import build_ensemble_cache_key
+
+    key_00z = build_ensemble_cache_key(
+        model="gefs",
+        latitude=38.125,
+        longitude=-106.875,
+        variable="temperature_2m",
+        lead_time_hours=18,
+        cycle_time="2026-08-13T00:00:00Z",
+    )
+    key_12z = build_ensemble_cache_key(
+        model="gefs",
+        latitude=38.125,
+        longitude=-106.875,
+        variable="temperature_2m",
+        lead_time_hours=18,
+        cycle_time="2026-08-13T12:00:00Z",
+    )
+    assert key_00z != key_12z
+
+
+def test_probability_cache_key_distinguishes_cycles() -> None:
+    """Probability cache keys also carry the forecast-run cycle."""
+    from api.services.cache import build_probability_cache_key
+
+    key_00z = build_probability_cache_key(
+        model="gefs",
+        latitude=38.125,
+        longitude=-106.875,
+        variable="precipitation_rate",
+        threshold=1.0,
+        operator="gt",
+        lead_time_hours=18,
+        threshold_max=None,
+        cycle_time="2026-08-13T00:00:00Z",
+    )
+    key_12z = build_probability_cache_key(
+        model="gefs",
+        latitude=38.125,
+        longitude=-106.875,
+        variable="precipitation_rate",
+        threshold=1.0,
+        operator="gt",
+        lead_time_hours=18,
+        threshold_max=None,
+        cycle_time="2026-08-13T12:00:00Z",
+    )
+    assert key_00z != key_12z
 
 
 def test_cache_corrupt_entry_is_miss_and_recomputed(cache):

@@ -13,11 +13,12 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from ingestion.core.base import LeadTimeMismatchError
+from ingestion.core.base import CycleStoreMismatchError, LeadTimeMismatchError
 from ingestion.core.catalog import (
     CatalogBase,
     CenterRecord,
@@ -69,11 +70,20 @@ def _spec(zarr_store_path: str) -> RunCatalogSpec:
     )
 
 
-def _dataset_for_lead(lead: int):
+#: Default cycle time used by synthetic test datasets, matching ``_spec``.
+DEFAULT_CYCLE = np.datetime64("2026-07-21T00:00:00")
+
+
+def _dataset_for_lead(lead: int, cycle=np.datetime64("2026-07-21T00:00:00")):
     """A normalized single-lead dataset for a given lead time.
 
-    Mirrors the parser output: ``temperature_2m`` as a 2-D field on the grid
-    with a scalar ``lead_time_hours`` coordinate.
+    Mirrors the parser output: ``temperature_2m`` as a 2-D field on the grid,
+    a scalar ``lead_time_hours`` coordinate, and the GRIB ``time`` coordinate
+    (the forecast-run cycle/reference time). Carrying ``time`` is essential so
+    the cycle-identity guard in ``_merge_lead`` can validate same-cycle merges
+    and reject cross-cycle merges (the real parser emits ``time``; the previous
+    synthetic datasets omitted it, which is why the cross-cycle defect was
+    untested).
     """
     import numpy as np
     import xarray as xr
@@ -86,6 +96,7 @@ def _dataset_for_lead(lead: int):
             )
         },
         coords={
+            "time": xr.DataArray(np.datetime64(cycle, "ns"), name="time"),
             "lead_time_hours": lead,
             "latitude": [38.0, 38.25, 38.5, 38.75],
             "longitude": [-107.0, -106.75, -106.5, -106.25],
@@ -493,3 +504,129 @@ def test_ingest_grib_file_reingest_lead_replaces_in_store(
     assert os.path.isdir(store_path)
     restored = xr.open_zarr(store_path)
     assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6, 12]
+
+
+# --- Forecast-run identity / cycle validation (ACCEPTANCE_REMEDIATION_PLAN §3-4) ---
+
+
+def test_merge_same_cycle_multiple_leads_succeeds(tmp_path) -> None:
+    """Same model + same cycle + multiple leads merge into one store."""
+    from ingestion.core.pipeline import _merge_lead
+    from ingestion.core.zarr_writer import read_dataset, write_dataset
+
+    store = str(tmp_path / "cycle.zarr")
+    first = _dataset_for_lead(6)
+    write_dataset(first.expand_dims("lead_time_hours"), store)
+    merged = _merge_lead(_dataset_for_lead(12), store)
+    write_dataset(merged, store)
+    restored = read_dataset(store)
+    assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6, 12]
+
+
+def test_merge_different_cycle_fails_fast(tmp_path) -> None:
+    """A different-cycle file must be refused, never silently merged.
+
+    This is the exact regression for the reported
+    ``MergeError: conflicting values for variable 'time'``: the store is 00Z,
+    the incoming file is 12Z. The merge must raise the domain
+    ``CycleStoreMismatchError`` and leave the store unchanged.
+    """
+    from ingestion.core.pipeline import _merge_lead
+    from ingestion.core.zarr_writer import read_dataset, write_dataset
+
+    store = str(tmp_path / "cycle.zarr")
+    write_dataset(_dataset_for_lead(6).expand_dims("lead_time_hours"), store)
+    incoming = _dataset_for_lead(18, cycle=np.datetime64("2026-07-21T12:00:00"))
+
+    with pytest.raises(CycleStoreMismatchError) as excinfo:
+        _merge_lead(incoming, store)
+    message = str(excinfo.value)
+    # The error must communicate both cycles and the refusal.
+    assert "2026-07-21T00:00:00" in message
+    assert "2026-07-21T12:00:00" in message
+    assert "Refusing" in message
+
+    # The store is unchanged after the refused merge: same leads, and its
+    # recoverable cycle identity is still the 00Z cycle (via the ``time``
+    # coordinate fallback, since the synthetic write carries no ``cycle_time``
+    # attr the way the real pipeline does).
+    from ingestion.core.pipeline import _resolve_cycle_time
+
+    restored = read_dataset(store)
+    assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6]
+    assert _resolve_cycle_time(restored) == "2026-07-21T00:00:00"
+
+
+def test_merge_missing_identity_refused(tmp_path) -> None:
+    """A dataset with no cycle identity must not silently merge into a store."""
+    import xarray as xr
+
+    from ingestion.core.pipeline import _merge_lead
+    from ingestion.core.zarr_writer import write_dataset
+
+    store = str(tmp_path / "cycle.zarr")
+    write_dataset(_dataset_for_lead(6).expand_dims("lead_time_hours"), store)
+
+    identityless = xr.Dataset(
+        data_vars={
+            "temperature_2m": (("latitude", "longitude"), np.ones((4, 4), dtype=float))
+        },
+        coords={
+            "lead_time_hours": 12,
+            "latitude": [38.0, 38.25, 38.5, 38.75],
+            "longitude": [-107.0, -106.75, -106.5, -106.25],
+        },
+    )
+    with pytest.raises(CycleStoreMismatchError):
+        _merge_lead(identityless, store)
+
+
+def test_store_is_self_describing_after_ingest(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A written cycle store carries model_id + cycle_time attrs (GAP-3)."""
+    import xarray as xr
+
+    store_path = str(tmp_path / "gfs.zarr")
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None):
+        return record_run(session, spec, dataset)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+
+    # The real fixture decodes to lead 6 at cycle 2026-07-21T00:00Z.
+    ingest_grib_file(_spec(store_path), FIXTURE, store_path)
+
+    restored = xr.open_zarr(store_path)
+    assert restored.attrs["model_id"] == "gfs"
+    assert restored.attrs["cycle_time"] == "2026-07-21T00:00:00"
+
+
+def test_merge_schema_mismatch_axis_rejected(tmp_path) -> None:
+    """A same-cycle lead with a different grid must fail fast (not corrupt)."""
+    import xarray as xr
+
+    from ingestion.core.base import StoreSchemaMismatchError
+    from ingestion.core.pipeline import _merge_lead
+    from ingestion.core.zarr_writer import read_dataset, write_dataset
+
+    store = str(tmp_path / "cycle.zarr")
+    write_dataset(_dataset_for_lead(6).expand_dims("lead_time_hours"), store)
+
+    different_grid = xr.Dataset(
+        data_vars={
+            "temperature_2m": (("latitude", "longitude"), np.ones((2, 2), dtype=float))
+        },
+        coords={
+            "time": xr.DataArray(np.datetime64("2026-07-21T00:00:00"), name="time"),
+            "lead_time_hours": 12,
+            "latitude": [38.0, 38.5],
+            "longitude": [-107.0, -106.5],
+        },
+    )
+    with pytest.raises(StoreSchemaMismatchError):
+        _merge_lead(different_grid, store)
+    restored = read_dataset(store)
+    assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6]

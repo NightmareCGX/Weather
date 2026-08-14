@@ -272,6 +272,7 @@ def build_point_cache_key(
     longitude: float,
     resolved_via: str,
     location_id: str | None,
+    cycle_time: str | None,
     variables: tuple[str, ...] | None,
     units: str,
     start_lead_time_hours: int | None,
@@ -287,9 +288,17 @@ def build_point_cache_key(
     at the same coordinates can differ in elevation. Including the resolved
     record's ``id`` (or ``None`` for coordinate resolution) guarantees no two
     distinct payloads share a cache key.
+
+    ``cycle_time`` is the resolved forecast run's cycle/reference time. It is
+    part of the key so a cache entry for one cycle (e.g. GFS 2026-08-13 00Z)
+    can never satisfy a request for another cycle of the same model at the
+    same location/lead (ACCEPTANCE_REMEDIATION_PLAN §9). A forecast is
+    identified by ``(model, cycle_time, lead, variable)``, never
+    ``(model, lead, variable)``.
     """
     payload = {
         "model": model,
+        "cycle_time": cycle_time,
         "latitude": latitude,
         "longitude": longitude,
         "resolved_via": resolved_via,
@@ -313,15 +322,19 @@ def build_probability_cache_key(
     operator: str,
     lead_time_hours: int,
     threshold_max: float | None,
+    cycle_time: str | None = None,
 ) -> str:
     """Build a deterministic cache key for a probability forecast request.
 
     The key is a SHA-256 digest of a canonical JSON payload, following the
     same convention as :func:`build_point_cache_key`. ``operator`` and both
     thresholds are included because they change the computed probability.
+    ``cycle_time`` (the resolved run's cycle) is part of the key so a cached
+    probability for one forecast run never satisfies another cycle's request.
     """
     payload = {
         "model": model,
+        "cycle_time": cycle_time,
         "latitude": latitude,
         "longitude": longitude,
         "variable": variable,
@@ -342,6 +355,7 @@ def build_ensemble_cache_key(
     variable: str,
     lead_time_hours: int,
     include_members: bool = False,
+    cycle_time: str | None = None,
 ) -> str:
     """Build a deterministic cache key for an ensemble statistics request.
 
@@ -349,10 +363,13 @@ def build_ensemble_cache_key(
     same convention as :func:`build_point_cache_key`. ``include_members`` is
     part of the key so a statistics-only cached response (which omits the
     member array) can never satisfy a distribution request, and a member-heavy
-    response can never satisfy a statistics-only request.
+    response can never satisfy a statistics-only request. ``cycle_time`` (the
+    resolved run's cycle) is part of the key so a cached ensemble response for
+    one forecast run never satisfies another cycle's request.
     """
     payload = {
         "model": model,
+        "cycle_time": cycle_time,
         "latitude": latitude,
         "longitude": longitude,
         "variable": variable,

@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
+import { resolvePlace, RequestAbortedError } from "@/lib/api/client";
 import { useSearch } from "@/hooks/useSearch";
-import type { SelectedLocation } from "@/lib/api/types";
+import { searchResultToSelectedLocation } from "@/lib/forecast/selection";
+import type { SearchResult, SelectedLocation } from "@/lib/api/types";
 
 interface LocationSearchProps {
   onSelect: (location: SelectedLocation) => void;
@@ -28,32 +30,46 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
   const inputRef = useRef<HTMLInputElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  const { results, status, error } = useSearch(query);
+  const { results, status, error, sessionToken } = useSearch(query);
+  const [resolving, setResolving] = useState(false);
 
   const listboxId = `${id}-listbox`;
   const optionId = (index: number) => `${id}-option-${index}`;
 
   const showListbox = open && query.trim().length > 0;
 
+  const selectResult = useCallback(
+    (result: SearchResult) => {
+      // A platform record (city/resort/station) already carries coordinates.
+      onSelect(searchResultToSelectedLocation(result));
+    },
+    [onSelect]
+  );
+
   const selectIndex = (index: number) => {
     const result = results[index];
     if (result === undefined) return;
-    onSelect({
-      name: result.name,
-      object: result.object,
-      latitude: result.latitude,
-      longitude: result.longitude,
-      elevation_m: result.elevation_m,
-      region: result.region,
-      country: result.country,
-      id: result.id,
-      resolvedVia:
-        result.object === "city"
-          ? "city"
-          : result.object === "ski_resort"
-            ? "resort"
-            : "coordinates",
-    });
+    setResolving(true);
+    if (result.object === "place" && typeof result.place_id === "string") {
+      // A place suggestion carries no coordinates yet; resolve the canonical
+      // place (name + lat/lon + region) before updating the map/forecast. The
+      // same session token is reused so Google bills one session.
+      resolvePlace({ placeId: result.place_id, sessionToken })
+        .then((resolved) => {
+          setResolving(false);
+          onSelect(searchResultToSelectedLocation(resolved));
+        })
+        .catch((err: unknown) => {
+          setResolving(false);
+          if (err instanceof RequestAbortedError) return;
+          // Fall back to the suggestion's display text so the UI degrades
+          // gracefully; the map simply won't recenter to real coordinates.
+          onSelect(searchResultToSelectedLocation(result));
+        });
+    } else {
+      selectResult(result);
+      setResolving(false);
+    }
     setQuery("");
     setOpen(false);
     setHighlighted(-1);

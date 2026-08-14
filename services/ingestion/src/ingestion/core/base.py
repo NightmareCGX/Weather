@@ -32,6 +32,28 @@ class LeadTimeMismatchError(IngestionError):
     """
 
 
+class CycleStoreMismatchError(IngestionError):
+    """Raised when a forecast dataset belongs to a different cycle than a store.
+
+    A Zarr store represents exactly one forecast cycle
+    (``UNIQUE(model_version_id, cycle_time)`` per DATABASE.md). Merging a
+    dataset from another cycle into that store would silently corrupt the
+    run's data, so ingestion must fail fast instead. This is a domain-level
+    condition: the caller requested a cycle that does not match the existing
+    store's identity, and the merge is refused.
+    """
+
+
+class StoreSchemaMismatchError(IngestionError):
+    """Raised when an incoming lead is structurally incompatible with a store.
+
+    Same-cycle leads merged into a cycle store must share the same spatial
+    grid (latitude/longitude axes), variable set, and (for ensembles) member
+    axis. A schema mismatch indicates the upstream product layout changed
+    mid-cycle; merging would corrupt the store, so ingestion fails fast.
+    """
+
+
 class BaseConnector(ABC):
     """Base interface implemented by all upstream model connectors.
 

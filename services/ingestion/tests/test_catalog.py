@@ -167,7 +167,7 @@ def test_record_run_naive_cycle_time_normalized_to_utc(session: Session) -> None
     spec = _spec(cycle_time=datetime(2026, 7, 21, 0, 0))  # naive
     run = record_run(session, spec, _dataset())
     # The run id is derived from the UTC-normalized cycle time.
-    assert run.id == "run_202607210000_gfs"
+    assert run.id == "run_version_gfs_v1.0_202607210000_gfs"
 
 
 def test_record_run_update_existing_run_store_path(session: Session) -> None:
@@ -189,6 +189,28 @@ def test_record_run_counts_unique_run_model_version(session: Session) -> None:
     assert run_a.id != run_b.id
     assert session.query(ModelRunRecord).count() == 2
     assert session.query(ModelVersionRecord).count() == 1
+
+
+def test_record_run_version_scoped_ids_no_pk_collision(session: Session) -> None:
+    """Two versions of the same model at the same cycle get distinct run ids.
+
+    The run id is version-scoped (GAP-4 fix): the schema's
+    ``(model_version_id, cycle_time)`` uniqueness allows both rows, so the id
+    must distinguish them or the second insert collides on the primary key.
+    """
+    run_a = record_run(
+        session, _spec(version_string="v1.0"), _dataset()
+    )
+    run_b = record_run(
+        session, _spec(version_string="v2.0"), _dataset()
+    )
+    assert run_a.id != run_b.id
+    assert session.query(ModelRunRecord).count() == 2
+    # Both versions share the same model row but are distinct versions.
+    assert session.query(ModelVersionRecord).count() == 2
+    assert session.query(ModelRecord).count() == 1
+    assert "v1.0" in run_a.id
+    assert "v2.0" in run_b.id
 
 
 def test_ensemble_members_unique_across_runs(session: Session) -> None:
@@ -246,6 +268,6 @@ def test_record_ingested_dataset_retries_on_integrity_error(
     )
 
     run = record_ingested_dataset(spec, _dataset(), effective_store_path="/tmp/gfs.zarr")
-    assert run.id == "run_202607210000_gfs"
+    assert run.id == "run_version_gfs_v1.0_202607210000_gfs"
     assert calls["n"] == 2  # first collided, second succeeded
     assert run.zarr_store_path == "/tmp/gfs.zarr"

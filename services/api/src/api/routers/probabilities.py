@@ -27,6 +27,7 @@ from api.services.cache import (
     build_probability_cache_key,
 )
 from api.services.ensemble_data import build_probability_forecast
+from api.services.point_forecast import resolve_latest_run_cycle_time
 
 router = APIRouter()
 
@@ -73,12 +74,23 @@ def get_probability(
             )
         ),
     ] = None,
+    # Optional cycle pinning (GAP-2): additive and non-breaking.
+    initial_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC cycle time pinning the model run "
+                "(e.g. 2026-08-13T00:00:00Z). Defaults to the newest ready run."
+            )
+        ),
+    ] = None,
     db: Session = DB,
 ) -> ProbabilityForecastEnvelope:
     """Return the exceedance probability for a forecast variable.
 
     The ensemble model (default ``gefs``) must exist and be an ensemble model;
-    member values are interpolated at the requested point and lead time.
+    member values are interpolated at the requested point and lead time. An
+    optional ``initial_time`` pins the forecast run.
     """
     _validate_threshold_bounds(operator, threshold, threshold_max)
 
@@ -91,11 +103,12 @@ def get_probability(
         operator=operator,
         lead_time_hours=lead_time_hours,
         threshold_max=threshold_max,
+        cycle_time=resolve_latest_run_cycle_time(db, model, initial_time),
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&threshold={threshold}"
         f"&operator={operator}&lead_time_hours={lead_time_hours}"
-        f"&model={model}&threshold_max={threshold_max}"
+        f"&model={model}&threshold_max={threshold_max}&initial_time={initial_time}"
     )
 
     envelope = _cache.compute_or_retrieve(
@@ -112,6 +125,7 @@ def get_probability(
             lead_time_hours,
             model,
             threshold_max,
+            initial_time,
         ),
         model_type=ProbabilityForecastEnvelope,
     )
@@ -152,6 +166,7 @@ def _compute(
     lead_time_hours: int,
     model: str,
     threshold_max: float | None,
+    initial_time: str | None,
 ) -> ProbabilityForecastEnvelope:
     data = build_probability_forecast(
         db,
@@ -163,5 +178,6 @@ def _compute(
         lead_time_hours=lead_time_hours,
         model=model,
         threshold_max=threshold_max,
+        initial_time=initial_time,
     )
     return ProbabilityForecastEnvelope(data=data)

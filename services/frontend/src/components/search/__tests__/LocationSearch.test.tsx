@@ -36,6 +36,7 @@ function mockResultsForQuery(query: string) {
     results: query.startsWith("A") ? results : [],
     status: "success",
     error: null,
+    sessionToken: "test-session-token",
   });
 }
 
@@ -146,6 +147,7 @@ describe("LocationSearch", () => {
       results: [],
       status: "error",
       error: "Failed to search locations.",
+      sessionToken: "test-session-token",
     });
     render(<LocationSearch onSelect={jest.fn()} />);
     const input = screen.getByRole("combobox");
@@ -155,7 +157,12 @@ describe("LocationSearch", () => {
   });
 
   it("shows a loading state while searching", () => {
-    mockUseSearch.mockReturnValue({ results: [], status: "loading", error: null });
+    mockUseSearch.mockReturnValue({
+      results: [],
+      status: "loading",
+      error: null,
+      sessionToken: "test-session-token",
+    });
     render(<LocationSearch onSelect={jest.fn()} />);
     const input = screen.getByRole("combobox");
     typeQuery(input, "Aspen");

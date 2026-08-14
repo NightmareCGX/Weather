@@ -16,6 +16,7 @@ from api.core.database import get_db
 from api.schemas import EnsembleStatisticsEnvelope
 from api.services.cache import PointCache, build_ensemble_cache_key
 from api.services.ensemble_data import build_ensemble_statistics
+from api.services.point_forecast import resolve_latest_run_cycle_time
 
 router = APIRouter()
 
@@ -58,13 +59,25 @@ def get_ensemble_statistics(
     include_members: Annotated[
         bool, Query(description="Return raw ensemble-member forecast values.")
     ] = False,
+    # Optional cycle pinning (GAP-2): lets a client request a specific forecast
+    # run's ensemble rather than always the newest. Additive and non-breaking.
+    initial_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC cycle time pinning the model run "
+                "(e.g. 2026-08-13T00:00:00Z). Defaults to the newest ready run."
+            )
+        ),
+    ] = None,
     db: Session = DB,
 ) -> EnsembleStatisticsEnvelope:
     """Return ensemble dispersion statistics for a forecast variable.
 
     The ensemble model (default ``gefs``) must exist and be an ensemble model;
     member values are interpolated at the requested point and lead time. When
-    ``include_members=true`` the genuine raw member values are attached.
+    ``include_members=true`` the genuine raw member values are attached. An
+    optional ``initial_time`` pins the forecast run.
     """
     cache_key = build_ensemble_cache_key(
         model=model,
@@ -73,10 +86,12 @@ def get_ensemble_statistics(
         variable=variable,
         lead_time_hours=lead_time_hours,
         include_members=include_members,
+        cycle_time=resolve_latest_run_cycle_time(db, model, initial_time),
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&model={model}"
         f"&lead_time_hours={lead_time_hours}&include_members={include_members}"
+        f"&initial_time={initial_time}"
     )
 
     envelope = _cache.compute_or_retrieve(
@@ -84,7 +99,14 @@ def get_ensemble_statistics(
         cache_key,
         query_params,
         lambda: _compute(
-            db, lat, lon, variable, model, lead_time_hours, include_members
+            db,
+            lat,
+            lon,
+            variable,
+            model,
+            lead_time_hours,
+            include_members,
+            initial_time,
         ),
         model_type=EnsembleStatisticsEnvelope,
     )
@@ -100,6 +122,7 @@ def _compute(
     model: str,
     lead_time_hours: int,
     include_members: bool,
+    initial_time: str | None,
 ) -> EnsembleStatisticsEnvelope:
     data = build_ensemble_statistics(
         db,
@@ -109,5 +132,6 @@ def _compute(
         model=model,
         lead_time_hours=lead_time_hours,
         include_members=include_members,
+        initial_time=initial_time,
     )
     return EnsembleStatisticsEnvelope(data=data)

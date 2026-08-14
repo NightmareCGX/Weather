@@ -356,7 +356,15 @@ def record_run(
             (ModelRunRecord.model_version_id == version.id)
             & (ModelRunRecord.cycle_time == cycle_time),
             {
-                "id": f"run_{cycle_time.strftime('%Y%m%d%H%M')}_{spec.model_id}",
+                # The run id is version-scoped so two versions of the same
+                # model at the same cycle cannot collide on the primary key
+                # (the schema's ``(model_version_id, cycle_time)`` uniqueness
+                # allows both rows, so the id must be able to distinguish
+                # them). It still captures model + cycle for readability.
+                "id": (
+                    f"run_{version.id}_{cycle_time.strftime('%Y%m%d%H%M')}_"
+                    f"{spec.model_id}"
+                ),
                 "model_version_id": version.id,
                 "cycle_time": cycle_time,
                 "status": "ready",

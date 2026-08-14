@@ -88,6 +88,7 @@ def build_probability_forecast(
     lead_time_hours: int,
     model: str,
     threshold_max: float | None = None,
+    initial_time: str | None = None,
 ) -> ProbabilityForecastData:
     """Build an exceedance probability forecast for a resolved point.
 
@@ -119,7 +120,7 @@ def build_probability_forecast(
     """
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    _run, dataset = _resolve_ready_dataset(db, model)
+    _run, dataset = _resolve_ready_dataset(db, model, initial_time=initial_time)
     leads = _resolve_lead_times(dataset, lead_time_hours, lead_time_hours)
     _resolve_variables(db, dataset, [variable])
 
@@ -149,6 +150,7 @@ def build_ensemble_statistics(
     model: str,
     lead_time_hours: int,
     include_members: bool = False,
+    initial_time: str | None = None,
 ) -> EnsembleStatisticsData:
     """Build ensemble statistics for a resolved point.
 
@@ -184,7 +186,7 @@ def build_ensemble_statistics(
     """
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    _run, dataset = _resolve_ready_dataset(db, model)
+    _run, dataset = _resolve_ready_dataset(db, model, initial_time=initial_time)
     leads = _resolve_lead_times(dataset, lead_time_hours, lead_time_hours)
     _resolve_variables(db, dataset, [variable])
 
