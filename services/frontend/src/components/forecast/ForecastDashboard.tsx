@@ -122,46 +122,51 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
         )}
       </section>
 
-      <section aria-label="Ensemble statistics" className="border-b border-slate-200 px-4 py-4">
-        <h3 className="mb-1 text-sm font-semibold text-slate-900">
-          Ensemble Statistics{selectedModel !== null ? ` (${selectedModel.toUpperCase()})` : ""}
-        </h3>
-        {ensembleModel === null ? (
-          <p className="text-sm text-slate-500">
-            No ensemble data available for the selected forecast.
-          </p>
-        ) : (
-          <>
-            <p className="mb-2 text-xs text-slate-500">
-              {ensembleVariable} · percentile range over lead time
+      {selectedModelIsEnsemble && (
+        <section aria-label="Ensemble statistics" className="border-b border-slate-200 px-4 py-4">
+          <h3 className="mb-1 text-sm font-semibold text-slate-900">
+            Ensemble Statistics{selectedModel !== null ? ` (${selectedModel.toUpperCase()})` : ""}
+          </h3>
+          {/* ensembleModel !== null here (the selected model is ensemble-capable).
+              The body distinguishes "ensemble data unavailable" from a genuine
+              request error, and never renders a misleading heading for a
+              deterministic model. */}
+          {ensemble.status === "loading" && (
+            <p role="status" className="text-sm text-slate-500">
+              Loading ensemble statistics…
             </p>
-            {ensemble.status === "loading" && (
-              <p role="status" className="text-sm text-slate-500">
-                Loading ensemble statistics…
+          )}
+          {ensemble.status === "error" && (
+            <p role="alert" className="text-sm text-red-700">
+              {ensemble.error}
+            </p>
+          )}
+          {ensemble.status === "success" && ensemble.byLead.size === 0 && (
+            <p className="text-sm text-slate-500">
+              Ensemble data is not yet available for this forecast.
+            </p>
+          )}
+          {ensemble.status === "success" && ensemble.byLead.size > 0 && (
+            <>
+              <p className="mb-2 text-xs text-slate-500">
+                {ensembleVariable} · percentile range over lead time
               </p>
-            )}
-            {ensemble.status === "error" && (
-              <p role="alert" className="text-sm text-red-700">
-                {ensemble.error}
-              </p>
-            )}
-            {ensemble.status === "success" && ensemble.byLead.size > 0 && (
               <EnsembleChart
                 byLead={ensemble.byLead}
                 variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
               />
-            )}
+            </>
+          )}
 
-            <EnsembleDistribution
-              data={distribution.data}
-              status={distribution.status}
-              error={distribution.error}
-              selectedLead={distributionLead}
-              variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
-            />
-          </>
-        )}
-      </section>
+          <EnsembleDistribution
+            data={distribution.data}
+            status={distribution.status}
+            error={distribution.error}
+            selectedLead={distributionLead}
+            variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
+          />
+        </section>
+      )}
     </div>
   );
 }

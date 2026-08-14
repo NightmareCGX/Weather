@@ -154,8 +154,10 @@ export async function getForecastAvailability(signal?: AbortSignal): Promise<For
 
 export interface SearchLocationsOptions {
   q: string;
-  type?: "city" | "resort" | "station" | "all";
+  type?: "city" | "resort" | "station" | "all" | "place";
   limit?: number;
+  /** Places search-session token (Google billing semantics). */
+  sessionToken?: string;
   signal?: AbortSignal;
 }
 
@@ -163,13 +165,40 @@ export async function searchLocations({
   q,
   type = "all",
   limit,
+  sessionToken,
   signal,
 }: SearchLocationsOptions): Promise<SearchResult[]> {
   const params = new URLSearchParams({ q, type });
   if (limit !== undefined) {
     params.set("limit", String(limit));
   }
+  if (sessionToken !== undefined) {
+    params.set("session_token", sessionToken);
+  }
   return request<SearchResult[]>(`/search?${params.toString()}`, { signal });
+}
+
+export interface ResolvePlaceOptions {
+  placeId: string;
+  /** Reuse the search-session token so the session is billed once. */
+  sessionToken?: string;
+  signal?: AbortSignal;
+}
+
+export async function resolvePlace({
+  placeId,
+  sessionToken,
+  signal,
+}: ResolvePlaceOptions): Promise<SearchResult> {
+  const params = new URLSearchParams();
+  if (sessionToken !== undefined) {
+    params.set("session_token", sessionToken);
+  }
+  const query = params.toString();
+  return request<SearchResult>(
+    `/search/places/${encodeURIComponent(placeId)}${query ? `?${query}` : ""}`,
+    { signal }
+  );
 }
 
 export type PointLocationSpecifier =

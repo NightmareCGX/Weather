@@ -266,6 +266,7 @@ class SearchResultOut(BaseModel):
     elevation_m: float | None = None
     latitude: float
     longitude: float
+    place_id: str | None = None
 
 
 class ProbabilityLocation(BaseModel):

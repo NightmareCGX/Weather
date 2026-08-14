@@ -72,7 +72,7 @@ test("map click → forecast: selecting a coordinate opens the dashboard", async
   await expect(page.getByText(/-?\d+\.\d+, -?\d+\.\d+/)).toBeVisible();
 });
 
-test("ensemble statistics: deterministic selected model shows ensemble empty state", async ({
+test("ensemble statistics: deterministic selected model shows no ensemble panel", async ({
   page,
 }) => {
   await page.goto("/");
@@ -81,13 +81,19 @@ test("ensemble statistics: deterministic selected model shows ensemble empty sta
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
-  // The availability mock's default selected model is GFS (deterministic), so
-  // the ensemble panel shows the honest empty state instead of requesting a
-  // hard-coded ensemble model that may not exist in the database.
-  await expect(page.getByText(/Ensemble Statistics \(GFS\)/)).toBeVisible();
+  // The availability mock's default selected model is GFS (deterministic).
+  // Per the approved remediation (Issue 5), a deterministic model is NOT an
+  // ensemble product, so the UI must render the deterministic point forecast
+  // and must NOT render a misleading "Ensemble Statistics" panel at all —
+  // neither the heading nor a deterministic-model empty-state message.
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
   await expect(
-    page.getByText("No ensemble data available for the selected forecast.")
+    page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
   ).toBeVisible();
+  await expect(page.getByText(/Ensemble Statistics/)).toHaveCount(0);
+  await expect(page.getByText("No ensemble data available for the selected forecast.")).toHaveCount(
+    0
+  );
 });
 
 test("selecting an ensemble model renders the percentile fan and member histogram", async ({

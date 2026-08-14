@@ -159,4 +159,35 @@ def normalize(dataset: xr.Dataset) -> xr.Dataset:
 
     normalized = dataset.drop_vars(["step", "valid_time"], errors="ignore")
     normalized = normalized.assign_coords(lead_time_hours=lead_time_hours)
+    # Record the cycle/reference time from the GRIB ``time`` coordinate so the
+    # Zarr store is self-describing: its forecast-run identity can be recovered
+    # from the store itself without relying on the S3 path (ACCEPTANCE_REMEDIATION
+    # PLAN §4). ``_merge_lead`` uses this to refuse cross-cycle merges.
+    cycle_time = _derive_cycle_time(normalized)
+    if cycle_time is not None:
+        normalized.attrs["cycle_time"] = cycle_time
     return normalized
+
+
+def _derive_cycle_time(dataset: xr.Dataset) -> str | None:
+    """Return the dataset's cycle/reference time as an ISO 8601 UTC string.
+
+    The GRIB ``time`` coordinate is the forecast's initialization (reference)
+    time. When present it is authoritative; ``None`` means the dataset carries
+    no cycle identity (e.g. a synthetic in-memory dataset with no GRIB
+    provenance), in which case no store-identity can be recorded.
+
+    Args:
+        dataset: A normalized (or partially normalized) dataset.
+
+    Returns:
+        The cycle time as an ISO 8601 UTC string, or ``None`` when the dataset
+        has no ``time`` coordinate.
+    """
+    if "time" not in dataset.coords:
+        return None
+    value = dataset.coords["time"].values
+    item = value.item() if np.ndim(value) != 0 else value
+    # ``np.datetime_as_string`` on a scalar returns a 0-d ndarray; ``item()``
+    # extracts the plain ``str`` so the return type is ``str | None``.
+    return str(np.datetime_as_string(np.asarray(item, dtype="datetime64[ns]"), unit="s").item())

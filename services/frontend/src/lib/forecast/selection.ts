@@ -42,6 +42,15 @@ export function searchResultToSelectedLocation(result: SearchResult): SelectedLo
         id: result.id,
         resolvedVia: "resort" as const,
       };
+    case "place":
+      // A resolved place has real coordinates; it resolves by coordinates for
+      // /v1/points (no platform id). The place_id is preserved for labeling.
+      return {
+        ...base,
+        object: "coordinates" as const,
+        id: result.place_id ?? null,
+        resolvedVia: "coordinates" as const,
+      };
     default:
       // Station: no /v1/points station specifier exists, so it resolves by
       // coordinates. The platform id is preserved for labeling but is not used

@@ -38,7 +38,9 @@ export function SelectedLocationSummary({ location }: SelectedLocationSummaryPro
         <div className="flex justify-between">
           <dt>Elevation</dt>
           <dd className="tabular-nums">
-            {location.elevation_m !== null ? `${Math.round(location.elevation_m)} m` : "—"}
+            {location.elevation_m !== null
+              ? `${Math.round(location.elevation_m).toLocaleString()} m`
+              : "unavailable"}
           </dd>
         </div>
       </dl>

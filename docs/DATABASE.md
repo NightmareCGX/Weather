@@ -50,7 +50,7 @@ Ingestion populates the PostgreSQL catalog automatically. The production orchest
 1. **`forecast_centers`**: `UNIQUE (center_id)`
 2. **`models`**: `UNIQUE (model_id)`
 3. **`model_versions`**: `UNIQUE (model_id, version_string)`
-4. **`model_runs`**: `UNIQUE (model_version_id, cycle_time)`
+4. **`model_runs`**: `UNIQUE (model_version_id, cycle_time)`. The run primary key is **version-scoped** (`run_{version_id}_{cycle_time:%Y%m%d%H%M}_{model_id}`) so two versions of the same model at the same cycle produce distinct run ids (the schema's uniqueness allows both rows; the id must distinguish them).
 5. **`ensemble_members`**: `UNIQUE (run_id, member_index)`
 6. **`forecast_variables`**: `UNIQUE (variable_code)`
 7. **`forecast_grids`**: `UNIQUE (grid_code)`

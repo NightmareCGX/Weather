@@ -29,18 +29,23 @@ export interface VariableResource {
 
 /**
  * A location search result (API.md section 6.1). `object` distinguishes the
- * source table: `city`, `ski_resort`, or `station`. Type-specific fields are
- * optional because not every source table defines them.
+ * source table (`city`, `ski_resort`, `station`) or the place-autocomplete
+ * provider (`place`). Type-specific fields are optional because not every
+ * source table defines them. A `place` result carries a `place_id` (the
+ * provider's canonical place id) but no resolved coordinates yet — they are
+ * populated only after the user selects it and the canonical place is
+ * resolved.
  */
 export interface SearchResult {
   id: string;
-  object: "city" | "ski_resort" | "station";
+  object: "city" | "ski_resort" | "station" | "place";
   name: string;
   region: string | null;
   country: string | null;
   elevation_m: number | null;
   latitude: number;
   longitude: number;
+  place_id?: string | null;
 }
 
 /**

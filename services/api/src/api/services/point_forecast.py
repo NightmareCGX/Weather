@@ -17,7 +17,7 @@ of scope for Milestone 9 and raises a clear error.
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 import numpy as np
@@ -44,6 +44,7 @@ from api.models.entities import (
     SkiResort,
 )
 from api.schemas import ForecastLocationOut, ForecastSeries, PointForecastData
+from api.services.elevation import get_elevation_provider
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +157,7 @@ def resolve_location(
         return ResolvedLocation(
             latitude=lat,
             longitude=lon,
-            elevation_m=None,
+            elevation_m=_elevation_for(lat, lon),
             resolved_via=RESOLVED_VIA_COORDINATES,
         )
 
@@ -181,11 +182,22 @@ def _resolve_city(db: Session, city_id: str) -> ResolvedLocation:
     return ResolvedLocation(
         latitude=float(row[2]),
         longitude=float(row[1]),
-        # Cities have no elevation column in the Milestone 3 schema.
-        elevation_m=None,
+        # Cities have no elevation column in the Milestone 3 schema, so the
+        # elevation is resolved from the coordinate via the elevation provider.
+        elevation_m=_elevation_for(float(row[2]), float(row[1])),
         resolved_via=RESOLVED_VIA_CITY,
         id=row[0].id,
     )
+
+
+def _elevation_for(latitude: float, longitude: float) -> float | None:
+    """Resolve terrain elevation (meters) for a coordinate, or ``None``.
+
+    Delegates to the configured elevation provider (a local/server-side DEM by
+    default). The provider returns ``None`` for no-data/ocean/unavailable, so
+    this never fabricates a value and never raises for a missing elevation.
+    """
+    return get_elevation_provider().get_elevation(latitude, longitude)
 
 
 def _resolve_ski_resort(db: Session, resort_id: str) -> ResolvedLocation:
@@ -282,8 +294,58 @@ def build_point_forecast(
     )
 
 
+def resolve_latest_run_cycle_time(
+    db: Session, model: str, initial_time: str | None = None
+) -> str | None:
+    """Return the resolved ready run's cycle time for a model, or ``None``.
+
+    The cache key for a point/probability/ensemble request must include the
+    resolved forecast run's cycle so a cached response for one cycle never
+    satisfies a request for another (ACCEPTANCE_REMEDIATION_PLAN §9). This is a
+    lightweight DB lookup (the newest ``ready`` run with a store, optionally
+    pinned to a specific cycle via ``initial_time``); the heavy store open
+    happens in the compute path.
+
+    Args:
+        db: Database session.
+        model: A single model identifier.
+        initial_time: Optional ISO 8601 UTC cycle time pinning the run. When
+            provided, the run at exactly that cycle is resolved (GAP-2).
+
+    Returns:
+        The run's ``cycle_time`` as an ISO 8601 UTC string, or ``None`` when no
+        matching ready run exists.
+    """
+    stmt = (
+        select(ModelRun.cycle_time)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model)
+        .where(ModelRun.status == "ready")
+        .where(ModelRun.zarr_store_path.isnot(None))
+    )
+    if initial_time is not None:
+        stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
+    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    value = db.execute(stmt).scalars().first()
+    if value is None:
+        return None
+    cycle = value
+    if cycle.tzinfo is None:
+        cycle = cycle.replace(tzinfo=timezone.utc)
+    return cycle.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_cycle_time(value: str) -> datetime:
+    """Parse an ISO 8601 UTC cycle time string into an aware UTC datetime."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _resolve_ready_dataset(
-    db: Session, model_id: str
+    db: Session, model_id: str, initial_time: str | None = None
 ) -> tuple[ModelRun, xr.Dataset]:
     """Return the newest ready run for a model whose Zarr store opens.
 
@@ -297,6 +359,8 @@ def _resolve_ready_dataset(
     Args:
         db: Database session.
         model_id: A single model identifier.
+        initial_time: Optional ISO 8601 UTC cycle time pinning the run. When
+            provided, only the run at that cycle is considered (GAP-2).
 
     Returns:
         A ``(run, dataset)`` pair for the first readable ready run.
@@ -312,8 +376,10 @@ def _resolve_ready_dataset(
         .where(Model.model_id == model_id)
         .where(ModelRun.status == "ready")
         .where(ModelRun.zarr_store_path.isnot(None))
-        .order_by(ModelRun.cycle_time.desc())
     )
+    if initial_time is not None:
+        stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
+    stmt = stmt.order_by(ModelRun.cycle_time.desc())
     runs = list(db.execute(stmt).scalars().all())
     if not runs:
         raise HTTPException(

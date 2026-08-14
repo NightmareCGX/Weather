@@ -289,7 +289,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-  *Notes*: `generated_at` is the selected model run's `cycle_time` (the forecast dataset generation time, keeping payloads deterministic). `valid_time` is derived as `cycle_time + lead_time_hours` (DATABASE.md section 1). `elevation_m` is returned when the resolved record defines it (e.g. ski resorts) and is `null` otherwise. Forecast entries carry the requested `forecast_variables` catalog codes (e.g. `temperature_2m`, `precipitation_rate`) as keys. Longitude queries are accepted in WGS84 `[-180, 180]`; datasets stored in the native GFS `[0, 360]` longitude convention are aligned automatically (a western-hemisphere longitude such as `-106.82` is mapped into a `0..360` store).
+  *Notes*: `generated_at` is the selected model run's `cycle_time` (the forecast dataset generation time, keeping payloads deterministic). `valid_time` is derived as `cycle_time + lead_time_hours` (DATABASE.md section 1). `elevation_m` is returned when the resolved record defines it (e.g. ski resorts) **or** when the configured elevation provider (a local/server-side DEM by default) resolves terrain elevation for the coordinate; it is `null` (rendered `unavailable` by the frontend) when no elevation value is available (ocean, no-data, no DEM configured). Forecast entries carry the requested `forecast_variables` catalog codes (e.g. `temperature_2m`, `precipitation_rate`) as keys. Longitude queries are accepted in WGS84 `[-180, 180]`; datasets stored in the native GFS `[0, 360]` longitude convention are aligned automatically (a western-hemisphere longitude such as `-106.82` is mapped into a `0..360` store).
 - **HTTP Status Codes**: `200 OK`, `404 Not Found`, `422 Unprocessable Entity`. *`400 Bad Request` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=1800` (30 minutes).
 
@@ -303,7 +303,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **Endpoint**: `/v1/probabilities`
 - **Purpose**: Calculate the statistical probability that a variable will exceed a given threshold based on ensemble spread.
 - **Required Parameters**: `lat`, `lon`, `variable`, `threshold`, `operator` (`gt`, `lt`, `between`), `lead_time_hours`. When `operator=between`, the additional `threshold_max` query parameter is **required** as the upper bound (and is rejected for `gt`/`lt`).
-- **Optional Parameters**: `model` (default `gefs`), `threshold_max` (upper bound of the `between` operator; required only when `operator=between`).
+- **Optional Parameters**: `model` (default `gefs`), `threshold_max` (upper bound of the `between` operator; required only when `operator=between`), `initial_time` (ISO 8601 UTC cycle time; **Default**: newest ready run). Pins the forecast run so a client can request a specific cycle's probability.
 - **Example Request**: `GET /v1/probabilities?lat=45.0&lon=-122.0&variable=precipitation_rate&threshold=10.0&operator=gt&lead_time_hours=24`
 - **Example Response**:
   ```json
@@ -335,6 +335,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **Endpoint**: `/v1/maps`
 - **Purpose**: Return tile URL templates and legend configuration for weather map visualization indexed by `lead_time_hours`.
 - **Required Parameters**: `model`, `variable`, `level`, `lead_time_hours`.
+- **Optional Parameters**: `initial_time` (ISO 8601 UTC cycle time). Pins the model run so a client can request a specific cycle's tiles. When present, the returned `tile_url_template` carries `initial_time`, so distinct cycles produce distinct tile URLs (no cross-cycle cache leakage).
 - **Example Request**: `GET /v1/maps?model=gfs&variable=temperature_2m&level=surface&lead_time_hours=12`
 - **Example Response**:
   ```json
@@ -370,6 +371,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **Optional Parameters**:
   - `lead_time_hours` (integer offset hours from cycle time; **Default**: `0`). When omitted, the initial forecast at the 0-hour lead is returned.
   - `include_members` (boolean; **Default**: `false`). When `true`, the response includes the `members` array of raw ensemble-member forecast values for the requested model, location, variable, and lead time.
+  - `initial_time` (ISO 8601 UTC cycle time; **Default**: newest ready run). Pins the forecast run so a client can request a specific cycle's ensemble (e.g. `2026-08-13T00:00:00Z`). Additive and non-breaking.
 - **Example Request (statistics only)**: `GET /v1/ensembles?lat=39.19&lon=-106.81&variable=temperature_2m&model=gefs&lead_time_hours=18`
 - **Example Response (statistics only)**:
   ```json
@@ -431,9 +433,9 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 #### 6.1 Search Locations
 - **HTTP Method**: `GET`
 - **Endpoint**: `/v1/search`
-- **Purpose**: Full-text search across cities, ski resorts, and observation stations.
+- **Purpose**: Full-text search across cities, ski resorts, observation stations, **and** global place autocomplete.
 - **Required Parameters**: `q` (search query string).
-- **Optional Parameters**: `type` (`city`, `resort`, `station`, `all`), `limit`.
+- **Optional Parameters**: `type` (`city`, `resort`, `station`, `all`, `place`), `limit`, `session_token` (place-autocomplete session token for provider billing).
 - **Example Request**: `GET /v1/search?q=Aspen&type=resort`
 - **Example Response**:
   ```json
@@ -454,8 +456,16 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `422 Unprocessable Entity` (missing/empty `q`, invalid `type`). *`400 Bad Request` applies once authentication is enabled (see section 2.2).*
-- **Cache Policy**: `public, max-age=86400`.
+- **Place autocomplete** (`type=place`): delegates to the configured place
+  provider (Google Places API (New) by default, proxied server-side — the API
+  key never reaches the browser). Results are suggestions (`object: "place"`)
+  that carry a `place_id` but **no resolved coordinates yet**; selecting one
+  resolves the canonical place via `GET /v1/search/places/{place_id}` (name,
+  lat/lon, country, region) so the client can recenter the map and update the
+  forecast. `session_token` spans an autocomplete session so the provider
+  bills one request instead of one per keystroke.
+- **HTTP Status Codes**: `200 OK`, `422 Unprocessable Entity` (missing/empty `q`, invalid `type`), `502 Bad Gateway` (place provider failure, surfaced gracefully). *`400 Bad Request` applies once authentication is enabled (see section 2.2).*
+- **Cache Policy**: `public, max-age=86400` for platform records; `public, max-age=300` for place results.
 
 ---
 

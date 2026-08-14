@@ -134,3 +134,54 @@ def test_tile_lead_not_available_404(client):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["type"] == "not_found_error"
+
+
+# --- Raster cache identity (ACCEPTANCE_REMEDIATION_PLAN §12) ---
+
+
+def test_tile_cache_key_distinguishes_cycles():
+    """GFS 00Z tile A must never equal GFS 12Z tile A in the tile cache."""
+    from api.services.tiles import _tile_cache_key
+
+    k00 = _tile_cache_key(
+        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T00:00:00Z"
+    )
+    k12 = _tile_cache_key(
+        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T12:00:00Z"
+    )
+    assert k00 != k12
+    # Same cycle + same tile -> same key (deterministic).
+    assert k00 == _tile_cache_key(
+        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T00:00:00Z"
+    )
+
+
+def test_tile_cache_key_distinguishes_leads():
+    """Lead 6 must never share a tile cache key with lead 18."""
+    from api.services.tiles import _tile_cache_key
+
+    k6 = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None)
+    k18 = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 18, None)
+    assert k6 != k18
+
+
+def test_tile_cache_key_distinguishes_tile_coordinates():
+    """Different tile x/y/z must never share a tile cache key."""
+    from api.services.tiles import _tile_cache_key
+
+    a = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None)
+    b = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 52, 98, 6, None)
+    c = _tile_cache_key("gfs", "temperature_2m", "surface", 9, 51, 98, 6, None)
+    assert len({a, b, c}) == 3
+
+
+def test_tile_cache_serves_identical_requests():
+    """A repeated identical tile request is served from the server cache."""
+    from api.services.tiles import _tile_cache, _tile_cache_get, _tile_cache_set, _tile_cache_key
+
+    _tile_cache.clear()
+    key = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None)
+    assert _tile_cache_get(key) is None
+    _tile_cache_set(key, b"PNG-DATA")
+    assert _tile_cache_get(key) == b"PNG-DATA"
+    _tile_cache.clear()

@@ -4,7 +4,12 @@ These tests run against a real PostgreSQL instance via TestClient and verify
 the response envelope, item shape, filters, and cache headers defined in
 ``docs/API.md`` section 6.1. When PostgreSQL is unreachable they skip,
 following the existing ``test_catalog.py`` convention.
+
+Place-autocomplete tests (``type=place``) are pure unit tests with a mocked
+provider and never require live Google services.
 """
+
+import pytest
 
 
 def test_search_contract_and_all_types(client):
@@ -105,3 +110,68 @@ def test_search_rejects_invalid_type(client):
     assert resp.status_code == 422
     body = resp.json()
     assert body["error"]["type"] == "validation_error"
+
+
+# --- Place autocomplete (ACCEPTANCE_REMEDIATION_PLAN §13); provider mocked ---
+
+
+def test_place_search_returns_suggestions(monkeypatch) -> None:
+    """type=place delegates to the (mocked) provider and maps suggestions."""
+    from api.services import search as search_mod
+    from api.services.places import PlaceSuggestion
+
+    class _Stub:
+        def suggest(self, text, session_token=None, limit=8):
+            return [
+                PlaceSuggestion("ChIJden", "Denver", "CO, USA", "Denver, CO, USA"),
+                PlaceSuggestion(
+                    "ChIJdenairport", "Denver International Airport", "CO, USA"
+                ),
+            ]
+
+    monkeypatch.setattr(search_mod, "get_provider", lambda: _Stub())
+    results = search_mod.search_locations(None, "den", "place", 20)  # type: ignore[arg-type]
+    assert len(results) == 2
+    assert results[0].object == "place"
+    assert results[0].name == "Denver"
+    assert results[0].place_id == "ChIJden"
+    assert results[1].name == "Denver International Airport"
+
+
+def test_place_search_provider_error_degrades(monkeypatch) -> None:
+    """A provider failure surfaces as a graceful error, never a crash."""
+    from api.services import search as search_mod
+    from api.services.places import PlaceAutocompleteError
+
+    class _Stub:
+        def suggest(self, text, session_token=None, limit=8):
+            raise PlaceAutocompleteError("Places autocomplete failed (HTTP 500): boom")
+
+    monkeypatch.setattr(search_mod, "get_provider", lambda: _Stub())
+    with pytest.raises(PlaceAutocompleteError, match="boom"):
+        search_mod.search_locations(None, "den", "place", 20)  # type: ignore[arg-type]
+
+
+def test_place_resolve_updates_coordinates(monkeypatch) -> None:
+    """Resolving a selected place yields canonical coordinates."""
+    from api.services import search as search_mod
+    from api.services.places import ResolvedPlace
+
+    class _Stub:
+        def resolve(self, place_id, session_token=None):
+            assert place_id == "ChIJden"
+            return ResolvedPlace(
+                "ChIJden",
+                "Denver",
+                39.7392,
+                -104.9903,
+                country="United States",
+                region="Colorado",
+            )
+
+    monkeypatch.setattr(search_mod, "get_provider", lambda: _Stub())
+    result = search_mod.resolve_place("ChIJden", session_token="tok")
+    assert result.latitude == pytest.approx(39.7392)
+    assert result.longitude == pytest.approx(-104.9903)
+    assert result.country == "United States"
+    assert result.region == "Colorado"

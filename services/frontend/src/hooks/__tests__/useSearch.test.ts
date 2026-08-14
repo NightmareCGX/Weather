@@ -38,14 +38,14 @@ describe("useSearch", () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it("debounces and fires /v1/search after the delay", async () => {
+  it("debounces and fires /v1/search (place autocomplete) after the delay", async () => {
     mockFetch.mockResolvedValueOnce(envelopeList([]));
     renderHook(() => useSearch("Aspen"));
 
     expect(mockFetch).not.toHaveBeenCalled();
     advanceDebounce();
     expect(mockFetch).toHaveBeenCalledWith(
-      "/v1/search?q=Aspen&type=all&limit=20",
+      expect.stringContaining("/v1/search?q=Aspen&type=place&limit=20"),
       expect.any(Object)
     );
   });

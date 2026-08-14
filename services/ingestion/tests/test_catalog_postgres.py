@@ -267,6 +267,11 @@ def test_cli_production_entrypoint_ingests_and_serves(
             "--cycle-hour", "0",
             "--lead-time-hours", "6",
             "--store", store,
+            # The test uses a local tmp_path store (no object storage in the
+            # test harness), which is a non-derived path. The approved store-path
+            # validation requires an explicit opt-in for such paths; this test
+            # opts in while still exercising the real production CLI entrypoint.
+            "--allow-custom-store",
             "--download-dir", download_dir,
         ]
     )
@@ -281,12 +286,14 @@ def test_cli_production_entrypoint_ingests_and_serves(
             .one()
         )
         assert run.status == "ready"
-        assert run.id == "run_202607220000_gfs"
+        # The run id is version-scoped (approved remediation): model gfs,
+        # version v1.0, cycle 2026-07-22T00Z.
+        assert run.id == "run_version_gfs_v1.0_202607220000_gfs"
 
     # /v1/runs lists it.
     resp = client.get("/v1/runs")
     assert resp.status_code == 200
-    assert any(r["id"] == "run_202607220000_gfs" for r in resp.json()["data"])
+    assert any(r["id"] == "run_version_gfs_v1.0_202607220000_gfs" for r in resp.json()["data"])
 
     # /v1/points serves it. Use the distinct point (LAT, LON) that is inside
     # the GRIB fixture grid (lat 44..0, lon -120..30) but deliberately differs

@@ -27,3 +27,8 @@ This document outlines the testing strategy, layers, and fixtures for the Global
 - **Upstream Network Mocking**: All NOAA NOMADS / S3 HTTP requests in ingestion tests are mocked using `respx` / `httpx` transport mocks to isolate tests from upstream API outages.
 - **Sample GRIB2 Fixtures**: Small, anonymized GRIB2 subset files are stored in `services/ingestion/tests/fixtures/` to test `cfgrib` decoding without downloading multi-gigabyte operational files.
 - **Temporary Zarr Stores**: Storage tests utilize `pytest`'s built-in `tmp_path` fixture to create isolated local Zarr hierarchies.
+- **External place/elevation providers are mocked** (never live Google/Copernicus):
+  the place provider (`api/services/places.py`) takes an injectable HTTP
+  transport, and the elevation provider (`api/services/elevation.py`) takes an
+  injectable DEM loader — so unit tests supply fakes and never make network
+  calls. See `test_places.py` and `test_elevation.py`.

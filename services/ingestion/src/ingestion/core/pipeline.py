@@ -30,14 +30,19 @@ import numpy as np
 import numpy.typing as npt
 import xarray as xr
 
-from ingestion.core.base import IngestionError, LeadTimeMismatchError
+from ingestion.core.base import (
+    CycleStoreMismatchError,
+    IngestionError,
+    LeadTimeMismatchError,
+    StoreSchemaMismatchError,
+)
 from ingestion.core.catalog import (
     ModelRunRecord,
     RunCatalogSpec,
     VariableSpec,
     record_ingested_dataset,
 )
-from ingestion.core.zarr_writer import read_dataset, store_exists, write_dataset
+from ingestion.core.zarr_writer import read_dataset, store_exists, write_dataset_atomic
 from ingestion.providers.noaa.parser import parse_grib2
 
 
@@ -234,9 +239,14 @@ def ingest_grib_file(
     dataset = parse_grib2(grib_path)
     dataset = _apply_variable_mapping(dataset, spec.variables)
     dataset = _normalize_canonical_units(dataset, spec.variables)
+    # Record the model so the Zarr store is self-describing about its forecast
+    # run (model + cycle) independently of the S3 path (ACCEPTANCE_REMEDIATION
+    # PLAN §4). ``cycle_time`` is set by the parser from the GRIB ``time``
+    # coordinate.
+    dataset.attrs["model_id"] = spec.model_id
     _validate_requested_lead(dataset, requested_lead_time_hours)
     dataset = _merge_lead(dataset, store_path)
-    write_dataset(dataset, store_path)
+    write_dataset_atomic(dataset, store_path)
     return record_ingested_dataset(spec, dataset, effective_store_path=store_path)
 
 
@@ -285,6 +295,14 @@ def _merge_lead(dataset: xr.Dataset, store_path: str) -> xr.Dataset:
     idempotency); the merged dataset is returned so the caller writes the
     complete cycle back to the store.
 
+    A Zarr store represents exactly one forecast cycle
+    (``UNIQUE(model_version_id, cycle_time)`` per DATABASE.md), so **before**
+    merging the incoming dataset's cycle identity is validated against the
+    existing store's identity. A mismatch is a hard error
+    (:class:`CycleStoreMismatchError`) — the merge is refused, never silently
+    bypassed. Same-cycle leads are also validated for structural compatibility
+    (grid axes, member axis, per-variable dimensions).
+
     Args:
         dataset: The normalized single-lead dataset for this GRIB file.
         store_path: The cycle store to merge into (may not exist yet).
@@ -292,6 +310,13 @@ def _merge_lead(dataset: xr.Dataset, store_path: str) -> xr.Dataset:
     Returns:
         The dataset for the whole cycle: the new lead alone on a fresh ingest,
         otherwise the accumulated cycle with the new lead merged in.
+
+    Raises:
+        CycleStoreMismatchError: If the incoming dataset's cycle differs from
+            the existing store's cycle, or either identity cannot be
+            established.
+        StoreSchemaMismatchError: If the incoming lead is structurally
+            incompatible with the existing store.
     """
     if "lead_time_hours" not in dataset.dims:
         dataset = dataset.expand_dims("lead_time_hours")
@@ -299,6 +324,8 @@ def _merge_lead(dataset: xr.Dataset, store_path: str) -> xr.Dataset:
         return dataset
 
     existing = read_dataset(store_path)
+    _validate_store_identity(dataset, existing, store_path)
+    _validate_lead_schema(dataset, existing, store_path)
     if "lead_time_hours" not in existing.dims:
         return dataset
     new_lead = int(dataset["lead_time_hours"].values[0])
@@ -309,3 +336,118 @@ def _merge_lead(dataset: xr.Dataset, store_path: str) -> xr.Dataset:
         coords="minimal",
     )
     return merged.sortby("lead_time_hours")
+
+
+def _resolve_cycle_time(dataset: xr.Dataset) -> str | None:
+    """Return a dataset's forecast-run cycle/reference time as a UTC string.
+
+    The authoritative identity is the ``cycle_time`` attribute written by the
+    parser from the GRIB ``time`` coordinate. Legacy stores written before that
+    attribute existed still carry the ``time`` coordinate (the parser always
+    kept it), which is used as the fallback so old stores remain validable.
+
+    Args:
+        dataset: A normalized dataset (incoming lead or existing store).
+
+    Returns:
+        The cycle time as an ISO 8601 UTC string, or ``None`` when the dataset
+        carries no cycle identity.
+    """
+    if "cycle_time" in dataset.attrs:
+        return str(dataset.attrs["cycle_time"])
+    if "time" in dataset.coords:
+        value = dataset.coords["time"].values
+        item = value.item() if np.ndim(value) != 0 else value
+        # ``np.datetime_as_string`` on a scalar returns a 0-d ndarray;
+        # ``item()`` extracts the plain ``str`` so the type is ``str | None``.
+        return str(np.datetime_as_string(np.asarray(item, dtype="datetime64[ns]"), unit="s").item())
+    return None
+
+
+def _validate_store_identity(
+    dataset: xr.Dataset,
+    existing: xr.Dataset,
+    store_path: str,
+) -> None:
+    """Refuse to merge a dataset whose cycle differs from the store's cycle.
+
+    Fail-fast correctness: a Zarr store represents one forecast cycle and must
+    never silently accept data belonging to another cycle. The merge is gated
+    on the incoming and stored identities matching exactly; if either identity
+    cannot be established the merge is refused (rather than guessing).
+
+    Args:
+        dataset: The incoming single-lead dataset.
+        existing: The existing cycle store dataset.
+        store_path: The store path (used in the error message).
+
+    Raises:
+        CycleStoreMismatchError: If the cycles differ or an identity is missing.
+    """
+    requested = _resolve_cycle_time(dataset)
+    stored = _resolve_cycle_time(existing)
+    if requested is None:
+        raise CycleStoreMismatchError(
+            f"Refusing to merge into {store_path!r}: the incoming forecast has "
+            "no cycle/reference time, so its forecast-run identity cannot be "
+            "established."
+        )
+    if stored is None:
+        raise CycleStoreMismatchError(
+            f"Refusing to merge into {store_path!r}: the existing store carries "
+            "no cycle/reference time, so it cannot be identified as a valid "
+            "cycle store."
+        )
+    if requested != stored:
+        raise CycleStoreMismatchError(
+            f"Refusing to merge: the incoming forecast is cycle {requested}, "
+            f"but the store at {store_path!r} already contains cycle {stored}. "
+            "A Zarr store represents exactly one forecast cycle; the cycles "
+            "must match."
+        )
+
+
+def _validate_lead_schema(
+    dataset: xr.Dataset,
+    existing: xr.Dataset,
+    store_path: str,
+) -> None:
+    """Validate that a same-cycle lead is structurally compatible with the store.
+
+    Same-cycle leads merged into a cycle store must share the same spatial
+    grid (latitude/longitude axes) and, for ensembles, the same member axis;
+    a variable present in both must have the same dimensions. Adding a
+    previously-absent variable is allowed (a lead file may omit a field the
+    parser skips); redefining an existing variable's structure is not.
+
+    Args:
+        dataset: The incoming single-lead dataset.
+        existing: The existing cycle store dataset.
+        store_path: The store path (used in the error message).
+
+    Raises:
+        StoreSchemaMismatchError: If the incoming lead is incompatible.
+    """
+    for axis in ("latitude", "longitude"):
+        if axis in existing.coords and axis in dataset.coords:
+            if not np.array_equal(existing.coords[axis].values, dataset.coords[axis].values):
+                raise StoreSchemaMismatchError(
+                    f"Refusing to merge into {store_path!r}: the incoming lead's "
+                    f"'{axis}' axis differs from the store's '{axis}' axis. A "
+                    "cycle store must have one consistent grid."
+                )
+    if "member" in existing.dims and "member" in dataset.dims:
+        if existing.sizes["member"] != dataset.sizes["member"]:
+            raise StoreSchemaMismatchError(
+                f"Refusing to merge into {store_path!r}: the incoming lead has "
+                f"{dataset.sizes['member']} ensemble members but the store has "
+                f"{existing.sizes['member']}. A cycle store must have one "
+                "consistent member axis."
+            )
+    for code in set(dataset.data_vars) & set(existing.data_vars):
+        if set(dataset[code].dims) != set(existing[code].dims):
+            raise StoreSchemaMismatchError(
+                f"Refusing to merge into {store_path!r}: variable '{code}' has "
+                f"dimensions {tuple(dataset[code].dims)} in the incoming lead "
+                f"but {tuple(existing[code].dims)} in the store."
+            )

@@ -171,6 +171,8 @@ describe("ForecastDashboard", () => {
 
     expect(screen.getByText("Aspen")).toBeInTheDocument();
     expect(screen.getByTestId("meteogram")).toHaveTextContent("temperature_2m");
+    // Elevation with no terrain value renders "unavailable", not a bare dash.
+    expect(screen.getByText("unavailable")).toBeInTheDocument();
   });
 
   it("degrades independently: an ensemble failure does not destroy the forecast", () => {
@@ -288,19 +290,38 @@ describe("ForecastDashboard", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("No forecast data covers this location.");
   });
 
-  it("shows an ensemble empty state for a deterministic selected model", () => {
-    // gfs is deterministic -> no ensemble data.
+  it("does not render an ensemble panel for a deterministic selected model", () => {
+    // gfs is deterministic -> no ensemble section at all (no misleading
+    // "Ensemble Statistics (GFS)" heading).
     mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
 
     render(<ForecastDashboard location={location} />);
 
-    expect(
-      screen.getByText("No ensemble data available for the selected forecast.")
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/Ensemble Statistics/)).not.toBeInTheDocument();
     // No ensemble requests were made (the hooks are called with model=null and
     // stay idle).
     expect(mockUseEnsemble).toHaveBeenCalledWith(location, expect.any(Array), "temperature_2m", {
       model: null,
     });
+  });
+
+  it("renders an ensemble panel for an ensemble model with no data", () => {
+    // gefs is ensemble-capable but has no data -> the panel renders with a
+    // distinct "not yet available" message (not the deterministic-model state).
+    mockEnsembleModelSelected();
+    mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "success",
+      error: null,
+      model: "gefs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    expect(screen.getByText(/Ensemble Statistics/)).toBeInTheDocument();
+    expect(
+      screen.getByText("Ensemble data is not yet available for this forecast.")
+    ).toBeInTheDocument();
   });
 });

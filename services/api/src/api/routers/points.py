@@ -34,6 +34,7 @@ from api.services.cache import PointCache, build_point_cache_key
 from api.services.point_forecast import (
     ResolvedLocation,
     build_point_forecast,
+    resolve_latest_run_cycle_time,
     resolve_location,
 )
 
@@ -87,6 +88,7 @@ def get_point_forecast(
         longitude=location.longitude,
         resolved_via=location.resolved_via,
         location_id=location.id,
+        cycle_time=resolve_latest_run_cycle_time(db, model_ids[0]),
         variables=tuple(var_codes) if var_codes else None,
         units=units,
         start_lead_time_hours=start_lead_time_hours,
