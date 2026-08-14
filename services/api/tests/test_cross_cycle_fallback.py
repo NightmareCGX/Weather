@@ -38,6 +38,8 @@ from api.core.database import get_db
 from api.main import app
 from api.models.entities import (
     ForecastCenter,
+    ForecastGrid,
+    ForecastProduct,
     ForecastVariable,
     Model,
     ModelRun,
@@ -238,3 +240,181 @@ def test_selection_discoveries_readable_store_lead_coord(tmp_path):
             vt = datetime(2026, 7, 21, lead, 0, tzinfo=timezone.utc)
             assert winners[vt][0] == (datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc), lead)
     engine.dispose()
+
+
+# --- Production stale-lead candidate fallback (regression) ---
+
+
+@pytest.fixture(scope="module")
+def stale_lead_client(tmp_path_factory):
+    """Two READY runs; the newest run's store lacks a lead its metadata claims.
+
+    Simulates a same-cycle re-ingest where ``forecast_products`` retains a stale
+    lead (12) the current store no longer holds. Cross-cycle selection must skip
+    the stale candidate and fall back to the older READY run that actually has
+    the lead, never raising KeyError/500.
+    """
+    db_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
+    )
+    engine = create_engine(db_url)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception:
+        pytest.skip("PostgreSQL not reachable; skipping integration test.")
+
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    alembic_cfg = Config(os.path.join(api_dir, "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    alembic_cfg.set_main_option("script_location", os.path.join(api_dir, "alembic"))
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+        conn.execute(text("GRANT ALL ON SCHEMA public TO public"))
+    command.upgrade(alembic_cfg, "head")
+
+    base = tmp_path_factory.mktemp("stalelead")
+    # Older READY run at 2026-07-21T00Z: store has leads [0,6,12,18], covers
+    # LAT/LON, and supplies the fallback for the newest run's stale leads.
+    old_store = _write_store(str(base / "old.zarr"))
+    # Newest READY run at 2026-07-21T12Z: store has ONLY lead [0]
+    # (pre-allocated with lead 0), but forecast_products claims leads
+    # [0,6,12,18] (stale metadata). Its stale leads 6/12/18 for valid_times
+    # 18Z/00Z(next)/06Z(next) must be skipped; the older run supplies them.
+    new_store = str(base / "new.zarr")
+    lat = np.array([38.0, 38.25, 38.5, 38.75])
+    lon = np.array([-107.0, -106.75, -106.5, -106.25])
+    new_lead = np.array([0])
+    lg, lag, log = np.meshgrid(new_lead, lat, lon, indexing="ij")
+    ds_new = xr.Dataset(
+        data_vars={
+            "temperature_2m": (
+                ("lead_time_hours", "latitude", "longitude"),
+                10.0 + 10.0 * (lag - 38.0) + 10.0 * (log + 107.0) + 0.5 * lg,
+            )
+        },
+        coords={"lead_time_hours": new_lead, "latitude": lat, "longitude": lon},
+    )
+    ds_new.to_zarr(new_store, mode="w")
+
+    with Session(engine) as session:
+        session.add(ForecastCenter(id="c_sl", center_id="noaa_sl", name="NOAA", country="USA"))
+        session.add(
+            Model(
+                id="m_sl",
+                model_id="gfs_stale",
+                name="GFS",
+                center_id="noaa_sl",
+                is_ensemble=False,
+                resolution_km=25.0,
+            )
+        )
+        session.add(ModelVersion(id="v_sl", model_id="gfs_stale", version_string="v1.0"))
+        session.add(
+            ForecastVariable(
+                id="var_temperature_2m_sl",
+                variable_code="temperature_2m",
+                name="T",
+                unit="°C",
+            )
+        )
+        session.add(
+            ForecastGrid(
+                id="grid_global_025deg_sl",
+                grid_code="global_025deg",
+                name="Global 0.25 Degree Grid",
+                resolution_km=25.0,
+            )
+        )
+        session.add(
+            ModelRun(
+                id="run_old",
+                model_version_id="v_sl",
+                cycle_time=datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc),
+                status="ready",
+                zarr_store_path=old_store,
+            )
+        )
+        session.add(
+            ModelRun(
+                id="run_new",
+                model_version_id="v_sl",
+                cycle_time=datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc),
+                status="ready",
+                zarr_store_path=new_store,
+            )
+        )
+        # Stale metadata on the NEWEST run: product rows claim leads 0,6,12,18,
+        # but the store only contains lead 0.
+        for lead in (0, 6, 12, 18):
+            session.add(
+                ForecastProduct(
+                    id=f"p_new_{lead}",
+                    run_id="run_new",
+                    variable_id="temperature_2m",
+                    grid_id="global_025deg",
+                    product_type="surface",
+                    lead_time_hours=lead,
+                )
+            )
+        session.commit()
+
+    def override_get_db():
+        db = Session(engine)
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        command.downgrade(alembic_cfg, "base")
+        engine.dispose()
+
+
+def test_stale_catalog_lead_falls_back_to_older_usable(stale_lead_client):
+    """The newest run (12Z) claims stale leads 6/12/18; valid_time 18Z skips the
+    stale lead-6 candidate and falls back to the older READY run's lead 18.
+    No KeyError / 500."""
+    resp = stale_lead_client.get(f"/v1/points?lat={LAT}&lon={LON}&models=gfs_stale")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    # valid_time 2026-07-21T18Z: newest (12Z) claims lead 6 (stale, store lacks
+    # it) and lead 12 (also stale); older (00Z) lead 18 is the usable minimum.
+    entry = next(
+        e for e in data["forecasts"] if e["lead_time_hours"] == 18
+    )
+    assert entry["cycle_time"] == "2026-07-21T00:00:00Z"
+    assert "temperature_2m" in entry
+    # valid_time 2026-07-21T12Z: newest (12Z) lead 0 (store has it) wins over
+    # older (00Z) lead 12.
+    entry0 = next(
+        e for e in data["forecasts"] if e["valid_time"] == "2026-07-21T12:00:00Z"
+    )
+    assert entry0["lead_time_hours"] == 0
+    assert entry0["cycle_time"] == "2026-07-21T12:00:00Z"
+
+
+def test_stale_lead_valid_time_not_dropped(stale_lead_client):
+    """A valid_time whose nominal best candidate is stale must not disappear."""
+    resp = stale_lead_client.get(f"/v1/points?lat={LAT}&lon={LON}&models=gfs_stale")
+    assert resp.status_code == 200
+    # valid_times 00Z/06Z/12Z/18Z all present. 12Z resolves to the newest run's
+    # lead 0 (min lead); 18Z falls back to the older run's lead 18 (newest's
+    # stale lead 6/12 skipped). No KeyError / no dropped valid_time.
+    by_valid = {
+        e["valid_time"]: e["lead_time_hours"]
+        for e in resp.json()["data"]["forecasts"]
+    }
+    assert by_valid == {
+        "2026-07-21T00:00:00Z": 0,
+        "2026-07-21T06:00:00Z": 6,
+        "2026-07-21T12:00:00Z": 0,
+        "2026-07-21T18:00:00Z": 18,
+    }

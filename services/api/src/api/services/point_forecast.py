@@ -279,9 +279,11 @@ def build_point_forecast(
         )
 
     # For each valid_time, try the candidate cycles in ascending-lead order and
-    # use the first whose store is readable. A broken newest store therefore
-    # falls back to the next READY readable candidate covering the same
-    # valid_time instead of dropping the record.
+    # use the first whose store is readable AND actually contains the requested
+    # lead. A broken newest store, or a store whose lead coordinate lacks the
+    # selected lead (stale forecast_products metadata after a same-cycle
+    # re-ingest), therefore falls back to the next READY candidate covering the
+    # same valid_time instead of dropping the record or raising a KeyError.
     by_cycle: dict[datetime, xr.Dataset] = {}
 
     def _open_cycle(cycle_time: datetime) -> xr.Dataset | None:
@@ -294,13 +296,30 @@ def build_point_forecast(
         by_cycle[cycle_time] = dataset
         return dataset
 
+    def _store_has_lead(dataset: xr.Dataset, lead: int) -> bool:
+        """Return whether the opened store actually carries the requested lead.
+
+        ``forecast_products`` is the fast metadata-first candidate-discovery
+        path, but a catalog candidate is only usable when the current Zarr store
+        contains the lead (a same-cycle re-ingest with a different lead set can
+        leave stale product rows pointing at leads the store no longer holds).
+        The check reads only the coordinate, never the full gridded variable.
+        """
+        if "lead_time_hours" not in dataset.coords:
+            return False
+        coord = dataset.coords["lead_time_hours"].values
+        if np.ndim(coord) == 0:
+            return int(coord) == lead
+        return lead in {int(v) for v in coord}
+
     resolved: dict[datetime, tuple[datetime, int]] = {}
     for valid_time, pairs in candidates.items():
         for cycle_time, lead in pairs:
             dataset = _open_cycle(cycle_time)
-            if dataset is not None:
-                resolved[valid_time] = (cycle_time, lead)
-                break
+            if dataset is None or not _store_has_lead(dataset, lead):
+                continue
+            resolved[valid_time] = (cycle_time, lead)
+            break
 
     if not resolved:
         raise HTTPException(

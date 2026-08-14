@@ -146,9 +146,16 @@ def catalog_db(tmp_path_factory):
         engine.dispose()
 
 
-def _ingest_gfs_run(engine, store_dir: str) -> str:
+def _ingest_gfs_run(engine, store_dir: str, *, model_id: str = "gfs") -> str:
     """Deterministic ingestion: write the dataset to a local Zarr store, then
-    record it in the PostgreSQL catalog as a ready run."""
+    record it in the PostgreSQL catalog as a ready run.
+
+    ``model_id`` gives each integration test a distinct model identity so the
+    three tests never share a run row or compete as cross-cycle candidates (a
+    shared ``(model_version_id, cycle_time)`` run would be upserted and its
+    ``zarr_store_path`` replaced by whichever test ran last, causing the
+    cross-cycle lead-coordinate mismatch this module validates against).
+    """
     store_path = store_dir
     dataset = _build_dataset()
     write_dataset(dataset, store_path)
@@ -157,7 +164,7 @@ def _ingest_gfs_run(engine, store_dir: str) -> str:
         center_id="noaa",
         center_name="National Oceanic and Atmospheric Administration",
         center_country="USA",
-        model_id="gfs",
+        model_id=model_id,
         model_name="Global Forecast System",
         is_ensemble=False,
         resolution_km=25.0,
@@ -183,7 +190,7 @@ def test_ingested_run_is_discoverable_and_served(catalog_db, tmp_path_factory) -
     client = catalog_db["client"]
 
     store_dir = str(tmp_path_factory.mktemp("catalog_it_gfs"))
-    store_path = _ingest_gfs_run(engine, store_dir)
+    store_path = _ingest_gfs_run(engine, store_dir, model_id="gfs_disc")
 
     # The run is recorded as ready with the store path.
     with Session(engine) as session:
@@ -203,10 +210,10 @@ def test_ingested_run_is_discoverable_and_served(catalog_db, tmp_path_factory) -
     assert any(r["status"] == "ready" for r in runs)
 
     # /v1/points serves it (the API _resolve_run shape: ready + store path).
-    resp = client.get(f"/v1/points?lat={LAT}&lon={LON}&models=gfs")
+    resp = client.get(f"/v1/points?lat={LAT}&lon={LON}&models=gfs_disc")
     assert resp.status_code == 200
     data = resp.json()["data"]
-    assert data["model"] == "gfs"
+    assert data["model"] == "gfs_disc"
     assert data["generated_at"] == "2026-07-22T00:00:00Z"
     assert any(entry["lead_time_hours"] == 6 for entry in data["forecasts"])
 
@@ -214,7 +221,9 @@ def test_ingested_run_is_discoverable_and_served(catalog_db, tmp_path_factory) -
 def test_ingested_run_catalog_tables(catalog_db, tmp_path_factory) -> None:
     engine = catalog_db["engine"]
 
-    _ingest_gfs_run(engine, str(tmp_path_factory.mktemp("catalog_it_gfs2")))
+    _ingest_gfs_run(
+        engine, str(tmp_path_factory.mktemp("catalog_it_gfs2")), model_id="gfs_catalog"
+    )
 
     with Session(engine) as session:
         # Variables and grid are recorded by the writer (not test fixtures).
@@ -242,7 +251,7 @@ def test_cli_production_entrypoint_ingests_and_serves(
 
     # Mock only the network download; run everything else for real.
     async def _fake_download(self, model, cycle_date, cycle_hour,
-                             lead_time_hours, destination):
+                             lead_time_hours, destination, member=None):
         from pathlib import Path
 
         destination = Path(destination)
@@ -287,7 +296,10 @@ def test_cli_production_entrypoint_ingests_and_serves(
         )
         assert run.status == "ready"
         # The run id is version-scoped (approved remediation): model gfs,
-        # version v1.0, cycle 2026-07-22T00Z.
+        # version v1.0, cycle 2026-07-22T00Z. The CLI only ingests gfs/gefs, so
+        # this test's run uses model gfs. The other two tests use distinct model
+        # ids (gfs_disc/gfs_catalog), so this CLI run never shares a run row
+        # with them and never competes as a cross-cycle candidate.
         assert run.id == "run_version_gfs_v1.0_202607220000_gfs"
 
     # /v1/runs lists it.
