@@ -184,10 +184,16 @@ def _bilinear_interp(
     f11 = float(elevation.values[i10, j10])
     if not all(np.isfinite(v) for v in (f00, f01, f10, f11)):
         return None
-    lat_lo = lat_axis[lat_lo_sorted]
-    lat_hi = lat_axis[lat_hi_sorted]
-    lon_lo = lon_axis[lon_lo_sorted]
-    lon_hi = lon_axis[lon_hi_sorted]
+    # ``np.ndarray.__getitem__`` is typed ``Any`` in numpy 1.26 stubs, so the
+    # numpy scalars read here would propagate ``Any`` through ``wx``/``wy`` and
+    # into the return, tripping ``no-any-return`` under mypy 1.9.0 (CI). The
+    # runtime values are always real scalars, so normalizing them to Python
+    # ``float`` at this boundary is the semantically-correct fix (not a
+    # suppression): the interpolation weights are genuinely floats.
+    lat_lo = float(lat_axis[lat_lo_sorted])
+    lat_hi = float(lat_axis[lat_hi_sorted])
+    lon_lo = float(lon_axis[lon_lo_sorted])
+    lon_hi = float(lon_axis[lon_hi_sorted])
     wx = (latitude - lat_lo) / (lat_hi - lat_lo) if lat_hi > lat_lo else 0.0
     wy = (longitude - lon_lo) / (lon_hi - lon_lo) if lon_hi > lon_lo else 0.0
     top = f00 * (1 - wy) + f01 * wy
