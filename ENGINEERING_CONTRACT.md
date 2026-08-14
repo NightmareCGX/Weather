@@ -168,3 +168,28 @@ Correctness is preferred over autonomous decision making.
   3. C:\Windows
   4. C:\
   unless necessary for the current milestone.
+
+---
+
+##17. Windows + Linux CI-PASS Required Engineering Gate
+
+- **No validated Windows + Linux compatibility → No commit.** A change or milestone is commit-ready only after validation in **both** the Windows development environment and the Linux GitHub Actions CI environment, to the extent each is reasonably reproducible locally. `.github/workflows/ci.yml` is the authoritative definition of GitHub CI.
+- Passing local Windows tests does **NOT** establish CI readiness; passing Linux CI-equivalent tests does **NOT** by itself establish Windows compatibility. The conceptual model:
+
+```
+Windows validation
+        +
+Linux/CI-equivalent validation
+        =
+Commit readiness
+```
+
+- This gate extends the Testing Rules (§8), Implementation Workflow (§11), Milestone Checklist (§12), and Git Rules (§15): `pytest`/`ruff`/`mypy` green on Windows alone is **not** sufficient for milestone acceptance or a commit while an applicable Linux/CI-equivalent failure remains unresolved. The intended lifecycle per milestone is:
+
+```
+implementation → affected-scope validation → Windows validation →
+Linux / CI-equivalent validation → final engineering acceptance validation →
+commit → push (by the user, per §15) → GitHub CI
+```
+
+- The complete rule — two-environment validation, the CI source-of-truth matrix, prohibited CI avoidance, Linux-only failure handling, dependency/Docker/database validation, the clean-environment principle, the final pre-commit gate, the required validation report, and the commit gate — is defined in `CLAUDE.md` under **`## WINDOWS + LINUX CI-PASS REQUIRED ENGINEERING GATE`** and is binding on all implementation in this repository.
