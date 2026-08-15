@@ -253,7 +253,7 @@ def test_record_ingested_dataset_retries_on_integrity_error(
     spec = _spec(zarr_store_path="/tmp/gfs.zarr")
     calls = {"n": 0}
 
-    def _run_with_one_collision(db, s, ds, *, member=None):
+    def _run_with_one_collision(db, s, ds, *, member=None, committed_state=None):
         calls["n"] += 1
         if calls["n"] == 1:
             # Simulate a concurrent worker committing the same run between
@@ -262,7 +262,7 @@ def test_record_ingested_dataset_retries_on_integrity_error(
 
             record_run(db, _spec(), ds)  # commits the run row
             raise IntegrityError("stmt", {}, Exception("unique violation"))
-        return record_run(db, s, ds, member=member)
+        return record_run(db, s, ds, member=member, committed_state=committed_state)
 
     monkeypatch.setattr(
         "ingestion.core.catalog.record_run", _run_with_one_collision

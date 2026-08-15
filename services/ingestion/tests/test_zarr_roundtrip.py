@@ -85,3 +85,89 @@ def test_api_reads_ingestion_written_store(grib_fixture: Path, tmp_path: Path) -
     compressor = restored.t2m.encoding.get("compressor")
     assert compressor is not None
     assert compressor.codec_id == "zstd"
+
+
+# --- Full-overwrite guard (Phase 2A) ---
+
+
+def _tiny_ds():
+    import numpy as np
+
+    lat = np.array([38.0, 38.25, 38.5, 38.75])
+    lon = np.array([-107.0, -106.75, -106.5, -106.25])
+    return xr.Dataset(
+        data_vars={
+            "temperature_2m": (
+                ("lead_time_hours", "latitude", "longitude"),
+                np.ones((1, 4, 4)),
+            )
+        },
+        coords={
+            "lead_time_hours": [6],
+            "latitude": lat,
+            "longitude": lon,
+        },
+    )
+
+
+def test_full_overwrite_guard_rejects_live_store(tmp_path) -> None:
+    """A full overwrite of a store referenced by a live model_runs is rejected."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from ingestion.core.base import LiveStoreOverwriteError
+    from ingestion.core.catalog import (
+        CatalogBase,
+        CenterRecord,
+        ModelRecord,
+        ModelRunRecord,
+        ModelVersionRecord,
+    )
+    from ingestion.core.pipeline import guard_full_overwrite
+
+    engine = create_engine("sqlite:///:memory:")
+    CatalogBase.metadata.create_all(engine)
+    store = str(tmp_path / "live.zarr")
+    write_dataset(_tiny_ds(), store)
+
+    with Session(engine) as session:
+        session.add(CenterRecord(id="c", center_id="noaa", name="NOAA", country="USA"))
+        session.add(
+            ModelRecord(
+                id="m", model_id="gfs", name="GFS", center_id="noaa",
+                is_ensemble=False, resolution_km=25.0,
+            )
+        )
+        session.add(ModelVersionRecord(id="v", model_id="gfs", version_string="v1.0"))
+        session.add(
+            ModelRunRecord(
+                id="r", model_version_id="v",
+                cycle_time=datetime(2026, 8, 14, 0, tzinfo=timezone.utc),
+                status="ready", zarr_store_path=store,
+            )
+        )
+        session.commit()
+        # A full overwrite of a live-run store is refused.
+        with pytest.raises(LiveStoreOverwriteError):
+            guard_full_overwrite(session, store)
+
+
+def test_full_overwrite_guard_allows_new_store(tmp_path) -> None:
+    """A full overwrite of a non-live (unreferenced) store is allowed."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from ingestion.core.catalog import CatalogBase
+    from ingestion.core.pipeline import guard_full_overwrite
+
+    engine = create_engine("sqlite:///:memory:")
+    CatalogBase.metadata.create_all(engine)
+    store = str(tmp_path / "new.zarr")
+    with Session(engine) as session:
+        # No model_runs references this store -> allowed.
+        guard_full_overwrite(session, store)
+    # The write itself still works.
+    write_dataset(_tiny_ds(), store)
+    assert read_dataset(store) is not None

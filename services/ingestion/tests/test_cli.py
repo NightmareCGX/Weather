@@ -136,8 +136,8 @@ def _install_download_and_catalog(
         _fake_download_idx,
     )
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        run = record_run(session, spec, dataset, member=member)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        run = record_run(session, spec, dataset, member=member, committed_state=committed_state)
         recorded.append(run)
         return run
 

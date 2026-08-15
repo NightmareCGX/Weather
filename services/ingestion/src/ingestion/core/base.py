@@ -54,6 +54,20 @@ class StoreSchemaMismatchError(IngestionError):
     """
 
 
+class LiveStoreOverwriteError(IngestionError):
+    """Raised when a full-overwrite would silently replace a live run's store.
+
+    The low-level Zarr helpers (``write_dataset``, ``write_dataset_atomic``,
+    ``prepare_run_store`` with ``mode="w"``) rebuild a store's coordinate axis
+    and would silently shrink/replace the contents of a store that is
+    referenced by a ``model_runs`` row (a "live run"). Doing so without a
+    coordinated catalog reconciliation would recreate the stale
+    ``forecast_products`` debt. The orchestration layer therefore guards these
+    helpers at the pipeline boundary: a full overwrite of a live-run store is
+    rejected with this error. New/non-live store creation is unaffected.
+    """
+
+
 class BaseConnector(ABC):
     """Base interface implemented by all upstream model connectors.
 

@@ -29,17 +29,21 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
+from sqlalchemy.orm import Session
 
 from ingestion.core.base import (
     CycleStoreMismatchError,
     IngestionError,
     LeadTimeMismatchError,
+    LiveStoreOverwriteError,
     StoreSchemaMismatchError,
 )
 from ingestion.core.catalog import (
+    CommittedState,
     ModelRunRecord,
     RunCatalogSpec,
     VariableSpec,
+    is_live_run_store,
     record_ingested_dataset,
 )
 from ingestion.core.zarr_writer import (
@@ -58,6 +62,110 @@ class UnitNormalizationError(IngestionError):
     to the target canonical unit nor a known source unit for that target is
     rejected rather than silently stored under a possibly-wrong label.
     """
+
+
+def read_committed_state(
+    store_path: str,
+    *,
+    is_ensemble: bool,
+) -> CommittedState:
+    """Return the actual committed lead/member state of a cycle store.
+
+    A cycle store's ``lead_time_hours`` coordinate is **pre-allocated** to the
+    full expected axis (NaN-filled), so mere coordinate membership does NOT mean
+    a lead is committed. This function inspects the store's **data regions**:
+    for each data variable with a ``lead_time_hours`` dimension (and, for
+    ensemble, a ``member`` dimension), it reduces over the spatial axes with
+    ``notnull().any()`` and collects the coordinates whose region holds any
+    non-NaN forecast value.
+
+    For deterministic runs the result is the committed lead set. For ensemble
+    runs it is the committed ``(member, lead)`` pair set; the committed member
+    set is derived from those pairs (a member is committed iff at least one of
+    its pairs has data).
+
+    The reduction only loads the small lead/member axes (the chunk grid is
+    ``(lead, lat, lon)`` / ``(member, lead, lat, lon)`` with one chunk per
+    region), not the full forecast grid.
+
+    Args:
+        store_path: The cycle store path/URL.
+        is_ensemble: Whether the store has a ``member`` axis (ensemble).
+
+    Returns:
+        The committed state derived from real data regions.
+
+    Raises:
+        ValueError: If the store cannot be read.
+    """
+    dataset = read_dataset(store_path)
+    if "lead_time_hours" not in dataset.coords:
+        raise ValueError(
+            f"Cannot derive committed state from {store_path!r}: no "
+            "'lead_time_hours' coordinate."
+        )
+    lead_values = dataset.coords["lead_time_hours"].values
+
+    if not is_ensemble:
+        committed_leads: set[int] = set()
+        for name in dataset.data_vars:
+            field = dataset[name]
+            if "lead_time_hours" not in field.dims:
+                continue
+            has = field.notnull().any(dim=("latitude", "longitude"))
+            for idx, value in enumerate(has.values):
+                if bool(value):
+                    committed_leads.add(int(lead_values[idx]))
+        return CommittedState.deterministic(committed_leads)
+
+    if "member" not in dataset.coords:
+        raise ValueError(
+            f"Cannot derive committed state from {store_path!r}: expected an "
+            "ensemble store but no 'member' coordinate is present."
+        )
+    member_values = dataset.coords["member"].values
+    committed_pairs: set[tuple[int, int]] = set()
+    for name in dataset.data_vars:
+        field = dataset[name]
+        if "member" not in field.dims or "lead_time_hours" not in field.dims:
+            continue
+        has = field.notnull().any(dim=("latitude", "longitude"))
+        for mi, member_val in enumerate(member_values):
+            for li, lead_val in enumerate(lead_values):
+                if bool(has.values[mi, li]):
+                    committed_pairs.add((int(member_val), int(lead_val)))
+    committed_members = {member for member, _ in committed_pairs}
+    return CommittedState.ensemble(committed_pairs, committed_members)
+
+
+def guard_full_overwrite(db: Session, store_path: str) -> None:
+    """Reject a full overwrite of a store that belongs to a live ``model_runs``.
+
+    The low-level Zarr full-write helpers (``write_dataset``,
+    ``write_dataset_atomic``, ``prepare_run_store`` with ``mode="w"``) rebuild a
+    store's coordinate axis and would silently shrink/replace the contents of a
+    run's store without catalog reconciliation — recreating the stale
+    ``forecast_products`` debt. This guard runs at the orchestration boundary
+    (NOT inside ``zarr_writer.py``, which stays DB-free): before any such full
+    write, the caller checks whether the target belongs to a live run and, if
+    so, refuses. New/non-live store creation is unaffected.
+
+    Args:
+        db: Database session used to check ``model_runs`` ownership.
+        store_path: The store path/URL that would be fully overwritten.
+
+    Raises:
+        LiveStoreOverwriteError: If the target is referenced by a live
+            ``model_runs`` row.
+    """
+    if is_live_run_store(db, store_path):
+        raise LiveStoreOverwriteError(
+            f"Refusing to fully overwrite {store_path!r}: the store belongs to "
+            "a live model_runs row. A full overwrite would silently shrink or "
+            "replace the run's contents without catalog reconciliation. "
+            "Re-ingest individual leads/members instead, or route through a "
+            "coordinated replacement path."
+        )
 
 
 def _unit_token(unit: str) -> str:
@@ -264,8 +372,27 @@ def ingest_grib_file(
         expected_lead_time_hours=spec.expected_lead_time_hours,
         expected_members=spec.expected_members,
     )
+    # Read the actual committed state AFTER the store write (the source of
+    # truth for catalog reconciliation and the store↔catalog READY gate). The
+    # per-run region writes are serialized (CLI store lock), so this read
+    # observes a stable post-write snapshot. When the store cannot be read
+    # (e.g. a stubbed/no-op store in tests, or a transient read failure), the
+    # committed state is omitted so reconciliation and the store↔catalog gate
+    # are skipped — the existing completeness-only status is preserved.
+    committed_state: CommittedState | None = None
+    try:
+        committed_state = read_committed_state(
+            store_path,
+            is_ensemble=spec.is_ensemble,
+        )
+    except Exception:  # noqa: BLE001 - a readable store is required for the gate, never fatal
+        committed_state = None
     return record_ingested_dataset(
-        spec, dataset, effective_store_path=store_path, member=member
+        spec,
+        dataset,
+        effective_store_path=store_path,
+        member=member,
+        committed_state=committed_state,
     )
 
 

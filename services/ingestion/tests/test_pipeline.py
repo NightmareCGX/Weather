@@ -37,6 +37,13 @@ from ingestion.core.pipeline import (
     _apply_variable_mapping,
     _normalize_canonical_units,
     ingest_grib_file,
+    read_committed_state,
+)
+from ingestion.core.zarr_writer import (
+    commit_region,
+    prepare_run_store,
+    read_dataset,
+    write_dataset,
 )
 from ingestion.providers.noaa.parser import GribParsingError
 
@@ -259,8 +266,8 @@ def test_ingest_grib_file_parses_writes_and_records(
     # Route the catalog write into the in-memory SQLite session instead of the
     # configured engine (pipeline imports record_ingested_dataset at module
     # level, so patch it on the pipeline module).
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        run = record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        run = record_run(session, spec, dataset, committed_state=committed_state)
         recorded.append(run)
         return run
 
@@ -329,8 +336,8 @@ def test_ingest_grib_file_multi_typeoflevel_end_to_end(
     """
     store_path = str(tmp_path / "gfs_multi.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        return record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, committed_state=committed_state)
 
     monkeypatch.setattr(
         "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
@@ -387,8 +394,8 @@ def test_ingest_grib_file_requested_lead_matches_succeeds(
     """A requested lead matching the fixture's decoded lead ingests normally."""
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        return record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, committed_state=committed_state)
 
     monkeypatch.setattr(
         "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
@@ -411,8 +418,8 @@ def test_ingest_grib_file_requested_lead_mismatch_aborts(
     """A requested lead differing from the fixture's lead aborts, writes nothing."""
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        return record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, committed_state=committed_state)
 
     monkeypatch.setattr(
         "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
@@ -442,8 +449,8 @@ def test_ingest_grib_file_merges_leads_into_cycle_store(
 
     recorded: list[ModelRunRecord] = []
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        run = record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        run = record_run(session, spec, dataset, committed_state=committed_state)
         recorded.append(run)
         return run
 
@@ -489,8 +496,8 @@ def test_ingest_grib_file_reingest_lead_replaces_in_store(
     """Re-ingesting the same lead replaces that lead's data in the cycle store."""
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        return record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, committed_state=committed_state)
 
     _call = {"n": 0}
     _leads = [6, 12, 6]
@@ -602,8 +609,8 @@ def test_store_is_self_describing_after_ingest(
 
     store_path = str(tmp_path / "gfs.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        return record_run(session, spec, dataset)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, committed_state=committed_state)
 
     monkeypatch.setattr(
         "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
@@ -643,3 +650,246 @@ def test_merge_schema_mismatch_axis_rejected(tmp_path) -> None:
         _merge_lead(different_grid, store)
     restored = read_dataset(store)
     assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6]
+
+
+# --- Catalog↔Zarr committed-state consistency (Phase 2A) ---
+
+
+def _committed_state_spec(
+    store: str,
+    *,
+    expected_leads: tuple[int, ...] = (0, 6, 12, 18),
+    **overrides: object,
+) -> RunCatalogSpec:
+    """A deterministic spec for committed-state tests."""
+    return _spec(
+        store,
+        expected_leads=expected_leads,
+        **overrides,
+    )
+
+
+def _committed_dataset(lead: int, value: float = 1.0):
+    """A single-lead deterministic dataset (2 variables)."""
+    import xarray as xr
+
+    lat = np.array([38.0, 38.25, 38.5, 38.75])
+    lon = np.array([-107.0, -106.75, -106.5, -106.25])
+    lg, lag, log = np.meshgrid(np.array([float(lead)]), lat, lon, indexing="ij")
+    return xr.Dataset(
+        data_vars={
+            "temperature_2m": (
+                ("lead_time_hours", "latitude", "longitude"),
+                value + 0.0 * lg,
+            ),
+            "precipitation_rate": (
+                ("lead_time_hours", "latitude", "longitude"),
+                0.5 * value + 0.0 * lg,
+            ),
+        },
+        coords={
+            "lead_time_hours": [float(lead)],
+            "latitude": lat,
+            "longitude": lon,
+            "time": np.datetime64("2026-07-21T00:00:00", "ns"),
+        },
+        attrs={"model_id": "gfs", "cycle_time": "2026-07-21T00:00:00"},
+    )
+
+
+def test_committed_state_detects_preallocated_axis_vs_committed(tmp_path) -> None:
+    """A preallocated axis is NOT the committed set; NaN regions are excluded."""
+    store = str(tmp_path / "prealloc.zarr")
+    prepare_run_store(
+        _committed_dataset(0),
+        store,
+        expected_lead_time_hours=(0, 6, 12, 18),
+    )
+    commit_region(_committed_dataset(0), store)
+    commit_region(_committed_dataset(6), store)
+    # Coordinate axis is the full preallocated set...
+    assert sorted(int(v) for v in read_dataset(store).coords["lead_time_hours"].values) == [
+        0,
+        6,
+        12,
+        18,
+    ]
+    # ...but the committed state is only {0,6}.
+    state = read_committed_state(store, is_ensemble=False)
+    assert sorted(state.lead_set()) == [0, 6]
+
+
+def test_healthy_partial_run_is_partial_not_falsely_inconsistent(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A partial run whose catalog matches the committed store is partial, not
+    falsely 'inconsistent' merely because the coordinate axis is preallocated."""
+    store = str(tmp_path / "partial.zarr")
+    sp = _committed_state_spec(store, expected_leads=(0, 6, 12, 18))
+    prepare_run_store(
+        _committed_dataset(0),
+        store,
+        expected_lead_time_hours=(0, 6, 12, 18),
+    )
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, member=member, committed_state=committed_state)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    # Commit only leads 0 and 6 -> committed state {0,6}; expected {0,6,12,18}.
+    with Session(session.bind) as s:
+        for lead in (0, 6):
+            commit_region(_committed_dataset(lead), store)
+            record_run(s, sp, _committed_dataset(lead), committed_state=read_committed_state(store, is_ensemble=False))
+    # The run is partial (not ready) but NOT falsely inconsistent.
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "partial"
+    # Catalog == committed store ({0,6}), so the store↔catalog gate holds; the
+    # non-ready status comes from invocation completeness.
+    leads = {p.lead_time_hours for p in session.query(ProductRecord).all()}
+    assert leads == {0, 6}
+
+
+def test_stale_catalog_reconciles_to_committed_store(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A stale catalog superset (catalog {0,6,12,18}, committed store {0,6}) is
+    reconciled to the store: stale rows are deleted, run is partial."""
+    store = str(tmp_path / "stale_catalog.zarr")
+    sp = _committed_state_spec(store, expected_leads=(0, 6, 12, 18))
+    prepare_run_store(
+        _committed_dataset(0),
+        store,
+        expected_lead_time_hours=(0, 6, 12, 18),
+    )
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, member=member, committed_state=committed_state)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    # Simulate a stale catalog: record a full {0,6,12,18} product set (as if the
+    # store had all four leads), then commit only {0,6} in the store and re-run.
+    # The store actually only holds {0,6} (preallocated axis, committed regions
+    # {0,6}): region-commit leads 0 and 6 into the store.
+    with Session(session.bind) as s:
+        commit_region(_committed_dataset(0), store)
+        commit_region(_committed_dataset(6), store)
+        # Record a stale catalog superset {0,6,12,18} (as if all four leads had
+        # been committed at some earlier point), then re-ingest lead 6 and
+        # reconcile against the real store (committed {0,6}).
+        for lead in (0, 6, 12, 18):
+            record_run(s, sp, _committed_dataset(lead), committed_state=None)
+        record_run(s, sp, _committed_dataset(6), committed_state=read_committed_state(store, is_ensemble=False))
+    leads = {p.lead_time_hours for p in session.query(ProductRecord).all()}
+    assert leads == {0, 6}
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "partial"
+
+
+def test_external_shrink_not_hidden_by_subset_readiness(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A store externally shrunk to {6} while catalog claims {0,6,12,18} must be
+    partial (the old subset rule alone would keep it ready)."""
+    store = str(tmp_path / "shrink.zarr")
+    sp = _committed_state_spec(store, expected_leads=(0, 6, 12, 18))
+    prepare_run_store(
+        _committed_dataset(0),
+        store,
+        expected_lead_time_hours=(0, 6, 12, 18),
+    )
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, member=member, committed_state=committed_state)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    # Build a healthy READY {0,6,12,18} catalog.
+    with Session(session.bind) as s:
+        for lead in (0, 6, 12, 18):
+            commit_region(_committed_dataset(lead), store)
+            record_run(s, sp, _committed_dataset(lead), committed_state=read_committed_state(store, is_ensemble=False))
+    assert session.query(ModelRunRecord).one().status == "ready"
+    # External shrink: full overwrite the store to {6} only.
+    write_dataset(_committed_dataset(6), store)
+    # Re-ingest lead 6 and reconcile against the now-{6} store.
+    with Session(session.bind) as s:
+        record_run(s, sp, _committed_dataset(6), committed_state=read_committed_state(store, is_ensemble=False))
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "partial"
+    leads = {p.lead_time_hours for p in session.query(ProductRecord).all()}
+    assert leads == {6}
+
+
+def test_healthy_patch_preserves_unrelated_and_stays_ready(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """A single-lead PATCH (lead 6) preserves unrelated leads and stays READY.
+
+    This is the mandatory PATCH regression: existing {0,6,12,18}, PATCH 6, final
+    {0,6,12,18} and READY, with no unrelated catalog rows deleted.
+    """
+    store = str(tmp_path / "patch.zarr")
+    sp = _committed_state_spec(store, expected_leads=(0, 6, 12, 18))
+    prepare_run_store(
+        _committed_dataset(0),
+        store,
+        expected_lead_time_hours=(0, 6, 12, 18),
+    )
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, member=member, committed_state=committed_state)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    with Session(session.bind) as s:
+        for lead in (0, 6, 12, 18):
+            commit_region(_committed_dataset(lead), store)
+            record_run(s, sp, _committed_dataset(lead), committed_state=read_committed_state(store, is_ensemble=False))
+    assert session.query(ModelRunRecord).one().status == "ready"
+    # PATCH lead 6 (same expected set).
+    with Session(session.bind) as s:
+        commit_region(_committed_dataset(6), store)
+        record_run(s, sp, _committed_dataset(6), committed_state=read_committed_state(store, is_ensemble=False))
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"
+    leads = sorted({p.lead_time_hours for p in session.query(ProductRecord).all()})
+    assert leads == [0, 6, 12, 18]
+
+
+def test_repeated_patch_is_idempotent(
+    session: Session, tmp_path, monkeypatch
+) -> None:
+    """Running the same PATCH twice is idempotent: store and catalog unchanged."""
+    store = str(tmp_path / "repeat_patch.zarr")
+    sp = _committed_state_spec(store, expected_leads=(0, 6, 12, 18))
+    prepare_run_store(
+        _committed_dataset(0),
+        store,
+        expected_lead_time_hours=(0, 6, 12, 18),
+    )
+
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, member=member, committed_state=committed_state)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    with Session(session.bind) as s:
+        for lead in (0, 6, 12, 18):
+            commit_region(_committed_dataset(lead), store)
+            record_run(s, sp, _committed_dataset(lead), committed_state=read_committed_state(store, is_ensemble=False))
+    for _ in range(2):
+        with Session(session.bind) as s:
+            commit_region(_committed_dataset(6), store)
+            record_run(s, sp, _committed_dataset(6), committed_state=read_committed_state(store, is_ensemble=False))
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"
+    leads = sorted({p.lead_time_hours for p in session.query(ProductRecord).all()})
+    assert leads == [0, 6, 12, 18]
