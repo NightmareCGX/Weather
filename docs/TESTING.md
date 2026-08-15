@@ -11,6 +11,19 @@ This document outlines the testing strategy, layers, and fixtures for the Global
 - **Scope**: Pure functions, mathematical operations (ensemble statistics, percentile calculations, interpolation), and data parsers.
 - **Rule**: Unit tests must run offline without requiring external network access, databases, or object storage.
 
+### 1.1.1 Catalog↔Zarr consistency tests
+
+The ingestion suite includes tests that prove the catalog↔actual-Zarr-committed-state consistency invariant (`services/ingestion/tests/test_pipeline.py`, `test_parallel_region.py`, `test_catalog.py`):
+
+- **Preallocated axis vs committed data** — a store pre-allocated to `{0,6,12,18}` with only `{0,6}` committed yields a committed set of `{0,6}`, not the axis.
+- **Healthy partial run** — a run whose catalog matches its committed store is `partial` (not falsely "inconsistent").
+- **Stale catalog** — a catalog superset (claims `{0,6,12,18}`) vs a committed store `{0,6}` is reconciled to `{0,6}` and not `ready`.
+- **External Zarr shrink** — a store shrunk to `{6}` while the catalog claims `{0,6,12,18}` is `partial` (the old subset rule alone would keep it `ready`).
+- **Healthy single-lead PATCH** — PATCH lead 6 on `{0,6,12,18}` preserves unrelated leads and stays `ready`; repeated PATCH is idempotent.
+- **Ensemble committed pairs** — actual committed `(member, lead)` pairs are detected; stale member metadata is reconciled away; member-axis consistency is enforced.
+- **Overwrite guard** — a full overwrite of a live-run store is rejected (`LiveStoreOverwriteError`); a new/non-live store is allowed.
+- **Failure/retry** — Zarr-write failure writes no catalog; reconciliation failure rolls back; retry converges.
+
 ### 1.2 Integration Tests (`pytest` + `Docker Compose`)
 - **Location**: `services/api/tests/`, `services/ingestion/tests/`
 - **Scope**: End-to-end flows involving FastAPI test clients, PostgreSQL + PostGIS spatial queries, Zarr dataset reads/writes, and the ingestion→catalog→serving pipeline (`services/ingestion/tests/test_catalog_postgres.py` writes a run to the catalog and serves it through `/v1/points`, including a test that drives the real `weather-ingest` CLI production entrypoint with a mocked download).

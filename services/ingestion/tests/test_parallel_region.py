@@ -187,8 +187,8 @@ def test_ingest_grib_file_concurrent_members_ready_when_complete(
     """Out-of-order per-member ingest reaches READY only when all members commit."""
     store = str(tmp_path / "cycle.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        return record_run(session, spec, dataset, member=member)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, member=member, committed_state=committed_state)
 
     def _fake_parse(path):
         # The test passes a synthetic dataset; derive member from the path.
@@ -235,8 +235,8 @@ def test_partial_run_has_correct_status(session: Session, tmp_path, monkeypatch)
     """A run with some but not all expected members is partial, not ready."""
     store = str(tmp_path / "cycle.zarr")
 
-    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None):
-        return record_run(session, spec, dataset, member=member)
+    def _record_into_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(session, spec, dataset, member=member, committed_state=committed_state)
 
     def _fake_parse(path):
         return _single_lead_dataset(6, member=1)
@@ -259,3 +259,79 @@ def test_partial_run_has_correct_status(session: Session, tmp_path, monkeypatch)
     # Products recorded for the committed lead only.
     leads = {p.lead_time_hours for p in session.query(ProductRecord).all()}
     assert leads == {6}
+
+
+# --- Ensemble committed-state consistency (Phase 2A) ---
+
+
+def test_ensemble_committed_pairs_detected_and_ready(session: Session, tmp_path, monkeypatch) -> None:
+    """Actual committed (member, lead) pairs are detected and the full set is READY."""
+    from ingestion.core.catalog import EnsembleMemberProductRecord
+    from ingestion.core.pipeline import read_committed_state
+
+    store = str(tmp_path / "ens_ready.zarr")
+    spec = _spec(store, is_ensemble=True, expected_leads=(6,), expected_members=(1, 2, 3))
+    prepare_run_store(
+        _single_lead_dataset(6, member=1),
+        store,
+        expected_lead_time_hours=(6,),
+        expected_members=(1, 2, 3),
+    )
+
+    def _record_into_session(s, spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(s, spec, dataset, member=member, committed_state=committed_state)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    for member in (1, 2, 3):
+        with Session(session.bind) as s:
+            commit_region(_single_lead_dataset(6, member=member), store)
+            record_run(s, spec, _single_lead_dataset(6, member=member), member=member,
+                       committed_state=read_committed_state(store, is_ensemble=True))
+    run = session.query(ModelRunRecord).one()
+    assert run.status == "ready"
+    pairs = {
+        (p.member_index, p.lead_time_hours)
+        for p in session.query(EnsembleMemberProductRecord).filter_by(run_id=run.id).all()
+    }
+    assert pairs == {(1, 6), (2, 6), (3, 6)}
+
+
+def test_ensemble_stale_member_metadata_reconciled(session: Session, tmp_path, monkeypatch) -> None:
+    """A member with no committed pair in the store is reconciled away."""
+    from ingestion.core.catalog import EnsembleMemberRecord, EnsembleMemberProductRecord
+    from ingestion.core.pipeline import read_committed_state
+
+    store = str(tmp_path / "ens_stale.zarr")
+    spec = _spec(store, is_ensemble=True, expected_leads=(0, 6), expected_members=(1, 2, 3))
+    prepare_run_store(
+        _single_lead_dataset(0, member=1),
+        store,
+        expected_lead_time_hours=(0, 6),
+        expected_members=(1, 2, 3),
+    )
+
+    def _record_into_session(s, spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        return record_run(s, spec, dataset, member=member, committed_state=committed_state)
+
+    monkeypatch.setattr(
+        "ingestion.core.pipeline.record_ingested_dataset", _record_into_session
+    )
+    # Commit members 1 and 2 fully; member 3 never commits.
+    for member, leads in ((1, (0, 6)), (2, (0, 6))):
+        for lead in leads:
+            with Session(session.bind) as s:
+                commit_region(_single_lead_dataset(lead, member=member), store)
+                record_run(s, spec, _single_lead_dataset(lead, member=member), member=member,
+                           committed_state=read_committed_state(store, is_ensemble=True))
+    run = session.query(ModelRunRecord).one()
+    members = sorted(m.member_index for m in session.query(EnsembleMemberRecord).filter_by(run_id=run.id).all())
+    pairs = {
+        (p.member_index, p.lead_time_hours)
+        for p in session.query(EnsembleMemberProductRecord).filter_by(run_id=run.id).all()
+    }
+    # Member 3 (never committed) is reconciled away.
+    assert members == [1, 2]
+    assert pairs == {(1, 0), (1, 6), (2, 0), (2, 6)}
+    assert run.status == "partial"  # expected member 3 not committed

@@ -62,6 +62,87 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@dataclass(frozen=True)
+class CommittedState:
+    """The actual committed forecast contents of a run's Zarr store.
+
+    This is the source of truth for catalog reconciliation and for the
+    store↔catalog READY consistency gate. It is derived from **real data
+    regions**, never from the preallocated coordinate axis: a cycle store is
+    pre-allocated with the full expected lead (and member) axis NaN-filled, so
+    a lead/member is only "committed" when its region actually holds non-NaN
+    forecast data. The detection helper lives in the pipeline layer
+    (``ingestion.core.pipeline.read_committed_state``), which reads the store
+    and builds one of these values.
+
+    Attributes:
+        leads: The set of committed lead times (hours). For deterministic
+            runs this is the committed lead set.
+        members: The set of committed member indices (real upstream member
+            identity). ``None`` for deterministic runs.
+        pairs: The set of committed ``(member, lead)`` pairs for ensemble
+            runs. ``None`` for deterministic runs.
+        is_ensemble: Whether the store carries a ``member`` axis.
+    """
+
+    leads: frozenset[int]
+    members: frozenset[int] | None
+    pairs: frozenset[tuple[int, int]] | None
+    is_ensemble: bool
+
+    @classmethod
+    def deterministic(cls, leads: set[int]) -> CommittedState:
+        """Build the committed state of a deterministic (non-ensemble) store."""
+        return cls(leads=frozenset(leads), members=None, pairs=None, is_ensemble=False)
+
+    @classmethod
+    def ensemble(
+        cls, pairs: set[tuple[int, int]], members: set[int]
+    ) -> CommittedState:
+        """Build the committed state of an ensemble store.
+
+        Args:
+            pairs: The committed ``(member, lead)`` pairs.
+            members: The member indices that have at least one committed pair.
+        """
+        return cls(
+            leads=frozenset(lead for _, lead in pairs),
+            members=frozenset(members),
+            pairs=frozenset(pairs),
+            is_ensemble=True,
+        )
+
+    def lead_set(self) -> set[int]:
+        """Return the committed lead set (shared by both store kinds)."""
+        return set(self.leads)
+
+    def member_set(self) -> set[int]:
+        """Return the committed member set (empty for deterministic runs)."""
+        return set(self.members or ())
+
+
+def is_live_run_store(db: Session, store_path: str) -> bool:
+    """Return whether ``store_path`` is referenced by a live ``model_runs`` row.
+
+    A "live" run is any ``model_runs`` row whose ``zarr_store_path`` equals the
+    target. Overwriting such a store with a full ``mode="w"`` rebuild would
+    silently replace/shrink the run's contents without catalog reconciliation,
+    recreating the stale ``forecast_products`` debt. The orchestration layer
+    uses this to guard the full-overwrite helpers at the pipeline boundary.
+
+    Args:
+        db: Database session.
+        store_path: The store path/URL to check.
+
+    Returns:
+        True when at least one ``model_runs`` row references the path.
+    """
+    row = db.execute(
+        select(ModelRunRecord.id).where(ModelRunRecord.zarr_store_path == store_path)
+    ).scalars().first()
+    return row is not None
+
+
 class CenterRecord(CatalogBase):
     __tablename__ = "forecast_centers"
 
@@ -315,12 +396,90 @@ def _lead_times(dataset: xr.Dataset) -> list[int]:
     return [0]
 
 
+def _reconcile_catalog_to_store(
+    db: Session,
+    run: ModelRunRecord,
+    committed_state: CommittedState,
+) -> None:
+    """Delete catalog rows whose lead/member is absent from the committed store.
+
+    The actual committed Zarr state is the source of truth for catalog
+    reconciliation. PATCH semantics: a lead/member is preserved when it is
+    present in the store (regardless of whether the current invocation touched
+    it); a lead/member is deleted only when it is **absent from the store**
+    (genuinely stale). Absence from the current incoming patch is NEVER a
+    deletion signal.
+
+    Deletion order respects foreign keys (``ensemble_member_products`` and
+    ``ensemble_members`` are children of ``model_runs``; ``forecast_products``
+    is a child of ``model_runs``):
+
+    1. ``ensemble_member_products`` pairs not in the committed pair set;
+    2. ``ensemble_members`` whose member index no longer has any committed
+       pair (only for ensemble runs);
+    3. ``forecast_products`` rows whose lead is not in the committed lead set.
+
+    This runs in the SAME transaction as the status derivation, so a failed
+    reconciliation rolls back atomically.
+
+    Args:
+        db: Database session.
+        run: The run row.
+        committed_state: The actual committed Zarr state (post-write).
+    """
+    committed_leads = committed_state.lead_set()
+
+    if committed_state.is_ensemble:
+        # 1. Delete stale member-product pairs first (child table; no FK to
+        #    ensemble_members, but deleting rows before parent member rows keeps
+        #    the member set derivable for step 2).
+        pair_rows = db.execute(
+            select(
+                EnsembleMemberProductRecord.member_index,
+                EnsembleMemberProductRecord.lead_time_hours,
+            ).where(EnsembleMemberProductRecord.run_id == run.id)
+        ).all()
+        committed_pairs = set(committed_state.pairs or ())
+        for member_num, lead_num in pair_rows:
+            key = (int(member_num), int(lead_num))
+            if key not in committed_pairs:
+                db.execute(
+                    EnsembleMemberProductRecord.__table__.delete().where(
+                        EnsembleMemberProductRecord.run_id == run.id,
+                        EnsembleMemberProductRecord.member_index == member_num,
+                        EnsembleMemberProductRecord.lead_time_hours == lead_num,
+                    )
+                )
+
+        # 2. Delete ensemble_members whose member index has no committed pair.
+        committed_members = committed_state.member_set()
+        db.execute(
+            EnsembleMemberRecord.__table__.delete().where(
+                EnsembleMemberRecord.run_id == run.id,
+                EnsembleMemberRecord.member_index.not_in(committed_members)
+                if committed_members
+                else EnsembleMemberRecord.member_index.is_not(None),
+            )
+        )
+
+    # 3. Delete forecast_products whose lead is absent from the committed set.
+    db.execute(
+        ProductRecord.__table__.delete().where(
+            ProductRecord.run_id == run.id,
+            ProductRecord.lead_time_hours.not_in(committed_leads)
+            if committed_leads
+            else ProductRecord.lead_time_hours.is_not(None),
+        )
+    )
+
+
 def record_run(
     db: Session,
     spec: RunCatalogSpec,
     dataset: xr.Dataset,
     *,
     member: int | None = None,
+    committed_state: CommittedState | None = None,
 ) -> ModelRunRecord:
     """Create or update the PostgreSQL catalog rows for an ingested run.
 
@@ -333,6 +492,13 @@ def record_run(
     committed it is ``partial``; otherwise ``processing``. An individual file's
     catalog write therefore no longer implies the whole run is ready.
 
+    When ``committed_state`` is provided, the catalog is additionally
+    **reconciled to the actual committed Zarr state** (rows whose lead/member
+    is absent from the store are deleted — PATCH preserves unrelated valid
+    rows) and run status requires the **store↔catalog consistency gate**
+    (``committed == actual committed Zarr``) in addition to invocation
+    completeness.
+
     Args:
         db: Database session.
         spec: The catalog metadata of the run (including the expected lead and
@@ -343,6 +509,10 @@ def record_run(
         member: The upstream GEFS member identity (``1..30``) being recorded.
             When provided, exactly one ``ensemble_members`` row for that real
             member number is created (never a positional index).
+        committed_state: The actual committed lead/member state of the run's
+            store (read post-write). When ``None`` (library callers without
+            store access), reconciliation and the store-consistency gate are
+            skipped and status is completeness-only.
 
     Returns:
         The recorded :class:`ModelRunRecord` (in its completeness-derived
@@ -532,32 +702,52 @@ def record_run(
                     },
                 )
 
+    # Reconcile the catalog to the actual committed Zarr state (source of
+    # truth for PATCH preservation and stale-row elimination). This runs
+    # BEFORE status derivation so status reflects the reconciled catalog.
+    if committed_state is not None:
+        _reconcile_catalog_to_store(db, run, committed_state)
+
     # Derive run-level readiness from committed vs expected sets. This is the
     # single decision point: a run becomes READY only when every expected lead
     # (and, for ensembles, every expected member) has a committed product /
-    # member row.
-    setattr(run, "status", _derive_run_status(db, run, spec))
+    # member row, AND (when the committed state is known) the catalog matches
+    # the actual committed Zarr state.
+    setattr(run, "status", _derive_run_status(db, run, spec, committed_state))
     db.commit()
     return run
 
 
 def _derive_run_status(
-    db: Session, run: ModelRunRecord, spec: RunCatalogSpec
+    db: Session,
+    run: ModelRunRecord,
+    spec: RunCatalogSpec,
+    committed_state: CommittedState | None = None,
 ) -> str:
-    """Return the run's status from its committed catalog rows vs expectations.
+    """Return the run's status from committed catalog rows and store state.
 
-    For a deterministic run (no ensemble), ``ready`` requires every expected
-    lead to have a committed ``forecast_products`` row.
+    Readiness requires BOTH:
 
-    For an ensemble run, ``ready`` requires the **Cartesian product** of
-    expected members × expected leads to be committed: every
-    ``(member, lead)`` pair must have a committed
-    ``ensemble_member_products`` row. Independent member-set and lead-set
-    completeness is NOT sufficient — a missing pair (e.g. member 3, lead 0)
-    keeps the run ``partial`` even when ``{1,2,3}`` and ``{0,6}`` are each
-    complete.
+    * **invocation completeness** — every expected lead (and, for ensembles,
+      every expected ``(member, lead)`` Cartesian pair) has a committed
+      catalog row; AND
+    * **store↔catalog consistency** (when ``committed_state`` is provided) —
+      the committed catalog rows equal the actual committed Zarr state.
 
-    ``partial`` when some but not all expected items are committed.
+    The invocation-completeness rule is the existing **subset** check
+    (``expected ⊆ committed``), which is PATCH-safe: a healthy run whose
+    catalog contains MORE leads than the current single-lead invocation's
+    expected set stays complete. It is deliberately NOT changed to exact
+    equality.
+
+    The store↔catalog gate is independent: when the catalog's committed set
+    differs from the actual committed Zarr set (e.g. a store shrunk to ``{6}``
+    while the catalog still claims ``{0,6,12,18}``), the run is ``partial``
+    even if invocation completeness holds. This prevents a stale catalog from
+    ever being reported ``ready``.
+
+    ``partial`` when some but not all expected items are committed, or when the
+    catalog does not match the actual committed store.
     ``processing`` when nothing is yet committed or the run declares no
     expectations (the caller's single write is treated as the whole truth).
 
@@ -565,6 +755,9 @@ def _derive_run_status(
         db: Database session.
         run: The run row.
         spec: The run's catalog spec (expected lead/member sets).
+        committed_state: The actual committed Zarr state (post-write). When
+            ``None`` (library caller without store access), the store↔catalog
+            gate is skipped and status is completeness-only.
 
     Returns:
         ``ready``, ``partial``, or ``processing``.
@@ -579,7 +772,8 @@ def _derive_run_status(
     expected_leads = set(spec.expected_lead_time_hours)
     if not expected_leads:
         # No declared expectations: the recorded dataset is the whole truth.
-        return "ready"
+        # Still honor the store↔catalog gate when the store is known.
+        return "ready" if _store_consistency_holds(db, run, committed_state) else "partial"
 
     if not expected_leads.issubset(committed_leads):
         # Nothing committed yet.
@@ -606,7 +800,56 @@ def _derive_run_status(
         if committed_pairs != expected_pairs:
             return "partial"
 
+    if not _store_consistency_holds(db, run, committed_state):
+        return "partial"
+
     return "ready"
+
+
+def _store_consistency_holds(
+    db: Session,
+    run: ModelRunRecord,
+    committed_state: CommittedState | None,
+) -> bool:
+    """Return whether the catalog's committed contents equal the store's.
+
+    The store↔catalog consistency gate: a run is only READY-eligible when its
+    committed catalog contents match the actual committed Zarr state. When the
+    store is unknown (``committed_state is None``) the gate is trivially
+    satisfied (completeness-only caller). When the store is known, a mismatch
+    (catalog claims leads/members the store does not actually hold) returns
+    False so the run cannot be ``ready``.
+
+    Args:
+        db: Database session.
+        run: The run row.
+        committed_state: The actual committed Zarr state, or ``None``.
+
+    Returns:
+        True when the store is unknown or the catalog matches the store;
+        False when a known store disagrees with the catalog.
+    """
+    if committed_state is None:
+        return True
+    committed_leads = set(
+        db.execute(
+            select(ProductRecord.lead_time_hours).where(
+                ProductRecord.run_id == run.id
+            )
+        ).scalars()
+    )
+    if committed_leads != committed_state.lead_set():
+        return False
+    if committed_state.is_ensemble:
+        rows = db.execute(
+            select(
+                EnsembleMemberProductRecord.member_index,
+                EnsembleMemberProductRecord.lead_time_hours,
+            ).where(EnsembleMemberProductRecord.run_id == run.id)
+        ).all()
+        committed_pairs = {(int(member_num), int(lead_num)) for member_num, lead_num in rows}
+        return committed_pairs == set(committed_state.pairs or ())
+    return True
 
 
 def record_ingested_dataset(
@@ -615,6 +858,7 @@ def record_ingested_dataset(
     *,
     effective_store_path: str | None = None,
     member: int | None = None,
+    committed_state: CommittedState | None = None,
 ) -> ModelRunRecord:
     """Record an ingested dataset to the configured PostgreSQL catalog.
 
@@ -639,6 +883,12 @@ def record_ingested_dataset(
             passes a staged sibling path when it re-ingests an existing run so
             the catalog records exactly the store that was written.
         member: The upstream GEFS member identity (``1..30``) being recorded.
+        committed_state: The actual committed lead/member state of the run's
+            Zarr store (read post-write). When provided, it is the source of
+            truth for catalog reconciliation and the store↔catalog READY gate;
+            when omitted (library callers without store access), reconciliation
+            and the store-consistency gate are skipped and the existing
+            completeness-only status is used.
 
     Returns:
         The recorded :class:`ModelRunRecord` (in its completeness-derived
@@ -650,7 +900,13 @@ def record_ingested_dataset(
     for _ in range(_MAX_CONCURRENT_WRITE_RETRIES):
         with SessionLocal() as session:
             try:
-                run = record_run(session, spec, dataset, member=member)
+                run = record_run(
+                    session,
+                    spec,
+                    dataset,
+                    member=member,
+                    committed_state=committed_state,
+                )
                 if effective_store_path is not None:
                     # ``run.zarr_store_path`` is typed as a ``Column`` on the
                     # declarative class; SQLAlchemy instruments instance
