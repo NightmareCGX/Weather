@@ -718,6 +718,26 @@ def record_run(
     return run
 
 
+def set_run_partial(db: Session, run_id: str) -> None:
+    """Downgrade a run to ``partial`` (the minimal same-cycle pre-update).
+
+    The wave pre-update sets ``model_runs.status = partial`` before mutating
+    any region so readers (which select only ``status == 'ready'``) exclude the
+    run during the in-progress re-ingest. Product/member rows are **not**
+    deleted here; the coalesced finalizer reconciles the catalog to the store
+    after the wave.
+
+    Args:
+        db: Database session.
+        run_id: The ``model_runs.id`` to downgrade.
+    """
+    run = db.get(ModelRunRecord, run_id)
+    if run is None:
+        return
+    setattr(run, "status", "partial")
+    db.flush()
+
+
 def _derive_run_status(
     db: Session,
     run: ModelRunRecord,

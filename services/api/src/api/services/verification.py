@@ -26,7 +26,6 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from api.core.zarr import read_dataset
 from api.models.entities import (
     ForecastProduct,
     Model,
@@ -295,7 +294,11 @@ def _dataset_for_run(
         return datasets[run_id]
     assert run.zarr_store_path is not None
     try:
-        dataset = read_dataset(run.zarr_store_path)
+        # Reader-gate: participate in the SHARED store gate + fresh Core
+        # revalidation so a store mid-re-ingest is never read.
+        from api.core.reader_gate import gated_read_dataset
+
+        dataset = gated_read_dataset(str(run.zarr_store_path))
     except Exception as exc:  # noqa: BLE001 - probe store, fall through
         logger.warning(
             "Skipping unreadable Zarr store for run %s (%s): %s",

@@ -25,6 +25,7 @@ import xarray as xr
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from ingestion.core.base import LiveStoreOverwriteError
 from ingestion.core.catalog import (
     CatalogBase,
     EnsembleMemberRecord,
@@ -91,12 +92,25 @@ def _spec(
 
 
 @pytest.fixture
-def session() -> Session:
-    engine = create_engine("sqlite:///:memory:")
+def session(tmp_path) -> Session:
+    # File-backed SQLite so the pipeline's live-store guard (which uses the
+    # injectable _live_store_session_factory) shares the same schema/rows.
+    db_file = tmp_path / "catalog.sqlite"
+    engine = create_engine(
+        f"sqlite:///{db_file}", connect_args={"check_same_thread": False}
+    )
     CatalogBase.metadata.create_all(engine)
     with Session(engine) as db:
         yield db
     engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _route_live_store_session(session: Session, monkeypatch) -> None:
+    """Route the library path's live-store guard to the test SQLite engine."""
+    import ingestion.core.pipeline as P
+
+    monkeypatch.setattr(P, "_live_store_session_factory", lambda: session.bind)
 
 
 def test_disjoint_member_region_writes_do_not_overwrite() -> None:
@@ -204,31 +218,29 @@ def test_ingest_grib_file_concurrent_members_ready_when_complete(
     monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
     spec = _spec(store, is_ensemble=True, expected_leads=(6,), expected_members=(1, 2, 3))
 
-    # Ingest out of order; the run should be partial until member 1,2,3 are all
-    # present, then ready.
-    statuses: list[str] = []
-    for member in (3, 1):
-        record = ingest_grib_file(
-            spec,
-            str(tmp_path / f"m{member}.grib2"),
-            store,
-            requested_lead_time_hours=6,
-            member=member,
-        )
-        statuses.append(record.status)
-    # Only members 1 and 3 committed -> partial.
-    assert statuses == ["partial", "partial"]
-    final = ingest_grib_file(
+    # The first library-path ingest creates the live store. Any further
+    # library-path ingest of the same store (a different member) is refused —
+    # multi-member ingestion is now the coordinator's responsibility (the
+    # weather-ingest CLI coordinator), which enforces the concurrency protocol.
+    first = ingest_grib_file(
         spec,
-        str(tmp_path / "m2.grib2"),
+        str(tmp_path / "m3.grib2"),
         store,
         requested_lead_time_hours=6,
-        member=2,
+        member=3,
     )
-    assert final.status == "ready"
-    # All three members recorded with their real identity.
+    assert first.status == "partial"
+    with pytest.raises(LiveStoreOverwriteError):
+        ingest_grib_file(
+            spec,
+            str(tmp_path / "m1.grib2"),
+            store,
+            requested_lead_time_hours=6,
+            member=1,
+        )
+    # Only member 3 was committed via the library path.
     member_rows = {m.member_index for m in session.query(EnsembleMemberRecord).all()}
-    assert member_rows == {1, 2, 3}
+    assert member_rows == {3}
 
 
 def test_partial_run_has_correct_status(session: Session, tmp_path, monkeypatch) -> None:

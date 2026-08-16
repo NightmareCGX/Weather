@@ -16,7 +16,10 @@ from api.core.database import get_db
 from api.schemas import EnsembleStatisticsEnvelope
 from api.services.cache import PointCache, build_ensemble_cache_key
 from api.services.ensemble_data import build_ensemble_statistics
-from api.services.point_forecast import resolve_latest_run_cycle_time
+from api.services.point_forecast import (
+    resolve_latest_run_cycle_time,
+    resolve_latest_run_serving_generation,
+)
 
 router = APIRouter()
 
@@ -87,6 +90,9 @@ def get_ensemble_statistics(
         lead_time_hours=lead_time_hours,
         include_members=include_members,
         cycle_time=resolve_latest_run_cycle_time(db, model, initial_time),
+        serving_generation=resolve_latest_run_serving_generation(
+            db, model, initial_time
+        ),
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&model={model}"

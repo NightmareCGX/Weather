@@ -27,7 +27,10 @@ from api.services.cache import (
     build_probability_cache_key,
 )
 from api.services.ensemble_data import build_probability_forecast
-from api.services.point_forecast import resolve_latest_run_cycle_time
+from api.services.point_forecast import (
+    resolve_latest_run_cycle_time,
+    resolve_latest_run_serving_generation,
+)
 
 router = APIRouter()
 
@@ -104,6 +107,9 @@ def get_probability(
         lead_time_hours=lead_time_hours,
         threshold_max=threshold_max,
         cycle_time=resolve_latest_run_cycle_time(db, model, initial_time),
+        serving_generation=resolve_latest_run_serving_generation(
+            db, model, initial_time
+        ),
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&threshold={threshold}"

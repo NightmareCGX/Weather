@@ -144,15 +144,15 @@ def test_tile_cache_key_distinguishes_cycles():
     from api.services.tiles import _tile_cache_key
 
     k00 = _tile_cache_key(
-        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T00:00:00Z"
+        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T00:00:00Z", "gen1"
     )
     k12 = _tile_cache_key(
-        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T12:00:00Z"
+        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T12:00:00Z", "gen1"
     )
     assert k00 != k12
     # Same cycle + same tile -> same key (deterministic).
     assert k00 == _tile_cache_key(
-        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T00:00:00Z"
+        "gfs", "temperature_2m", "surface", 8, 51, 98, 6, "2026-08-13T00:00:00Z", "gen1"
     )
 
 
@@ -160,8 +160,8 @@ def test_tile_cache_key_distinguishes_leads():
     """Lead 6 must never share a tile cache key with lead 18."""
     from api.services.tiles import _tile_cache_key
 
-    k6 = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None)
-    k18 = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 18, None)
+    k6 = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None, "gen1")
+    k18 = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 18, None, "gen1")
     assert k6 != k18
 
 
@@ -169,9 +169,9 @@ def test_tile_cache_key_distinguishes_tile_coordinates():
     """Different tile x/y/z must never share a tile cache key."""
     from api.services.tiles import _tile_cache_key
 
-    a = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None)
-    b = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 52, 98, 6, None)
-    c = _tile_cache_key("gfs", "temperature_2m", "surface", 9, 51, 98, 6, None)
+    a = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None, "gen1")
+    b = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 52, 98, 6, None, "gen1")
+    c = _tile_cache_key("gfs", "temperature_2m", "surface", 9, 51, 98, 6, None, "gen1")
     assert len({a, b, c}) == 3
 
 
@@ -180,7 +180,7 @@ def test_tile_cache_serves_identical_requests():
     from api.services.tiles import _tile_cache, _tile_cache_get, _tile_cache_set, _tile_cache_key
 
     _tile_cache.clear()
-    key = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None)
+    key = _tile_cache_key("gfs", "temperature_2m", "surface", 8, 51, 98, 6, None, "gen1")
     assert _tile_cache_get(key) is None
     _tile_cache_set(key, b"PNG-DATA")
     assert _tile_cache_get(key) == b"PNG-DATA"

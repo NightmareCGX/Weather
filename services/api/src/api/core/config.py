@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     GOOGLE_PLACES_TIMEOUT: Any = 5.0
     MAPBOX_TOKEN: Any = ""
 
+    # Reader-gate configuration (Zarr region-write concurrency).
+    # The API serving tier participates in the SHARED store gate when reading
+    # forecast Zarr stores so it never observes a store mid-re-ingest.
+    API_MAX_CONCURRENT_GATED_READS: Any = 16
+    API_READER_LOCK_POOL_SIZE: Any = 16
+    API_READER_LOCK_MAX_OVERFLOW: Any = 8
+    API_READER_LOCK_POOL_TIMEOUT_SECONDS: Any = 5.0
+    API_READER_GATE_TIMEOUT_SECONDS: Any = 30.0
+    API_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: Any = 40.0
+
     # Elevation resolution (ACCEPTANCE_REMEDIATION_PLAN §15).
     # ``dem`` (default): local/server-side DEM via api/services/elevation.py.
     # ``google``: Google Elevation API (ToS restricts caching; not the default).

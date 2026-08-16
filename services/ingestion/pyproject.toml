@@ -23,6 +23,12 @@ pydantic-settings = "^2.2.1"
 # assertion). Constrain to the same ^2.2.1 range the root/api projects use so
 # the resolved version is pandas 2.x and GRIB2 parsing works.
 pandas = "^2.2.1"
+# The ingestion region-write concurrency protocol imports the pure shared
+# identity/fingerprint helpers from ``domain.locks`` (the advisory-key
+# derivation, canonical storage identity, and serving-state fingerprint).
+# These are imported by ingestion production source (``ingestion.core.locks``),
+# so ``weather-platform-domain`` is a genuine production dependency.
+weather-platform-domain = { path = "../../packages/domain" }
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
@@ -34,21 +40,26 @@ minio = "^7.2.7"
 # The ingestion integration test test_catalog_postgres.py imports the API
 # serving tier (api.main, api.models.entities, api.core.database) and runs
 # Alembic migrations directly, so its test environment must provide the API's
-# own runtime deps and the shared domain package. These are test-only for
-# ingestion (ingestion production source never imports api.*/domain); they are
-# declared here so ``poetry run pytest`` is self-contained and reproducible.
+# own runtime deps. These are test-only for ingestion (ingestion production
+# source never imports api.*); they are declared here so ``poetry run pytest``
+# is self-contained and reproducible. ``weather-platform-domain`` is a genuine
+# production dependency (ingestion.core.locks imports domain.locks), declared
+# under [tool.poetry.dependencies] above.
 alembic = "^1.13.1"
 fastapi = "^0.110.0"
 redis = "^5.0.2"
 geoalchemy2 = "^0.14.3"
-weather-platform-domain = { path = "../../packages/domain" }
 
 [tool.poetry.scripts]
 weather-ingest = "ingestion.cli:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["src", "../api/src"]
+# ``domain`` is a production dependency (imported by ingestion.core.locks).
+# In the workspace dev/test environment, point pytest at the package source so
+# the new domain.locks module is found without requiring a reinstall. CI uses
+# ``poetry install`` which installs the path dependency normally.
+pythonpath = ["src", "../api/src", "../../packages/domain/src"]
 testpaths = ["tests"]
 
 # test_catalog_postgres.py prepends api/ingestion src to sys.path before

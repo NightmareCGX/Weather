@@ -34,7 +34,6 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from api.core.zarr import read_dataset
 from api.models.entities import (
     City,
     ForecastProduct,
@@ -478,7 +477,11 @@ def _select_min_lead_winners(
             continue
         assert run.zarr_store_path is not None
         try:
-            dataset = read_dataset(run.zarr_store_path)
+            # Candidate discovery reads the store's lead axis; use the reader
+            # gate so a store mid-re-ingest is never opened.
+            from api.core.reader_gate import gated_read_dataset
+
+            dataset = gated_read_dataset(str(run.zarr_store_path))
         except Exception as exc:  # noqa: BLE001 - unreadable store
             logger.warning(
                 "Skipping unreadable Zarr store for run %s: %s", run.id, exc
@@ -499,6 +502,27 @@ def _select_min_lead_winners(
         valid_time: sorted(pairs, key=lambda pair: pair[1])
         for valid_time, pairs in candidates_by_valid.items()
     }
+
+
+def _gated_read_dataset(store_path: str) -> xr.Dataset:
+    """Read a forecast Zarr store under the SHARED reader gate.
+
+    The reader participates in the same PostgreSQL store gate as the ingestion
+    writer, so it never observes a store mid-re-ingest. The dataset is fully
+    materialized (xarray open + load) before the gate is released.
+
+    Falls back to a direct read when the reader-gate pool is not initialized
+    (test/development path).
+
+    Raises:
+        FileNotFoundError: If the run is no longer READY (revalidation fails).
+    """
+    from api.core.reader_gate import gated_read_dataset
+
+    result = gated_read_dataset(store_path)
+    if not isinstance(result, xr.Dataset):
+        raise FileNotFoundError(f"run {store_path!r} did not materialize a dataset")
+    return result
 
 
 def _open_run_store(db: Session, model: str, cycle_time: datetime) -> xr.Dataset:
@@ -531,12 +555,58 @@ def _open_run_store(db: Session, model: str, cycle_time: datetime) -> xr.Dataset
     if run is None or run.zarr_store_path is None:
         raise HTTPException(status_code=404, detail=f"Run for cycle {cycle_time} not found.")
     try:
-        return read_dataset(run.zarr_store_path)
+        # Reader-gate: participate in the SHARED store gate + fresh Core
+        # revalidation so the run is still READY and its store is stable while
+        # this request materializes the dataset.
+        return _gated_read_dataset(str(run.zarr_store_path))
+    except FileNotFoundError as exc:
+        logger.warning("Skipping no-longer-ready Zarr store for run %s", run.id)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Run store for cycle {cycle_time} is no longer ready.",
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - a broken store is "unavailable"
         logger.warning("Skipping unreadable Zarr store for run %s: %s", run.id, exc)
         raise HTTPException(
             status_code=404, detail=f"Run store for cycle {cycle_time} is unreadable."
         ) from exc
+
+
+def resolve_latest_run_serving_generation(
+    db: Session, model: str, initial_time: str | None = None
+) -> str | None:
+    """Return the committed-manifest generation for the latest ready run.
+
+    The generation is the cache-generation discriminator: a same-set same-cycle
+    data replacement changes the manifest generation, making old cache entries
+    unreachable. Falls back to the legacy deterministic token when no manifest
+    exists.
+
+    Returns:
+        The serving generation string, or ``None`` when no ready run exists or
+        the store path cannot be resolved.
+    """
+    from api.core.manifest_reader import ManifestReadError, manifest_generation
+
+    stmt = (
+        select(ModelRun.zarr_store_path)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model)
+        .where(ModelRun.status == "ready")
+        .where(ModelRun.zarr_store_path.isnot(None))
+    )
+    if initial_time is not None:
+        stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
+    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    path = db.execute(stmt).scalars().first()
+    if path is None:
+        return None
+    try:
+        return manifest_generation(path)
+    except ManifestReadError:
+        # A malformed manifest fails closed: do not serve a stale cache key.
+        return None
 
 
 def resolve_latest_run_cycle_time(
@@ -636,7 +706,11 @@ def _resolve_ready_dataset(
     for run in runs:
         assert run.zarr_store_path is not None
         try:
-            dataset = read_dataset(run.zarr_store_path)
+            # Reader-gate: SHARED store gate + fresh Core revalidation so a
+            # store mid-re-ingest is never read.
+            from api.core.reader_gate import gated_read_dataset
+
+            dataset = gated_read_dataset(str(run.zarr_store_path))
         except Exception as exc:  # noqa: BLE001 - probe store, fall through
             logger.warning(
                 "Skipping unreadable Zarr store for run %s (%s): %s",

@@ -119,3 +119,69 @@ Existing `ready` rows whose catalog diverged from the store (created before this
 2. **Time-Series Growth**:
    * *Concern*: As verification observations and forecast product catalogs grow across multiple models (NOAA, ECMWF, Canada) and AI downscaling, table sizes will expand rapidly.
    * *Mitigation*: The schema is partition-ready with future table boundaries, and time-range partitioning on `verification_observations` and `model_runs` can be applied without architectural refactoring.
+
+---
+
+## 7. Zarr region-write concurrency protocol
+
+The ingestion pipeline uses a PostgreSQL-advisory-lock coordination protocol so
+multiple processes can safely write disjoint physical Zarr regions of the same
+forecast run concurrently.
+
+### Lock order (deadlock-free)
+
+```
+admission turnstile
+    -> store gate (SHARED for writers/readers, EXCLUSIVE for init/finalize)
+    -> sorted unique physical-region locks
+```
+
+- The store gate uses **native** `pg_advisory_lock_shared`/`pg_advisory_lock`
+  on one key (SHARED/EXCLUSIVE on the same key).
+- Region locks are exclusive per physical conflict group. Under the current
+  ensemble chunk layout (`member` full-extent), different members at the same
+  lead share a physical chunk and serialize; different leads are disjoint and
+  may proceed concurrently.
+
+### Data commit order
+
+```
+UPDATING marker declared
+    -> region data objects
+    -> COMPLETE marker
+    -> committed manifest
+    -> catalog reconciliation/status commit
+```
+
+Stable per-region markers live at `<store>/__commit__/v1/regions/<region>.json`
+with state+generation in the body; the committed manifest at
+`<store>/__commit__/v1/manifest.json`.
+
+### Protocol modes
+
+- `legacy`: no markers (pre-upgrade behavior).
+- `hybrid_marker_v1`: a touched region's marker overrides the legacy rule;
+  marker-less regions use the legacy rule.
+- `marker_v1`: strict — every committed region must have a COMPLETE marker.
+
+### API reader gate
+
+The API serving tier participates in the SHARED store gate when reading a
+forecast Zarr store, so it never observes a store mid-re-ingest. Cache keys
+include the committed-manifest generation, so a same-set same-cycle data
+replacement makes old cache entries unreachable.
+
+### Local-filesystem concurrent serving
+
+Compliant API readers and ingestion writers coordinate via the PostgreSQL
+gate even on local filesystems. Arbitrary non-gated external processes opening
+local Zarr files directly are **unsupported** during an in-place chunk
+replacement (local writes are not atomic); MinIO/S3 is the supported
+concurrent-serving backend.
+
+### Accepted split-brain limitation
+
+If PostgreSQL connectivity is lost while an old ingestion writer can still
+mutate MinIO/S3, the writer is **not fenced** (no fencing tokens). Under the
+ensemble shared-chunk layout the RMW lost-update race can reappear in that
+excluded split-brain failure model.

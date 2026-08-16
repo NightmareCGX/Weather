@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from ingestion.core.base import (
@@ -62,6 +63,32 @@ class UnitNormalizationError(IngestionError):
     to the target canonical unit nor a known source unit for that target is
     rejected rather than silently stored under a possibly-wrong label.
     """
+
+
+def _session_local() -> "Session":
+    """Return a new catalog Session for the live-store check (library path).
+
+    The unlocked library path uses this only to check whether the target store
+    belongs to a live run before refusing to bypass the concurrency protocol.
+    Tests monkeypatch ``_live_store_session_factory`` to route this to their
+    SQLite catalog engine.
+    """
+    from sqlalchemy.orm import Session
+
+    return Session(bind=_live_store_session_factory())
+
+
+def _default_live_store_engine() -> "Engine":
+    """Return the configured ingestion catalog engine (live-store guard)."""
+    from ingestion.core.db import engine
+
+    return engine
+
+
+#: Injectable engine factory for the unlocked-library-path live-store check.
+#: Production uses the configured ingestion engine; tests replace this with an
+#: in-memory SQLite engine so the library path can be exercised without PG.
+_live_store_session_factory = _default_live_store_engine
 
 
 def read_committed_state(
@@ -356,6 +383,20 @@ def ingest_grib_file(
         ValueError: If the Zarr store target is unsupported.
         sqlalchemy error: If the catalog write fails (no row is committed).
     """
+    # The unlocked library path must not mutate a live-run store. The CLI uses
+    # the coordinator (which acquires the advisory-lock store gate); library
+    # callers of ingest_grib_file that target a live store are refused rather
+    # than silently bypassing the concurrency protocol.
+    from ingestion.core.catalog import is_live_run_store
+
+    if is_live_run_store(_session_local(), store_path):
+        raise LiveStoreOverwriteError(
+            f"Refusing to ingest via the unlocked library path into {store_path!r}: "
+            "the store belongs to a live model_runs row. Use the coordinated "
+            "ingestion path (the weather-ingest CLI coordinator) so the "
+            "region-write concurrency protocol is enforced."
+        )
+
     dataset = parse_grib2(grib_path)
     dataset = _apply_variable_mapping(dataset, spec.variables)
     dataset = _normalize_canonical_units(dataset, spec.variables)
