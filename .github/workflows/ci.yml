@@ -328,6 +328,38 @@ jobs:
           print("MinIO round-trip executed and passed (not skipped)")
           PY
 
+      # The Zarr region-write concurrency correctness suite is a required Linux
+      # CI gate. The PG-backed advisory-lock tests and the MinIO marker tests
+      # must run and PASS (not skip) — the correctness suite is not silently
+      # optional.
+      - name: Verify concurrency correctness tests ran and passed (not skipped)
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("services/ingestion/ingestion-junit.xml").getroot()
+          required = [
+              "test_exclusive_conflicts_with_shared",
+              "test_shared_shared_same_key_coexist",
+              "test_no_shared_to_exclusive_upgrade",
+              "test_minio_marker_atomic_put",
+              "test_minio_manifest_roundtrip",
+              "test_late_failed_wave_put_cannot_overwrite_newer_wave",
+              "test_required_materialized_object_deleted_invalidates",
+              "test_valid_omitted_fill_chunk_passes",
+              "test_cross_process_disjoint_deterministic_writes",
+              "test_cross_process_conflicting_ensemble_serializes",
+              "test_cross_process_four_way_conflict_no_lost_members",
+          ]
+          for name in required:
+              test = root.find(f".//testcase[@name='{name}']")
+              assert test is not None, f"required concurrency test {name!r} not found"
+              assert test.find("failure") is None and test.find("error") is None, \
+                  f"concurrency test {name!r} FAILED"
+              assert test.find("skipped") is None, \
+                  f"concurrency test {name!r} was SKIPPED"
+          print("All required concurrency tests executed and passed (not skipped)")
+          PY
+
   # ---------------------------------------------------------------------------
   # Frontend unit tests: Jest (jsdom, offline; maplibre mocked).
   # ---------------------------------------------------------------------------

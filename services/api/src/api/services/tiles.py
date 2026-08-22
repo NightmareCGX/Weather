@@ -40,7 +40,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.core.png import encode_rgba_png
-from api.core.zarr import read_dataset
 from api.models.entities import (
     ForecastProduct,
     ForecastVariable,
@@ -238,8 +237,16 @@ def render_tile_png(
         ValueError: For invalid tile/grid/field input.
     """
     _validate_tile(zoom, x, y)
+    # Resolve the committed-manifest generation for cache identity before the
+    # lookup (the tile cache key includes the generation so a same-set data
+    # replacement makes old tiles unreachable).
+    from api.services.point_forecast import resolve_latest_run_serving_generation
+
+    serving_generation = resolve_latest_run_serving_generation(
+        db, model, initial_time
+    )
     cache_key = _tile_cache_key(
-        model, variable, level, zoom, x, y, lead_time_hours, initial_time
+        model, variable, level, zoom, x, y, lead_time_hours, initial_time, serving_generation
     )
     cached = _tile_cache_get(cache_key)
     if cached is not None:
@@ -358,9 +365,20 @@ def _tile_cache_key(
     y: int,
     lead_time_hours: int,
     initial_time: str | None,
+    serving_generation: str | None,
 ) -> tuple[object, ...]:
-    """Build the tile cache key: the full forecast + spatial identity."""
-    return (model, variable, level, zoom, x, y, lead_time_hours, initial_time)
+    """Build the tile cache key: the full forecast + spatial + generation."""
+    return (
+        model,
+        variable,
+        level,
+        zoom,
+        x,
+        y,
+        lead_time_hours,
+        initial_time,
+        serving_generation,
+    )
 
 
 def _tile_cache_get(key: tuple[object, ...]) -> bytes | None:
@@ -593,7 +611,11 @@ def _resolve_run_and_field(
     for run in runs:
         assert run.zarr_store_path is not None
         try:
-            dataset = read_dataset(run.zarr_store_path)
+            # Reader-gate: SHARED store gate + fresh Core revalidation so a
+            # store mid-re-ingest is never read.
+            from api.core.reader_gate import gated_read_dataset
+
+            dataset = gated_read_dataset(str(run.zarr_store_path))
         except Exception:  # noqa: BLE001 - probe store, fall through
             continue
         _require_product(db, run, variable, level, lead_time_hours)

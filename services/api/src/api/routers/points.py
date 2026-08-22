@@ -35,6 +35,7 @@ from api.services.point_forecast import (
     ResolvedLocation,
     build_point_forecast,
     resolve_latest_run_cycle_time,
+    resolve_latest_run_serving_generation,
     resolve_location,
 )
 
@@ -93,6 +94,7 @@ def get_point_forecast(
         # cross-cycle series must be invalidated. The series itself is built
         # from all READY cycles.
         cycle_time=resolve_latest_run_cycle_time(db, model_ids[0]),
+        serving_generation=resolve_latest_run_serving_generation(db, model_ids[0]),
         variables=tuple(var_codes) if var_codes else None,
         units=units,
         start_lead_time_hours=start_lead_time_hours,

@@ -36,6 +36,12 @@ class IngestionSettings(BaseSettings):
     MINIO_SECURE: bool = False
     MINIO_BUCKET_NAME: Any = "weather-data"
 
+    # Wave pre-update marker-PUT concurrency / timeout (region-write protocol).
+    MARKER_PUT_CONCURRENCY: Any = 8
+    MARKER_PUT_TIMEOUT_SECONDS: Any = 30.0
+    # Advisory-lock acquisition timeout for the ingestion coordinator.
+    ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

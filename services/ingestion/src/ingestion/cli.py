@@ -54,14 +54,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import xarray as xr
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session
+
 from ingestion.core.base import CycleStoreMismatchError, LeadTimeMismatchError
 from ingestion.core.catalog import RunCatalogSpec, VariableSpec
-from ingestion.core.pipeline import ingest_grib_file
+from ingestion.core.pipeline import (
+    _apply_variable_mapping,
+    _normalize_canonical_units,
+    _validate_requested_lead,
+)
 from ingestion.providers.noaa.connector import NOAAConnector
 
 #: Supported NOAA model identifiers (NOMADS GFS/GEFS).
@@ -627,12 +637,15 @@ def _cleanup_source(destination: Path) -> None:
 def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     """Download and ingest every lead/member of a single forecast run.
 
-    For a deterministic model every requested lead is fetched and ingested
-    concurrently (bounded by ``--concurrency``). For GEFS, each ``gepNN`` file
-    is fetched and ingested concurrently with its real member identity. Each
-    file flows independently: download -> staging -> decode -> region commit ->
-    catalog -> durable success -> delete source. A failure in one file does not
-    abort the others.
+    Implements the approved region-write concurrency protocol:
+
+    * retained-seed fresh-store initialization;
+    * one wave-level EXCLUSIVE pre-update (run -> partial + UPDATING markers);
+    * bounded region workers (SHARED gate + region locks + generation check);
+    * one coalesced finalization after the wave drains.
+
+    A failure in one file does not abort the others; the wave finalizer still
+    runs (the run stays partial if any target is incomplete).
 
     Args:
         spec: The forecast-run specification.
@@ -653,7 +666,6 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     )
     catalog_spec = _build_spec(spec, args, store_path)
     concurrency = max(1, int(getattr(args, "concurrency", 4)))
-    store_lock = asyncio.Lock()
     failures: list[str] = []
 
     # Each (member, lead) work item, or just (lead) for deterministic.
@@ -668,87 +680,198 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             for lead in sorted(spec.lead_time_hours)
         ]
 
-    async def _process_one(
-        connector: NOAAConnector,
-        semaphore: asyncio.Semaphore,
-        member: int | None,
-        lead: int,
-    ) -> None:
-        """Fetch -> stage -> decode -> region commit -> catalog -> cleanup."""
-        destination = _destination_for(
-            spec, args, lead=lead, member=member
+    # Retained seed: deterministically select the lowest (member, lead) item,
+    # download + parse it exactly once before dispatch.
+    seed_item = items[0]
+    seed_member, seed_lead = seed_item
+
+    async def _prepare_seed(connector: NOAAConnector) -> xr.Dataset:
+        dest = _destination_for(spec, args, lead=seed_lead, member=seed_member)
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        await connector.download(
+            spec.model, spec.cycle_date, spec.cycle_hour, seed_lead, dest, member=seed_member
         )
-        # Download is I/O-bound; bounded by the semaphore so NOMADS is not
-        # flooded and disk staging is bounded.
-        async with semaphore:
-            idx_destination = Path(str(destination) + ".idx")
-            try:
-                await connector.download(
-                    spec.model,
-                    spec.cycle_date,
-                    spec.cycle_hour,
-                    lead,
-                    destination,
-                    member=member,
-                )
-                # The .idx is a source artifact fetched alongside the GRIB2;
-                # a missing .idx does not block ingestion (the GRIB2 carries
-                # all the decoding information).
-                try:
-                    await connector.download_idx(
-                        spec.model,
-                        spec.cycle_date,
-                        spec.cycle_hour,
-                        lead,
-                        idx_destination,
-                        member=member,
-                    )
-                except Exception:  # noqa: BLE001 - idx is optional
-                    idx_destination.unlink(missing_ok=True)
-            except Exception as exc:  # noqa: BLE001 - report this file's failure
-                failures.append(
-                    f"{spec.model} member={member} lead={lead}: {exc}"
-                )
-                return
+        ds = _parse_for_ingest(dest)
+        ds = _apply_variable_mapping(ds, catalog_spec.variables)
+        ds = _normalize_canonical_units(ds, catalog_spec.variables)
+        ds.attrs["model_id"] = catalog_spec.model_id
+        _validate_requested_lead(ds, seed_lead)
+        return ds
 
-        # Decode + region commit + catalog. GRIB parsing is CPU-bound and
-        # releases the GIL, so it can run on the event loop; the region commit
-        # (a shared store write) is serialized per run via the store lock so
-        # disjoint-but-unsafe metadata operations never race.
-        try:
-            async with store_lock:
-                record = ingest_grib_file(
-                    catalog_spec,
-                    destination,
-                    store_path,
-                    requested_lead_time_hours=lead,
-                    member=member,
-                )
-        except Exception as exc:  # noqa: BLE001 - report this file's failure
-            failures.append(f"{spec.model} member={member} lead={lead}: {exc}")
-            return
+    async def _run_wave() -> str:
+        from concurrent.futures import ThreadPoolExecutor
 
-        # File-level durable success: the data is in the store and the catalog
-        # is recorded. The source may be deleted now; a cleanup failure must
-        # not invalidate the committed data.
-        _cleanup_source(destination)
-        print(
-            f"Ingested {record.id} "
-            f"{('member %d ' % member) if member is not None else ''}lead {lead}h "
-            f"({record.status}) -> {store_path}"
+        from ingestion.core.cancel import await_all_workers_non_abandoning
+        from ingestion.core.coordinator import (
+            RunCoordinator,
+            WaveRegion,
         )
 
-    async def _download_and_ingest() -> None:
+        coordinator = RunCoordinator(
+            catalog_spec,
+            store_path,
+            timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
+        )
+        cancel_event = threading.Event()
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+        worker_futures = []
+        engine = _catalog_session_factory()
+
         async with NOAAConnector() as connector:
-            semaphore = asyncio.Semaphore(concurrency)
-            await asyncio.gather(
-                *[
-                    _process_one(connector, semaphore, member, lead)
+            # 1. Retained seed.
+            seed_dataset = await _prepare_seed(connector)
+
+            # 2. Determine run id + same-cycle.
+            run_id: str | None = None
+            is_same_cycle = False
+            with _catalog_session() as db:
+                from ingestion.core.catalog import ModelRunRecord
+                from sqlalchemy import select
+
+                row = db.execute(
+                    select(ModelRunRecord).where(
+                        ModelRunRecord.zarr_store_path == store_path
+                    )
+                ).scalars().first()
+                if row is not None:
+                    run_id = str(row.id)
+                    is_same_cycle = True
+
+            # 3. Wave-level EXCLUSIVE pre-update (init + UPDATING markers).
+            pre_conn = engine.connect()
+            try:
+                coordinator.initialize_run_store(
+                    pre_conn,
+                    seed_dataset=seed_dataset,
+                    expected_leads=spec.lead_time_hours,
+                    expected_members=spec.members,
+                    run_id=run_id,
+                    is_same_cycle=is_same_cycle,
+                )
+                regions = [
+                    WaveRegion(
+                        lead_time_hours=lead,
+                        member=member,
+                        generation=_new_generation(),
+                    )
                     for member, lead in items
                 ]
+                coordinator.pre_update_wave(
+                    pre_conn,
+                    regions=regions,
+                    run_id=run_id,
+                    is_same_cycle=is_same_cycle,
+                    executor=executor,
+                    cancel_event=cancel_event,
+                )
+            finally:
+                pre_conn.close()
+
+            # 4. Download every non-seed file on the event loop (bounded by a
+            #    semaphore) before dispatching the sync workers.
+            download_sem = asyncio.Semaphore(concurrency)
+
+            async def _download_non_seed(member: int | None, lead: int) -> None:
+                if (member, lead) == seed_item:
+                    return
+                dest = _destination_for(spec, args, lead=lead, member=member)
+                async with download_sem:
+                    try:
+                        await connector.download(
+                            spec.model, spec.cycle_date, spec.cycle_hour,
+                            lead, dest, member=member,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report this file's failure
+                        failures.append(f"{spec.model} member={member} lead={lead}: {exc}")
+
+            await asyncio.gather(
+                *[_download_non_seed(m, lead) for m, lead in items if (m, lead) != seed_item]
             )
 
-    asyncio.run(_download_and_ingest())
+            # 5. Dispatch region workers (sync, in the executor).
+            generation_by_region = {r.region_id: r.generation for r in regions}
+
+            def _run_region_worker(member: int | None, lead: int) -> None:
+                worker_conn = engine.connect()
+                try:
+                    ds = _parse_for_ingest(
+                        _destination_for(spec, args, lead=lead, member=member)
+                    )
+                    ds = _apply_variable_mapping(ds, catalog_spec.variables)
+                    ds = _normalize_canonical_units(ds, catalog_spec.variables)
+                    ds.attrs["model_id"] = catalog_spec.model_id
+                    _validate_requested_lead(ds, lead)
+                    region_id = _region_id_for(lead, member)
+                    generation = generation_by_region.get(region_id)
+                    if generation is None:
+                        raise RuntimeError(f"no generation for region {region_id}")
+                    coordinator.write_region_worker(
+                        worker_conn,
+                        dataset=ds,
+                        member=member,
+                        generation=generation,
+                        expected_leads=spec.lead_time_hours,
+                        expected_members=spec.members,
+                    )
+                finally:
+                    worker_conn.close()
+
+            # 6. Retained-seed writer uses the retained dataset (no re-parse).
+            def _run_seed_region() -> None:
+                worker_conn = engine.connect()
+                try:
+                    region_id = _region_id_for(seed_lead, seed_member)
+                    generation = generation_by_region.get(region_id)
+                    if generation is None:
+                        raise RuntimeError(f"no generation for region {region_id}")
+                    coordinator.write_region_worker(
+                        worker_conn,
+                        dataset=seed_dataset,
+                        member=seed_member,
+                        generation=generation,
+                        expected_leads=spec.lead_time_hours,
+                        expected_members=spec.members,
+                    )
+                finally:
+                    worker_conn.close()
+
+            # 7. Aggregate drain.
+            loop = asyncio.get_event_loop()
+            for member, lead in items:
+                if (member, lead) == seed_item:
+                    fut = loop.run_in_executor(executor, _run_seed_region)
+                else:
+                    fut = loop.run_in_executor(
+                        executor, _run_region_worker, member, lead
+                    )
+                worker_futures.append(fut)
+            results, cancelled = await await_all_workers_non_abandoning(
+                worker_futures, cancel_event
+            )
+            # Record per-file failures.
+            for idx, res in enumerate(results):
+                if isinstance(res, BaseException):
+                    m, lead = items[idx]
+                    failures.append(f"{spec.model} member={m} lead={lead}: {res}")
+
+        # 7. Coalesced finalization (after all worker Futures drained).
+        fin_conn = engine.connect()
+        try:
+            run_id = _resolve_run_id(catalog_spec, store_path)
+            status = coordinator.finalize_run(
+                fin_conn,
+                run_id=run_id,
+                spec=catalog_spec,
+                expected_leads=spec.lead_time_hours,
+                expected_members=spec.members,
+            )
+        finally:
+            fin_conn.close()
+            engine.dispose()
+            executor.shutdown(wait=False)
+        return status
+
+    status = asyncio.run(_run_wave())
 
     if failures:
         raise RuntimeError(
@@ -757,6 +880,93 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             + "; ".join(failures[:5])
             + ("; ..." if len(failures) > 5 else "")
         )
+    print(
+        f"Ingested {len(items)} region(s) for model={spec.model} "
+        f"cycle={spec.cycle_time} ({status}) -> {store_path}"
+    )
+
+
+def _parse_for_ingest(destination: str | Path) -> xr.Dataset:
+    """Parse a staged GRIB2 file (used by the CLI's region workers)."""
+    from ingestion.providers.noaa.parser import parse_grib2
+
+    return parse_grib2(os.fspath(destination))
+
+
+def _region_id_for(lead: int, member: int | None) -> str:
+    from domain.locks import logical_region_encoding
+
+    return logical_region_encoding(lead_time_hours=lead, member=member)
+
+
+def _new_generation() -> str:
+    import uuid
+
+    return uuid.uuid4().hex
+
+
+def _catalog_session() -> Session:
+    """Open a catalog session using the injectable session factory.
+
+    Tests monkeypatch ``_catalog_session_factory`` to route catalog writes to
+    an in-memory SQLite database instead of the configured PostgreSQL engine.
+    """
+    return Session(bind=_catalog_session_factory())
+
+
+def _default_catalog_engine() -> "Engine":
+    """Return the configured ingestion catalog engine."""
+    from ingestion.core.db import engine
+
+    return engine
+
+
+#: Injectable engine factory for the CLI's catalog access. Production returns
+#: the configured ingestion engine; tests replace this with an in-memory
+#: SQLite engine so the CLI coordinator path can be exercised without PG.
+_catalog_session_factory = _default_catalog_engine
+
+
+def _resolve_run_id(spec: RunCatalogSpec, store_path: str) -> str:
+    """Resolve the run id for a store path (create it if absent)."""
+    from sqlalchemy import select
+
+    from ingestion.core.catalog import ModelRunRecord, record_run
+
+    with _catalog_session() as db:
+        row = db.execute(
+            select(ModelRunRecord).where(ModelRunRecord.zarr_store_path == store_path)
+        ).scalars().first()
+        if row is not None:
+            return str(row.id)
+        # Fresh run: create the catalog rows (processing status).
+        ds = _synthetic_spec_dataset(spec)
+        run = record_run(db, spec, ds)
+        return str(run.id)
+
+
+def _synthetic_spec_dataset(spec: RunCatalogSpec) -> "xr.Dataset":
+    """Build a minimal dataset for catalog row creation when no file is retained."""
+    import numpy as np
+
+    lat = np.array([38.0, 38.25, 38.5, 38.75])
+    lon = np.array([-107.0, -106.75, -106.5, -106.25])
+    lead = spec.expected_lead_time_hours[0] if spec.expected_lead_time_hours else 6
+    return xr.Dataset(
+        data_vars={
+            v.code: (
+                ("lead_time_hours", "latitude", "longitude"),
+                np.full((1, 4, 4), np.nan, dtype=np.float32),
+            )
+            for v in spec.variables
+        },
+        coords={
+            "lead_time_hours": [lead],
+            "latitude": lat,
+            "longitude": lon,
+        },
+        attrs={"model_id": spec.model_id, "cycle_time": spec.cycle_time.isoformat()},
+    )
 
 
 def _build_spec(

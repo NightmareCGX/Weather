@@ -7,6 +7,13 @@ current_dir = os.path.dirname(__file__)
 src_dir = os.path.abspath(os.path.join(current_dir, "../src"))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
+# The API depends on weather-platform-domain (which provides domain.locks for
+# the reader-gate). In the workspace dev/test environment, point at the package
+# source so the new domain.locks module is found without a reinstall. CI uses
+# ``poetry install`` which installs the path dependency normally.
+_domain_src = os.path.abspath(os.path.join(current_dir, "../../../packages/domain/src"))
+if _domain_src not in sys.path:
+    sys.path.insert(0, _domain_src)
 
 import pytest
 from alembic.config import Config

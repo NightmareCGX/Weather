@@ -18,7 +18,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from ingestion.core.base import CycleStoreMismatchError, LeadTimeMismatchError
+from ingestion.core.base import (
+    CycleStoreMismatchError,
+    LeadTimeMismatchError,
+    LiveStoreOverwriteError,
+)
 from ingestion.core.catalog import (
     CatalogBase,
     CenterRecord,
@@ -121,12 +125,25 @@ def _dataset_for_lead(lead: int, cycle=np.datetime64("2026-07-21T00:00:00")):
 
 
 @pytest.fixture
-def session() -> Session:
-    engine = create_engine("sqlite:///:memory:")
+def session(tmp_path) -> Session:
+    # File-backed SQLite so every connection (including the pipeline's
+    # live-store guard) shares the same schema/rows across the test.
+    db_file = tmp_path / "catalog.sqlite"
+    engine = create_engine(
+        f"sqlite:///{db_file}", connect_args={"check_same_thread": False}
+    )
     CatalogBase.metadata.create_all(engine)
     with Session(engine) as db:
         yield db
     engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _route_live_store_session(session: Session, monkeypatch) -> None:
+    """Route the library path's live-store guard to the test SQLite engine."""
+    import ingestion.core.pipeline as P
+
+    monkeypatch.setattr(P, "_live_store_session_factory", lambda: session.bind)
 
 
 def test_apply_variable_mapping_renames_source_to_platform() -> None:
@@ -467,18 +484,17 @@ def test_ingest_grib_file_merges_leads_into_cycle_store(
     monkeypatch.setattr("ingestion.core.pipeline.record_ingested_dataset", _record_into_session)
     monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
 
-    # Ingest the same cycle store for two different leads. The run's expected
-    # lead set is pre-declared so the store is pre-allocated with both leads
-    # (the new region-write architecture pre-allocates before region commits).
+    # The first library-path ingest creates the run/store. Re-ingestion of a
+    # live store via the unlocked library path is now refused (the concurrency
+    # protocol requires the coordinator); the second call must raise.
     spec = _spec(store_path, expected_leads=(6, 12))
     first = ingest_grib_file(spec, FIXTURE, store_path)
-    second = ingest_grib_file(spec, FIXTURE, store_path)
-
-    # Both leads share one run row and one store path.
-    assert first.id == second.id
-    assert second.zarr_store_path == store_path
-    assert len(recorded) == 2
-    assert recorded[0].id == recorded[1].id
+    assert first.id
+    assert first.zarr_store_path == store_path
+    # The store is now live (recorded in the SQLite catalog). A second library
+    # ingest of the same live store is refused.
+    with pytest.raises(LiveStoreOverwriteError):
+        ingest_grib_file(spec, FIXTURE, store_path)
 
     # The store now contains both leads.
     import os
@@ -513,17 +529,24 @@ def test_ingest_grib_file_reingest_lead_replaces_in_store(
     monkeypatch.setattr("ingestion.core.pipeline.parse_grib2", _fake_parse)
 
     spec = _spec(store_path, expected_leads=(6, 12))
-    ingest_grib_file(spec, FIXTURE, store_path)  # lead 6
-    ingest_grib_file(spec, FIXTURE, store_path)  # lead 12
-    # Re-ingest lead 6 a second time: still exactly two leads in the store.
-    ingest_grib_file(spec, FIXTURE, store_path)  # lead 6 again
+    ingest_grib_file(spec, FIXTURE, store_path)  # lead 6 creates the live store
+    # The store is now live; any further library-path ingest of the same store
+    # is refused (the concurrency protocol requires the coordinator).
+    with pytest.raises(LiveStoreOverwriteError):
+        ingest_grib_file(spec, FIXTURE, store_path)  # lead 12
 
     import os
+    import numpy as np
     import xarray as xr
 
     assert os.path.isdir(store_path)
     restored = xr.open_zarr(store_path)
+    # The store coordinate axis is the pre-allocated [6,12], but only lead 6
+    # was committed (lead 12 is NaN because its region was never written).
     assert sorted(int(v) for v in restored["lead_time_hours"].values) == [6, 12]
+    assert np.isnan(
+        restored["temperature_2m"].sel(lead_time_hours=12).values[0, 0]
+    )
 
 
 # --- Forecast-run identity / cycle validation (ACCEPTANCE_REMEDIATION_PLAN §3-4) ---

@@ -273,6 +273,7 @@ def build_point_cache_key(
     resolved_via: str,
     location_id: str | None,
     cycle_time: str | None,
+    serving_generation: str | None = None,
     variables: tuple[str, ...] | None,
     units: str,
     start_lead_time_hours: int | None,
@@ -304,6 +305,7 @@ def build_point_cache_key(
     payload = {
         "model": model,
         "cycle_time": cycle_time,
+        "serving_generation": serving_generation,
         "latitude": latitude,
         "longitude": longitude,
         "resolved_via": resolved_via,
@@ -329,18 +331,21 @@ def build_probability_cache_key(
     lead_time_hours: int,
     threshold_max: float | None,
     cycle_time: str | None = None,
+    serving_generation: str | None = None,
 ) -> str:
     """Build a deterministic cache key for a probability forecast request.
 
     The key is a SHA-256 digest of a canonical JSON payload, following the
     same convention as :func:`build_point_cache_key`. ``operator`` and both
     thresholds are included because they change the computed probability.
-    ``cycle_time`` (the resolved run's cycle) is part of the key so a cached
-    probability for one forecast run never satisfies another cycle's request.
+    ``cycle_time`` (the resolved run's cycle) and ``serving_generation`` (the
+    committed-manifest generation) are part of the key so a cached response for
+    one forecast run (or one data generation) never satisfies another.
     """
     payload = {
         "model": model,
         "cycle_time": cycle_time,
+        "serving_generation": serving_generation,
         "latitude": latitude,
         "longitude": longitude,
         "variable": variable,
@@ -362,6 +367,7 @@ def build_ensemble_cache_key(
     lead_time_hours: int,
     include_members: bool = False,
     cycle_time: str | None = None,
+    serving_generation: str | None = None,
 ) -> str:
     """Build a deterministic cache key for an ensemble statistics request.
 
@@ -370,12 +376,13 @@ def build_ensemble_cache_key(
     part of the key so a statistics-only cached response (which omits the
     member array) can never satisfy a distribution request, and a member-heavy
     response can never satisfy a statistics-only request. ``cycle_time`` (the
-    resolved run's cycle) is part of the key so a cached ensemble response for
-    one forecast run never satisfies another cycle's request.
+    resolved run's cycle) and ``serving_generation`` (the committed-manifest
+    generation) are part of the key.
     """
     payload = {
         "model": model,
         "cycle_time": cycle_time,
+        "serving_generation": serving_generation,
         "latitude": latitude,
         "longitude": longitude,
         "variable": variable,

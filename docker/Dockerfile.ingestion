@@ -27,6 +27,12 @@ WORKDIR /app
 
 # 1) Manifests (committed lockfile -> reproducible install).
 COPY services/ingestion/pyproject.toml services/ingestion/poetry.lock /app/services/ingestion/
+# weather-platform-domain is a local path dependency of the ingestion package
+# (services/ingestion/pyproject.toml -> ../../packages/domain, i.e. /app/packages/domain
+# in the image). It must be present before `poetry install` so Poetry can resolve
+# and install the path dependency for the main dependency group.
+COPY packages/domain/pyproject.toml /app/packages/domain/
+COPY packages/domain/src /app/packages/domain/src
 RUN cd /app/services/ingestion && poetry install --only main --no-root
 
 # 2) Add the ingestion source, install the root package (creates the
@@ -49,6 +55,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --create-home --uid 1001 appuser
 COPY --from=builder /app/services/ingestion/.venv /app/services/ingestion/.venv
+# Ship the domain source consumed by the ingestion worker (the same path
+# dependency installed into the venv). Matches the runtime stage's style used
+# for the ingestion source below.
+RUN mkdir -p /app/packages/domain
+COPY --chown=appuser:appuser --from=builder /app/packages/domain/src /app/packages/domain/src
 COPY --from=builder /app/services/ingestion/src /app/services/ingestion/src
 USER appuser
 WORKDIR /app/services/ingestion
