@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 from domain.locks import (
@@ -90,6 +91,33 @@ def test_canonical_identity_local_realpath_normcase() -> None:
     assert a == b
     # realpath/abspath resolves symlinks and relativizes.
     assert canonical_storage_identity(path).startswith("local://")
+
+
+def test_canonical_identity_local_forced_windows_normcase(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Simulate the Windows ``os.name == "nt"`` branch on any host OS.
+
+    ``locks.canonical_storage_identity`` only applies ``os.path.normcase`` to a
+    local store path when ``os.name == "nt"`` (locks.py:117-118). On Linux CI
+    that branch is never taken by real execution, so it stays uncovered.
+    Patching the shared ``os`` module the function reads at call time forces
+    the branch; a recording ``normcase`` proves the branch is entered, the
+    call happens, and its normalized result is the exact value embedded in the
+    returned canonical local-store identity.
+    """
+    calls: list[str] = []
+
+    def fake_normcase(path: str) -> str:
+        calls.append(path)
+        return "C:\\DATA\\CYCLE.ZARR"
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os.path, "normcase", fake_normcase)
+    ident = canonical_storage_identity(str(tmp_path / "cycle.zarr"))
+    assert calls, "os.path.normcase was not invoked under the nt branch"
+    assert ident == "local://C:\\DATA\\CYCLE.ZARR"
 
 
 def test_canonical_identity_local_file_uri() -> None:
