@@ -143,6 +143,37 @@ def is_live_run_store(db: Session, store_path: str) -> bool:
     return row is not None
 
 
+def is_ready_run_store(db: Session, store_path: str) -> bool:
+    """Return whether ``store_path`` is referenced by a **ready** ``model_runs`` row.
+
+    A ``ready`` run is quiescent and committed: its store carries the content
+    the catalog advertises. A ``ready`` row whose store is missing is an
+    external shrink / corruption condition that must never be silently repaired
+    by a cold-start full overwrite — doing so would replace the run's contents
+    without catalog reconciliation.
+
+    Non-ready rows (``processing``/``partial``) are placeholders from an
+    in-flight or aborted first ingestion: their store may be genuinely absent
+    (the run was recorded before any committed region existed — e.g. a
+    region-write failure). Cold-start initializing such a store is the legitimate
+    recovery path, so those rows are NOT "live" for the full-overwrite guard.
+
+    Args:
+        db: Database session.
+        store_path: The store path/URL to check.
+
+    Returns:
+        True when at least one **ready** ``model_runs`` row references the path.
+    """
+    row = db.execute(
+        select(ModelRunRecord.id).where(
+            (ModelRunRecord.zarr_store_path == store_path)
+            & (ModelRunRecord.status == "ready")
+        )
+    ).scalars().first()
+    return row is not None
+
+
 class CenterRecord(CatalogBase):
     __tablename__ = "forecast_centers"
 

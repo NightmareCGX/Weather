@@ -245,27 +245,41 @@ def expand_run_specs(
     dates = _as_list(args.cycle_date)
     hours = _as_list(args.cycle_hour)
     leads = tuple(_as_list(args.lead_time_hours))
-    members = tuple(_as_list(getattr(args, "member", None)))
+    global_members = tuple(_as_list(getattr(args, "member", None)))
     if not models or not dates or not hours or not leads:
         raise ValueError(
             "At least one --model, --cycle-date, --cycle-hour, and "
             "--lead-time-hours is required."
         )
-    # A GEFS run without an explicit member list defaults to the full
-    # perturbation set gep01..gep30 (member identity preserved per file).
-    if "gefs" in models and not members:
-        members = tuple(range(1, 31))
     # Aligned-zipped expansion: the number of (model, date, hour) triples must
     # match unless a single value is broadcast across the others. A single
     # model/date/hour broadcasts; multiple values must align 1:1.
     triples = _align_triples(models, dates, hours)
+
+    def _run_members(model: str) -> tuple[int, ...]:
+        """Resolve the member identities for one model in the batch.
+
+        ``--member`` is meaningful only for ensemble models (GEFS) and is
+        ignored for deterministic models (GFS). A global ``--member 1 2 3`` in
+        a mixed ``--model gfs gefs`` batch must therefore attach members to the
+        GEFS run only; the GFS run keeps ``()`` so its store is pre-allocated
+        WITHOUT a ``member`` axis (a member-shaped GFS store would reject every
+        deterministic region merge). This mirrors ``_parse_manifest``, which
+        already resolves members per manifest entry.
+        """
+        if model == "gefs":
+            # An explicit --member list is used verbatim; when absent, the full
+            # perturbation set gep01..gep30 is the CLI default.
+            return global_members or tuple(range(1, 31))
+        return ()
+
     return [
         RunSpec(
             model=model,
             cycle_date=cycle_date,
             cycle_hour=cycle_hour,
             lead_time_hours=leads,
-            members=members,
+            members=_run_members(model),
             store=args.store,
             allow_custom_store=args.allow_custom_store,
         )
