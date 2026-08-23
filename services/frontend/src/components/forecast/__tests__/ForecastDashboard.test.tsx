@@ -324,4 +324,70 @@ describe("ForecastDashboard", () => {
       screen.getByText("Ensemble data is not yet available for this forecast.")
     ).toBeInTheDocument();
   });
+
+  it("never renders a metadata field (cycle_time) as a forecast chart title", () => {
+    // Regression: the backend attaches the additive `cycle_time` provenance
+    // field to every forecast entry (API.md section 2.1). It must never be
+    // treated as a forecast data variable: no chart titled "cycle_time", and
+    // the ensemble variable (the first real variable code) must be a genuine
+    // meteorological variable — never a coordinate/provenance field.
+    mockEnsembleModelSelected();
+    mockUsePointForecast.mockReturnValue({
+      forecast: {
+        location: {
+          latitude: 38.19,
+          longitude: -106.82,
+          elevation_m: null,
+          resolved_via: "city",
+        },
+        generated_at: "2026-07-21T00:00:00Z",
+        model: "gefs",
+        forecasts: [
+          {
+            lead_time_hours: 0,
+            valid_time: "2026-07-21T00:00:00Z",
+            cycle_time: "2026-07-21T00:00:00Z",
+            temperature_2m: 10,
+            precipitation_rate: 0,
+          },
+          {
+            lead_time_hours: 6,
+            valid_time: "2026-07-21T06:00:00Z",
+            cycle_time: "2026-07-21T00:00:00Z",
+            temperature_2m: 13,
+            precipitation_rate: 3,
+          },
+        ],
+      },
+      status: "success",
+      error: null,
+    });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "error",
+      error: "Ensemble stats unavailable.",
+      model: "gefs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    // Exactly two meteograms render, keyed by the two real variables. No
+    // chart is titled with a coordinate/provenance field like `cycle_time`.
+    const meteograms = screen.getAllByTestId("meteogram");
+    expect(meteograms).toHaveLength(2);
+    const codes = meteograms.map((node) => node.textContent);
+    expect(codes).toEqual(["temperature_2m", "precipitation_rate"]);
+    expect(codes).not.toContain("cycle_time");
+    expect(codes).not.toContain("lead_time_hours");
+    expect(codes).not.toContain("valid_time");
+
+    // The ensemble request is anchored to the first REAL variable code, never
+    // to a metadata/coordinate field.
+    expect(mockUseEnsemble).toHaveBeenCalledWith(
+      location,
+      expect.any(Array),
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+  });
 });

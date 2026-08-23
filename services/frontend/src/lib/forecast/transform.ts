@@ -1,4 +1,5 @@
 import type { EnsembleStatistics, EnsembleStatisticsData, ForecastEntry } from "@/lib/api/types";
+import { isForecastDataVariable } from "@/lib/api/types";
 
 /**
  * Pure data transformations from API envelopes to chart-ready structures.
@@ -19,13 +20,19 @@ export interface MeteogramPoint {
 
 /**
  * Extract the plottable variable codes from a forecast series, excluding the
- * structural keys `lead_time_hours` and `valid_time`.
+ * structural keys `lead_time_hours`/`valid_time`/`cycle_time`.
+ *
+ * The exclusion set is the single authoritative
+ * {@link FORECAST_ENTRY_METADATA_FIELDS} boundary: only the backend's declared
+ * structural fields are skipped, so a future additive metadata field is
+ * excluded here automatically instead of surfacing as a bogus chart (or an
+ * invalid `/v1/ensembles` request).
  */
 export function forecastVariableCodes(forecasts: ForecastEntry[]): string[] {
   const codes = new Set<string>();
   for (const entry of forecasts) {
     for (const key of Object.keys(entry)) {
-      if (key !== "lead_time_hours" && key !== "valid_time") {
+      if (isForecastDataVariable(key)) {
         codes.add(key);
       }
     }

@@ -85,6 +85,41 @@ export interface ForecastEntry {
   [variableCode: string]: number | string | undefined;
 }
 
+/**
+ * Structural/metadata keys carried by a {@link ForecastEntry} that are NOT
+ * forecast data variables (API.md section 2.1: the point forecast is a
+ * cross-cycle series where each entry exposes the source ``cycle_time``).
+ *
+ * These fields describe the entry itself (its lead offset, its valid time,
+ * the run that produced it) rather than rendering as a meteorological
+ * variable, so every consumer that derives the "real" forecast-variable set
+ * from a series MUST treat them as excluded. Because the backend attaches
+ * variable codes as dynamic keys, the only sound way to separate the two is
+ * this explicit structural-key set — an allow-by-schema convention. Keeping
+ * the set adjacent to {@link ForecastEntry} ensures a future additive
+ * metadata field is captured here, in the same review, instead of surfacing
+ * later as a bogus chart/ensemble/map request.
+ */
+export const FORECAST_ENTRY_METADATA_FIELDS: ReadonlySet<string> = new Set([
+  "lead_time_hours",
+  "valid_time",
+  "cycle_time",
+]);
+
+/**
+ * Whether a forecast-entry key is a structural/metadata field rather than a
+ * forecast data variable. Shared by the point-forecast and map-variable
+ * extractors so the metadata boundary is governed by one source of truth.
+ */
+export function isForecastEntryMetadataField(key: string): boolean {
+  return FORECAST_ENTRY_METADATA_FIELDS.has(key);
+}
+
+/** Whether a forecast-entry key is a candidate forecast data variable. */
+export function isForecastDataVariable(key: string): boolean {
+  return !isForecastEntryMetadataField(key);
+}
+
 /** The resolved location of a point forecast (API.md section 2.1). */
 export interface PointForecastLocation {
   latitude: number;
