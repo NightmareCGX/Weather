@@ -44,7 +44,7 @@ from ingestion.core.catalog import (
     ModelRunRecord,
     RunCatalogSpec,
     VariableSpec,
-    is_live_run_store,
+    is_ready_run_store,
     record_ingested_dataset,
 )
 from ingestion.core.zarr_writer import (
@@ -174,18 +174,28 @@ def guard_full_overwrite(db: Session, store_path: str) -> None:
     run's store without catalog reconciliation — recreating the stale
     ``forecast_products`` debt. This guard runs at the orchestration boundary
     (NOT inside ``zarr_writer.py``, which stays DB-free): before any such full
-    write, the caller checks whether the target belongs to a live run and, if
-    so, refuses. New/non-live store creation is unaffected.
+    write, the caller checks whether the target belongs to a **ready** run and,
+    if so, refuses. New/non-live store creation is unaffected.
+
+    Live-store semantics: a full overwrite destroys content only when the
+    target has committed content. A ``ready`` row is the only
+    committed-and-quiescent state. A ``processing``/``partial`` row is a
+    placeholder from an in-flight or aborted first ingestion whose store may be
+    genuinely absent (a region-write failure before any data committed);
+    cold-start initializing such a store is the legitimate recovery path and
+    must NOT be refused — otherwise a fresh cycle whose first attempt failed
+    would self-block on retry. A ``ready`` run whose store is missing is instead
+    an external shrink/corruption condition and is refused.
 
     Args:
         db: Database session used to check ``model_runs`` ownership.
         store_path: The store path/URL that would be fully overwritten.
 
     Raises:
-        LiveStoreOverwriteError: If the target is referenced by a live
+        LiveStoreOverwriteError: If the target is referenced by a ready
             ``model_runs`` row.
     """
-    if is_live_run_store(db, store_path):
+    if is_ready_run_store(db, store_path):
         raise LiveStoreOverwriteError(
             f"Refusing to fully overwrite {store_path!r}: the store belongs to "
             "a live model_runs row. A full overwrite would silently shrink or "
