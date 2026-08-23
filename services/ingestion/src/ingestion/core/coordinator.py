@@ -575,7 +575,7 @@ class RunCoordinator:
                     raise RuntimeError(f"run {run_id} not found during finalization")
                 from ingestion.core.catalog import _reconcile_catalog_to_store, _derive_run_status
 
-                _reconcile_catalog_to_store(db, run, committed_state)
+                _reconcile_catalog_to_store(db, run, committed_state, spec)
                 status = _derive_run_status(db, run, spec, committed_state)
                 setattr(run, "status", status)
                 db.commit()

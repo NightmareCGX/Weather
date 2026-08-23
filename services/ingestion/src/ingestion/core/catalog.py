@@ -431,24 +431,36 @@ def _reconcile_catalog_to_store(
     db: Session,
     run: ModelRunRecord,
     committed_state: CommittedState,
+    spec: RunCatalogSpec | None = None,
 ) -> None:
-    """Delete catalog rows whose lead/member is absent from the committed store.
+    """Make the catalog products exactly match the actual committed store.
 
-    The actual committed Zarr state is the source of truth for catalog
-    reconciliation. PATCH semantics: a lead/member is preserved when it is
-    present in the store (regardless of whether the current invocation touched
-    it); a lead/member is deleted only when it is **absent from the store**
-    (genuinely stale). Absence from the current incoming patch is NEVER a
-    deletion signal.
+    The actual committed Zarr state (derived exclusively from COMPLETE
+    marker/generation evidence) is the source of truth for catalog
+    reconciliation. PATCH semantics in BOTH directions:
 
-    Deletion order respects foreign keys (``ensemble_member_products`` and
+    * **stale removal** — a lead/member present in the catalog but absent from
+      the store is deleted (existing behavior);
+    * **missing restoration** — a lead/member physically committed in the store
+      but absent from the catalog is inserted/upserted (new: the bug being
+      fixed). A coordinator-path multi-region run only reached READY when every
+      committed region also had a catalog row; because region workers commit to
+      Zarr without ``record_run``, the catalog silently lagged the store and the
+      run stayed ``partial``.
+
+    Restoration requires authoritative metadata from the run's catalog spec:
+    the variables, grid, product type, store path, and model id used by
+    ``record_run``'s deterministic row-ID convention. When ``spec`` is ``None``
+    (legacy callers that only delete), restoration is skipped and the function
+    behaves exactly as before (delete-only). Row identity is deterministic, so
+    re-running is idempotent (no duplicates, no ID churn).
+
+    Deletion order respects foreign keys (``ensemble_member_products`` then
     ``ensemble_members`` are children of ``model_runs``; ``forecast_products``
-    is a child of ``model_runs``):
-
-    1. ``ensemble_member_products`` pairs not in the committed pair set;
-    2. ``ensemble_members`` whose member index no longer has any committed
-       pair (only for ensemble runs);
-    3. ``forecast_products`` rows whose lead is not in the committed lead set.
+    is a child of ``model_runs``). Restoration order creates parent member rows
+    before their child pair rows, and reuses ``_get_or_create`` so unique
+    constraints are respected (no new race: the caller's transaction + advisory
+    gate serialize reconciliation in production).
 
     This runs in the SAME transaction as the status derivation, so a failed
     reconciliation rolls back atomically.
@@ -457,6 +469,9 @@ def _reconcile_catalog_to_store(
         db: Database session.
         run: The run row.
         committed_state: The actual committed Zarr state (post-write).
+        spec: The run's catalog metadata (variables, grid, product type, store
+            path, model id) used to reconstruct missing rows. ``None`` restricts
+            reconciliation to delete-only (legacy behavior).
     """
     committed_leads = committed_state.lead_set()
 
@@ -470,8 +485,11 @@ def _reconcile_catalog_to_store(
                 EnsembleMemberProductRecord.lead_time_hours,
             ).where(EnsembleMemberProductRecord.run_id == run.id)
         ).all()
+        existing_pairs = {
+            (int(member_num), int(lead_num)) for member_num, lead_num in pair_rows
+        }
         committed_pairs = set(committed_state.pairs or ())
-        for member_num, lead_num in pair_rows:
+        for member_num, lead_num in existing_pairs:
             key = (int(member_num), int(lead_num))
             if key not in committed_pairs:
                 db.execute(
@@ -493,7 +511,38 @@ def _reconcile_catalog_to_store(
             )
         )
 
-    # 3. Delete forecast_products whose lead is absent from the committed set.
+        # 3. Restore missing ensemble member rows + (member, lead) pairs.
+        #    A member is authoritative iff it has at least one committed pair.
+        if spec is not None:
+            for member_number in sorted(committed_members):
+                _get_or_create(
+                    db,
+                    EnsembleMemberRecord,
+                    (EnsembleMemberRecord.run_id == run.id)
+                    & (EnsembleMemberRecord.member_index == member_number),
+                    {
+                        "id": f"member_{member_number}_{run.id}",
+                        "run_id": run.id,
+                        "member_index": member_number,
+                        "member_name": f"{spec.model_id}_member_{member_number}",
+                    },
+                )
+            for member_num, lead_num in sorted(committed_pairs):
+                _get_or_create(
+                    db,
+                    EnsembleMemberProductRecord,
+                    (EnsembleMemberProductRecord.run_id == run.id)
+                    & (EnsembleMemberProductRecord.member_index == member_num)
+                    & (EnsembleMemberProductRecord.lead_time_hours == lead_num),
+                    {
+                        "id": f"member_product_{member_num}_{lead_num}_{run.id}",
+                        "run_id": run.id,
+                        "member_index": member_num,
+                        "lead_time_hours": lead_num,
+                    },
+                )
+
+    # 4. Delete forecast_products whose lead is absent from the committed set.
     db.execute(
         ProductRecord.__table__.delete().where(
             ProductRecord.run_id == run.id,
@@ -502,6 +551,45 @@ def _reconcile_catalog_to_store(
             else ProductRecord.lead_time_hours.is_not(None),
         )
     )
+
+    # 5. Restore missing forecast_products for committed leads. The store's
+    #    committed lead set is authoritative; the per-lead product rows are
+    #    reconstructed from the run spec's variables/grid/product metadata.
+    if spec is not None and spec.variables:
+        grid_code = spec.grid_id
+        product_type = spec.product_type
+        zarr_chunk_path = spec.zarr_store_path or run.zarr_store_path
+        existing_products = set(
+            int(p) for p in db.execute(
+                select(ProductRecord.lead_time_hours).where(
+                    ProductRecord.run_id == run.id
+                )
+            ).scalars()
+        )
+        missing_leads = committed_leads - existing_products
+        for lead in sorted(missing_leads):
+            for variable_code in (v.code for v in spec.variables):
+                _get_or_create(
+                    db,
+                    ProductRecord,
+                    (ProductRecord.run_id == run.id)
+                    & (ProductRecord.variable_id == variable_code)
+                    & (ProductRecord.grid_id == grid_code)
+                    & (ProductRecord.product_type == product_type)
+                    & (ProductRecord.lead_time_hours == lead),
+                    {
+                        "id": (
+                            f"product_{run.id}_{variable_code}_{grid_code}_"
+                            f"{product_type}_{lead}"
+                        ),
+                        "run_id": run.id,
+                        "variable_id": variable_code,
+                        "grid_id": grid_code,
+                        "product_type": product_type,
+                        "lead_time_hours": lead,
+                        "zarr_chunk_path": zarr_chunk_path,
+                    },
+                )
 
 
 def record_run(
@@ -734,10 +822,11 @@ def record_run(
                 )
 
     # Reconcile the catalog to the actual committed Zarr state (source of
-    # truth for PATCH preservation and stale-row elimination). This runs
-    # BEFORE status derivation so status reflects the reconciled catalog.
+    # truth for PATCH preservation, stale-row elimination, AND missing-row
+    # restoration). This runs BEFORE status derivation so status reflects the
+    # reconciled catalog.
     if committed_state is not None:
-        _reconcile_catalog_to_store(db, run, committed_state)
+        _reconcile_catalog_to_store(db, run, committed_state, spec)
 
     # Derive run-level readiness from committed vs expected sets. This is the
     # single decision point: a run becomes READY only when every expected lead
