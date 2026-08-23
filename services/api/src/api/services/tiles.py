@@ -217,6 +217,20 @@ def render_tile_png(
     (no per-pixel Python loop) and the longitude alignment is vectorized
     (no ``np.vectorize``), removing the dominant rendering costs.
 
+    **Connection lifetime (row liveness).** All database metadata — the
+    committed-manifest serving generation, the ready run, and the forecast
+    product — is resolved into plain values *first*, while the request's DB
+    session is live. The session is then closed, returning its QueuePool
+    connection, **before** the expensive Zarr materialize + PNG encode runs.
+    The store read itself goes through ``api.core.reader_gate`` which uses its
+    own dedicated lock pool and revalidates the run is READY on a fresh core
+    query (per ``docs/ARCHITECTURE.md``), so no ORM session is needed after the
+    metadata phase. This keeps a single tile request's database connection
+    checkout to a few milliseconds of catalog queries instead of the full
+    render duration, so a browser viewport's concurrent tile requests cannot
+    exhaust the QueuePool (``pool_size=5``/``max_overflow=10``) even when many
+    tiles need cold reads of a large store.
+
     Args:
         db: Database session.
         model: A model identifier.
@@ -239,7 +253,7 @@ def render_tile_png(
     _validate_tile(zoom, x, y)
     # Resolve the committed-manifest generation for cache identity before the
     # lookup (the tile cache key includes the generation so a same-set data
-    # replacement makes old tiles unreachable).
+    # replacement makes old tiles unreachable). This is a cheap catalog query.
     from api.services.point_forecast import resolve_latest_run_serving_generation
 
     serving_generation = resolve_latest_run_serving_generation(
@@ -252,14 +266,62 @@ def render_tile_png(
     if cached is not None:
         return cached
 
-    run, dataset, lead = _resolve_run_and_field(
-        db,
-        model=model,
+    from api.core import reader_gate
+    from api.core.database import SessionLocal
+
+    session = db
+    excluded: set[str] = set()
+    while True:
+        try:
+            store_path = _resolve_run_store_path(
+                session,
+                model=model,
+                variable=variable,
+                level=level,
+                lead_time_hours=lead_time_hours,
+                initial_time=initial_time,
+                excluded=excluded,
+            )
+        except BaseException:
+            # No usable candidate (404) or a query error: the session's
+            # connection must still be returned to the pool before propagating.
+            session.close()
+            raise
+        # Release this session's DB connection BEFORE the expensive Zarr read.
+        # The reader gate revalidates the run is READY on its own dedicated
+        # lock-pool connection, so no ORM session is needed during the read. On
+        # a broken store the catalog is re-queried on a fresh short-lived
+        # session (rare recovery path) to fall through to the next candidate.
+        session.close()  # return the connection to the QueuePool
+        try:
+            dataset = reader_gate.gated_read_dataset(store_path)
+        except Exception:  # noqa: BLE001 - unreadable/no-longer-ready store
+            excluded.add(store_path)
+            session = SessionLocal()
+            continue
+        break
+    return _render_dataset_to_png(
+        dataset,
         variable=variable,
-        level=level,
+        zoom=zoom,
+        x=x,
+        y=y,
         lead_time_hours=lead_time_hours,
-        initial_time=initial_time,
+        cache_key=cache_key,
     )
+
+
+def _render_dataset_to_png(
+    dataset: xr.Dataset,
+    *,
+    variable: str,
+    zoom: int,
+    x: int,
+    y: int,
+    lead_time_hours: int,
+    cache_key: tuple[object, ...],
+) -> bytes:
+    """Rasterize an already-materialized dataset into a tile PNG (no DB)."""
     grid = _derive_grid(dataset)
     stops = _color_stops(variable)
     data_min, data_max = _data_range(variable)
@@ -280,7 +342,7 @@ def render_tile_png(
     lon_native = _align_longitudes(grid, pixel_lons)
 
     field, lat_axis, lon_axis = _slice_field(
-        dataset, variable, lead, grid, pixel_lats, lon_native
+        dataset, variable, lead_time_hours, grid, pixel_lats, lon_native
     )
 
     # Nearest grid index per pixel, into the *sliced* ascending axes.
@@ -564,7 +626,7 @@ def _resolve_ready_run(
     return runs[0]
 
 
-def _resolve_run_and_field(
+def _resolve_run_store_path(
     db: Session,
     *,
     model: str,
@@ -572,13 +634,23 @@ def _resolve_run_and_field(
     level: str,
     lead_time_hours: int,
     initial_time: str | None,
-) -> tuple[ModelRun, xr.Dataset, int]:
-    """Resolve the ready run and dataset backing a tile request.
+    excluded: set[str],
+) -> str:
+    """Resolve the ready run's Zarr store path for a tile request (catalog only).
+
+    This is the **DB metadata phase** of the tile render. It validates the
+    model/variable/level, selects the newest ready run with a store (optionally
+    pinned to ``initial_time``), and confirms a matching ``forecast_products``
+    row exists. Only cheap catalog queries run here; the caller releases the
+    session/connection before any Zarr read.
+
+    ``excluded`` holds store paths already tried and found unreadable, so the
+    broken-newest-store recovery path falls through to the next-newest ready
+    run (mirroring the legacy ``_resolve_run_and_field`` fallback).
 
     Raises:
         HTTPException: 404 when the model/variable/level/lead combination is
-            not available (no ready run, no matching product, or a store that
-            cannot be read), 422 for an unsupported level.
+            not available, 422 for an unsupported level.
     """
     from fastapi import HTTPException
 
@@ -599,31 +671,31 @@ def _resolve_run_and_field(
         stmt = stmt.where(ModelRun.cycle_time == cycle)
     stmt = stmt.order_by(ModelRun.cycle_time.desc())
     runs = list(db.execute(stmt).scalars().all())
-    if not runs:
+
+    candidates = [
+        run for run in runs
+        if run.zarr_store_path is not None
+        and str(run.zarr_store_path) not in excluded
+    ]
+    if not candidates:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"No ready forecast run with data was found for model '{model}'"
+                f"No readable forecast run with data was found for model '{model}'."
+                if excluded
+                else f"No ready forecast run with data was found for model '{model}'"
                 + (f" and initial time '{initial_time}'." if initial_time else ".")
             ),
         )
 
-    for run in runs:
+    for run in candidates:
         assert run.zarr_store_path is not None
-        try:
-            # Reader-gate: SHARED store gate + fresh Core revalidation so a
-            # store mid-re-ingest is never read.
-            from api.core.reader_gate import gated_read_dataset
-
-            dataset = gated_read_dataset(str(run.zarr_store_path))
-        except Exception:  # noqa: BLE001 - probe store, fall through
-            continue
+        # ``_require_product`` raises 404 when the newest matching run lacks
+        # this exact variable/level/lead product (no fallback to older runs),
+        # preserving the legacy selection semantics.
         _require_product(db, run, variable, level, lead_time_hours)
-        return run, dataset, lead_time_hours
-    raise HTTPException(
-        status_code=404,
-        detail=f"No readable forecast run with data was found for model '{model}'.",
-    )
+        return str(run.zarr_store_path)
+    raise AssertionError("unreachable: every candidate raised in _require_product")
 
 
 def _require_model_variable(db: Session, model: str, variable: str) -> None:
