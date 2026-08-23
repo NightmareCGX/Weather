@@ -53,8 +53,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
-import os
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -699,19 +699,6 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     seed_item = items[0]
     seed_member, seed_lead = seed_item
 
-    async def _prepare_seed(connector: NOAAConnector) -> xr.Dataset:
-        dest = _destination_for(spec, args, lead=seed_lead, member=seed_member)
-        Path(dest).parent.mkdir(parents=True, exist_ok=True)
-        await connector.download(
-            spec.model, spec.cycle_date, spec.cycle_hour, seed_lead, dest, member=seed_member
-        )
-        ds = _parse_for_ingest(dest)
-        ds = _apply_variable_mapping(ds, catalog_spec.variables)
-        ds = _normalize_canonical_units(ds, catalog_spec.variables)
-        ds.attrs["model_id"] = catalog_spec.model_id
-        _validate_requested_lead(ds, seed_lead)
-        return ds
-
     async def _run_wave() -> str:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -720,6 +707,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             RunCoordinator,
             WaveRegion,
         )
+        from ingestion.core.decode_worker import DecodePool
 
         coordinator = RunCoordinator(
             catalog_spec,
@@ -728,12 +716,27 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
         )
         cancel_event = threading.Event()
         executor = ThreadPoolExecutor(max_workers=concurrency)
+        # The persistent decode pool: up to ``concurrency`` reusable worker
+        # processes each holding independent cfgrib/ecCodes native state. Only
+        # the native GRIB decode crosses this boundary. Sized by the number of
+        # distinct decode tasks (never more than concurrency) so a small run
+        # does not spawn unused workers.
+        decode_pool = DecodePool(max_workers=min(len(items), max(1, concurrency)))
         worker_futures = []
         engine = _catalog_session_factory()
 
         async with NOAAConnector() as connector:
-            # 1. Retained seed.
-            seed_dataset = await _prepare_seed(connector)
+            # 1. Retained seed. Download the seed first, then decode it in a
+            #    worker process (the native ecCodes boundary).
+            seed_dest = _destination_for(spec, args, lead=seed_lead, member=seed_member)
+            Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
+            await connector.download(
+                spec.model, spec.cycle_date, spec.cycle_hour, seed_lead, seed_dest,
+                member=seed_member,
+            )
+            seed_future = decode_pool.submit(seed_dest)
+            seed_dataset = _decode_and_normalize(seed_future, catalog_spec)
+            _validate_requested_lead(seed_dataset, seed_lead)
 
             # 2. Determine run id + same-cycle.
             run_id: str | None = None
@@ -782,7 +785,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
                 pre_conn.close()
 
             # 4. Download every non-seed file on the event loop (bounded by a
-            #    semaphore) before dispatching the sync workers.
+            #    semaphore), and submit each file's decode to the process pool.
             download_sem = asyncio.Semaphore(concurrency)
 
             async def _download_non_seed(member: int | None, lead: int) -> None:
@@ -802,18 +805,21 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
                 *[_download_non_seed(m, lead) for m, lead in items if (m, lead) != seed_item]
             )
 
-            # 5. Dispatch region workers (sync, in the executor).
+            # 5. Dispatch region workers (sync, in the executor). Each worker
+            #    submits its file's decode to the process pool (the native
+            #    ecCodes boundary) and awaits MY OWN decode future, so at most
+            #    ``concurrency`` decodes are in flight at once — decode results
+            #    are consumed by the owning thread immediately, bounding
+            #    parent-side decoded-dataset memory to the pool size. After
+            #    decode returns, the pure-numpy mapping/normalization/validation
+            #    runs in the parent before the region write.
             generation_by_region = {r.region_id: r.generation for r in regions}
 
             def _run_region_worker(member: int | None, lead: int) -> None:
                 worker_conn = engine.connect()
                 try:
-                    ds = _parse_for_ingest(
-                        _destination_for(spec, args, lead=lead, member=member)
-                    )
-                    ds = _apply_variable_mapping(ds, catalog_spec.variables)
-                    ds = _normalize_canonical_units(ds, catalog_spec.variables)
-                    ds.attrs["model_id"] = catalog_spec.model_id
+                    dest = _destination_for(spec, args, lead=lead, member=member)
+                    ds = _decode_and_normalize(decode_pool.submit(dest), catalog_spec)
                     _validate_requested_lead(ds, lead)
                     region_id = _region_id_for(lead, member)
                     generation = generation_by_region.get(region_id)
@@ -830,7 +836,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
                 finally:
                     worker_conn.close()
 
-            # 6. Retained-seed writer uses the retained dataset (no re-parse).
+            # 7. Retained-seed writer uses the retained dataset (no re-parse).
             def _run_seed_region() -> None:
                 worker_conn = engine.connect()
                 try:
@@ -849,7 +855,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
                 finally:
                     worker_conn.close()
 
-            # 7. Aggregate drain.
+            # 8. Aggregate drain.
             loop = asyncio.get_event_loop()
             for member, lead in items:
                 if (member, lead) == seed_item:
@@ -868,7 +874,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
                     m, lead = items[idx]
                     failures.append(f"{spec.model} member={m} lead={lead}: {res}")
 
-        # 7. Coalesced finalization (after all worker Futures drained).
+        # 9. Coalesced finalization (after all worker Futures drained).
         fin_conn = engine.connect()
         try:
             run_id = _resolve_run_id(catalog_spec, store_path)
@@ -883,6 +889,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             fin_conn.close()
             engine.dispose()
             executor.shutdown(wait=False)
+            decode_pool.shutdown()
         return status
 
     status = asyncio.run(_run_wave())
@@ -900,11 +907,39 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     )
 
 
-def _parse_for_ingest(destination: str | Path) -> xr.Dataset:
-    """Parse a staged GRIB2 file (used by the CLI's region workers)."""
-    from ingestion.providers.noaa.parser import parse_grib2
+def _decode_and_normalize(
+    future: "concurrent.futures.Future[xr.Dataset]",
+    catalog_spec: RunCatalogSpec,
+) -> xr.Dataset:
+    """Await a decode worker result and normalize it in the parent process.
 
-    return parse_grib2(os.fspath(destination))
+    The GRIB decode itself happened inside an isolated decode worker process
+    (the native ecCodes boundary). Here the parent receives the raw-normalized
+    dataset — transported via pickling — and applies the pure-numpy platform
+    normalization that must stay in the orchestrator: variable-name mapping to
+    the platform vocabulary, canonical-unit conversion, and the model-id
+    attribute. A worker process that died during decode (a native ecCodes
+    abort) surfaces here as ``concurrent.futures.process.BrokenProcessPool``
+    (its ``result()`` raises), which the caller records as a per-file failure —
+    the parent stays alive and the region is never committed.
+
+    Args:
+        future: The decode-pool future for the staged GRIB2 file.
+        catalog_spec: The run's catalog metadata (variable specs + model id).
+
+    Returns:
+        The mapped, canonical-unit, model-tagged dataset.
+
+    Raises:
+        BaseException: The decode worker's exception (or ``BrokenProcessPool``
+            when a worker process died), propagated to the caller's failure
+            accounting.
+    """
+    ds = future.result()
+    ds = _apply_variable_mapping(ds, catalog_spec.variables)
+    ds = _normalize_canonical_units(ds, catalog_spec.variables)
+    ds.attrs["model_id"] = catalog_spec.model_id
+    return ds
 
 
 def _region_id_for(lead: int, member: int | None) -> str:
