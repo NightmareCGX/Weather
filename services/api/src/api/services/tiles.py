@@ -423,13 +423,18 @@ def _render_window_to_png(
     lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
     pixel_lats = np.degrees(lat_rad)
 
-    # Nearest grid index per pixel, into the *sliced* ascending axes.
-    rows = _nearest_indices(lat_axis_arr, pixel_lats)
-    cols = _nearest_indices(lon_axis_arr, pixel_lons)
-
     # Align pixel longitudes into the grid's native convention (the window's
     # lon_axis already matches, so use the grid's start/stop bounds).
     aligned_lons = _align_longitudes(window.grid, pixel_lons)
+
+    # Nearest grid index per pixel, into the *sliced* ascending axes. Columns
+    # MUST use the grid-native aligned longitudes just like the selection stage
+    # (and the pre-Phase-1 renderer): raw ``[-180, 180)`` pixel longitudes have
+    # no consistent displacement within the window's native lon axis and clamp
+    # every western-hemisphere pixel to index 0, rendering mirrored-wrong
+    # bands. ``_align_longitudes`` shifts each pixel by at most one ±360 step.
+    rows = _nearest_indices(lat_axis_arr, pixel_lats)
+    cols = _nearest_indices(lon_axis_arr, aligned_lons)
     valid = _inside_grid(window.grid, pixel_lats, aligned_lons)
     values = field_arr[rows, cols]
 
@@ -614,10 +619,20 @@ def _slice_field(
     lon_native_min = float(lon_native.min())
     lon_native_max = float(lon_native.max())
 
-    lo_lat = float(max(lat_axis_full[0], lat_min))
-    hi_lat = float(min(lat_axis_full[-1], lat_max))
-    lo_lon = float(max(lon_axis_full[0], lon_native_min))
-    hi_lon = float(min(lon_axis_full[-1], lon_native_max))
+    # Pixel-perfect edge handling: the crop must contain every grid cell that a
+    # full-field nearest-neighbor lookup could select for the tile's pixel band.
+    # A pixel anywhere within half a cell of the band's min/max resolves to the
+    # cell JUST OUTSIDE the band, so cropping to the pixel values themselves is
+    # one cell short at every tile border (edge pixels clamp to the inner cell,
+    # a tile-aligned 1-cell band of wrong values). Expand the scalar bounds by
+    # one full grid step each side; full-field nearest-neighbor then selects the
+    # identical cell. Still bounded: +1 cell per edge, not full-global.
+    lat_step = float(lat_axis_full[1] - lat_axis_full[0]) if len(lat_axis_full) > 1 else 1.0
+    lon_step = float(lon_axis_full[1] - lon_axis_full[0]) if len(lon_axis_full) > 1 else 1.0
+    lo_lat = float(max(lat_axis_full[0], lat_min - lat_step))
+    hi_lat = float(min(lat_axis_full[-1], lat_max + lat_step))
+    lo_lon = float(max(lon_axis_full[0], lon_native_min - lon_step))
+    hi_lon = float(min(lon_axis_full[-1], lon_native_max + lon_step))
     if lo_lat > hi_lat or lo_lon > hi_lon:
         # The tile is entirely outside the grid; return a transparent field
         # carrying the full axes so nearest-index lookups stay in bounds.
