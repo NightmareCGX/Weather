@@ -890,8 +890,9 @@ def _interpolate_neighborhood(
     The fractional row/col is computed from the derived ascending ``grid``
     (``row_col_from_coordinates``), then the four surrounding stored indices
     are located (mapping the ascending row/col back into the stored axis
-    orientation when the axis is descending). Only that 2x2 window is read via
-    ``.isel(...).values`` and interpolated with the same formulas as
+    orientation when the axis is descending; the window arrives in ascending
+    row/col ORDER because list indexers preserve order). Only that 2x2 window
+    is read via ``.isel(...).values`` and interpolated with the same formulas as
     :func:`domain.geo.interpolation.bilinear_interpolate` (which would
     otherwise materialize the full 2-D grid).
 
@@ -915,8 +916,13 @@ def _interpolate_neighborhood(
     t_row = row_f - row_0
     t_col = col_f - col_0
 
-    # Map ascending grid row/col to stored axis indices (reverse when stored
-    # descending so the stored window reads the correct rows/columns).
+    # Map ascending grid rows/cols to STORED indices (reverse when stored
+    # descending so the stored window reads the correct rows/columns). xarray
+    # ``isel`` with a LIST indexer returns elements in LIST order, so the
+    # window arrives ordered ``[row_0, row_1]`` / ``[col_0, col_1]`` in the
+    # ascending-grid sense regardless of stored-axis direction -- NO further
+    # in-memory reversal is needed (reversing here would swap the corners and
+    # bias the interpolation by up to ~(1 - 2*t) * cell gradient).
     def _stored(value: int, size: int, descending: bool) -> int:
         return (size - 1 - value) if descending else value
 
@@ -937,11 +943,9 @@ def _interpolate_neighborhood(
     values = np.asarray(window.values, dtype=float)
     if values.ndim == 0:
         values = np.full((1, 1), float(values))
-    # values[stored_row, stored_col]: normalize to ascending-lat/lon layout.
-    if lat_descending:
-        values = values[::-1, :]
-    if lon_descending:
-        values = values[:, ::-1]
+    # Corner layout (ascending-grid sense): values[0, 0] = (row_0, col_0),
+    # values[0, 1] = (row_0, col_1), values[1, 0] = (row_1, col_0),
+    # values[1, 1] = (row_1, col_1).
 
     value_00 = values[0, 0]
     value_01 = values[0, 1]

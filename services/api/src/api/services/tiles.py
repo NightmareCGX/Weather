@@ -571,11 +571,22 @@ def _slice_field(
     mean-then-crop ordering, and ~1,500x fewer chunk reads). Deterministic
     (GFS) fields have no ``member`` axis and are returned unchanged.
 
-    The field is reversed along any descending axis and then sliced to the
-    tile's latitude / native-longitude bounds so only the Zarr chunks
-    overlapping the tile are read. The returned axes are the sliced ascending
-    ``latitude`` and ``longitude`` arrays, used to index the field with
-    nearest-neighbor lookup.
+    The field is cropped to the tile's latitude / native-longitude bounds so
+    only the Zarr chunks overlapping the tile are read. The returned axes are
+    the sliced **ascending** ``latitude`` / ``longitude`` arrays, used to index
+    the field with nearest-neighbor lookup.
+
+    **No negative-step indexing on the lazy backend.** A negative-step slice
+    composed onto a lazily-indexed chunked Zarr array can crash inside xarray's
+    indexer decomposition (``xarray.core.indexing._decompose_slice`` computes
+    ``range(start, stop, step)[-1]``, which raises ``IndexError: range object
+    index out of range`` for any *empty* negative-step slice) at certain
+    latitude/window combinations. Instead, the label-slice arguments are
+    ordered to match each stored axis's own monotonic direction (descending
+    source axis -> ``slice(hi, lo)``), which xarray translates into a plain
+    positive-step positional read; the bounded window is then normalized to
+    ascending orientation *in memory* after materialization (a tiny reverse on
+    an already-small array).
 
     When the tile does not intersect the grid, a 1x1 NaN field with the full
     axes is returned so the caller's mask renders every pixel transparent.
@@ -607,11 +618,6 @@ def _slice_field(
     if "lead_time_hours" in field.dims:
         field = field.sel(lead_time_hours=lead)
 
-    if grid.lat_reversed:
-        field = field.isel(latitude=slice(None, None, -1))
-    if grid.lon_reversed:
-        field = field.isel(longitude=slice(None, None, -1))
-
     lat_axis_full = field.latitude.values
     lon_axis_full = field.longitude.values
     lat_min = float(pixel_lats.min())
@@ -629,20 +635,26 @@ def _slice_field(
     # identical cell. Still bounded: +1 cell per edge, not full-global.
     lat_step = float(lat_axis_full[1] - lat_axis_full[0]) if len(lat_axis_full) > 1 else 1.0
     lon_step = float(lon_axis_full[1] - lon_axis_full[0]) if len(lon_axis_full) > 1 else 1.0
-    lo_lat = float(max(lat_axis_full[0], lat_min - lat_step))
-    hi_lat = float(min(lat_axis_full[-1], lat_max + lat_step))
-    lo_lon = float(max(lon_axis_full[0], lon_native_min - lon_step))
-    hi_lon = float(min(lon_axis_full[-1], lon_native_max + lon_step))
+    lo_lat = float(max(min(lat_axis_full[0], lat_axis_full[-1]), lat_min - abs(lat_step)))
+    hi_lat = float(min(max(lat_axis_full[-1], lat_axis_full[0]), lat_max + abs(lat_step)))
+    lo_lon = float(max(min(lon_axis_full[0], lon_axis_full[-1]), lon_native_min - abs(lon_step)))
+    hi_lon = float(min(max(lon_axis_full[-1], lon_axis_full[0]), lon_native_max + abs(lon_step)))
     if lo_lat > hi_lat or lo_lon > hi_lon:
         # The tile is entirely outside the grid; return a transparent field
         # carrying the full axes so nearest-index lookups stay in bounds.
         return (
             np.full((1, 1), np.nan),
-            np.asarray([lat_axis_full[0]]),
-            np.asarray([lon_axis_full[0]]),
+            np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
+            np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
         )
+    # Direction-aware label slices: a stored-descending axis receives
+    # ``(hi, lo)`` so xarray derives a POSITIVE-step positional slice for the
+    # backend (never a negative-step one). Empty selections (no coordinate in
+    # the band, possible on coarse grids) degrade gracefully to zero-length
+    # windows instead of tripping negative-step decomposition.
     sliced = field.sel(
-        latitude=slice(lo_lat, hi_lat), longitude=slice(lo_lon, hi_lon)
+        latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
+        longitude=slice(hi_lon, lo_lon) if grid.lon_reversed else slice(lo_lon, hi_lon),
     )
     # After the spatial crop, reduce the member axis (GEFS ensemble mean). Only
     # the window's chunks are read for the reduction now.
@@ -653,11 +665,28 @@ def _slice_field(
     # not a renderable surface (the tile endpoint surfaces this as a 422).
     if sliced.ndim != 2:
         raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
-    return (
-        np.asarray(sliced.values, dtype=float),
-        np.asarray(sliced.latitude.values, dtype=float),
-        np.asarray(sliced.longitude.values, dtype=float),
-    )
+    values = np.asarray(sliced.values, dtype=float)
+    lat_sliced = np.asarray(sliced.latitude.values, dtype=float)
+    lon_sliced = np.asarray(sliced.longitude.values, dtype=float)
+    # A band containing no coordinate (possible on coarse/irregular axes)
+    # yields a zero-length window; render it as fully transparent via the
+    # same fallback the outside-the-grid path uses.
+    if values.shape[0] == 0 or values.shape[1] == 0:
+        return (
+            np.full((1, 1), np.nan),
+            np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
+            np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
+        )
+    # Normalize to the renderer's ascending-axis contract IN MEMORY (bounded,
+    # already-materialized): reverse stored-descending windows after release of
+    # the backend selection, never on the lazy object.
+    if len(lat_sliced) > 1 and lat_sliced[-1] < lat_sliced[0]:
+        values = values[::-1, :]
+        lat_sliced = lat_sliced[::-1]
+    if len(lon_sliced) > 1 and lon_sliced[-1] < lon_sliced[0]:
+        values = values[:, ::-1]
+        lon_sliced = lon_sliced[::-1]
+    return (values, lat_sliced, lon_sliced)
 
 
 def _inside_grid(
