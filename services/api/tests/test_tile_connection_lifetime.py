@@ -189,28 +189,33 @@ def _tile_img_url() -> str:
 
 
 def test_tile_connection_released_before_store_read(tile_client, monkeypatch):
-    """The request's DB connection is returned before gated_read_dataset runs.
+    """The request's DB connection is returned before the gated store read.
 
     ``render_tile_png`` is invoked directly with a Session bound to a dedicated
-    engine, and ``gated_read_dataset`` is replaced with a probe that records
-    ``engine.pool.checkedout()`` at the instant the store read begins.
+    engine, and ``gated_read_dataset_with_selector`` is replaced with a probe
+    that records ``engine.pool.checkedout()`` at the instant the store read
+    begins.
 
     * Before the fix the Session (and its checked-out connection) was carried
       into the store read, so the pool reported 1 checked out.
     * After the fix the metadata phase closes the session first, so the pool
       reports 0 checked out when the store read begins.
     """
-    from api.services.tiles import _tile_cache, render_tile_png
+    from api.services.tiles import _TileWindow, _tile_cache, render_tile_png
 
     eng = create_engine(DB_URL, pool_size=5, max_overflow=10, pool_pre_ping=True)
     observed: dict[str, object] = {}
 
-    def fake_gated(store_path: str) -> xr.Dataset:
+    def fake_gated(store_path: str, selector):
         observed["checked_out"] = eng.pool.checkedout()
         observed["store_path"] = store_path
-        return _build_tiny_dataset()
+        # Invoke the selector on the tiny dataset and return its "window".
+        dataset = _build_tiny_dataset()
+        return selector(dataset)
 
-    monkeypatch.setattr("api.core.reader_gate.gated_read_dataset", fake_gated)
+    monkeypatch.setattr(
+        "api.core.reader_gate.gated_read_dataset_with_selector", fake_gated
+    )
 
     _tile_cache.clear()
     db = Session(eng)
@@ -237,6 +242,7 @@ def test_tile_connection_released_before_store_read(tile_client, monkeypatch):
         f"{observed['checked_out']} (>=1 means the session/connection is held "
         f"across the expensive render -> QueuePool exhaustion under tile concurrency)"
     )
+    assert isinstance(png, bytes) and _TileWindow is not None  # narrow typing
 
 
 def test_concurrent_tiles_no_timeout_with_tight_pool(tile_client, monkeypatch):
@@ -257,11 +263,13 @@ def test_concurrent_tiles_no_timeout_with_tight_pool(tile_client, monkeypatch):
 
     tight_engine = create_engine(DB_URL, pool_size=2, max_overflow=2, pool_timeout=0.5, pool_pre_ping=True)
 
-    def fake_slow_gated(store_path: str) -> xr.Dataset:
+    def fake_slow_gated(store_path: str, selector):
         time.sleep(0.6)  # simulate a slow cold Zarr materialize
-        return _build_tiny_dataset()
+        return selector(_build_tiny_dataset())
 
-    monkeypatch.setattr("api.core.reader_gate.gated_read_dataset", fake_slow_gated)
+    monkeypatch.setattr(
+        "api.core.reader_gate.gated_read_dataset_with_selector", fake_slow_gated
+    )
 
     _tile_cache.clear()
     errors: list[BaseException] = []

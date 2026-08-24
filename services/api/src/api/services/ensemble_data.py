@@ -36,7 +36,6 @@ from domain.exceptions import (
     PointOutsideGridError,
 )
 from domain.geo.coordinates import validate_coordinates
-from domain.geo.interpolation import bilinear_interpolate
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -50,7 +49,7 @@ from api.schemas import (
 )
 from api.services.point_forecast import (
     _derive_grid,
-    _field_values,
+    _interpolate_neighborhood,
     _resolve_lead_times,
     _resolve_ready_dataset,
     _resolve_variables,
@@ -120,11 +119,14 @@ def build_probability_forecast(
     """
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    _run, dataset = _resolve_ready_dataset(db, model, initial_time=initial_time)
-    leads = _resolve_lead_times(dataset, lead_time_hours, lead_time_hours)
-    _resolve_variables(db, dataset, [variable])
+    run, metadata = _resolve_ready_dataset(db, model, initial_time=initial_time)
+    leads = _resolve_lead_times(metadata, lead_time_hours, lead_time_hours)
+    _resolve_variables(db, metadata, [variable])
+    assert run.zarr_store_path is not None
 
-    members = _ensemble_member_values(dataset, variable, leads[0], latitude, longitude)
+    members = _gated_member_values(
+        str(run.zarr_store_path), variable, leads[0], latitude, longitude
+    )
     probability = _probability(members, threshold, operator, threshold_max)
     lower, upper = probability_confidence_interval(probability, len(members))
     data: dict[str, Any] = {
@@ -186,11 +188,14 @@ def build_ensemble_statistics(
     """
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    _run, dataset = _resolve_ready_dataset(db, model, initial_time=initial_time)
-    leads = _resolve_lead_times(dataset, lead_time_hours, lead_time_hours)
-    _resolve_variables(db, dataset, [variable])
+    run, metadata = _resolve_ready_dataset(db, model, initial_time=initial_time)
+    leads = _resolve_lead_times(metadata, lead_time_hours, lead_time_hours)
+    _resolve_variables(db, metadata, [variable])
+    assert run.zarr_store_path is not None
 
-    members = _ensemble_member_values(dataset, variable, leads[0], latitude, longitude)
+    members = _gated_member_values(
+        str(run.zarr_store_path), variable, leads[0], latitude, longitude
+    )
     return EnsembleStatisticsData(
         model=model,
         lead_time_hours=lead_time_hours,
@@ -260,14 +265,19 @@ def _probability(
         raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
 
 
-def _ensemble_member_values(
-    dataset: xr.Dataset,
+def _gated_member_values(
+    store_path: str,
     var_code: str,
     lead: int,
     latitude: float,
     longitude: float,
 ) -> list[float]:
     """Interpolate each ensemble member's field at a point and lead time.
+
+    Phase 1 remediation: a single SHARED gate session opens the lazy store and
+    interpolates every member's 2x2 neighborhood around the point — reading
+    only the tiny spatial window per member, never the full global ensemble
+    field.
 
     Returns a flat 1-D list of member values in the dataset's ``member``
     coordinate order, suitable for the ``domain.ensemble`` functions.
@@ -277,50 +287,60 @@ def _ensemble_member_values(
             location is outside the grid, 500 for invalid grid data or a
             non-2-D per-member field.
     """
-    if var_code not in dataset.data_vars:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Variable '{var_code}' is not available in the forecast dataset.",
-        )
-    field = dataset[var_code]
-    if "member" not in field.dims:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Variable '{var_code}' has no ensemble member dimension in "
-                "the forecast dataset."
-            ),
-        )
-    if "lead_time_hours" in field.dims:
-        field = field.sel(lead_time_hours=lead)
+    from api.core.reader_gate import gated_read_dataset_with_selector
 
-    grid, lat_descending, lon_descending = _derive_grid(dataset)
-    member_coord = dataset.coords["member"].values
-    member_count = int(member_coord.size)
-    values: list[float] = []
-    for member_index in range(member_count):
-        member_field = field.isel(member=member_index)
-        if member_field.ndim != 2:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"Variable '{var_code}' is not a 2-D surface field; "
-                    "vertical-level variables are not supported."
-                ),
-            )
-        member_values = _field_values(member_field, lat_descending, lon_descending)
-        try:
-            values.append(
-                float(bilinear_interpolate(grid, member_values, latitude, longitude))
-            )
-        except PointOutsideGridError as exc:
+    def select_and_interpolate(dataset: xr.Dataset) -> list[float]:
+        if var_code not in dataset.data_vars:
             raise HTTPException(
                 status_code=404,
-                detail=f"No forecast data covers the requested location: {exc}",
-            ) from exc
-        except InvalidGridError as exc:
+                detail=f"Variable '{var_code}' is not available in the forecast dataset.",
+            )
+        field = dataset[var_code]
+        if "member" not in field.dims:
             raise HTTPException(
-                status_code=500,
-                detail="The forecast dataset grid is invalid.",
-            ) from exc
-    return values
+                status_code=422,
+                detail=(
+                    f"Variable '{var_code}' has no ensemble member dimension in "
+                    "the forecast dataset."
+                ),
+            )
+        if "lead_time_hours" in field.dims:
+            field = field.sel(lead_time_hours=lead)
+
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        member_count = int(dataset.coords["member"].size)
+        values: list[float] = []
+        for member_index in range(member_count):
+            member_field = field.isel(member=member_index)
+            if member_field.ndim != 2:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Variable '{var_code}' is not a 2-D surface field; "
+                        "vertical-level variables are not supported."
+                    ),
+                )
+            try:
+                values.append(
+                    _interpolate_neighborhood(
+                        member_field,
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+            except PointOutsideGridError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No forecast data covers the requested location: {exc}",
+                ) from exc
+            except InvalidGridError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="The forecast dataset grid is invalid.",
+                ) from exc
+        return values
+
+    return gated_read_dataset_with_selector(store_path, select_and_interpolate)

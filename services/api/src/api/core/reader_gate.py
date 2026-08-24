@@ -23,7 +23,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeVar
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection
@@ -35,6 +35,9 @@ from domain.locks import (
 
 
 logger = logging.getLogger(__name__)
+
+
+T = TypeVar("T")
 
 
 class ReaderGateClosing(Exception):
@@ -221,13 +224,37 @@ class _ReaderGateSession:
         return self._conn
 
 
-def gated_read_dataset(store_path: str) -> Any:
-    """Read a forecast Zarr store under the SHARED reader gate.
+def gated_read_dataset_with_selector(
+    store_path: str,
+    selector: Callable[[Any], T],
+) -> T:
+    """Run a request-bounded selection on a forecast Zarr store under the gate.
 
-    Falls back to a direct materialized read when the reader-gate pool is not
-    initialized (TestClient without a running lifespan, or a non-PostgreSQL
-    test database). This preserves pre-gate serving behavior for tests while
-    production uses the gate.
+    This is the **performance-correct read path** (Phase 1 remediation): the
+    reader gate acquires the SHARED lock, then invokes ``selector`` on the
+    **lazy** xarray dataset. The selector applies the request's bounded
+    selection (lead/member/spatial window/point) and materializes **only** that
+    selection (via ``.values`` / ``np.asarray`` on the bounded array) *inside*
+    the gate, so all Zarr/S3 chunk I/O happens under the SHARED lock. The gate
+    is released only after the selection is fully materialized; the returned
+    value is in-memory (numpy-backed) with no lazy references escaping.
+
+    Contract on ``selector``:
+
+    * It receives the lazily-opened ``xr.Dataset`` and returns an **already
+      materialized** in-memory value (a ``np.ndarray``, a small raw region, a
+      point series, a member vector, or a small named tuple of such values).
+    * It must not return a lazy/full xarray object: it must invoke ``.values``
+      (or an equivalent read) on a *bounded* selection before returning.
+    * It should never index/read the full 2-D ``(lat, lon)`` grid for a tile
+      or point request.
+
+    Args:
+        store_path: The forecast Zarr store path (``s3://`` or local).
+        selector: ``lambda ds: <already-materialized bounded result>``.
+
+    Returns:
+        The in-memory result produced by ``selector``.
 
     Raises:
         FileNotFoundError: If the run is no longer READY (revalidation fails).
@@ -235,10 +262,12 @@ def gated_read_dataset(store_path: str) -> Any:
     from api.core.config import settings
     from api.core.zarr import read_dataset
 
-    def materialize() -> Any:
+    def materialize_selected() -> T:
+        # read_dataset returns a lazily-opened dataset; the selector materializes
+        # only its bounded selection before returning. So no additional .compute()
+        # (which would force a full-store read) is needed here.
         ds = read_dataset(store_path)
-        # Fully materialize under the gate (no lazy chunks escape).
-        return ds.compute()
+        return selector(ds)
 
     try:
         from api.main import reader_lifecycle, reader_pool
@@ -246,14 +275,14 @@ def gated_read_dataset(store_path: str) -> Any:
         reader_lifecycle = None  # type: ignore[assignment]
         reader_pool = None  # type: ignore[assignment]
     if reader_pool is None or reader_lifecycle is None:
-        return materialize()
+        return materialize_selected()
     try:
         return gated_read(
             reader_pool,
             reader_lifecycle,
             store_path=store_path,
             revalidate_db_url=str(settings.DATABASE_URL),
-            materialize=materialize,
+            materialize=materialize_selected,
             timeout_seconds=float(settings.API_READER_GATE_TIMEOUT_SECONDS),
         )
     except (FileNotFoundError, ReaderGateTimeout):
@@ -266,9 +295,9 @@ def gated_read(
     *,
     store_path: str,
     revalidate_db_url: str,
-    materialize: Callable[[], Any],
+    materialize: Callable[[], T],
     timeout_seconds: float = 30.0,
-) -> Any:
+) -> T:
     """Run a fully materialized forecast read under the SHARED store gate.
 
     Args:

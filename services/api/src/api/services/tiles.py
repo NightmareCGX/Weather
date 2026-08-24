@@ -294,35 +294,120 @@ def render_tile_png(
         # session (rare recovery path) to fall through to the next candidate.
         session.close()  # return the connection to the QueuePool
         try:
-            dataset = reader_gate.gated_read_dataset(store_path)
+            # Phase 1 remediation: only the tile's geographic window is read
+            # from the store. The selector receives the lazy dataset, selects
+            # the variable/lead (and member-reduces GEFS), crops the spatial
+            # window, then materializes that bounded window *inside* the gate.
+            windowed = reader_gate.gated_read_dataset_with_selector(
+                store_path,
+                selector=lambda dataset: _select_tile_window(
+                    dataset,
+                    variable=variable,
+                    lead=lead_time_hours,
+                    zoom=zoom,
+                    x=x,
+                    y=y,
+                ),
+            )
         except Exception:  # noqa: BLE001 - unreadable/no-longer-ready store
             excluded.add(store_path)
             session = SessionLocal()
             continue
         break
-    return _render_dataset_to_png(
-        dataset,
+    return _render_window_to_png(
+        windowed,
         variable=variable,
         zoom=zoom,
         x=x,
         y=y,
-        lead_time_hours=lead_time_hours,
         cache_key=cache_key,
     )
 
 
-def _render_dataset_to_png(
+@dataclass(frozen=True)
+class _TileWindow:
+    """A materialized spatial window selected from a forecast store.
+
+    Attributes:
+        field: Ascending ``(lat, lon)`` in-memory numpy array of the window.
+        lat_axis: Ascending latitude coordinates of ``field`` rows.
+        lon_axis: Ascending longitude coordinates of ``field`` columns.
+        grid: The dataset's regular grid (:class:`_TileGrid`).
+    """
+
+    field: npt.NDArray[np.float64]
+    lat_axis: npt.NDArray[np.float64]
+    lon_axis: npt.NDArray[np.float64]
+    grid: _TileGrid
+
+
+def _select_tile_window(
     dataset: xr.Dataset,
+    *,
+    variable: str,
+    lead: int,
+    zoom: int,
+    x: int,
+    y: int,
+) -> _TileWindow:
+    """Gate-time selector: read only the tile's geographic window from the store.
+
+    Runs on the **lazy** dataset *inside* the reader gate. It derives the grid
+    (coordinate arrays only), computes the tile's pixel bounds, selects the
+    variable + lead (and member-reduces GEFS to the ensemble mean), crops the
+    spatial window to the tile bounds, and materializes only that small window
+    via ``sliced.values``. Because ``sliced`` is a ``MemoryCachedArray``-backed
+    selection, ``.values`` reads only the zarr chunks overlapping the window —
+    never the full global field.
+
+    Returns:
+        A :class:`_TileWindow` containing the bounded window + its axes + grid.
+    """
+    grid = _derive_grid(dataset)
+
+    # Compute the tile's geographic bounds (pixel centers), vectorized.
+    n = 2**zoom
+    px_idx, py_idx = np.meshgrid(
+        np.arange(TILE_SIZE, dtype=np.float64),
+        np.arange(TILE_SIZE, dtype=np.float64),
+        indexing="xy",
+    )
+    pixel_lons = ((x + (px_idx + 0.5) / TILE_SIZE) / n) * 360.0 - 180.0
+    y_merc = y + (py_idx + 0.5) / TILE_SIZE
+    lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
+    pixel_lats = np.degrees(lat_rad)
+    lon_native = _align_longitudes(grid, pixel_lons)
+
+    field, lat_axis, lon_axis = _slice_field(
+        dataset, variable, lead, grid, pixel_lats, lon_native
+    )
+    # ``_slice_field`` already materializes the bounded window. Return the
+    # window + its axes + the grid so rendering needs no store access.
+    return _TileWindow(
+        field=np.asarray(field, dtype=np.float64),
+        lat_axis=np.asarray(lat_axis, dtype=np.float64),
+        lon_axis=np.asarray(lon_axis, dtype=np.float64),
+        grid=grid,
+    )
+
+
+def _render_window_to_png(
+    window: _TileWindow,
     *,
     variable: str,
     zoom: int,
     x: int,
     y: int,
-    lead_time_hours: int,
     cache_key: tuple[object, ...],
 ) -> bytes:
-    """Rasterize an already-materialized dataset into a tile PNG (no DB)."""
-    grid = _derive_grid(dataset)
+    """Rasterize an already-materialized spatial window into a tile PNG (no DB).
+
+    All data access already happened under the reader gate; this function is
+    pure CPU (nearest-neighbor pixel sampling + color mapping + PNG encode).
+    """
+    field_arr = window.field
+    lat_axis_arr = window.lat_axis
+    lon_axis_arr = window.lon_axis
     stops = _color_stops(variable)
     data_min, data_max = _data_range(variable)
 
@@ -338,19 +423,15 @@ def _render_dataset_to_png(
     lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
     pixel_lats = np.degrees(lat_rad)
 
-    # Align pixel longitudes into the dataset's native convention up front.
-    lon_native = _align_longitudes(grid, pixel_lons)
-
-    field, lat_axis, lon_axis = _slice_field(
-        dataset, variable, lead_time_hours, grid, pixel_lats, lon_native
-    )
-
     # Nearest grid index per pixel, into the *sliced* ascending axes.
-    rows = _nearest_indices(lat_axis, pixel_lats)
-    cols = _nearest_indices(lon_axis, lon_native)
+    rows = _nearest_indices(lat_axis_arr, pixel_lats)
+    cols = _nearest_indices(lon_axis_arr, pixel_lons)
 
-    valid = _inside_grid(grid, pixel_lats, lon_native)
-    values = field[rows, cols]
+    # Align pixel longitudes into the grid's native convention (the window's
+    # lon_axis already matches, so use the grid's start/stop bounds).
+    aligned_lons = _align_longitudes(window.grid, pixel_lons)
+    valid = _inside_grid(window.grid, pixel_lats, aligned_lons)
+    values = field_arr[rows, cols]
 
     # Fully vectorized color mapping: clamp, interpolate across the stop ramp
     # per RGB channel with ``np.interp``, and build the RGBA scanlines with
@@ -477,6 +558,14 @@ def _slice_field(
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Return the 2-D ascending field and its sliced axes for the tile bounds.
 
+    **Phase 1 remediation ordering:** the spatial crop happens **before** any
+    ensemble-member reduction. For a GEFS ``(member, lead, lat, lon)`` store,
+    cropping to the tile's geographic window first means only the Zarr chunks
+    overlapping the window are read; the subsequent ``mean(dim="member")``
+    operates on that small window (verified numerically identical to the old
+    mean-then-crop ordering, and ~1,500x fewer chunk reads). Deterministic
+    (GFS) fields have no ``member`` axis and are returned unchanged.
+
     The field is reversed along any descending axis and then sliced to the
     tile's latitude / native-longitude bounds so only the Zarr chunks
     overlapping the tile are read. The returned axes are the sliced ascending
@@ -505,14 +594,13 @@ def _slice_field(
     """
     if variable not in dataset.data_vars:
         raise ValueError(f"Variable '{variable}' is not in the dataset.")
-    from api.services.point_forecast import _reduce_surface_field
 
-    field = _reduce_surface_field(dataset[variable], lead=lead)
-    # The shared reduction returns a 2-D ``(latitude, longitude)`` surface; a
-    # field that is still not 2-D after lead selection and member reduction is
-    # not a renderable surface (the tile endpoint surfaces this as a 422).
-    if field.ndim != 2:
-        raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
+    field = dataset[variable]
+    # Phase 1: crop the spatial window FIRST (while the array is lazy), then
+    # reduce the member axis. Cropping before member-reduction reads only the
+    # chunks overlapping the tile instead of the full global field.
+    if "lead_time_hours" in field.dims:
+        field = field.sel(lead_time_hours=lead)
 
     if grid.lat_reversed:
         field = field.isel(latitude=slice(None, None, -1))
@@ -541,6 +629,15 @@ def _slice_field(
     sliced = field.sel(
         latitude=slice(lo_lat, hi_lat), longitude=slice(lo_lon, hi_lon)
     )
+    # After the spatial crop, reduce the member axis (GEFS ensemble mean). Only
+    # the window's chunks are read for the reduction now.
+    if "member" in sliced.dims:
+        sliced = sliced.mean(dim="member", keep_attrs=True)
+    # The shared reduction returns a 2-D ``(latitude, longitude)`` surface; a
+    # field that is still not 2-D after lead selection and member reduction is
+    # not a renderable surface (the tile endpoint surfaces this as a 422).
+    if sliced.ndim != 2:
+        raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
     return (
         np.asarray(sliced.values, dtype=float),
         np.asarray(sliced.latitude.values, dtype=float),

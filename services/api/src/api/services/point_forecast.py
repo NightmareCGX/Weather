@@ -15,6 +15,7 @@ of scope for Milestone 9 and raises a clear error.
 """
 
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,7 +30,6 @@ from domain.exceptions import (
 )
 from domain.geo.coordinates import validate_coordinates
 from domain.geo.grid import RegularGrid
-from domain.geo.interpolation import bilinear_interpolate
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -277,45 +277,35 @@ def build_point_forecast(
             ),
         )
 
-    # For each valid_time, try the candidate cycles in ascending-lead order and
-    # use the first whose store is readable AND actually contains the requested
-    # lead. A broken newest store, or a store whose lead coordinate lacks the
-    # selected lead (stale forecast_products metadata after a same-cycle
-    # re-ingest), therefore falls back to the next READY candidate covering the
-    # same valid_time instead of dropping the record or raising a KeyError.
-    by_cycle: dict[datetime, xr.Dataset] = {}
+    # Phase 1 remediation: metadata (lead/var sets) and point interpolations are
+    # read through *bounded* gate selectors — never the full store. A broken
+    # newest store, or a store whose lead coordinate lacks the selected lead
+    # (stale forecast_products metadata after a same-cycle re-ingest),
+    # therefore falls back to the next READY candidate covering the same
+    # valid_time instead of dropping the record or raising a KeyError.
+    by_cycle: dict[datetime, _CycleMetadata] = {}
 
-    def _open_cycle(cycle_time: datetime) -> xr.Dataset | None:
+    def _open_cycle(cycle_time: datetime) -> _CycleMetadata | None:
         if cycle_time in by_cycle:
             return by_cycle[cycle_time]
         try:
-            dataset = _open_run_store(db, model, cycle_time)
+            store_path = _resolve_cycle_store_path(db, model, cycle_time)
         except HTTPException:
             return None
-        by_cycle[cycle_time] = dataset
-        return dataset
-
-    def _store_has_lead(dataset: xr.Dataset, lead: int) -> bool:
-        """Return whether the opened store actually carries the requested lead.
-
-        ``forecast_products`` is the fast metadata-first candidate-discovery
-        path, but a catalog candidate is only usable when the current Zarr store
-        contains the lead (a same-cycle re-ingest with a different lead set can
-        leave stale product rows pointing at leads the store no longer holds).
-        The check reads only the coordinate, never the full gridded variable.
-        """
-        if "lead_time_hours" not in dataset.coords:
-            return False
-        coord = dataset.coords["lead_time_hours"].values
-        if np.ndim(coord) == 0:
-            return int(coord) == lead
-        return lead in {int(v) for v in coord}
+        if store_path is None:
+            return None
+        try:
+            metadata = gated_cycle_metadata(store_path)
+        except Exception:  # noqa: BLE001 - unreadable store
+            return None
+        by_cycle[cycle_time] = metadata
+        return metadata
 
     resolved: dict[datetime, tuple[datetime, int]] = {}
     for valid_time, pairs in candidates.items():
         for cycle_time, lead in pairs:
-            dataset = _open_cycle(cycle_time)
-            if dataset is None or not _store_has_lead(dataset, lead):
+            metadata = _open_cycle(cycle_time)
+            if metadata is None or lead not in metadata.lead_times:
                 continue
             resolved[valid_time] = (cycle_time, lead)
             break
@@ -326,13 +316,33 @@ def build_point_forecast(
             detail=f"No readable forecast data was found for model '{model}'.",
         )
 
-    # Resolve variables from the union of the opened winning stores.
-    var_codes = _resolve_variables(db, _merge_var_sets(by_cycle.values()), variables)
+    # Resolve variables from the union of the opening cycles' var sets.
+    merged_names = _merge_var_names(by_cycle)
+    var_codes = _resolve_variables(
+        db,
+        _CycleMetadata(lead_times=frozenset(), var_names=frozenset(merged_names)),
+        variables,
+    )
     units_by_code = _variable_units(db, var_codes)
 
     forecasts: list[ForecastSeries] = []
     for valid_time, (cycle_time, lead) in sorted(resolved.items()):
-        dataset = by_cycle[cycle_time]
+        store_path = _resolve_cycle_store_path(db, model, cycle_time)
+        if store_path is None:
+            continue
+        # One bounded gate session interpolates every requested variable at the
+        # point and lead (the small 2x2 neighborhood read under the SHARED lock).
+        values_by_var = gated_point_interpolations(
+            store_path,
+            var_codes=tuple(var_codes),
+            lead=lead,
+            latitude=location.latitude,
+            longitude=location.longitude,
+        )
+        if values_by_var is None:
+            # The store became unreadable between winner resolution and
+            # interpolation; drop this record rather than failing the request.
+            continue
         entry: dict[str, Any] = {
             "lead_time_hours": lead,
             "valid_time": valid_time,
@@ -340,9 +350,7 @@ def build_point_forecast(
             "cycle_time": cycle_time,
         }
         for var_code in var_codes:
-            value = _interpolate_variable(
-                dataset, var_code, lead, location.latitude, location.longitude
-            )
+            value = values_by_var[var_code]
             entry[var_code] = _convert_value(value, units_by_code[var_code], units)
         forecasts.append(ForecastSeries(**entry))
 
@@ -365,26 +373,6 @@ def build_point_forecast(
         generated_at=newest_cycle,
         model=model,
         forecasts=forecasts,
-    )
-
-
-def _merge_var_sets(datasets: Iterable[xr.Dataset]) -> xr.Dataset:
-    """Return a minimal dataset whose data-variable names union the inputs.
-
-    Used to resolve the default variable set across multiple winning runs of a
-    cross-cycle series without loading any gridded data.
-
-    Args:
-        datasets: The opened winning run datasets.
-
-    Returns:
-        A dataset exposing the union of the input data-variable names.
-    """
-    names: set[str] = set()
-    for dataset in datasets:
-        names.update(str(name) for name in dataset.data_vars)
-    return xr.Dataset(
-        {name: (("latitude", "longitude"), np.empty((0, 0))) for name in sorted(names)}
     )
 
 
@@ -477,23 +465,16 @@ def _select_min_lead_winners(
             continue
         assert run.zarr_store_path is not None
         try:
-            # Candidate discovery reads the store's lead axis; use the reader
-            # gate so a store mid-re-ingest is never opened.
-            from api.core.reader_gate import gated_read_dataset
-
-            dataset = gated_read_dataset(str(run.zarr_store_path))
+            # Candidate discovery reads only the store's lead coordinate
+            # metadata (bounded), under the reader gate so a store mid-re-ingest
+            # is never opened — never the full gridded data.
+            metadata = gated_cycle_metadata(str(run.zarr_store_path))
         except Exception as exc:  # noqa: BLE001 - unreadable store
             logger.warning(
                 "Skipping unreadable Zarr store for run %s: %s", run.id, exc
             )
             continue
-        if "lead_time_hours" not in dataset.coords:
-            continue
-        coord = dataset.coords["lead_time_hours"].values
-        if np.ndim(coord) == 0:
-            leads = [int(coord)]
-        else:
-            leads = [int(v) for v in coord]
+        leads = sorted(metadata.lead_times)
         for lead in leads:
             _add(cycle_time, lead)
 
@@ -504,44 +485,16 @@ def _select_min_lead_winners(
     }
 
 
-def _gated_read_dataset(store_path: str) -> xr.Dataset:
-    """Read a forecast Zarr store under the SHARED reader gate.
+def _resolve_cycle_store_path(
+    db: Session, model: str, cycle_time: datetime
+) -> str | None:
+    """Return the READY run's Zarr store path for a cycle, or ``None``.
 
-    The reader participates in the same PostgreSQL store gate as the ingestion
-    writer, so it never observes a store mid-re-ingest. The dataset is fully
-    materialized (xarray open + load) before the gate is released.
-
-    Falls back to a direct read when the reader-gate pool is not initialized
-    (test/development path).
-
-    Raises:
-        FileNotFoundError: If the run is no longer READY (revalidation fails).
-    """
-    from api.core.reader_gate import gated_read_dataset
-
-    result = gated_read_dataset(store_path)
-    if not isinstance(result, xr.Dataset):
-        raise FileNotFoundError(f"run {store_path!r} did not materialize a dataset")
-    return result
-
-
-def _open_run_store(db: Session, model: str, cycle_time: datetime) -> xr.Dataset:
-    """Open the Zarr store of the given READY run, or raise 404.
-
-    Args:
-        db: Database session.
-        model: A single deterministic model identifier.
-        cycle_time: The run's cycle time.
-
-    Returns:
-        The opened dataset.
-
-    Raises:
-        HTTPException: 404 if the run does not exist or its store is unreadable.
+    Catalog-only; no store I/O.
     """
     run = (
         db.execute(
-            select(ModelRun)
+            select(ModelRun.zarr_store_path)
             .join(ModelRun.model_version)
             .join(ModelVersion.model)
             .where(Model.model_id == model)
@@ -552,24 +505,125 @@ def _open_run_store(db: Session, model: str, cycle_time: datetime) -> xr.Dataset
         .scalars()
         .one_or_none()
     )
-    if run is None or run.zarr_store_path is None:
-        raise HTTPException(status_code=404, detail=f"Run for cycle {cycle_time} not found.")
+    return str(run) if run is not None else None
+
+
+@dataclass(frozen=True)
+class _CycleMetadata:
+    """Metadata read from a cycle's store (no gridded data materialized).
+
+    Attributes:
+        lead_times: The store's ``lead_time_hours`` coordinate values.
+        var_names: The store's data-variable names.
+    """
+
+    lead_times: frozenset[int]
+    var_names: frozenset[str]
+
+
+def gated_cycle_metadata(store_path: str) -> _CycleMetadata:
+    """Read a cycle store's lead-time and variable metadata under the gate.
+
+    Reads only coordinate/data-var names (tiny) — never the gridded variables —
+    so a point request never materializes the global field just to discover
+    what the store carries.
+    """
+    from api.core.reader_gate import gated_read_dataset_with_selector
+
+    def select_metadata(dataset: xr.Dataset) -> _CycleMetadata:
+        leads: set[int] = set()
+        if "lead_time_hours" in dataset.coords:
+            coord = dataset.coords["lead_time_hours"].values
+            if np.ndim(coord) == 0:
+                leads.add(int(coord))
+            else:
+                leads = {int(v) for v in coord}
+        names = {str(name) for name in dataset.data_vars}
+        return _CycleMetadata(lead_times=frozenset(leads), var_names=frozenset(names))
+
+    return gated_read_dataset_with_selector(store_path, select_metadata)
+
+
+def gated_point_interpolations(
+    store_path: str,
+    *,
+    var_codes: tuple[str, ...],
+    lead: int,
+    latitude: float,
+    longitude: float,
+) -> dict[str, float] | None:
+    """Interpolate every requested variable at a point/lead under the gate.
+
+    A single SHARED gate session opens the lazy store, derives the grid
+    (coordinates), and for each variable crops the 2x2 interpolation
+    neighborhood around the point, reduces the member axis (GEFS), and
+    materializes only that tiny window. Returns ``{var_code: value}``, or
+    ``None`` if the store is unreadable (caller drops the record).
+    """
+    from api.core.reader_gate import gated_read_dataset_with_selector
+
+    def select_and_interpolate(dataset: xr.Dataset) -> dict[str, float]:
+        grid, lat_desc, lon_desc = _derive_grid(dataset)
+        out: dict[str, float] = {}
+        for var_code in var_codes:
+            if var_code not in dataset.data_vars:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Variable '{var_code}' is not available in the forecast dataset."
+                    ),
+                )
+            field = dataset[var_code]
+            if "lead_time_hours" in field.dims:
+                field = field.sel(lead_time_hours=lead)
+            # Phase 1: member-mean is performed by _interpolate_neighborhood
+            # AFTER the 2x2 crop, so only the window's chunks are read.
+            if field.ndim not in (2, 3):
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Variable '{var_code}' is not a 2-D/3-D (member) surface field; "
+                        "vertical-level variables are not supported."
+                    ),
+                )
+            out[var_code] = float(
+                _interpolate_neighborhood(
+                    field, grid, lat_desc, lon_desc, latitude, longitude
+                )
+            )
+        return out
+
+    from api.core.reader_gate import ReaderGateTimeout
+
     try:
-        # Reader-gate: participate in the SHARED store gate + fresh Core
-        # revalidation so the run is still READY and its store is stable while
-        # this request materializes the dataset.
-        return _gated_read_dataset(str(run.zarr_store_path))
-    except FileNotFoundError as exc:
-        logger.warning("Skipping no-longer-ready Zarr store for run %s", run.id)
+        return gated_read_dataset_with_selector(store_path, select_and_interpolate)
+    except HTTPException:
+        raise
+    except ReaderGateTimeout:
+        raise
+    except PointOutsideGridError as exc:
+        # The point is outside the grid: a 404 (the historical contract).
         raise HTTPException(
             status_code=404,
-            detail=f"Run store for cycle {cycle_time} is no longer ready.",
+            detail=(f"No forecast data covers the requested location: {exc}"),
         ) from exc
-    except Exception as exc:  # noqa: BLE001 - a broken store is "unavailable"
-        logger.warning("Skipping unreadable Zarr store for run %s: %s", run.id, exc)
+    except InvalidGridError as exc:
         raise HTTPException(
-            status_code=404, detail=f"Run store for cycle {cycle_time} is unreadable."
+            status_code=500,
+            detail="The forecast dataset grid is invalid.",
         ) from exc
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 - unreadable store
+        return None
+
+
+def _merge_var_names(by_cycle: dict[datetime, _CycleMetadata]) -> Iterable[str]:
+    """Union the data-variable names across the opening cycles' metadata."""
+    names: set[str] = set()
+    for metadata in by_cycle.values():
+        names.update(metadata.var_names)
+    return sorted(names)
 
 
 def resolve_latest_run_serving_generation(
@@ -661,15 +715,14 @@ def _parse_cycle_time(value: str) -> datetime:
 
 def _resolve_ready_dataset(
     db: Session, model_id: str, initial_time: str | None = None
-) -> tuple[ModelRun, xr.Dataset]:
+) -> tuple[ModelRun, _CycleMetadata]:
     """Return the newest ready run for a model whose Zarr store opens.
 
-    Ready runs are ordered newest-first; each candidate's store is opened in
-    turn and the first one that reads successfully is returned with its
-    dataset. A corrupted, truncated, or momentarily-unreachable store on the
-    newest run therefore falls through to the next-newest readable run instead
-    of failing the request. The store is re-probed per request, so a broken
-    run is skipped only for requests while it remains unreadable.
+    Ready runs are ordered newest-first; each candidate's store is probed in
+    turn (bounded metadata read under the SHARED gate) and the first readable
+    one is returned with its cycle metadata. A corrupted, truncated, or
+    momentarily-unreachable store on the newest run therefore falls through to
+    the next-newest readable run instead of failing the request.
 
     Args:
         db: Database session.
@@ -678,7 +731,9 @@ def _resolve_ready_dataset(
             provided, only the run at that cycle is considered (GAP-2).
 
     Returns:
-        A ``(run, dataset)`` pair for the first readable ready run.
+        A ``(run, metadata)`` pair for the first readable ready run, where
+        ``metadata`` exposes the store's lead times and variable names (no
+        gridded data materialized).
 
     Raises:
         HTTPException: 404 when no ready run exists or none of the ready runs
@@ -707,10 +762,9 @@ def _resolve_ready_dataset(
         assert run.zarr_store_path is not None
         try:
             # Reader-gate: SHARED store gate + fresh Core revalidation so a
-            # store mid-re-ingest is never read.
-            from api.core.reader_gate import gated_read_dataset
-
-            dataset = gated_read_dataset(str(run.zarr_store_path))
+            # store mid-re-ingest is never read. Reads only coordinate/var-name
+            # metadata (bounded), never the gridded variables.
+            metadata = gated_cycle_metadata(str(run.zarr_store_path))
         except Exception as exc:  # noqa: BLE001 - probe store, fall through
             logger.warning(
                 "Skipping unreadable Zarr store for run %s (%s): %s",
@@ -719,7 +773,7 @@ def _resolve_ready_dataset(
                 exc,
             )
             continue
-        return run, dataset
+        return run, metadata
     raise HTTPException(
         status_code=404,
         detail=(
@@ -729,20 +783,29 @@ def _resolve_ready_dataset(
 
 
 def _resolve_lead_times(
-    dataset: xr.Dataset,
+    source: _CycleMetadata | xr.Dataset,
     start: int | None,
     end: int | None,
 ) -> list[int]:
-    if "lead_time_hours" not in dataset.coords:
-        raise HTTPException(
-            status_code=404,
-            detail="The forecast dataset has no lead_time_hours coordinate.",
-        )
-    coord = dataset.coords["lead_time_hours"].values
-    if np.ndim(coord) == 0:
-        available = [int(coord)]
+    available: list[int]
+    if isinstance(source, _CycleMetadata):
+        available = sorted(source.lead_times)
+        if not available:
+            raise HTTPException(
+                status_code=404,
+                detail="The forecast dataset has no lead_time_hours coordinate.",
+            )
     else:
-        available = [int(value) for value in coord]
+        if "lead_time_hours" not in source.coords:
+            raise HTTPException(
+                status_code=404,
+                detail="The forecast dataset has no lead_time_hours coordinate.",
+            )
+        coord = source.coords["lead_time_hours"].values
+        if np.ndim(coord) == 0:
+            available = [int(coord)]
+        else:
+            available = [int(value) for value in coord]
     selected = [
         lead
         for lead in sorted(available)
@@ -758,14 +821,14 @@ def _resolve_lead_times(
 
 def _resolve_variables(
     db: Session,
-    dataset: xr.Dataset,
+    source: _CycleMetadata | xr.Dataset,
     variables: list[str] | None,
 ) -> list[str]:
     """Resolve the requested variable codes.
 
     When ``variables`` is ``None`` the default set is the documented
     ``forecast_variables`` catalog intersected with the variables present in
-    the dataset. This explicit allowlist ensures auxiliary or non-surface
+    the dataset/store. This explicit allowlist ensures auxiliary or non-surface
     dataset variables are never accidentally exposed or interpolated (API.md
     does not define a default variable list; the catalog is the platform's
     documented forecast-variable vocabulary). Provided codes are validated
@@ -773,7 +836,12 @@ def _resolve_variables(
     """
     if variables is None:
         catalog = _catalog_variable_codes(db)
-        return sorted(catalog.intersection(str(name) for name in dataset.data_vars))
+        present = (
+            set(source.var_names)
+            if isinstance(source, _CycleMetadata)
+            else {str(name) for name in source.data_vars}
+        )
+        return sorted(catalog.intersection(present))
     missing = _missing_catalog_variables(db, variables)
     if missing:
         raise HTTPException(
@@ -809,80 +877,80 @@ def _variable_units(db: Session, var_codes: list[str]) -> dict[str, str | None]:
     return {code: units.get(code) for code in var_codes}
 
 
-def _reduce_surface_field(
+def _interpolate_neighborhood(
     field: xr.DataArray,
-    *,
-    lead: int,
-) -> xr.DataArray:
-    """Return a surface field from a (possibly ensemble) dataset variable.
-
-    GEFS stores carry a leading ``member`` dimension. A single-valued surface
-    (a point forecast or a map tile) is the ensemble mean — the platform's
-    documented ensemble aggregate (API.md 5.1 derives statistics from all
-    members). This is the **shared** ensemble-reduction semantic used by the
-    map tile renderer (:mod:`api.services.tiles`) and the point forecast, so
-    both surfaces agree on the ensemble-mean field. Deterministic (GFS) fields
-    have no ``member`` axis and are returned unchanged.
-
-    Only the reduction is shared: the caller validates the resulting field is a
-    plain 2-D surface and maps a non-surface field to its own error semantics
-    (tiles render it as a 422, the point forecast as a 500 — the historical
-    per-surface contract).
-
-    Args:
-        field: The dataset's data variable for the requested forecast variable.
-        lead: The lead time to select.
-
-    Returns:
-        The ``(latitude, longitude)`` surface field for the lead, with the
-        ``member`` axis (when present) reduced by the ensemble mean.
-    """
-    if "lead_time_hours" in field.dims:
-        field = field.sel(lead_time_hours=lead)
-    if "member" in field.dims:
-        # Ensemble stores carry a leading ``member`` axis; the surface renders
-        # the ensemble mean (matching the map tile and the ensemble statistics
-        # mean).
-        field = field.mean(dim="member", keep_attrs=True)
-    return field
-
-
-def _interpolate_variable(
-    dataset: xr.Dataset,
-    var_code: str,
-    lead: int,
+    grid: RegularGrid,
+    lat_descending: bool,
+    lon_descending: bool,
     latitude: float,
     longitude: float,
 ) -> float:
-    if var_code not in dataset.data_vars:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Variable '{var_code}' is not available in the forecast dataset.",
+    """Bilinearly interpolate ``field`` at a point using only the 2x2 window.
+
+    The fractional row/col is computed from the derived ascending ``grid``
+    (``row_col_from_coordinates``), then the four surrounding stored indices
+    are located (mapping the ascending row/col back into the stored axis
+    orientation when the axis is descending). Only that 2x2 window is read via
+    ``.isel(...).values`` and interpolated with the same formulas as
+    :func:`domain.geo.interpolation.bilinear_interpolate` (which would
+    otherwise materialize the full 2-D grid).
+
+    Raises:
+        PointOutsideGridError: If the point lies outside the grid.
+        InvalidGridError: If the grid cannot support interpolation.
+    """
+    if grid.rows < 2 or grid.cols < 2:
+        raise InvalidGridError(
+            "Bilinear interpolation requires at least two rows and two columns; "
+            f"grid is {grid.rows} x {grid.cols}."
         )
-    field = dataset[var_code]
-    field = _reduce_surface_field(field, lead=lead)
-    if field.ndim != 2:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Variable '{var_code}' is not a 2-D surface field; "
-                "vertical-level variables are not supported."
-            ),
-        )
-    grid, lat_descending, lon_descending = _derive_grid(dataset)
-    values = _field_values(field, lat_descending, lon_descending)
-    try:
-        return float(bilinear_interpolate(grid, values, latitude, longitude))
-    except PointOutsideGridError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail=(f"No forecast data covers the requested location: {exc}"),
-        ) from exc
-    except InvalidGridError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="The forecast dataset grid is invalid.",
-        ) from exc
+    row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+    row_0 = math.floor(row_f)
+    col_0 = math.floor(col_f)
+    if row_0 == grid.rows - 1:
+        row_0 = grid.rows - 2
+    if col_0 == grid.cols - 1:
+        col_0 = grid.cols - 2
+    row_1, col_1 = row_0 + 1, col_0 + 1
+    t_row = row_f - row_0
+    t_col = col_f - col_0
+
+    # Map ascending grid row/col to stored axis indices (reverse when stored
+    # descending so the stored window reads the correct rows/columns).
+    def _stored(value: int, size: int, descending: bool) -> int:
+        return (size - 1 - value) if descending else value
+
+    lat_size = int(field.sizes["latitude"])
+    lon_size = int(field.sizes["longitude"])
+    lat_idx = ([_stored(row_0, lat_size, lat_descending),
+                _stored(row_1, lat_size, lat_descending)])
+    lon_idx = ([_stored(col_0, lon_size, lon_descending),
+                _stored(col_1, lon_size, lon_descending)])
+
+    # Phase 1: crop to the 2x2 neighborhood FIRST, then reduce the member
+    # axis. For a GEFS (member, lat, lon) field this reads only the tiny
+    # window's chunk(s) per member instead of the full global grid — matching
+    # the tile path's crop-before-mean ordering (numerically identical).
+    window = field.isel(latitude=lat_idx, longitude=lon_idx)
+    if "member" in window.dims:
+        window = window.mean(dim="member", keep_attrs=True)
+    values = np.asarray(window.values, dtype=float)
+    if values.ndim == 0:
+        values = np.full((1, 1), float(values))
+    # values[stored_row, stored_col]: normalize to ascending-lat/lon layout.
+    if lat_descending:
+        values = values[::-1, :]
+    if lon_descending:
+        values = values[:, ::-1]
+
+    value_00 = values[0, 0]
+    value_01 = values[0, 1]
+    value_10 = values[1, 0]
+    value_11 = values[1, 1]
+
+    lower = value_00 + (value_01 - value_00) * t_col
+    upper = value_10 + (value_11 - value_10) * t_col
+    return float(lower + (upper - lower) * t_row)
 
 
 def _derive_grid(
@@ -980,23 +1048,6 @@ def _ascending(values: list[float]) -> tuple[list[float], bool]:
     if values[-1] < values[0]:
         return list(reversed(values)), True
     return list(values), False
-
-
-def _field_values(
-    field: xr.DataArray,
-    lat_descending: bool,
-    lon_descending: bool,
-) -> list[list[float]]:
-    if lat_descending:
-        field = field.isel(latitude=slice(None, None, -1))
-    if lon_descending:
-        field = field.isel(longitude=slice(None, None, -1))
-    # ``numpy.asarray(...).tolist()`` is typed ``Any`` (numpy's ``Any``
-    # overloads), which would trip ``no-any-return`` under strict mode. The
-    # runtime value is always a nested ``list[float]``, so narrow it through a
-    # typed intermediate.
-    values: list[list[float]] = np.asarray(field.values, dtype=float).tolist()
-    return values
 
 
 def _convert_value(value: float, si_unit: str | None, units: str) -> float:
