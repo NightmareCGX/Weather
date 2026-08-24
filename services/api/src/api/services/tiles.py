@@ -508,6 +508,14 @@ def _slice_field(
     field = dataset[variable]
     if "lead_time_hours" in field.dims:
         field = field.sel(lead_time_hours=lead)
+    # Ensemble (GEFS) stores carry a leading ``member`` dimension. A map tile
+    # is a single deterministic surface image, so the member axis is reduced by
+    # the mean (the platform's documented ensemble aggregate — API.md 5.1
+    # derives statistics from all members; member 0 control is not present in
+    # the real stores, which hold perturbation members 1..30). Reject only if
+    # the field is still not a plain 2-D surface after the reduction.
+    if "member" in field.dims:
+        field = field.mean(dim="member", keep_attrs=True)
     if field.ndim != 2:
         raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
 
