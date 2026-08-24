@@ -223,6 +223,46 @@ def test_point_default_models_single(client):
     assert body["data"]["model"] == "gfs"
 
 
+def test_point_gefs_returns_ensemble_mean(client):
+    """The Hourly Forecast for GEFS serves the ensemble mean.
+
+    Regression for the systematic GEFS serving defect: ``/v1/points`` previously
+    rejected any field carrying a ``member`` dimension with a 500 ("not a 2-D
+    surface field"), so requesting GEFS directly failed while the UI silently
+    fell back to GFS. The point forecast now reduces the member axis by the mean
+    (the shared ensemble aggregate) and returns the ensemble-mean field at the
+    point — matching the map tile and the ensemble statistics mean.
+    """
+    lat = LAT_START + 0.125  # 38.125
+    lon = LON_START + 0.125  # -106.875
+    resp = client.get(f"/v1/points?lat={lat}&lon={lon}&models=gefs")
+    assert resp.status_code == 200
+    body = resp.json()
+    data = body["data"]
+    assert data["model"] == "gefs"
+    entry = {e["lead_time_hours"]: e for e in data["forecasts"]}[6]
+    # Ensemble mean of the fixture: member-0 value + 2 * mean([0..4]=2.0) = +4.0.
+    import numpy as np
+
+    from tests.fixtures import (
+        MEMBER_INDICES,
+        ensemble_precipitation_at,
+        ensemble_temperature_at,
+    )
+
+    member_values = [
+        ensemble_temperature_at(member, lat, lon, 6) for member in MEMBER_INDICES
+    ]
+    expected_mean = float(np.mean(member_values))
+    assert abs(entry["temperature_2m"] - expected_mean) < 1e-9
+    # The GEFS fixture holds precipitation_rate on every member; the Hourly
+    # Forecast precipitation is the ensemble mean of the per-member rate.
+    member_precip = [
+        ensemble_precipitation_at(member, 6) for member in MEMBER_INDICES
+    ]
+    assert abs(entry["precipitation_rate"] - float(np.mean(member_precip))) < 1e-9
+
+
 def test_point_blank_models_rejected(client):
     lat = LAT_START + 0.125
     lon = LON_START + 0.125

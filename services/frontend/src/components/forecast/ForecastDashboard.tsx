@@ -44,13 +44,20 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
   const { selection, options } = useForecastSelection();
   const selectedModel = selection?.model ?? null;
   const selectedModelIsEnsemble = options.model?.is_ensemble ?? false;
-  // The deterministic model used for /v1/points (never an ensemble model):
-  // the selected model when it is deterministic, otherwise the first
-  // deterministic model in availability. Both are database-driven.
-  const pointModel =
-    selectedModel !== null && !selectedModelIsEnsemble
-      ? selectedModel
-      : (options.models.find((model) => !model.is_ensemble)?.id ?? null);
+  // The Hourly Forecast tracks the UI selection. With the backend's
+  // ensemble-mean reduction for a ``member`` dimension, ``/v1/points`` serves
+  // the ensemble mean for an ensemble model (GEFS) exactly as it serves the
+  // deterministic field for GFS — so the selected model is the source model for
+  // both cases. Only when the selection predates a model availability change
+  // (the selected model is not in the current availability) do we fall back to
+  // the first available model. This preserves the invariant "UI selected model =
+  // GEFS ⇒ Hourly Forecast source model = GEFS" (previously the dashboard
+  // silently routed an ensemble selection to the first deterministic model).
+  const selectedModelAvailable =
+    selectedModel !== null && options.models.some((m) => m.id === selectedModel);
+  const pointModel = selectedModelAvailable
+    ? selectedModel
+    : (options.models.find((model) => !model.is_ensemble)?.id ?? null);
 
   const {
     forecast,
@@ -95,7 +102,7 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
         <h3 className="mb-2 text-sm font-semibold text-slate-900">Hourly Forecast</h3>
         {pointModel === null && (
           <p className="text-sm text-slate-500">
-            No deterministic forecast model is available for this selection.
+            No forecast model is available for this selection.
           </p>
         )}
         {pointStatus === "loading" && (

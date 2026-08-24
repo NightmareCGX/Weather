@@ -123,7 +123,18 @@ function mockEnsembleModelSelected() {
       leadTimeHours: 6,
     },
     options: {
-      models: [{ id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] }],
+      // Availability carries both models; the selected GEFS is present so the
+      // Hourly Forecast tracks the UI selection (it must NOT silently fall
+      // back to GFS).
+      models: [
+        { id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] },
+        {
+          id: "gefs",
+          name: "Global Ensemble Forecast System",
+          is_ensemble: true,
+          variables: [],
+        },
+      ],
       model: {
         id: "gefs",
         name: "Global Ensemble Forecast System",
@@ -249,7 +260,15 @@ describe("ForecastDashboard", () => {
         leadTimeHours: 6,
       },
       options: {
-        models: [{ id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] }],
+        models: [
+          { id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] },
+          {
+            id: "gefs",
+            name: "Global Ensemble Forecast System",
+            is_ensemble: true,
+            variables: [],
+          },
+        ],
         model: {
           id: "gefs",
           name: "Global Ensemble Forecast System",
@@ -389,5 +408,40 @@ describe("ForecastDashboard", () => {
       "temperature_2m",
       expect.objectContaining({ model: "gefs" })
     );
+  });
+
+  it("routes the Hourly Forecast to the selected GEFS model (not GFS)", () => {
+    // Invariant: UI selected model = GEFS ⇒ Hourly Forecast source model =
+    // GEFS. The backend point forecast reduces the member axis to the ensemble
+    // mean, so an ensemble model is a valid Hourly source. The dashboard must
+    // NOT silently fall back to the first deterministic model.
+    mockEnsembleModelSelected();
+    mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "idle",
+      error: null,
+      model: "gefs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    expect(mockUsePointForecast).toHaveBeenCalledWith(location, { model: "gefs" });
+    expect(mockUsePointForecast).not.toHaveBeenCalledWith(location, { model: "gfs" });
+  });
+
+  it("keeps the deterministic selected model as the Hourly source", () => {
+    // GFS selected → Hourly Forecast uses GFS (no fallback changes).
+    mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "idle",
+      error: null,
+      model: "gfs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    expect(mockUsePointForecast).toHaveBeenCalledWith(location, { model: "gfs" });
   });
 });

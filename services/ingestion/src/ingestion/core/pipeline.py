@@ -132,6 +132,13 @@ def read_committed_state(
             "'lead_time_hours' coordinate."
         )
     lead_values = dataset.coords["lead_time_hours"].values
+    # The store's real variable set is the source of truth for catalog ↔ store
+    # variable honesty: the catalog must only advertise products for variables
+    # the store actually carries (e.g. a GEFS store never has
+    # ``precipitation_rate`` because GEFS pgrb2s has no instant prate field).
+    # Recording the store's data variables here lets reconciliation prune stale
+    # products for store-absent variables and never restore them.
+    store_variables = {str(name) for name in dataset.data_vars}
 
     if not is_ensemble:
         committed_leads: set[int] = set()
@@ -143,7 +150,7 @@ def read_committed_state(
             for idx, value in enumerate(has.values):
                 if bool(value):
                     committed_leads.add(int(lead_values[idx]))
-        return CommittedState.deterministic(committed_leads)
+        return CommittedState.deterministic(committed_leads, variables=store_variables)
 
     if "member" not in dataset.coords:
         raise ValueError(
@@ -162,7 +169,9 @@ def read_committed_state(
                 if bool(has.values[mi, li]):
                     committed_pairs.add((int(member_val), int(lead_val)))
     committed_members = {member for member, _ in committed_pairs}
-    return CommittedState.ensemble(committed_pairs, committed_members)
+    return CommittedState.ensemble(
+        committed_pairs, committed_members, variables=store_variables
+    )
 
 
 def guard_full_overwrite(db: Session, store_path: str) -> None:

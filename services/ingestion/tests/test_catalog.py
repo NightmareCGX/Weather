@@ -164,6 +164,40 @@ def test_record_run_products_cover_each_variable_and_lead(session: Session) -> N
     assert all(row.product_type == "surface" for row in rows)
 
 
+def test_record_run_products_only_for_store_variables(session: Session) -> None:
+    """Catalog products are recorded only for variables the store actually
+    carries (catalog↔store variable-honesty contract).
+
+    Regression for the systemic GEFS defect: the shared ``DEFAULT_VARIABLES``
+    vocabulary declares ``precipitation_rate`` for every model, but a real GEFS
+    ``pgrb2s`` file has no instantaneous ``prate`` field — so a GEFS store
+    holds only ``temperature_2m``. Recording a product for a store-absent
+    variable made availability advertise data that could never be served (a map
+    422 / ensemble 404). The ``forecast_variables`` registry row is still
+    created for the full vocabulary (platform-wide, model-agnostic); only the
+    per-run ``forecast_products`` rows (which drive availability/serving) are
+    filtered to the store's real data variables.
+    """
+    dataset = _dataset(with_member=True).drop_vars("precipitation_rate")
+    run = record_run(
+        session,
+        _spec(is_ensemble=True, model_id="gefs"),
+        dataset,
+    )
+    # The vocabulary registry still records both documented variables...
+    assert session.query(VariableRecord).count() == 2
+    # ...but only temperature_2m gets product rows (the store lacks
+    # precipitation_rate): 1 variable x 2 leads = 2 products.
+    products = {(row.variable_id, row.lead_time_hours) for row in session.query(ProductRecord).all()}
+    assert products == {
+        ("temperature_2m", 0),
+        ("temperature_2m", 6),
+    }
+    # The run still becomes ready (product completeness is satisfied by the
+    # store's real variable set — there is no expected set to be missing).
+    assert run.status == "ready"
+
+
 def test_record_run_naive_cycle_time_normalized_to_utc(session: Session) -> None:
     spec = _spec(cycle_time=datetime(2026, 7, 21, 0, 0))  # naive
     run = record_run(session, spec, _dataset())

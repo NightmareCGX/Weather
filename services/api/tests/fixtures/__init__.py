@@ -237,6 +237,23 @@ MEMBER_COUNT = 5
 #: Member coordinate values of the ensemble fixture dataset.
 MEMBER_INDICES = list(range(MEMBER_COUNT))
 
+#: The canonical set of GEFS variables the fixture GEFS store carries. This is
+#: the **contract** for the table-driven GEFS surface regression tests: every
+#: variable here must be servable across Map / Hourly Forecast (points) /
+#: Ensemble Statistics. A future GEFS variable addition must extend this set
+#: and thereby fail CI if one serving surface is forgotten.
+GEFS_FIXTURE_VARIABLES: tuple[str, ...] = (
+    "temperature_2m",
+    "precipitation_rate",
+)
+
+#: The canonical set of GFS (deterministic) variables the fixture GFS store
+#: carries. Added for the deterministic non-regression matrix.
+GFS_FIXTURE_VARIABLES: tuple[str, ...] = (
+    "temperature_2m",
+    "precipitation_rate",
+)
+
 
 def build_ensemble_dataset() -> xr.Dataset:
     """Build a deterministic ensemble dataset with surface variables.

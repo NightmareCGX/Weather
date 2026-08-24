@@ -83,33 +83,58 @@ class CommittedState:
         pairs: The set of committed ``(member, lead)`` pairs for ensemble
             runs. ``None`` for deterministic runs.
         is_ensemble: Whether the store carries a ``member`` axis.
+        variables: The set of data variables actually present in the store
+            (the run's real store contents). ``None`` when unknown (legacy
+            callers that never read the store); when known it is the source of
+            truth for catalog ↔ store variable honesty — products are only
+            restored for variables the store actually carries, and products for
+            store-absent variables are stale and deleted.
     """
 
     leads: frozenset[int]
     members: frozenset[int] | None
     pairs: frozenset[tuple[int, int]] | None
     is_ensemble: bool
+    variables: frozenset[str] | None = None
 
     @classmethod
-    def deterministic(cls, leads: set[int]) -> CommittedState:
-        """Build the committed state of a deterministic (non-ensemble) store."""
-        return cls(leads=frozenset(leads), members=None, pairs=None, is_ensemble=False)
+    def deterministic(
+        cls, leads: set[int], variables: set[str] | None = None
+    ) -> CommittedState:
+        """Build the committed state of a deterministic (non-ensemble) store.
+
+        Args:
+            leads: The committed lead set.
+            variables: The store's data-variable set, when known.
+        """
+        return cls(
+            leads=frozenset(leads),
+            members=None,
+            pairs=None,
+            is_ensemble=False,
+            variables=frozenset(variables) if variables is not None else None,
+        )
 
     @classmethod
     def ensemble(
-        cls, pairs: set[tuple[int, int]], members: set[int]
+        cls,
+        pairs: set[tuple[int, int]],
+        members: set[int],
+        variables: set[str] | None = None,
     ) -> CommittedState:
         """Build the committed state of an ensemble store.
 
         Args:
             pairs: The committed ``(member, lead)`` pairs.
             members: The member indices that have at least one committed pair.
+            variables: The store's data-variable set, when known.
         """
         return cls(
             leads=frozenset(lead for _, lead in pairs),
             members=frozenset(members),
             pairs=frozenset(pairs),
             is_ensemble=True,
+            variables=frozenset(variables) if variables is not None else None,
         )
 
     def lead_set(self) -> set[int]:
@@ -542,7 +567,13 @@ def _reconcile_catalog_to_store(
                     },
                 )
 
-    # 4. Delete forecast_products whose lead is absent from the committed set.
+    # 4. Delete forecast_products the store does not actually carry. Two stale
+    #    classes are removed: products whose lead is absent from the committed
+    #    set, and (when the store's real variable set is known) products whose
+    #    variable is absent from the store (e.g. a GEFS store that never holds
+    #    ``precipitation_rate`` because GEFS pgrb2s has no instant prate). A
+    #    store-absent variable must never remain advertised — that is exactly
+    #    the map-422 / ensemble-404 false-availability class.
     db.execute(
         ProductRecord.__table__.delete().where(
             ProductRecord.run_id == run.id,
@@ -551,10 +582,23 @@ def _reconcile_catalog_to_store(
             else ProductRecord.lead_time_hours.is_not(None),
         )
     )
+    store_vars = committed_state.variables
+    if store_vars is not None:
+        db.execute(
+            ProductRecord.__table__.delete().where(
+                ProductRecord.run_id == run.id,
+                ProductRecord.variable_id.not_in(store_vars)
+                if store_vars
+                else ProductRecord.variable_id.is_not(None),
+            )
+        )
 
     # 5. Restore missing forecast_products for committed leads. The store's
     #    committed lead set is authoritative; the per-lead product rows are
-    #    reconstructed from the run spec's variables/grid/product metadata.
+    #    reconstructed from the run spec's variables/grid/product metadata. Only
+    #    variables the store actually carries are restored (a spec variable that
+    #    is absent from the store — GEFS ``precipitation_rate`` — is never
+    #    reconstructed, consistent with step 4 and with ``record_run``).
     if spec is not None and spec.variables:
         grid_code = spec.grid_id
         product_type = spec.product_type
@@ -567,8 +611,13 @@ def _reconcile_catalog_to_store(
             ).scalars()
         )
         missing_leads = committed_leads - existing_products
+        restore_variables = [
+            v.code
+            for v in spec.variables
+            if store_vars is None or v.code in store_vars
+        ]
         for lead in sorted(missing_leads):
-            for variable_code in (v.code for v in spec.variables):
+            for variable_code in restore_variables:
                 _get_or_create(
                     db,
                     ProductRecord,
@@ -726,6 +775,20 @@ def record_run(
         },
     )
 
+    # The catalog must only advertise variables the run's store actually
+    # carries. ``spec.variables`` is the platform's documented vocabulary (the
+    # same list is shared by GFS and GEFS), but a model product may genuinely
+    # omit a variable (e.g. GEFS ``pgrb2s`` files have no instantaneous
+    # ``prate`` field, so a GEFS store never holds ``precipitation_rate``).
+    # Recording products for a variable absent from the store would make
+    # availability advertise data that cannot be served (a map 422 / ensemble
+    # 404). ``dataset.data_vars`` is the truth: a variable is recorded only when
+    # the mapped dataset actually contains it. The ``forecast_variables``
+    # catalog row is still created for every documented variable (the platform
+    # vocabulary is model-agnostic); only the per-run ``forecast_products``
+    # rows (which drive availability/serving) are filtered to the store's real
+    # contents.
+    dataset_vars = {str(name) for name in dataset.data_vars}
     variable_codes: list[str] = []
     for variable in spec.variables:
         variable_record = _get_or_create(
@@ -739,7 +802,8 @@ def record_run(
                 "unit": variable.unit,
             },
         )
-        variable_codes.append(variable_record.variable_code)
+        if variable_record.variable_code in dataset_vars:
+            variable_codes.append(variable_record.variable_code)
 
     for lead in _lead_times(dataset):
         for variable_code in variable_codes:

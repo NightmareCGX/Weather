@@ -505,17 +505,12 @@ def _slice_field(
     """
     if variable not in dataset.data_vars:
         raise ValueError(f"Variable '{variable}' is not in the dataset.")
-    field = dataset[variable]
-    if "lead_time_hours" in field.dims:
-        field = field.sel(lead_time_hours=lead)
-    # Ensemble (GEFS) stores carry a leading ``member`` dimension. A map tile
-    # is a single deterministic surface image, so the member axis is reduced by
-    # the mean (the platform's documented ensemble aggregate — API.md 5.1
-    # derives statistics from all members; member 0 control is not present in
-    # the real stores, which hold perturbation members 1..30). Reject only if
-    # the field is still not a plain 2-D surface after the reduction.
-    if "member" in field.dims:
-        field = field.mean(dim="member", keep_attrs=True)
+    from api.services.point_forecast import _reduce_surface_field
+
+    field = _reduce_surface_field(dataset[variable], lead=lead)
+    # The shared reduction returns a 2-D ``(latitude, longitude)`` surface; a
+    # field that is still not 2-D after lead selection and member reduction is
+    # not a renderable surface (the tile endpoint surfaces this as a 422).
     if field.ndim != 2:
         raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
 
