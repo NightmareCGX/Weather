@@ -809,6 +809,44 @@ def _variable_units(db: Session, var_codes: list[str]) -> dict[str, str | None]:
     return {code: units.get(code) for code in var_codes}
 
 
+def _reduce_surface_field(
+    field: xr.DataArray,
+    *,
+    lead: int,
+) -> xr.DataArray:
+    """Return a surface field from a (possibly ensemble) dataset variable.
+
+    GEFS stores carry a leading ``member`` dimension. A single-valued surface
+    (a point forecast or a map tile) is the ensemble mean — the platform's
+    documented ensemble aggregate (API.md 5.1 derives statistics from all
+    members). This is the **shared** ensemble-reduction semantic used by the
+    map tile renderer (:mod:`api.services.tiles`) and the point forecast, so
+    both surfaces agree on the ensemble-mean field. Deterministic (GFS) fields
+    have no ``member`` axis and are returned unchanged.
+
+    Only the reduction is shared: the caller validates the resulting field is a
+    plain 2-D surface and maps a non-surface field to its own error semantics
+    (tiles render it as a 422, the point forecast as a 500 — the historical
+    per-surface contract).
+
+    Args:
+        field: The dataset's data variable for the requested forecast variable.
+        lead: The lead time to select.
+
+    Returns:
+        The ``(latitude, longitude)`` surface field for the lead, with the
+        ``member`` axis (when present) reduced by the ensemble mean.
+    """
+    if "lead_time_hours" in field.dims:
+        field = field.sel(lead_time_hours=lead)
+    if "member" in field.dims:
+        # Ensemble stores carry a leading ``member`` axis; the surface renders
+        # the ensemble mean (matching the map tile and the ensemble statistics
+        # mean).
+        field = field.mean(dim="member", keep_attrs=True)
+    return field
+
+
 def _interpolate_variable(
     dataset: xr.Dataset,
     var_code: str,
@@ -822,8 +860,7 @@ def _interpolate_variable(
             detail=f"Variable '{var_code}' is not available in the forecast dataset.",
         )
     field = dataset[var_code]
-    if "lead_time_hours" in field.dims:
-        field = field.sel(lead_time_hours=lead)
+    field = _reduce_surface_field(field, lead=lead)
     if field.ndim != 2:
         raise HTTPException(
             status_code=500,

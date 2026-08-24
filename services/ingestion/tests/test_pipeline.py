@@ -310,11 +310,14 @@ def test_ingest_grib_file_parses_writes_and_records(
     assert session.query(ModelRecord).count() == 1
     assert session.query(CenterRecord).count() == 1
     assert session.query(GridRecord).count() == 1
-    # The catalog records the spec's platform variables (a registry), and one
-    # product row per (variable x lead). The fixture has one lead and the spec
-    # declares two variables.
+    # The catalog records the spec's platform variables (a registry, model-
+    # agnostic), but only ONE product row: the parsed fixture (a single-message
+    # t2m file) contains only ``temperature_2m``, and the catalog must never
+    # advertise a product for a variable the store does not actually carry
+    # (the catalog↔store variable-honesty contract). The spec declares two
+    # variables; the store holds one.
     assert session.query(VariableRecord).count() == 2
-    assert session.query(ProductRecord).count() == 2
+    assert session.query(ProductRecord).count() == 1
 
 
 def test_ingest_grib_file_store_uses_platform_variable(tmp_path) -> None:

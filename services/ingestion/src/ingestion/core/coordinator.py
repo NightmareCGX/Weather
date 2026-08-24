@@ -669,10 +669,15 @@ class RunCoordinator:
             leads.add(lead)
             if member is not None:
                 pairs.add((member, lead))
+        # The store's real variable set (used for catalog ↔ store variable
+        # honesty during reconciliation). Read once from the store's schema.
+        store_vars = set(_store_data_var_paths(self.store_path))
         if self.spec.is_ensemble:
             members = {m for m, _ in pairs}
-            return CommittedState.ensemble(pairs, members)
-        return CommittedState.deterministic(leads)
+            return CommittedState.ensemble(
+                pairs, members, variables=store_vars
+            )
+        return CommittedState.deterministic(leads, variables=store_vars)
 
 
 def _validate_store_identity(

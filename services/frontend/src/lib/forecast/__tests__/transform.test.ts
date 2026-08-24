@@ -1,5 +1,10 @@
 import type { EnsembleStatisticsData, ForecastEntry } from "@/lib/api/types";
 import {
+  FORECAST_ENTRY_METADATA_FIELDS,
+  isForecastDataVariable,
+  isForecastEntryMetadataField,
+} from "@/lib/api/types";
+import {
   distributionSummary,
   ensembleStatisticsEntries,
   forecastLeadTimes,
@@ -32,6 +37,53 @@ const entries: ForecastEntry[] = [
   },
 ];
 
+/**
+ * A forecast entry carrying every structural/metadata field the backend
+ * attaches to a point-forecast series (API.md section 2.1: lead offset, valid
+ * time, and the additive cross-cycle provenance `cycle_time`).
+ */
+const entriesWithEveryMetadataField: ForecastEntry[] = [
+  {
+    lead_time_hours: 0,
+    valid_time: "2026-07-21T00:00:00Z",
+    cycle_time: "2026-07-21T00:00:00Z",
+    temperature_2m: 10,
+    precipitation_rate: 0,
+  },
+  {
+    lead_time_hours: 6,
+    valid_time: "2026-07-21T06:00:00Z",
+    cycle_time: "2026-07-21T00:00:00Z",
+    temperature_2m: 13,
+    precipitation_rate: 3,
+  },
+];
+
+describe("FORECAST_ENTRY_METADATA_FIELDS", () => {
+  it("classifies every structural forecast-entry field as metadata", () => {
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("lead_time_hours")).toBe(true);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("valid_time")).toBe(true);
+    // The additive cross-cycle provenance field must never render as a
+    // variable or be sent as /v1/ensembles?variable=….
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("cycle_time")).toBe(true);
+  });
+
+  it("does not classify real forecast variables as metadata", () => {
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("temperature_2m")).toBe(false);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_rate")).toBe(false);
+  });
+
+  it("exposes the guards for every field in the set and for variables", () => {
+    const metadataFields = Array.from(FORECAST_ENTRY_METADATA_FIELDS);
+    for (const field of metadataFields) {
+      expect(isForecastEntryMetadataField(field)).toBe(true);
+      expect(isForecastDataVariable(field)).toBe(false);
+    }
+    expect(isForecastEntryMetadataField("temperature_2m")).toBe(false);
+    expect(isForecastDataVariable("temperature_2m")).toBe(true);
+  });
+});
+
 describe("forecastVariableCodes", () => {
   it("returns only the variable keys, excluding structural keys", () => {
     expect(forecastVariableCodes(entries)).toEqual(["temperature_2m", "precipitation_rate"]);
@@ -41,6 +93,21 @@ describe("forecastVariableCodes", () => {
     expect(
       forecastVariableCodes([{ lead_time_hours: 0, valid_time: "2026-07-21T00:00:00Z" }])
     ).toEqual([]);
+  });
+
+  it("excludes every metadata/coordinate field, not just cycle_time", () => {
+    // The regression contract: metadata/coordinate fields are excluded from
+    // renderable forecast variables, so they can never reach chart titles or
+    // /v1/ensembles?variable=…. Assert the exclusion over the full documented
+    // structural set, not an individual-cycle_time special case.
+    const metadataFields = Array.from(FORECAST_ENTRY_METADATA_FIELDS);
+    for (const field of metadataFields) {
+      expect(forecastVariableCodes(entriesWithEveryMetadataField)).not.toContain(field);
+    }
+    expect(forecastVariableCodes(entriesWithEveryMetadataField)).toEqual([
+      "temperature_2m",
+      "precipitation_rate",
+    ]);
   });
 });
 

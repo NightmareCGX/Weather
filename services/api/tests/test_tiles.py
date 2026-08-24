@@ -136,6 +136,90 @@ def test_tile_lead_not_available_404(client):
     assert resp.json()["error"]["type"] == "not_found_error"
 
 
+def test_tile_renders_ensemble_map_png(client):
+    """A supported GEFS tile request must render, not 422.
+
+    The fixture gefs store holds ``temperature_2m(member, lead, lat, lon)``;
+    the tile endpoint must reduce the ``member`` dimension (ensemble mean) and
+    return a real 256x256 PNG. Regression test for the GEFS map-tile 422: the
+    renderer previously rejected any field with ndim > 2 after lead selection.
+    """
+    resp = client.get(
+        "/v1/maps/gefs/temperature_2m/surface/8/51/98.png?lead_time_hours=6"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"] == "image/png"
+    width, height = _png_dimensions(resp.content)
+    assert (width, height) == (256, 256)
+    assert _png_has_opaque_pixels(resp.content)
+
+
+def test_tile_renders_ensemble_precipitation_png(client):
+    """The ensemble precipitation field is also renderable as a map tile."""
+    resp = client.get(
+        "/v1/maps/gefs/precipitation_rate/surface/8/51/98.png?lead_time_hours=6"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"] == "image/png"
+    assert _png_has_opaque_pixels(resp.content)
+
+
+def test_ensemble_tile_reduces_member_dimension_to_mean():
+    """GEFS map tiles render the ensemble mean, not a single member.
+
+    The documented ensemble contract (API.md 5.1) derives statistics from all
+    members; the map tile therefore reduces the ``member`` dimension by the
+    mean so the rendered field is the deterministic ensemble-mean surface
+    (member 0 is not a valid selection — the real stores carry only
+    perturbation members 1..30). This asserts the *semantics* of the member
+    reduction, not merely HTTP 200.
+    """
+    import numpy as np
+
+    from api.services.tiles import _slice_field
+    from tests.fixtures import (
+        LATITUDES,
+        LONGITUDES,
+        build_ensemble_dataset,
+        ensemble_temperature_at,
+    )
+
+    dataset = build_ensemble_dataset()
+    # Mean over members of the fixture ensemble temperature (analytic field:
+    # base + 0.5*lead + 2*member) is base + 0.5*lead + 2*mean([0..4]) = +4.0.
+    grid_lat = np.asarray(LATITUDES)
+    grid_lon = np.asarray(LONGITUDES)
+    lead = 6
+    field, lat_axis, lon_axis = _slice_field(
+        dataset, "temperature_2m", lead, _derive_grid_fixture(dataset),
+        grid_lat, grid_lon,
+    )
+    # The whole grid is inside the slice window, so the field equals the mean.
+    expected = np.array(
+        [
+            [
+                ensemble_temperature_at(member, lat, lon, lead)
+                for member in [0, 1, 2, 3, 4]
+            ]
+            for lat in LATITUDES
+            for lon in LONGITUDES
+        ]
+    ).reshape(len(LATITUDES), len(LONGITUDES), -1).mean(axis=2)
+    assert field.shape == expected.shape
+    # Mean over members is the additive constant 4.0 above the member-0 field
+    # base; assert the rendered grid matches the ensemble-mean surface.
+    for i, lat in enumerate(LATITUDES):
+        for j, lon in enumerate(LONGITUDES):
+            assert abs(field[i, j] - expected[i, j]) < 1e-6
+
+
+def _derive_grid_fixture(dataset):
+    """Small helper: derive the grid for the fixture ensemble dataset."""
+    from api.services.tiles import _derive_grid
+
+    return _derive_grid(dataset)
+
+
 # --- Raster cache identity (ACCEPTANCE_REMEDIATION_PLAN §12) ---
 
 

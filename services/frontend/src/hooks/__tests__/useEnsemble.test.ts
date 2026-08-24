@@ -112,6 +112,32 @@ describe("useEnsemble", () => {
     );
   });
 
+  it("never issues a request with a metadata/coordinate field as the variable", async () => {
+    // Regression: a metadata/coordinate field such as `cycle_time` must never
+    // reach the API as `variable=…`. A single polluted `variable` fans out
+    // invalid 404 requests across EVERY lead time, so assert the exact query
+    // string carried by every request in a multi-lead fan-out.
+    mockFetch.mockResolvedValueOnce(statsResponse(0));
+    mockFetch.mockResolvedValueOnce(statsResponse(6));
+    mockFetch.mockResolvedValueOnce(statsResponse(12));
+
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6, 12], "temperature_2m", { model: "gefs" })
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    const queriedVariables = mockFetch.mock.calls.map(([input]) => {
+      const url = new URL(String(input), "http://localhost");
+      return url.searchParams.get("variable");
+    });
+    expect(queriedVariables).toEqual(["temperature_2m", "temperature_2m", "temperature_2m"]);
+    expect(queriedVariables).not.toContain("cycle_time");
+    expect(queriedVariables).not.toContain("lead_time_hours");
+    expect(queriedVariables).not.toContain("valid_time");
+  });
+
   it("stays idle when no ensemble model is selected", async () => {
     const { result } = renderHook(() =>
       useEnsemble(location, [0, 6], "temperature_2m", { model: null })
