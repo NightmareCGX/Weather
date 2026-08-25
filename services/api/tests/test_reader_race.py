@@ -164,3 +164,101 @@ def test_reader_revalidation_ready_succeeds(catalog_engine, tmp_path) -> None:
     finally:
         session.release()
         pool.dispose()
+
+
+def test_gated_read_materializes_bounded_selection_under_lock(catalog_engine, tmp_path) -> None:
+    """A gated read's selector runs while the SHARED advisory lock is held.
+
+    The materialize callback opens a second DB connection and attempts a
+    non-blocking EXCLUSIVE advisory lock on the store-gate key. Because the
+    gate's SHARED lock is still held at that moment, the EXCLUSIVE attempt must
+    fail. This proves the selector/read does its Zarr S3/local I/O while the
+    gate is held (Phase 1 contract).
+    """
+
+    import numpy as np
+    import xarray as xr
+
+    from api.core.reader_gate import (
+        ReaderGateLifecycle,
+        ReaderLockPool,
+        gated_read,
+    )
+
+    # Build a tiny READY-store row.
+    store_path = str(tmp_path / "gated.zarr")
+    from tests._zarr_writer import write_dataset
+
+    lat = np.arange(40.0, 40.0 + 0.25 * 8, 0.25)
+    lon = np.arange(-107.0, -107.0 + 0.25 * 8, 0.25)
+    lead = np.array([0, 6, 12, 18])
+    lead_g, lat_g, lon_g = np.meshgrid(lead, lat, lon, indexing="ij")
+    temperature = 10.0 + 0.1 * lat_g + 0.2 * lon_g + 0.5 * lead_g
+    ds = xr.Dataset(
+        {"temperature_2m": (("lead_time_hours", "latitude", "longitude"), temperature)},
+        coords={"lead_time_hours": lead, "latitude": lat, "longitude": lon},
+    )
+    write_dataset(ds, store_path)
+
+    # Seed a READY run row pointing at our store so revalidation succeeds.
+    from datetime import datetime, timezone as _tz
+    from ingestion.core.catalog import (
+        CenterRecord, GridRecord, ModelRecord, ModelRunRecord, ModelVersionRecord,
+    )
+    from sqlalchemy.orm import Session as _Session
+
+    with _Session(catalog_engine) as db:
+        db.add(CenterRecord(id='c3', center_id='noaa', name='NOAA', country='USA'))
+        db.flush()
+        db.add(ModelRecord(id='m3', model_id='gfs', name='GFS', center_id='noaa', is_ensemble=False, resolution_km=25.0))
+        db.flush()
+        db.add(ModelVersionRecord(id='v3', model_id='gfs', version_string='v1.0'))
+        db.flush()
+        db.add(ModelRunRecord(id='r3', model_version_id='v3', cycle_time=datetime(2026,7,22,0,0,tzinfo=_tz.utc), status='ready', zarr_store_path=store_path))
+        db.add(GridRecord(id='g3', grid_code='global_025deg', name='g', resolution_km=25.0))
+        db.commit()
+
+    pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
+    lifecycle = ReaderGateLifecycle()
+    lock_held_during_selector: list[bool] = []
+
+    def materialize():
+        # Prove the SHARED gate is held by attempting an EXCLUSIVE advisory
+        # lock on the SAME store-gate key from a second, non-blocking connection.
+        # If the SHARED gate were not held, pg_try_advisory_lock would return
+        # True immediately; because the gate's SHARED lock is held, it returns
+        # False. This proves the selector/read executes while the gate is live.
+        from domain.locks import store_gate_key as _sgk
+
+        key = _sgk(store_path)
+        eng2 = create_engine(DB_URL, pool_pre_ping=True)
+        with eng2.connect() as c2:
+            acquired = c2.execute(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": key},
+            ).scalar()
+        eng2.dispose()
+        lock_held_during_selector.append(not acquired)
+        import xarray as _xr
+
+        ds = _xr.open_zarr(store_path, consolidated=False)
+        sel = ds["temperature_2m"].sel(lead_time_hours=6, latitude=slice(40, 41), longitude=slice(-107, -106))
+        return sel.values
+
+    try:
+        out = gated_read(
+            pool,
+            lifecycle,
+            store_path=store_path,
+            revalidate_db_url=DB_URL,
+            materialize=materialize,
+            timeout_seconds=10.0,
+        )
+    finally:
+        pool.dispose()
+    assert lock_held_during_selector == [True], (
+        "SHARED advisory lock was not held during gated materialization: "
+        f"{lock_held_during_selector}"
+    )
+    assert isinstance(out, np.ndarray)
+    assert out.shape == (5, 5), f"bounded read shape wrong: {out.shape}"

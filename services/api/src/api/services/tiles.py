@@ -294,35 +294,120 @@ def render_tile_png(
         # session (rare recovery path) to fall through to the next candidate.
         session.close()  # return the connection to the QueuePool
         try:
-            dataset = reader_gate.gated_read_dataset(store_path)
+            # Phase 1 remediation: only the tile's geographic window is read
+            # from the store. The selector receives the lazy dataset, selects
+            # the variable/lead (and member-reduces GEFS), crops the spatial
+            # window, then materializes that bounded window *inside* the gate.
+            windowed = reader_gate.gated_read_dataset_with_selector(
+                store_path,
+                selector=lambda dataset: _select_tile_window(
+                    dataset,
+                    variable=variable,
+                    lead=lead_time_hours,
+                    zoom=zoom,
+                    x=x,
+                    y=y,
+                ),
+            )
         except Exception:  # noqa: BLE001 - unreadable/no-longer-ready store
             excluded.add(store_path)
             session = SessionLocal()
             continue
         break
-    return _render_dataset_to_png(
-        dataset,
+    return _render_window_to_png(
+        windowed,
         variable=variable,
         zoom=zoom,
         x=x,
         y=y,
-        lead_time_hours=lead_time_hours,
         cache_key=cache_key,
     )
 
 
-def _render_dataset_to_png(
+@dataclass(frozen=True)
+class _TileWindow:
+    """A materialized spatial window selected from a forecast store.
+
+    Attributes:
+        field: Ascending ``(lat, lon)`` in-memory numpy array of the window.
+        lat_axis: Ascending latitude coordinates of ``field`` rows.
+        lon_axis: Ascending longitude coordinates of ``field`` columns.
+        grid: The dataset's regular grid (:class:`_TileGrid`).
+    """
+
+    field: npt.NDArray[np.float64]
+    lat_axis: npt.NDArray[np.float64]
+    lon_axis: npt.NDArray[np.float64]
+    grid: _TileGrid
+
+
+def _select_tile_window(
     dataset: xr.Dataset,
+    *,
+    variable: str,
+    lead: int,
+    zoom: int,
+    x: int,
+    y: int,
+) -> _TileWindow:
+    """Gate-time selector: read only the tile's geographic window from the store.
+
+    Runs on the **lazy** dataset *inside* the reader gate. It derives the grid
+    (coordinate arrays only), computes the tile's pixel bounds, selects the
+    variable + lead (and member-reduces GEFS to the ensemble mean), crops the
+    spatial window to the tile bounds, and materializes only that small window
+    via ``sliced.values``. Because ``sliced`` is a ``MemoryCachedArray``-backed
+    selection, ``.values`` reads only the zarr chunks overlapping the window —
+    never the full global field.
+
+    Returns:
+        A :class:`_TileWindow` containing the bounded window + its axes + grid.
+    """
+    grid = _derive_grid(dataset)
+
+    # Compute the tile's geographic bounds (pixel centers), vectorized.
+    n = 2**zoom
+    px_idx, py_idx = np.meshgrid(
+        np.arange(TILE_SIZE, dtype=np.float64),
+        np.arange(TILE_SIZE, dtype=np.float64),
+        indexing="xy",
+    )
+    pixel_lons = ((x + (px_idx + 0.5) / TILE_SIZE) / n) * 360.0 - 180.0
+    y_merc = y + (py_idx + 0.5) / TILE_SIZE
+    lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
+    pixel_lats = np.degrees(lat_rad)
+    lon_native = _align_longitudes(grid, pixel_lons)
+
+    field, lat_axis, lon_axis = _slice_field(
+        dataset, variable, lead, grid, pixel_lats, lon_native
+    )
+    # ``_slice_field`` already materializes the bounded window. Return the
+    # window + its axes + the grid so rendering needs no store access.
+    return _TileWindow(
+        field=np.asarray(field, dtype=np.float64),
+        lat_axis=np.asarray(lat_axis, dtype=np.float64),
+        lon_axis=np.asarray(lon_axis, dtype=np.float64),
+        grid=grid,
+    )
+
+
+def _render_window_to_png(
+    window: _TileWindow,
     *,
     variable: str,
     zoom: int,
     x: int,
     y: int,
-    lead_time_hours: int,
     cache_key: tuple[object, ...],
 ) -> bytes:
-    """Rasterize an already-materialized dataset into a tile PNG (no DB)."""
-    grid = _derive_grid(dataset)
+    """Rasterize an already-materialized spatial window into a tile PNG (no DB).
+
+    All data access already happened under the reader gate; this function is
+    pure CPU (nearest-neighbor pixel sampling + color mapping + PNG encode).
+    """
+    field_arr = window.field
+    lat_axis_arr = window.lat_axis
+    lon_axis_arr = window.lon_axis
     stops = _color_stops(variable)
     data_min, data_max = _data_range(variable)
 
@@ -338,19 +423,20 @@ def _render_dataset_to_png(
     lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
     pixel_lats = np.degrees(lat_rad)
 
-    # Align pixel longitudes into the dataset's native convention up front.
-    lon_native = _align_longitudes(grid, pixel_lons)
+    # Align pixel longitudes into the grid's native convention (the window's
+    # lon_axis already matches, so use the grid's start/stop bounds).
+    aligned_lons = _align_longitudes(window.grid, pixel_lons)
 
-    field, lat_axis, lon_axis = _slice_field(
-        dataset, variable, lead_time_hours, grid, pixel_lats, lon_native
-    )
-
-    # Nearest grid index per pixel, into the *sliced* ascending axes.
-    rows = _nearest_indices(lat_axis, pixel_lats)
-    cols = _nearest_indices(lon_axis, lon_native)
-
-    valid = _inside_grid(grid, pixel_lats, lon_native)
-    values = field[rows, cols]
+    # Nearest grid index per pixel, into the *sliced* ascending axes. Columns
+    # MUST use the grid-native aligned longitudes just like the selection stage
+    # (and the pre-Phase-1 renderer): raw ``[-180, 180)`` pixel longitudes have
+    # no consistent displacement within the window's native lon axis and clamp
+    # every western-hemisphere pixel to index 0, rendering mirrored-wrong
+    # bands. ``_align_longitudes`` shifts each pixel by at most one ±360 step.
+    rows = _nearest_indices(lat_axis_arr, pixel_lats)
+    cols = _nearest_indices(lon_axis_arr, aligned_lons)
+    valid = _inside_grid(window.grid, pixel_lats, aligned_lons)
+    values = field_arr[rows, cols]
 
     # Fully vectorized color mapping: clamp, interpolate across the stop ramp
     # per RGB channel with ``np.interp``, and build the RGBA scanlines with
@@ -477,11 +563,30 @@ def _slice_field(
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Return the 2-D ascending field and its sliced axes for the tile bounds.
 
-    The field is reversed along any descending axis and then sliced to the
-    tile's latitude / native-longitude bounds so only the Zarr chunks
-    overlapping the tile are read. The returned axes are the sliced ascending
-    ``latitude`` and ``longitude`` arrays, used to index the field with
-    nearest-neighbor lookup.
+    **Phase 1 remediation ordering:** the spatial crop happens **before** any
+    ensemble-member reduction. For a GEFS ``(member, lead, lat, lon)`` store,
+    cropping to the tile's geographic window first means only the Zarr chunks
+    overlapping the window are read; the subsequent ``mean(dim="member")``
+    operates on that small window (verified numerically identical to the old
+    mean-then-crop ordering, and ~1,500x fewer chunk reads). Deterministic
+    (GFS) fields have no ``member`` axis and are returned unchanged.
+
+    The field is cropped to the tile's latitude / native-longitude bounds so
+    only the Zarr chunks overlapping the tile are read. The returned axes are
+    the sliced **ascending** ``latitude`` / ``longitude`` arrays, used to index
+    the field with nearest-neighbor lookup.
+
+    **No negative-step indexing on the lazy backend.** A negative-step slice
+    composed onto a lazily-indexed chunked Zarr array can crash inside xarray's
+    indexer decomposition (``xarray.core.indexing._decompose_slice`` computes
+    ``range(start, stop, step)[-1]``, which raises ``IndexError: range object
+    index out of range`` for any *empty* negative-step slice) at certain
+    latitude/window combinations. Instead, the label-slice arguments are
+    ordered to match each stored axis's own monotonic direction (descending
+    source axis -> ``slice(hi, lo)``), which xarray translates into a plain
+    positive-step positional read; the bounded window is then normalized to
+    ascending orientation *in memory* after materialization (a tiny reverse on
+    an already-small array).
 
     When the tile does not intersect the grid, a 1x1 NaN field with the full
     axes is returned so the caller's mask renders every pixel transparent.
@@ -505,19 +610,13 @@ def _slice_field(
     """
     if variable not in dataset.data_vars:
         raise ValueError(f"Variable '{variable}' is not in the dataset.")
-    from api.services.point_forecast import _reduce_surface_field
 
-    field = _reduce_surface_field(dataset[variable], lead=lead)
-    # The shared reduction returns a 2-D ``(latitude, longitude)`` surface; a
-    # field that is still not 2-D after lead selection and member reduction is
-    # not a renderable surface (the tile endpoint surfaces this as a 422).
-    if field.ndim != 2:
-        raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
-
-    if grid.lat_reversed:
-        field = field.isel(latitude=slice(None, None, -1))
-    if grid.lon_reversed:
-        field = field.isel(longitude=slice(None, None, -1))
+    field = dataset[variable]
+    # Phase 1: crop the spatial window FIRST (while the array is lazy), then
+    # reduce the member axis. Cropping before member-reduction reads only the
+    # chunks overlapping the tile instead of the full global field.
+    if "lead_time_hours" in field.dims:
+        field = field.sel(lead_time_hours=lead)
 
     lat_axis_full = field.latitude.values
     lon_axis_full = field.longitude.values
@@ -526,26 +625,68 @@ def _slice_field(
     lon_native_min = float(lon_native.min())
     lon_native_max = float(lon_native.max())
 
-    lo_lat = float(max(lat_axis_full[0], lat_min))
-    hi_lat = float(min(lat_axis_full[-1], lat_max))
-    lo_lon = float(max(lon_axis_full[0], lon_native_min))
-    hi_lon = float(min(lon_axis_full[-1], lon_native_max))
+    # Pixel-perfect edge handling: the crop must contain every grid cell that a
+    # full-field nearest-neighbor lookup could select for the tile's pixel band.
+    # A pixel anywhere within half a cell of the band's min/max resolves to the
+    # cell JUST OUTSIDE the band, so cropping to the pixel values themselves is
+    # one cell short at every tile border (edge pixels clamp to the inner cell,
+    # a tile-aligned 1-cell band of wrong values). Expand the scalar bounds by
+    # one full grid step each side; full-field nearest-neighbor then selects the
+    # identical cell. Still bounded: +1 cell per edge, not full-global.
+    lat_step = float(lat_axis_full[1] - lat_axis_full[0]) if len(lat_axis_full) > 1 else 1.0
+    lon_step = float(lon_axis_full[1] - lon_axis_full[0]) if len(lon_axis_full) > 1 else 1.0
+    lo_lat = float(max(min(lat_axis_full[0], lat_axis_full[-1]), lat_min - abs(lat_step)))
+    hi_lat = float(min(max(lat_axis_full[-1], lat_axis_full[0]), lat_max + abs(lat_step)))
+    lo_lon = float(max(min(lon_axis_full[0], lon_axis_full[-1]), lon_native_min - abs(lon_step)))
+    hi_lon = float(min(max(lon_axis_full[-1], lon_axis_full[0]), lon_native_max + abs(lon_step)))
     if lo_lat > hi_lat or lo_lon > hi_lon:
         # The tile is entirely outside the grid; return a transparent field
         # carrying the full axes so nearest-index lookups stay in bounds.
         return (
             np.full((1, 1), np.nan),
-            np.asarray([lat_axis_full[0]]),
-            np.asarray([lon_axis_full[0]]),
+            np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
+            np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
         )
+    # Direction-aware label slices: a stored-descending axis receives
+    # ``(hi, lo)`` so xarray derives a POSITIVE-step positional slice for the
+    # backend (never a negative-step one). Empty selections (no coordinate in
+    # the band, possible on coarse grids) degrade gracefully to zero-length
+    # windows instead of tripping negative-step decomposition.
     sliced = field.sel(
-        latitude=slice(lo_lat, hi_lat), longitude=slice(lo_lon, hi_lon)
+        latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
+        longitude=slice(hi_lon, lo_lon) if grid.lon_reversed else slice(lo_lon, hi_lon),
     )
-    return (
-        np.asarray(sliced.values, dtype=float),
-        np.asarray(sliced.latitude.values, dtype=float),
-        np.asarray(sliced.longitude.values, dtype=float),
-    )
+    # After the spatial crop, reduce the member axis (GEFS ensemble mean). Only
+    # the window's chunks are read for the reduction now.
+    if "member" in sliced.dims:
+        sliced = sliced.mean(dim="member", keep_attrs=True)
+    # The shared reduction returns a 2-D ``(latitude, longitude)`` surface; a
+    # field that is still not 2-D after lead selection and member reduction is
+    # not a renderable surface (the tile endpoint surfaces this as a 422).
+    if sliced.ndim != 2:
+        raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
+    values = np.asarray(sliced.values, dtype=float)
+    lat_sliced = np.asarray(sliced.latitude.values, dtype=float)
+    lon_sliced = np.asarray(sliced.longitude.values, dtype=float)
+    # A band containing no coordinate (possible on coarse/irregular axes)
+    # yields a zero-length window; render it as fully transparent via the
+    # same fallback the outside-the-grid path uses.
+    if values.shape[0] == 0 or values.shape[1] == 0:
+        return (
+            np.full((1, 1), np.nan),
+            np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
+            np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
+        )
+    # Normalize to the renderer's ascending-axis contract IN MEMORY (bounded,
+    # already-materialized): reverse stored-descending windows after release of
+    # the backend selection, never on the lazy object.
+    if len(lat_sliced) > 1 and lat_sliced[-1] < lat_sliced[0]:
+        values = values[::-1, :]
+        lat_sliced = lat_sliced[::-1]
+    if len(lon_sliced) > 1 and lon_sliced[-1] < lon_sliced[0]:
+        values = values[:, ::-1]
+        lon_sliced = lon_sliced[::-1]
+    return (values, lat_sliced, lon_sliced)
 
 
 def _inside_grid(

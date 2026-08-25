@@ -78,7 +78,13 @@ def _resolve_s3_store(path: str) -> MutableMapping[str, bytes]:
 
 
 def read_dataset(store: str | PathLike[str] | MutableMapping[str, bytes]) -> xr.Dataset:
-    """Read a Zarr store back into a numpy-backed dataset.
+    """Read a Zarr store back into a numpy-backed dataset (always fresh).
+
+    This is the uncached open. The serving paths use
+    :func:`read_dataset_cached`, which reuses the lazily-opened dataset per
+    ``(store_path, serving_generation)``; this function remains for callers
+    that need an unconditional fresh open (and as the opener the cache
+    invokes on miss).
 
     Args:
         store: A local path, ``s3://`` URL, or mapping to read.
@@ -92,4 +98,60 @@ def read_dataset(store: str | PathLike[str] | MutableMapping[str, bytes]) -> xr.
     # through a ``Dataset``-typed intermediate enforces the declared return
     # type (the value is always a concrete ``Dataset`` at runtime).
     dataset: xr.Dataset = xr.open_zarr(resolved)
+    return dataset
+
+
+def _generation_for(store: str) -> str | None:
+    """Return the committed-manifest generation for cache identity.
+
+    Returns ``None`` when the manifest cannot be used for identity (missing
+    manifest on a legacy/hybrid store is resolved by ``manifest_generation``
+    to a deterministic legacy token instead). A malformed manifest fails
+    closed: ``None`` means "do not reuse", so the caller opens directly.
+    """
+    from api.core.manifest_reader import ManifestReadError, manifest_generation
+
+    try:
+        return manifest_generation(str(os.fspath(store)))
+    except ManifestReadError:
+        return None
+
+
+def read_dataset_cached(
+    store: str | PathLike[str] | MutableMapping[str, bytes],
+) -> xr.Dataset:
+    """Return the lazily-opened dataset for a store, reusing per generation.
+
+    Phase 2 serving-path entry point. The lazy ``xr.Dataset`` produced by
+    :func:`read_dataset` is cached keyed by ``(store_root,
+    serving_generation)`` so repeated requests skip the repeated
+    S3FileSystem/mapper resolution, ``xr.open_zarr``, and consolidated
+    ``.zmetadata`` fetch — while every actual chunk I/O still happens at
+    selection time under the SHARED reader gate (unchanged).
+
+    Same-cycle correctness: the committed-manifest generation is probed on
+    EVERY call (one small GET), so once a writer replaces the same cycle and
+    commits a new generation, the next reader's key changes, misses, and
+    opens fresh — generation-A state can never satisfy a generation-B
+    request. Mappings (non-path stores) and malformed-manifest stores bypass
+    the cache and open directly.
+
+    The cached object holds only metadata + coordinate arrays (the selectors
+    materialize bounded numpy results separately); no decoded meteorological
+    field is retained.
+    """
+    if isinstance(store, MutableMapping):
+        return read_dataset(store)
+    path = os.fspath(store)
+    generation = _generation_for(path)
+    if generation is None:
+        # Fail closed: unusable identity -> never reuse.
+        return read_dataset(path)
+
+    from api.core.store_cache import store_handle_cache
+
+    def _open() -> xr.Dataset:
+        return read_dataset(path)
+
+    dataset, _hit = store_handle_cache.get_or_open((path, generation), _open)
     return dataset

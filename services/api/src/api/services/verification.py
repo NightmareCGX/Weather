@@ -20,7 +20,6 @@ from typing import cast
 
 import xarray as xr
 from domain.exceptions import InvalidGridError, PointOutsideGridError
-from domain.geo.interpolation import bilinear_interpolate
 from domain.verification import bias, mean_absolute_error, root_mean_squared_error
 from fastapi import HTTPException
 from sqlalchemy import func, select
@@ -35,7 +34,10 @@ from api.models.entities import (
     VerificationObservation,
 )
 from api.schemas import VerificationPeriod, VerificationReportData
-from api.services.point_forecast import _derive_grid, _field_values
+from api.services.point_forecast import (
+    _derive_grid,
+    _interpolate_neighborhood,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +96,6 @@ def build_verification_report(
     runs_by_id = {cast(str, run.id): run for run in runs}
 
     station_coords: dict[str, tuple[float, float] | None] = {}
-    datasets: dict[str, xr.Dataset | None] = {}
     pairs_by_variable: dict[str, list[tuple[float, float]]] = defaultdict(list)
 
     for observation in observations:
@@ -122,11 +123,12 @@ def build_verification_report(
             run_cycle_time = cast(datetime, run.cycle_time)
             if run_cycle_time + timedelta(hours=product_lead) != valid_time:
                 continue
-            dataset = _dataset_for_run(run, datasets)
-            if dataset is None:
-                continue
-            forecast_value = _interpolate_candidate(
-                dataset,
+            assert run.zarr_store_path is not None
+            # Phase 1 remediation: interpolate the single observation point via
+            # a bounded gated read (only the 2x2 neighborhood is materialized,
+            # never the full grid), under the SHARED reader gate.
+            forecast_value = _gated_interpolate_candidate(
+                str(run.zarr_store_path),
                 product_variable,
                 product_lead,
                 latitude,
@@ -274,65 +276,25 @@ def _station_coordinates(
     return (float(row[1]), float(row[0]))
 
 
-def _dataset_for_run(
-    run: ModelRun, datasets: dict[str, xr.Dataset | None]
-) -> xr.Dataset | None:
-    """Open a run's Zarr store once, caching the result by run id.
-
-    A store that cannot be read is cached as ``None`` so the run is skipped for
-    the remainder of the request instead of being re-probed per candidate.
-
-    Args:
-        run: The model run.
-        datasets: Per-request cache of opened datasets keyed by run id.
-
-    Returns:
-        The opened dataset, or ``None`` when the store is unreadable.
-    """
-    run_id = cast(str, run.id)
-    if run_id in datasets:
-        return datasets[run_id]
-    assert run.zarr_store_path is not None
-    try:
-        # Reader-gate: participate in the SHARED store gate + fresh Core
-        # revalidation so a store mid-re-ingest is never read.
-        from api.core.reader_gate import gated_read_dataset
-
-        # ``gated_read_dataset`` is declared ``Any`` (reader_gate returns the
-        # fully materialized value generically). Narrowing through a
-        # ``Dataset``-typed intermediate (same idiom as api/core/zarr.py)
-        # enforces the exact runtime type on the read path so the cached value
-        # and this function's ``Dataset | None`` return stay typed.
-        dataset: xr.Dataset = gated_read_dataset(str(run.zarr_store_path))
-    except Exception as exc:  # noqa: BLE001 - probe store, fall through
-        logger.warning(
-            "Skipping unreadable Zarr store for run %s (%s): %s",
-            run_id,
-            run.zarr_store_path,
-            exc,
-        )
-        datasets[run_id] = None
-        return None
-    datasets[run_id] = dataset
-    return dataset
-
-
-def _interpolate_candidate(
-    dataset: xr.Dataset,
+def _gated_interpolate_candidate(
+    store_path: str,
     var_code: str,
     lead: int,
     latitude: float,
     longitude: float,
 ) -> float | None:
-    """Interpolate a forecast field at a station, or return ``None`` to skip.
+    """Interpolate a forecast field at a station via a bounded gated read.
 
-    A candidate is skipped (returning ``None``) when the variable is absent
-    from the dataset, the requested lead time is absent, the field is not a 2-D
-    surface field, or the station falls outside the grid. Invalid grid data
-    propagates as a server error (matching the point-forecast behavior).
+    A single SHARED gate session opens the lazy store, selects the variable +
+    lead, crops the 2x2 neighborhood around the station, and materializes only
+    that tiny window. A candidate is skipped (returning ``None``) when the
+    variable is absent from the dataset, the requested lead time is absent, the
+    field is not a 2-D surface field, the station falls outside the grid, or
+    the store is unreadable. Invalid grid data propagates as a server error
+    (matching the point-forecast behavior).
 
     Args:
-        dataset: The run's Zarr dataset.
+        store_path: The run's Zarr store path.
         var_code: A forecast variable code.
         lead: The lead time hours of the candidate product.
         latitude: Station latitude.
@@ -342,20 +304,30 @@ def _interpolate_candidate(
         The interpolated forecast value, or ``None`` when the candidate is
         skipped.
     """
-    if var_code not in dataset.data_vars:
-        return None
-    field = dataset[var_code]
-    if "lead_time_hours" in field.dims:
-        try:
-            field = field.sel(lead_time_hours=lead)
-        except KeyError:
-            return None
-    if field.ndim != 2:
-        return None
-    try:
+    from api.core.reader_gate import gated_read_dataset_with_selector
+
+    def select_and_interpolate(dataset: xr.Dataset) -> float:
+        if var_code not in dataset.data_vars:
+            raise _SkipCandidate()
+        field = dataset[var_code]
+        if "lead_time_hours" in field.dims:
+            try:
+                field = field.sel(lead_time_hours=lead)
+            except KeyError:
+                raise _SkipCandidate() from None
+        if "member" in field.dims:
+            field = field.mean(dim="member", keep_attrs=True)
+        if field.ndim != 2:
+            raise _SkipCandidate()
         grid, lat_descending, lon_descending = _derive_grid(dataset)
-        values = _field_values(field, lat_descending, lon_descending)
-        return float(bilinear_interpolate(grid, values, latitude, longitude))
+        return _interpolate_neighborhood(
+            field, grid, lat_descending, lon_descending, latitude, longitude
+        )
+
+    try:
+        return gated_read_dataset_with_selector(store_path, select_and_interpolate)
+    except _SkipCandidate:
+        return None
     except (PointOutsideGridError, InvalidGridError) as exc:
         logger.warning(
             "Skipping verification candidate %s at lead %s for (%s, %s): %s",
@@ -366,3 +338,12 @@ def _interpolate_candidate(
             exc,
         )
         return None
+    except Exception as exc:  # noqa: BLE001 - unreadable store
+        logger.warning(
+            "Skipping unreadable verification store %s: %s", store_path, exc
+        )
+        return None
+
+
+class _SkipCandidate(Exception):
+    """Internal signal: a candidate is not servable (skip, not error)."""
