@@ -89,6 +89,7 @@ def _resolve_s3_store(
         key=conn_settings.MINIO_ACCESS_KEY,
         secret=conn_settings.MINIO_SECRET_KEY,
         client_kwargs={"endpoint_url": _endpoint_url(conn_settings)},
+        use_listings_cache=False,
     )
     # ``get_mapper`` is untyped in the s3fs stub (import-untyped), so mypy
     # sees ``Any``. Narrowing through a ``MutableMapping[str, bytes]``-typed

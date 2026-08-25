@@ -171,3 +171,79 @@ def test_full_overwrite_guard_allows_new_store(tmp_path) -> None:
     # The write itself still works.
     write_dataset(_tiny_ds(), store)
     assert read_dataset(store) is not None
+
+
+def test_cross_process_s3_chunk_visibility_without_cache_clear(minio_store: str) -> None:
+    """Regression: long-lived process must observe S3 chunk materialized by a subprocess.
+
+    A long-lived parent process prepares an ensemble store with NaN fill
+    (``write_empty_chunks=False``), so the chunk key initially does not exist in
+    S3. The parent reads the store (which under default ``s3fs`` cached that
+    the chunk key was absent in ``dircache``). A separate OS subprocess then
+    commits data into that chunk. The parent process reads the store again
+    WITHOUT manually clearing any instance cache — the parent MUST observe the
+    newly created data values rather than stale NaN.
+    """
+    import os
+    import subprocess
+    import sys
+    import numpy as np
+    from ingestion.core.zarr_writer import prepare_run_store
+
+    lat = np.array([38.0, 38.25, 38.5, 38.75])
+    lon = np.array([-107.0, -106.75, -106.5, -106.25])
+    dims = ("member", "lead_time_hours", "latitude", "longitude")
+    shape = (1, 1, 4, 4)
+    coords = {
+        "member": [1],
+        "lead_time_hours": [6],
+        "latitude": lat,
+        "longitude": lon,
+        "time": np.datetime64("2026-07-22T00:00:00"),
+    }
+    ds_seed = xr.Dataset(
+        data_vars={"temperature_2m": (dims, np.full(shape, 1.0, dtype=np.float32))},
+        coords=coords,
+        attrs={"cycle_time": "2026-07-22T00:00:00", "model_id": "gfs"},
+    )
+
+    # 1. Prepare store in parent process (write_empty_chunks=False; chunk is absent)
+    prepare_run_store(
+        ds_seed,
+        minio_store,
+        expected_lead_time_hours=(6, 12),
+        expected_members=(1, 2),
+    )
+
+    # 2. Parent reads store before subprocess write (observes initial NaN fill)
+    ds_before = read_dataset(minio_store)
+    val_before = float(ds_before["temperature_2m"].sel(member=1, lead_time_hours=6).values[0, 0])
+    assert np.isnan(val_before), f"expected initial NaN fill, got {val_before}"
+
+    # 3. Subprocess materializes chunk temperature_2m/0.0.0.0 in S3
+    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../src"))
+    domain_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../packages/domain/src"))
+    worker_script = (
+        "import sys, os\n"
+        f"sys.path.insert(0, {src_dir!r})\n"
+        f"sys.path.insert(0, {domain_src!r})\n"
+        "import numpy as np, xarray as xr\n"
+        "from ingestion.core.zarr_writer import commit_region\n"
+        "lat = np.array([38.0, 38.25, 38.5, 38.75])\n"
+        "lon = np.array([-107.0, -106.75, -106.5, -106.25])\n"
+        "dims = ('member', 'lead_time_hours', 'latitude', 'longitude')\n"
+        "coords = {'member': [1], 'lead_time_hours': [6], 'latitude': lat, 'longitude': lon,\n"
+        "          'time': np.datetime64('2026-07-22T00:00:00')}\n"
+        "ds = xr.Dataset(data_vars={'temperature_2m': (dims, np.full((1, 1, 4, 4), 1.0, dtype=np.float32))},\n"
+        "                coords=coords, attrs={'cycle_time': '2026-07-22T00:00:00', 'model_id': 'gfs'})\n"
+        f"commit_region(ds, {minio_store!r})\n"
+    )
+    res = subprocess.run([sys.executable, "-c", worker_script], capture_output=True, text=True)
+    assert res.returncode == 0, f"subprocess write failed: {res.stderr}"
+
+    # 4. Parent reads store again without manual cache clearing; MUST see new data
+    ds_after = read_dataset(minio_store)
+    val_after = float(ds_after["temperature_2m"].sel(member=1, lead_time_hours=6).values[0, 0])
+    assert val_after == pytest.approx(1.0), (
+        "Parent read observed stale NaN instead of subprocess-written value 1.0"
+    )
