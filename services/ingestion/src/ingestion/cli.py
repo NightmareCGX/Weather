@@ -158,6 +158,7 @@ def validate_store_path(
         f"{canonical!r}. Pass --allow-custom-store to override."
     )
 
+
 @dataclass(frozen=True)
 class RunSpec:
     """One forecast-run specification: a model + cycle + its leads/members.
@@ -361,9 +362,7 @@ def _parse_manifest(path: str) -> list[RunSpec]:
                 f"Manifest run is missing required key(s): {', '.join(missing)}."
             )
         if entry["model"] not in SUPPORTED_MODELS:
-            raise ValueError(
-                f"Manifest model {entry['model']!r} is not supported."
-            )
+            raise ValueError(f"Manifest model {entry['model']!r} is not supported.")
         try:
             cycle_date = date.fromisoformat(str(entry["cycle_date"]))
             cycle_hour = int(entry["cycle_hour"])
@@ -384,6 +383,8 @@ def _parse_manifest(path: str) -> list[RunSpec]:
                 cycle_hour=cycle_hour,
                 lead_time_hours=leads,
                 members=members,
+                store=entry.get("store"),
+                allow_custom_store=bool(entry.get("allow_custom_store", False)),
             )
         )
     if not specs:
@@ -453,89 +454,110 @@ def _build_parser() -> argparse.ArgumentParser:
         "ingest", help="download, parse, and record one or more forecast runs"
     )
     ingest.add_argument(
-        "--model", nargs="+", choices=SUPPORTED_MODELS,
+        "--model",
+        nargs="+",
+        choices=SUPPORTED_MODELS,
         help="NOAA model identifier(s) (gfs or gefs); one or more. Required "
-             "unless --manifest is given.",
+        "unless --manifest is given.",
     )
     ingest.add_argument(
-        "--cycle-date", nargs="+", type=date.fromisoformat,
+        "--cycle-date",
+        nargs="+",
+        type=date.fromisoformat,
         help="UTC run date(s) (ISO format, e.g. 2026-07-21); one or more. "
-             "Required unless --manifest is given.",
+        "Required unless --manifest is given.",
     )
     ingest.add_argument(
-        "--cycle-hour", nargs="+", type=int, choices=(0, 6, 12, 18),
+        "--cycle-hour",
+        nargs="+",
+        type=int,
+        choices=(0, 6, 12, 18),
         help="UTC run cycle hour(s); one or more. Required unless --manifest "
-             "is given.",
+        "is given.",
     )
     ingest.add_argument(
-        "--lead-time-hours", nargs="+", type=int,
+        "--lead-time-hours",
+        nargs="+",
+        type=int,
         help="Forecast lead time offset(s) from cycle time (0-384); one or "
-             "more. Required unless --manifest is given.",
+        "more. Required unless --manifest is given.",
     )
     ingest.add_argument(
-        "--member", nargs="+", type=int,
+        "--member",
+        nargs="+",
+        type=int,
         help="GEFS perturbation member identity/identities (1..30). For GEFS "
-             "each member is downloaded as its own gepNN file and ingested "
-             "independently; member identity is preserved regardless of "
-             "completion order. Ignored for deterministic models.",
+        "each member is downloaded as its own gepNN file and ingested "
+        "independently; member identity is preserved regardless of "
+        "completion order. Ignored for deterministic models.",
     )
     ingest.add_argument(
         "--manifest",
         default=None,
         help="Path to a JSON manifest describing an explicit list of runs "
-             "({model, cycle_date, cycle_hour, lead_time_hours}); the "
-             "authoritative source for complex batch jobs.",
+        "({model, cycle_date, cycle_hour, lead_time_hours}); the "
+        "authoritative source for complex batch jobs.",
     )
     ingest.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the resolved run specifications without downloading or "
-             "writing anything.",
+        "writing anything.",
     )
     ingest.add_argument(
         "--max-runs",
         type=int,
         default=16,
         help="Maximum number of run specifications a batch may expand to "
-             "(default 16); exceeding it aborts to prevent an accidental "
-             "huge job.",
+        "(default 16); exceeding it aborts to prevent an accidental "
+        "huge job.",
     )
     ingest.add_argument(
         "--store",
         default=None,
         help="Zarr store path/URL of the run's cycle. When omitted it is "
-             "derived from --model/--cycle-date/--cycle-hour "
-             "(s3://weather-data/{model}/{date}/{hour}/cycle.zarr). All leads "
-             "of a cycle are merged into this store, so pass the same --store "
-             "for every lead. A supplied path that contradicts the forecast "
-             "identity is rejected unless --allow-custom-store is set.",
+        "derived from --model/--cycle-date/--cycle-hour "
+        "(s3://weather-data/{model}/{date}/{hour}/cycle.zarr). All leads "
+        "of a cycle are merged into this store, so pass the same --store "
+        "for every lead. A supplied path that contradicts the forecast "
+        "identity is rejected unless --allow-custom-store is set.",
     )
     ingest.add_argument(
         "--allow-custom-store",
         action="store_true",
         help="Accept an explicit --store that differs from the derived "
-             "s3://weather-data/{model}/{date}/{hour}/cycle.zarr layout.",
+        "s3://weather-data/{model}/{date}/{hour}/cycle.zarr layout.",
     )
     ingest.add_argument(
-        "--download-dir", default="downloads",
-        help="Local directory the GRIB2 file is downloaded to (created if "
-             "missing).",
+        "--download-dir",
+        default="downloads",
+        help="Local directory the GRIB2 file is downloaded to (created if " "missing).",
     )
     ingest.add_argument(
-        "--concurrency", type=int, default=4,
+        "--keep-downloads",
+        action="store_true",
+        help="Retain downloaded .grib2 and .idx files after successful ingestion.",
+    )
+    ingest.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
         help="Maximum number of forecast files fetched/ingested concurrently "
-             "per run (default 4). Bounded so NOMADS is not flooded and disk "
-             "staging stays bounded.",
+        "per run (default 4). Bounded so NOMADS is not flooded and disk "
+        "staging stays bounded.",
     )
     ingest.add_argument("--center-id", default="noaa")
     ingest.add_argument("--version-string", default="v1.0")
     ingest.add_argument("--grid-id", default="global_025deg")
     ingest.add_argument(
-        "--variable", action="append", default=None,
-        type=_parse_variable, metavar="CODE:NAME:UNIT[:SOURCE]",
+        "--variable",
+        action="append",
+        default=None,
+        type=_parse_variable,
+        metavar="CODE:NAME:UNIT[:SOURCE]",
         help="Catalog variable metadata; repeatable. Defaults to the "
-             "documented platform surface vocabulary (temperature_2m, "
-             "precipitation_rate).",
+        "documented platform surface vocabulary (temperature_2m, "
+        "precipitation_rate).",
     )
     return parser
 
@@ -593,59 +615,88 @@ def _run_ingest(args: argparse.Namespace) -> int:
 
 
 def _destination_for(
-    spec: RunSpec, args: argparse.Namespace, *, lead: int, member: int | None = None
+    spec: RunSpec, staging_dir: Path, *, lead: int, member: int | None = None
 ) -> Path:
     """Return the staged download path for a (member,) lead file.
 
-    The path encodes the model/cycle/lead (and member) so distinct files never
-    collide in the staging directory, and re-ingestion of the same file
-    overwrites its own staged copy.
+    The path encodes the model, cycle date, cycle hour, lead (and member) so
+    distinct forecast runs never collide in the staging directory.
 
     Args:
         spec: The run spec.
-        args: Parsed CLI arguments (download dir).
+        staging_dir: The run-scoped staging directory.
         lead: Forecast lead time.
         member: GEFS member identity, or ``None`` for deterministic.
 
     Returns:
         The staging path.
     """
+    date_str = f"{spec.cycle_date:%Y%m%d}"
     if member is not None:
         name = (
-            f"gep{member:02d}.t{spec.cycle_hour:02d}z.pgrb2s.0p25."
+            f"gep{member:02d}.{date_str}.t{spec.cycle_hour:02d}z.pgrb2s.0p25."
             f"f{lead:03d}"
         )
     else:
-        name = (
-            f"{spec.model}.t{spec.cycle_hour:02d}z.pgrb2.0p25.f{lead:03d}"
-        )
-    return Path(args.download_dir) / f"{name}.grib2"
+        name = f"{spec.model}.{date_str}.t{spec.cycle_hour:02d}z.pgrb2.0p25.f{lead:03d}"
+    return staging_dir / f"{name}.grib2"
 
 
 def _cleanup_source(destination: Path) -> None:
-    """Delete a successfully-ingested source file and its ``.idx``.
+    """Delete a successfully-ingested source file and its associated .idx cache files.
 
-    Deletion is best-effort source-artifact cleanup. A failure to delete an
-    already-successfully-ingested file must NOT invalidate the ingested data;
-    the file is left in place for a later cleanup/retry and the failure logged.
+    Deletion is best-effort post-commit resource reclamation. Failure to delete
+    an already-committed artifact logs a warning and does not invalidate
+    committed forecast data. Only filesystem errors (OSError) are caught.
 
     Args:
-        destination: The staged GRIB2 path (the ``.idx`` sibling is also
-            removed when present).
+        destination: Path to the staged GRIB2 file to remove.
     """
     import logging
 
     logger = logging.getLogger(__name__)
-    for path in (destination, Path(str(destination) + ".idx")):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:  # noqa: BLE001 - cleanup must never fail ingest
-            logger.warning(
-                "Failed to delete ingested source artifact %s: %s; data is "
-                "safe, cleanup will be retried.",
-                path,
-                exc,
-            )
+
+    # 1. Delete the primary GRIB2 file
+    try:
+        destination.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Failed to delete committed source artifact %s: %s; data is safe.",
+            destination,
+            exc,
+        )
+
+    # 2. Delete strictly associated index files (*.grib2.<hash>.idx and *.grib2.idx)
+    try:
+        parent_dir = destination.parent
+        if parent_dir.exists():
+            # Matches cfgrib hash index files: <filename>.<hash>.idx
+            for idx_file in parent_dir.glob(f"{destination.name}.*.idx"):
+                try:
+                    idx_file.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to delete index artifact %s: %s; data is safe.",
+                        idx_file,
+                        exc,
+                    )
+            # Matches direct index files: <filename>.idx
+            direct_idx = Path(f"{destination}.idx")
+            if direct_idx.name != destination.name:
+                try:
+                    direct_idx.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to delete direct index artifact %s: %s; data is safe.",
+                        direct_idx,
+                        exc,
+                    )
+    except OSError as exc:
+        logger.warning(
+            "Error scanning for index artifacts of %s: %s; data is safe.",
+            destination,
+            exc,
+        )
 
 
 def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
@@ -700,6 +751,8 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     seed_member, seed_lead = seed_item
 
     async def _run_wave() -> str:
+        import logging
+        import uuid
         from concurrent.futures import ThreadPoolExecutor
 
         from ingestion.core.cancel import await_all_workers_non_abandoning
@@ -708,6 +761,14 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             WaveRegion,
         )
         from ingestion.core.decode_worker import DecodePool
+
+        logger = logging.getLogger(__name__)
+        run_tag = (
+            f"staging_{spec.model}_{spec.cycle_date:%Y%m%d}_"
+            f"{spec.cycle_hour:02d}z_{uuid.uuid4().hex}"
+        )
+        staging_dir = Path(args.download_dir) / run_tag
+        staging_dir.mkdir(parents=True, exist_ok=True)
 
         coordinator = RunCoordinator(
             catalog_spec,
@@ -728,10 +789,16 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
         async with NOAAConnector() as connector:
             # 1. Retained seed. Download the seed first, then decode it in a
             #    worker process (the native ecCodes boundary).
-            seed_dest = _destination_for(spec, args, lead=seed_lead, member=seed_member)
+            seed_dest = _destination_for(
+                spec, staging_dir, lead=seed_lead, member=seed_member
+            )
             Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
             await connector.download(
-                spec.model, spec.cycle_date, spec.cycle_hour, seed_lead, seed_dest,
+                spec.model,
+                spec.cycle_date,
+                spec.cycle_hour,
+                seed_lead,
+                seed_dest,
                 member=seed_member,
             )
             seed_future = decode_pool.submit(seed_dest)
@@ -745,11 +812,15 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
                 from ingestion.core.catalog import ModelRunRecord
                 from sqlalchemy import select
 
-                row = db.execute(
-                    select(ModelRunRecord).where(
-                        ModelRunRecord.zarr_store_path == store_path
+                row = (
+                    db.execute(
+                        select(ModelRunRecord).where(
+                            ModelRunRecord.zarr_store_path == store_path
+                        )
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 if row is not None:
                     run_id = str(row.id)
                     is_same_cycle = True
@@ -791,18 +862,28 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             async def _download_non_seed(member: int | None, lead: int) -> None:
                 if (member, lead) == seed_item:
                     return
-                dest = _destination_for(spec, args, lead=lead, member=member)
+                dest = _destination_for(spec, staging_dir, lead=lead, member=member)
                 async with download_sem:
                     try:
                         await connector.download(
-                            spec.model, spec.cycle_date, spec.cycle_hour,
-                            lead, dest, member=member,
+                            spec.model,
+                            spec.cycle_date,
+                            spec.cycle_hour,
+                            lead,
+                            dest,
+                            member=member,
                         )
                     except Exception as exc:  # noqa: BLE001 - report this file's failure
-                        failures.append(f"{spec.model} member={member} lead={lead}: {exc}")
+                        failures.append(
+                            f"{spec.model} member={member} lead={lead}: {exc}"
+                        )
 
             await asyncio.gather(
-                *[_download_non_seed(m, lead) for m, lead in items if (m, lead) != seed_item]
+                *[
+                    _download_non_seed(m, lead)
+                    for m, lead in items
+                    if (m, lead) != seed_item
+                ]
             )
 
             # 5. Dispatch region workers (sync, in the executor). Each worker
@@ -818,7 +899,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             def _run_region_worker(member: int | None, lead: int) -> None:
                 worker_conn = engine.connect()
                 try:
-                    dest = _destination_for(spec, args, lead=lead, member=member)
+                    dest = _destination_for(spec, staging_dir, lead=lead, member=member)
                     ds = _decode_and_normalize(decode_pool.submit(dest), catalog_spec)
                     _validate_requested_lead(ds, lead)
                     region_id = _region_id_for(lead, member)
@@ -878,13 +959,34 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
         fin_conn = engine.connect()
         try:
             run_id = _resolve_run_id(catalog_spec, store_path)
-            status = coordinator.finalize_run(
+            finalize_result = coordinator.finalize_run(
                 fin_conn,
                 run_id=run_id,
                 spec=catalog_spec,
                 expected_leads=spec.lead_time_hours,
                 expected_members=spec.members,
             )
+            status = finalize_result.status
+
+            # Post-finalization cleanup: clean up only regions proven committed
+            # by THIS wave's generation, unless --keep-downloads is set.
+            if not getattr(args, "keep_downloads", False):
+                for r in regions:
+                    committed_gen = finalize_result.committed_regions.get(r.region_id)
+                    if committed_gen is not None and committed_gen == r.generation:
+                        dest = _destination_for(
+                            spec, staging_dir, lead=r.lead_time_hours, member=r.member
+                        )
+                        _cleanup_source(dest)
+                # Best-effort removal of the owned staging directory.
+                try:
+                    staging_dir.rmdir()
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove staging directory %s: %s; data is safe.",
+                        staging_dir,
+                        exc,
+                    )
         finally:
             fin_conn.close()
             engine.dispose()
@@ -983,9 +1085,15 @@ def _resolve_run_id(spec: RunCatalogSpec, store_path: str) -> str:
     from ingestion.core.catalog import ModelRunRecord, record_run
 
     with _catalog_session() as db:
-        row = db.execute(
-            select(ModelRunRecord).where(ModelRunRecord.zarr_store_path == store_path)
-        ).scalars().first()
+        row = (
+            db.execute(
+                select(ModelRunRecord).where(
+                    ModelRunRecord.zarr_store_path == store_path
+                )
+            )
+            .scalars()
+            .first()
+        )
         if row is not None:
             return str(row.id)
         # Fresh run: create the catalog rows (processing status).
@@ -1029,9 +1137,7 @@ def _build_spec(
     grid_name, grid_resolution_km = _GRID_METADATA.get(
         args.grid_id, (args.grid_id, 0.0)
     )
-    variables = (
-        tuple(args.variable) if args.variable is not None else DEFAULT_VARIABLES
-    )
+    variables = tuple(args.variable) if args.variable is not None else DEFAULT_VARIABLES
     return RunCatalogSpec(
         center_id=args.center_id,
         center_name=center_name,

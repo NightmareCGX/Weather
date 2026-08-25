@@ -110,13 +110,30 @@ class Wave:
         return sorted({r.region_id for r in self.regions})
 
 
+@dataclass(frozen=True)
+class FinalizeResult:
+    """The authoritative result of a coalesced finalization run.
+
+    Attributes:
+        status: The derived run status ('ready', 'partial', or 'processing').
+        committed_regions: Mapping of logical region id (e.g. 'det_L0006',
+            'mem017_L0006') to the committed generation UUID for all regions
+            durably committed and reconciled in this run.
+    """
+
+    status: str
+    committed_regions: Mapping[str, str] = field(default_factory=dict)
+
+
 def _new_generation() -> str:
     import uuid
 
     return uuid.uuid4().hex
 
 
-def _physical_conflict_region_ids(dataset: xr.Dataset, store_path: str, *, member: int | None) -> list[str]:
+def _physical_conflict_region_ids(
+    dataset: xr.Dataset, store_path: str, *, member: int | None
+) -> list[str]:
     """Derive the physical-conflict region ids for a commit.
 
     The conflict identities come from the store's ACTUAL ``.zarray`` chunk
@@ -305,9 +322,7 @@ class RunCoordinator:
             co.release_exclusive_gate()
             co.release_admission()
 
-    def _make_updating_put(
-        self, regions: list[WaveRegion]
-    ) -> "Callable[[str], None]":
+    def _make_updating_put(self, regions: list[WaveRegion]) -> "Callable[[str], None]":
         """Build the per-region UPDATING marker PUT callable."""
 
         def put_one(region_id: str) -> None:
@@ -323,7 +338,9 @@ class RunCoordinator:
                             "generation": r.generation,
                             "logical_region": {
                                 "lead_time_hours": r.lead_time_hours,
-                                **({"member": r.member} if r.member is not None else {}),
+                                **(
+                                    {"member": r.member} if r.member is not None else {}
+                                ),
                             },
                             "expected_write_set_fingerprint": "",
                             "required_materialized_object_keys": [],
@@ -365,7 +382,9 @@ class RunCoordinator:
         co.acquire_shared_admission()
         co.acquire_shared_gate()
         try:
-            region_ids = _physical_conflict_region_ids(dataset, self.store_path, member=member)
+            region_ids = _physical_conflict_region_ids(
+                dataset, self.store_path, member=member
+            )
             co.acquire_region_locks(region_ids)
             try:
                 lead_values = dataset.coords["lead_time_hours"].values
@@ -373,7 +392,10 @@ class RunCoordinator:
                 marker = read_region_marker(
                     self.store_path, lead_time_hours=lead, member=member
                 )
-                if marker.get("state") != "updating" or marker.get("generation") != generation:
+                if (
+                    marker.get("state") != "updating"
+                    or marker.get("generation") != generation
+                ):
                     logger.error(
                         "region %s generation mismatch: expected generation %s, "
                         "marker=%s; aborting with zero data writes",
@@ -452,10 +474,10 @@ class RunCoordinator:
         spec: RunCatalogSpec,
         expected_leads: tuple[int, ...],
         expected_members: tuple[int, ...],
-    ) -> str:
+    ) -> FinalizeResult:
         """Run the single coalesced finalization for the bounded CLI wave.
 
-        Returns the derived run status.
+        Returns the authoritative FinalizeResult with status and committed_regions.
         """
         co = StoreLockCoordinator(
             conn,
@@ -536,13 +558,9 @@ class RunCoordinator:
                 store_protocol_mode=mode,
                 run_identity=run_identity,
                 store_schema_fingerprint=store_schema_fp,
-                region_serving_states=_region_serving_states(
-                    committed, updating, mode
-                ),
+                region_serving_states=_region_serving_states(committed, updating, mode),
             )
-            committed_fp = sha256_hex(
-                "committed", *sorted(committed.keys())
-            )
+            committed_fp = sha256_hex("committed", *sorted(committed.keys()))
             markers_fp = sha256_hex("markers", *sorted(marker_keys))
 
             existing_manifest = read_manifest(self.store_path)
@@ -573,13 +591,16 @@ class RunCoordinator:
                 run = db.get(ModelRunRecord, run_id)
                 if run is None:
                     raise RuntimeError(f"run {run_id} not found during finalization")
-                from ingestion.core.catalog import _reconcile_catalog_to_store, _derive_run_status
+                from ingestion.core.catalog import (
+                    _reconcile_catalog_to_store,
+                    _derive_run_status,
+                )
 
                 _reconcile_catalog_to_store(db, run, committed_state, spec)
                 status = _derive_run_status(db, run, spec, committed_state)
                 setattr(run, "status", status)
                 db.commit()
-            return status
+            return FinalizeResult(status=status, committed_regions=committed)
         finally:
             co.release_exclusive_gate()
             co.release_admission()
@@ -674,9 +695,7 @@ class RunCoordinator:
         store_vars = set(_store_data_var_paths(self.store_path))
         if self.spec.is_ensemble:
             members = {m for m, _ in pairs}
-            return CommittedState.ensemble(
-                pairs, members, variables=store_vars
-            )
+            return CommittedState.ensemble(pairs, members, variables=store_vars)
         return CommittedState.deterministic(leads, variables=store_vars)
 
 
