@@ -96,4 +96,72 @@ describe("useEnsembleDistribution", () => {
     await waitFor(() => expect(result.current.status).toBe("error"));
     expect(result.current.data).toBeNull();
   });
+
+  it("refetches with the new lead when leadTimeHours changes (0 -> 24)", async () => {
+    mockFetch.mockResolvedValueOnce(distResponse(0, [10, 11, 12, 13, 14]));
+    mockFetch.mockResolvedValueOnce(distResponse(24, [34, 35, 36, 37, 38]));
+
+    const { result, rerender } = renderHook(
+      ({ lead }: { lead: number }) =>
+        useEnsembleDistribution(location, lead, "temperature_2m", { model: "gefs" }),
+      { initialProps: { lead: 0 } }
+    );
+
+    expect(result.current.status).toBe("loading");
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      "/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&lead_time_hours=0&include_members=true",
+      expect.any(Object)
+    );
+    expect(result.current.data?.lead_time_hours).toBe(0);
+    expect(result.current.data?.members).toEqual([10, 11, 12, 13, 14]);
+
+    // Rerender with non-zero lead (+24h)
+    rerender({ lead: 24 });
+    expect(result.current.status).toBe("loading");
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      "/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&lead_time_hours=24&include_members=true",
+      expect.any(Object)
+    );
+    expect(result.current.data?.lead_time_hours).toBe(24);
+    expect(result.current.data?.members).toEqual([34, 35, 36, 37, 38]);
+  });
+
+  it("discards a slow response from an older lead time so it cannot overwrite newer lead state", async () => {
+    let resolveLead0!: (res: Response) => void;
+    const lead0Promise = new Promise<Response>((resolve) => {
+      resolveLead0 = resolve;
+    });
+
+    // Lead 0 hangs initially
+    mockFetch.mockImplementationOnce(() => lead0Promise);
+    // Lead 24 resolves immediately
+    mockFetch.mockResolvedValueOnce(distResponse(24, [34, 35, 36, 37, 38]));
+
+    const { result, rerender } = renderHook(
+      ({ lead }: { lead: number }) =>
+        useEnsembleDistribution(location, lead, "temperature_2m", { model: "gefs" }),
+      { initialProps: { lead: 0 } }
+    );
+
+    expect(result.current.status).toBe("loading");
+
+    // Switch lead to +24h while +0h is still pending
+    rerender({ lead: 24 });
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.data?.lead_time_hours).toBe(24);
+    expect(result.current.data?.members).toEqual([34, 35, 36, 37, 38]);
+
+    // Now resolve the older +0h request
+    resolveLead0(distResponse(0, [10, 11, 12, 13, 14]));
+    // Wait a tick to ensure any pending promises settle
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Stale +0h response must not overwrite current +24h state
+    expect(result.current.data?.lead_time_hours).toBe(24);
+    expect(result.current.data?.members).toEqual([34, 35, 36, 37, 38]);
+  });
 });
