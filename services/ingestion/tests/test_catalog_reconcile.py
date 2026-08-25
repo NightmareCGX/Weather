@@ -132,9 +132,7 @@ def test_deterministic_missing_lead_restored(db: Session) -> None:
     run = record_run(db, spec, _dataset_leads((0, 12)), committed_state=None)
     assert _product_leads(db, run.id) == {0, 12}
 
-    _reconcile_catalog_to_store(
-        db, run, _deterministic_state({0, 12, 24}), spec
-    )
+    _reconcile_catalog_to_store(db, run, _deterministic_state({0, 12, 24}), spec)
     assert _product_leads(db, run.id) == {0, 12, 24}
 
 
@@ -167,15 +165,11 @@ def test_deterministic_stale_and_missing_reconciled(db: Session) -> None:
 def test_ensemble_missing_pair_restored(db: Session) -> None:
     """Store (1,6),(2,6); catalog (1,6); restore (2,6) + member 2."""
     spec = _spec(is_ensemble=True, expected_leads=(6,), expected_members=(1, 2))
-    run = record_run(
-        db, spec, _dataset_member(1, (6,)), member=1, committed_state=None
-    )
+    run = record_run(db, spec, _dataset_member(1, (6,)), member=1, committed_state=None)
     assert _member_pairs(db, run.id) == {(1, 6)}
     assert _member_indices(db, run.id) == {1}
 
-    _reconcile_catalog_to_store(
-        db, run, _ensemble_state({(1, 6), (2, 6)}), spec
-    )
+    _reconcile_catalog_to_store(db, run, _ensemble_state({(1, 6), (2, 6)}), spec)
     assert _member_pairs(db, run.id) == {(1, 6), (2, 6)}
     assert _member_indices(db, run.id) == {1, 2}
 
@@ -183,9 +177,7 @@ def test_ensemble_missing_pair_restored(db: Session) -> None:
 def test_ensemble_stale_pair_removed(db: Session) -> None:
     """Store (1,6); catalog (1,6),(2,6); remove stale (2,6) + member 2."""
     spec = _spec(is_ensemble=True, expected_leads=(6,), expected_members=(1, 2))
-    run = record_run(
-        db, spec, _dataset_member(2, (6,)), member=2, committed_state=None
-    )
+    run = record_run(db, spec, _dataset_member(2, (6,)), member=2, committed_state=None)
     # Simulate a stale catalog entry for member 2 (store only has member 1).
     _reconcile_catalog_to_store(db, run, _ensemble_state({(1, 6)}), spec)
     assert _member_pairs(db, run.id) == {(1, 6)}
@@ -198,21 +190,15 @@ def test_ensemble_stale_and_missing_reconciled(db: Session) -> None:
     run = record_run(
         db, spec, _dataset_member(1, (6, 12)), member=1, committed_state=None
     )
-    _reconcile_catalog_to_store(
-        db, run, _ensemble_state({(1, 6), (2, 12)}), spec
-    )
+    _reconcile_catalog_to_store(db, run, _ensemble_state({(1, 6), (2, 12)}), spec)
     assert _member_pairs(db, run.id) == {(1, 6), (2, 12)}
     assert _member_indices(db, run.id) == {1, 2}
 
 
 def test_ensemble_missing_multiple_pairs_restored(db: Session) -> None:
     """Store full 2x2 matrix; catalog only member-1 lead-6; restore all others."""
-    spec = _spec(
-        is_ensemble=True, expected_leads=(0, 12), expected_members=(1, 2, 3)
-    )
-    run = record_run(
-        db, spec, _dataset_member(1, (0,)), member=1, committed_state=None
-    )
+    spec = _spec(is_ensemble=True, expected_leads=(0, 12), expected_members=(1, 2, 3))
+    run = record_run(db, spec, _dataset_member(1, (0,)), member=1, committed_state=None)
     committed = {(m, lead_t) for m in (1, 2, 3) for lead_t in (0, 12)}
     _reconcile_catalog_to_store(db, run, _ensemble_state(committed), spec)
     assert _member_pairs(db, run.id) == committed
@@ -240,11 +226,7 @@ def test_repeated_reconciliation_idempotent(db: Session) -> None:
     for _ in range(3):
         _reconcile_catalog_to_store(db, run, state, spec)
     # Exactly one product per (variable x lead); 2 vars x 3 leads = 6 rows.
-    products = (
-        db.query(ProductRecord)
-        .filter(ProductRecord.run_id == run.id)
-        .all()
-    )
+    products = db.query(ProductRecord).filter(ProductRecord.run_id == run.id).all()
     assert len(products) == 6
     assert _product_leads(db, run.id) == {0, 12, 24}
     # Re-running on an already-consistent catalog is a no-op.
@@ -266,11 +248,7 @@ def test_concurrent_reconcile_no_duplicates(db: Session) -> None:
     state = _deterministic_state({0, 12})
     _reconcile_catalog_to_store(db, run, state, spec)
     _reconcile_catalog_to_store(db, run, state, spec)
-    products = (
-        db.query(ProductRecord)
-        .filter(ProductRecord.run_id == run.id)
-        .all()
-    )
+    products = db.query(ProductRecord).filter(ProductRecord.run_id == run.id).all()
     assert len(products) == 4  # 2 vars x 2 leads, no duplicates
 
 
@@ -318,12 +296,8 @@ def test_ensemble_ready_only_when_declared_matrix_complete(db: Session) -> None:
     """GEFS declared members {1,2}, leads {0,12}; both members complete -> READY."""
     from ingestion.core.catalog import _derive_run_status
 
-    spec = _spec(
-        is_ensemble=True, expected_leads=(0, 12), expected_members=(1, 2)
-    )
-    run = record_run(
-        db, spec, _dataset_member(1, (0,)), member=1, committed_state=None
-    )
+    spec = _spec(is_ensemble=True, expected_leads=(0, 12), expected_members=(1, 2))
+    run = record_run(db, spec, _dataset_member(1, (0,)), member=1, committed_state=None)
     committed = {(m, lead_t) for m in (1, 2) for lead_t in (0, 12)}
     _reconcile_catalog_to_store(db, run, _ensemble_state(committed), spec)
     status = _derive_run_status(db, run, spec, _ensemble_state(committed))
@@ -334,12 +308,8 @@ def test_ensemble_partial_when_declared_members_missing(db: Session) -> None:
     """GEFS declared members {1,2,3}; only 1,2 committed -> PARTIAL."""
     from ingestion.core.catalog import _derive_run_status
 
-    spec = _spec(
-        is_ensemble=True, expected_leads=(0, 12), expected_members=(1, 2, 3)
-    )
-    run = record_run(
-        db, spec, _dataset_member(1, (0,)), member=1, committed_state=None
-    )
+    spec = _spec(is_ensemble=True, expected_leads=(0, 12), expected_members=(1, 2, 3))
+    run = record_run(db, spec, _dataset_member(1, (0,)), member=1, committed_state=None)
     committed = {(m, lead_t) for m in (1, 2) for lead_t in (0, 12)}
     _reconcile_catalog_to_store(db, run, _ensemble_state(committed), spec)
     status = _derive_run_status(db, run, spec, _ensemble_state(committed))
@@ -430,7 +400,12 @@ def test_coordinator_multi_lead_run_reaches_ready(tmp_path, monkeypatch) -> None
         from ingestion.cli import _synthetic_spec_dataset
 
         with Session(bind=conn) as catalog_session:
-            db_run = record_run(catalog_session, spec, _synthetic_spec_dataset(spec), committed_state=None)
+            db_run = record_run(
+                catalog_session,
+                spec,
+                _synthetic_spec_dataset(spec),
+                committed_state=None,
+            )
             run_id = str(db_run.id)
 
         # 2. Initialize the store with the seed (lead 6).
@@ -468,13 +443,15 @@ def test_coordinator_multi_lead_run_reaches_ready(tmp_path, monkeypatch) -> None
             )
 
         # 4. Finalize.
-        status = coordinator.finalize_run(
+        finalize_result = coordinator.finalize_run(
             conn,
             run_id=run_id,
             spec=spec,
             expected_leads=(6, 12, 18),
             expected_members=(),
         )
+        status = finalize_result.status
+        assert status == "ready"
     finally:
         conn.close()
 

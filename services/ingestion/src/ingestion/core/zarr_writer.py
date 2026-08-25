@@ -318,7 +318,7 @@ def prepare_run_store(
         # Only the spatial axes come from the source file; the lead (and for
         # GEFS, member) axes are the run's expected dimensions.
         base_dims: tuple[str, ...] = tuple(
-            d for d in da.dims if d in ("latitude", "longitude")
+            str(d) for d in da.dims if str(d) in ("latitude", "longitude")
         )
         grid_shape = tuple(int(dataset.sizes[d]) for d in base_dims)
         if members:
