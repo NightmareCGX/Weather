@@ -25,7 +25,9 @@ jest.mock("../../charts/EnsembleChart", () => ({
   EnsembleChart: () => <div data-testid="ensemble-chart" />,
 }));
 jest.mock("../../charts/EnsembleDistribution", () => ({
-  EnsembleDistribution: () => <div data-testid="ensemble-distribution" />,
+  EnsembleDistribution: ({ selectedLead }: { selectedLead?: number }) => (
+    <div data-testid="ensemble-distribution" data-selected-lead={selectedLead} />
+  ),
 }));
 
 const mockUsePointForecast = usePointForecast as jest.MockedFunction<typeof usePointForecast>;
@@ -289,6 +291,76 @@ describe("ForecastDashboard", () => {
     expect(screen.getByTestId("ensemble-chart")).toBeInTheDocument();
     // …and the distribution view renders from the focused members request.
     expect(screen.getByTestId("ensemble-distribution")).toBeInTheDocument();
+    expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
+      location,
+      6,
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+    expect(screen.getByTestId("ensemble-distribution")).toHaveAttribute("data-selected-lead", "6");
+  });
+
+  it("propagates non-zero selected lead time (+24h) to the ensemble distribution hook and chart", () => {
+    mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "success",
+      error: null,
+      model: "gefs",
+    });
+    mockUseEnsembleDistribution.mockReturnValue({
+      data: null,
+      status: "idle",
+      error: null,
+    });
+    mockSelectionContext({
+      selection: {
+        model: "gefs",
+        variable: "temperature_2m",
+        initialTime: "2026-08-13T00:00:00Z",
+        leadTimeHours: 24,
+      },
+      options: {
+        models: [
+          { id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] },
+          {
+            id: "gefs",
+            name: "Global Ensemble Forecast System",
+            is_ensemble: true,
+            variables: [],
+          },
+        ],
+        model: {
+          id: "gefs",
+          name: "Global Ensemble Forecast System",
+          is_ensemble: true,
+          variables: [],
+        },
+        variables: [],
+        initialTimes: [],
+        variable: null,
+        initialTime: null,
+        leadTimes: [0, 6, 12, 18, 24],
+      },
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    // Forecast series starts at lead 0, but the distribution hook must receive
+    // the authoritative selected lead (+24h), NOT the first lead (+0h).
+    expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
+      location,
+      24,
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+    expect(mockUseEnsembleDistribution).not.toHaveBeenCalledWith(
+      location,
+      0,
+      expect.anything(),
+      expect.anything()
+    );
+    expect(screen.getByTestId("ensemble-distribution")).toHaveAttribute("data-selected-lead", "24");
   });
 
   it("shows the point forecast error state inline", () => {
