@@ -7,9 +7,8 @@ mid-re-ingest, each store-reading endpoint:
         -> acquire SHARED admission
         -> acquire SHARED store gate
         -> fresh Core revalidation (run status, path, availability)
-        -> read committed manifest generation
-        -> generation-aware cache lookup
-        -> on miss: open Zarr + fully materialize under the gate
+        -> generation-aware lazy-dataset reuse (Phase 2) + bounded selection
+        -> materialize ONLY the selected subset under the gate
         -> release SHARED store gate + admission
 
 The gate uses the **same** PostgreSQL advisory-lock key derivation as the
@@ -260,13 +259,15 @@ def gated_read_dataset_with_selector(
         FileNotFoundError: If the run is no longer READY (revalidation fails).
     """
     from api.core.config import settings
-    from api.core.zarr import read_dataset
+    from api.core.zarr import read_dataset_cached
 
     def materialize_selected() -> T:
-        # read_dataset returns a lazily-opened dataset; the selector materializes
-        # only its bounded selection before returning. So no additional .compute()
-        # (which would force a full-store read) is needed here.
-        ds = read_dataset(store_path)
+        # read_dataset_cached returns the lazily-opened dataset (reused per
+        # serving_generation); the selector materializes only its bounded
+        # selection before returning — all chunk I/O happens HERE, under the
+        # SHARED gate. So no additional .compute() (which would force a
+        # full-store read) is needed here.
+        ds = read_dataset_cached(store_path)
         return selector(ds)
 
     try:
