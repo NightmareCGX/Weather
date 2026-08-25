@@ -117,6 +117,7 @@ def _s3_fs() -> "s3fs.S3FileSystem":
         key=settings.MINIO_ACCESS_KEY,
         secret=settings.MINIO_SECRET_KEY,
         client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+        use_listings_cache=False,
     )
 
 

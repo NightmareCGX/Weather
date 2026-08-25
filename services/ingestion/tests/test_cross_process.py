@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -34,7 +35,7 @@ import numpy as np, xarray as xr
 lead = int(sys.argv[1])
 member_raw = sys.argv[2]
 s3_store = sys.argv[3]
-barrier_file = sys.argv[4]
+barrier_dir = sys.argv[4]
 barrier_count = int(sys.argv[5])
 member = int(member_raw) if member_raw != "None" else None
 
@@ -86,19 +87,30 @@ if (lead == 6 and member is None) or member == 1:
     finally:
         conn.close()
 
-# Barrier: append this process's pid, wait for both.
-with open(barrier_file, "a", encoding="utf-8") as fh:
-    fh.write(str(os.getpid()) + "\n")
-deadline = time.monotonic() + 30
+# Atomic directory-based barrier: create a unique marker file per worker.
+worker_tag = f"m{member}_L{lead}_{os.getpid()}"
+marker_file = os.path.join(barrier_dir, f"{worker_tag}.ready")
+with open(marker_file, "w", encoding="utf-8") as fh:
+    fh.write(str(os.getpid()))
+
+deadline = time.monotonic() + 15
 while time.monotonic() < deadline:
     try:
-        with open(barrier_file, "r", encoding="utf-8") as fh:
-            n = len(fh.read().strip().splitlines())
-        if n >= barrier_count:
+        markers = [f for f in os.listdir(barrier_dir) if f.endswith(".ready")]
+        if len(markers) >= barrier_count:
             break
     except OSError:
         pass
-    time.sleep(0.05)
+    time.sleep(0.02)
+else:
+    try:
+        observed = os.listdir(barrier_dir)
+    except Exception:
+        observed = []
+    raise RuntimeError(
+        f"Worker {worker_tag} timed out waiting for barrier ({barrier_count} expected, "
+        f"observed {len(observed)}: {observed})"
+    )
 
 conn = engine.connect()
 try:
@@ -148,13 +160,13 @@ def _minio_reachable() -> bool:
         return False
 
 
-def _spawn_worker(lead: int, member: int | None, store: str, barrier: str, n: int):
+def _spawn_worker(lead: int, member: int | None, store: str, barrier_dir: str | Path, n: int):
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../src"))
     domain_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../packages/domain/src"))
     script = _WORKER % (src_dir, domain_src)
     cmd = [
         sys.executable, "-c", script,
-        str(lead), "None" if member is None else str(member), store, barrier, str(n),
+        str(lead), "None" if member is None else str(member), store, str(barrier_dir), str(n),
     ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -163,16 +175,15 @@ def _spawn_worker(lead: int, member: int | None, store: str, barrier: str, n: in
     os.environ.get("WEATHER_TEST_MINIO") != "1" or not _minio_reachable(),
     reason="MinIO integration test",
 )
-def test_cross_process_disjoint_deterministic_writes() -> None:
+def test_cross_process_disjoint_deterministic_writes(tmp_path: Path) -> None:
     """Two processes write disjoint leads 6 and 12; both survive; union in store."""
     _ensure_catalog_schema()
     store = f"s3://{settings.MINIO_BUCKET_NAME}/m5-cross/{uuid.uuid4().hex}"
-    barrier = os.path.join(os.path.dirname(__file__), "_m5-barrier")
-    if os.path.exists(barrier):
-        os.unlink(barrier)
+    barrier_dir = tmp_path / "barrier_det"
+    barrier_dir.mkdir(parents=True, exist_ok=True)
 
-    p_a = _spawn_worker(6, None, store, barrier, 2)
-    p_b = _spawn_worker(12, None, store, barrier, 2)
+    p_a = _spawn_worker(6, None, store, barrier_dir, 2)
+    p_b = _spawn_worker(12, None, store, barrier_dir, 2)
     _, err_a = p_a.communicate(timeout=90)
     _, err_b = p_b.communicate(timeout=90)
     assert p_a.returncode == 0, f"process A (lead 6) failed: {err_a.decode()[:500]}"
@@ -191,24 +202,21 @@ def test_cross_process_disjoint_deterministic_writes() -> None:
 
     keys = list_region_marker_keys(store)
     assert len(keys) == 2, f"expected 2 COMPLETE markers, got {keys}"
-    if os.path.exists(barrier):
-        os.unlink(barrier)
 
 
 @pytest.mark.skipif(
     os.environ.get("WEATHER_TEST_MINIO") != "1" or not _minio_reachable(),
     reason="MinIO integration test",
 )
-def test_cross_process_conflicting_ensemble_serializes() -> None:
+def test_cross_process_conflicting_ensemble_serializes(tmp_path: Path) -> None:
     """Two processes target different members of the SAME lead -> serialize."""
     _ensure_catalog_schema()
     store = f"s3://{settings.MINIO_BUCKET_NAME}/m5-cross/{uuid.uuid4().hex}"
-    barrier = os.path.join(os.path.dirname(__file__), "_m5-barrier-ens")
-    if os.path.exists(barrier):
-        os.unlink(barrier)
+    barrier_dir = tmp_path / "barrier_ens"
+    barrier_dir.mkdir(parents=True, exist_ok=True)
 
-    p_a = _spawn_worker(6, 1, store, barrier, 2)
-    p_b = _spawn_worker(6, 2, store, barrier, 2)
+    p_a = _spawn_worker(6, 1, store, barrier_dir, 2)
+    p_b = _spawn_worker(6, 2, store, barrier_dir, 2)
     _, err_a = p_a.communicate(timeout=90)
     _, err_b = p_b.communicate(timeout=90)
     assert p_a.returncode == 0, f"process A (member 1) failed: {err_a.decode()[:500]}"
@@ -223,25 +231,22 @@ def test_cross_process_conflicting_ensemble_serializes() -> None:
     # Members write distinct sentinels (member identity) to detect lost updates.
     assert m1 == pytest.approx(1.0)
     assert m2 == pytest.approx(2.0)
-    if os.path.exists(barrier):
-        os.unlink(barrier)
 
 
 @pytest.mark.skipif(
     os.environ.get("WEATHER_TEST_MINIO") != "1" or not _minio_reachable(),
     reason="MinIO integration test",
 )
-def test_cross_process_four_way_conflict_no_lost_members() -> None:
+def test_cross_process_four_way_conflict_no_lost_members(tmp_path: Path) -> None:
     """Four independent writers target members 1..4 of the SAME lead. Each writes
     a distinct sentinel. Under the full-member chunk layout all four share the
     physical chunk, so max_active == 1 and no member value is lost."""
     _ensure_catalog_schema()
     store = f"s3://{settings.MINIO_BUCKET_NAME}/m5-cross/{uuid.uuid4().hex}"
-    barrier = os.path.join(os.path.dirname(__file__), "_m5-barrier-4way")
-    if os.path.exists(barrier):
-        os.unlink(barrier)
+    barrier_dir = tmp_path / "barrier_4way"
+    barrier_dir.mkdir(parents=True, exist_ok=True)
 
-    procs = [_spawn_worker(6, m, store, barrier, 4) for m in (1, 2, 3, 4)]
+    procs = [_spawn_worker(6, m, store, barrier_dir, 4) for m in (1, 2, 3, 4)]
     for p in procs:
         _, err = p.communicate(timeout=120)
         assert p.returncode == 0, f"process failed: {err.decode()[:500]}"
@@ -255,5 +260,3 @@ def test_cross_process_four_way_conflict_no_lost_members() -> None:
         if v != float(m):
             lost.append((m, v))
     assert not lost, f"lost member values: {lost}"
-    if os.path.exists(barrier):
-        os.unlink(barrier)
