@@ -319,5 +319,17 @@ describe("ensembleStatisticsEntries", () => {
       };
       expect(distributionXDomain(emptySummary, null)).toEqual([0, 1]);
     });
+
+    it("expands identical min/max to prevent zero-width scale when PDF is absent", () => {
+      const constantSummary = {
+        count: 5,
+        min: 20.0,
+        max: 20.0,
+        mean: 20.0,
+        median: 20.0,
+        stdDev: 0.0,
+      };
+      expect(distributionXDomain(constantSummary, null)).toEqual([19.0, 21.0]);
+    });
   });
 });

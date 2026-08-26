@@ -139,7 +139,7 @@ export function EnsembleDistribution({
         className="h-44 w-full"
       >
         <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
+          <ComposedChart data={binChartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
             <XAxis
               type="number"
@@ -177,11 +177,11 @@ export function EnsembleDistribution({
             />
             <Bar
               yAxisId="left"
-              data={binChartData}
               dataKey="count"
               isAnimationActive={false}
               radius={[2, 2, 0, 0]}
               name="Member count"
+              barSize={32}
             >
               {bins.map((bin, index) => (
                 <Cell

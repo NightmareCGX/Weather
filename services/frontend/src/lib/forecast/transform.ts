@@ -314,8 +314,12 @@ export function distributionXDomain(
       return [validX[0], validX[validX.length - 1]];
     }
   }
-  const min = Number.isFinite(summary.min) ? summary.min : 0;
-  const max = Number.isFinite(summary.max) ? summary.max : 1;
+  let min = Number.isFinite(summary.min) ? summary.min : 0;
+  let max = Number.isFinite(summary.max) ? summary.max : 1;
+  if (min === max) {
+    min -= 1;
+    max += 1;
+  }
   return [min, max];
 }
 

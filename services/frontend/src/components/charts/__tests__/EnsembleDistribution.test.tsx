@@ -1,15 +1,19 @@
+import React from "react";
 import { render, screen } from "@testing-library/react";
 
 import { EnsembleDistribution } from "@/components/charts/EnsembleDistribution";
+import { histogramBins } from "@/lib/forecast/transform";
 import type { EnsembleStatisticsData } from "@/lib/api/types";
 
 jest.mock("recharts", () => {
   const actual = jest.requireActual("recharts");
   return {
     ...actual,
-    ResponsiveContainer: ({ children }: { children: React.ReactNode }) => (
+    ResponsiveContainer: ({ children }: { children: React.ReactElement }) => (
       <div data-testid="responsive" style={{ width: 640, height: 192 }}>
-        {children}
+        {React.isValidElement(children)
+          ? React.cloneElement(children, { width: 640, height: 192 } as React.Attributes)
+          : children}
       </div>
     ),
   };
@@ -77,7 +81,7 @@ const baseProps = {
 
 describe("EnsembleDistribution", () => {
   it("renders a histogram, PDF line, and member rug from raw members and pdf when present", () => {
-    render(
+    const { container } = render(
       <EnsembleDistribution {...baseProps} data={withMembersAndPdf} status="success" error={null} />
     );
 
@@ -91,10 +95,27 @@ describe("EnsembleDistribution", () => {
     expect(screen.getByText("Min")).toBeInTheDocument();
     expect(screen.getByText("Max")).toBeInTheDocument();
     expect(screen.getByText(/canonical Gaussian kernel density estimate/)).toBeInTheDocument();
+
+    // Semantic SVG mark assertions for histogram bars
+    const expectedBins = histogramBins(withMembersAndPdf.members!).length;
+    const bars = container.querySelectorAll(".recharts-rectangle");
+    expect(bars.length).toBe(expectedBins);
+    bars.forEach((bar) => {
+      expect(bar.getAttribute("d")).toMatch(/^M\s*[\d.]+/);
+    });
+
+    // Semantic SVG mark assertion for PDF continuous line curve
+    const lineCurve = container.querySelector(".recharts-line-curve");
+    expect(lineCurve).toBeInTheDocument();
+    expect(lineCurve?.getAttribute("d")).toMatch(/^M\s*[\d.]+/);
+
+    // Semantic SVG mark assertion for member rug dots
+    const dots = container.querySelectorAll(".recharts-scatter-symbol");
+    expect(dots.length).toBe(withMembersAndPdf.members!.length);
   });
 
   it("handles null pdf gracefully by rendering histogram, dots, and warning note", () => {
-    render(
+    const { container } = render(
       <EnsembleDistribution
         {...baseProps}
         data={withMembersNullPdf}
@@ -112,6 +133,22 @@ describe("EnsembleDistribution", () => {
     expect(
       screen.getByText(/Continuous probability density is unavailable for this lead time/)
     ).toBeInTheDocument();
+
+    // Histogram bars must still render when PDF is null
+    const expectedBins = histogramBins(withMembersNullPdf.members!).length;
+    const bars = container.querySelectorAll(".recharts-rectangle");
+    expect(bars.length).toBe(expectedBins);
+    bars.forEach((bar) => {
+      expect(bar.getAttribute("d")).toMatch(/^M\s*[\d.]+/);
+    });
+
+    // PDF line must be absent
+    const lineCurve = container.querySelector(".recharts-line-curve");
+    expect(lineCurve).not.toBeInTheDocument();
+
+    // Rug dots must still be present
+    const dots = container.querySelectorAll(".recharts-scatter-symbol");
+    expect(dots.length).toBe(withMembersNullPdf.members!.length);
   });
 
   it("shows an honest unavailable state when members are absent", () => {
