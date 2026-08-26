@@ -96,7 +96,7 @@ test("ensemble statistics: deterministic selected model shows no ensemble panel"
   );
 });
 
-test("selecting an ensemble model renders the percentile fan and member histogram", async ({
+test("selecting an ensemble model renders the percentile fan and member distribution", async ({
   page,
 }) => {
   await page.goto("/");
@@ -116,10 +116,15 @@ test("selecting an ensemble model renders the percentile fan and member histogra
     page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
   ).toBeVisible();
 
-  // The mock returns members for /v1/ensembles, so the Distribution View shows
-  // a genuine member histogram.
+  // The mock returns members and pdf for /v1/ensembles, so the Distribution View
+  // renders both the histogram bars and the continuous PDF line.
   await expect(page.getByText(/Member distribution/)).toBeVisible();
-  await expect(page.getByRole("img", { name: /Histogram of 5 ensemble members/ })).toBeVisible();
+  const distribution = page.getByRole("img", {
+    name: /Histogram and PDF of 5 ensemble members/,
+  });
+  await expect(distribution).toBeVisible();
+  await expect(distribution.locator(".recharts-rectangle").first()).toBeVisible();
+  await expect(distribution.locator(".recharts-line-curve")).toBeVisible();
 });
 
 test("empty search: coherent empty state, app stays usable", async ({ page }) => {

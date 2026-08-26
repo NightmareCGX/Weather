@@ -6,6 +6,7 @@ import {
 } from "@/lib/api/types";
 import {
   distributionSummary,
+  distributionXDomain,
   ensembleStatisticsEntries,
   forecastLeadTimes,
   forecastVariableCodes,
@@ -14,6 +15,7 @@ import {
   toEnsembleFanData,
   toMemberDots,
   toMeteogramSeries,
+  toPdfPoints,
 } from "@/lib/forecast/transform";
 
 const entries: ForecastEntry[] = [
@@ -253,5 +255,81 @@ describe("ensembleStatisticsEntries", () => {
       "p75",
       "p90",
     ]);
+  });
+
+  describe("toPdfPoints", () => {
+    it("converts valid PDF payload to x/density coordinate objects", () => {
+      const pdf = {
+        x: [10.0, 15.0, 20.0],
+        density: [0.01, 0.15, 0.02],
+      };
+      expect(toPdfPoints(pdf)).toEqual([
+        { x: 10.0, density: 0.01 },
+        { x: 15.0, density: 0.15 },
+        { x: 20.0, density: 0.02 },
+      ]);
+    });
+
+    it("handles null, undefined, or empty PDF gracefully", () => {
+      expect(toPdfPoints(null)).toEqual([]);
+      expect(toPdfPoints(undefined)).toEqual([]);
+      expect(toPdfPoints({ x: [], density: [] })).toEqual([]);
+    });
+
+    it("filters non-finite numbers", () => {
+      const pdf = {
+        x: [10.0, Number.NaN, 20.0],
+        density: [0.01, 0.15, Number.POSITIVE_INFINITY],
+      };
+      expect(toPdfPoints(pdf)).toEqual([{ x: 10.0, density: 0.01 }]);
+    });
+  });
+
+  describe("distributionXDomain", () => {
+    const summary = {
+      count: 5,
+      min: 15.0,
+      max: 25.0,
+      mean: 20.0,
+      median: 20.0,
+      stdDev: 3.5,
+    };
+
+    it("spans PDF extrema when PDF is present", () => {
+      const pdf = {
+        x: [10.0, 15.0, 20.0, 25.0, 30.0],
+        density: [0.001, 0.05, 0.2, 0.05, 0.001],
+      };
+      expect(distributionXDomain(summary, pdf)).toEqual([10.0, 30.0]);
+    });
+
+    it("falls back to sample min/max when PDF is absent", () => {
+      expect(distributionXDomain(summary, null)).toEqual([15.0, 25.0]);
+      expect(distributionXDomain(summary, undefined)).toEqual([15.0, 25.0]);
+    });
+
+    it("handles empty summary when fallback needed", () => {
+      const emptySummary = {
+        count: 0,
+        min: Number.NaN,
+        max: Number.NaN,
+        mean: Number.NaN,
+        median: Number.NaN,
+        stdDev: Number.NaN,
+      };
+      expect(distributionXDomain(emptySummary, null)).toEqual([0, 1]);
+    });
+
+    it("expands identical min/max to prevent zero-width scale when PDF is absent", () => {
+      const constantSummary = {
+        count: 5,
+        min: 20.0,
+        max: 20.0,
+        mean: 20.0,
+        median: 20.0,
+        stdDev: 0.0,
+      };
+      expect(distributionXDomain(constantSummary, null)).toEqual([19.0, 21.0]);
+    });
   });
 });

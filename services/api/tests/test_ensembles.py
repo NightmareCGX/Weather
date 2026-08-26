@@ -188,6 +188,7 @@ def test_ensembles_default_omits_members(client):
     assert resp.status_code == 200
     data = resp.json()["data"]
     assert "members" not in data
+    assert "pdf" not in data
     assert data["member_count"] == MEMBER_COUNT
     assert set(data["statistics"]) == {
         "mean",
@@ -210,6 +211,7 @@ def test_ensembles_explicit_false_omits_members(client):
     assert resp.status_code == 200
     data = resp.json()["data"]
     assert "members" not in data
+    assert "pdf" not in data
     assert data["member_count"] == MEMBER_COUNT
 
 
@@ -227,6 +229,12 @@ def test_ensembles_include_members_returns_genuine_values(client):
     ]
     assert data["members"] == pytest.approx(expected_members)
     assert data["member_count"] == len(data["members"])
+    assert "pdf" in data
+    assert data["pdf"] is not None
+    assert len(data["pdf"]["x"]) == 100
+    assert len(data["pdf"]["density"]) == 100
+    assert data["pdf"]["x"][0] < min(expected_members)
+    assert data["pdf"]["x"][-1] > max(expected_members)
 
 
 def test_ensembles_members_match_statistics(client):
@@ -285,3 +293,26 @@ def test_ensembles_cache_separates_members_flag(client):
     assert "members" in resp_dist2.json()["data"]
     assert resp_stats2.json()["data"]["statistics"] == stats_data["statistics"]
     assert resp_dist2.json()["data"]["statistics"] == dist_data["statistics"]
+
+
+def test_ensembles_include_members_degenerate_returns_pdf_null(monkeypatch, client):
+    """When member values have zero variance, pdf is returned as null."""
+    from api.services import ensemble_data
+
+    monkeypatch.setattr(
+        ensemble_data,
+        "_gated_member_values",
+        lambda *args, **kwargs: [20.0, 20.0, 20.0, 20.0, 20.0],
+    )
+
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT + 0.05}&lon={LON + 0.05}"
+        "&variable=temperature_2m"
+        f"&lead_time_hours={LEAD}&include_members=true"
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["members"] == [20.0, 20.0, 20.0, 20.0, 20.0]
+    assert data["statistics"]["spread"] == 0.0
+    assert "pdf" in data
+    assert data["pdf"] is None

@@ -376,15 +376,23 @@ class EnsembleStatistics(BaseModel):
     p90: float
 
 
+class EnsemblePDF(BaseModel):
+    """Ensemble probability density function estimate."""
+
+    x: list[float]
+    density: list[float]
+
+
 class EnsembleStatisticsData(BaseModel):
     """The payload of ensemble statistics (API.md section 5.1).
 
     ``members`` carries the raw ensemble-member forecast values (in dataset
     ``member``-coordinate order) for the requested model, location, variable,
-    and lead time. It is an opt-in field returned only when the request sets
-    ``include_members=true``; it is serialized only when present so a
-    statistics-only response never exposes a ``null`` ``members`` key (API.md
-    section 5.1, additive opt-in extension).
+    and lead time. ``pdf`` carries the canonical 1-D Gaussian Kernel Density
+    Estimate over the ensemble members (or ``null`` when variation across
+    members is degenerate / std = 0). Both are opt-in fields returned only
+    when the request sets ``include_members=true``; they are omitted on
+    statistics-only responses (API.md section 5.1, additive opt-in extension).
     """
 
     model: str
@@ -392,10 +400,11 @@ class EnsembleStatisticsData(BaseModel):
     member_count: int
     statistics: EnsembleStatistics
     members: list[float] | None = None
+    pdf: EnsemblePDF | None = None
 
     @model_serializer
-    def _serialize_members(self) -> dict[str, object]:
-        """Omit ``members`` unless present (include_members=true)."""
+    def _serialize_distribution_fields(self) -> dict[str, object]:
+        """Omit ``members`` and ``pdf`` unless include_members=true."""
         payload: dict[str, object] = {
             "model": self.model,
             "lead_time_hours": self.lead_time_hours,
@@ -404,6 +413,7 @@ class EnsembleStatisticsData(BaseModel):
         }
         if self.members is not None:
             payload["members"] = self.members
+            payload["pdf"] = self.pdf
         return payload
 
 
