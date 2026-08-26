@@ -89,6 +89,83 @@ describe("WeatherMap", () => {
     expect(map.addSource).toHaveBeenCalledTimes(2);
   });
 
+  it("replaces the weather layer immediately when map.loaded() is false but style is loaded (tiles in flight)", () => {
+    const { rerender } = renderMap();
+    const [map] = getInstances();
+
+    // Simulate active raster tile downloads: loaded() is false, but isStyleLoaded() is true
+    map.isLoaded = false;
+    expect(map.loaded()).toBe(false);
+    expect(map.isStyleLoaded()).toBe(true);
+
+    rerender(
+      <WeatherMap
+        layer={{
+          ...layer,
+          lead_time_hours: 24,
+          tile_url_template:
+            "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=24",
+        }}
+        selectedLocation={null}
+        validTime={null}
+        onSelect={jest.fn()}
+      />
+    );
+
+    // Must still replace the layer immediately without waiting for tile downloads to finish
+    expect(map.removeLayer).toHaveBeenCalledWith("weather");
+    expect(map.removeSource).toHaveBeenCalledWith("weather");
+    expect(map.addSource).toHaveBeenCalledWith(
+      "weather",
+      expect.objectContaining({
+        tiles: ["/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=24"],
+      })
+    );
+  });
+
+  it("delays applying weather layer when style is not ready on mount and applies latest layer on load", () => {
+    // Set MockMap default to style not loaded during mount
+    clearInstances();
+    MockMap.defaultIsStyleLoaded = false;
+
+    const { rerender } = render(
+      <WeatherMap layer={layer} selectedLocation={null} validTime={null} onSelect={jest.fn()} />
+    );
+    const [map] = getInstances();
+    expect(map.isStyleLoaded()).toBe(false);
+
+    // Initial mount with style not ready must not have applied layer yet
+    expect(map.addSource).not.toHaveBeenCalled();
+
+    // Update layer while style is still loading
+    rerender(
+      <WeatherMap
+        layer={{
+          ...layer,
+          lead_time_hours: 36,
+          tile_url_template:
+            "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=36",
+        }}
+        selectedLocation={null}
+        validTime={null}
+        onSelect={jest.fn()}
+      />
+    );
+    expect(map.addSource).not.toHaveBeenCalled();
+
+    // Now style finishes loading and fires 'load' event
+    map._isStyleLoaded = true;
+    map.fire("load");
+
+    // The latest layer (lead_time_hours: 36) must be applied
+    expect(map.addSource).toHaveBeenCalledWith(
+      "weather",
+      expect.objectContaining({
+        tiles: ["/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=36"],
+      })
+    );
+  });
+
   it("removes the weather layer when the layer becomes null (selection cleared/failed)", () => {
     const { rerender } = renderMap();
     const [map] = getInstances();

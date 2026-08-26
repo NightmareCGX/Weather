@@ -17,6 +17,8 @@ const markers: MockMarker[] = [];
 
 export function clearInstances(): void {
   instances.length = 0;
+  MockMap.defaultIsStyleLoaded = true;
+  MockMap.defaultIsLoaded = true;
 }
 
 export function getInstances(): MockMap[] {
@@ -32,12 +34,16 @@ export function getMarkers(): MockMarker[] {
 }
 
 export class MockMap {
+  static defaultIsStyleLoaded = true;
+  static defaultIsLoaded = true;
+
   options: Record<string, unknown>;
   handlers = new Map<string, (payload?: unknown) => void>();
   sources = new Set<string>();
   layers = new Set<string>();
   removed = false;
-  isLoaded = true;
+  isLoaded = MockMap.defaultIsLoaded;
+  _isStyleLoaded = MockMap.defaultIsStyleLoaded;
 
   on = jest.fn((event: string, handler: (payload?: unknown) => void) => {
     this.handlers.set(event, handler);
@@ -61,6 +67,7 @@ export class MockMap {
   getSource = jest.fn((id: string) => (this.sources.has(id) ? { id } : undefined));
   getLayer = jest.fn((id: string) => (this.layers.has(id) ? { id } : undefined));
   loaded = jest.fn(() => this.isLoaded);
+  isStyleLoaded = jest.fn(() => this._isStyleLoaded);
   remove = jest.fn(() => {
     this.removed = true;
   });

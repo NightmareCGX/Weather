@@ -39,6 +39,7 @@ export function useMapLayer(): UseMapLayerResult {
     }
 
     const controller = new AbortController();
+    let active = true;
     setLoading(true);
     setError(null);
 
@@ -50,17 +51,21 @@ export function useMapLayer(): UseMapLayerResult {
       signal: controller.signal,
     })
       .then((next) => {
+        if (!active) return;
         setLayer(next);
         setLoading(false);
       })
       .catch((err: unknown) => {
-        if (err instanceof RequestAbortedError) return;
+        if (!active || err instanceof RequestAbortedError) return;
         setLayer(null);
         setError(err instanceof Error ? err.message : "Unable to load forecast data.");
         setLoading(false);
       });
 
-    return () => controller.abort();
+    return () => {
+      active = false;
+      controller.abort();
+    };
   }, [selection]);
 
   return { layer, loading, error };
