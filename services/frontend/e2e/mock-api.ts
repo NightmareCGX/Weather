@@ -317,7 +317,7 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       p75: sorted[3],
       p90: sorted[4],
     };
-    // Production-contract-faithful: `members` is returned only when the
+    // Production-contract-faithful: `members` and `pdf` are returned only when the
     // request opts in with `include_members=true`.
     const payload: Record<string, unknown> = {
       model: url.searchParams.get("model") ?? "gefs",
@@ -327,6 +327,10 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
     };
     if (includeMembers) {
       payload.members = members;
+      payload.pdf = {
+        x: [10.0, 15.0, 20.0, 25.0, 30.0],
+        density: [0.01, 0.05, 0.2, 0.05, 0.01],
+      };
     }
     route.fulfill({
       status: 200,
