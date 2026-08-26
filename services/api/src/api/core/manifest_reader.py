@@ -14,8 +14,6 @@ from typing import Any
 
 import s3fs  # type: ignore[import-untyped]
 
-from domain.locks import canonical_storage_identity, sha256_hex
-
 from api.core.config import settings
 
 #: Committed manifest path under a store's commit namespace.
@@ -43,6 +41,7 @@ def _read_manifest(store_path: str) -> dict[str, Any] | None:
             key=settings.MINIO_ACCESS_KEY,
             secret=settings.MINIO_SECRET_KEY,
             client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+            use_listings_cache=False,
         )
         try:
             raw = fs.cat_file(f"{root}/{_MANIFEST_PATH}")
@@ -64,22 +63,21 @@ def _read_manifest(store_path: str) -> dict[str, Any] | None:
     return payload
 
 
-def manifest_generation(store_path: str) -> str:
+def manifest_generation(store_path: str) -> str | None:
     """Return the committed-manifest serving generation for cache keys.
 
-    When no manifest exists (a legacy/hybrid store not yet finalized), derive a
-    deterministic legacy token from the canonical store identity so the cache
-    key is stable until the first marker-aware finalization writes a real
-    generation.
+    Returns:
+        The trusted generation string if a valid committed manifest exists,
+        or ``None`` when the manifest is confirmed absent (legacy or
+        unfinalized store).
 
     Raises:
-        ManifestReadError: If a manifest exists but is malformed (fail closed).
+        ManifestReadError: If a manifest exists but is malformed/invalid (fail closed).
     """
     payload = _read_manifest(store_path)
     if payload is None:
-        # Legacy compatibility token: deterministic, stable until the first
-        # marker-aware finalization writes a real manifest generation.
-        return "legacy-" + sha256_hex(canonical_storage_identity(store_path))
+        # Confirmed absent -> no trusted generation (caller must bypass handle cache).
+        return None
     generation = payload.get("generation")
     if not isinstance(generation, str) or not generation:
         raise ManifestReadError("committed manifest has no valid generation")

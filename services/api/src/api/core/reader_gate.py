@@ -259,16 +259,17 @@ def gated_read_dataset_with_selector(
         FileNotFoundError: If the run is no longer READY (revalidation fails).
     """
     from api.core.config import settings
-    from api.core.zarr import read_dataset_cached
+    from api.core.zarr import open_serving_dataset
 
     def materialize_selected() -> T:
-        # read_dataset_cached returns the lazily-opened dataset (reused per
-        # serving_generation); the selector materializes only its bounded
+        # open_serving_dataset provides the dataset under the authoritative
+        # serving freshness and ownership contract (reusing StoreHandleCache
+        # when a trusted generation exists, and opening fresh + closing on
+        # exit when uncached). The selector materializes only its bounded
         # selection before returning — all chunk I/O happens HERE, under the
-        # SHARED gate. So no additional .compute() (which would force a
-        # full-store read) is needed here.
-        ds = read_dataset_cached(store_path)
-        return selector(ds)
+        # SHARED gate.
+        with open_serving_dataset(store_path) as ds:
+            return selector(ds)
 
     try:
         from api.main import reader_lifecycle, reader_pool

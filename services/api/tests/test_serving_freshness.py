@@ -14,6 +14,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 import xarray as xr
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -145,6 +146,19 @@ def test_long_lived_api_observes_new_lead_and_cycle_without_restart(
         assert resp_map_2.status_code == 200
         assert resp_map_2.headers["Cache-Control"] == "no-cache"
 
+        # Exercise the actual Zarr reading paths (point forecast and map tile) for the new lead.
+        resp_point_2 = client.get("/v1/points?lat=38.125&lon=-106.875&models=gfs&start_lead_time_hours=6&end_lead_time_hours=6")
+        assert resp_point_2.status_code == 200
+        assert resp_point_2.headers["Cache-Control"] == "no-cache"
+        forecasts_2 = resp_point_2.json()["data"]["forecasts"]
+        fc_00 = next(f for f in forecasts_2 if f["cycle_time"] == "2026-07-25T00:00:00Z")
+        assert fc_00["lead_time_hours"] == 6
+        assert fc_00["temperature_2m"] == pytest.approx(18.0)
+
+        resp_tile_2 = client.get("/v1/maps/gfs/temperature_2m/surface/0/0/0.png?lead_time_hours=6&initial_time=2026-07-25T00:00:00Z")
+        assert resp_tile_2.status_code == 200
+        assert resp_tile_2.headers["Cache-Control"] == "no-cache"
+
         # 5. Mid-process Ingestion Event 2: Ingest a brand-new cycle 2026-07-25 06Z.
         write_dataset(_make_forecast_dataset([0], base_temp=20.0), store_dir_06)
         with Session(migrated_db) as session:
@@ -187,3 +201,85 @@ def test_long_lived_api_observes_new_lead_and_cycle_without_restart(
         assert "run_freshness_2026072506z_gfs" in run_ids
 
     app.dependency_overrides.pop(get_db, None)
+
+
+def test_no_manifest_store_observes_new_lead_without_restart(
+    migrated_db,
+    seed_data,
+    tmp_path,
+):
+    """A running API process querying a no-manifest store observes an appended lead without restart."""
+    store_dir = str(tmp_path / "gfs_nomanifest.zarr")
+
+    # 1. Initial store with lead 0 only (no manifest written)
+    write_dataset(_make_forecast_dataset([0], base_temp=12.0), store_dir)
+
+    with Session(migrated_db) as session:
+        run = ModelRun(
+            id="run_nomanifest_gfs",
+            model_version_id="version_gfs_v1",
+            cycle_time=datetime(2026, 7, 26, 0, 0, tzinfo=timezone.utc),
+            status="ready",
+            zarr_store_path=store_dir,
+        )
+        session.add(run)
+        session.flush()
+
+        prod_l0 = ForecastProduct(
+            id="prod_nomanifest_l0",
+            run_id="run_nomanifest_gfs",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=0,
+        )
+        session.add(prod_l0)
+        session.commit()
+
+    def override_get_db():
+        db = Session(migrated_db)
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as client:
+        # Flush the Redis response cache at start to ensure clean test state
+        from api.routers.points import _cache as point_cache
+        point_cache._client.flushdb()
+
+        # Request 1: lead 0 works
+        resp1 = client.get("/v1/points?lat=38.125&lon=-106.875&models=gfs")
+        assert resp1.status_code == 200
+        run_fc_1 = [f for f in resp1.json()["data"]["forecasts"] if f["cycle_time"] == "2026-07-26T00:00:00Z"]
+        leads_1 = [f["lead_time_hours"] for f in run_fc_1]
+        assert leads_1 == [0]
+
+        # Mid-process ingestion: append lead 6 to the store on disk
+        write_dataset(_make_forecast_dataset([0, 6], base_temp=12.0), store_dir)
+        with Session(migrated_db) as session:
+            prod_l6 = ForecastProduct(
+                id="prod_nomanifest_l6",
+                run_id="run_nomanifest_gfs",
+                variable_id="temperature_2m",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=6,
+            )
+            session.add(prod_l6)
+            session.commit()
+
+        # Flush the Redis response cache to simulate a cache-bypassed/revalidated query
+        # and test that the underlying Zarr reader opens fresh and observes lead 6.
+        point_cache._client.flushdb()
+
+        # Request 2 in the same running client: lead 6 must be served successfully
+        resp2 = client.get("/v1/points?lat=38.125&lon=-106.875&models=gfs")
+        assert resp2.status_code == 200
+        run_fc_2 = [f for f in resp2.json()["data"]["forecasts"] if f["cycle_time"] == "2026-07-26T00:00:00Z"]
+        leads_2 = [f["lead_time_hours"] for f in run_fc_2]
+        assert 6 in leads_2
+
+    app.dependency_overrides.pop(get_db, None)
+

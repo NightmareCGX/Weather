@@ -633,12 +633,12 @@ def resolve_latest_run_serving_generation(
 
     The generation is the cache-generation discriminator: a same-set same-cycle
     data replacement changes the manifest generation, making old cache entries
-    unreachable. Falls back to the legacy deterministic token when no manifest
-    exists.
+    unreachable. Returns ``None`` when no manifest exists (legacy store) or when
+    no ready run exists.
 
     Returns:
-        The serving generation string, or ``None`` when no ready run exists or
-        the store path cannot be resolved.
+        The serving generation string, or ``None`` when no ready run exists, no
+        manifest exists, or the store path cannot be resolved.
     """
     from api.core.manifest_reader import ManifestReadError, manifest_generation
 
