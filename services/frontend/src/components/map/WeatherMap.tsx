@@ -92,7 +92,7 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
   useEffect(() => {
     layerRef.current = layer;
     const map = mapRef.current;
-    if (map === null || !map.loaded()) {
+    if (map === null || !map.isStyleLoaded()) {
       return;
     }
     if (layer === null) {
