@@ -1,6 +1,7 @@
 import {
   ApiError,
   getEnsembleStatistics,
+  getForecastAvailability,
   getMapLayer,
   getPointForecast,
   listModels,
@@ -384,6 +385,55 @@ describe("listVariables", () => {
       expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/json" }) })
     );
     expect(variables[0].unit).toBe("°C");
+  });
+});
+
+describe("getForecastAvailability", () => {
+  it("requests /v1/forecast/availability with cache: 'no-cache' for fresh discovery", async () => {
+    const availabilityData = {
+      models: [
+        {
+          id: "gfs",
+          name: "Global Forecast System",
+          is_ensemble: false,
+          variables: [
+            {
+              id: "temperature_2m",
+              name: "2-Meter Temperature",
+              unit: "°C",
+              initial_times: [
+                {
+                  value: "2026-07-21T00:00:00Z",
+                  lead_time_hours: [0, 6, 12, 18],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        object: "forecast_availability",
+        data: availabilityData,
+        has_more: false,
+        next_cursor: null,
+      })
+    );
+
+    const controller = new AbortController();
+    const result = await getForecastAvailability(controller.signal);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/forecast/availability",
+      expect.objectContaining({
+        cache: "no-cache",
+        signal: controller.signal,
+        headers: expect.objectContaining({ Accept: "application/json" }),
+      })
+    );
+    expect(result).toEqual(availabilityData);
   });
 });
 

@@ -149,7 +149,10 @@ export async function getMapLayer({
 }
 
 export async function getForecastAvailability(signal?: AbortSignal): Promise<ForecastAvailability> {
-  return request<ForecastAvailability>(`/forecast/availability`, { signal });
+  return request<ForecastAvailability>(`/forecast/availability`, {
+    signal,
+    cache: "no-cache",
+  });
 }
 
 export interface SearchLocationsOptions {

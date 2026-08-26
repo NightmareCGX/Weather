@@ -175,7 +175,7 @@ def test_point_cache_control_header(client):
     lon = LON_START + 0.125
     resp = client.get(f"/v1/points?lat={lat}&lon={lon}&models=gfs")
     assert resp.status_code == 200
-    assert resp.headers["Cache-Control"] == "public, max-age=1800"
+    assert resp.headers["Cache-Control"] == "no-cache"
 
 
 def test_point_request_id_header(client):

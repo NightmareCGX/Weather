@@ -37,8 +37,9 @@ router = APIRouter()
 
 #: Cache policy for stable catalog resources (API.md: 24 hours).
 CACHE_CONTROL_DAILY = "public, max-age=86400"
-#: Cache policy for model runs (API.md: 5 minutes).
-CACHE_CONTROL_RUNS = "public, max-age=300"
+#: Cache policy for model runs: run status and available runs mutate upon
+#: ingestion, so revalidation (no-cache) guarantees status changes are seen.
+CACHE_CONTROL_RUNS = "no-cache"
 
 T = TypeVar("T", bound=BaseModel)
 

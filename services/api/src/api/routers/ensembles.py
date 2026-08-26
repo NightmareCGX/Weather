@@ -26,8 +26,10 @@ router = APIRouter()
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
 
-#: Cache policy for ensemble statistics (API.md 5.1: 30 minutes).
-CACHE_CONTROL_ENSEMBLE = "public, max-age=1800"
+#: Cache policy for ensemble statistics: resolves to the newest ready run
+#: when initial_time is omitted, so revalidation (no-cache) ensures new cycles
+#: or same-cycle updates are seen immediately while Redis caches by generation.
+CACHE_CONTROL_ENSEMBLE = "no-cache"
 
 #: Cache TTL in seconds for ensemble statistics.
 CACHE_TTL_SECONDS_ENSEMBLE = 1800

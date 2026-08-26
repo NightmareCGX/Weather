@@ -14,7 +14,7 @@ def test_availability_contract(client):
     assert body["object"] == "forecast_availability"
     assert body["has_more"] is False
     assert body["next_cursor"] is None
-    assert resp.headers["Cache-Control"] == "public, max-age=60"
+    assert resp.headers["Cache-Control"] == "no-cache"
 
     models = body["data"]["models"]
     assert {model["id"] for model in models} == {"gfs", "gefs"}

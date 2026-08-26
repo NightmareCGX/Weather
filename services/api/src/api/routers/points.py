@@ -44,8 +44,10 @@ router = APIRouter()
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
 
-#: Cache policy for point forecasts (API.md 2.1: 30 minutes).
-CACHE_CONTROL_POINT = "public, max-age=1800"
+#: Cache policy for point forecasts: cross-cycle minimum-lead series mutates
+#: upon new cycle or lead ingestion, so revalidation (no-cache) ensures the
+#: browser always sees fresh data while Redis caches responses by generation.
+CACHE_CONTROL_POINT = "no-cache"
 
 #: In-memory point cache instance for the API process.
 _cache = PointCache()

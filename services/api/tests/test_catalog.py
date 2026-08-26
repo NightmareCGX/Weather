@@ -168,7 +168,7 @@ def test_cache_control_headers(client):
     assert client.get("/v1/models").headers["Cache-Control"] == "public, max-age=86400"
     assert client.get("/v1/variables").headers["Cache-Control"] == "public, max-age=86400"
     assert client.get("/v1/grids").headers["Cache-Control"] == "public, max-age=86400"
-    assert client.get("/v1/runs").headers["Cache-Control"] == "public, max-age=300"
+    assert client.get("/v1/runs").headers["Cache-Control"] == "no-cache"
 
 
 def test_request_id_header_present(client):

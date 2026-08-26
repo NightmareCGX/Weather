@@ -37,8 +37,10 @@ router = APIRouter()
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
 
-#: Cache policy for probability forecasts (API.md 3.1: 60 minutes).
-CACHE_CONTROL_PROBABILITY = "public, max-age=3600"
+#: Cache policy for probability forecasts: resolves to the newest ready run
+#: when initial_time is omitted, so revalidation (no-cache) ensures new cycles
+#: or same-cycle updates are seen immediately while Redis caches by generation.
+CACHE_CONTROL_PROBABILITY = "no-cache"
 
 #: Cache TTL in seconds for probability forecasts.
 CACHE_TTL_SECONDS_PROBABILITY = 3600
