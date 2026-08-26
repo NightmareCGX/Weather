@@ -736,7 +736,7 @@ def test_uncached_dataset_closed_after_selection(tmp_path, monkeypatch) -> None:
 
 
 def test_api_s3fs_use_listings_cache_disabled(monkeypatch) -> None:
-    """API S3FileSystem constructors must pass use_listings_cache=False."""
+    """API S3FileSystem constructors must pass use_listings_cache=False without network I/O."""
     import s3fs
     from api.core.manifest_reader import _read_manifest
     from api.core.zarr import _resolve_s3_store
@@ -747,10 +747,16 @@ def test_api_s3fs_use_listings_cache_disabled(monkeypatch) -> None:
 
     def spy_init(self, *args, **kwargs):
         captured_kwargs.append(dict(kwargs))
-        # Call original with dummy endpoint so it doesn't fail
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(s3fs.S3FileSystem, "__init__", spy_init)
+    # Stub I/O methods so the test does not require live MinIO/S3 connectivity.
+    monkeypatch.setattr(
+        s3fs.S3FileSystem,
+        "cat_file",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError("isolated test")),
+    )
+    monkeypatch.setattr(s3fs.S3FileSystem, "ls", lambda self, *args, **kwargs: [])
 
     # 1. Manifest reader S3 resolution
     s3fs.S3FileSystem.clear_instance_cache()
