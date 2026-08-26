@@ -21,6 +21,7 @@ from domain.ensemble import (
     ensemble_median,
     ensemble_percentile,
     ensemble_spread,
+    estimate_ensemble_pdf,
     probability_above_threshold,
     probability_below_threshold,
     probability_between_thresholds,
@@ -42,6 +43,7 @@ from sqlalchemy.orm import Session
 
 from api.models.entities import Model
 from api.schemas import (
+    EnsemblePDF,
     EnsembleStatistics,
     EnsembleStatisticsData,
     ProbabilityForecastData,
@@ -196,6 +198,12 @@ def build_ensemble_statistics(
     members = _gated_member_values(
         str(run.zarr_store_path), variable, leads[0], latitude, longitude
     )
+    pdf_payload: EnsemblePDF | None = None
+    if include_members:
+        domain_pdf = estimate_ensemble_pdf(members)
+        if domain_pdf is not None:
+            pdf_payload = EnsemblePDF(x=domain_pdf.x, density=domain_pdf.density)
+
     return EnsembleStatisticsData(
         model=model,
         lead_time_hours=lead_time_hours,
@@ -211,6 +219,7 @@ def build_ensemble_statistics(
             p90=ensemble_percentile(members, 90),
         ),
         members=members if include_members else None,
+        pdf=pdf_payload if include_members else None,
     )
 
 

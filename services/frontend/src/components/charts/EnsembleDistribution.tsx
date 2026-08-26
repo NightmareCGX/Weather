@@ -4,16 +4,23 @@ import {
   Bar,
   CartesianGrid,
   Cell,
+  ComposedChart,
+  Line,
   ResponsiveContainer,
   Scatter,
   ScatterChart,
   Tooltip,
   XAxis,
   YAxis,
-  BarChart,
 } from "recharts";
 
-import { distributionSummary, histogramBins, toMemberDots } from "@/lib/forecast/transform";
+import {
+  distributionSummary,
+  distributionXDomain,
+  histogramBins,
+  toMemberDots,
+  toPdfPoints,
+} from "@/lib/forecast/transform";
 import { formatValue } from "@/lib/forecast/labels";
 import { formatLeadTimeHours } from "@/lib/forecast/time";
 import type { DistributionStatus } from "@/hooks/useEnsembleDistribution";
@@ -33,20 +40,22 @@ const ACCENT = "#1d4ed8";
 const HISTOGRAM_COLORS = ["#93c5fd", "#3b82f6", "#1d4ed8"];
 
 /**
- * Ensemble Distribution View — the raw member-level distribution for a
- * selected location / variable / lead time.
+ * Ensemble Distribution View — the raw member-level distribution and canonical
+ * Probability Density Function (PDF) for a selected location / variable / lead.
  *
- * This is deliberately distinct from the Ensemble Statistics / Spread product:
- * it shows *how the individual ensemble members are distributed* (concentration,
- * dispersion, skewness, tails, outliers, multimodality), not just aggregate
- * statistics. It is fed by a focused `include_members=true` `/v1/ensembles`
- * request for the selected lead only.
+ * This visualization overlays a 1-D Gaussian Kernel Density Estimate (PDF)
+ * directly over the discrete ensemble histogram within a single plot area using
+ * dual Y-axes:
  *
- * When `members` is absent (loading, error, or an older backend that omits the
- * opt-in field), this view renders an honest "not yet available" state and
- * never fabricates a distribution from summary statistics. When the genuine
- * member array is present, it renders a real histogram and a member dot/rug
- * plot from the actual discrete ensemble.
+ * - Left Y-axis: Member count (histogram bar frequency)
+ * - Right Y-axis: Probability density (continuous PDF estimate, 1/variable-unit)
+ * - Shared numeric X-axis: Physical variable values
+ * - Member rug/dot plot: Discrete raw ensemble member markers aligned below
+ *
+ * When `members` is absent (loading, error, or statistics-only response), an
+ * honest "not yet available" state is shown without fabricating values. When
+ * `pdf` is null (degenerate spread / identical members), the histogram and rug
+ * are shown with an informative note.
  */
 export function EnsembleDistribution({
   data,
@@ -96,7 +105,17 @@ export function EnsembleDistribution({
   const bins = histogramBins(members);
   const dots = toMemberDots(members);
   const summary = distributionSummary(members);
+  const pdfPoints = toPdfPoints(data.pdf);
+  const [xMin, xMax] = distributionXDomain(summary, data.pdf);
   const memberCount = data.member_count;
+
+  // Prepare bin data points with explicit x coordinate for numeric XAxis
+  const binChartData = bins.map((bin) => ({
+    x: bin.mid,
+    count: bin.count,
+    start: bin.start,
+    end: bin.end,
+  }));
 
   return (
     <div className="mt-4">
@@ -116,31 +135,54 @@ export function EnsembleDistribution({
 
       <div
         role="img"
-        aria-label={`Histogram of ${memberCount} ensemble members for ${variableLabel}`}
-        className="h-40 w-full"
+        aria-label={`Histogram and PDF of ${memberCount} ensemble members for ${variableLabel}`}
+        className="h-44 w-full"
       >
         <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={bins} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
+          <ComposedChart margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
             <XAxis
-              dataKey="mid"
+              type="number"
+              dataKey="x"
+              domain={[xMin, xMax]}
               tickFormatter={(value: number) => value.toFixed(1)}
               tick={{ fontSize: 10, fill: "#64748b" }}
               tickLine={false}
             />
             <YAxis
+              yAxisId="left"
               allowDecimals={false}
               tick={{ fontSize: 10, fill: "#64748b" }}
               tickLine={false}
               axisLine={false}
               width={32}
             />
+            <YAxis
+              yAxisId="right"
+              orientation="right"
+              allowDecimals={true}
+              tick={{ fontSize: 10, fill: "#64748b" }}
+              tickLine={false}
+              axisLine={false}
+              width={38}
+              tickFormatter={(v: number) => v.toFixed(2)}
+            />
             <Tooltip
-              formatter={(value: number) => [value, "Members"]}
-              labelFormatter={(mid) => `≈ ${Number(mid).toFixed(2)}`}
+              formatter={(value: number, name: string) => [
+                name === "Probability density" ? value.toFixed(4) : value,
+                name === "Probability density" ? "Probability density" : "Members",
+              ]}
+              labelFormatter={(label) => `Value ≈ ${Number(label).toFixed(2)}`}
               contentStyle={{ fontSize: 12 }}
             />
-            <Bar dataKey="count" isAnimationActive={false} radius={[2, 2, 0, 0]}>
+            <Bar
+              yAxisId="left"
+              data={binChartData}
+              dataKey="count"
+              isAnimationActive={false}
+              radius={[2, 2, 0, 0]}
+              name="Member count"
+            >
               {bins.map((bin, index) => (
                 <Cell
                   key={`${bin.start}-${bin.end}`}
@@ -148,7 +190,20 @@ export function EnsembleDistribution({
                 />
               ))}
             </Bar>
-          </BarChart>
+            {pdfPoints.length > 0 && (
+              <Line
+                yAxisId="right"
+                data={pdfPoints}
+                dataKey="density"
+                type="linear"
+                stroke="#d97706"
+                strokeWidth={2}
+                dot={false}
+                isAnimationActive={false}
+                name="Probability density"
+              />
+            )}
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
 
@@ -164,7 +219,7 @@ export function EnsembleDistribution({
               dataKey="value"
               tick={{ fontSize: 10, fill: "#64748b" }}
               tickLine={false}
-              domain={[summary.min, summary.max]}
+              domain={[xMin, xMax]}
             />
             <YAxis hide domain={[0, 1]} />
             <Tooltip
@@ -177,9 +232,17 @@ export function EnsembleDistribution({
           </ScatterChart>
         </ResponsiveContainer>
       </div>
+
+      {data.pdf === null && (
+        <p className="mt-1 text-[11px] text-amber-700">
+          Continuous probability density is unavailable for this lead time (insufficient spread
+          across members).
+        </p>
+      )}
+
       <p className="mt-1 text-[11px] text-slate-400">
-        Histogram and dots show the observed ensemble members only — a finite sample, not a
-        continuous probability density.
+        Histogram bars and dots show the discrete ensemble member sample. The continuous curve shows
+        the canonical Gaussian kernel density estimate (probability density).
       </p>
     </div>
   );

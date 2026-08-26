@@ -1,4 +1,9 @@
-import type { EnsembleStatistics, EnsembleStatisticsData, ForecastEntry } from "@/lib/api/types";
+import type {
+  EnsemblePDF,
+  EnsembleStatistics,
+  EnsembleStatisticsData,
+  ForecastEntry,
+} from "@/lib/api/types";
 import { isForecastDataVariable } from "@/lib/api/types";
 
 /**
@@ -257,6 +262,61 @@ export function distributionSummary(members: number[]): DistributionSummary {
     median: percentile(sortedValues, 50),
     stdDev: Math.sqrt(variance),
   };
+}
+
+/** A single evaluation point of the continuous PDF line series. */
+export interface PdfPoint {
+  x: number;
+  density: number;
+}
+
+/**
+ * Convert an API EnsemblePDF payload into chart-ready coordinate points.
+ *
+ * Missing or empty payloads return an empty array so the chart series can be
+ * safely skipped.
+ */
+export function toPdfPoints(pdf?: EnsemblePDF | null): PdfPoint[] {
+  if (!pdf || !Array.isArray(pdf.x) || !Array.isArray(pdf.density)) {
+    return [];
+  }
+  const len = Math.min(pdf.x.length, pdf.density.length);
+  const points: PdfPoint[] = [];
+  for (let i = 0; i < len; i += 1) {
+    const x = pdf.x[i];
+    const density = pdf.density[i];
+    if (
+      typeof x === "number" &&
+      Number.isFinite(x) &&
+      typeof density === "number" &&
+      Number.isFinite(density)
+    ) {
+      points.push({ x, density });
+    }
+  }
+  return points;
+}
+
+/**
+ * Compute the shared numeric X-domain for the member distribution visualization.
+ *
+ * When a PDF is present, the domain spans the full canonical evaluation window
+ * `[min(pdf.x), max(pdf.x)]` so continuous tails are not clipped. When the PDF
+ * is absent, it defaults to the observed sample extrema `[min, max]`.
+ */
+export function distributionXDomain(
+  summary: DistributionSummary,
+  pdf?: EnsemblePDF | null
+): [number, number] {
+  if (pdf && Array.isArray(pdf.x) && pdf.x.length > 0) {
+    const validX = pdf.x.filter((v) => typeof v === "number" && Number.isFinite(v));
+    if (validX.length > 0) {
+      return [validX[0], validX[validX.length - 1]];
+    }
+  }
+  const min = Number.isFinite(summary.min) ? summary.min : 0;
+  const max = Number.isFinite(summary.max) ? summary.max : 1;
+  return [min, max];
 }
 
 /**

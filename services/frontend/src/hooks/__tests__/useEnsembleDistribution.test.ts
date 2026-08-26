@@ -12,7 +12,11 @@ function jsonResponse(body: unknown, status = 200): Response {
   } as Response;
 }
 
-function distResponse(lead: number, members?: number[]) {
+function distResponse(
+  lead: number,
+  members?: number[],
+  pdf?: { x: number[]; density: number[] } | null
+) {
   return jsonResponse({
     object: "ensemble_statistics",
     data: {
@@ -30,6 +34,7 @@ function distResponse(lead: number, members?: number[]) {
         p90: 12 + lead,
       },
       ...(members !== undefined ? { members } : {}),
+      ...(pdf !== undefined ? { pdf } : {}),
     },
     has_more: false,
     next_cursor: null,
@@ -55,7 +60,11 @@ beforeEach(() => {
 
 describe("useEnsembleDistribution", () => {
   it("requests a single lead with include_members=true and returns the data", async () => {
-    mockFetch.mockResolvedValueOnce(distResponse(6, [15.5, 17.5, 19.5, 21.5, 23.5]));
+    const samplePdf = {
+      x: [10.0, 15.0, 20.0, 25.0, 30.0],
+      density: [0.01, 0.05, 0.2, 0.05, 0.01],
+    };
+    mockFetch.mockResolvedValueOnce(distResponse(6, [15.5, 17.5, 19.5, 21.5, 23.5], samplePdf));
 
     const { result } = renderHook(() =>
       useEnsembleDistribution(location, 6, "temperature_2m", { model: "gefs" })
@@ -69,6 +78,7 @@ describe("useEnsembleDistribution", () => {
     );
     expect(result.current.data?.members).toEqual([15.5, 17.5, 19.5, 21.5, 23.5]);
     expect(result.current.data?.member_count).toBe(5);
+    expect(result.current.data?.pdf).toEqual(samplePdf);
   });
 
   it("is idle with no selection", () => {

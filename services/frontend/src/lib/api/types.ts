@@ -149,14 +149,23 @@ export interface EnsembleStatistics {
 }
 
 /**
+ * Canonical ensemble probability density function evaluation.
+ */
+export interface EnsemblePDF {
+  x: number[];
+  density: number[];
+}
+
+/**
  * The payload of ensemble statistics (API.md section 5.1).
  *
  * `members` is an opt-in additive field (request `include_members=true`): raw
  * ensemble-member forecast values in dataset `member`-coordinate order, for
- * the requested model, location, variable, and lead time. It is absent on
- * statistics-only responses, so the Distribution View must treat absence as
- * "not yet available" rather than fabricating a distribution from the
- * aggregate statistics.
+ * the requested model, location, variable, and lead time. `pdf` carries the
+ * canonical 1-D Gaussian Kernel Density Estimate (or `null` when variation is
+ * degenerate). Both are absent on statistics-only responses, so the
+ * Distribution View must treat absence as "not yet available" rather than
+ * fabricating a distribution from aggregate statistics.
  */
 export interface EnsembleStatisticsData {
   model: string;
@@ -164,6 +173,7 @@ export interface EnsembleStatisticsData {
   member_count: number;
   statistics: EnsembleStatistics;
   members?: number[];
+  pdf?: EnsemblePDF | null;
 }
 
 /**
