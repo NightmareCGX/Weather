@@ -745,125 +745,291 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             for lead in sorted(spec.lead_time_hours)
         ]
 
-    # Retained seed: deterministically select the lowest (member, lead) item,
-    # download + parse it exactly once before dispatch.
+    status = asyncio.run(
+        _run_wave(
+            spec=spec,
+            args=args,
+            catalog_spec=catalog_spec,
+            store_path=store_path,
+            concurrency=concurrency,
+            failures=failures,
+        )
+    )
+
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)}/{len(items)} file(s) failed for "
+            f"model={spec.model} cycle={spec.cycle_time}: "
+            + "; ".join(failures[:5])
+            + ("; ..." if len(failures) > 5 else "")
+        )
+    print(
+        f"Ingested {len(items)} region(s) for model={spec.model} "
+        f"cycle={spec.cycle_time} ({status}) -> {store_path}"
+    )
+
+
+async def _run_wave(
+    spec: RunSpec,
+    args: argparse.Namespace,
+    catalog_spec: RunCatalogSpec,
+    store_path: str,
+    concurrency: int,
+    failures: list[str],
+) -> str:
+    """Download and ingest every lead/member of a single forecast run.
+
+    Implements the approved bounded task-per-item streaming pipeline (Option B2):
+    - retained-seed fresh-store initialization;
+    - one wave-level EXCLUSIVE pre-update (run -> partial + UPDATING markers);
+    - seed worker starts immediately in ThreadPoolExecutor;
+    - non-seed items: bounded download (download_sem) -> bounded ingestion admission (ingest_sem)
+      -> process-isolated decode (DecodePool) -> region write under advisory locks;
+    - non-abandoning drain of all worker futures before finalization gate;
+    - one coalesced finalization (EXCLUSIVE store gate) after all workers drain.
+    """
+    import logging
+    import uuid
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ingestion.core.cancel import await_all_workers_non_abandoning
+    from ingestion.core.coordinator import (
+        RunCoordinator,
+        WaveRegion,
+    )
+    from ingestion.core.decode_worker import DecodePool
+
+    logger = logging.getLogger(__name__)
+    run_tag = (
+        f"staging_{spec.model}_{spec.cycle_date:%Y%m%d}_"
+        f"{spec.cycle_hour:02d}z_{uuid.uuid4().hex}"
+    )
+    staging_dir = Path(args.download_dir) / run_tag
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # Each (member, lead) work item, or just (lead) for deterministic.
+    if spec.model != "gefs":
+        items: list[tuple[int | None, int]] = [
+            (None, lead) for lead in sorted(spec.lead_time_hours)
+        ]
+    else:
+        items = [
+            (member, lead)
+            for member in sorted(spec.members)
+            for lead in sorted(spec.lead_time_hours)
+        ]
+
     seed_item = items[0]
     seed_member, seed_lead = seed_item
 
-    async def _run_wave() -> str:
-        import logging
-        import uuid
-        from concurrent.futures import ThreadPoolExecutor
+    coordinator = RunCoordinator(
+        catalog_spec,
+        store_path,
+        timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
+    )
+    cancel_event = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=concurrency)
+    # The persistent decode pool: up to ``concurrency`` reusable worker
+    # processes each holding independent cfgrib/ecCodes native state.
+    decode_pool = DecodePool(max_workers=min(len(items), max(1, concurrency)))
+    engine = _catalog_session_factory()
 
-        from ingestion.core.cancel import await_all_workers_non_abandoning
-        from ingestion.core.coordinator import (
-            RunCoordinator,
-            WaveRegion,
+    async with NOAAConnector() as connector:
+        # 1. Retained seed. Download the seed first, then decode it in a
+        #    worker process (the native ecCodes boundary).
+        seed_dest = _destination_for(
+            spec, staging_dir, lead=seed_lead, member=seed_member
         )
-        from ingestion.core.decode_worker import DecodePool
-
-        logger = logging.getLogger(__name__)
-        run_tag = (
-            f"staging_{spec.model}_{spec.cycle_date:%Y%m%d}_"
-            f"{spec.cycle_hour:02d}z_{uuid.uuid4().hex}"
+        Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
+        await connector.download(
+            spec.model,
+            spec.cycle_date,
+            spec.cycle_hour,
+            seed_lead,
+            seed_dest,
+            member=seed_member,
         )
-        staging_dir = Path(args.download_dir) / run_tag
-        staging_dir.mkdir(parents=True, exist_ok=True)
+        seed_future = decode_pool.submit(seed_dest)
+        seed_dataset = _decode_and_normalize(seed_future, catalog_spec)
+        _validate_requested_lead(seed_dataset, seed_lead)
 
-        coordinator = RunCoordinator(
-            catalog_spec,
-            store_path,
-            timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
-        )
-        cancel_event = threading.Event()
-        executor = ThreadPoolExecutor(max_workers=concurrency)
-        # The persistent decode pool: up to ``concurrency`` reusable worker
-        # processes each holding independent cfgrib/ecCodes native state. Only
-        # the native GRIB decode crosses this boundary. Sized by the number of
-        # distinct decode tasks (never more than concurrency) so a small run
-        # does not spawn unused workers.
-        decode_pool = DecodePool(max_workers=min(len(items), max(1, concurrency)))
-        worker_futures = []
-        engine = _catalog_session_factory()
+        # 2. Determine run id + same-cycle.
+        run_id: str | None = None
+        is_same_cycle = False
+        with _catalog_session() as db:
+            from ingestion.core.catalog import ModelRunRecord
+            from sqlalchemy import select
 
-        async with NOAAConnector() as connector:
-            # 1. Retained seed. Download the seed first, then decode it in a
-            #    worker process (the native ecCodes boundary).
-            seed_dest = _destination_for(
-                spec, staging_dir, lead=seed_lead, member=seed_member
-            )
-            Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
-            await connector.download(
-                spec.model,
-                spec.cycle_date,
-                spec.cycle_hour,
-                seed_lead,
-                seed_dest,
-                member=seed_member,
-            )
-            seed_future = decode_pool.submit(seed_dest)
-            seed_dataset = _decode_and_normalize(seed_future, catalog_spec)
-            _validate_requested_lead(seed_dataset, seed_lead)
-
-            # 2. Determine run id + same-cycle.
-            run_id: str | None = None
-            is_same_cycle = False
-            with _catalog_session() as db:
-                from ingestion.core.catalog import ModelRunRecord
-                from sqlalchemy import select
-
-                row = (
-                    db.execute(
-                        select(ModelRunRecord).where(
-                            ModelRunRecord.zarr_store_path == store_path
-                        )
+            row = (
+                db.execute(
+                    select(ModelRunRecord).where(
+                        ModelRunRecord.zarr_store_path == store_path
                     )
-                    .scalars()
-                    .first()
                 )
-                if row is not None:
-                    run_id = str(row.id)
-                    is_same_cycle = True
+                .scalars()
+                .first()
+            )
+            if row is not None:
+                run_id = str(row.id)
+                is_same_cycle = True
 
-            # 3. Wave-level EXCLUSIVE pre-update (init + UPDATING markers).
-            pre_conn = engine.connect()
+        # 3. Wave-level EXCLUSIVE pre-update (init + UPDATING markers).
+        pre_conn = engine.connect()
+        try:
+            coordinator.initialize_run_store(
+                pre_conn,
+                seed_dataset=seed_dataset,
+                expected_leads=spec.lead_time_hours,
+                expected_members=spec.members,
+                run_id=run_id,
+                is_same_cycle=is_same_cycle,
+            )
+            regions = [
+                WaveRegion(
+                    lead_time_hours=lead,
+                    member=member,
+                    generation=_new_generation(),
+                )
+                for member, lead in items
+            ]
+            coordinator.pre_update_wave(
+                pre_conn,
+                regions=regions,
+                run_id=run_id,
+                is_same_cycle=is_same_cycle,
+                executor=executor,
+                cancel_event=cancel_event,
+            )
+        finally:
+            pre_conn.close()
+
+        # 4. Pipelined download and ingestion scheduling (Option B2).
+        # Bounded by:
+        # - download_sem: at most `concurrency` active HTTP downloads;
+        # - staging_sem: at most `2 * concurrency` in-flight pipeline admissions
+        #   (downloading + waiting + actively ingesting);
+        # - ingest_sem: at most `concurrency` submitted-but-uncompleted executor jobs.
+        download_sem = asyncio.Semaphore(concurrency)
+        staging_sem = asyncio.Semaphore(2 * concurrency)
+        ingest_sem = asyncio.Semaphore(concurrency)
+        futures_lock = threading.Lock()
+        registered_worker_futures: list[asyncio.Future[Any]] = []
+        pipeline_tasks: list[asyncio.Task[Any]] = []
+
+        generation_by_region = {r.region_id: r.generation for r in regions}
+
+        def _run_region_worker(member: int | None, lead: int) -> None:
+            worker_conn = engine.connect()
             try:
-                coordinator.initialize_run_store(
-                    pre_conn,
-                    seed_dataset=seed_dataset,
+                dest = _destination_for(spec, staging_dir, lead=lead, member=member)
+                ds = _decode_and_normalize(decode_pool.submit(dest), catalog_spec)
+                _validate_requested_lead(ds, lead)
+                region_id = _region_id_for(lead, member)
+                generation = generation_by_region.get(region_id)
+                if generation is None:
+                    raise RuntimeError(f"no generation for region {region_id}")
+                coordinator.write_region_worker(
+                    worker_conn,
+                    dataset=ds,
+                    member=member,
+                    generation=generation,
                     expected_leads=spec.lead_time_hours,
                     expected_members=spec.members,
-                    run_id=run_id,
-                    is_same_cycle=is_same_cycle,
-                )
-                regions = [
-                    WaveRegion(
-                        lead_time_hours=lead,
-                        member=member,
-                        generation=_new_generation(),
-                    )
-                    for member, lead in items
-                ]
-                coordinator.pre_update_wave(
-                    pre_conn,
-                    regions=regions,
-                    run_id=run_id,
-                    is_same_cycle=is_same_cycle,
-                    executor=executor,
-                    cancel_event=cancel_event,
                 )
             finally:
-                pre_conn.close()
+                worker_conn.close()
 
-            # 4. Download every non-seed file on the event loop (bounded by a
-            #    semaphore), and submit each file's decode to the process pool.
-            download_sem = asyncio.Semaphore(concurrency)
+        # Retained-seed writer uses the retained dataset (no re-parse).
+        def _run_seed_region() -> None:
+            worker_conn = engine.connect()
+            try:
+                region_id = _region_id_for(seed_lead, seed_member)
+                generation = generation_by_region.get(region_id)
+                if generation is None:
+                    raise RuntimeError(f"no generation for region {region_id}")
+                coordinator.write_region_worker(
+                    worker_conn,
+                    dataset=seed_dataset,
+                    member=seed_member,
+                    generation=generation,
+                    expected_leads=spec.lead_time_hours,
+                    expected_members=spec.members,
+                )
+            finally:
+                worker_conn.close()
 
-            async def _download_non_seed(member: int | None, lead: int) -> None:
-                if (member, lead) == seed_item:
+        loop = asyncio.get_event_loop()
+
+        # Seed task: starts immediately after pre-update
+        async def _run_seed_task() -> None:
+            if cancel_event.is_set():
+                return
+            async with ingest_sem:
+                if cancel_event.is_set():
                     return
-                dest = _destination_for(spec, staging_dir, lead=lead, member=member)
+                logger.debug(
+                    "ingest_start: model=%s cycle=%s member=%s lead=%s",
+                    spec.model,
+                    spec.cycle_time,
+                    seed_member,
+                    seed_lead,
+                )
+                fut = loop.run_in_executor(executor, _run_seed_region)
+                with futures_lock:
+                    registered_worker_futures.append(fut)
+
+                cancel_requested = False
+                while not fut.done():
+                    try:
+                        await asyncio.shield(fut)
+                    except asyncio.CancelledError:
+                        cancel_requested = True
+                        cancel_event.set()
+                        continue
+                    except Exception:
+                        break
+
+                try:
+                    fut.result()
+                    logger.debug(
+                        "ingest_complete: model=%s cycle=%s member=%s lead=%s",
+                        spec.model,
+                        spec.cycle_time,
+                        seed_member,
+                        seed_lead,
+                    )
+                except Exception as exc:  # noqa: BLE001 - report failure
+                    failures.append(
+                        f"{spec.model} member={seed_member} lead={seed_lead}: {exc}"
+                    )
+
+                if cancel_requested:
+                    raise asyncio.CancelledError
+
+        pipeline_tasks.append(asyncio.create_task(_run_seed_task()))
+
+        # Non-seed pipeline tasks: bounded download -> bounded ingest admission -> decode -> write
+        async def _pipeline_item(member: int | None, lead: int) -> None:
+            if cancel_event.is_set():
+                return
+            dest = _destination_for(spec, staging_dir, lead=lead, member=member)
+
+            # Stage 1: Pipeline admission (bounds total in-flight staged/active work)
+            async with staging_sem:
+                if cancel_event.is_set():
+                    return
+
+                # Stage 2: Bounded download
                 async with download_sem:
+                    if cancel_event.is_set():
+                        return
+                    logger.debug(
+                        "download_start: model=%s cycle=%s member=%s lead=%s",
+                        spec.model,
+                        spec.cycle_time,
+                        member,
+                        lead,
+                    )
                     try:
                         await connector.download(
                             spec.model,
@@ -873,128 +1039,141 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
                             dest,
                             member=member,
                         )
-                    except Exception as exc:  # noqa: BLE001 - report this file's failure
+                        logger.debug(
+                            "download_complete: model=%s cycle=%s member=%s lead=%s",
+                            spec.model,
+                            spec.cycle_time,
+                            member,
+                            lead,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report download failure
+                        failures.append(
+                            f"{spec.model} member={member} lead={lead}: {exc}"
+                        )
+                        return
+
+                # Stage 3: Ingest admission (bounds executor submission)
+                if cancel_event.is_set():
+                    return
+                async with ingest_sem:
+                    if cancel_event.is_set():
+                        return
+                    logger.debug(
+                        "ingest_start: model=%s cycle=%s member=%s lead=%s",
+                        spec.model,
+                        spec.cycle_time,
+                        member,
+                        lead,
+                    )
+                    worker_fut = loop.run_in_executor(
+                        executor, _run_region_worker, member, lead
+                    )
+                    with futures_lock:
+                        registered_worker_futures.append(worker_fut)
+
+                    # Stage 4: Non-abandoning worker wait
+                    cancel_requested = False
+                    while not worker_fut.done():
+                        try:
+                            await asyncio.shield(worker_fut)
+                        except asyncio.CancelledError:
+                            cancel_requested = True
+                            cancel_event.set()
+                            continue
+                        except Exception:
+                            break
+
+                    try:
+                        worker_fut.result()
+                        logger.debug(
+                            "ingest_complete: model=%s cycle=%s member=%s lead=%s",
+                            spec.model,
+                            spec.cycle_time,
+                            member,
+                            lead,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report ingest failure
                         failures.append(
                             f"{spec.model} member={member} lead={lead}: {exc}"
                         )
 
-            await asyncio.gather(
-                *[
-                    _download_non_seed(m, lead)
-                    for m, lead in items
-                    if (m, lead) != seed_item
-                ]
-            )
+                    if cancel_requested:
+                        raise asyncio.CancelledError
 
-            # 5. Dispatch region workers (sync, in the executor). Each worker
-            #    submits its file's decode to the process pool (the native
-            #    ecCodes boundary) and awaits MY OWN decode future, so at most
-            #    ``concurrency`` decodes are in flight at once — decode results
-            #    are consumed by the owning thread immediately, bounding
-            #    parent-side decoded-dataset memory to the pool size. After
-            #    decode returns, the pure-numpy mapping/normalization/validation
-            #    runs in the parent before the region write.
-            generation_by_region = {r.region_id: r.generation for r in regions}
+        for member, lead in items:
+            if (member, lead) != seed_item:
+                pipeline_tasks.append(
+                    asyncio.create_task(_pipeline_item(member, lead))
+                )
 
-            def _run_region_worker(member: int | None, lead: int) -> None:
-                worker_conn = engine.connect()
-                try:
-                    dest = _destination_for(spec, staging_dir, lead=lead, member=member)
-                    ds = _decode_and_normalize(decode_pool.submit(dest), catalog_spec)
-                    _validate_requested_lead(ds, lead)
-                    region_id = _region_id_for(lead, member)
-                    generation = generation_by_region.get(region_id)
-                    if generation is None:
-                        raise RuntimeError(f"no generation for region {region_id}")
-                    coordinator.write_region_worker(
-                        worker_conn,
-                        dataset=ds,
-                        member=member,
-                        generation=generation,
-                        expected_leads=spec.lead_time_hours,
-                        expected_members=spec.members,
+        # 5. Aggregate drain: wait for all outer pipeline tasks
+        results, cancelled = await await_all_workers_non_abandoning(
+            pipeline_tasks, cancel_event
+        )
+        for res in results:
+            if isinstance(res, BaseException) and not isinstance(
+                res, asyncio.CancelledError
+            ):
+                msg = str(res)
+                if not any(msg in f for f in failures):
+                    failures.append(msg)
+
+        # 6. Finalization gate: Verify that 100% of underlying worker futures are genuinely settled
+        for fut in registered_worker_futures:
+            if not fut.done():
+                raise RuntimeError(
+                    "Finalization gate invariant violated: active executor worker detected"
+                )
+
+    # 7. Coalesced finalization (after all worker Futures drained).
+    logger.debug("finalize_start: model=%s cycle=%s", spec.model, spec.cycle_time)
+    fin_conn = engine.connect()
+    try:
+        run_id = _resolve_run_id(catalog_spec, store_path)
+        finalize_result = coordinator.finalize_run(
+            fin_conn,
+            run_id=run_id,
+            spec=catalog_spec,
+            expected_leads=spec.lead_time_hours,
+            expected_members=spec.members,
+        )
+        status = finalize_result.status
+        logger.debug(
+            "finalize_complete: model=%s cycle=%s status=%s",
+            spec.model,
+            spec.cycle_time,
+            status,
+        )
+
+        # Post-finalization cleanup: clean up only regions proven committed
+        # by THIS wave's generation, unless --keep-downloads is set.
+        if not getattr(args, "keep_downloads", False):
+            for r in regions:
+                committed_gen = finalize_result.committed_regions.get(r.region_id)
+                if committed_gen is not None and committed_gen == r.generation:
+                    dest = _destination_for(
+                        spec, staging_dir, lead=r.lead_time_hours, member=r.member
                     )
-                finally:
-                    worker_conn.close()
+                    _cleanup_source(dest)
+            # Best-effort removal of the owned staging directory.
+            try:
+                staging_dir.rmdir()
+            except OSError as exc:
+                logger.warning(
+                    "Failed to remove staging directory %s: %s; data is safe.",
+                    staging_dir,
+                    exc,
+                )
+    finally:
+        fin_conn.close()
+        engine.dispose()
+        executor.shutdown(wait=True)
+        decode_pool.shutdown()
 
-            # 7. Retained-seed writer uses the retained dataset (no re-parse).
-            def _run_seed_region() -> None:
-                worker_conn = engine.connect()
-                try:
-                    region_id = _region_id_for(seed_lead, seed_member)
-                    generation = generation_by_region.get(region_id)
-                    if generation is None:
-                        raise RuntimeError(f"no generation for region {region_id}")
-                    coordinator.write_region_worker(
-                        worker_conn,
-                        dataset=seed_dataset,
-                        member=seed_member,
-                        generation=generation,
-                        expected_leads=spec.lead_time_hours,
-                        expected_members=spec.members,
-                    )
-                finally:
-                    worker_conn.close()
+    if cancelled:
+        raise asyncio.CancelledError
 
-            # 8. Aggregate drain.
-            loop = asyncio.get_event_loop()
-            for member, lead in items:
-                if (member, lead) == seed_item:
-                    fut = loop.run_in_executor(executor, _run_seed_region)
-                else:
-                    fut = loop.run_in_executor(
-                        executor, _run_region_worker, member, lead
-                    )
-                worker_futures.append(fut)
-            results, cancelled = await await_all_workers_non_abandoning(
-                worker_futures, cancel_event
-            )
-            # Record per-file failures.
-            for idx, res in enumerate(results):
-                if isinstance(res, BaseException):
-                    m, lead = items[idx]
-                    failures.append(f"{spec.model} member={m} lead={lead}: {res}")
-
-        # 9. Coalesced finalization (after all worker Futures drained).
-        fin_conn = engine.connect()
-        try:
-            run_id = _resolve_run_id(catalog_spec, store_path)
-            finalize_result = coordinator.finalize_run(
-                fin_conn,
-                run_id=run_id,
-                spec=catalog_spec,
-                expected_leads=spec.lead_time_hours,
-                expected_members=spec.members,
-            )
-            status = finalize_result.status
-
-            # Post-finalization cleanup: clean up only regions proven committed
-            # by THIS wave's generation, unless --keep-downloads is set.
-            if not getattr(args, "keep_downloads", False):
-                for r in regions:
-                    committed_gen = finalize_result.committed_regions.get(r.region_id)
-                    if committed_gen is not None and committed_gen == r.generation:
-                        dest = _destination_for(
-                            spec, staging_dir, lead=r.lead_time_hours, member=r.member
-                        )
-                        _cleanup_source(dest)
-                # Best-effort removal of the owned staging directory.
-                try:
-                    staging_dir.rmdir()
-                except OSError as exc:
-                    logger.warning(
-                        "Failed to remove staging directory %s: %s; data is safe.",
-                        staging_dir,
-                        exc,
-                    )
-        finally:
-            fin_conn.close()
-            engine.dispose()
-            executor.shutdown(wait=False)
-            decode_pool.shutdown()
-        return status
-
-    status = asyncio.run(_run_wave())
+    return status
 
     if failures:
         raise RuntimeError(

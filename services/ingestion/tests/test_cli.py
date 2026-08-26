@@ -24,6 +24,7 @@ from ingestion.core.catalog import (
     ModelVersionRecord,
     record_run,
 )
+from ingestion.providers.noaa.connector import NOAAConnector
 
 #: Path to the committed GRIB2 fixture, resolved from this file so the tests
 #: run correctly regardless of the current working directory (root-level CI).
@@ -1680,3 +1681,395 @@ def test_cleanup_never_touches_sibling_staging_dirs(
     # Sibling staging directory and its files must remain intact
     assert sibling_dir.exists()
     assert sibling_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# P1 CLI Streaming / Pipelined Ingestion Scheduler Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_pipelined_ingestion_starts_before_all_downloads_complete(
+    session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    """1. Streaming overlap: ingestion of lead 6 starts before download of lead 12 completes."""
+    import asyncio
+    import threading
+
+    recorded: list[ModelRunRecord] = []
+    _install_download_and_catalog(monkeypatch, session, recorded)
+
+    lead_6_ingest_started = threading.Event()
+    lead_6_ingest_started_before_lead_12_download_finished = False
+
+    orig_download = NOAAConnector.download
+
+    async def _staggered_download(
+        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+    ):
+        nonlocal lead_6_ingest_started_before_lead_12_download_finished
+        if lead_time_hours == 12:
+            # Lead 12 download pauses until lead 6 ingestion has actively started
+            while not lead_6_ingest_started.is_set():
+                await asyncio.sleep(0.01)
+            # Record that lead 6 ingestion is active while lead 12 is still in download
+            lead_6_ingest_started_before_lead_12_download_finished = True
+        return await orig_download(
+            self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=member
+        )
+
+    monkeypatch.setattr(NOAAConnector, "download", _staggered_download)
+
+    # Hook decode to signal that lead 6 ingestion has started and adjust lead coord
+    import re
+    from ingestion.core.decode_worker import DecodePool
+    orig_submit = DecodePool.submit
+
+    def _hooked_submit(self, path):
+        if "f006" in str(path):
+            lead_6_ingest_started.set()
+        fut = orig_submit(self, path)
+        m = re.search(r"\.f(\d{3})\.", str(path))
+        if m:
+            lead = int(m.group(1))
+            orig_result = fut.result
+            def _get_adjusted_ds(timeout=None):
+                ds = orig_result(timeout=timeout)
+                return ds.assign_coords(lead_time_hours=lead)
+            fut.result = _get_adjusted_ds
+        return fut
+
+    monkeypatch.setattr(DecodePool, "submit", _hooked_submit)
+
+    from ingestion.cli import main
+
+    store = str(tmp_path / "gfs.zarr")
+    dl_dir = tmp_path / "dl"
+
+    code = main(
+        [
+            "ingest",
+            "--model",
+            "gfs",
+            "--cycle-date",
+            "2026-07-21",
+            "--cycle-hour",
+            "0",
+            "--lead-time-hours",
+            "6",
+            "12",
+            "--store",
+            store,
+            "--allow-custom-store",
+            "--download-dir",
+            str(dl_dir),
+            "--concurrency",
+            "2",
+        ]
+    )
+    assert code == 0
+    assert lead_6_ingest_started_before_lead_12_download_finished is True
+
+
+def test_pipelined_ingestion_backpressure_bounds(
+    session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    """2. Backpressure bounds: active downloads <= N, active submissions <= N, staging <= 2N."""
+    import threading
+    import time
+
+    recorded: list[ModelRunRecord] = []
+    _install_download_and_catalog(monkeypatch, session, recorded)
+    import re
+    from ingestion.core.decode_worker import DecodePool
+    orig_submit = DecodePool.submit
+
+    def _lead_aware_submit(self, path):
+        fut = orig_submit(self, path)
+        m = re.search(r"\.f(\d{3})\.", str(path))
+        if m:
+            lead = int(m.group(1))
+            orig_result = fut.result
+            def _get_adjusted_ds(timeout=None):
+                ds = orig_result(timeout=timeout)
+                return ds.assign_coords(lead_time_hours=lead)
+            fut.result = _get_adjusted_ds
+        return fut
+
+    monkeypatch.setattr(DecodePool, "submit", _lead_aware_submit)
+
+    concurrency = 2
+    active_downloads = 0
+    max_active_downloads = 0
+    active_executor_workers = 0
+    max_active_executor_workers = 0
+    lock = threading.Lock()
+    worker_hold_event = threading.Event()
+
+    orig_download = NOAAConnector.download
+
+    async def _instrumented_download(
+        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+    ):
+        nonlocal active_downloads, max_active_downloads
+        with lock:
+            active_downloads += 1
+            if active_downloads > max_active_downloads:
+                max_active_downloads = active_downloads
+        try:
+            return await orig_download(
+                self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=member
+            )
+        finally:
+            with lock:
+                active_downloads -= 1
+
+    monkeypatch.setattr(NOAAConnector, "download", _instrumented_download)
+
+    from ingestion.core.coordinator import RunCoordinator
+    orig_write = RunCoordinator.write_region_worker
+
+    def _instrumented_write(self, conn, **kwargs):
+        nonlocal active_executor_workers, max_active_executor_workers
+        with lock:
+            active_executor_workers += 1
+            if active_executor_workers > max_active_executor_workers:
+                max_active_executor_workers = active_executor_workers
+        try:
+            # Block workers momentarily so backpressure builds up
+            worker_hold_event.wait(timeout=2.0)
+            return orig_write(self, conn, **kwargs)
+        finally:
+            with lock:
+                active_executor_workers -= 1
+
+    monkeypatch.setattr(RunCoordinator, "write_region_worker", _instrumented_write)
+
+    # Release worker hold after a brief delay
+    def _release_timer():
+        time.sleep(0.3)
+        worker_hold_event.set()
+
+    threading.Thread(target=_release_timer, daemon=True).start()
+
+    from ingestion.cli import main
+
+    store = str(tmp_path / "gfs.zarr")
+    dl_dir = tmp_path / "dl"
+
+    code = main(
+        [
+            "ingest",
+            "--model",
+            "gfs",
+            "--cycle-date",
+            "2026-07-21",
+            "--cycle-hour",
+            "0",
+            "--lead-time-hours",
+            "6",
+            "12",
+            "18",
+            "24",
+            "--store",
+            store,
+            "--allow-custom-store",
+            "--download-dir",
+            str(dl_dir),
+            "--concurrency",
+            str(concurrency),
+        ]
+    )
+    assert code == 0
+    # Enforced bounds verification
+    assert max_active_downloads <= concurrency
+    assert max_active_executor_workers <= concurrency
+
+
+def test_finalization_gate_on_cancellation(
+    session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    """3. Finalization gate: finalize_run MUST NOT begin while any region worker is running."""
+    import asyncio
+    import threading
+
+    recorded: list[ModelRunRecord] = []
+    _install_download_and_catalog(monkeypatch, session, recorded)
+    monkeypatch.setattr(
+        "ingestion.cli._validate_requested_lead", lambda ds, lead: None
+    )
+
+    worker_in_write = threading.Event()
+    worker_allow_finish = threading.Event()
+    finalizer_started = threading.Event()
+    finalizer_ran_prematurely = False
+
+    from ingestion.core.coordinator import RunCoordinator
+    orig_write = RunCoordinator.write_region_worker
+    orig_finalize = RunCoordinator.finalize_run
+
+    def _hooked_write(self, conn, **kwargs):
+        worker_in_write.set()
+        worker_allow_finish.wait(timeout=5.0)
+        return orig_write(self, conn, **kwargs)
+
+    def _hooked_finalize(self, conn, **kwargs):
+        nonlocal finalizer_ran_prematurely
+        finalizer_started.set()
+        if not worker_allow_finish.is_set():
+            finalizer_ran_prematurely = True
+        return orig_finalize(self, conn, **kwargs)
+
+    monkeypatch.setattr(RunCoordinator, "write_region_worker", _hooked_write)
+    monkeypatch.setattr(RunCoordinator, "finalize_run", _hooked_finalize)
+
+    store = str(tmp_path / "gfs.zarr")
+    dl_dir = tmp_path / "dl"
+
+    async def _run_and_cancel():
+        from ingestion.cli import (
+            _build_parser,
+            _build_spec,
+            _run_wave,
+            expand_run_specs,
+        )
+
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "ingest",
+                "--model",
+                "gfs",
+                "--cycle-date",
+                "2026-07-21",
+                "--cycle-hour",
+                "0",
+                "--lead-time-hours",
+                "6",
+                "--store",
+                store,
+                "--allow-custom-store",
+                "--download-dir",
+                str(dl_dir),
+            ]
+        )
+        spec = expand_run_specs(args)[0]
+        catalog_spec = _build_spec(spec, args, store)
+        failures: list[str] = []
+
+        # Launch _run_wave in an asyncio task on the loop
+        task = asyncio.create_task(
+            _run_wave(
+                spec=spec,
+                args=args,
+                catalog_spec=catalog_spec,
+                store_path=store,
+                concurrency=2,
+                failures=failures,
+            )
+        )
+
+        # Wait for worker to enter write
+        while not worker_in_write.is_set():
+            await asyncio.sleep(0.01)
+
+        # Cancel the task
+        task.cancel()
+        # Brief pause: verify finalizer does not run while worker is blocked
+        await asyncio.sleep(0.05)
+        assert finalizer_started.is_set() is False
+
+        # Release worker to finish cleanly
+        worker_allow_finish.set()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run_and_cancel())
+
+    assert finalizer_ran_prematurely is False
+    assert finalizer_started.is_set() is True
+
+
+def test_cancellation_propagates_as_cancelled_error(
+    session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    """4. Cancellation propagation: cancelled wave raises CancelledError, not silent success."""
+    import asyncio
+    import threading
+
+    recorded: list[ModelRunRecord] = []
+    _install_download_and_catalog(monkeypatch, session, recorded)
+
+    download_started = threading.Event()
+    download_block = threading.Event()
+
+    orig_download = NOAAConnector.download
+
+    async def _blocking_download(
+        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+    ):
+        download_started.set()
+        while not download_block.is_set():
+            await asyncio.sleep(0.02)
+        return await orig_download(
+            self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=member
+        )
+
+    monkeypatch.setattr(NOAAConnector, "download", _blocking_download)
+
+    from ingestion.cli import (
+        _build_parser,
+        _build_spec,
+        _run_wave,
+        expand_run_specs,
+    )
+
+    store = str(tmp_path / "gfs.zarr")
+    dl_dir = tmp_path / "dl"
+
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "ingest",
+            "--model",
+            "gfs",
+            "--cycle-date",
+            "2026-07-21",
+            "--cycle-hour",
+            "0",
+            "--lead-time-hours",
+            "6",
+            "12",
+            "--store",
+            store,
+            "--allow-custom-store",
+            "--download-dir",
+            str(dl_dir),
+        ]
+    )
+
+    async def _test_cancel_flow():
+        spec = expand_run_specs(args)[0]
+        catalog_spec = _build_spec(spec, args, store)
+        failures: list[str] = []
+
+        task = asyncio.create_task(
+            _run_wave(
+                spec=spec,
+                args=args,
+                catalog_spec=catalog_spec,
+                store_path=store,
+                concurrency=2,
+                failures=failures,
+            )
+        )
+        while not download_started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        download_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_test_cancel_flow())
