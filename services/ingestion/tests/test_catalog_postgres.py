@@ -248,10 +248,20 @@ def test_cli_production_entrypoint_ingests_and_serves(
 
     store = str(tmp_path_factory.mktemp("cli_it") / "gfs.zarr")
     download_dir = str(tmp_path_factory.mktemp("cli_it_dl"))
+    captured_variables: list[tuple[str, ...] | None] = []
 
     # Mock only the network download; run everything else for real.
-    async def _fake_download(self, model, cycle_date, cycle_hour,
-                             lead_time_hours, destination, member=None):
+    async def _fake_download(
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        variables=None,
+    ):
+        captured_variables.append(variables)
         from pathlib import Path
 
         destination = Path(destination)
@@ -285,6 +295,7 @@ def test_cli_production_entrypoint_ingests_and_serves(
         ]
     )
     assert code == 0
+    assert captured_variables == [("temperature_2m", "precipitation_rate")]
 
     # The run is recorded as ready with the store path.
     with Session(engine) as session:
