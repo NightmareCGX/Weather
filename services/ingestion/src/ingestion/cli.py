@@ -71,6 +71,7 @@ from ingestion.core.pipeline import (
     _apply_variable_mapping,
     _normalize_canonical_units,
     _validate_requested_lead,
+    _validate_requested_member,
 )
 from ingestion.providers.noaa.connector import NOAAConnector
 
@@ -834,6 +835,8 @@ async def _run_wave(
     decode_pool = DecodePool(max_workers=min(len(items), max(1, concurrency)))
     engine = _catalog_session_factory()
 
+    var_codes = tuple(v.code for v in catalog_spec.variables)
+
     async with NOAAConnector() as connector:
         # 1. Retained seed. Download the seed first, then decode it in a
         #    worker process (the native ecCodes boundary).
@@ -848,10 +851,12 @@ async def _run_wave(
             seed_lead,
             seed_dest,
             member=seed_member,
+            variables=var_codes,
         )
         seed_future = decode_pool.submit(seed_dest)
         seed_dataset = _decode_and_normalize(seed_future, catalog_spec)
         _validate_requested_lead(seed_dataset, seed_lead)
+        _validate_requested_member(seed_dataset, seed_member)
 
         # 2. Determine run id + same-cycle.
         run_id: str | None = None
@@ -924,6 +929,7 @@ async def _run_wave(
                 dest = _destination_for(spec, staging_dir, lead=lead, member=member)
                 ds = _decode_and_normalize(decode_pool.submit(dest), catalog_spec)
                 _validate_requested_lead(ds, lead)
+                _validate_requested_member(ds, member)
                 region_id = _region_id_for(lead, member)
                 generation = generation_by_region.get(region_id)
                 if generation is None:
@@ -1038,6 +1044,7 @@ async def _run_wave(
                             lead,
                             dest,
                             member=member,
+                            variables=var_codes,
                         )
                         logger.debug(
                             "download_complete: model=%s cycle=%s member=%s lead=%s",

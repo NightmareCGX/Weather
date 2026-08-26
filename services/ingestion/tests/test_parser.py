@@ -291,3 +291,57 @@ def test_parse_grib2_gefs_preserves_member_dimension(tmp_path: Path) -> None:
     assert ds.t2m.dims == ("member", "latitude", "longitude")
     assert ds.t2m.shape == (2, 5, 10)
     assert ds.lead_time_hours.values == 6
+
+
+def test_parse_grib2_selective_vs_full_equivalence(tmp_path: Path) -> None:
+    """A selective GRIB artifact with only required messages decodes identically to full file."""
+    from eccodes import (
+        codes_get,
+        codes_get_message,
+        codes_grib_new_from_file,
+        codes_release,
+    )
+
+    # Decode full file
+    ds_full = parse_grib2(MULTI_FIXTURE)
+
+    # Extract only required messages (2t and instantaneous prate)
+    selected_messages: list[bytes] = []
+    with MULTI_FIXTURE.open("rb") as f:
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            sn = codes_get(gid, "shortName")
+            tol = codes_get(gid, "typeOfLevel")
+            st = codes_get(gid, "stepType")
+            if (sn == "2t" and tol == "heightAboveGround") or (
+                sn == "prate" and tol == "surface" and st == "instant"
+            ):
+                selected_messages.append(codes_get_message(gid))
+            codes_release(gid)
+
+    assert len(selected_messages) == 2
+
+    # Write selective GRIB artifact
+    sel_path = tmp_path / "selective.grib2"
+    with sel_path.open("wb") as f:
+        for msg in selected_messages:
+            f.write(msg)
+
+    # Decode selective artifact
+    ds_sel = parse_grib2(sel_path)
+
+    # Verify 100% equivalence of data variables and coordinates
+    assert set(ds_full.data_vars) == set(ds_sel.data_vars)
+    assert set(ds_full.coords) == set(ds_sel.coords)
+    assert ds_full.lead_time_hours.values == ds_sel.lead_time_hours.values
+
+    for var in ds_full.data_vars:
+        assert ds_full[var].dims == ds_sel[var].dims
+        assert ds_full[var].shape == ds_sel[var].shape
+        assert np.array_equal(ds_full[var].values, ds_sel[var].values)
+
+    for coord in ds_full.coords:
+        assert np.array_equal(ds_full[coord].values, ds_sel[coord].values)
+

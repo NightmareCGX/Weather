@@ -2,19 +2,32 @@
 
 import asyncio
 from datetime import date
+import logging
+import os
 from pathlib import Path
+import re
+import time
 from types import TracebackType
 from typing import Self
+import uuid
 
 import httpx
 
 from ingestion.core.base import (
     BaseConnector,
     DownloadFailedError,
+    IngestionError,
     InvalidRunError,
     UpstreamUnavailableError,
 )
 from ingestion.core.config import IngestionSettings, settings
+from ingestion.providers.noaa.idx_parser import (
+    IdxParseError,
+    parse_idx,
+    select_records,
+)
+
+logger = logging.getLogger(__name__)
 
 _SUPPORTED_MODELS = frozenset({"gfs", "gefs"})
 _CYCLE_HOURS = frozenset({0, 6, 12, 18})
@@ -24,6 +37,22 @@ _GEFS_LEAD_TIME_PRODUCT_SPLIT = 240
 #: upstream perturbation number, never a positional completion index.
 _GEFS_MEMBER_MIN = 1
 _GEFS_MEMBER_MAX = 30
+
+_CONTENT_RANGE_PATTERN = re.compile(
+    r"^bytes\s+(\d+)-(\d+)/(?:\d+|\*)$", re.IGNORECASE
+)
+
+
+class SelectiveFallbackError(IngestionError):
+    """Raised when a selective byte-range download fails and requires full-file fallback.
+
+    Attributes:
+        reason: Stable telemetry reason code explaining the fallback trigger.
+    """
+
+    def __init__(self, reason: str, message: str | None = None) -> None:
+        super().__init__(message or f"Selective download fallback triggered: {reason}")
+        self.reason = reason
 
 
 class NOAAConnector(BaseConnector):
@@ -37,16 +66,16 @@ class NOAAConnector(BaseConnector):
     * GFS: ``gfs.YYYYMMDD/CC/atmos/gfs.tCCz.pgrb2.0p25.fXXX``
     * GEFS 0.25° (<= 240 h): ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/
       gepNN.tCCz.pgrb2s.0p25.fXXX``
-    * GEFS 0.50° (> 240 h): ``gefs.YYYYMMDD/CC/atmos/pgrb2ap5/pgrb2bp5/
+    * GEFS 0.50° (> 240 h): ``gefs.YYYYMMDD/CC/atmos/pgrb2bp5/
       gepNN.tCCz.pgrb2s.0p50.fXXX``
 
     Only the 30 perturbation members are ingested; the control (``gec00``),
     ensemble-mean (``geavg``), and spread (``gespr``) files are out of scope.
 
-    Downloads are streamed to disk, validated against HTTP status codes,
-    and retried with progressive backoff on transient failures (network
-    errors and 5xx responses). All other non-2xx responses (including
-    redirects) fail immediately.
+    Downloads use sequential single-range HTTP requests based on NOMADS ``.idx``
+    offsets to selectively fetch only the required GRIB messages, saving >97%
+    bandwidth. If the selective path encounters index anomalies, missing required
+    records, or range rejection, it cleanly falls back to the full-file download path.
     """
 
     def __init__(self, conn_settings: IngestionSettings | None = None) -> None:
@@ -146,12 +175,14 @@ class NOAAConnector(BaseConnector):
         lead_time_hours: int,
         destination: Path,
         member: int | None = None,
+        variables: tuple[str, ...] = ("temperature_2m", "precipitation_rate"),
     ) -> Path:
-        """Download a GRIB2 file to ``destination``.
+        """Download a GRIB2 file to ``destination`` using selective byte ranges.
 
-        Transient failures (network errors and 5xx responses) are retried
-        up to ``DOWNLOAD_RETRIES`` extra attempts with progressive backoff;
-        all other non-2xx responses (including redirects) fail immediately.
+        Attempts selective single-range downloading based on NOMADS ``.idx``
+        metadata. If selective downloading encounters index anomalies, missing
+        required records, or range errors, it automatically falls back to full-file
+        downloading.
 
         Args:
             model: Model identifier, either ``gfs`` or ``gefs``.
@@ -162,6 +193,7 @@ class NOAAConnector(BaseConnector):
                 parent directory is created if missing.
             member: GEFS perturbation member (1..30). Required for GEFS;
                 ignored for GFS.
+            variables: Canonical platform variables to select.
 
         Returns:
             The path the file was written to.
@@ -177,18 +209,290 @@ class NOAAConnector(BaseConnector):
         url = self.build_url(model, cycle_date, cycle_hour, lead_time_hours, member)
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
+
+        if getattr(self._settings, "ENABLE_SELECTIVE_DOWNLOAD", True):
+            try:
+                return await self._download_selective_with_retry(
+                    url=url,
+                    model=model,
+                    cycle_date=cycle_date,
+                    cycle_hour=cycle_hour,
+                    lead_time_hours=lead_time_hours,
+                    destination=destination,
+                    member=member,
+                    variables=variables,
+                )
+            except SelectiveFallbackError as fallback_exc:
+                logger.warning(
+                    "download_fallback: model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "fallback_reason=%s; falling back to full download.",
+                    model,
+                    cycle_date,
+                    cycle_hour,
+                    lead_time_hours,
+                    member,
+                    fallback_exc.reason,
+                )
+            except Exception as exc:
+                # Catch any unexpected selective-path error to ensure reliable fallback
+                logger.warning(
+                    "download_fallback: model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "fallback_reason=unexpected_selective_error error=%s; falling back to full download.",
+                    model,
+                    cycle_date,
+                    cycle_hour,
+                    lead_time_hours,
+                    member,
+                    exc,
+                )
+
+        return await self._download_full_with_retry(url, destination)
+
+    async def _download_selective_with_retry(
+        self,
+        url: str,
+        model: str,
+        cycle_date: date,
+        cycle_hour: int,
+        lead_time_hours: int,
+        destination: Path,
+        member: int | None,
+        variables: tuple[str, ...],
+    ) -> Path:
+        """Attempt selective range download with artifact-transaction retry semantics."""
         attempts = self._settings.DOWNLOAD_RETRIES + 1
         last_error: BaseException | None = None
+
+        for attempt in range(1, attempts + 1):
+            temp_dest = destination.with_suffix(f".tmp.{uuid.uuid4().hex}.grib2")
+            start_time = time.monotonic()
+            try:
+                # 1. Fetch fresh .idx (never reuse cached .idx across retries)
+                idx_url = f"{url}.idx"
+                try:
+                    idx_resp = await self._client.get(idx_url)
+                except httpx.TransportError as exc:
+                    raise exc
+
+                if idx_resp.status_code == httpx.codes.NOT_FOUND:
+                    raise SelectiveFallbackError("idx_not_found")
+                if idx_resp.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"Upstream returned HTTP {idx_resp.status_code} for .idx: {idx_url}",
+                        request=idx_resp.request,
+                        response=idx_resp,
+                    )
+                if not 200 <= idx_resp.status_code < 300:
+                    raise SelectiveFallbackError(f"idx_http_{idx_resp.status_code}")
+
+                # 2. Strict parse into IdxRecords
+                try:
+                    records = parse_idx(idx_resp.text)
+                except IdxParseError as exc:
+                    raise SelectiveFallbackError(
+                        "idx_parse_error", str(exc)
+                    ) from exc
+
+                # 3. Product-aware selection
+                selection = select_records(
+                    model=model,
+                    records=records,
+                    lead_time_hours=lead_time_hours,
+                    variables=variables,
+                    member=member,
+                )
+                if not selection.is_valid:
+                    if selection.missing_required:
+                        raise SelectiveFallbackError(
+                            "required_record_missing_in_idx",
+                            f"Missing required records for {selection.missing_required}",
+                        )
+                    if selection.ambiguous:
+                        raise SelectiveFallbackError(
+                            "ambiguous_record_selection",
+                            f"Ambiguous matching records for {selection.ambiguous}",
+                        )
+
+                if not selection.selected_records:
+                    raise SelectiveFallbackError("no_records_selected")
+
+                # 4. Sequential single-range requests in original source order
+                total_downloaded = 0
+                with temp_dest.open("wb") as handle:
+                    for rec in selection.selected_records:
+                        range_header = (
+                            f"bytes={rec.start_offset}-{rec.end_offset}"
+                            if rec.end_offset is not None
+                            else f"bytes={rec.start_offset}-"
+                        )
+                        async with self._client.stream(
+                            "GET", url, headers={"Range": range_header}
+                        ) as resp:
+                            if resp.status_code == httpx.codes.NOT_FOUND:
+                                raise DownloadFailedError(
+                                    f"Requested file not found: {url}"
+                                )
+                            if resp.status_code == 200:
+                                # Upstream ignored Range header. Stream full response directly
+                                # to destination as an immediate in-stream fallback.
+                                handle.close()
+                                temp_dest.unlink(missing_ok=True)
+                                logger.warning(
+                                    "Server returned 200 OK instead of 206 for Range request; "
+                                    "streaming full file directly."
+                                )
+                                return await self._stream_response_to_file(
+                                    resp, destination
+                                )
+                            if resp.status_code == 416:
+                                raise SelectiveFallbackError(
+                                    "range_not_satisfiable_416"
+                                )
+                            if resp.status_code >= 500:
+                                raise httpx.HTTPStatusError(
+                                    f"Upstream returned HTTP {resp.status_code}: {url}",
+                                    request=resp.request,
+                                    response=resp,
+                                    )
+                            if resp.status_code != 206:
+                                raise SelectiveFallbackError(
+                                    f"range_unexpected_status_{resp.status_code}"
+                                )
+
+                            # Validate Content-Range header
+                            content_range = resp.headers.get("content-range", "")
+                            match = _CONTENT_RANGE_PATTERN.match(content_range.strip())
+                            if not match:
+                                raise SelectiveFallbackError(
+                                    "range_content_mismatch",
+                                    f"Malformed Content-Range: {content_range!r}",
+                                )
+                            cr_start = int(match.group(1))
+                            cr_end = int(match.group(2))
+                            if cr_start != rec.start_offset:
+                                raise SelectiveFallbackError(
+                                    "range_content_mismatch",
+                                    f"Start offset mismatch: expected {rec.start_offset}, got {cr_start}",
+                                )
+                            if rec.end_offset is not None and cr_end != rec.end_offset:
+                                raise SelectiveFallbackError(
+                                    "range_content_mismatch",
+                                    f"End offset mismatch: expected {rec.end_offset}, got {cr_end}",
+                                )
+
+                            chunk = await resp.aread()
+
+                            # Body length validation
+                            expected_len = cr_end - cr_start + 1
+                            if len(chunk) != expected_len:
+                                raise SelectiveFallbackError(
+                                    "range_truncated",
+                                    f"Truncated body: expected {expected_len} bytes, got {len(chunk)}",
+                                )
+
+                            # Binary GRIB validation
+                            if not chunk.startswith(b"GRIB"):
+                                raise SelectiveFallbackError(
+                                    "grib_magic_invalid",
+                                    "Chunk missing 'GRIB' magic header",
+                                )
+                            if not chunk.endswith(b"7777"):
+                                raise SelectiveFallbackError(
+                                    "grib_terminator_invalid",
+                                    "Chunk missing '7777' terminator",
+                                )
+                            # Section 0 total declared length check (octets 9-16)
+                            if len(chunk) < 16:
+                                raise SelectiveFallbackError(
+                                    "grib_length_invalid",
+                                    "Chunk shorter than Section 0 header",
+                                )
+                            declared_len = int.from_bytes(
+                                chunk[8:16], byteorder="big", signed=False
+                            )
+                            if declared_len != len(chunk):
+                                raise SelectiveFallbackError(
+                                    "grib_length_invalid",
+                                    f"GRIB Section 0 declared length {declared_len} != chunk length {len(chunk)}",
+                                )
+
+                            handle.write(chunk)
+                            total_downloaded += len(chunk)
+
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+                # Atomic publish
+                temp_dest.replace(destination)
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                logger.info(
+                    "download_complete: model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "mode=selective records_selected=%d downloaded_bytes=%d duration_ms=%d",
+                    model,
+                    cycle_date,
+                    cycle_hour,
+                    lead_time_hours,
+                    member,
+                    len(selection.selected_records),
+                    total_downloaded,
+                    elapsed_ms,
+                )
+                return destination
+
+            except (SelectiveFallbackError, DownloadFailedError):
+                temp_dest.unlink(missing_ok=True)
+                raise
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                temp_dest.unlink(missing_ok=True)
+                last_error = exc
+                if attempt < attempts:
+                    await asyncio.sleep(self._settings.RETRY_BACKOFF_SECONDS * attempt)
+            except Exception as exc:
+                temp_dest.unlink(missing_ok=True)
+                raise SelectiveFallbackError("unexpected_selective_exception", str(exc)) from exc
+
+        assert last_error is not None
+        raise SelectiveFallbackError("selective_retry_exhausted", str(last_error)) from last_error
+
+    async def _stream_response_to_file(
+        self, response: httpx.Response, destination: Path
+    ) -> Path:
+        """Stream an already-open HTTP response safely to destination with atomic publication."""
+        temp_dest = destination.with_suffix(f".tmp.{uuid.uuid4().hex}.grib2")
+        try:
+            with temp_dest.open("wb") as handle:
+                async for chunk in response.aiter_bytes():
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp_dest.replace(destination)
+            return destination
+        except Exception:
+            temp_dest.unlink(missing_ok=True)
+            raise
+
+    async def _download_full_with_retry(self, url: str, destination: Path) -> Path:
+        """Download full GRIB2 file with retries (operational fallback path)."""
+        attempts = self._settings.DOWNLOAD_RETRIES + 1
+        last_error: BaseException | None = None
+        start_time = time.monotonic()
+
         for attempt in range(1, attempts + 1):
             try:
-                return await self._download_once(url, destination)
-            except httpx.TransportError as exc:
-                last_error = exc
-            except httpx.HTTPStatusError as exc:
+                path = await self._download_full_once(url, destination)
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                logger.info(
+                    "download_complete: url=%s mode=full duration_ms=%d",
+                    url,
+                    elapsed_ms,
+                )
+                return path
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                 last_error = exc
             if attempt < attempts:
                 await asyncio.sleep(self._settings.RETRY_BACKOFF_SECONDS * attempt)
-        assert last_error is not None, "download loop must record a failure"
+
+        assert last_error is not None
         if isinstance(last_error, httpx.HTTPStatusError):
             raise DownloadFailedError(
                 f"Upstream returned HTTP {last_error.response.status_code} "
@@ -197,6 +501,35 @@ class NOAAConnector(BaseConnector):
         raise UpstreamUnavailableError(
             f"Upstream unreachable after {attempts} attempts: {url}"
         ) from last_error
+
+    async def _download_full_once(self, url: str, destination: Path) -> Path:
+        """Perform a single full-file download attempt with atomic staging."""
+        temp_dest = destination.with_suffix(f".tmp.{uuid.uuid4().hex}.grib2")
+        try:
+            async with self._client.stream("GET", url) as response:
+                if response.status_code == httpx.codes.NOT_FOUND:
+                    raise DownloadFailedError(f"Requested file not found: {url}")
+                if response.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"Upstream returned HTTP {response.status_code}: {url}",
+                        request=response.request,
+                        response=response,
+                    )
+                if not 200 <= response.status_code < 300:
+                    raise DownloadFailedError(
+                        f"Upstream rejected the request with HTTP "
+                        f"{response.status_code}: {url}"
+                    )
+                with temp_dest.open("wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        handle.write(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            temp_dest.replace(destination)
+            return destination
+        except Exception:
+            temp_dest.unlink(missing_ok=True)
+            raise
 
     async def download_idx(
         self,
@@ -237,51 +570,7 @@ class NOAAConnector(BaseConnector):
         url = f"{url}.idx"
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        attempts = self._settings.DOWNLOAD_RETRIES + 1
-        last_error: BaseException | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return await self._download_once(url, destination)
-            except httpx.TransportError as exc:
-                last_error = exc
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-            if attempt < attempts:
-                await asyncio.sleep(self._settings.RETRY_BACKOFF_SECONDS * attempt)
-        assert last_error is not None, "download loop must record a failure"
-        if isinstance(last_error, httpx.HTTPStatusError):
-            raise DownloadFailedError(
-                f"Upstream returned HTTP {last_error.response.status_code} "
-                f"after {attempts} attempts: {url}"
-            ) from last_error
-        raise UpstreamUnavailableError(
-            f"Upstream unreachable after {attempts} attempts: {url}"
-        ) from last_error
-
-    async def _download_once(self, url: str, destination: Path) -> Path:
-        """Perform a single download attempt with HTTP validation."""
-        async with self._client.stream("GET", url) as response:
-            if response.status_code == httpx.codes.NOT_FOUND:
-                raise DownloadFailedError(f"Requested file not found: {url}")
-            if response.status_code >= 500:
-                raise httpx.HTTPStatusError(
-                    f"Upstream returned HTTP {response.status_code}: {url}",
-                    request=response.request,
-                    response=response,
-                )
-            if not 200 <= response.status_code < 300:
-                raise DownloadFailedError(
-                    f"Upstream rejected the request with HTTP "
-                    f"{response.status_code}: {url}"
-                )
-            try:
-                with destination.open("wb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        handle.write(chunk)
-            except Exception:
-                destination.unlink(missing_ok=True)
-                raise
-        return destination
+        return await self._download_full_with_retry(url, destination)
 
     def _validate_run(self, model: str, cycle_hour: int, lead_time_hours: int) -> None:
         """Validate model, cycle hour, and lead time against NOMADS limits."""

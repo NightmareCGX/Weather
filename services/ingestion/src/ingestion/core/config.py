@@ -20,6 +20,11 @@ class IngestionSettings(BaseSettings):
     DOWNLOAD_RETRIES: Any = 3
     RETRY_BACKOFF_SECONDS: Any = 1.0
 
+    #: Feature switch for NOMADS .idx byte-range selective downloading.
+    #: When True, selectively fetches only platform-required GRIB records with
+    #: automatic fallback to full downloads on index/range anomalies.
+    ENABLE_SELECTIVE_DOWNLOAD: bool = True
+
     #: PostgreSQL catalog connection used to record ingested runs so the API
     #: serving tier can discover and serve them.
     DATABASE_URL: Any = (

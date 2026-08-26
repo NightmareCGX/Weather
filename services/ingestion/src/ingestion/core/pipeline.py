@@ -490,6 +490,34 @@ def _validate_requested_lead(
         )
 
 
+def _validate_requested_member(
+    dataset: xr.Dataset,
+    requested_member: int | None,
+) -> None:
+    """Fail fast when a requested GEFS member disagrees with the parsed dataset.
+
+    Args:
+        dataset: The normalized parsed dataset.
+        requested_member: The member identity the caller requested (e.g. 1..30),
+            or None for deterministic models.
+
+    Raises:
+        StoreSchemaMismatchError: When the requested member is provided and does
+            not match the dataset's parsed member coordinate.
+    """
+    if requested_member is None:
+        return
+    if "member" in dataset.coords or "member" in dataset.dims:
+        member_values = dataset["member"].values
+        parsed = int(member_values[0] if np.ndim(member_values) != 0 else member_values)
+        if parsed != requested_member:
+            raise StoreSchemaMismatchError(
+                f"Downloaded GEFS file decodes to member {parsed}, but the "
+                f"requested member is {requested_member}. The file does not "
+                "match the requested forecast member; aborting."
+            )
+
+
 def _merge_lead(dataset: xr.Dataset, store_path: str) -> xr.Dataset:
     """Merge a single-lead dataset into a cycle's Zarr store.
 
