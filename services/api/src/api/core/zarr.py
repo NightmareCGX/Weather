@@ -14,8 +14,9 @@ uses so a store produced by the ingestion worker is readable here.
 from __future__ import annotations
 
 import os
+from collections.abc import Generator, MutableMapping
+from contextlib import contextmanager
 from os import PathLike
-from typing import MutableMapping
 
 import s3fs  # type: ignore[import-untyped]
 import xarray as xr
@@ -68,6 +69,7 @@ def _resolve_s3_store(path: str) -> MutableMapping[str, bytes]:
         key=settings.MINIO_ACCESS_KEY,
         secret=settings.MINIO_SECRET_KEY,
         client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+        use_listings_cache=False,
     )
     # ``get_mapper`` is untyped in the s3fs stub (import-untyped), so mypy
     # sees ``Any``. The declared ``MutableMapping[str, bytes]`` return is
@@ -81,10 +83,10 @@ def read_dataset(store: str | PathLike[str] | MutableMapping[str, bytes]) -> xr.
     """Read a Zarr store back into a numpy-backed dataset (always fresh).
 
     This is the uncached open. The serving paths use
-    :func:`read_dataset_cached`, which reuses the lazily-opened dataset per
-    ``(store_path, serving_generation)``; this function remains for callers
-    that need an unconditional fresh open (and as the opener the cache
-    invokes on miss).
+    :func:`open_serving_dataset` (or :func:`read_dataset_cached`), which reuses
+    the lazily-opened dataset per ``(store_path, serving_generation)``; this
+    function remains for callers that need an unconditional fresh open (and as
+    the opener the cache invokes on miss).
 
     Args:
         store: A local path, ``s3://`` URL, or mapping to read.
@@ -101,51 +103,70 @@ def read_dataset(store: str | PathLike[str] | MutableMapping[str, bytes]) -> xr.
     return dataset
 
 
-def _generation_for(store: str) -> str | None:
-    """Return the committed-manifest generation for cache identity.
+@contextmanager
+def open_serving_dataset(
+    store: str | PathLike[str] | MutableMapping[str, bytes],
+) -> Generator[xr.Dataset, None, None]:
+    """Provide an opened xarray.Dataset with deterministic ownership and caching.
 
-    Returns ``None`` when the manifest cannot be used for identity (missing
-    manifest on a legacy/hybrid store is resolved by ``manifest_generation``
-    to a deterministic legacy token instead). A malformed manifest fails
-    closed: ``None`` means "do not reuse", so the caller opens directly.
+    * For in-memory / MutableMapping stores: opens fresh and closes on context exit.
+    * For path-backed stores with a valid trusted generation (marker-v1):
+      borrows the cached Dataset from StoreHandleCache; does NOT close it on context exit.
+    * For path-backed stores with confirmed missing manifest (legacy):
+      opens a fresh Dataset via read_dataset; deterministically closes it on context exit via finally.
+    * For malformed manifests: raises ManifestReadError (fail closed).
+    * For infrastructure/IO failures: propagates the error (fail closed).
     """
-    from api.core.manifest_reader import ManifestReadError, manifest_generation
+    if isinstance(store, MutableMapping):
+        ds = read_dataset(store)
+        try:
+            yield ds
+        finally:
+            ds.close()
+        return
 
-    try:
-        return manifest_generation(str(os.fspath(store)))
-    except ManifestReadError:
-        return None
+    path = os.fspath(store)
+    from api.core.manifest_reader import manifest_generation
+
+    generation = manifest_generation(path)
+    if generation is None:
+        # Confirmed absent manifest (legacy compatibility path):
+        # Open fresh, bypass StoreHandleCache, close deterministically on exit.
+        ds = read_dataset(path)
+        try:
+            yield ds
+        finally:
+            ds.close()
+    else:
+        # Trusted generation: borrow from StoreHandleCache, do not close on exit.
+        from api.core.store_cache import store_handle_cache
+
+        def _open() -> xr.Dataset:
+            return read_dataset(path)
+
+        dataset, _hit = store_handle_cache.get_or_open((path, generation), _open)
+        yield dataset
 
 
 def read_dataset_cached(
     store: str | PathLike[str] | MutableMapping[str, bytes],
 ) -> xr.Dataset:
-    """Return the lazily-opened dataset for a store, reusing per generation.
+    """Return the lazily-opened dataset for a store, reusing per trusted generation.
 
-    Phase 2 serving-path entry point. The lazy ``xr.Dataset`` produced by
-    :func:`read_dataset` is cached keyed by ``(store_root,
-    serving_generation)`` so repeated requests skip the repeated
-    S3FileSystem/mapper resolution, ``xr.open_zarr``, and consolidated
-    ``.zmetadata`` fetch — while every actual chunk I/O still happens at
-    selection time under the SHARED reader gate (unchanged).
+    When a trusted committed generation exists (marker-v1), the lazy dataset
+    is reused from StoreHandleCache. When no manifest exists (legacy store),
+    caching is bypassed and a fresh dataset is returned.
 
-    Same-cycle correctness: the committed-manifest generation is probed on
-    EVERY call (one small GET), so once a writer replaces the same cycle and
-    commits a new generation, the next reader's key changes, misses, and
-    opens fresh — generation-A state can never satisfy a generation-B
-    request. Mappings (non-path stores) and malformed-manifest stores bypass
-    the cache and open directly.
-
-    The cached object holds only metadata + coordinate arrays (the selectors
-    materialize bounded numpy results separately); no decoded meteorological
-    field is retained.
+    Note: Prefer :func:`open_serving_dataset` for request-bounded serving
+    reads to ensure deterministic dataset cleanup when uncached.
     """
     if isinstance(store, MutableMapping):
         return read_dataset(store)
     path = os.fspath(store)
-    generation = _generation_for(path)
+    from api.core.manifest_reader import manifest_generation
+
+    generation = manifest_generation(path)
     if generation is None:
-        # Fail closed: unusable identity -> never reuse.
         return read_dataset(path)
 
     from api.core.store_cache import store_handle_cache

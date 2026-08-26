@@ -121,7 +121,7 @@ def test_read_dataset_cached_sees_replaced_store_content(tmp_path, monkeypatch) 
     """End-to-end over read_dataset_cached: rewrite the SAME path with new
     values and confirm the next cached call returns the NEW values."""
     store = _write_store(tmp_path, "cycle.zarr", 0.0)
-    monkeypatch.setattr("api.core.zarr._generation_for", lambda _p: "gen-x")
+    monkeypatch.setattr("api.core.manifest_reader.manifest_generation", lambda _p: "gen-x")
 
     first = read_dataset_cached(store)
     v_first = float(first["temperature_2m"].isel(lead_time_hours=2, latitude=9, longitude=19))
@@ -153,9 +153,9 @@ def test_broken_newest_store_falls_back_and_repairs(tmp_path, monkeypatch) -> No
         calls.append(store)
         if store.endswith("newest"):
             raise ManifestReadError("malformed manifest")
-        return "legacy-" + store
+        return "gen-" + store
 
-    monkeypatch.setattr("api.core.zarr._generation_for", fake_generation)
+    monkeypatch.setattr("api.core.manifest_reader.manifest_generation", fake_generation)
 
     good = _write_store(tmp_path, "older", 0.0)
 
@@ -176,8 +176,8 @@ def test_broken_newest_store_falls_back_and_repairs(tmp_path, monkeypatch) -> No
     # committed a valid manifest.
     repaired = _write_store(tmp_path, "newest", 7.0)
     monkeypatch.setattr(
-        "api.core.zarr._generation_for",
-        lambda s: "legacy-" + s,
+        "api.core.manifest_reader.manifest_generation",
+        lambda s: "gen-" + s,
     )
     ds_new = read_dataset_cached(repaired)
     v_new = float(ds_new["temperature_2m"].isel(lead_time_hours=1, latitude=5, longitude=10))
@@ -250,11 +250,13 @@ def test_16_concurrent_readers_same_generation(tmp_path) -> None:
 def test_concurrent_readers_via_read_dataset_cached_single_open(
     tmp_path, monkeypatch
 ) -> None:
-    """Under concurrency, repeated read_dataset_cached calls share cached opens;
-    every thread's bounded selection matches the analytic field exactly."""
+    """Under concurrency with a trusted generation, repeated read_dataset_cached
+    calls share cached opens; every thread's bounded selection matches the analytic
+    field exactly."""
     from concurrent.futures import ThreadPoolExecutor
 
     store = _write_store(tmp_path, "conc.zarr", 0.0)
+    monkeypatch.setattr("api.core.manifest_reader.manifest_generation", lambda _p: "gen-concurrent")
 
     open_calls = {"n": 0}
     real_read = read_dataset
@@ -554,3 +556,222 @@ def test_numerical_identity_cached_vs_fresh(tmp_path) -> None:
     a = cached_ds["temperature_2m"].values  # tiny fixture grid: full compare OK here
     b = fresh_ds["temperature_2m"].values
     np.testing.assert_array_equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Legacy / no-manifest cache bypass and resource ownership tests.
+# ---------------------------------------------------------------------------
+
+
+def test_no_manifest_store_bypasses_store_handle_cache(tmp_path) -> None:
+    """Stores without a manifest return generation=None and bypass StoreHandleCache."""
+    from api.core.manifest_reader import manifest_generation
+    from api.core.store_cache import store_handle_cache
+    from api.core.zarr import open_serving_dataset
+
+    store = _write_store(tmp_path, "no_manifest.zarr", 0.0)
+    store_handle_cache.clear()
+
+    assert manifest_generation(store) is None
+
+    # Serving open 1
+    with open_serving_dataset(store) as ds1:
+        v1 = float(ds1["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+        assert np.isfinite(v1)
+
+    # Serving open 2
+    with open_serving_dataset(store) as ds2:
+        v2 = float(ds2["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+        assert np.isfinite(v2)
+
+    # Must NOT have inserted into StoreHandleCache
+    assert len(store_handle_cache) == 0
+
+
+def test_no_manifest_same_cycle_replacement_without_restart(tmp_path) -> None:
+    """Overwriting data in a no-manifest store is immediately visible on the next read."""
+    from api.core.store_cache import store_handle_cache
+    from api.core.zarr import open_serving_dataset
+
+    store = _write_store(tmp_path, "cycle_replace.zarr", 0.0)
+    store_handle_cache.clear()
+
+    with open_serving_dataset(store) as ds:
+        v_initial = float(ds["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+
+    # Ingestion overwrites the same path with new values (no manifest).
+    write_dataset(
+        _make_dataset(values_offset=40.0),
+        store,
+        chunks={"lead_time_hours": 1, "latitude": 5, "longitude": 5},
+    )
+
+    # Next request in the SAME process must observe the new values.
+    with open_serving_dataset(store) as ds:
+        v_after = float(ds["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+
+    assert v_after == pytest.approx(v_initial + 40.0)
+
+
+def test_manifest_created_after_initial_no_manifest_serving(tmp_path) -> None:
+    """When a valid manifest appears on a store, the API transitions to generation-aware caching."""
+    import json
+    from api.core.manifest_reader import manifest_generation
+    from api.core.store_cache import store_handle_cache
+    from api.core.zarr import open_serving_dataset
+
+    store = _write_store(tmp_path, "transition.zarr", 0.0)
+    store_handle_cache.clear()
+
+    # Initial request without manifest -> uncached
+    assert manifest_generation(store) is None
+    with open_serving_dataset(store) as ds:
+        _ = float(ds["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+    assert len(store_handle_cache) == 0
+
+    # Ingestion finalizer writes a valid marker-v1 manifest.
+    manifest_dir = os.path.join(store, "__commit__", "v1")
+    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_path = os.path.join(manifest_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump({"manifest_schema_version": 1, "generation": "gen-first-commit-123"}, fh)
+
+    assert manifest_generation(store) == "gen-first-commit-123"
+
+    # Next read should cache under the real generation
+    with open_serving_dataset(store) as ds:
+        _ = float(ds["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+
+    assert len(store_handle_cache) == 1
+    assert (store, "gen-first-commit-123") in store_handle_cache._entries
+
+    # Subsequent read is a cache hit
+    hit_count_before = store_handle_cache.hits
+    with open_serving_dataset(store) as ds:
+        _ = float(ds["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+    assert store_handle_cache.hits == hit_count_before + 1
+
+
+def test_malformed_manifest_raises_and_does_not_fallback(tmp_path) -> None:
+    """A malformed manifest raises ManifestReadError and never silently falls back to legacy serving."""
+    from api.core.manifest_reader import ManifestReadError, manifest_generation
+    from api.core.store_cache import store_handle_cache
+    from api.core.zarr import open_serving_dataset
+
+    store = _write_store(tmp_path, "malformed.zarr", 0.0)
+    store_handle_cache.clear()
+
+    manifest_dir = os.path.join(store, "__commit__", "v1")
+    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_path = os.path.join(manifest_dir, "manifest.json")
+    with open(manifest_path, "wb") as fh:
+        fh.write(b"not-valid-json{{{")
+
+    with pytest.raises(ManifestReadError):
+        manifest_generation(store)
+
+    with pytest.raises(ManifestReadError):
+        with open_serving_dataset(store):
+            pass
+
+    assert len(store_handle_cache) == 0
+
+
+def test_manifest_infrastructure_read_failure_propagates(tmp_path, monkeypatch) -> None:
+    """A transport/IO error reading the manifest propagates and does not masquerade as legacy."""
+    from api.core.store_cache import store_handle_cache
+    from api.core.zarr import open_serving_dataset
+
+    store = _write_store(tmp_path, "io_fail.zarr", 0.0)
+    store_handle_cache.clear()
+
+    def failing_read(_path):
+        raise ConnectionResetError("S3 connection reset by peer")
+
+    monkeypatch.setattr("api.core.manifest_reader._read_manifest", failing_read)
+
+    with pytest.raises(ConnectionResetError):
+        with open_serving_dataset(store):
+            pass
+
+    assert len(store_handle_cache) == 0
+
+
+def test_uncached_dataset_closed_after_selection(tmp_path, monkeypatch) -> None:
+    """Uncached datasets are closed on context exit; cached datasets are not closed."""
+    import json
+    from api.core.store_cache import store_handle_cache
+    from api.core.zarr import open_serving_dataset
+
+    store = _write_store(tmp_path, "closing.zarr", 0.0)
+    store_handle_cache.clear()
+
+    closed_datasets: list[xr.Dataset] = []
+    real_close = xr.Dataset.close
+
+    def spy_close(self):
+        closed_datasets.append(self)
+        real_close(self)
+
+    monkeypatch.setattr(xr.Dataset, "close", spy_close)
+
+    # 1. Uncached no-manifest store
+    with open_serving_dataset(store) as ds:
+        _ = float(ds["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+
+    assert len(closed_datasets) == 1
+
+    # 2. Cached marker-v1 store
+    manifest_dir = os.path.join(store, "__commit__", "v1")
+    os.makedirs(manifest_dir, exist_ok=True)
+    with open(os.path.join(manifest_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump({"generation": "gen-keep-open"}, fh)
+
+    closed_datasets.clear()
+    with open_serving_dataset(store) as ds:
+        _ = float(ds["temperature_2m"].isel(lead_time_hours=0, latitude=0, longitude=0))
+
+    # Cached dataset must NOT have been closed on exit
+    assert len(closed_datasets) == 0
+
+
+def test_api_s3fs_use_listings_cache_disabled(monkeypatch) -> None:
+    """API S3FileSystem constructors must pass use_listings_cache=False without network I/O."""
+    import s3fs
+    from api.core.manifest_reader import _read_manifest
+    from api.core.zarr import _resolve_s3_store
+    from api.routers.admin import _object_storage_connected
+
+    captured_kwargs: list[dict] = []
+    original_init = s3fs.S3FileSystem.__init__
+
+    def spy_init(self, *args, **kwargs):
+        captured_kwargs.append(dict(kwargs))
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(s3fs.S3FileSystem, "__init__", spy_init)
+    # Stub I/O methods so the test does not require live MinIO/S3 connectivity.
+    monkeypatch.setattr(
+        s3fs.S3FileSystem,
+        "cat_file",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError("isolated test")),
+    )
+    monkeypatch.setattr(s3fs.S3FileSystem, "ls", lambda self, *args, **kwargs: [])
+
+    # 1. Manifest reader S3 resolution
+    s3fs.S3FileSystem.clear_instance_cache()
+    _ = _read_manifest("s3://bucket/store.zarr")
+    assert any(k.get("use_listings_cache") is False for k in captured_kwargs)
+
+    # 2. Zarr store S3 resolution
+    captured_kwargs.clear()
+    s3fs.S3FileSystem.clear_instance_cache()
+    _ = _resolve_s3_store("s3://bucket/store.zarr")
+    assert any(k.get("use_listings_cache") is False for k in captured_kwargs)
+
+    # 3. Admin health probe
+    captured_kwargs.clear()
+    s3fs.S3FileSystem.clear_instance_cache()
+    _ = _object_storage_connected()
+    assert any(k.get("use_listings_cache") is False for k in captured_kwargs)
+

@@ -133,6 +133,7 @@ def _object_storage_connected() -> bool:
             key=settings.MINIO_ACCESS_KEY,
             secret=settings.MINIO_SECRET_KEY,
             client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+            use_listings_cache=False,
         )
         fs.ls("")
         return True

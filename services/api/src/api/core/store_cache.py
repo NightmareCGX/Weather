@@ -37,14 +37,13 @@ A same-cycle re-ingestion replaces the data behind the SAME ``store_path``
 and commits a new committed-manifest generation. A cache keyed only by
 ``store_path`` would serve generation-A metadata (lead axis, variable set,
 chunk layout) to generation-B readers. The key therefore includes the
-generation; :func:`read_dataset_cached` re-probes the committed manifest on
-every call (one small GET — far cheaper than the open it saves), so the
-moment a writer commits generation B the next reader computes a B-keyed
-identity, misses, and opens fresh. Legacy stores without a manifest use the
-same deterministic legacy token as ``manifest_generation``; the first
-marker-aware finalization writes a real generation and naturally rotates the
-key. A malformed manifest fails closed (no caching) rather than risking a
-stale key.
+generation; :func:`read_dataset_cached` and :func:`open_serving_dataset` re-probe
+the committed manifest on every call (one small GET — far cheaper than the open it
+saves), so the moment a writer commits generation B the next reader computes a
+B-keyed identity, misses, and opens fresh. Legacy stores without a manifest
+bypass persistent Dataset handle caching entirely and open fresh per request. A
+malformed manifest fails closed (no caching, raises ManifestReadError) rather
+than risking a stale key.
 
 Why lazy I/O must remain under the reader lock
 ----------------------------------------------
