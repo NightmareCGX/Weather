@@ -25,10 +25,10 @@ router = APIRouter()
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
 
-#: Cache policy: availability changes only when ingestion writes new runs, so
-#: a short TTL keeps the selectors fresh after an ingest without hammering the
-#: database on every interaction.
-CACHE_CONTROL_AVAILABILITY = "public, max-age=60"
+#: Cache policy: availability is derived dynamically from PostgreSQL, so
+#: revalidation (no-cache) guarantees newly ingested runs are visible
+#: immediately on browser refresh without waiting for a stale TTL.
+CACHE_CONTROL_AVAILABILITY = "no-cache"
 
 
 @router.get(

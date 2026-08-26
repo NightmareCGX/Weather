@@ -181,7 +181,7 @@ def test_verification_cache_control(client):
         f"/v1/verifications?model=gfs&start_date={SINGLE_PAIR_WINDOW}"
         f"&end_date={SINGLE_PAIR_WINDOW}"
     )
-    assert resp.headers["Cache-Control"] == "public, max-age=86400"
+    assert resp.headers["Cache-Control"] == "no-cache"
 
 
 def test_verification_request_id_header(client):

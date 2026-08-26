@@ -22,8 +22,9 @@ router = APIRouter()
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
 
-#: Cache policy for verification metrics (API.md 7.1: 24 hours).
-CACHE_CONTROL_VERIFICATION = "public, max-age=86400"
+#: Cache policy for verification metrics: observation ingestion updates
+#: verification samples, so revalidation (no-cache) ensures new metrics are seen.
+CACHE_CONTROL_VERIFICATION = "no-cache"
 
 
 @router.get(

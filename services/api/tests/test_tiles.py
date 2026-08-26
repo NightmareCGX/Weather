@@ -70,7 +70,7 @@ def test_tile_renders_temperature_png(client):
     )
     assert resp.status_code == 200
     assert resp.headers["Content-Type"] == "image/png"
-    assert resp.headers["Cache-Control"] == "public, max-age=300"
+    assert resp.headers["Cache-Control"] == "no-cache"
     width, height = _png_dimensions(resp.content)
     assert (width, height) == (256, 256)
     assert _png_has_opaque_pixels(resp.content)

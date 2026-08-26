@@ -63,7 +63,7 @@ def test_ensembles_temperature_contract(client):
     assert resp.status_code == 200
     body = resp.json()
     _assert_envelope(body)
-    assert resp.headers["Cache-Control"] == "public, max-age=1800"
+    assert resp.headers["Cache-Control"] == "no-cache"
 
     data = body["data"]
     assert data["model"] == "gefs"

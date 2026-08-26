@@ -48,10 +48,14 @@ router = APIRouter()
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
 
-#: Cache policy for spatial layer metadata (API.md 4.1: 60 minutes).
-CACHE_CONTROL_MAPS = "public, max-age=3600"
-#: Cache policy for rendered tile images (short, so new runs appear promptly).
-CACHE_CONTROL_TILE = "public, max-age=300"
+#: Cache policy for spatial layer metadata: resolves to the newest ready run
+#: when initial_time is omitted, so revalidation (no-cache) ensures new cycles
+#: are resolved immediately.
+CACHE_CONTROL_MAPS = "no-cache"
+#: Cache policy for rendered tile images: mutable under same URL when new
+#: cycles or same-cycle replacements arrive, so revalidation (no-cache) prevents
+#: the browser from reusing stale tiles while backend caches accelerate computation.
+CACHE_CONTROL_TILE = "no-cache"
 
 
 def _legend_stops(variable: str) -> list[list[float | str]]:

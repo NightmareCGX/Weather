@@ -21,7 +21,7 @@ def test_maps_contract(client):
     assert resp.status_code == 200
     body = resp.json()
     _assert_envelope(body)
-    assert resp.headers["Cache-Control"] == "public, max-age=3600"
+    assert resp.headers["Cache-Control"] == "no-cache"
 
     data = body["data"]
     assert data["tile_url_template"] == (
