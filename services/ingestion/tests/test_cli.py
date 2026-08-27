@@ -93,7 +93,15 @@ def _write_gefs_member_file(path: str, member_number: int, value: float) -> None
 
 
 async def _fake_download(
-    self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+    self,
+    model,
+    cycle_date,
+    cycle_hour,
+    lead_time_hours,
+    destination,
+    member=None,
+    variables=None,
+    **kwargs,
 ):
     """Download mock: copy the real GRIB fixture, or build a GEFS member file.
 
@@ -1704,7 +1712,15 @@ def test_pipelined_ingestion_starts_before_all_downloads_complete(
     orig_download = NOAAConnector.download
 
     async def _staggered_download(
-        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        *args,
+        **kwargs,
     ):
         nonlocal lead_6_ingest_started_before_lead_12_download_finished
         if lead_time_hours == 12:
@@ -1714,7 +1730,15 @@ def test_pipelined_ingestion_starts_before_all_downloads_complete(
             # Record that lead 6 ingestion is active while lead 12 is still in download
             lead_6_ingest_started_before_lead_12_download_finished = True
         return await orig_download(
-            self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=member
+            self,
+            model,
+            cycle_date,
+            cycle_hour,
+            lead_time_hours,
+            destination,
+            member=member,
+            *args,
+            **kwargs,
         )
 
     monkeypatch.setattr(NOAAConnector, "download", _staggered_download)
@@ -1808,7 +1832,15 @@ def test_pipelined_ingestion_backpressure_bounds(
     orig_download = NOAAConnector.download
 
     async def _instrumented_download(
-        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        *args,
+        **kwargs,
     ):
         nonlocal active_downloads, max_active_downloads
         with lock:
@@ -1817,7 +1849,15 @@ def test_pipelined_ingestion_backpressure_bounds(
                 max_active_downloads = active_downloads
         try:
             return await orig_download(
-                self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=member
+                self,
+                model,
+                cycle_date,
+                cycle_hour,
+                lead_time_hours,
+                destination,
+                member=member,
+                *args,
+                **kwargs,
             )
         finally:
             with lock:
@@ -2008,13 +2048,29 @@ def test_cancellation_propagates_as_cancelled_error(
     orig_download = NOAAConnector.download
 
     async def _blocking_download(
-        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        *args,
+        **kwargs,
     ):
         download_started.set()
         while not download_block.is_set():
             await asyncio.sleep(0.02)
         return await orig_download(
-            self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=member
+            self,
+            model,
+            cycle_date,
+            cycle_hour,
+            lead_time_hours,
+            destination,
+            member=member,
+            *args,
+            **kwargs,
         )
 
     monkeypatch.setattr(NOAAConnector, "download", _blocking_download)

@@ -373,8 +373,16 @@ def _install_cli_stubs(monkeypatch, engine):
     """Mock download/routing for a CLI run (mirrors test_cli helpers)."""
     import ingestion.cli as CLI
 
-    def _download_gefs_member(self, model, cycle_date, cycle_hour, lead_time_hours,
-                              destination, member=None):
+    def _download_gefs_member(
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        variables=None,
+    ):
         from pathlib import Path
 
         destination = Path(destination)
@@ -382,8 +390,16 @@ def _install_cli_stubs(monkeypatch, engine):
         _write_gefs_member_file(destination, member or 1, 280.0)
         return destination
 
-    def _download_gfs(self, model, cycle_date, cycle_hour, lead_time_hours,
-                      destination, member=None):
+    def _download_gfs(
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        variables=None,
+    ):
         from pathlib import Path
 
         destination = Path(destination)
@@ -391,16 +407,48 @@ def _install_cli_stubs(monkeypatch, engine):
         destination.write_bytes(GFS_FIXTURE.read_bytes())
         return destination
 
-    async def _fake_download(self, model, cycle_date, cycle_hour, lead_time_hours,
-                             destination, member=None):
+    async def _fake_download(
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        variables=None,
+    ):
         if model == "gefs":
-            return _download_gefs_member(self, model, cycle_date, cycle_hour,
-                                         lead_time_hours, destination, member)
-        return _download_gfs(self, model, cycle_date, cycle_hour, lead_time_hours,
-                             destination, member)
+            return _download_gefs_member(
+                self,
+                model,
+                cycle_date,
+                cycle_hour,
+                lead_time_hours,
+                destination,
+                member,
+                variables,
+            )
+        return _download_gfs(
+            self,
+            model,
+            cycle_date,
+            cycle_hour,
+            lead_time_hours,
+            destination,
+            member,
+            variables,
+        )
 
-    async def _download_corrupt_gfs(self, model, cycle_date, cycle_hour,
-                                    lead_time_hours, destination, member=None):
+    async def _download_corrupt_gfs(
+        self,
+        model,
+        cycle_date,
+        cycle_hour,
+        lead_time_hours,
+        destination,
+        member=None,
+        variables=None,
+    ):
         from pathlib import Path
 
         destination = Path(destination)

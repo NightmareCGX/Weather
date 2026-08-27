@@ -272,3 +272,337 @@ async def test_download_stream_failure_deletes_partial_file(tmp_path: Path) -> N
     # created each time and must have been cleaned up by the failure handler.
     assert _BrokenBody.entered == 3
     assert not (tmp_path / "partial.grib2").exists()
+
+
+def _make_mock_grib2(data: bytes = b"payload") -> bytes:
+    """Construct a mock GRIB2 message with a valid Section 0 declared length."""
+    total = 16 + len(data) + 4
+    return b"GRIB\x00\x00\x00\x02" + total.to_bytes(8, "big") + data + b"7777"
+
+
+@respx.mock
+async def test_download_selective_gfs_success(tmp_path: Path) -> None:
+    """GFS selective download fetches .idx, resolves ranges, and writes combined artifact."""
+    chunk1 = _make_mock_grib2(b"temperature-data")
+    chunk2 = _make_mock_grib2(b"precipitation-data")
+    len1 = len(chunk1)
+    len2 = len(chunk2)
+
+    # Offset 0..len1-1 for record 1 (TMP)
+    # Offset len1..len1+len2-1 for record 2 (PRATE)
+    # Offset len1+len2 for record 3 (SPFH)
+    idx_text = (
+        f"1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
+        f"2:{len1}:d=2026072100:PRATE:surface:6 hour fcst:\n"
+        f"3:{len1 + len2}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+
+    total_bytes = len1 + len2 + 5000
+    respx.get(GFS_006_URL, headers={"Range": f"bytes=0-{len1 - 1}"}).mock(
+        return_value=httpx.Response(
+            206,
+            content=chunk1,
+            headers={"Content-Range": f"bytes 0-{len1 - 1}/{total_bytes}"},
+        )
+    )
+    respx.get(GFS_006_URL, headers={"Range": f"bytes={len1}-{len1 + len2 - 1}"}).mock(
+        return_value=httpx.Response(
+            206,
+            content=chunk2,
+            headers={"Content-Range": f"bytes {len1}-{len1 + len2 - 1}/{total_bytes}"},
+        )
+    )
+
+    dest = tmp_path / "selective_gfs.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == chunk1 + chunk2
+
+
+@respx.mock
+async def test_download_selective_gefs_member_success(tmp_path: Path) -> None:
+    """GEFS selective download fetches TMP for the requested member only."""
+    chunk = _make_mock_grib2(b"gefs-member-17-tmp")
+    len1 = len(chunk)
+    idx_text = (
+        f"1:0:d=2026072106:VIS:surface:240 hour fcst:ENS=+17\n"
+        f"2:500:d=2026072106:TMP:2 m above ground:240 hour fcst:ENS=+17\n"
+        f"3:{500 + len1}:d=2026072106:APCP:surface:0-240 hour acc fcst:ENS=+17\n"
+    )
+    respx.get(f"{GEFS_240_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+    respx.get(GEFS_240_URL, headers={"Range": f"bytes=500-{500 + len1 - 1}"}).mock(
+        return_value=httpx.Response(
+            206,
+            content=chunk,
+            headers={"Content-Range": f"bytes 500-{500 + len1 - 1}/50000"},
+        )
+    )
+
+    dest = tmp_path / "selective_gefs.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gefs", CYCLE, 6, 240, dest, member=17)
+
+    assert out == dest
+    assert dest.read_bytes() == chunk
+
+
+@respx.mock
+async def test_download_selective_server_returns_200_fallback(tmp_path: Path) -> None:
+    """When Range request returns 200 OK (Range ignored), streams full file directly."""
+    full_content = _make_mock_grib2(b"full-grib-content")
+    idx_text = (
+        "1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
+        "2:500:d=2026072100:PRATE:surface:6 hour fcst:\n"
+        "3:1000:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+    # Server returns 200 OK instead of 206
+    respx.get(GFS_006_URL).mock(return_value=httpx.Response(200, content=full_content))
+
+    dest = tmp_path / "fallback_200.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+
+
+@respx.mock
+async def test_download_selective_later_range_returns_200_fallback(
+    tmp_path: Path,
+) -> None:
+    """When a subsequent Range request returns 200 OK after record 1 was written,
+    the partial selective artifact is discarded and the full file is streamed safely
+    without producing a mixed/corrupted artifact.
+    """
+    chunk1 = _make_mock_grib2(b"chunk1-temperature-data")
+    full_content = _make_mock_grib2(b"complete-upstream-grib2-file-contents")
+    len1 = len(chunk1)
+
+    idx_text = (
+        f"1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
+        f"2:{len1}:d=2026072100:PRATE:surface:6 hour fcst:\n"
+        f"3:{len1 + 500}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+
+    # Range #1 for TMP succeeds with 206
+    respx.get(GFS_006_URL, headers={"Range": f"bytes=0-{len1 - 1}"}).mock(
+        return_value=httpx.Response(
+            206,
+            content=chunk1,
+            headers={"Content-Range": f"bytes 0-{len1 - 1}/50000"},
+        )
+    )
+
+    # Range #2 for PRATE returns 200 OK with full file content
+    respx.get(GFS_006_URL, headers={"Range": f"bytes={len1}-{len1 + 499}"}).mock(
+        return_value=httpx.Response(200, content=full_content)
+    )
+
+    dest = tmp_path / "gfs_later_200.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    # Assert final artifact is EXACTLY the full content, NOT chunk1 + full_content
+    result_bytes = dest.read_bytes()
+    assert result_bytes == full_content
+    assert result_bytes != chunk1 + full_content
+    assert not result_bytes.startswith(chunk1 + full_content)
+
+    # Verify no leftover temporary files in directory
+    temp_files = list(tmp_path.glob("*.tmp.*"))
+    assert len(temp_files) == 0
+
+
+@respx.mock
+async def test_download_disabled_selective_uses_full_download(tmp_path: Path) -> None:
+    """When ENABLE_SELECTIVE_DOWNLOAD is False, downloads full file directly without .idx."""
+    full_content = _make_mock_grib2(b"full-direct-download")
+    idx_route = respx.get(f"{GFS_006_URL}.idx").mock(return_value=httpx.Response(404))
+    data_route = respx.get(GFS_006_URL).mock(
+        return_value=httpx.Response(200, content=full_content)
+    )
+
+    dest = tmp_path / "full_direct.grib2"
+    async with NOAAConnector(
+        conn_settings=_settings(ENABLE_SELECTIVE_DOWNLOAD=False)
+    ) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+    # .idx route was never even requested
+    assert idx_route.call_count == 0
+    assert data_route.call_count == 1
+
+
+@respx.mock
+async def test_download_selective_idx_404_falls_back_to_full(tmp_path: Path) -> None:
+    """Missing .idx file triggers fallback to full download."""
+    full_content = _make_mock_grib2(b"full-download-fallback")
+    respx.get(f"{GFS_006_URL}.idx").mock(return_value=httpx.Response(404))
+    respx.get(GFS_006_URL).mock(return_value=httpx.Response(200, content=full_content))
+
+    dest = tmp_path / "fallback_idx_404.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+
+
+@respx.mock
+async def test_download_selective_malformed_idx_falls_back_to_full(
+    tmp_path: Path,
+) -> None:
+    """Malformed .idx triggers fallback to full download."""
+    full_content = _make_mock_grib2(b"full-download-fallback-malformed")
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text="not:a:valid:idx:file")
+    )
+    respx.get(GFS_006_URL).mock(return_value=httpx.Response(200, content=full_content))
+
+    dest = tmp_path / "fallback_malformed_idx.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+
+
+@respx.mock
+async def test_download_selective_missing_required_variable_falls_back(
+    tmp_path: Path,
+) -> None:
+    """When required variable is missing in .idx for GFS, falls back to full download."""
+    full_content = _make_mock_grib2(b"full-download-fallback-missing-var")
+    # GFS index has TMP but lacks PRATE
+    idx_text = (
+        "1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
+        "2:500:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+    respx.get(GFS_006_URL).mock(return_value=httpx.Response(200, content=full_content))
+
+    dest = tmp_path / "fallback_missing_var.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+
+
+@respx.mock
+async def test_download_selective_binary_framing_corrupted_falls_back(
+    tmp_path: Path,
+) -> None:
+    """Corrupted binary framing (missing 7777) triggers fallback to full download."""
+    full_content = _make_mock_grib2(b"full-download-fallback-corrupt-framing")
+    # Bad chunk lacks '7777'
+    bad_chunk = b"GRIB\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x1aBAD_PAYLOAD_NO_7777"
+    idx_text = (
+        f"1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
+        f"2:{len(bad_chunk)}:d=2026072100:PRATE:surface:6 hour fcst:\n"
+        f"3:{len(bad_chunk) + 100}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+    respx.get(GFS_006_URL, headers={"Range": f"bytes=0-{len(bad_chunk) - 1}"}).mock(
+        return_value=httpx.Response(
+            206,
+            content=bad_chunk,
+            headers={"Content-Range": f"bytes 0-{len(bad_chunk) - 1}/5000"},
+        )
+    )
+    respx.get(GFS_006_URL).mock(return_value=httpx.Response(200, content=full_content))
+
+    dest = tmp_path / "fallback_corrupted_framing.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+
+
+@respx.mock
+async def test_download_selective_section0_length_mismatch_falls_back(
+    tmp_path: Path,
+) -> None:
+    """GRIB Section 0 declared length mismatch triggers fallback to full download."""
+    full_content = _make_mock_grib2(b"full-download-fallback-length-mismatch")
+    # Declares 9999 bytes length but only has 25 bytes
+    fake_len = 9999
+    bad_chunk = b"GRIB\x00\x00\x00\x02" + fake_len.to_bytes(8, "big") + b"data7777"
+    idx_text = (
+        f"1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
+        f"2:{len(bad_chunk)}:d=2026072100:PRATE:surface:6 hour fcst:\n"
+        f"3:{len(bad_chunk) + 100}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+    respx.get(GFS_006_URL, headers={"Range": f"bytes=0-{len(bad_chunk) - 1}"}).mock(
+        return_value=httpx.Response(
+            206,
+            content=bad_chunk,
+            headers={"Content-Range": f"bytes 0-{len(bad_chunk) - 1}/5000"},
+        )
+    )
+    respx.get(GFS_006_URL).mock(return_value=httpx.Response(200, content=full_content))
+
+    dest = tmp_path / "fallback_length_mismatch.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+
+
+@respx.mock
+async def test_download_selective_content_range_mismatch_falls_back(
+    tmp_path: Path,
+) -> None:
+    """Mismatched Content-Range start offset triggers fallback to full download."""
+    full_content = _make_mock_grib2(b"full-download-fallback-cr-mismatch")
+    chunk = _make_mock_grib2(b"valid-chunk")
+    idx_text = (
+        f"1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
+        f"2:{len(chunk)}:d=2026072100:PRATE:surface:6 hour fcst:\n"
+        f"3:{len(chunk) + 100}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+    # Returns Content-Range for byte 100 instead of 0
+    respx.get(GFS_006_URL, headers={"Range": f"bytes=0-{len(chunk) - 1}"}).mock(
+        return_value=httpx.Response(
+            206,
+            content=chunk,
+            headers={"Content-Range": f"bytes 100-{100 + len(chunk) - 1}/5000"},
+        )
+    )
+    respx.get(GFS_006_URL).mock(return_value=httpx.Response(200, content=full_content))
+
+    dest = tmp_path / "fallback_cr_mismatch.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+
+    assert out == dest
+    assert dest.read_bytes() == full_content
+
