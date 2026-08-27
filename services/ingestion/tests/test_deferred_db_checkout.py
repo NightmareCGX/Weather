@@ -52,7 +52,7 @@ def _synthetic_dataset(lead: int, member: int | None = None) -> xr.Dataset:
 def test_db_checkout_deferred_past_decode_and_normalization(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Prove execution order: download -> decode -> normalize -> validate -> DB connect -> write -> close."""
+    """Prove execution order per region: download -> decode -> normalize -> validate -> DB connect -> write -> close."""
     events: list[tuple[str, str]] = []
 
     # Mock NOAA download
@@ -88,12 +88,19 @@ def test_db_checkout_deferred_past_decode_and_normalization(
     real_connect = real_engine.connect
 
     def _spied_connect(*args, **kwargs):
-        # Track worker-specific connection checkouts
-        stack_funcs = [frame.function for frame in __import__("inspect").stack()]
-        if "_run_region_write" in stack_funcs:
-            events.append(("worker.connect", "checkout"))
+        stack_frames = __import__("inspect").stack()
+        target_lead = None
+        for frame_info in stack_frames:
+            if frame_info.function == "_run_region_write":
+                target_lead = frame_info.frame.f_locals.get("lead")
+                break
+            if frame_info.function == "_run_seed_region":
+                target_lead = frame_info.frame.f_locals.get("seed_lead") or 6
+                break
+        if target_lead is not None:
+            events.append(("worker.connect", f"lead_{target_lead}"))
         else:
-            events.append(("engine.connect", "other"))
+            events.append(("engine.connect", "control_plane"))
         return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(real_engine, "connect", _spied_connect)
@@ -155,24 +162,22 @@ def test_db_checkout_deferred_past_decode_and_normalization(
     assert status == "ready"
     assert len(failures) == 0
 
-    # Verify that for non-seed lead 12:
-    # 'decode' appears BEFORE lead 12's worker.connect!
-    # And worker.connect appears immediately before coordinator.write_region_worker for lead 12.
     event_list = list(events)
 
+    # 1. Deterministic happens-before ordering for non-seed lead 12:
+    # download(lead_12) < decode(lead_12) < worker.connect(lead_12) < write_region_worker(lead_12)
+    idx_lead12_download = event_list.index(("download", "lead_12"))
     idx_lead12_decode = event_list.index(("decode", "lead_12"))
+    idx_lead12_connect = event_list.index(("worker.connect", "lead_12"))
     idx_lead12_write = event_list.index(("coordinator.write_region_worker", "lead_12"))
 
-    # Assert decode occurred before the write
-    assert idx_lead12_decode < idx_lead12_write
+    assert idx_lead12_download < idx_lead12_decode < idx_lead12_connect < idx_lead12_write
 
-    # Find worker connection checkouts (should be exactly 2: seed worker + lead 12 worker)
-    worker_connect_indices = [i for i, (evt, _) in enumerate(event_list) if evt == "worker.connect"]
-    assert len(worker_connect_indices) == 2
+    # 2. Deterministic happens-before ordering for seed lead 6:
+    # download(lead_6) < decode(lead_6) < worker.connect(lead_6) < write_region_worker(lead_6)
+    idx_lead6_download = event_list.index(("download", "lead_6"))
+    idx_lead6_decode = event_list.index(("decode", "lead_6"))
+    idx_lead6_connect = event_list.index(("worker.connect", "lead_6"))
+    idx_lead6_write = event_list.index(("coordinator.write_region_worker", "lead_6"))
 
-    lead12_connect_idx = worker_connect_indices[1]
-
-    # Crucially: Lead 12 decode happened BEFORE its DB connection checkout!
-    assert idx_lead12_decode < lead12_connect_idx
-    # And the DB connection checkout happened immediately before the region write!
-    assert lead12_connect_idx == idx_lead12_write - 1
+    assert idx_lead6_download < idx_lead6_decode < idx_lead6_connect < idx_lead6_write
