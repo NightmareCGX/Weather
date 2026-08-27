@@ -133,86 +133,6 @@ def _member_positional_index(store_path: str, array_path: str, member: int) -> i
     return max(0, member - 1)
 
 
-def physical_conflict_keys(
-    store_path: str,
-    *,
-    member: int | None,
-    lead_index: int,
-    data_var_paths: list[str],
-) -> list[str]:
-    """Derive the physical-chunk conflict identities a logical region writes.
-
-    This maps a logical region ``(member?, lead, lat, lon)`` to the actual
-    physical chunk coordinates it can modify, using the store's real
-    ``.zarray`` chunk geometry (NOT a hard-coded member/lead convention).
-
-    Under the CURRENT ensemble layout (``member`` full-extent, ``lead``
-    chunked at 1), different members at the same lead map to the SAME member
-    chunk coordinate (0) and the same lead chunk -> identical conflict keys,
-    so they serialize. Different leads map to different lead chunks -> disjoint
-    keys.
-
-    For a layout where ``member`` is chunked at 1 (a test-only alternate
-    layout), different members map to different member-chunk coordinates ->
-    distinct keys.
-
-    Args:
-        store_path: The store path/URL.
-        member: The ensemble member identity, or ``None`` for deterministic.
-        lead_index: The positional index of the lead in the store's
-            ``lead_time_hours`` coordinate.
-        data_var_paths: The data-variable array paths.
-
-    Returns:
-        A sorted, de-duplicated list of physical-chunk conflict identities
-        (e.g. ``"temperature_2m/0.0.0"`` for a full-member ensemble chunk).
-    """
-    out: list[str] = []
-    for array_path in data_var_paths:
-        za = _read_zarray(store_path, array_path)
-        if za is None:
-            continue
-        shape = za.get("shape")
-        chunks = za.get("chunks")
-        if not isinstance(shape, list) or not isinstance(chunks, list):
-            continue
-        shape = [int(s) for s in shape]
-        chunks = [int(c) for c in chunks]
-        # Layout: (member?, lead, lat, lon). Lead is dim index 1 for ensemble
-        # (4-D), index 0 for deterministic (3-D).
-        lead_dim = 1 if len(shape) == 4 else 0
-        has_member = len(shape) == 4
-        # The member axis (if present) is at index 0. Compute the member chunk
-        # coordinate from the ACTUAL chunk size using the member's POSITIONAL
-        # index in the store's member coordinate (the member identity may be a
-        # 1..30 upstream number, not a positional index). For a full-extent
-        # member chunk, every member positional index maps to member chunk 0.
-        member_chunk = 0
-        if has_member and member is not None:
-            member_index = _member_positional_index(store_path, array_path, member)
-            member_chunk = member_index // chunks[0] if chunks[0] > 0 else 0
-        n_spatial = len(shape) - lead_dim - 1
-        spatial_chunk_counts = [
-            (shape[lead_dim + 1 + i] + chunks[lead_dim + 1 + i] - 1)
-            // chunks[lead_dim + 1 + i]
-            for i in range(n_spatial)
-        ]
-        import itertools
-
-        for combo in itertools.product(*[range(c) for c in spatial_chunk_counts]):
-            coords = [0] * len(shape)
-            if has_member:
-                coords[0] = member_chunk
-                coords[lead_dim] = lead_index
-                coords[lead_dim + 1 :] = list(combo)
-            else:
-                coords[lead_dim] = lead_index
-                coords[lead_dim + 1 :] = list(combo)
-            key = array_path + "/" + ".".join(str(c) for c in coords)
-            out.append(key)
-    return sorted(set(out))
-
-
 def _read_zarray(store_path: str, array_path: str) -> dict[str, object] | None:
     """Read a data variable's ``.zarray`` metadata, or None when absent."""
     backend, root = _storage_backend(store_path)
@@ -235,6 +155,167 @@ def _read_zarray(store_path: str, array_path: str) -> dict[str, object] | None:
         return None
 
 
+def _read_zattrs(store_path: str, array_path: str) -> dict[str, object] | None:
+    """Read a data variable's ``.zattrs`` metadata, or None when absent."""
+    backend, root = _storage_backend(store_path)
+    rel = f"{array_path}/.zattrs"
+    if backend == "local":
+        full = os.path.join(root, *rel.split("/"))
+        try:
+            with open(full, "r", encoding="utf-8") as fh:
+                parsed = json.load(fh)
+                return parsed if isinstance(parsed, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+    fs = _s3_fs()
+    full = f"{root}/{rel}"
+    try:
+        raw = fs.cat_file(full)
+        parsed = json.loads(raw.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except (Exception, json.JSONDecodeError):  # noqa: BLE001 - unreadable -> None
+        return None
+
+
+def _array_dimension_layout(
+    store_path: str,
+    array_path: str,
+    shape: list[int],
+    *,
+    zattrs_cache: dict[str, dict[str, object]] | None = None,
+) -> tuple[bool, int | None, int, list[int]]:
+    """Determine the semantic dimension layout of a stored Zarr array.
+
+    First inspects the array's ``.zattrs`` metadata for ``_ARRAY_DIMENSIONS``
+    to resolve exact named axis positions. Falls back to the canonical platform
+    contract where 4-D represents ``(member, lead_time_hours, latitude, longitude)``
+    and 3-D represents ``(lead_time_hours, latitude, longitude)``.
+
+    Returns:
+        A tuple of ``(has_member, member_dim, lead_dim, spatial_dims)``.
+    """
+    za_attrs: dict[str, object] | None
+    if zattrs_cache is not None and array_path in zattrs_cache:
+        za_attrs = zattrs_cache[array_path]
+    else:
+        za_attrs = _read_zattrs(store_path, array_path)
+        if za_attrs is not None and zattrs_cache is not None:
+            zattrs_cache[array_path] = za_attrs
+
+    if za_attrs is not None:
+        dims_obj = za_attrs.get("_ARRAY_DIMENSIONS")
+        if isinstance(dims_obj, list) and all(isinstance(d, str) for d in dims_obj):
+            dims: list[str] = list(dims_obj)
+            has_member = "member" in dims
+            member_dim = dims.index("member") if has_member else None
+            lead_dim = (
+                dims.index("lead_time_hours")
+                if "lead_time_hours" in dims
+                else (1 if has_member else 0)
+            )
+            spatial_dims = [
+                i for i in range(len(shape)) if i != member_dim and i != lead_dim
+            ]
+            return has_member, member_dim, lead_dim, spatial_dims
+
+    # Fallback to positional contract: 4-D is (member, lead, lat, lon),
+    # 3-D is (lead, lat, lon).
+    has_member = len(shape) == 4
+    member_dim = 0 if has_member else None
+    lead_dim = 1 if has_member else 0
+    spatial_dims = list(range(lead_dim + 1, len(shape)))
+    return has_member, member_dim, lead_dim, spatial_dims
+
+
+def _derive_region_chunk_keys(
+    store_path: str,
+    array_path: str,
+    *,
+    member: int | None,
+    lead_index: int,
+    za: dict[str, object],
+    zattrs_cache: dict[str, dict[str, object]] | None = None,
+) -> list[str]:
+    """Derive the physical chunk keys a logical region maps to in one array."""
+    shape_raw = za.get("shape")
+    chunks_raw = za.get("chunks")
+    if not isinstance(shape_raw, list) or not isinstance(chunks_raw, list):
+        return []
+    shape = [int(s) for s in shape_raw]
+    chunks = [int(c) for c in chunks_raw]
+
+    has_member, member_dim, lead_dim, spatial_dims = _array_dimension_layout(
+        store_path, array_path, shape, zattrs_cache=zattrs_cache
+    )
+
+    member_chunk = 0
+    if has_member and member is not None and member_dim is not None:
+        member_index = _member_positional_index(store_path, array_path, member)
+        member_chunk = (
+            member_index // chunks[member_dim] if chunks[member_dim] > 0 else 0
+        )
+
+    spatial_chunk_counts = [
+        (shape[d] + chunks[d] - 1) // chunks[d] for d in spatial_dims
+    ]
+
+    out: list[str] = []
+    import itertools
+
+    for combo in itertools.product(*[range(c) for c in spatial_chunk_counts]):
+        coords = [0] * len(shape)
+        if has_member and member_dim is not None:
+            coords[member_dim] = member_chunk
+        coords[lead_dim] = lead_index
+        for i, d in enumerate(spatial_dims):
+            coords[d] = combo[i]
+        key = array_path + "/" + ".".join(str(c) for c in coords)
+        out.append(key)
+    return out
+
+
+def physical_conflict_keys(
+    store_path: str,
+    *,
+    member: int | None,
+    lead_index: int,
+    data_var_paths: list[str],
+) -> list[str]:
+    """Derive the physical-chunk conflict identities a logical region writes.
+
+    This maps a logical region ``(member?, lead, lat, lon)`` to the actual
+    physical chunk coordinates it can modify, using the store's real
+    ``.zarray`` chunk geometry (NOT a hard-coded member/lead convention).
+
+    Under the member_chunk=1 ensemble layout, different members at the same lead
+    map to distinct member-chunk coordinates -> disjoint keys -> concurrent writes.
+    Under legacy member_chunk=30 stores, different members map to member-chunk 0 ->
+    identical conflict keys -> serialized writes.
+
+    Args:
+        store_path: The store path/URL.
+        member: The ensemble member identity, or ``None`` for deterministic.
+        lead_index: The positional index of the lead in the store's
+            ``lead_time_hours`` coordinate.
+        data_var_paths: The data-variable array paths.
+
+    Returns:
+        A sorted, de-duplicated list of physical-chunk conflict identities
+        (e.g. ``"temperature_2m/0.0.0.0"`` for a member_chunk=1 chunk).
+    """
+    out: list[str] = []
+    for array_path in data_var_paths:
+        za = _read_zarray(store_path, array_path)
+        if za is None:
+            continue
+        out.extend(
+            _derive_region_chunk_keys(
+                store_path, array_path, member=member, lead_index=lead_index, za=za
+            )
+        )
+    return sorted(set(out))
+
+
 def region_expected_object_keys(
     store_path: str,
     *,
@@ -242,13 +323,14 @@ def region_expected_object_keys(
     lead_index: int,
     data_var_paths: list[str],
     zarray_cache: dict[str, dict[str, object]] | None = None,
+    zattrs_cache: dict[str, dict[str, object]] | None = None,
 ) -> list[str]:
     """Derive the physical chunk object keys a logical region writes.
 
     The actual store's ``.zarray`` chunk metadata determines the physical chunk
-    grid. Under the current layout (``lead`` chunked at 1, ``member``
-    full-extent for ensemble), a logical region maps to the spatial chunks of
-    the target lead (all spatial chunks across each data variable).
+    grid. Uses the exact same chunk-coordinate derivation as
+    :func:`physical_conflict_keys`, ensuring complete consistency between
+    advisory locking and marker completion evidence.
 
     Args:
         store_path: The store path/URL.
@@ -260,6 +342,8 @@ def region_expected_object_keys(
         zarray_cache: An optional in-memory cache of per-array ``.zarray``
             metadata (built once per finalizer run), avoiding repeated remote
             reads across markers.
+        zattrs_cache: An optional in-memory cache of per-array ``.zattrs``
+            metadata.
 
     Returns:
         A sorted list of physical chunk object keys (relative to the store).
@@ -275,33 +359,16 @@ def region_expected_object_keys(
                 zarray_cache[array_path] = za
         if za is None:
             continue
-        shape = za.get("shape")
-        chunks = za.get("chunks")
-        if not isinstance(shape, list) or not isinstance(chunks, list):
-            continue
-        shape = [int(s) for s in shape]
-        chunks = [int(c) for c in chunks]
-        # Determine the position of the lead dim. The layout is
-        # (member?, lead, lat, lon). Ensemble is 4-D (lead at index 1);
-        # deterministic is 3-D (lead at index 0). The member axis (if present)
-        # is full-extent so it contributes no additional chunk dimension.
-        lead_dim = 1 if len(shape) == 4 else 0
-        n_spatial = len(shape) - lead_dim - 1
-        # Number of spatial chunks along the trailing axes.
-        spatial_chunk_counts = [
-            (shape[lead_dim + 1 + i] + chunks[lead_dim + 1 + i] - 1)
-            // chunks[lead_dim + 1 + i]
-            for i in range(n_spatial)
-        ]
-        # Enumerate every spatial chunk combination for the target lead chunk.
-        import itertools
-
-        for combo in itertools.product(*[range(c) for c in spatial_chunk_counts]):
-            coords = [0] * len(shape)
-            coords[lead_dim] = lead_index
-            coords[lead_dim + 1 :] = list(combo)
-            key = array_path + "/" + ".".join(str(c) for c in coords)
-            out.append(key)
+        out.extend(
+            _derive_region_chunk_keys(
+                store_path,
+                array_path,
+                member=member,
+                lead_index=lead_index,
+                za=za,
+                zattrs_cache=zattrs_cache,
+            )
+        )
     return sorted(set(out))
 
 
