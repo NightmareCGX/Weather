@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +32,18 @@ class IngestionSettings(BaseSettings):
         "postgresql://weather_user:weather_password@localhost:5432/weather_db"
     )
 
+    #: PostgreSQL QueuePool connection pool settings for the ingestion service.
+    #: DB_POOL_SIZE provides steady-state base connection capacity for region writers.
+    #: DB_MAX_OVERFLOW is burst headroom (never relied upon for steady-state scheduling).
+    DB_POOL_SIZE: Any = 10
+    DB_MAX_OVERFLOW: Any = 5
+    DB_POOL_TIMEOUT_SECONDS: Any = 30.0
+
+    #: Default stage concurrency ceilings (clamped by CLI requested concurrency).
+    MAX_DOWNLOAD_CONCURRENCY: Any = 24
+    MAX_DECODE_CONCURRENCY: Any = 8
+    MAX_WRITE_CONCURRENCY: Any = 6
+
     MINIO_ENDPOINT: Any = "localhost:9000"
     MINIO_ACCESS_KEY: Any = "minio_admin"
     MINIO_SECRET_KEY: Any = "minio_password"
@@ -46,6 +59,42 @@ class IngestionSettings(BaseSettings):
     MARKER_PUT_TIMEOUT_SECONDS: Any = 30.0
     # Advisory-lock acquisition timeout for the ingestion coordinator.
     ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
+
+    @model_validator(mode="after")
+    def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
+        pool_size = int(self.DB_POOL_SIZE)
+        max_overflow = int(self.DB_MAX_OVERFLOW)
+        pool_timeout = float(self.DB_POOL_TIMEOUT_SECONDS)
+        max_download = int(self.MAX_DOWNLOAD_CONCURRENCY)
+        max_decode = int(self.MAX_DECODE_CONCURRENCY)
+        max_write = int(self.MAX_WRITE_CONCURRENCY)
+
+        if pool_size < 1:
+            raise ValueError(f"DB_POOL_SIZE must be >= 1, got {pool_size}")
+        if max_overflow < 0:
+            raise ValueError(f"DB_MAX_OVERFLOW must be >= 0, got {max_overflow}")
+        if pool_timeout <= 0.0:
+            raise ValueError(
+                f"DB_POOL_TIMEOUT_SECONDS must be > 0.0, got {pool_timeout}"
+            )
+        if max_download < 1:
+            raise ValueError(
+                f"MAX_DOWNLOAD_CONCURRENCY must be >= 1, got {max_download}"
+            )
+        if max_decode < 1:
+            raise ValueError(
+                f"MAX_DECODE_CONCURRENCY must be >= 1, got {max_decode}"
+            )
+        if max_write < 1:
+            raise ValueError(
+                f"MAX_WRITE_CONCURRENCY must be >= 1, got {max_write}"
+            )
+        if max_write > pool_size:
+            raise ValueError(
+                f"MAX_WRITE_CONCURRENCY ({max_write}) must not exceed "
+                f"DB_POOL_SIZE ({pool_size}) to prevent QueuePool saturation"
+            )
+        return self
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

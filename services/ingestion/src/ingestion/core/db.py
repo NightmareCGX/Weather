@@ -14,5 +14,11 @@ from ingestion.core.config import settings
 #: Declarative base for the ingestion catalog tables.
 CatalogBase = declarative_base()
 
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=int(settings.DB_POOL_SIZE),
+    max_overflow=int(settings.DB_MAX_OVERFLOW),
+    pool_timeout=float(settings.DB_POOL_TIMEOUT_SECONDS),
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
