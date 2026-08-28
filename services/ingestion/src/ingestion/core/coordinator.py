@@ -205,6 +205,7 @@ class RunCoordinator:
         expected_members: tuple[int, ...],
         run_id: str | None,
         is_same_cycle: bool,
+        observer: object | None = None,
     ) -> None:
         """Initialize the store under the EXCLUSIVE gate (retained-seed flow).
 
@@ -218,6 +219,7 @@ class RunCoordinator:
                 (downgrade to partial), else ``None`` (fresh run creation is
                 handled by the finalizer).
             is_same_cycle: Whether this wave re-ingests an existing live run.
+            observer: Optional progress/milestone observer.
 
         Raises:
             LiveStoreOverwriteError: If a live run owns the absent store path.
@@ -229,7 +231,11 @@ class RunCoordinator:
             secure=self.secure,
             timeout_seconds=self.timeout_seconds,
         )
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("store_gate_wait_start")
         co.acquire_exclusive_gate()
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("store_gate_acquired")
         try:
             if store_exists(self.store_path):
                 # Existing store: validate identity only; the region worker's
@@ -246,12 +252,18 @@ class RunCoordinator:
             with Session(bind=conn) as db:
                 guard_full_overwrite(db, self.store_path)
                 db.commit()
+            if observer is not None and hasattr(observer, "set_init_phase"):
+                observer.set_init_phase("prepare_run_store")
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("prepare_run_store_start")
             prepare_run_store(
                 seed_dataset,
                 self.store_path,
                 expected_lead_time_hours=expected_leads,
                 expected_members=expected_members,
             )
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("prepare_run_store_complete")
             # New stores are strict marker_v1.
             write_protocol_version(self.store_path, MARKER_V1)
         finally:
@@ -269,6 +281,7 @@ class RunCoordinator:
         is_same_cycle: bool,
         executor: object,
         cancel_event: threading.Event,
+        observer: object | None = None,
     ) -> list[WaveRegion]:
         """Declare UPDATING markers for every target under the EXCLUSIVE gate.
 
@@ -301,6 +314,11 @@ class RunCoordinator:
             # Allocate a fresh generation per target and write UPDATING markers.
             from ingestion.core.marker_put_scheduler import put_markers_rolling
 
+            if observer is not None and hasattr(observer, "set_init_phase"):
+                observer.set_init_phase("pre_update_markers")
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("pre_update_start")
+
             targets = {r.region_id: r for r in regions}
             region_ids = sorted(targets)
             put_one = self._make_updating_put(regions)
@@ -311,7 +329,11 @@ class RunCoordinator:
                 cancel_event=cancel_event,
                 timeout_seconds=self.timeout_seconds,
                 executor=executor,
+                observer=observer,
             )
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("pre_update_complete")
+
             if not result.ok:
                 raise WavePreUpdateError(
                     f"wave pre-update failed: {len(result.failures)} PUT failures, "
@@ -474,6 +496,7 @@ class RunCoordinator:
         spec: RunCatalogSpec,
         expected_leads: tuple[int, ...],
         expected_members: tuple[int, ...],
+        observer: object | None = None,
     ) -> FinalizeResult:
         """Run the single coalesced finalization for the bounded CLI wave.
 
@@ -486,6 +509,8 @@ class RunCoordinator:
             secure=self.secure,
             timeout_seconds=self.timeout_seconds,
         )
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("finalize_start")
         co.acquire_admission()
         co.acquire_exclusive_gate()
         try:
@@ -600,6 +625,8 @@ class RunCoordinator:
                 status = _derive_run_status(db, run, spec, committed_state)
                 setattr(run, "status", status)
                 db.commit()
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("finalize_complete")
             return FinalizeResult(status=status, committed_regions=committed)
         finally:
             co.release_exclusive_gate()

@@ -29,6 +29,7 @@ pandas = "^2.2.1"
 # These are imported by ingestion production source (``ingestion.core.locks``),
 # so ``weather-platform-domain`` is a genuine production dependency.
 weather-platform-domain = { path = "../../packages/domain" }
+rich = "^13.7.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"

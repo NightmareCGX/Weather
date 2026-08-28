@@ -56,6 +56,7 @@ import asyncio
 import concurrent.futures
 import json
 import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -624,6 +625,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Retain downloaded .grib2 and .idx files after successful ingestion.",
     )
     ingest.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable live terminal progress UI and emit plain-text logs only.",
+    )
+    ingest.add_argument(
         "--concurrency",
         type=int,
         default=4,
@@ -888,6 +894,10 @@ async def _run_wave(
         WaveRegion,
     )
     from ingestion.core.decode_worker import DecodePool
+    from ingestion.core.observability import (
+        PipelineProgressTracker,
+        create_progress_renderer,
+    )
 
     logger = logging.getLogger(__name__)
     run_tag = (
@@ -911,6 +921,31 @@ async def _run_wave(
 
     seed_item = items[0]
     seed_member, seed_lead = seed_item
+
+    # Observability: tracker and live UI renderer
+    no_progress = getattr(args, "no_progress", False)
+    tracker = PipelineProgressTracker(
+        model=spec.model,
+        cycle_str=spec.cycle_time.strftime("%Y-%m-%d %H:%MZ"),
+        total_items=len(items),
+    )
+    renderer = create_progress_renderer(tracker, no_progress=no_progress)
+    renderer.start()
+    tracker.record_milestone("run_start")
+
+    ui_stop_event = asyncio.Event()
+
+    async def _ui_update_loop() -> None:
+        while not ui_stop_event.is_set():
+            try:
+                renderer.update()
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                break
+
+    ui_task = asyncio.create_task(_ui_update_loop())
 
     # Resolve decoupled stage capacities
     plan = _resolve_concurrency_plan(concurrency, settings)
@@ -954,23 +989,64 @@ async def _run_wave(
             spec, staging_dir, lead=seed_lead, member=seed_member
         )
         Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
-        await connector.download(
-            spec.model,
-            spec.cycle_date,
-            spec.cycle_hour,
-            seed_lead,
-            seed_dest,
-            member=seed_member,
-            variables=var_codes,
-        )
-        seed_future = decode_pool.submit(seed_dest)
-        seed_dataset = _decode_and_normalize(seed_future, catalog_spec)
-        _validate_requested_lead(seed_dataset, seed_lead)
-        _validate_requested_member(seed_dataset, seed_member)
+        tracker.set_init_phase("seed_download")
+        tracker.record_milestone("seed_download_start")
+        tracker.on_download_start(seed_member, seed_lead, is_seed=True)
+        t_dl_start = time.monotonic()
+        try:
+            await connector.download(
+                spec.model,
+                spec.cycle_date,
+                spec.cycle_hour,
+                seed_lead,
+                seed_dest,
+                member=seed_member,
+                variables=var_codes,
+            )
+            tracker.record_milestone("seed_download_complete")
+            tracker.on_download_complete(
+                seed_member,
+                seed_lead,
+                duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
+            )
+        except Exception:
+            tracker.on_download_failed(
+                seed_member,
+                seed_lead,
+                duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
+            )
+            tracker.set_init_phase("failed")
+            raise
+
+        tracker.set_init_phase("seed_decode")
+        tracker.record_milestone("seed_decode_start")
+        tracker.on_decode_start(seed_member, seed_lead)
+        t_dec_start = time.monotonic()
+        try:
+            seed_future = decode_pool.submit(seed_dest)
+            seed_dataset = _decode_and_normalize(seed_future, catalog_spec)
+            _validate_requested_lead(seed_dataset, seed_lead)
+            _validate_requested_member(seed_dataset, seed_member)
+            tracker.record_milestone("seed_decode_complete")
+            tracker.on_decode_complete(
+                seed_member,
+                seed_lead,
+                duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
+            )
+        except Exception:
+            tracker.on_decode_failed(
+                seed_member,
+                seed_lead,
+                duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
+            )
+            tracker.set_init_phase("failed")
+            raise
 
         # 2. Determine run id + same-cycle.
         run_id: str | None = None
         is_same_cycle = False
+        tracker.set_init_phase("catalog_init")
+        tracker.record_milestone("catalog_init_start")
         with _catalog_session() as db:
             from ingestion.core.catalog import ModelRunRecord
             from sqlalchemy import select
@@ -987,10 +1063,12 @@ async def _run_wave(
             if row is not None:
                 run_id = str(row.id)
                 is_same_cycle = True
+        tracker.record_milestone("catalog_init_complete")
 
         # 3. Wave-level EXCLUSIVE pre-update (init + UPDATING markers).
         pre_conn = engine.connect()
         try:
+            tracker.set_init_phase("initialize_run_store")
             coordinator.initialize_run_store(
                 pre_conn,
                 seed_dataset=seed_dataset,
@@ -998,6 +1076,7 @@ async def _run_wave(
                 expected_members=spec.members,
                 run_id=run_id,
                 is_same_cycle=is_same_cycle,
+                observer=tracker,
             )
             regions = [
                 WaveRegion(
@@ -1014,7 +1093,13 @@ async def _run_wave(
                 is_same_cycle=is_same_cycle,
                 executor=executor,
                 cancel_event=cancel_event,
+                observer=tracker,
             )
+            tracker.set_init_phase("store_ready")
+            tracker.record_milestone("store_ready")
+        except Exception:
+            tracker.set_init_phase("failed")
+            raise
         finally:
             pre_conn.close()
 
@@ -1069,13 +1154,9 @@ async def _run_wave(
             async with write_sem:
                 if cancel_event.is_set():
                     return
-                logger.debug(
-                    "write_start: model=%s cycle=%s member=%s lead=%s",
-                    spec.model,
-                    spec.cycle_time,
-                    seed_member,
-                    seed_lead,
-                )
+                tracker.record_milestone("seed_write_start")
+                tracker.on_write_start(seed_member, seed_lead, is_seed=True)
+                t_wr_start = time.monotonic()
                 fut = loop.run_in_executor(executor, _run_seed_region)
                 with futures_lock:
                     registered_worker_futures.append(fut)
@@ -1093,14 +1174,16 @@ async def _run_wave(
 
                 try:
                     fut.result()
-                    logger.debug(
-                        "write_complete: model=%s cycle=%s member=%s lead=%s",
-                        spec.model,
-                        spec.cycle_time,
-                        seed_member,
-                        seed_lead,
+                    wr_dur = (time.monotonic() - t_wr_start) * 1000.0
+                    tracker.record_milestone("seed_write_complete")
+                    tracker.on_write_complete(
+                        seed_member, seed_lead, duration_ms=wr_dur
                     )
                 except Exception as exc:  # noqa: BLE001 - report failure
+                    wr_dur = (time.monotonic() - t_wr_start) * 1000.0
+                    tracker.on_write_failed(
+                        seed_member, seed_lead, duration_ms=wr_dur
+                    )
                     failures.append(
                         f"{spec.model} member={seed_member} lead={seed_lead}: {exc}"
                     )
@@ -1126,13 +1209,8 @@ async def _run_wave(
                 async with download_sem:
                     if cancel_event.is_set():
                         return
-                    logger.debug(
-                        "download_start: model=%s cycle=%s member=%s lead=%s",
-                        spec.model,
-                        spec.cycle_time,
-                        member,
-                        lead,
-                    )
+                    tracker.on_download_start(member, lead)
+                    t_dl_start = time.monotonic()
                     try:
                         await connector.download(
                             spec.model,
@@ -1143,14 +1221,15 @@ async def _run_wave(
                             member=member,
                             variables=var_codes,
                         )
-                        logger.debug(
-                            "download_complete: model=%s cycle=%s member=%s lead=%s",
-                            spec.model,
-                            spec.cycle_time,
-                            member,
-                            lead,
+                        dl_dur = (time.monotonic() - t_dl_start) * 1000.0
+                        tracker.on_download_complete(
+                            member, lead, duration_ms=dl_dur
                         )
                     except Exception as exc:  # noqa: BLE001 - report download failure
+                        dl_dur = (time.monotonic() - t_dl_start) * 1000.0
+                        tracker.on_download_failed(
+                            member, lead, duration_ms=dl_dur
+                        )
                         failures.append(
                             f"{spec.model} member={member} lead={lead} download: {exc}"
                         )
@@ -1164,13 +1243,8 @@ async def _run_wave(
                 async with decode_sem:
                     if cancel_event.is_set():
                         return
-                    logger.debug(
-                        "decode_start: model=%s cycle=%s member=%s lead=%s",
-                        spec.model,
-                        spec.cycle_time,
-                        member,
-                        lead,
-                    )
+                    tracker.on_decode_start(member, lead)
+                    t_dec_start = time.monotonic()
                     decode_fut = decode_pool.submit(dest)
                     try:
                         raw_ds = await asyncio.wrap_future(decode_fut)
@@ -1179,14 +1253,15 @@ async def _run_wave(
                         ds.attrs["model_id"] = catalog_spec.model_id
                         _validate_requested_lead(ds, lead)
                         _validate_requested_member(ds, member)
-                        logger.debug(
-                            "decode_complete: model=%s cycle=%s member=%s lead=%s",
-                            spec.model,
-                            spec.cycle_time,
-                            member,
-                            lead,
+                        dec_dur = (time.monotonic() - t_dec_start) * 1000.0
+                        tracker.on_decode_complete(
+                            member, lead, duration_ms=dec_dur
                         )
                     except Exception as exc:  # noqa: BLE001 - report decode failure
+                        dec_dur = (time.monotonic() - t_dec_start) * 1000.0
+                        tracker.on_decode_failed(
+                            member, lead, duration_ms=dec_dur
+                        )
                         failures.append(
                             f"{spec.model} member={member} lead={lead} decode: {exc}"
                         )
@@ -1206,13 +1281,8 @@ async def _run_wave(
                 async with write_sem:
                     if cancel_event.is_set():
                         return
-                    logger.debug(
-                        "write_start: model=%s cycle=%s member=%s lead=%s",
-                        spec.model,
-                        spec.cycle_time,
-                        member,
-                        lead,
-                    )
+                    tracker.on_write_start(member, lead)
+                    t_wr_start = time.monotonic()
                     assert ds is not None
                     worker_fut = loop.run_in_executor(
                         executor, _run_region_write, ds, member, lead, generation
@@ -1234,14 +1304,15 @@ async def _run_wave(
 
                     try:
                         worker_fut.result()
-                        logger.debug(
-                            "write_complete: model=%s cycle=%s member=%s lead=%s",
-                            spec.model,
-                            spec.cycle_time,
-                            member,
-                            lead,
+                        wr_dur = (time.monotonic() - t_wr_start) * 1000.0
+                        tracker.on_write_complete(
+                            member, lead, duration_ms=wr_dur
                         )
                     except Exception as exc:  # noqa: BLE001 - report write failure
+                        wr_dur = (time.monotonic() - t_wr_start) * 1000.0
+                        tracker.on_write_failed(
+                            member, lead, duration_ms=wr_dur
+                        )
                         failures.append(
                             f"{spec.model} member={member} lead={lead} write: {exc}"
                         )
@@ -1252,6 +1323,7 @@ async def _run_wave(
                     if cancel_requested:
                         raise asyncio.CancelledError
 
+        tracker.record_milestone("wave_tasks_created")
         for member, lead in items:
             if (member, lead) != seed_item:
                 pipeline_tasks.append(
@@ -1278,7 +1350,8 @@ async def _run_wave(
                 )
 
     # 7. Coalesced finalization (after all worker Futures drained).
-    logger.debug("finalize_start: model=%s cycle=%s", spec.model, spec.cycle_time)
+    tracker.on_finalize_start()
+    t_fin_start = time.monotonic()
     fin_conn = engine.connect()
     try:
         run_id = _resolve_run_id(catalog_spec, store_path)
@@ -1288,14 +1361,11 @@ async def _run_wave(
             spec=catalog_spec,
             expected_leads=spec.lead_time_hours,
             expected_members=spec.members,
+            observer=tracker,
         )
         status = finalize_result.status
-        logger.debug(
-            "finalize_complete: model=%s cycle=%s status=%s",
-            spec.model,
-            spec.cycle_time,
-            status,
-        )
+        fin_dur = (time.monotonic() - t_fin_start) * 1000.0
+        tracker.on_finalize_complete(duration_ms=fin_dur)
 
         # Post-finalization cleanup: clean up only regions proven committed
         # by THIS wave's generation, unless --keep-downloads is set.
@@ -1316,11 +1386,33 @@ async def _run_wave(
                     staging_dir,
                     exc,
                 )
+    except Exception:
+        fin_dur = (time.monotonic() - t_fin_start) * 1000.0
+        tracker.on_finalize_failed(duration_ms=fin_dur)
+        raise
     finally:
         fin_conn.close()
         engine.dispose()
         executor.shutdown(wait=True)
         decode_pool.shutdown()
+        ui_stop_event.set()
+        ui_task.cancel()
+        renderer.stop()
+
+    # Emit and print final startup timeline report
+    report = tracker.timeline.format_report(
+        model=spec.model,
+        cycle_str=spec.cycle_time.strftime("%Y-%m-%d %H:%MZ"),
+        total_items=len(items),
+    )
+    if not no_progress:
+        print("\n" + report)
+    logger.info("Startup timeline breakdown:\n%s", report)
+
+    if cancelled:
+        raise asyncio.CancelledError
+
+    return status
 
     if cancelled:
         raise asyncio.CancelledError
