@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_MODELS = frozenset({"gfs", "gefs"})
 _CYCLE_HOURS = frozenset({0, 6, 12, 18})
 _MAX_LEAD_TIME_HOURS = 384
-_GEFS_LEAD_TIME_PRODUCT_SPLIT = 240
 #: GEFS perturbation member range (gep01..gep30). Member identity is the real
 #: upstream perturbation number, never a positional completion index.
 _GEFS_MEMBER_MIN = 1
@@ -56,23 +55,21 @@ class SelectiveFallbackError(IngestionError):
 
 
 class NOAAConnector(BaseConnector):
-    """Connector for NOAA NOMADS GRIB2 forecast products.
+    """Connector for NOAA operational GFS and GEFS forecast products.
 
     Supports the deterministic GFS model and the GEFS ensemble perturbation
     members (``gep01``..``gep30``) for the four daily cycles (00Z, 06Z, 12Z,
-    18Z). Download URLs are built deterministically from the official NOMADS
+    18Z) on the canonical 0.25° grid across lead times up to 384 hours.
+    Download URLs and S3 keys are built deterministically from the official
     directory layout:
 
-    * GFS: ``gfs.YYYYMMDD/CC/atmos/gfs.tCCz.pgrb2.0p25.fXXX``
-    * GEFS 0.25° (<= 240 h): ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/
-      gepNN.tCCz.pgrb2s.0p25.fXXX``
-    * GEFS 0.50° (> 240 h): ``gefs.YYYYMMDD/CC/atmos/pgrb2bp5/
-      gepNN.tCCz.pgrb2s.0p50.fXXX``
+    * GFS 0.25°: ``gfs.YYYYMMDD/CC/atmos/gfs.tCCz.pgrb2.0p25.fXXX``
+    * GEFS 0.25°: ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/gepNN.tCCz.pgrb2s.0p25.fXXX``
 
     Only the 30 perturbation members are ingested; the control (``gec00``),
     ensemble-mean (``geavg``), and spread (``gespr``) files are out of scope.
 
-    Downloads use sequential single-range HTTP requests based on NOMADS ``.idx``
+    Downloads use sequential single-range HTTP requests based on ``.idx``
     offsets to selectively fetch only the required GRIB messages, saving >97%
     bandwidth. If the selective path encounters index anomalies, missing required
     records, or range rejection, it cleanly falls back to the full-file download path.
@@ -106,7 +103,7 @@ class NOAAConnector(BaseConnector):
         """Close the underlying HTTP client."""
         await self._client.aclose()
 
-    def build_url(
+    def build_s3_key(
         self,
         model: str,
         cycle_date: date,
@@ -114,7 +111,11 @@ class NOAAConnector(BaseConnector):
         lead_time_hours: int,
         member: int | None = None,
     ) -> str:
-        """Return the deterministic NOMADS download URL for a GRIB2 file.
+        """Return the deterministic AWS S3 object key for a GRIB2 file.
+
+        Key layouts on AWS Open Data (us-east-1):
+        * GFS 0.25°: ``gfs.YYYYMMDD/CC/atmos/gfs.tCCz.pgrb2.0p25.fXXX``
+        * GEFS 0.25°: ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/gepNN.tCCz.pgrb2s.0p25.fXXX``
 
         Args:
             model: Model identifier, either ``gfs`` or ``gefs``.
@@ -125,12 +126,61 @@ class NOAAConnector(BaseConnector):
                 ignored for GFS.
 
         Returns:
-            Absolute NOMADS URL of the requested GRIB2 file.
+            Relative S3 object key.
 
         Raises:
             InvalidRunError: If the model, cycle hour, lead time, or member is
                 unsupported.
         """
+        self._validate_run(model, cycle_hour, lead_time_hours)
+        if model == "gefs":
+            if member is None:
+                raise InvalidRunError(
+                    "A GEFS member identity (1..30) is required to build a "
+                    "per-member download URL; the combined "
+                    "'gefs.tCCz.pgrb2a.0p25' product no longer exists."
+                )
+            if not _GEFS_MEMBER_MIN <= member <= _GEFS_MEMBER_MAX:
+                raise InvalidRunError(
+                    f"Invalid GEFS member: {member}; expected "
+                    f"{_GEFS_MEMBER_MIN}-{_GEFS_MEMBER_MAX} (gepNN)."
+                )
+        date_str = cycle_date.strftime("%Y%m%d")
+        hour_str = f"{cycle_hour:02d}"
+        lead_str = f"{lead_time_hours:03d}"
+        if model == "gfs":
+            return f"gfs.{date_str}/{hour_str}/atmos/gfs.t{hour_str}z.pgrb2.0p25.f{lead_str}"
+        return (
+            f"gefs.{date_str}/{hour_str}/atmos/pgrb2sp25/"
+            f"gep{member:02d}.t{hour_str}z.pgrb2s.0p25.f{lead_str}"
+        )
+
+    def build_s3_url(
+        self,
+        model: str,
+        cycle_date: date,
+        cycle_hour: int,
+        lead_time_hours: int,
+        member: int | None = None,
+    ) -> str:
+        """Return the deterministic public HTTPS URL for an AWS S3 GRIB2 object."""
+        key = self.build_s3_key(model, cycle_date, cycle_hour, lead_time_hours, member)
+        base = (
+            self._settings.AWS_GFS_BASE_URL
+            if model == "gfs"
+            else self._settings.AWS_GEFS_BASE_URL
+        )
+        return f"{base}/{key}"
+
+    def build_nomads_url(
+        self,
+        model: str,
+        cycle_date: date,
+        cycle_hour: int,
+        lead_time_hours: int,
+        member: int | None = None,
+    ) -> str:
+        """Return the deterministic NOMADS download URL for a GRIB2 file."""
         self._validate_run(model, cycle_hour, lead_time_hours)
         if model == "gefs":
             if member is None:
@@ -153,18 +203,47 @@ class NOAAConnector(BaseConnector):
                 f"gfs.{date_str}/{hour_str}/atmos/"
                 f"gfs.t{hour_str}z.pgrb2.0p25.f{lead_str}"
             )
-        # GEFS 0.25 deg short/medium range (<= 240 h): pgrb2sp25/, gepNN.
-        if lead_time_hours <= _GEFS_LEAD_TIME_PRODUCT_SPLIT:
-            return (
-                f"{self._settings.NOMADS_BASE_URL}/pub/data/nccf/com/gens/prod/"
-                f"gefs.{date_str}/{hour_str}/atmos/pgrb2sp25/"
-                f"gep{member:02d}.t{hour_str}z.pgrb2s.0p25.f{lead_str}"
-            )
-        # GEFS beyond 240 h is 0.5 deg: pgrb2bp5/, gepNN.
         return (
             f"{self._settings.NOMADS_BASE_URL}/pub/data/nccf/com/gens/prod/"
-            f"gefs.{date_str}/{hour_str}/atmos/pgrb2bp5/"
-            f"gep{member:02d}.t{hour_str}z.pgrb2s.0p50.f{lead_str}"
+            f"gefs.{date_str}/{hour_str}/atmos/pgrb2sp25/"
+            f"gep{member:02d}.t{hour_str}z.pgrb2s.0p25.f{lead_str}"
+        )
+
+    def build_url(
+        self,
+        model: str,
+        cycle_date: date,
+        cycle_hour: int,
+        lead_time_hours: int,
+        member: int | None = None,
+        source: str | None = None,
+    ) -> str:
+        """Return the deterministic download URL for a GRIB2 file.
+
+        Args:
+            model: Model identifier, either ``gfs`` or ``gefs``.
+            cycle_date: UTC date of the model run.
+            cycle_hour: UTC cycle hour; one of 0, 6, 12, 18.
+            lead_time_hours: Forecast lead time in hours (0-384).
+            member: GEFS perturbation member (1..30). Required for GEFS;
+                ignored for GFS.
+            source: Upstream provider identifier (``"aws_s3"`` or ``"nomads"``).
+                Defaults to the configured ``NOAA_DOWNLOAD_SOURCE``.
+
+        Returns:
+            Absolute URL of the requested GRIB2 file.
+
+        Raises:
+            InvalidRunError: If the model, cycle hour, lead time, or member is
+                unsupported.
+        """
+        src = source or getattr(self._settings, "NOAA_DOWNLOAD_SOURCE", "aws_s3")
+        if src == "nomads":
+            return self.build_nomads_url(
+                model, cycle_date, cycle_hour, lead_time_hours, member
+            )
+        return self.build_s3_url(
+            model, cycle_date, cycle_hour, lead_time_hours, member
         )
 
     async def download(
@@ -179,10 +258,18 @@ class NOAAConnector(BaseConnector):
     ) -> Path:
         """Download a GRIB2 file to ``destination`` using selective byte ranges.
 
-        Attempts selective single-range downloading based on NOMADS ``.idx``
-        metadata. If selective downloading encounters index anomalies, missing
-        required records, or range errors, it automatically falls back to full-file
-        downloading.
+        Default primary source is AWS Open Data on S3. If an upstream availability
+        or publication failure occurs (e.g. 404 Not Found due to publication lag,
+        or 5xx after retries) and NOMADS fallback is enabled, automatically falls
+        back to NOMADS.
+
+        Fallback Hierarchy:
+        1. AWS S3 selective Range download.
+        2. If selective-specific failure occurs (index/framing/Range 200/length),
+           fall back to AWS S3 full download first.
+        3. Fall back to NOMADS only for provider availability/publication failures
+           (404 Not Found after retry, or 5xx/transport exhaustion).
+        4. If NOMADS fallback is disabled or NOMADS also fails, raise the error.
 
         Args:
             model: Model identifier, either ``gfs`` or ``gefs``.
@@ -206,10 +293,68 @@ class NOAAConnector(BaseConnector):
             DownloadFailedError: If the upstream provider returns an error
                 status, or keeps returning 5xx after all retry attempts.
         """
-        url = self.build_url(model, cycle_date, cycle_hour, lead_time_hours, member)
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
 
+        primary_source = getattr(self._settings, "NOAA_DOWNLOAD_SOURCE", "aws_s3")
+        primary_url = self.build_url(
+            model, cycle_date, cycle_hour, lead_time_hours, member, source=primary_source
+        )
+
+        try:
+            return await self._download_single_provider(
+                url=primary_url,
+                model=model,
+                cycle_date=cycle_date,
+                cycle_hour=cycle_hour,
+                lead_time_hours=lead_time_hours,
+                destination=destination,
+                member=member,
+                variables=variables,
+            )
+        except (DownloadFailedError, UpstreamUnavailableError) as primary_exc:
+            if (
+                primary_source == "aws_s3"
+                and getattr(self._settings, "ENABLE_NOMADS_FALLBACK", True)
+            ):
+                logger.warning(
+                    "download_provider_fallback: model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "primary_url=%s error=%s; attempting NOMADS fallback.",
+                    model,
+                    cycle_date,
+                    cycle_hour,
+                    lead_time_hours,
+                    member,
+                    primary_url,
+                    primary_exc,
+                )
+                nomads_url = self.build_nomads_url(
+                    model, cycle_date, cycle_hour, lead_time_hours, member
+                )
+                return await self._download_single_provider(
+                    url=nomads_url,
+                    model=model,
+                    cycle_date=cycle_date,
+                    cycle_hour=cycle_hour,
+                    lead_time_hours=lead_time_hours,
+                    destination=destination,
+                    member=member,
+                    variables=variables,
+                )
+            raise
+
+    async def _download_single_provider(
+        self,
+        url: str,
+        model: str,
+        cycle_date: date,
+        cycle_hour: int,
+        lead_time_hours: int,
+        destination: Path,
+        member: int | None,
+        variables: tuple[str, ...],
+    ) -> Path:
+        """Download from a single provider URL using selective ranges with full-download fallback."""
         if getattr(self._settings, "ENABLE_SELECTIVE_DOWNLOAD", True):
             try:
                 return await self._download_selective_with_retry(
@@ -224,8 +369,9 @@ class NOAAConnector(BaseConnector):
                 )
             except SelectiveFallbackError as fallback_exc:
                 logger.warning(
-                    "download_fallback: model=%s cycle=%sT%02dZ lead=%d member=%s "
-                    "fallback_reason=%s; falling back to full download.",
+                    "download_selective_fallback: url=%s model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "reason=%s; falling back to full download on same provider.",
+                    url,
                     model,
                     cycle_date,
                     cycle_hour,
@@ -234,10 +380,11 @@ class NOAAConnector(BaseConnector):
                     fallback_exc.reason,
                 )
             except Exception as exc:
-                # Catch any unexpected selective-path error to ensure reliable fallback
+                # Catch any unexpected selective-path error to ensure reliable full-file fallback
                 logger.warning(
-                    "download_fallback: model=%s cycle=%sT%02dZ lead=%d member=%s "
-                    "fallback_reason=unexpected_selective_error error=%s; falling back to full download.",
+                    "download_selective_fallback: url=%s model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "reason=unexpected_selective_error error=%s; falling back to full download on same provider.",
+                    url,
                     model,
                     cycle_date,
                     cycle_hour,
@@ -539,14 +686,14 @@ class NOAAConnector(BaseConnector):
         lead_time_hours: int,
         destination: Path,
         member: int | None = None,
+        source: str | None = None,
     ) -> Path:
         """Download the GRIB2 index (``.idx``) file for a forecast product.
 
-        NOMADS serves a ``.idx`` file alongside every GRIB2 product (the
-        wgrib2 index describing the records in the GRIB2 file). The index is a
-        source artifact that is cleaned up together with the GRIB2 file after
-        successful ingestion. Transient failures are retried like the data
-        download.
+        Fetches the companion ``.idx`` file for a GRIB2 product from the active
+        or requested upstream source. The index is a source artifact that is
+        cleaned up together with the GRIB2 file after successful ingestion.
+        Transient failures are retried like the data download.
 
         Args:
             model: Model identifier, either ``gfs`` or ``gefs``.
@@ -555,6 +702,7 @@ class NOAAConnector(BaseConnector):
             lead_time_hours: Forecast lead time in hours (0-384).
             destination: Local path the ``.idx`` file is written to.
             member: GEFS perturbation member (1..30). Required for GEFS.
+            source: Optional upstream source override (``"aws_s3"`` or ``"nomads"``).
 
         Returns:
             The path the file was written to.
@@ -566,7 +714,9 @@ class NOAAConnector(BaseConnector):
             DownloadFailedError: If the upstream provider returns an error
                 status.
         """
-        url = self.build_url(model, cycle_date, cycle_hour, lead_time_hours, member)
+        url = self.build_url(
+            model, cycle_date, cycle_hour, lead_time_hours, member, source=source
+        )
         url = f"{url}.idx"
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
