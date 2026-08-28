@@ -15,7 +15,23 @@ class IngestionSettings(BaseSettings):
     # Attribute types are ``Any`` because pydantic settings declare them via
     # the class namespace; they are validated at instantiation time. This keeps
     # strict typing clean without suppressing broader checks.
+    #: Primary upstream provider for NOAA operational products ("aws_s3" or "nomads").
+    #: Defaults to AWS Open Data on S3 to prevent NOMADS rate limiting / anti-abuse bans.
+    NOAA_DOWNLOAD_SOURCE: Any = "aws_s3"
+
+    #: Base URL for NOAA GFS on AWS Open Data (us-east-1).
+    AWS_GFS_BASE_URL: Any = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+
+    #: Base URL for NOAA GEFS on AWS Open Data (us-east-1).
+    AWS_GEFS_BASE_URL: Any = "https://noaa-gefs-pds.s3.amazonaws.com"
+
+    #: Base URL for NOAA NOMADS operational archive (fallback source).
     NOMADS_BASE_URL: Any = "https://nomads.ncep.noaa.gov"
+
+    #: Enable automatic fallback to NOMADS when AWS S3 returns 404 (e.g. publication lag)
+    #: or upstream availability failure.
+    ENABLE_NOMADS_FALLBACK: bool = True
+
     NOAA_USER_AGENT: Any = "weather-platform-ingestion/0.1.0"
     REQUEST_TIMEOUT_SECONDS: Any = 30.0
     DOWNLOAD_RETRIES: Any = 3
