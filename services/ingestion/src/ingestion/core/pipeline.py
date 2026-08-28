@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -579,6 +580,7 @@ def _commit_region(
     member: int | None = None,
     expected_lead_time_hours: tuple[int, ...] = (),
     expected_members: tuple[int, ...] = (),
+    snapshot: Any | None = None,
 ) -> None:
     """Commit a single-lead (and optional single-member) file to the store.
 
@@ -587,22 +589,20 @@ def _commit_region(
     pre-allocated serving store that is written. Only that region is touched:
     existing data in other leads/members is never read or rewritten.
 
-    When the store does not yet exist, it is **pre-allocated** with the full
-    expected coordinate structure (``expected_lead_time_hours`` and, for GEFS,
-    ``expected_members``) so every subsequent file region-commits independently
-    — no whole-store read-modify-write ever happens.
+    When ``snapshot`` is supplied (from the wave coordinator), schema and identity
+    validation are performed in-memory and positional indices are passed directly,
+    avoiding all redundant remote store opens.
 
     Args:
         dataset: The normalized single-lead dataset for this GRIB file.
         store_path: The cycle store to commit into (may not exist yet).
         member: The upstream GEFS member identity (``1..30``). ``None`` for
-            deterministic models. When set, the dataset's ``member``
-            coordinate is replaced with ``[member]`` so the region mapping is
-            coordinate-driven.
+            deterministic models.
         expected_lead_time_hours: The full lead set the run is expected to
             serve; used to pre-allocate the store on the first write.
         expected_members: The full GEFS member set; used to pre-allocate the
             store on the first write.
+        snapshot: Optional immutable StoreMetadataSnapshot from the coordinator.
 
     Raises:
         CycleStoreMismatchError: If the store already exists and the incoming
@@ -645,6 +645,22 @@ def _commit_region(
                 }
             )
 
+    if snapshot is not None:
+        _validate_store_identity_from_snapshot(dataset, snapshot, store_path)
+        _validate_lead_schema_from_snapshot(dataset, snapshot, store_path)
+        lead_val = int(dataset["lead_time_hours"].values[0])
+        lead_idx = snapshot.lead_index_map.get(lead_val)
+        member_idx = snapshot.member_index_map.get(member) if member is not None else None
+        commit_region(
+            dataset,
+            store_path,
+            lead_time_hours=lead_val,
+            member=member,
+            lead_index=lead_idx,
+            member_index=member_idx,
+        )
+        return
+
     if not store_exists(store_path):
         # First write: pre-allocate the full serving store with the run's
         # expected leads (and, for GEFS, members), NaN-filled, then commit this
@@ -663,6 +679,68 @@ def _commit_region(
     _validate_lead_schema(dataset, existing, store_path)
 
     commit_region(dataset, store_path)
+
+
+def _validate_store_identity_from_snapshot(
+    dataset: xr.Dataset,
+    snapshot: Any,
+    store_path: str,
+) -> None:
+    """In-memory validation of incoming forecast identity against snapshot."""
+    requested = _resolve_cycle_time(dataset)
+    stored = snapshot.cycle_time
+    if requested is None:
+        raise CycleStoreMismatchError(
+            f"Refusing to merge into {store_path!r}: the incoming forecast has "
+            "no cycle/reference time, so its forecast-run identity cannot be "
+            "established."
+        )
+    if stored is None:
+        raise CycleStoreMismatchError(
+            f"Refusing to merge into {store_path!r}: the existing store carries "
+            "no cycle/reference time, so it cannot be identified as a valid "
+            "cycle store."
+        )
+    if requested != stored:
+        raise CycleStoreMismatchError(
+            f"Refusing to merge: the incoming forecast is cycle {requested}, "
+            f"but the store at {store_path!r} already contains cycle {stored}. "
+            "A Zarr store represents exactly one forecast cycle; the cycles "
+            "must match."
+        )
+
+
+def _validate_lead_schema_from_snapshot(
+    dataset: xr.Dataset,
+    snapshot: Any,
+    store_path: str,
+) -> None:
+    """In-memory validation of incoming dataset schema against snapshot."""
+    for axis in ("latitude", "longitude"):
+        if axis in snapshot.coords_values and axis in dataset.coords:
+            stored_vals = snapshot.coords_values[axis]
+            incoming_vals = dataset.coords[axis].values
+            if len(stored_vals) != len(incoming_vals) or not np.allclose(
+                np.asarray(stored_vals, dtype=np.float32),
+                np.asarray(incoming_vals, dtype=np.float32),
+            ):
+                raise StoreSchemaMismatchError(
+                    f"Refusing to merge into {store_path!r}: the incoming file's "
+                    f"'{axis}' axis differs from the store's '{axis}' axis. A "
+                    "cycle store must have one consistent grid."
+                )
+
+    for code in set(dataset.data_vars) & set(snapshot.data_var_dims):
+        incoming_dims = set(dataset[code].dims)
+        existing_dims = set(snapshot.data_var_dims[code])
+        incoming_dims.discard("member")
+        existing_dims.discard("member")
+        if incoming_dims != existing_dims:
+            raise StoreSchemaMismatchError(
+                f"Refusing to merge into {store_path!r}: variable '{code}' has "
+                f"dimensions {tuple(dataset[code].dims)} in the incoming file "
+                f"but {snapshot.data_var_dims[code]} in the store."
+            )
 
 
 def _resolve_cycle_time(dataset: xr.Dataset) -> str | None:

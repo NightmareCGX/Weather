@@ -222,3 +222,59 @@ def test_timeout_after_shared_acquired(engine) -> None:
         co1.release_shared_gate()
         c1.close()
         c2.close()
+
+
+def test_batched_region_locks_acquire_and_release(engine) -> None:
+    """Acquiring and releasing 100 region locks in batch properly sets and removes all locks."""
+    store = "s3://weather-data/gfs/2026-07-21/00/cycle.zarr"
+    c1 = engine.connect()
+    co1 = _co(engine, c1, store)
+    region_ids = [f"det_L{i:04d}" for i in range(100)]
+    keys = [co1.region(r) for r in region_ids]
+    try:
+        co1.acquire_region_locks(region_ids)
+        assert len(co1.held_keys) == 100
+        # Verify from independent session that all 100 keys are held
+        for k in keys[:5]:  # sample check
+            assert _independent_holds(engine, k)
+        co1.release_region_locks(region_ids)
+        assert len(co1.held_keys) == 0
+        for k in keys[:5]:
+            assert not _independent_holds(engine, k)
+    finally:
+        co1.release_all()
+        c1.close()
+
+
+def test_batched_region_locks_partial_contention_timeout(engine) -> None:
+    """When 1 key in a batch of 50 is held by another session, the batch times out cleanly without leaking partial locks."""
+    store = "s3://weather-data/gfs/2026-07-21/00/cycle.zarr"
+    c1 = engine.connect()
+    c2 = engine.connect()
+    co1 = _co(engine, c1, store)
+    co2 = _co(engine, c2, store)
+    region_ids = [f"det_L{i:04d}" for i in range(50)]
+    contested_id = region_ids[25]
+    contested_key = co1.region(contested_id)
+
+    try:
+        # co1 holds the contested key
+        co1.acquire_region_locks([contested_id])
+        assert _independent_holds(engine, contested_key)
+
+        # co2 tries to acquire the full batch of 50 keys, which includes contested_key
+        with pytest.raises(LockTimeoutError):
+            co2.acquire_region_locks(region_ids)
+
+        # Ensure co2 holds ZERO locks after failure (no partial leak)
+        assert len(co2.held_keys) == 0
+        for r in region_ids:
+            k = co2.region(r)
+            if k != contested_key:
+                assert not _independent_holds(engine, k)
+    finally:
+        co1.release_all()
+        co2.release_all()
+        c1.close()
+        c2.close()
+

@@ -385,6 +385,8 @@ def commit_region(
     *,
     lead_time_hours: int | None = None,
     member: int | None = None,
+    lead_index: int | None = None,
+    member_index: int | None = None,
 ) -> str:
     """Commit a single-lead (and optional single-member) file into an existing store.
 
@@ -412,6 +414,8 @@ def commit_region(
         member: Explicit member identity (``1..30``) to target. When ``None``
             but the dataset has a ``member`` dimension of length 1, the member
             is derived from its ``member`` coordinate value.
+        lead_index: Optional pre-resolved coordinate index for the lead.
+        member_index: Optional pre-resolved coordinate index for the member.
 
     Returns:
         The store target as a string.
@@ -438,20 +442,18 @@ def commit_region(
 
     resolved = _resolve_store(store)
 
-    # Resolve the lead/member coordinate values to positional indices against
-    # the pre-allocated store's coordinates. This is coordinate-driven: a
-    # gep17 file always targets the member position whose value is 17, never a
-    # completion-order index.
-    existing = read_dataset(store)
-    lead_index = _coordinate_index(existing, "lead_time_hours", lead_time_hours)
-    member_index = None
-    if member is not None:
-        if "member" not in existing.coords:
-            raise ValueError(
-                "commit_region: the store has no 'member' coordinate but a "
-                "member identity was requested."
-            )
-        member_index = _coordinate_index(existing, "member", member)
+    # Resolve positional indices against store coordinates if not pre-resolved
+    if lead_index is None or (member is not None and member_index is None):
+        existing = read_dataset(store)
+        if lead_index is None:
+            lead_index = _coordinate_index(existing, "lead_time_hours", lead_time_hours)
+        if member is not None and member_index is None:
+            if "member" not in existing.coords:
+                raise ValueError(
+                    "commit_region: the store has no 'member' coordinate but a "
+                    "member identity was requested."
+                )
+            member_index = _coordinate_index(existing, "member", member)
 
     # The dataset is single-lead (and, for GEFS, single-member). Build the
     # positional region slices. Data variables already carry the lead (and

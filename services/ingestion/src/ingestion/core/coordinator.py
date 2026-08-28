@@ -160,6 +160,30 @@ def _physical_conflict_region_ids(
     )
 
 
+@dataclass(frozen=True)
+class StoreMetadataSnapshot:
+    """Immutable, generation-bound metadata snapshot of an initialized Zarr store.
+
+    Captures coordinate indices, variable schemas, and .zarray/.zattrs physical chunk
+    geometries so that region-write workers can perform validation, conflict derivation,
+    and slice resolution in-memory without remote store re-opens.
+    """
+
+    store_path: str
+    generation: str | None
+    is_ensemble: bool
+    data_var_paths: tuple[str, ...]
+    lead_index_map: Mapping[int, int]
+    member_index_map: Mapping[int, int]
+    zarray_by_var: Mapping[str, Mapping[str, object]]
+    zattrs_by_var: Mapping[str, Mapping[str, object]]
+    data_var_dims: Mapping[str, tuple[str, ...]]
+    coords_values: Mapping[str, tuple[float, ...]]
+    grid_shape: tuple[int, int]
+    cycle_time: str | None
+    model_id: str | None
+
+
 class RunCoordinator:
     """Coordinates the wave pre-update, region workers, and coalesced finalizer.
 
@@ -186,12 +210,72 @@ class RunCoordinator:
         self._lead_index_cache: dict[int, int] = {}
         # Cache the data-variable .zarray geometry per array path.
         self._zarray_cache: dict[str, dict[str, object]] = {}
+        # Immutable metadata snapshot of the store built under the exclusive gate.
+        self._snapshot: StoreMetadataSnapshot | None = None
 
     def _lead_index_for(self, lead: int) -> int:
         """Return the positional lead index, caching per lead value."""
         if lead not in self._lead_index_cache:
             self._lead_index_cache[lead] = _lead_index_in_store(self.store_path, lead)
         return self._lead_index_cache[lead]
+
+    def _build_snapshot(self) -> StoreMetadataSnapshot:
+        """Build an immutable snapshot from the store's persisted metadata."""
+        from ingestion.core.inventory import _read_zarray, _read_zattrs
+        from ingestion.core.pipeline import _resolve_cycle_time
+        from ingestion.core.markers import read_manifest
+
+        ds = read_dataset(self.store_path)
+        manifest = read_manifest(self.store_path)
+        gen = str(manifest.get("generation")) if manifest and manifest.get("generation") else None
+
+        lead_values = np.atleast_1d(ds.coords["lead_time_hours"].values).reshape(-1)
+        lead_index_map = {int(v): i for i, v in enumerate(lead_values)}
+        member_index_map = {}
+        if "member" in ds.coords:
+            member_values = np.atleast_1d(ds.coords["member"].values).reshape(-1)
+            member_index_map = {int(v): i for i, v in enumerate(member_values)}
+
+        data_var_paths = tuple(sorted(str(v) for v in ds.data_vars))
+        zarray_by_var: dict[str, Mapping[str, object]] = {}
+        zattrs_by_var: dict[str, Mapping[str, object]] = {}
+        data_var_dims: dict[str, tuple[str, ...]] = {}
+        for var in data_var_paths:
+            za = _read_zarray(self.store_path, var)
+            if za is not None:
+                zarray_by_var[var] = za
+                self._zarray_cache[var] = za
+            zat = _read_zattrs(self.store_path, var)
+            if zat is not None:
+                zattrs_by_var[var] = zat
+            data_var_dims[var] = tuple(str(d) for d in ds[var].dims if str(d) != "member")
+
+        coords_values: dict[str, tuple[float, ...]] = {}
+        for axis in ("latitude", "longitude"):
+            if axis in ds.coords:
+                coords_values[axis] = tuple(float(v) for v in ds.coords[axis].values)
+
+        lat_len = ds.sizes.get("latitude", 0)
+        lon_len = ds.sizes.get("longitude", 0)
+        grid_shape = (int(lat_len), int(lon_len))
+        cycle_time = _resolve_cycle_time(ds)
+        model_id = str(ds.attrs.get("model_id")) if "model_id" in ds.attrs else None
+
+        return StoreMetadataSnapshot(
+            store_path=self.store_path,
+            generation=gen,
+            is_ensemble=self.spec.is_ensemble,
+            data_var_paths=data_var_paths,
+            lead_index_map=lead_index_map,
+            member_index_map=member_index_map,
+            zarray_by_var=zarray_by_var,
+            zattrs_by_var=zattrs_by_var,
+            data_var_dims=data_var_dims,
+            coords_values=coords_values,
+            grid_shape=grid_shape,
+            cycle_time=cycle_time,
+            model_id=model_id,
+        )
 
     # ------------------------------------------------------------------
     # Retained-seed initialization (Step 5)
@@ -247,6 +331,7 @@ class RunCoordinator:
                     with Session(bind=conn) as db:
                         set_run_partial(db, run_id)
                         db.commit()
+                self._snapshot = self._build_snapshot()
                 return
             # Absent store: guard against a live-owned path, then initialize.
             with Session(bind=conn) as db:
@@ -266,6 +351,7 @@ class RunCoordinator:
                 observer.record_milestone("prepare_run_store_complete")
             # New stores are strict marker_v1.
             write_protocol_version(self.store_path, MARKER_V1)
+            self._snapshot = self._build_snapshot()
         finally:
             co.release_exclusive_gate()
 
@@ -310,6 +396,9 @@ class RunCoordinator:
                 with Session(bind=conn) as db:
                     set_run_partial(db, run_id)
                     db.commit()
+
+            if self._snapshot is None:
+                self._snapshot = self._build_snapshot()
 
             # Allocate a fresh generation per target and write UPDATING markers.
             from ingestion.core.marker_put_scheduler import put_markers_rolling
@@ -404,13 +493,26 @@ class RunCoordinator:
         co.acquire_shared_admission()
         co.acquire_shared_gate()
         try:
-            region_ids = _physical_conflict_region_ids(
-                dataset, self.store_path, member=member
+            snapshot = self._snapshot or self._build_snapshot()
+            lead_values = dataset.coords["lead_time_hours"].values
+            lead = int(np.asarray(lead_values).reshape(-1)[0])
+            lead_index = snapshot.lead_index_map.get(lead)
+            if lead_index is None:
+                raise StoreSchemaMismatchError(f"lead {lead} not found in store coordinate")
+
+            from ingestion.core.inventory import physical_conflict_keys
+
+            region_ids = physical_conflict_keys(
+                self.store_path,
+                member=member,
+                lead_index=lead_index,
+                data_var_paths=snapshot.data_var_paths,
+                zarray_cache=snapshot.zarray_by_var,
+                zattrs_cache=snapshot.zattrs_by_var,
+                member_index_cache=snapshot.member_index_map,
             )
             co.acquire_region_locks(region_ids)
             try:
-                lead_values = dataset.coords["lead_time_hours"].values
-                lead = int(np.asarray(lead_values).reshape(-1)[0])
                 marker = read_region_marker(
                     self.store_path, lead_time_hours=lead, member=member
                 )
@@ -429,32 +531,40 @@ class RunCoordinator:
                         f"region (member={member}, lead={lead}) is not owned by "
                         f"generation {generation}"
                     )
-                # Generation-ownership confirmed: write the data.
+                # Generation-ownership confirmed: write the data using snapshot
                 _commit_region(
                     dataset,
                     self.store_path,
                     member=member,
                     expected_lead_time_hours=expected_leads,
                     expected_members=expected_members,
+                    snapshot=snapshot,
                 )
-                # Compute the physical object inventory for the COMPLETE marker.
+                # Compute the physical object inventory for the COMPLETE marker from snapshot
                 from ingestion.core.inventory import (
                     expected_write_set_fingerprint,
-                    list_object_keys,
                     region_expected_object_keys,
+                    verify_expected_object_keys,
                 )
 
-                lead_index = _lead_index_in_store(self.store_path, lead)
-                data_var_paths = sorted(str(v) for v in dataset.data_vars)
                 expected_keys = region_expected_object_keys(
                     self.store_path,
                     member=member,
                     lead_index=lead_index,
-                    data_var_paths=data_var_paths,
+                    data_var_paths=snapshot.data_var_paths,
+                    zarray_cache=snapshot.zarray_by_var,
+                    zattrs_cache=snapshot.zattrs_by_var,
+                    member_index_cache=snapshot.member_index_map,
                 )
-                existing_keys = set()
-                for var in data_var_paths:
-                    existing_keys.update(list_object_keys(self.store_path, var))
+                existing_keys = verify_expected_object_keys(
+                    self.store_path,
+                    expected_keys,
+                    member=member,
+                    lead_index=lead_index,
+                    zarray_cache=snapshot.zarray_by_var,
+                    zattrs_cache=snapshot.zattrs_by_var,
+                    member_index_cache=snapshot.member_index_map,
+                )
                 # Real-data writes materialize all expected chunks; an expected
                 # chunk that is absent is an all-fill omission.
                 required = [k for k in expected_keys if k in existing_keys]
