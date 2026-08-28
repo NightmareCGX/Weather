@@ -198,6 +198,90 @@ class RunSpec:
         )
 
 
+@dataclass(frozen=True)
+class ConcurrencyPlan:
+    """Effective concurrency and staging bounds for an ingestion wave.
+
+    Decouples requested CLI concurrency into independently bounded resource stages:
+    * ``download_concurrency``: Network I/O ceiling (NOMADS HTTP range GETs).
+    * ``decode_concurrency``: CPU compute ceiling (ProcessPool ecCodes decoding).
+    * ``write_concurrency``: Database & Storage I/O ceiling (PostgreSQL advisory
+      locks + Zarr chunk writes + COMPLETE marker PUTs).
+    * ``staging_concurrency``: Maximum total in-flight active/queued items in the
+      pipeline, bounding peak resident decoded datasets in memory.
+    """
+
+    requested: int
+    download_concurrency: int
+    decode_concurrency: int
+    write_concurrency: int
+    staging_concurrency: int
+
+
+def _detect_effective_cpus() -> int:
+    """Affinity/cpuset-aware conservative CPU detection for decode worker sizing.
+
+    Respects Linux process affinity (e.g. Docker/cgroup cpuset pinning via
+    ``sched_getaffinity``) with fallback to ``os.cpu_count()``. Note: CFS
+    bandwidth/quota limits may differ from cpuset affinity; ``MAX_DECODE_CONCURRENCY``
+    provides an explicit safety ceiling. On Windows, enforces a hard ceiling of 61
+    workers to stay within the 64-handle limit of ``_winapi.WaitForMultipleObjects``
+    used by Python's ``ProcessPoolExecutor``.
+    """
+    import os
+    import sys
+
+    cpus: int | None = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpus = len(os.sched_getaffinity(0))
+        except (NotImplementedError, OSError, AttributeError):
+            pass
+    if cpus is None or cpus < 1:
+        cpus = os.cpu_count() or 1
+    if sys.platform == "win32":
+        cpus = min(cpus, 61)
+    return max(1, cpus)
+
+
+def _resolve_concurrency_plan(
+    requested: int, settings: Any | None = None
+) -> ConcurrencyPlan:
+    """Derive decoupled stage capacities from requested CLI concurrency.
+
+    Args:
+        requested: Requested concurrency integer (from ``--concurrency``).
+        settings: Optional ``IngestionSettings`` instance. Defaults to the
+            global settings object.
+
+    Returns:
+        The resolved :class:`ConcurrencyPlan`.
+    """
+    if settings is None:
+        from ingestion.core.config import settings as default_settings
+
+        settings = default_settings
+
+    req = max(1, requested)
+    eff_cpus = _detect_effective_cpus()
+    max_download = max(1, int(settings.MAX_DOWNLOAD_CONCURRENCY))
+    max_decode = max(1, int(settings.MAX_DECODE_CONCURRENCY))
+    max_write = max(1, int(settings.MAX_WRITE_CONCURRENCY))
+
+    download = min(req, max_download)
+    decode = min(req, eff_cpus, max_decode)
+    write = min(req, max_write)
+    staging = download + decode + write
+
+    return ConcurrencyPlan(
+        requested=req,
+        download_concurrency=download,
+        decode_concurrency=decode,
+        write_concurrency=write,
+        staging_concurrency=staging,
+    )
+
+
 def _as_list(value: Any) -> list[Any]:
     """Coerce a CLI nargs value to a flat list.
 
@@ -780,12 +864,16 @@ async def _run_wave(
 ) -> str:
     """Download and ingest every lead/member of a single forecast run.
 
-    Implements the approved bounded task-per-item streaming pipeline (Option B2):
+    Implements the approved decoupled pipeline architecture (Phase 1):
     - retained-seed fresh-store initialization;
     - one wave-level EXCLUSIVE pre-update (run -> partial + UPDATING markers);
-    - seed worker starts immediately in ThreadPoolExecutor;
-    - non-seed items: bounded download (download_sem) -> bounded ingestion admission (ingest_sem)
-      -> process-isolated decode (DecodePool) -> region write under advisory locks;
+    - seed worker starts immediately in write stage;
+    - non-seed items:
+        1. Staging envelope admission (staging_sem: bounds in-flight items / memory)
+        2. Bounded network download (download_sem)
+        3. Bounded process-isolated decode & parent normalization (decode_sem + DecodePool)
+        4. Application-level write admission (write_sem: bounds DB pool & Zarr concurrency)
+        5. Deferred DB connection checkout inside write executor critical section;
     - non-abandoning drain of all worker futures before finalization gate;
     - one coalesced finalization (EXCLUSIVE store gate) after all workers drain.
     """
@@ -794,6 +882,7 @@ async def _run_wave(
     from concurrent.futures import ThreadPoolExecutor
 
     from ingestion.core.cancel import await_all_workers_non_abandoning
+    from ingestion.core.config import settings
     from ingestion.core.coordinator import (
         RunCoordinator,
         WaveRegion,
@@ -823,16 +912,37 @@ async def _run_wave(
     seed_item = items[0]
     seed_member, seed_lead = seed_item
 
+    # Resolve decoupled stage capacities
+    plan = _resolve_concurrency_plan(concurrency, settings)
+    logger.info(
+        "Starting wave: model=%s cycle=%s items=%d requested_concurrency=%d "
+        "effective_concurrency=(download=%d, decode=%d, write=%d, staging=%d) "
+        "db_pool=(size=%d, max_overflow=%d, timeout=%.1fs)",
+        spec.model,
+        spec.cycle_time,
+        len(items),
+        concurrency,
+        plan.download_concurrency,
+        plan.decode_concurrency,
+        plan.write_concurrency,
+        plan.staging_concurrency,
+        int(settings.DB_POOL_SIZE),
+        int(settings.DB_MAX_OVERFLOW),
+        float(settings.DB_POOL_TIMEOUT_SECONDS),
+    )
+
     coordinator = RunCoordinator(
         catalog_spec,
         store_path,
         timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
     )
     cancel_event = threading.Event()
-    executor = ThreadPoolExecutor(max_workers=concurrency)
-    # The persistent decode pool: up to ``concurrency`` reusable worker
+    executor = ThreadPoolExecutor(max_workers=plan.write_concurrency)
+    # The persistent decode pool: up to ``plan.decode_concurrency`` reusable worker
     # processes each holding independent cfgrib/ecCodes native state.
-    decode_pool = DecodePool(max_workers=min(len(items), max(1, concurrency)))
+    decode_pool = DecodePool(
+        max_workers=min(len(items), max(1, plan.decode_concurrency))
+    )
     engine = _catalog_session_factory()
 
     var_codes = tuple(v.code for v in catalog_spec.variables)
@@ -908,35 +1018,32 @@ async def _run_wave(
         finally:
             pre_conn.close()
 
-        # 4. Pipelined download and ingestion scheduling (Option B2).
-        # Bounded by:
-        # - download_sem: at most `concurrency` active HTTP downloads;
-        # - staging_sem: at most `2 * concurrency` in-flight pipeline admissions
-        #   (downloading + waiting + actively ingesting);
-        # - ingest_sem: at most `concurrency` submitted-but-uncompleted executor jobs.
-        download_sem = asyncio.Semaphore(concurrency)
-        staging_sem = asyncio.Semaphore(2 * concurrency)
-        ingest_sem = asyncio.Semaphore(concurrency)
+        # 4. Decoupled stage semaphores (Phase 1):
+        # - download_sem: at most `plan.download_concurrency` active HTTP downloads;
+        # - decode_sem: at most `plan.decode_concurrency` active decode jobs;
+        # - write_sem: at most `plan.write_concurrency` active DB/Zarr writes;
+        # - staging_sem: at most `plan.staging_concurrency` in-flight pipeline admissions
+        #   (bounding peak resident decoded datasets in memory).
+        download_sem = asyncio.Semaphore(plan.download_concurrency)
+        decode_sem = asyncio.Semaphore(plan.decode_concurrency)
+        write_sem = asyncio.Semaphore(plan.write_concurrency)
+        staging_sem = asyncio.Semaphore(plan.staging_concurrency)
         futures_lock = threading.Lock()
         registered_worker_futures: list[asyncio.Future[Any]] = []
         pipeline_tasks: list[asyncio.Task[Any]] = []
 
         generation_by_region = {r.region_id: r.generation for r in regions}
 
-        def _run_region_worker(member: int | None, lead: int) -> None:
+        # Synchronous write execution: checks out DB connection only for the
+        # coordinated critical section (advisory locks + Zarr write + COMPLETE marker).
+        def _run_region_write(
+            dataset: xr.Dataset, member: int | None, lead: int, generation: str
+        ) -> None:
             worker_conn = engine.connect()
             try:
-                dest = _destination_for(spec, staging_dir, lead=lead, member=member)
-                ds = _decode_and_normalize(decode_pool.submit(dest), catalog_spec)
-                _validate_requested_lead(ds, lead)
-                _validate_requested_member(ds, member)
-                region_id = _region_id_for(lead, member)
-                generation = generation_by_region.get(region_id)
-                if generation is None:
-                    raise RuntimeError(f"no generation for region {region_id}")
                 coordinator.write_region_worker(
                     worker_conn,
-                    dataset=ds,
+                    dataset=dataset,
                     member=member,
                     generation=generation,
                     expected_leads=spec.lead_time_hours,
@@ -947,34 +1054,23 @@ async def _run_wave(
 
         # Retained-seed writer uses the retained dataset (no re-parse).
         def _run_seed_region() -> None:
-            worker_conn = engine.connect()
-            try:
-                region_id = _region_id_for(seed_lead, seed_member)
-                generation = generation_by_region.get(region_id)
-                if generation is None:
-                    raise RuntimeError(f"no generation for region {region_id}")
-                coordinator.write_region_worker(
-                    worker_conn,
-                    dataset=seed_dataset,
-                    member=seed_member,
-                    generation=generation,
-                    expected_leads=spec.lead_time_hours,
-                    expected_members=spec.members,
-                )
-            finally:
-                worker_conn.close()
+            region_id = _region_id_for(seed_lead, seed_member)
+            generation = generation_by_region.get(region_id)
+            if generation is None:
+                raise RuntimeError(f"no generation for region {region_id}")
+            _run_region_write(seed_dataset, seed_member, seed_lead, generation)
 
         loop = asyncio.get_event_loop()
 
-        # Seed task: starts immediately after pre-update
+        # Seed task: starts immediately after pre-update under write_sem admission
         async def _run_seed_task() -> None:
             if cancel_event.is_set():
                 return
-            async with ingest_sem:
+            async with write_sem:
                 if cancel_event.is_set():
                     return
                 logger.debug(
-                    "ingest_start: model=%s cycle=%s member=%s lead=%s",
+                    "write_start: model=%s cycle=%s member=%s lead=%s",
                     spec.model,
                     spec.cycle_time,
                     seed_member,
@@ -998,7 +1094,7 @@ async def _run_wave(
                 try:
                     fut.result()
                     logger.debug(
-                        "ingest_complete: model=%s cycle=%s member=%s lead=%s",
+                        "write_complete: model=%s cycle=%s member=%s lead=%s",
                         spec.model,
                         spec.cycle_time,
                         seed_member,
@@ -1014,13 +1110,14 @@ async def _run_wave(
 
         pipeline_tasks.append(asyncio.create_task(_run_seed_task()))
 
-        # Non-seed pipeline tasks: bounded download -> bounded ingest admission -> decode -> write
+        # Non-seed pipeline tasks:
+        # bounded download -> bounded decode & parent normalize -> bounded write admission -> write
         async def _pipeline_item(member: int | None, lead: int) -> None:
             if cancel_event.is_set():
                 return
             dest = _destination_for(spec, staging_dir, lead=lead, member=member)
 
-            # Stage 1: Pipeline admission (bounds total in-flight staged/active work)
+            # Stage 1: Pipeline admission (bounds total in-flight active/queued work)
             async with staging_sem:
                 if cancel_event.is_set():
                     return
@@ -1055,30 +1152,75 @@ async def _run_wave(
                         )
                     except Exception as exc:  # noqa: BLE001 - report download failure
                         failures.append(
-                            f"{spec.model} member={member} lead={lead}: {exc}"
+                            f"{spec.model} member={member} lead={lead} download: {exc}"
                         )
                         return
 
-                # Stage 3: Ingest admission (bounds executor submission)
+                # Stage 3: Bounded decode (ProcessPool execution + parent normalization)
+                # ZERO DB connections checked out during this compute-intensive phase.
                 if cancel_event.is_set():
                     return
-                async with ingest_sem:
+                ds: xr.Dataset | None = None
+                async with decode_sem:
                     if cancel_event.is_set():
                         return
                     logger.debug(
-                        "ingest_start: model=%s cycle=%s member=%s lead=%s",
+                        "decode_start: model=%s cycle=%s member=%s lead=%s",
                         spec.model,
                         spec.cycle_time,
                         member,
                         lead,
                     )
+                    decode_fut = decode_pool.submit(dest)
+                    try:
+                        raw_ds = await asyncio.wrap_future(decode_fut)
+                        ds = _apply_variable_mapping(raw_ds, catalog_spec.variables)
+                        ds = _normalize_canonical_units(ds, catalog_spec.variables)
+                        ds.attrs["model_id"] = catalog_spec.model_id
+                        _validate_requested_lead(ds, lead)
+                        _validate_requested_member(ds, member)
+                        logger.debug(
+                            "decode_complete: model=%s cycle=%s member=%s lead=%s",
+                            spec.model,
+                            spec.cycle_time,
+                            member,
+                            lead,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report decode failure
+                        failures.append(
+                            f"{spec.model} member={member} lead={lead} decode: {exc}"
+                        )
+                        return
+
+                # Stage 4: Bounded write admission (application-level backpressure BEFORE thread submission)
+                if cancel_event.is_set():
+                    return
+                region_id = _region_id_for(lead, member)
+                generation = generation_by_region.get(region_id)
+                if generation is None:
+                    failures.append(
+                        f"{spec.model} member={member} lead={lead}: no generation for region {region_id}"
+                    )
+                    return
+
+                async with write_sem:
+                    if cancel_event.is_set():
+                        return
+                    logger.debug(
+                        "write_start: model=%s cycle=%s member=%s lead=%s",
+                        spec.model,
+                        spec.cycle_time,
+                        member,
+                        lead,
+                    )
+                    assert ds is not None
                     worker_fut = loop.run_in_executor(
-                        executor, _run_region_worker, member, lead
+                        executor, _run_region_write, ds, member, lead, generation
                     )
                     with futures_lock:
                         registered_worker_futures.append(worker_fut)
 
-                    # Stage 4: Non-abandoning worker wait
+                    # Stage 5: Non-abandoning worker wait
                     cancel_requested = False
                     while not worker_fut.done():
                         try:
@@ -1093,16 +1235,19 @@ async def _run_wave(
                     try:
                         worker_fut.result()
                         logger.debug(
-                            "ingest_complete: model=%s cycle=%s member=%s lead=%s",
+                            "write_complete: model=%s cycle=%s member=%s lead=%s",
                             spec.model,
                             spec.cycle_time,
                             member,
                             lead,
                         )
-                    except Exception as exc:  # noqa: BLE001 - report ingest failure
+                    except Exception as exc:  # noqa: BLE001 - report write failure
                         failures.append(
-                            f"{spec.model} member={member} lead={lead}: {exc}"
+                            f"{spec.model} member={member} lead={lead} write: {exc}"
                         )
+                    finally:
+                        # Drop local dataset reference so memory is freed promptly
+                        ds = None
 
                     if cancel_requested:
                         raise asyncio.CancelledError
@@ -1181,18 +1326,6 @@ async def _run_wave(
         raise asyncio.CancelledError
 
     return status
-
-    if failures:
-        raise RuntimeError(
-            f"{len(failures)}/{len(items)} file(s) failed for "
-            f"model={spec.model} cycle={spec.cycle_time}: "
-            + "; ".join(failures[:5])
-            + ("; ..." if len(failures) > 5 else "")
-        )
-    print(
-        f"Ingested {len(items)} region(s) for model={spec.model} "
-        f"cycle={spec.cycle_time} ({status}) -> {store_path}"
-    )
 
 
 def _decode_and_normalize(

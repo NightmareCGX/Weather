@@ -26,6 +26,7 @@ from ingestion.core.config import IngestionSettings, settings
 
 #: Default chunks applied per dimension when none are provided.
 DEFAULT_CHUNKS: Mapping[str, int] = {
+    "member": 1,
     "time": 1,
     "lead_time_hours": 1,
     "isobaricInhPa": 1,

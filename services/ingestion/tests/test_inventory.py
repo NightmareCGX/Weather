@@ -274,3 +274,70 @@ def test_physical_conflict_keys_deterministic_disjoint(tmp_path) -> None:
     assert k6 != k12
     assert k6[0].startswith("temperature_2m/0.")
     assert k12[0].startswith("temperature_2m/1.")
+
+
+@pytest.mark.parametrize("member,expected_m_chunk", [(1, 0), (15, 14), (30, 29)])
+@pytest.mark.parametrize("lead_idx", [0, 1, 8])
+def test_region_expected_matches_conflict_keys_member_chunk_1(tmp_path, member, expected_m_chunk, lead_idx) -> None:
+    """Under member_chunk=1, region_expected_object_keys and physical_conflict_keys
+    must be 100% identical and map to the specific member's chunk coordinate."""
+    store = tmp_path / f"ens_mc1_{member}_{lead_idx}.zarr"
+    var_dir = store / "temperature_2m"
+    var_dir.mkdir(parents=True)
+    import json as _json
+
+    _json.dump(
+        {"shape": [30, 10, 4, 4], "chunks": [1, 1, 2, 2], "zarr_format": 2},
+        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    )
+    _json.dump(
+        {"_ARRAY_DIMENSIONS": ["member", "lead_time_hours", "latitude", "longitude"]},
+        open(var_dir / ".zattrs", "w", encoding="utf-8"),
+    )
+    from ingestion.core.inventory import physical_conflict_keys, region_expected_object_keys
+
+    exp_keys = region_expected_object_keys(
+        str(store), member=member, lead_index=lead_idx, data_var_paths=["temperature_2m"]
+    )
+    conf_keys = physical_conflict_keys(
+        str(store), member=member, lead_index=lead_idx, data_var_paths=["temperature_2m"]
+    )
+
+    assert exp_keys == conf_keys
+    assert len(exp_keys) == 4  # 2x2 spatial chunks
+    prefix = f"temperature_2m/{expected_m_chunk}.{lead_idx}."
+    assert all(k.startswith(prefix) for k in exp_keys)
+
+
+@pytest.mark.parametrize("member", [1, 15, 30])
+@pytest.mark.parametrize("lead_idx", [0, 5])
+def test_region_expected_matches_conflict_keys_legacy_member_chunk_30(tmp_path, member, lead_idx) -> None:
+    """Under legacy member_chunk=30, all members map to member chunk 0 and
+    region_expected_object_keys and physical_conflict_keys are identical."""
+    store = tmp_path / f"ens_mc30_{member}_{lead_idx}.zarr"
+    var_dir = store / "temperature_2m"
+    var_dir.mkdir(parents=True)
+    import json as _json
+
+    _json.dump(
+        {"shape": [30, 10, 4, 4], "chunks": [30, 1, 2, 2], "zarr_format": 2},
+        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    )
+    _json.dump(
+        {"_ARRAY_DIMENSIONS": ["member", "lead_time_hours", "latitude", "longitude"]},
+        open(var_dir / ".zattrs", "w", encoding="utf-8"),
+    )
+    from ingestion.core.inventory import physical_conflict_keys, region_expected_object_keys
+
+    exp_keys = region_expected_object_keys(
+        str(store), member=member, lead_index=lead_idx, data_var_paths=["temperature_2m"]
+    )
+    conf_keys = physical_conflict_keys(
+        str(store), member=member, lead_index=lead_idx, data_var_paths=["temperature_2m"]
+    )
+
+    assert exp_keys == conf_keys
+    assert len(exp_keys) == 4
+    prefix = f"temperature_2m/0.{lead_idx}."
+    assert all(k.startswith(prefix) for k in exp_keys)
+

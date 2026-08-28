@@ -47,7 +47,8 @@ def _minio_reachable(conn_settings: IngestionSettings) -> bool:
         secure=conn_settings.MINIO_SECURE,
     )
     try:
-        client.bucket_exists(conn_settings.MINIO_BUCKET_NAME)
+        if not client.bucket_exists(conn_settings.MINIO_BUCKET_NAME):
+            client.make_bucket(conn_settings.MINIO_BUCKET_NAME)
         return True
     except S3Error:
         # Reachable but rejected (bad credentials, invalid configuration).
