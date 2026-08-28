@@ -607,6 +607,7 @@ class RunCoordinator:
         expected_leads: tuple[int, ...],
         expected_members: tuple[int, ...],
         observer: object | None = None,
+        marker_concurrency: int | None = None,
     ) -> FinalizeResult:
         """Run the single coalesced finalization for the bounded CLI wave.
 
@@ -649,9 +650,11 @@ class RunCoordinator:
                         self._zarray_cache[array_path] = za
             committed: dict[str, str] = {}  # region_id -> generation
             updating: list[str] = []
-            for key in marker_keys:
+            marker_results = _read_marker_payloads_bounded(
+                self.store_path, marker_keys, max_concurrency=marker_concurrency
+            )
+            for key, payload in marker_results:
                 region_id = key.rsplit("/", 1)[-1].removesuffix(".json")
-                payload = _read_marker_payload(self.store_path, key)
                 state = payload.get("state")
                 gen = payload.get("generation")
                 if state == "complete":
@@ -870,6 +873,60 @@ def _read_marker_payload(store_path: str, key: str) -> dict[str, object]:
         lead = int(rest)
         return read_region_marker(store_path, lead_time_hours=lead, member=member)
     return {"state": "absent"}
+
+
+def _read_marker_payloads_bounded(
+    store_path: str,
+    marker_keys: list[str],
+    *,
+    max_concurrency: int | None = None,
+) -> list[tuple[str, dict[str, object]]]:
+    """Read marker payloads for the given keys using bounded thread concurrency.
+
+    Preserves input key order in the returned tuples. If any marker read fails
+    with an exception, the exception is propagated immediately and all worker
+    resources are cleaned up.
+
+    Args:
+        store_path: Root of the Zarr store.
+        marker_keys: List of marker relative keys to read.
+        max_concurrency: Maximum number of concurrent worker threads. Defaults
+            to ``settings.MARKER_GET_CONCURRENCY`` (clamped to at least 1).
+
+    Returns:
+        List of (key, payload) tuples in the exact order of ``marker_keys``.
+    """
+    if not marker_keys:
+        return []
+
+    from ingestion.core.config import settings
+
+    concurrency = int(
+        max_concurrency
+        if max_concurrency is not None
+        else getattr(settings, "MARKER_GET_CONCURRENCY", 32)
+    )
+    concurrency = max(1, min(concurrency, len(marker_keys)))
+
+    if concurrency == 1 or len(marker_keys) == 1:
+        return [(k, _read_marker_payload(store_path, k)) for k in marker_keys]
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [
+            executor.submit(_read_marker_payload, store_path, k) for k in marker_keys
+        ]
+        try:
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()
+        except BaseException:
+            for fut in futures:
+                fut.cancel()
+            raise
+
+        payloads = [fut.result() for fut in futures]
+        return list(zip(marker_keys, payloads, strict=True))
 
 
 def _lead_index_in_store(store_path: str, lead_time_hours: int) -> int:

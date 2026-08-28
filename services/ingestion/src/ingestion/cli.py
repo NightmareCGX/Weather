@@ -733,6 +733,78 @@ def _destination_for(
     return staging_dir / f"{name}.grib2"
 
 
+def _cleanup_sources(staging_dir: Path, destinations: list[Path] | set[Path]) -> None:
+    """Delete successfully-ingested source files and their associated .idx cache files.
+
+    Performs direct O(1) unlinks for primary source files and direct index files,
+    followed by at most one single directory scan to unlink hash-based cfgrib index files
+    matching the committed artifacts. Eliminates repeated O(N^2) directory globs.
+
+    Deletion is best-effort post-commit resource reclamation. Failure to delete
+    an already-committed artifact logs a warning and does not invalidate
+    committed forecast data. Only filesystem errors (OSError) are caught.
+
+    Args:
+        staging_dir: Parent directory containing the staged files.
+        destinations: Collection of staged GRIB2 file paths to remove.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    if not destinations:
+        return
+
+    dest_set = set(destinations)
+    committed_names = {d.name for d in dest_set}
+
+    # 1. Direct O(1) unlinks for primary files and exact .idx files
+    for destination in dest_set:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Failed to delete committed source artifact %s: %s; data is safe.",
+                destination,
+                exc,
+            )
+
+        direct_idx = Path(f"{destination}.idx")
+        if direct_idx.name != destination.name:
+            try:
+                direct_idx.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to delete direct index artifact %s: %s; data is safe.",
+                    direct_idx,
+                    exc,
+                )
+
+    # 2. Single-pass directory scan for cfgrib hash index files: <filename>.<hash>.idx
+    try:
+        if staging_dir.exists():
+            for entry in staging_dir.iterdir():
+                try:
+                    if entry.name.endswith(".idx"):
+                        no_ext = entry.name.removesuffix(".idx")
+                        candidate = (
+                            no_ext.rpartition(".")[0] if "." in no_ext else no_ext
+                        )
+                        if candidate in committed_names or no_ext in committed_names:
+                            entry.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to delete index artifact %s: %s; data is safe.",
+                        entry,
+                        exc,
+                    )
+    except OSError as exc:
+        logger.warning(
+            "Error scanning for index artifacts in %s: %s; data is safe.",
+            staging_dir,
+            exc,
+        )
+
+
 def _cleanup_source(destination: Path) -> None:
     """Delete a successfully-ingested source file and its associated .idx cache files.
 
@@ -743,51 +815,7 @@ def _cleanup_source(destination: Path) -> None:
     Args:
         destination: Path to the staged GRIB2 file to remove.
     """
-    import logging
-
-    logger = logging.getLogger(__name__)
-
-    # 1. Delete the primary GRIB2 file
-    try:
-        destination.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning(
-            "Failed to delete committed source artifact %s: %s; data is safe.",
-            destination,
-            exc,
-        )
-
-    # 2. Delete strictly associated index files (*.grib2.<hash>.idx and *.grib2.idx)
-    try:
-        parent_dir = destination.parent
-        if parent_dir.exists():
-            # Matches cfgrib hash index files: <filename>.<hash>.idx
-            for idx_file in parent_dir.glob(f"{destination.name}.*.idx"):
-                try:
-                    idx_file.unlink(missing_ok=True)
-                except OSError as exc:
-                    logger.warning(
-                        "Failed to delete index artifact %s: %s; data is safe.",
-                        idx_file,
-                        exc,
-                    )
-            # Matches direct index files: <filename>.idx
-            direct_idx = Path(f"{destination}.idx")
-            if direct_idx.name != destination.name:
-                try:
-                    direct_idx.unlink(missing_ok=True)
-                except OSError as exc:
-                    logger.warning(
-                        "Failed to delete direct index artifact %s: %s; data is safe.",
-                        direct_idx,
-                        exc,
-                    )
-    except OSError as exc:
-        logger.warning(
-            "Error scanning for index artifacts of %s: %s; data is safe.",
-            destination,
-            exc,
-        )
+    _cleanup_sources(destination.parent, [destination])
 
 
 def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
@@ -1370,13 +1398,16 @@ async def _run_wave(
         # Post-finalization cleanup: clean up only regions proven committed
         # by THIS wave's generation, unless --keep-downloads is set.
         if not getattr(args, "keep_downloads", False):
+            committed_dests: list[Path] = []
             for r in regions:
                 committed_gen = finalize_result.committed_regions.get(r.region_id)
                 if committed_gen is not None and committed_gen == r.generation:
                     dest = _destination_for(
                         spec, staging_dir, lead=r.lead_time_hours, member=r.member
                     )
-                    _cleanup_source(dest)
+                    committed_dests.append(dest)
+            if committed_dests:
+                _cleanup_sources(staging_dir, committed_dests)
             # Best-effort removal of the owned staging directory.
             try:
                 staging_dir.rmdir()
