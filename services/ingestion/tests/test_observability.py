@@ -19,6 +19,7 @@ from ingestion.core.observability import (
     RichLiveRenderer,
     StartupTimeline,
     create_progress_renderer,
+    logger as obs_logger,
 )
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "gfs.t00z.pgrb2.0p25.f006.grib2")
@@ -392,19 +393,26 @@ def test_bounded_memory_invariant() -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_debug_logging_efficiency(caplog) -> None:
+def test_debug_logging_efficiency(caplog: pytest.LogCaptureFixture) -> None:
     """Structured stage transitions log under DEBUG and produce zero output at INFO."""
     tracker = PipelineProgressTracker(model="gfs", cycle_str="2026-07-21 00:00Z", total_items=1)
+    logger_name = obs_logger.name
+    obs_logger.disabled = False
 
-    caplog.set_level(logging.INFO)
+    # At INFO: logger is not DEBUG-enabled, taking the fast-path with zero records emitted
+    caplog.set_level(logging.INFO, logger=logger_name)
     tracker.log_stage_transition(member=None, lead=6, stage="download", event="start")
-    assert len(caplog.records) == 0
+    obs_records = [r for r in caplog.records if r.name == logger_name]
+    assert len(obs_records) == 0
 
-    caplog.set_level(logging.DEBUG)
+    # At DEBUG: logger is DEBUG-enabled, emitting the expected structured record
+    caplog.set_level(logging.DEBUG, logger=logger_name)
     tracker.log_stage_transition(member=1, lead=6, stage="download", event="complete", duration_ms=123.4)
-    assert len(caplog.records) == 1
-    assert "stage_transition: model=gfs" in caplog.records[0].message
-    assert "duration_ms=123.40" in caplog.records[0].message
+    obs_records = [r for r in caplog.records if r.name == logger_name]
+    assert len(obs_records) == 1
+    assert obs_records[0].levelno == logging.DEBUG
+    assert "stage_transition: model=gfs" in obs_records[0].message
+    assert "duration_ms=123.40" in obs_records[0].message
 
 
 # -----------------------------------------------------------------------------
