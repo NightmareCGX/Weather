@@ -17,9 +17,9 @@ from os import PathLike
 from typing import Hashable, Mapping, MutableMapping
 
 import numpy as np
-import numpy.typing as npt
 import s3fs  # type: ignore[import-untyped]
 import xarray as xr
+import zarr  # type: ignore[import-untyped]
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.config import IngestionSettings, settings
@@ -275,10 +275,12 @@ def prepare_run_store(
     """Pre-allocate the serving store for a run before region writes begin.
 
     The store is initialized with the full expected coordinate structure:
-    every expected lead (and, for GEFS, every expected member) as dimensions,
-    NaN-filled data variables. Subsequent per-file ``commit_region`` calls
-    write only their own (lead, member) slice, so writes are independent and
-    no whole-store read-modify-write ever happens.
+    every expected lead (and, for GEFS, every expected member) as dimensions.
+    Forecast data variables are initialized directly via Zarr schema metadata
+    without allocating full-grid NaN arrays or creating empty data chunks.
+    Subsequent per-file ``commit_region`` calls write only their own
+    (lead, member) slice, so writes are independent and no whole-store
+    read-modify-write ever happens.
 
     Args:
         dataset: A parsed (normalized) file of the run used to derive the grid
@@ -314,7 +316,40 @@ def prepare_run_store(
             leads = [int(v) for v in lead_values]
     members = list(expected_members) if expected_members else []
 
-    data_vars: dict[str, tuple[tuple[str, ...], npt.NDArray[np.float32]]] = {}
+    coords: dict[str, object] = {
+        "lead_time_hours": leads,
+        "latitude": lat,
+        "longitude": lon,
+    }
+    if expected_members:
+        coords["member"] = members
+
+    # Initialize store root with coordinates and attributes
+    ds_coords = xr.Dataset(coords=coords)
+    ds_coords.attrs = dict(dataset.attrs)
+    # Preserve the cycle identity on the store even when the source dataset
+    # carried it only as a ``time`` coordinate (the parser derives cycle_time
+    # from the GRIB ``time`` coord; synthetic datasets in tests may carry only
+    # ``time``). The pipeline's store-identity guard reads ``cycle_time``
+    # attribute then falls back to the ``time`` coordinate, so carrying either
+    # keeps the store identifiable.
+    if "cycle_time" not in ds_coords.attrs and "time" in dataset.coords:
+        import numpy as _np
+
+        value = dataset.coords["time"].values
+        item = value.item() if _np.ndim(value) != 0 else value
+        ds_coords.attrs["cycle_time"] = str(
+            _np.datetime_as_string(
+                _np.asarray(item, dtype="datetime64[ns]"), unit="s"
+            ).item()
+        )
+
+    resolved = _resolve_store(store)
+    ds_coords.to_zarr(resolved, mode="w", consolidated=False)
+
+    # Initialize data variables directly via Zarr schema metadata without
+    # allocating full logical forecast cubes or creating empty data chunks.
+    root = zarr.open_group(resolved, mode="a")
     for name, da in dataset.data_vars.items():
         # Only the spatial axes come from the source file; the lead (and for
         # GEFS, member) axes are the run's expected dimensions.
@@ -328,54 +363,26 @@ def prepare_run_store(
         else:
             dims = ("lead_time_hours",) + base_dims
             shape = (len(leads),) + grid_shape
-        filled: npt.NDArray[np.float32] = np.full(
-            shape, np.nan, dtype=da.dtype
+
+        chunks = tuple(
+            min(DEFAULT_CHUNKS.get(str(d), s), s)
+            for d, s in zip(dims, shape)
         )
-        data_vars[name] = (dims, filled)
-
-    coords: dict[str, object] = {
-        "lead_time_hours": leads,
-        "latitude": lat,
-        "longitude": lon,
-    }
-    if expected_members:
-        coords["member"] = members
-
-    store_ds = xr.Dataset(data_vars=data_vars, coords=coords)
-    # Copy the dataset and variable attributes (model_id, cycle_time, units,
-    # ...) from the source file so the store is self-describing about its
-    # forecast run and its canonical units.
-    store_ds.attrs = dict(dataset.attrs)
-    for name, da in dataset.data_vars.items():
-        store_ds[name].attrs = dict(da.attrs)
-    # Preserve the cycle identity on the store even when the source dataset
-    # carried it only as a ``time`` coordinate (the parser derives cycle_time
-    # from the GRIB ``time`` coord; synthetic datasets in tests may carry only
-    # ``time``). The pipeline's store-identity guard reads ``cycle_time``
-    # attribute then falls back to the ``time`` coordinate, so carrying either
-    # keeps the store identifiable.
-    if "cycle_time" not in store_ds.attrs and "time" in dataset.coords:
-        import numpy as _np
-
-        value = dataset.coords["time"].values
-        item = value.item() if _np.ndim(value) != 0 else value
-        store_ds.attrs["cycle_time"] = str(
-            _np.datetime_as_string(
-                _np.asarray(item, dtype="datetime64[ns]"), unit="s"
-            ).item()
+        fill_val = "NaN" if np.issubdtype(da.dtype, np.floating) else None
+        arr = root.create_dataset(
+            str(name),
+            shape=shape,
+            chunks=chunks,
+            dtype=da.dtype,
+            compressor=Zstd(level=5),
+            fill_value=fill_val,
+            order="C",
         )
-    # Don't write empty (all-NaN) chunks for the un-committed regions; only
-    # committed regions materialize chunks.
-    chunk_map = _chunk_sizes(store_ds, DEFAULT_CHUNKS)
-    encoding = {
-        name: {
-            "chunks": chunk_map[name],
-            "compressor": Zstd(level=5),
-            "write_empty_chunks": False,
-        }
-        for name in store_ds.data_vars
-    }
-    store_ds.to_zarr(_resolve_store(store), mode="w", encoding=encoding)
+        var_attrs: dict[str, object] = {"_ARRAY_DIMENSIONS": list(dims)}
+        var_attrs.update(da.attrs)
+        arr.attrs.update(var_attrs)
+
+    zarr.consolidate_metadata(resolved)
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
 
 
