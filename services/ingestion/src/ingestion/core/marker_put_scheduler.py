@@ -47,6 +47,7 @@ def put_markers_rolling(
     cancel_event: threading.Event,
     timeout_seconds: float,
     executor: concurrent.futures.ThreadPoolExecutor,
+    observer: object | None = None,
 ) -> MarkerPutResult:
     """Submit marker PUTs with a rolling concurrency bound.
 
@@ -58,6 +59,7 @@ def put_markers_rolling(
         timeout_seconds: Per-PUT storage/network timeout (a slow PUT bounds the
             drain).
         executor: The thread pool to run PUTs on.
+        observer: Optional observer receiving progress updates.
 
     Returns:
         A :class:`MarkerPutResult` with successes, failures, and cancelled
@@ -68,6 +70,16 @@ def put_markers_rolling(
     failures: list[tuple[str, BaseException]] = []
     lock = threading.Lock()
 
+    def _notify_observer(active_count: int) -> None:
+        if observer is not None and hasattr(observer, "set_marker_progress"):
+            with lock:
+                done_count = len(successes) + len(failures)
+            observer.set_marker_progress(
+                done=done_count,
+                total=len(target_list),
+                active=active_count,
+            )
+
     def run_one(region_id: str) -> None:
         try:
             put_one(region_id)
@@ -76,6 +88,7 @@ def put_markers_rolling(
         except BaseException as exc:  # noqa: BLE001 - record; the scheduler drains
             with lock:
                 failures.append((region_id, exc))
+        _notify_observer(len(in_flight))
 
     # Rolling submission: an in-flight map future -> region id. Initially submit
     # up to `concurrency`. As futures complete, submit the next target. On the
@@ -110,6 +123,7 @@ def put_markers_rolling(
     for _ in range(min(concurrency, len(target_list))):
         if not submit_next():
             break
+    _notify_observer(len(in_flight))
 
     while True:
         # Collect completed futures.
