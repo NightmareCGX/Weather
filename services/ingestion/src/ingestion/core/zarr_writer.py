@@ -17,12 +17,12 @@ from os import PathLike
 from typing import Hashable, Mapping, MutableMapping
 
 import numpy as np
-import s3fs  # type: ignore[import-untyped]
 import xarray as xr
 import zarr  # type: ignore[import-untyped]
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.config import IngestionSettings, settings
+from ingestion.core.s3 import resolve_s3_mapper
 
 #: Default chunks applied per dimension when none are provided.
 DEFAULT_CHUNKS: Mapping[str, int] = {
@@ -70,7 +70,7 @@ def _resolve_store(
 def _resolve_s3_store(
     path: str, conn_settings: IngestionSettings
 ) -> MutableMapping[str, bytes]:
-    """Build an ``FSMap`` over an ``s3://`` URL using S3 settings.
+    """Build an ``FSMap`` over an ``s3://`` URL using thread-local S3 settings.
 
     Args:
         path: An ``s3://bucket/prefix`` URL.
@@ -82,27 +82,7 @@ def _resolve_s3_store(
     Raises:
         ValueError: If the bucket/prefix cannot be derived from the URL.
     """
-    rest = path[len("s3://") :].strip("/")
-    if not rest:
-        raise ValueError(f"Invalid S3 store URL: {path!r}")
-
-    fs = s3fs.S3FileSystem(
-        key=conn_settings.MINIO_ACCESS_KEY,
-        secret=conn_settings.MINIO_SECRET_KEY,
-        client_kwargs={"endpoint_url": _endpoint_url(conn_settings)},
-        use_listings_cache=False,
-    )
-    # ``get_mapper`` is untyped in the s3fs stub (import-untyped), so mypy
-    # sees ``Any``. Narrowing through a ``MutableMapping[str, bytes]``-typed
-    # intermediate enforces the declared return type instead of suppressing it.
-    mapper: MutableMapping[str, bytes] = fs.get_mapper(rest)
-    return mapper
-
-
-def _endpoint_url(conn_settings: IngestionSettings) -> str:
-    """Build the S3 endpoint URL from MinIO settings."""
-    scheme = "https" if conn_settings.MINIO_SECURE else "http"
-    return f"{scheme}://{conn_settings.MINIO_ENDPOINT}"
+    return resolve_s3_mapper(path, conn_settings)
 
 
 def write_dataset(
