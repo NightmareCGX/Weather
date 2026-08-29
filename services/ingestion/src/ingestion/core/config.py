@@ -73,8 +73,18 @@ class IngestionSettings(BaseSettings):
     # Wave pre-update marker-PUT concurrency / timeout (region-write protocol).
     MARKER_PUT_CONCURRENCY: Any = 8
     MARKER_PUT_TIMEOUT_SECONDS: Any = 30.0
+    # Coalesced finalization marker-GET concurrency (P1-B bounded retrieval).
+    MARKER_GET_CONCURRENCY: Any = 32
     # Advisory-lock acquisition timeout for the ingestion coordinator.
     ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
+
+    #: Maximum concurrent connections per S3 client connection pool for data-plane chunk writes (P2 Phase 1).
+    #: Sized to allow high concurrent chunk PUT throughput within region writes.
+    S3_MAX_POOL_CONNECTIONS: Any = 50
+
+    #: Maximum concurrent connections per S3 client connection pool for control-plane operations (markers, inventory).
+    #: Matched to MARKER_GET_CONCURRENCY / MARKER_PUT_CONCURRENCY without excess socket allocation.
+    S3_CONTROL_MAX_POOL_CONNECTIONS: Any = 32
 
     @model_validator(mode="after")
     def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
@@ -84,6 +94,9 @@ class IngestionSettings(BaseSettings):
         max_download = int(self.MAX_DOWNLOAD_CONCURRENCY)
         max_decode = int(self.MAX_DECODE_CONCURRENCY)
         max_write = int(self.MAX_WRITE_CONCURRENCY)
+        max_marker_get = int(self.MARKER_GET_CONCURRENCY)
+        s3_max_pool = int(self.S3_MAX_POOL_CONNECTIONS)
+        s3_ctrl_pool = int(self.S3_CONTROL_MAX_POOL_CONNECTIONS)
 
         if pool_size < 1:
             raise ValueError(f"DB_POOL_SIZE must be >= 1, got {pool_size}")
@@ -109,6 +122,18 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"MAX_WRITE_CONCURRENCY ({max_write}) must not exceed "
                 f"DB_POOL_SIZE ({pool_size}) to prevent QueuePool saturation"
+            )
+        if max_marker_get < 1:
+            raise ValueError(
+                f"MARKER_GET_CONCURRENCY must be >= 1, got {max_marker_get}"
+            )
+        if s3_max_pool < 1:
+            raise ValueError(
+                f"S3_MAX_POOL_CONNECTIONS must be >= 1, got {s3_max_pool}"
+            )
+        if s3_ctrl_pool < 1:
+            raise ValueError(
+                f"S3_CONTROL_MAX_POOL_CONNECTIONS must be >= 1, got {s3_ctrl_pool}"
             )
         return self
 

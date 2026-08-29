@@ -161,15 +161,36 @@ def test_counter_lifecycle_full_flow() -> None:
     assert tracker.counters.download_done == 2
     assert tracker.counters.decode_queued == 1
 
-    # Seed write lifecycle
+    # Seed write lifecycle (seed leaves write_waiting and enters write_active)
     tracker.on_write_start(member=1, lead=6, is_seed=True)
     assert tracker.counters.write_active == 1
-    assert tracker.counters.write_waiting == 1  # non-seed item 2 still waiting
+    assert tracker.counters.write_waiting == 0
 
     tracker.on_write_complete(member=1, lead=6, duration_ms=50.0)
     assert tracker.counters.write_active == 0
     assert tracker.counters.write_done == 1
     assert tracker.counters.overall_done == 1
+
+    # Non-seed item 2 decode lifecycle (enters write_waiting)
+    tracker.on_decode_start(member=2, lead=6)
+    assert tracker.counters.decode_queued == 0
+    assert tracker.counters.decode_active == 1
+
+    tracker.on_decode_complete(member=2, lead=6, duration_ms=90.0)
+    assert tracker.counters.decode_active == 0
+    assert tracker.counters.decode_done == 2
+    assert tracker.counters.write_waiting == 1
+
+    # Non-seed item 2 write lifecycle (leaves write_waiting)
+    tracker.on_write_start(member=2, lead=6, is_seed=False)
+    assert tracker.counters.write_active == 1
+    assert tracker.counters.write_waiting == 0
+
+    tracker.on_write_complete(member=2, lead=6, duration_ms=50.0)
+    assert tracker.counters.write_active == 0
+    assert tracker.counters.write_done == 2
+    assert tracker.counters.overall_done == 2
+    assert tracker.counters.write_waiting == 0
 
     # Finalize lifecycle
     tracker.on_finalize_start()
@@ -600,6 +621,256 @@ def test_gefs_30_member_startup_timeline_breakdown(session: Session, tmp_path, m
     assert "30" in out
     assert "Pre-Update Marker PUTs" in out
     assert "Total Cold-Start Delay" in out
+    assert "Pipeline Drain Milestones:" in out
+    assert "downloads_drained" in out
+    assert "decodes_drained" in out
+    assert "writes_drained" in out
+    assert "Tail Physical Write Drain (decodes_drained -> writes_drained)" in out
+
+
+# -----------------------------------------------------------------------------
+# 7. Phase 2A Observability Tests (Tests A - G)
+# -----------------------------------------------------------------------------
+
+
+def test_seed_write_waiting_counter_lifecycle() -> None:
+    """Test A — Seed lifecycle: verify write_waiting transitions 0 -> 1 -> 0."""
+    tracker = PipelineProgressTracker(
+        model="gfs",
+        cycle_str="2026-07-21 00:00Z",
+        total_items=1,
+    )
+    # Initial state
+    assert tracker.counters.write_waiting == 0
+    assert tracker.counters.write_active == 0
+    assert tracker.counters.write_done == 0
+
+    # 1. Seed download lifecycle
+    tracker.on_download_start(member=None, lead=6, is_seed=True)
+    tracker.on_download_complete(member=None, lead=6, duration_ms=100.0)
+
+    # 2. Seed decode lifecycle (decode complete -> enters write_waiting)
+    tracker.on_decode_start(member=None, lead=6)
+    tracker.on_decode_complete(member=None, lead=6, duration_ms=50.0)
+    assert tracker.counters.write_waiting == 1
+    assert tracker.counters.write_active == 0
+
+    # 3. Seed write start (leaves write_waiting -> enters write_active)
+    tracker.on_write_start(member=None, lead=6, is_seed=True)
+    assert tracker.counters.write_waiting == 0
+    assert tracker.counters.write_active == 1
+
+    # 4. Seed write complete (leaves write_active -> enters write_done)
+    tracker.on_write_complete(member=None, lead=6, duration_ms=40.0)
+    assert tracker.counters.write_waiting == 0
+    assert tracker.counters.write_active == 0
+    assert tracker.counters.write_done == 1
+
+
+def test_full_mixed_lifecycle_counter_accounting() -> None:
+    """Test B — Full mixed lifecycle: 1 seed + N non-seed items ending with write_waiting=0."""
+    n_non_seed = 5
+    total = 1 + n_non_seed
+    tracker = PipelineProgressTracker(
+        model="gefs",
+        cycle_str="2026-07-21 00:00Z",
+        total_items=total,
+    )
+
+    # Seed flow
+    tracker.on_download_start(member=1, lead=6, is_seed=True)
+    tracker.on_download_complete(member=1, lead=6, duration_ms=100.0)
+    tracker.on_decode_start(member=1, lead=6)
+    tracker.on_decode_complete(member=1, lead=6, duration_ms=50.0)
+    assert tracker.counters.write_waiting == 1
+
+    tracker.on_write_start(member=1, lead=6, is_seed=True)
+    assert tracker.counters.write_waiting == 0
+    assert tracker.counters.write_active == 1
+
+    tracker.on_write_complete(member=1, lead=6, duration_ms=40.0)
+    assert tracker.counters.write_active == 0
+    assert tracker.counters.write_done == 1
+    assert tracker.counters.write_waiting == 0
+
+    # Non-seed items flow
+    for m in range(2, 2 + n_non_seed):
+        tracker.on_download_start(member=m, lead=6, is_seed=False)
+        tracker.on_download_complete(member=m, lead=6, duration_ms=80.0)
+        tracker.on_decode_start(member=m, lead=6)
+        tracker.on_decode_complete(member=m, lead=6, duration_ms=40.0)
+
+    # All 5 non-seed items finished decode -> write_waiting should be 5
+    assert tracker.counters.write_waiting == n_non_seed
+
+    # Start writing all 5 non-seed items
+    for m in range(2, 2 + n_non_seed):
+        tracker.on_write_start(member=m, lead=6, is_seed=False)
+    assert tracker.counters.write_waiting == 0
+    assert tracker.counters.write_active == n_non_seed
+
+    # Complete writing all 5 non-seed items
+    for m in range(2, 2 + n_non_seed):
+        tracker.on_write_complete(member=m, lead=6, duration_ms=30.0)
+
+    # Final state: active=0, done=total, waiting=0
+    assert tracker.counters.write_active == 0
+    assert tracker.counters.write_done == total
+    assert tracker.counters.write_waiting == 0
+
+
+def test_no_negative_waiting_counts_under_valid_and_out_of_order_events() -> None:
+    """Test C — No negative waiting counts under valid or edge-case event ordering."""
+    tracker = PipelineProgressTracker(
+        model="gfs",
+        cycle_str="2026-07-21 00:00Z",
+        total_items=2,
+    )
+    assert tracker.counters.write_waiting == 0
+
+    # Starting write when waiting is 0 must not underflow
+    tracker.on_write_start(member=None, lead=6, is_seed=False)
+    assert tracker.counters.write_waiting == 0
+    tracker.on_write_start(member=None, lead=12, is_seed=True)
+    assert tracker.counters.write_waiting == 0
+
+
+def test_tail_drain_milestone_ordering() -> None:
+    """Test D — Milestone ordering: downloads_drained <= decodes_drained <= writes_drained <= finalize_start."""
+    tracker = PipelineProgressTracker(
+        model="gfs",
+        cycle_str="2026-07-21 00:00Z",
+        total_items=2,
+    )
+
+    t0 = 1000.0
+    tracker.record_milestone("run_start", t0)
+
+    # Item 1 (seed)
+    tracker.on_download_start(member=None, lead=6, is_seed=True)
+    tracker.on_download_complete(member=None, lead=6, duration_ms=10.0)
+    tracker.on_decode_start(member=None, lead=6)
+    tracker.on_decode_complete(member=None, lead=6, duration_ms=10.0)
+
+    # Item 2 (non-seed) download completes -> downloads_drained recorded
+    tracker.on_download_start(member=None, lead=12, is_seed=False)
+    tracker.timeline.record("downloads_drained", t0 + 5.0)
+    tracker.on_download_complete(member=None, lead=12, duration_ms=10.0)
+
+    # Item 2 decode completes -> decodes_drained recorded
+    tracker.on_decode_start(member=None, lead=12)
+    tracker.timeline.record("decodes_drained", t0 + 7.0)
+    tracker.on_decode_complete(member=None, lead=12, duration_ms=10.0)
+
+    # Item 1 and Item 2 writes complete -> writes_drained recorded
+    tracker.on_write_start(member=None, lead=6, is_seed=True)
+    tracker.on_write_complete(member=None, lead=6, duration_ms=10.0)
+    tracker.on_write_start(member=None, lead=12, is_seed=False)
+    tracker.timeline.record("writes_drained", t0 + 15.0)
+    tracker.on_write_complete(member=None, lead=12, duration_ms=10.0)
+
+    # Finalization start
+    tracker.timeline.record("finalize_start", t0 + 15.003)
+    tracker.on_finalize_start()
+    tracker.timeline.record("finalize_complete", t0 + 19.0)
+    tracker.on_finalize_complete(duration_ms=4000.0)
+
+    t_dl = tracker.timeline.get("downloads_drained")
+    t_dec = tracker.timeline.get("decodes_drained")
+    t_wr = tracker.timeline.get("writes_drained")
+    t_fin_start = tracker.timeline.get("finalize_start")
+    t_fin_end = tracker.timeline.get("finalize_complete")
+
+    assert t_dl is not None
+    assert t_dec is not None
+    assert t_wr is not None
+    assert t_fin_start is not None
+    assert t_fin_end is not None
+
+    assert t_dl <= t_dec
+    assert t_dec <= t_wr
+    assert t_wr <= t_fin_start
+    assert t_fin_start <= t_fin_end
+
+
+def test_tail_write_interval_calculation_and_reporting() -> None:
+    """Test E — Tail-write interval: decodes_drained < writes_drained correctly formatted."""
+    timeline = StartupTimeline()
+    t0 = 500.0
+    timeline.record("run_start", t0)
+    timeline.record("seed_download_start", t0 + 0.1)
+    timeline.record("seed_download_complete", t0 + 0.5)
+    timeline.record("seed_decode_start", t0 + 0.51)
+    timeline.record("seed_decode_complete", t0 + 0.71)
+    timeline.record("store_ready", t0 + 2.0)
+    timeline.record("first_non_seed_download_start", t0 + 2.1)
+
+    # Simulated producer drain vs writer drain
+    timeline.record("downloads_drained", t0 + 10.0)
+    timeline.record("decodes_drained", t0 + 12.0)
+    timeline.record("writes_drained", t0 + 31.2)  # 19.2s of tail physical writes
+    timeline.record("finalize_start", t0 + 31.203)  # 3ms of task teardown
+    timeline.record("finalize_complete", t0 + 35.0)
+
+    tail_dur = timeline.duration("decodes_drained", "writes_drained")
+    assert tail_dur is not None
+    assert pytest.approx(tail_dur, rel=1e-3) == 19.200
+
+    teardown_dur = timeline.duration("writes_drained", "finalize_start")
+    assert teardown_dur is not None
+    assert pytest.approx(teardown_dur, rel=1e-3) == 0.003
+
+    report = timeline.format_report(model="gefs", cycle_str="2026-07-21 00:00Z", total_items=1110)
+    assert "Pipeline Drain Milestones:" in report
+    assert "downloads_drained" in report
+    assert "decodes_drained" in report
+    assert "writes_drained" in report
+    assert "* Tail Physical Write Drain (decodes_drained -> writes_drained): 19.200s" in report
+    assert "* Task Teardown / Gate Transition (writes_drained -> finalize_start): 0.003s" in report
+
+
+def test_no_false_tail_write_drain_reporting() -> None:
+    """Test F — No false tail: when decodes and writes finish at the same time, duration is ~0s."""
+    timeline = StartupTimeline()
+    t0 = 100.0
+    timeline.record("run_start", t0)
+    timeline.record("downloads_drained", t0 + 5.0)
+    timeline.record("decodes_drained", t0 + 5.0)
+    timeline.record("writes_drained", t0 + 5.0)
+    timeline.record("finalize_start", t0 + 5.001)
+
+    tail_dur = timeline.duration("decodes_drained", "writes_drained")
+    assert tail_dur == 0.0
+
+    report = timeline.format_report(model="gfs", cycle_str="2026-07-21 00:00Z", total_items=1)
+    assert "* Tail Physical Write Drain (decodes_drained -> writes_drained): 0.000s" in report
+    assert "* Task Teardown / Gate Transition (writes_drained -> finalize_start): 0.001s" in report
+
+
+def test_gfs_gefs_report_drain_milestones_compatibility() -> None:
+    """Test G — GFS and GEFS timeline reports render drain milestones cleanly without errors."""
+    for model_name, n_items in [("gfs", 37), ("gefs", 1110)]:
+        tracker = PipelineProgressTracker(model=model_name, cycle_str="2026-07-21 00:00Z", total_items=n_items)
+        # Record minimal milestones
+        tracker.record_milestone("run_start", 100.0)
+        tracker.record_milestone("seed_download_start", 100.1)
+        tracker.record_milestone("seed_download_complete", 100.4)
+        tracker.record_milestone("first_non_seed_download_start", 101.0)
+        tracker.record_milestone("downloads_drained", 150.0)
+        tracker.record_milestone("decodes_drained", 151.0)
+        tracker.record_milestone("writes_drained", 170.0)
+        tracker.record_milestone("finalize_start", 170.002)
+
+        report = tracker.timeline.format_report(model=model_name, cycle_str="2026-07-21 00:00Z", total_items=n_items)
+        assert model_name.upper() in report
+        assert str(n_items) in report
+        assert "Pipeline Drain Milestones:" in report
+        assert "downloads_drained" in report
+        assert "decodes_drained" in report
+        assert "writes_drained" in report
+        assert "Tail Physical Write Drain" in report
+        assert "Task Teardown / Gate Transition" in report
+
 
 
 def test_gefs_510_region_startup_delay_measurement(session: Session, tmp_path, monkeypatch) -> None:

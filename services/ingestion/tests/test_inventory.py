@@ -341,3 +341,85 @@ def test_region_expected_matches_conflict_keys_legacy_member_chunk_30(tmp_path, 
     prefix = f"temperature_2m/0.{lead_idx}."
     assert all(k.startswith(prefix) for k in exp_keys)
 
+
+def test_verify_expected_object_keys_bounded(tmp_path) -> None:
+    """verify_expected_object_keys returns only the keys that exist among expected_keys."""
+    from ingestion.core.inventory import verify_expected_object_keys, region_expected_object_keys
+
+    store = _mk_store(tmp_path)
+    keys = region_expected_object_keys(store, member=None, lead_index=0, data_var_paths=["temperature_2m"])
+    # Write only keys[0] and keys[2]
+    _write_chunk(store, keys[0])
+    _write_chunk(store, keys[2])
+
+    confirmed = verify_expected_object_keys(store, keys)
+    assert confirmed == {keys[0], keys[2]}
+
+
+def test_dimension_separator_slash_respected(tmp_path) -> None:
+    """When .zarray defines dimension_separator='/', chunk keys use '/'."""
+    from ingestion.core.inventory import region_expected_object_keys
+
+    store = tmp_path / "slash.zarr"
+    var_dir = store / "temperature_2m"
+    var_dir.mkdir(parents=True)
+    import json as _json
+
+    _json.dump(
+        {
+            "shape": [2, 4, 4],
+            "chunks": [1, 2, 2],
+            "zarr_format": 2,
+            "dimension_separator": "/",
+        },
+        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    )
+    keys = region_expected_object_keys(str(store), member=None, lead_index=0, data_var_paths=["temperature_2m"])
+    assert keys == [
+        "temperature_2m/0/0/0",
+        "temperature_2m/0/0/1",
+        "temperature_2m/0/1/0",
+        "temperature_2m/0/1/1",
+    ]
+
+
+def test_derive_region_prefix_structural_isolation() -> None:
+    """Validate structural region prefix derivation for dot vs slash and member 1 vs 10."""
+    from ingestion.core.inventory import _derive_region_prefix
+
+    za_dot = {
+        "shape": [30, 37, 721, 1440],
+        "chunks": [1, 1, 100, 100],
+        "dimension_separator": ".",
+    }
+    za_slash = {
+        "shape": [30, 37, 721, 1440],
+        "chunks": [1, 1, 100, 100],
+        "dimension_separator": "/",
+    }
+    zattrs = {"_ARRAY_DIMENSIONS": ["member", "lead_time_hours", "latitude", "longitude"]}
+
+    # Member 1 (positional 0), lead 0
+    p1_0_dot = _derive_region_prefix("s3://fake/store.zarr", "temperature_2m", member=1, lead_index=0, za=za_dot, zattrs_cache={"temperature_2m": zattrs})
+    assert p1_0_dot == "temperature_2m/0.0."
+
+    # Member 10 (positional 9), lead 0
+    p10_0_dot = _derive_region_prefix("s3://fake/store.zarr", "temperature_2m", member=10, lead_index=0, za=za_dot, zattrs_cache={"temperature_2m": zattrs})
+    assert p10_0_dot == "temperature_2m/9.0."
+    assert not p10_0_dot.startswith(p1_0_dot)
+    assert not p1_0_dot.startswith(p10_0_dot)
+
+    # Slash separator: member 1, lead 6
+    p1_6_slash = _derive_region_prefix("s3://fake/store.zarr", "temperature_2m", member=1, lead_index=6, za=za_slash, zattrs_cache={"temperature_2m": zattrs})
+    assert p1_6_slash == "temperature_2m/0/6/"
+
+    # Legacy member_chunk=30 layout: member 15 -> member_chunk=0
+    za_legacy = {
+        "shape": [30, 37, 721, 1440],
+        "chunks": [30, 1, 100, 100],
+    }
+    p15_legacy = _derive_region_prefix("s3://fake/store.zarr", "temperature_2m", member=15, lead_index=2, za=za_legacy, zattrs_cache={"temperature_2m": zattrs})
+    assert p15_legacy == "temperature_2m/0.2."
+
+
+

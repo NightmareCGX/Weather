@@ -110,15 +110,9 @@ def _storage_backend(store_path: str) -> tuple[str, str]:
 
 
 def _s3_fs() -> "s3fs.S3FileSystem":
-    from ingestion.core.config import settings
+    from ingestion.core.s3 import get_control_s3_fs
 
-    scheme = "https" if settings.MINIO_SECURE else "http"
-    return s3fs.S3FileSystem(
-        key=settings.MINIO_ACCESS_KEY,
-        secret=settings.MINIO_SECRET_KEY,
-        client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
-        use_listings_cache=False,
-    )
+    return get_control_s3_fs()
 
 
 def _read_object(store_path: str, rel_key: str) -> bytes | None:

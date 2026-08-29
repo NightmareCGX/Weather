@@ -17,12 +17,12 @@ from os import PathLike
 from typing import Hashable, Mapping, MutableMapping
 
 import numpy as np
-import numpy.typing as npt
-import s3fs  # type: ignore[import-untyped]
 import xarray as xr
+import zarr  # type: ignore[import-untyped]
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.config import IngestionSettings, settings
+from ingestion.core.s3 import resolve_s3_mapper
 
 #: Default chunks applied per dimension when none are provided.
 DEFAULT_CHUNKS: Mapping[str, int] = {
@@ -70,7 +70,7 @@ def _resolve_store(
 def _resolve_s3_store(
     path: str, conn_settings: IngestionSettings
 ) -> MutableMapping[str, bytes]:
-    """Build an ``FSMap`` over an ``s3://`` URL using S3 settings.
+    """Build an ``FSMap`` over an ``s3://`` URL using thread-local S3 settings.
 
     Args:
         path: An ``s3://bucket/prefix`` URL.
@@ -82,27 +82,7 @@ def _resolve_s3_store(
     Raises:
         ValueError: If the bucket/prefix cannot be derived from the URL.
     """
-    rest = path[len("s3://") :].strip("/")
-    if not rest:
-        raise ValueError(f"Invalid S3 store URL: {path!r}")
-
-    fs = s3fs.S3FileSystem(
-        key=conn_settings.MINIO_ACCESS_KEY,
-        secret=conn_settings.MINIO_SECRET_KEY,
-        client_kwargs={"endpoint_url": _endpoint_url(conn_settings)},
-        use_listings_cache=False,
-    )
-    # ``get_mapper`` is untyped in the s3fs stub (import-untyped), so mypy
-    # sees ``Any``. Narrowing through a ``MutableMapping[str, bytes]``-typed
-    # intermediate enforces the declared return type instead of suppressing it.
-    mapper: MutableMapping[str, bytes] = fs.get_mapper(rest)
-    return mapper
-
-
-def _endpoint_url(conn_settings: IngestionSettings) -> str:
-    """Build the S3 endpoint URL from MinIO settings."""
-    scheme = "https" if conn_settings.MINIO_SECURE else "http"
-    return f"{scheme}://{conn_settings.MINIO_ENDPOINT}"
+    return resolve_s3_mapper(path, conn_settings)
 
 
 def write_dataset(
@@ -275,10 +255,12 @@ def prepare_run_store(
     """Pre-allocate the serving store for a run before region writes begin.
 
     The store is initialized with the full expected coordinate structure:
-    every expected lead (and, for GEFS, every expected member) as dimensions,
-    NaN-filled data variables. Subsequent per-file ``commit_region`` calls
-    write only their own (lead, member) slice, so writes are independent and
-    no whole-store read-modify-write ever happens.
+    every expected lead (and, for GEFS, every expected member) as dimensions.
+    Forecast data variables are initialized directly via Zarr schema metadata
+    without allocating full-grid NaN arrays or creating empty data chunks.
+    Subsequent per-file ``commit_region`` calls write only their own
+    (lead, member) slice, so writes are independent and no whole-store
+    read-modify-write ever happens.
 
     Args:
         dataset: A parsed (normalized) file of the run used to derive the grid
@@ -314,7 +296,40 @@ def prepare_run_store(
             leads = [int(v) for v in lead_values]
     members = list(expected_members) if expected_members else []
 
-    data_vars: dict[str, tuple[tuple[str, ...], npt.NDArray[np.float32]]] = {}
+    coords: dict[str, object] = {
+        "lead_time_hours": leads,
+        "latitude": lat,
+        "longitude": lon,
+    }
+    if expected_members:
+        coords["member"] = members
+
+    # Initialize store root with coordinates and attributes
+    ds_coords = xr.Dataset(coords=coords)
+    ds_coords.attrs = dict(dataset.attrs)
+    # Preserve the cycle identity on the store even when the source dataset
+    # carried it only as a ``time`` coordinate (the parser derives cycle_time
+    # from the GRIB ``time`` coord; synthetic datasets in tests may carry only
+    # ``time``). The pipeline's store-identity guard reads ``cycle_time``
+    # attribute then falls back to the ``time`` coordinate, so carrying either
+    # keeps the store identifiable.
+    if "cycle_time" not in ds_coords.attrs and "time" in dataset.coords:
+        import numpy as _np
+
+        value = dataset.coords["time"].values
+        item = value.item() if _np.ndim(value) != 0 else value
+        ds_coords.attrs["cycle_time"] = str(
+            _np.datetime_as_string(
+                _np.asarray(item, dtype="datetime64[ns]"), unit="s"
+            ).item()
+        )
+
+    resolved = _resolve_store(store)
+    ds_coords.to_zarr(resolved, mode="w", consolidated=False)
+
+    # Initialize data variables directly via Zarr schema metadata without
+    # allocating full logical forecast cubes or creating empty data chunks.
+    root = zarr.open_group(resolved, mode="a")
     for name, da in dataset.data_vars.items():
         # Only the spatial axes come from the source file; the lead (and for
         # GEFS, member) axes are the run's expected dimensions.
@@ -328,54 +343,26 @@ def prepare_run_store(
         else:
             dims = ("lead_time_hours",) + base_dims
             shape = (len(leads),) + grid_shape
-        filled: npt.NDArray[np.float32] = np.full(
-            shape, np.nan, dtype=da.dtype
+
+        chunks = tuple(
+            min(DEFAULT_CHUNKS.get(str(d), s), s)
+            for d, s in zip(dims, shape)
         )
-        data_vars[name] = (dims, filled)
-
-    coords: dict[str, object] = {
-        "lead_time_hours": leads,
-        "latitude": lat,
-        "longitude": lon,
-    }
-    if expected_members:
-        coords["member"] = members
-
-    store_ds = xr.Dataset(data_vars=data_vars, coords=coords)
-    # Copy the dataset and variable attributes (model_id, cycle_time, units,
-    # ...) from the source file so the store is self-describing about its
-    # forecast run and its canonical units.
-    store_ds.attrs = dict(dataset.attrs)
-    for name, da in dataset.data_vars.items():
-        store_ds[name].attrs = dict(da.attrs)
-    # Preserve the cycle identity on the store even when the source dataset
-    # carried it only as a ``time`` coordinate (the parser derives cycle_time
-    # from the GRIB ``time`` coord; synthetic datasets in tests may carry only
-    # ``time``). The pipeline's store-identity guard reads ``cycle_time``
-    # attribute then falls back to the ``time`` coordinate, so carrying either
-    # keeps the store identifiable.
-    if "cycle_time" not in store_ds.attrs and "time" in dataset.coords:
-        import numpy as _np
-
-        value = dataset.coords["time"].values
-        item = value.item() if _np.ndim(value) != 0 else value
-        store_ds.attrs["cycle_time"] = str(
-            _np.datetime_as_string(
-                _np.asarray(item, dtype="datetime64[ns]"), unit="s"
-            ).item()
+        fill_val = "NaN" if np.issubdtype(da.dtype, np.floating) else None
+        arr = root.create_dataset(
+            str(name),
+            shape=shape,
+            chunks=chunks,
+            dtype=da.dtype,
+            compressor=Zstd(level=5),
+            fill_value=fill_val,
+            order="C",
         )
-    # Don't write empty (all-NaN) chunks for the un-committed regions; only
-    # committed regions materialize chunks.
-    chunk_map = _chunk_sizes(store_ds, DEFAULT_CHUNKS)
-    encoding = {
-        name: {
-            "chunks": chunk_map[name],
-            "compressor": Zstd(level=5),
-            "write_empty_chunks": False,
-        }
-        for name in store_ds.data_vars
-    }
-    store_ds.to_zarr(_resolve_store(store), mode="w", encoding=encoding)
+        var_attrs: dict[str, object] = {"_ARRAY_DIMENSIONS": list(dims)}
+        var_attrs.update(da.attrs)
+        arr.attrs.update(var_attrs)
+
+    zarr.consolidate_metadata(resolved)
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
 
 
@@ -385,6 +372,8 @@ def commit_region(
     *,
     lead_time_hours: int | None = None,
     member: int | None = None,
+    lead_index: int | None = None,
+    member_index: int | None = None,
 ) -> str:
     """Commit a single-lead (and optional single-member) file into an existing store.
 
@@ -412,6 +401,8 @@ def commit_region(
         member: Explicit member identity (``1..30``) to target. When ``None``
             but the dataset has a ``member`` dimension of length 1, the member
             is derived from its ``member`` coordinate value.
+        lead_index: Optional pre-resolved coordinate index for the lead.
+        member_index: Optional pre-resolved coordinate index for the member.
 
     Returns:
         The store target as a string.
@@ -438,20 +429,18 @@ def commit_region(
 
     resolved = _resolve_store(store)
 
-    # Resolve the lead/member coordinate values to positional indices against
-    # the pre-allocated store's coordinates. This is coordinate-driven: a
-    # gep17 file always targets the member position whose value is 17, never a
-    # completion-order index.
-    existing = read_dataset(store)
-    lead_index = _coordinate_index(existing, "lead_time_hours", lead_time_hours)
-    member_index = None
-    if member is not None:
-        if "member" not in existing.coords:
-            raise ValueError(
-                "commit_region: the store has no 'member' coordinate but a "
-                "member identity was requested."
-            )
-        member_index = _coordinate_index(existing, "member", member)
+    # Resolve positional indices against store coordinates if not pre-resolved
+    if lead_index is None or (member is not None and member_index is None):
+        existing = read_dataset(store)
+        if lead_index is None:
+            lead_index = _coordinate_index(existing, "lead_time_hours", lead_time_hours)
+        if member is not None and member_index is None:
+            if "member" not in existing.coords:
+                raise ValueError(
+                    "commit_region: the store has no 'member' coordinate but a "
+                    "member identity was requested."
+                )
+            member_index = _coordinate_index(existing, "member", member)
 
     # The dataset is single-lead (and, for GEFS, single-member). Build the
     # positional region slices. Data variables already carry the lead (and

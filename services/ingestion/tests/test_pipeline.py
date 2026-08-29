@@ -919,3 +919,63 @@ def test_repeated_patch_is_idempotent(
     assert run.status == "ready"
     leads = sorted({p.lead_time_hours for p in session.query(ProductRecord).all()})
     assert leads == [0, 6, 12, 18]
+
+
+def test_snapshot_in_memory_validation_catches_schema_mismatch(tmp_path) -> None:
+    """_validate_lead_schema_from_snapshot rejects incompatible incoming dimensions or coordinates in-memory."""
+    from ingestion.core.coordinator import StoreMetadataSnapshot
+    from ingestion.core.pipeline import _validate_lead_schema_from_snapshot
+    from ingestion.core.base import StoreSchemaMismatchError
+
+    snapshot = StoreMetadataSnapshot(
+        store_path=str(tmp_path / "snap.zarr"),
+        generation="gen_test",
+        is_ensemble=False,
+        data_var_paths=("temperature_2m",),
+        lead_index_map={0: 0, 6: 1},
+        member_index_map={},
+        zarray_by_var={"temperature_2m": {"shape": [2, 4, 4], "chunks": [1, 2, 2]}},
+        zattrs_by_var={},
+        data_var_dims={"temperature_2m": ("lead_time_hours", "latitude", "longitude")},
+        coords_values={"latitude": (38.0, 38.25, 38.5, 38.75), "longitude": (-107.0, -106.75, -106.5, -106.25)},
+        grid_shape=(4, 4),
+        cycle_time="2026-07-21T00:00:00",
+        model_id="gfs",
+    )
+
+    # Incompatible grid coordinates (wrong latitude)
+    bad_ds = _committed_dataset(6)
+    bad_ds = bad_ds.assign_coords(latitude=[10.0, 20.0, 30.0, 40.0])
+
+    with pytest.raises(StoreSchemaMismatchError, match="latitude"):
+        _validate_lead_schema_from_snapshot(bad_ds, snapshot, snapshot.store_path)
+
+
+def test_snapshot_in_memory_validation_catches_cycle_mismatch(tmp_path) -> None:
+    """_validate_store_identity_from_snapshot rejects incoming dataset with mismatched cycle time."""
+    from ingestion.core.coordinator import StoreMetadataSnapshot
+    from ingestion.core.pipeline import _validate_store_identity_from_snapshot
+    from ingestion.core.base import CycleStoreMismatchError
+
+    snapshot = StoreMetadataSnapshot(
+        store_path=str(tmp_path / "snap.zarr"),
+        generation="gen_test",
+        is_ensemble=False,
+        data_var_paths=("temperature_2m",),
+        lead_index_map={0: 0},
+        member_index_map={},
+        zarray_by_var={},
+        zattrs_by_var={},
+        data_var_dims={},
+        coords_values={},
+        grid_shape=(4, 4),
+        cycle_time="2026-07-21T00:00:00",
+        model_id="gfs",
+    )
+
+    ds = _committed_dataset(0)
+    ds.attrs["cycle_time"] = "2026-07-22T12:00:00"  # different cycle
+
+    with pytest.raises(CycleStoreMismatchError, match="Refusing to merge"):
+        _validate_store_identity_from_snapshot(ds, snapshot, snapshot.store_path)
+

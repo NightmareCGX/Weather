@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 
 import s3fs  # type: ignore[import-untyped]
 
@@ -47,15 +48,9 @@ def _storage_backend(store_path: str) -> tuple[str, str]:
 
 
 def _s3_fs() -> "s3fs.S3FileSystem":
-    from ingestion.core.config import settings
+    from ingestion.core.s3 import get_control_s3_fs
 
-    scheme = "https" if settings.MINIO_SECURE else "http"
-    return s3fs.S3FileSystem(
-        key=settings.MINIO_ACCESS_KEY,
-        secret=settings.MINIO_SECRET_KEY,
-        client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
-        use_listings_cache=False,
-    )
+    return get_control_s3_fs()
 
 
 def object_exists(store_path: str, object_key: str) -> bool:
@@ -107,17 +102,170 @@ def list_object_keys(store_path: str, array_path: str) -> list[str]:
     return sorted(out)
 
 
+def _derive_region_prefix(
+    store_path: str,
+    array_path: str,
+    *,
+    member: int | None,
+    lead_index: int,
+    za: Mapping[str, object] | dict[str, object],
+    zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
+    member_index_cache: Mapping[int, int] | None = None,
+) -> str:
+    """Structurally derive the exact object-key prefix for a logical region.
+
+    Derives the prefix from the store's authoritative .zarray chunk geometry,
+    dimension layout, and dimension separator, ensuring zero string common-prefix
+    heuristics or cross-region prefix bleed (e.g. member 1 vs 10, separator '.' vs '/').
+
+    Args:
+        store_path: The store path/URL.
+        array_path: The Zarr array path (e.g. 'temperature_2m').
+        member: The ensemble member identity, or None for deterministic.
+        lead_index: The positional lead index.
+        za: The array's .zarray metadata dict.
+        zattrs_cache: Optional cached .zattrs metadata.
+        member_index_cache: Optional cached member coordinate index mapping.
+
+    Returns:
+        The structural chunk key prefix ending with the dimension separator,
+        e.g. 'temperature_2m/0.1.' or 'temperature_2m/0/1/'.
+    """
+    shape_raw = za.get("shape")
+    chunks_raw = za.get("chunks")
+    if not isinstance(shape_raw, list) or not isinstance(chunks_raw, list):
+        return f"{array_path}/"
+    shape = [int(s) for s in shape_raw]
+    chunks = [int(c) for c in chunks_raw]
+
+    has_member, member_dim, lead_dim, spatial_dims = _array_dimension_layout(
+        store_path, array_path, shape, zattrs_cache=zattrs_cache
+    )
+
+    member_chunk = 0
+    if has_member and member is not None and member_dim is not None:
+        member_index = _member_positional_index(
+            store_path, array_path, member, member_index_cache=member_index_cache
+        )
+        member_chunk = (
+            member_index // chunks[member_dim] if chunks[member_dim] > 0 else 0
+        )
+
+    sep = str(za.get("dimension_separator") or ".")
+    if has_member and member_dim is not None:
+        if member_dim < lead_dim:
+            prefix_coords = [str(member_chunk), str(lead_index)]
+        else:
+            prefix_coords = [str(lead_index), str(member_chunk)]
+        return f"{array_path}/{sep.join(prefix_coords)}{sep}"
+    return f"{array_path}/{lead_index}{sep}"
+
+
+def verify_expected_object_keys(
+    store_path: str,
+    expected_keys: list[str],
+    *,
+    member: int | None = None,
+    lead_index: int | None = None,
+    zarray_cache: Mapping[str, Mapping[str, object]] | None = None,
+    zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
+    member_index_cache: Mapping[int, int] | None = None,
+) -> set[str]:
+    """Boundedly verify which of the expected physical chunk keys exist in the store.
+
+    Uses structural region prefix derivation from the store's authoritative .zarray
+    chunk geometry and dimension separator, ensuring O(1) bounded S3 listing calls
+    without store-wide prefix scans.
+
+    Args:
+        store_path: The store path/URL.
+        expected_keys: The expected chunk keys for the target region.
+        member: Optional member identity for structural prefix derivation.
+        lead_index: Optional lead index for structural prefix derivation.
+        zarray_cache: Optional cached .zarray metadata.
+        zattrs_cache: Optional cached .zattrs metadata.
+        member_index_cache: Optional cached member coordinate index mapping.
+
+    Returns:
+        The set of confirmed existing chunk keys among the expected keys.
+    """
+    if not expected_keys:
+        return set()
+    backend, root = _storage_backend(store_path)
+    if backend == "local":
+        out: set[str] = set()
+        for key in expected_keys:
+            full = os.path.join(root, *key.split("/"))
+            if os.path.isfile(full):
+                out.add(key)
+        return out
+
+    fs = _s3_fs()
+    out_s3: set[str] = set()
+    expected_set = set(expected_keys)
+
+    # Group expected keys by array path / variable prefix
+    by_var: dict[str, list[str]] = {}
+    for key in expected_keys:
+        var = key.split("/", 1)[0]
+        by_var.setdefault(var, []).append(key)
+
+    for var, keys in by_var.items():
+        za: Mapping[str, object] | None = None
+        if zarray_cache is not None and var in zarray_cache:
+            za = zarray_cache[var]
+        else:
+            za = _read_zarray(store_path, var)
+
+        if za is not None and lead_index is not None:
+            region_prefix = _derive_region_prefix(
+                store_path,
+                var,
+                member=member,
+                lead_index=lead_index,
+                za=za,
+                zattrs_cache=zattrs_cache,
+                member_index_cache=member_index_cache,
+            )
+            full_prefix = f"{root}/{region_prefix}"
+            try:
+                for item in fs.find(full_prefix):
+                    rel = item[len(root) + 1 :]
+                    if rel in expected_set:
+                        out_s3.add(rel)
+            except Exception:
+                pass
+        else:
+            # Fallback when za / lead_index is omitted: direct bounded stat on expected keys
+            for key in keys:
+                full = f"{root}/{key}"
+                try:
+                    if fs.exists(full):
+                        out_s3.add(key)
+                except Exception:
+                    pass
+    return out_s3
+
+
 def expected_write_set_fingerprint(required_keys: list[str], omitted: list[str]) -> str:
     """Fingerprint the expected write set from materialized + omitted keys."""
     return sha256_hex("write-set", *sorted(required_keys), *sorted(omitted))
 
 
-def _member_positional_index(store_path: str, array_path: str, member: int) -> int:
+def _member_positional_index(
+    store_path: str,
+    array_path: str,
+    member: int,
+    *,
+    member_index_cache: Mapping[int, int] | None = None,
+) -> int:
     """Return the positional index of an ensemble member in the store's member
     coordinate (the upstream member identity may be 1..30, not positional).
 
     Falls back to ``member - 1`` when the member coordinate cannot be read.
     """
+    if member_index_cache is not None and member in member_index_cache:
+        return member_index_cache[member]
     try:
         from ingestion.core.zarr_writer import read_dataset
 
@@ -182,7 +330,7 @@ def _array_dimension_layout(
     array_path: str,
     shape: list[int],
     *,
-    zattrs_cache: dict[str, dict[str, object]] | None = None,
+    zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
 ) -> tuple[bool, int | None, int, list[int]]:
     """Determine the semantic dimension layout of a stored Zarr array.
 
@@ -194,12 +342,12 @@ def _array_dimension_layout(
     Returns:
         A tuple of ``(has_member, member_dim, lead_dim, spatial_dims)``.
     """
-    za_attrs: dict[str, object] | None
+    za_attrs: Mapping[str, object] | None
     if zattrs_cache is not None and array_path in zattrs_cache:
         za_attrs = zattrs_cache[array_path]
     else:
         za_attrs = _read_zattrs(store_path, array_path)
-        if za_attrs is not None and zattrs_cache is not None:
+        if za_attrs is not None and isinstance(zattrs_cache, dict):
             zattrs_cache[array_path] = za_attrs
 
     if za_attrs is not None:
@@ -234,7 +382,8 @@ def _derive_region_chunk_keys(
     member: int | None,
     lead_index: int,
     za: dict[str, object],
-    zattrs_cache: dict[str, dict[str, object]] | None = None,
+    zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
+    member_index_cache: Mapping[int, int] | None = None,
 ) -> list[str]:
     """Derive the physical chunk keys a logical region maps to in one array."""
     shape_raw = za.get("shape")
@@ -250,7 +399,9 @@ def _derive_region_chunk_keys(
 
     member_chunk = 0
     if has_member and member is not None and member_dim is not None:
-        member_index = _member_positional_index(store_path, array_path, member)
+        member_index = _member_positional_index(
+            store_path, array_path, member, member_index_cache=member_index_cache
+        )
         member_chunk = (
             member_index // chunks[member_dim] if chunks[member_dim] > 0 else 0
         )
@@ -258,6 +409,7 @@ def _derive_region_chunk_keys(
     spatial_chunk_counts = [
         (shape[d] + chunks[d] - 1) // chunks[d] for d in spatial_dims
     ]
+    sep = str(za.get("dimension_separator") or ".")
 
     out: list[str] = []
     import itertools
@@ -269,7 +421,7 @@ def _derive_region_chunk_keys(
         coords[lead_dim] = lead_index
         for i, d in enumerate(spatial_dims):
             coords[d] = combo[i]
-        key = array_path + "/" + ".".join(str(c) for c in coords)
+        key = array_path + "/" + sep.join(str(c) for c in coords)
         out.append(key)
     return out
 
@@ -279,7 +431,10 @@ def physical_conflict_keys(
     *,
     member: int | None,
     lead_index: int,
-    data_var_paths: list[str],
+    data_var_paths: list[str] | tuple[str, ...],
+    zarray_cache: Mapping[str, Mapping[str, object]] | None = None,
+    zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
+    member_index_cache: Mapping[int, int] | None = None,
 ) -> list[str]:
     """Derive the physical-chunk conflict identities a logical region writes.
 
@@ -298,6 +453,9 @@ def physical_conflict_keys(
         lead_index: The positional index of the lead in the store's
             ``lead_time_hours`` coordinate.
         data_var_paths: The data-variable array paths.
+        zarray_cache: Optional cached .zarray metadata.
+        zattrs_cache: Optional cached .zattrs metadata.
+        member_index_cache: Optional cached member coordinate index mapping.
 
     Returns:
         A sorted, de-duplicated list of physical-chunk conflict identities
@@ -305,12 +463,22 @@ def physical_conflict_keys(
     """
     out: list[str] = []
     for array_path in data_var_paths:
-        za = _read_zarray(store_path, array_path)
+        za: dict[str, object] | None
+        if zarray_cache is not None and array_path in zarray_cache:
+            za = dict(zarray_cache[array_path])
+        else:
+            za = _read_zarray(store_path, array_path)
         if za is None:
             continue
         out.extend(
             _derive_region_chunk_keys(
-                store_path, array_path, member=member, lead_index=lead_index, za=za
+                store_path,
+                array_path,
+                member=member,
+                lead_index=lead_index,
+                za=za,
+                zattrs_cache=zattrs_cache,
+                member_index_cache=member_index_cache,
             )
         )
     return sorted(set(out))
@@ -321,9 +489,10 @@ def region_expected_object_keys(
     *,
     member: int | None,
     lead_index: int,
-    data_var_paths: list[str],
-    zarray_cache: dict[str, dict[str, object]] | None = None,
-    zattrs_cache: dict[str, dict[str, object]] | None = None,
+    data_var_paths: list[str] | tuple[str, ...],
+    zarray_cache: Mapping[str, Mapping[str, object]] | None = None,
+    zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
+    member_index_cache: Mapping[int, int] | None = None,
 ) -> list[str]:
     """Derive the physical chunk object keys a logical region writes.
 
@@ -344,6 +513,8 @@ def region_expected_object_keys(
             reads across markers.
         zattrs_cache: An optional in-memory cache of per-array ``.zattrs``
             metadata.
+        member_index_cache: An optional in-memory cache of member coordinate
+            indices.
 
     Returns:
         A sorted list of physical chunk object keys (relative to the store).
@@ -352,10 +523,10 @@ def region_expected_object_keys(
     for array_path in data_var_paths:
         za: dict[str, object] | None
         if zarray_cache is not None and array_path in zarray_cache:
-            za = zarray_cache[array_path]
+            za = dict(zarray_cache[array_path])
         else:
             za = _read_zarray(store_path, array_path)
-            if za is not None and zarray_cache is not None:
+            if za is not None and isinstance(zarray_cache, dict):
                 zarray_cache[array_path] = za
         if za is None:
             continue
@@ -367,6 +538,7 @@ def region_expected_object_keys(
                 lead_index=lead_index,
                 za=za,
                 zattrs_cache=zattrs_cache,
+                member_index_cache=member_index_cache,
             )
         )
     return sorted(set(out))

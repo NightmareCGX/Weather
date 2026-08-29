@@ -116,6 +116,11 @@ class StartupTimeline:
         "seed_write_start",
         "seed_write_complete",
         "first_non_seed_download_start",
+        "downloads_drained",
+        "decodes_drained",
+        "writes_drained",
+        "finalize_start",
+        "finalize_complete",
     )
 
     def __init__(self) -> None:
@@ -190,6 +195,14 @@ class StartupTimeline:
         startup_delay_str = (
             f"{total_startup_delay:.3f}s" if total_startup_delay is not None else "N/A"
         )
+        tail_write_dur = self.duration("decodes_drained", "writes_drained")
+        tail_write_str = (
+            f"{tail_write_dur:.3f}s" if tail_write_dur is not None else "--"
+        )
+        teardown_dur = self.duration("writes_drained", "finalize_start")
+        teardown_str = (
+            f"{teardown_dur:.3f}s" if teardown_dur is not None else "--"
+        )
 
         lines = [
             "=" * 80,
@@ -228,6 +241,14 @@ class StartupTimeline:
             "Seed Write (Async Task):",
             f"   ├─ seed_write_start                    {_fmt_ts('seed_write_start')}",
             f"   └─ seed_write_complete                 {_fmt_ts('seed_write_complete'):<20} {seed_wr_dur}",
+            "-" * 80,
+            "Pipeline Drain Milestones:",
+            f"   ├─ downloads_drained                   {_fmt_ts('downloads_drained')}",
+            f"   ├─ decodes_drained                     {_fmt_ts('decodes_drained')}",
+            f"   └─ writes_drained                      {_fmt_ts('writes_drained')}",
+            "-" * 80,
+            f"* Tail Physical Write Drain (decodes_drained -> writes_drained): {tail_write_str}",
+            f"* Task Teardown / Gate Transition (writes_drained -> finalize_start): {teardown_str}",
             "=" * 80,
         ]
         return "\n".join(lines)
@@ -338,6 +359,11 @@ class PipelineProgressTracker:
             self.counters.download_active = max(0, self.counters.download_active - 1)
             self.counters.download_done += 1
             self.counters.decode_queued += 1
+            if (
+                self.counters.download_done + self.counters.download_failed >= self.total_items
+                and self.counters.download_active == 0
+            ):
+                self.timeline.record("downloads_drained")
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -352,6 +378,11 @@ class PipelineProgressTracker:
         with self._lock:
             self.counters.download_active = max(0, self.counters.download_active - 1)
             self.counters.download_failed += 1
+            if (
+                self.counters.download_done + self.counters.download_failed >= self.total_items
+                and self.counters.download_active == 0
+            ):
+                self.timeline.record("downloads_drained")
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -375,6 +406,11 @@ class PipelineProgressTracker:
             self.counters.decode_active = max(0, self.counters.decode_active - 1)
             self.counters.decode_done += 1
             self.counters.write_waiting += 1
+            if (
+                self.counters.decode_done + self.counters.decode_failed >= self.total_items
+                and self.counters.decode_active == 0
+            ):
+                self.timeline.record("decodes_drained")
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -389,6 +425,11 @@ class PipelineProgressTracker:
         with self._lock:
             self.counters.decode_active = max(0, self.counters.decode_active - 1)
             self.counters.decode_failed += 1
+            if (
+                self.counters.decode_done + self.counters.decode_failed >= self.total_items
+                and self.counters.decode_active == 0
+            ):
+                self.timeline.record("decodes_drained")
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -399,8 +440,7 @@ class PipelineProgressTracker:
 
     def on_write_start(self, member: int | None, lead: int, *, is_seed: bool = False) -> None:
         with self._lock:
-            if not is_seed:
-                self.counters.write_waiting = max(0, self.counters.write_waiting - 1)
+            self.counters.write_waiting = max(0, self.counters.write_waiting - 1)
             self.counters.write_active += 1
         self.log_stage_transition(
             member=member, lead=lead, stage="write", event="start"
@@ -413,6 +453,11 @@ class PipelineProgressTracker:
             self.counters.write_active = max(0, self.counters.write_active - 1)
             self.counters.write_done += 1
             self.counters.overall_done += 1
+            if (
+                self.counters.write_done + self.counters.write_failed >= self.total_items
+                and self.counters.write_active == 0
+            ):
+                self.timeline.record("writes_drained")
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -427,6 +472,11 @@ class PipelineProgressTracker:
         with self._lock:
             self.counters.write_active = max(0, self.counters.write_active - 1)
             self.counters.write_failed += 1
+            if (
+                self.counters.write_done + self.counters.write_failed >= self.total_items
+                and self.counters.write_active == 0
+            ):
+                self.timeline.record("writes_drained")
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -439,6 +489,7 @@ class PipelineProgressTracker:
         with self._lock:
             self.counters.finalize_state = "active"
             self.counters.finalize_start_time = time.monotonic()
+            self.timeline.record("finalize_start")
         self.log_stage_transition(
             member=None, lead=None, stage="finalize", event="start"
         )
@@ -446,6 +497,7 @@ class PipelineProgressTracker:
     def on_finalize_complete(self, *, duration_ms: float) -> None:
         with self._lock:
             self.counters.finalize_state = "done"
+            self.timeline.record("finalize_complete")
         self.log_stage_transition(
             member=None,
             lead=None,

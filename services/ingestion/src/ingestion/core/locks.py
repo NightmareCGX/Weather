@@ -151,30 +151,133 @@ class StoreLockCoordinator:
         self._release_exclusive(self.store_gate())
 
     def acquire_region_locks(self, region_ids: list[str]) -> None:
-        """Acquire sorted unique region locks (ascending key order)."""
+        """Acquire sorted unique region locks in a single batched round-trip."""
         keys = sorted({self.region(r) for r in region_ids})
-        for key in keys:
-            self._acquire_exclusive(key)
+        self._acquire_batch_exclusive(keys)
 
     def release_region_locks(self, region_ids: list[str]) -> None:
-        """Release sorted unique region locks (descending key order)."""
+        """Release sorted unique region locks in a single batched round-trip."""
         keys = sorted({self.region(r) for r in region_ids}, reverse=True)
-        for key in keys:
-            self._release_exclusive(key)
+        with self._lock:
+            held = [k for k in keys if k in self._locks.held]
+        self._release_batch_exclusive(held)
 
     def release_all(self) -> None:
         """Release every lock this coordinator holds (descending, best-effort)."""
         with self._lock:
             exclusive = sorted(self._locks.held, reverse=True)
             shared = sorted(self._locks.shared_held, reverse=True)
-        for key in exclusive:
-            self._release_exclusive(key)
+        if exclusive:
+            self._release_batch_exclusive(exclusive)
         for key in shared:
             self._release_shared(key)
 
     # ------------------------------------------------------------------
     # Internal PG helpers
     # ------------------------------------------------------------------
+    def _acquire_batch_exclusive(self, keys: list[int]) -> None:
+        """Acquire a sorted batch of exclusive advisory locks in bounded round-trips.
+
+        Uses non-blocking pg_try_advisory_lock() over the candidate keys in a single
+        query, checks for complete acquisition, unlocks partial acquisitions if any key
+        was unavailable, and retries until deadline.
+
+        On any unhandled query or connection error where lock acquisition state is indeterminate,
+        the physical connection is invalidated immediately so the backend drops any locks.
+        """
+        if not keys:
+            return
+        with self._lock:
+            for k in keys:
+                if k in self._locks.held or k in self._locks.shared_held:
+                    raise RuntimeError(f"advisory lock {k} already held by this worker")
+
+        deadline = time.monotonic() + self._timeout_seconds
+        sorted_keys = sorted(keys)
+
+        while True:
+            acquired_keys: list[int] = []
+            try:
+                stmt = text(
+                    "SELECT k, pg_try_advisory_lock(k) AS acquired "
+                    "FROM unnest(CAST(:keys AS bigint[])) AS k"
+                )
+                results = self._connection.execute(stmt, {"keys": sorted_keys}).fetchall()
+                all_acquired = True
+                for row in results:
+                    k_val = int(row[0])
+                    acq = bool(row[1])
+                    if acq:
+                        acquired_keys.append(k_val)
+                    else:
+                        all_acquired = False
+
+                if all_acquired:
+                    with self._lock:
+                        for k in acquired_keys:
+                            self._locks.record_exclusive(k)
+                    return
+
+                # Partial acquisition: at least one key was held by another worker.
+                # Must release all keys acquired in this attempt before sleeping.
+                if acquired_keys:
+                    self._release_batch_exclusive(acquired_keys)
+
+            except Exception:
+                if acquired_keys:
+                    try:
+                        self._release_batch_exclusive(acquired_keys)
+                    except Exception:
+                        pass
+                logger.error(
+                    "Error during batched advisory lock acquisition on %s; invalidating "
+                    "physical Connection to guarantee no lock leaks",
+                    self._store_path,
+                )
+                self._invalidate_connection()
+                raise
+
+            if time.monotonic() >= deadline:
+                raise LockTimeoutError(
+                    f"timed out acquiring {len(keys)} advisory locks on {self._store_path} "
+                    f"after {self._timeout_seconds}s"
+                )
+            time.sleep(0.02)
+
+    def _release_batch_exclusive(self, keys: list[int]) -> None:
+        """Release a batch of exclusive advisory locks in a single SQL round-trip.
+
+        Verifies that every lock returns true from pg_advisory_unlock. If any unlock
+        returns false or raises, invalidates the physical connection.
+        """
+        if not keys:
+            return
+        sorted_keys = sorted(keys, reverse=True)
+        ok = True
+        try:
+            stmt = text(
+                "SELECT k, pg_advisory_unlock(k) AS released "
+                "FROM unnest(CAST(:keys AS bigint[])) AS k"
+            )
+            results = self._connection.execute(stmt, {"keys": sorted_keys}).fetchall()
+            for row in results:
+                if not bool(row[1]):
+                    ok = False
+        except Exception:
+            ok = False
+
+        if not ok:
+            logger.error(
+                "Batched advisory unlock returned false or raised on %s; invalidating "
+                "the physical Connection so no lock leaks into the pool",
+                self._store_path,
+            )
+            self._invalidate_connection()
+
+        with self._lock:
+            for k in keys:
+                self._locks.held.discard(k)
+
     def _acquire_exclusive(self, key: int) -> None:
         self._acquire(
             key, "pg_advisory_lock", "pg_try_advisory_lock", exclusive=True
