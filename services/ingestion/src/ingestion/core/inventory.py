@@ -48,9 +48,9 @@ def _storage_backend(store_path: str) -> tuple[str, str]:
 
 
 def _s3_fs() -> "s3fs.S3FileSystem":
-    from ingestion.core.s3 import get_s3_fs
+    from ingestion.core.s3 import get_control_s3_fs
 
-    return get_s3_fs()
+    return get_control_s3_fs()
 
 
 def object_exists(store_path: str, object_key: str) -> bool:
