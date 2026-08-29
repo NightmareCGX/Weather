@@ -2,6 +2,7 @@ import type {
   ForecastAvailability,
   InitialTimeAvailability,
   ModelAvailability,
+  SpatialLayer,
   VariableAvailability,
 } from "@/lib/api/types";
 
@@ -173,4 +174,47 @@ export function resolveValidTime(
   }
   parsed.setUTCHours(parsed.getUTCHours() + leadTimeHours);
   return parsed.toISOString();
+}
+
+/**
+ * Synchronously construct the authoritative SpatialLayer for a valid selection
+ * using the backend-provided layer descriptor on the variable in availability.
+ *
+ * Interpolates `{lead_time_hours}` and `{initial_time}` into the backend's
+ * authoritative tile URL template pattern, preserving backend URL authority
+ * while eliminating the redundant `/v1/maps` metadata network roundtrip.
+ *
+ * Returns null if the selection is incomplete, not present in availability,
+ * or lacks a layer descriptor.
+ */
+export function resolveSpatialLayer(
+  availability: ForecastAvailability | null,
+  selection: ForecastSelection | null
+): SpatialLayer | null {
+  if (availability === null || selection === null) {
+    return null;
+  }
+  const model = findModel(availability, selection.model);
+  const variable = findVariable(model, selection.variable);
+  if (variable === null || !variable.layer) {
+    return null;
+  }
+  const initial = findInitialTime(variable, selection.initialTime);
+  if (initial === null || !initial.lead_time_hours.includes(selection.leadTimeHours)) {
+    return null;
+  }
+
+  const { tile_url_template, min_zoom, max_zoom, legend } = variable.layer;
+  // Substitute selection parameters into the backend-supplied URL template pattern
+  const tileUrl = tile_url_template
+    .replace("{lead_time_hours}", String(selection.leadTimeHours))
+    .replace("{initial_time}", encodeURIComponent(selection.initialTime));
+
+  return {
+    tile_url_template: tileUrl,
+    min_zoom,
+    max_zoom,
+    lead_time_hours: selection.leadTimeHours,
+    legend,
+  };
 }

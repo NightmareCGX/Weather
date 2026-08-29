@@ -178,6 +178,42 @@ describe("WeatherMap", () => {
     expect(map.removeSource).toHaveBeenCalledWith("weather");
   });
 
+  it("rapidly transitions A -> B -> C layers directly with only C remaining installed", () => {
+    const { rerender } = renderMap();
+    const [map] = getInstances();
+
+    const layerA: SpatialLayer = { ...layer, lead_time_hours: 6 };
+    const layerB: SpatialLayer = { ...layer, lead_time_hours: 12 };
+    const layerC: SpatialLayer = { ...layer, lead_time_hours: 18 };
+
+    // Initial A
+    rerender(
+      <WeatherMap layer={layerA} selectedLocation={null} validTime={null} onSelect={jest.fn()} />
+    );
+    expect(map.addSource).toHaveBeenLastCalledWith(
+      "weather",
+      expect.objectContaining({ tiles: [layerA.tile_url_template] })
+    );
+
+    // Switch to B
+    rerender(
+      <WeatherMap layer={layerB} selectedLocation={null} validTime={null} onSelect={jest.fn()} />
+    );
+    expect(map.addSource).toHaveBeenLastCalledWith(
+      "weather",
+      expect.objectContaining({ tiles: [layerB.tile_url_template] })
+    );
+
+    // Switch to C
+    rerender(
+      <WeatherMap layer={layerC} selectedLocation={null} validTime={null} onSelect={jest.fn()} />
+    );
+    expect(map.addSource).toHaveBeenLastCalledWith(
+      "weather",
+      expect.objectContaining({ tiles: [layerC.tile_url_template] })
+    );
+  });
+
   it("removes the map on unmount", () => {
     const { unmount } = renderMap();
     const [map] = getInstances();

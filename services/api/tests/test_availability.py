@@ -33,6 +33,17 @@ def test_availability_contract(client):
     assert initial["value"] == "2026-07-21T00:00:00Z"
     assert initial["lead_time_hours"] == [0, 6, 12, 18]
 
+    # Authoritative map layer descriptor for zero-waterfall synchronous transition.
+    layer = temp["layer"]
+    assert layer is not None
+    assert layer["tile_url_template"] == (
+        "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}"
+    )
+    assert layer["min_zoom"] == 0
+    assert layer["max_zoom"] == 9
+    assert layer["legend"]["unit"] == "°C"
+    assert len(layer["legend"]["stops"]) > 0
+
 
 def test_availability_only_ready_runs(client):
     # The seeded database has a ready gfs run and a ready gefs run; a

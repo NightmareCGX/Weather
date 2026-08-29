@@ -1,9 +1,9 @@
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { renderHook } from "@testing-library/react";
 
 import { useMapLayer } from "@/hooks/useMapLayer";
 import { useForecastSelection } from "@/context/forecast-selection";
 import type { ForecastSelection } from "@/lib/forecast/availability";
-import type { SpatialLayer } from "@/lib/api/types";
+import type { ForecastAvailability, SpatialLayer } from "@/lib/api/types";
 
 jest.mock("../../context/forecast-selection");
 
@@ -11,96 +11,148 @@ const mockUseForecastSelection = useForecastSelection as jest.MockedFunction<
   typeof useForecastSelection
 >;
 
-const mockFetch = jest.fn<Promise<Response>, [RequestInfo | URL, RequestInit?]>();
+const mockAvailability: ForecastAvailability = {
+  models: [
+    {
+      id: "gfs",
+      name: "Global Forecast System",
+      is_ensemble: false,
+      variables: [
+        {
+          id: "temperature_2m",
+          name: "2-Meter Temperature",
+          unit: "°C",
+          initial_times: [
+            {
+              value: "2026-08-13T00:00:00Z",
+              lead_time_hours: [0, 6, 12, 18, 24],
+            },
+            {
+              value: "2026-08-13T06:00:00Z",
+              lead_time_hours: [0, 6, 12],
+            },
+          ],
+          layer: {
+            tile_url_template:
+              "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+            min_zoom: 0,
+            max_zoom: 9,
+            legend: {
+              unit: "°C",
+              stops: [
+                [-40, "#0000ff"],
+                [40, "#ff0000"],
+              ],
+            },
+          },
+        },
+        {
+          id: "precipitation_rate",
+          name: "Precipitation Rate",
+          unit: "mm/h",
+          initial_times: [
+            {
+              value: "2026-08-13T00:00:00Z",
+              lead_time_hours: [0, 6, 12],
+            },
+          ],
+          layer: {
+            tile_url_template:
+              "/v1/maps/gfs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+            min_zoom: 0,
+            max_zoom: 9,
+            legend: {
+              unit: "mm/h",
+              stops: [
+                [0, "#ffffff"],
+                [50, "#0000ff"],
+              ],
+            },
+          },
+        },
+      ],
+    },
+    {
+      id: "gefs",
+      name: "Global Ensemble Forecast System",
+      is_ensemble: true,
+      variables: [
+        {
+          id: "temperature_2m",
+          name: "2-Meter Temperature",
+          unit: "°C",
+          initial_times: [
+            {
+              value: "2026-08-13T00:00:00Z",
+              lead_time_hours: [0, 6, 12, 18, 24],
+            },
+          ],
+          layer: {
+            tile_url_template:
+              "/v1/maps/gefs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+            min_zoom: 0,
+            max_zoom: 9,
+            legend: {
+              unit: "°C",
+              stops: [
+                [-40, "#313695"],
+                [45, "#a50026"],
+              ],
+            },
+          },
+        },
+      ],
+    },
+  ],
+};
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: () => Promise.resolve(body),
-  } as Response;
-}
-
-function layerResponse(layer: SpatialLayer): Response {
-  return jsonResponse({
-    object: "spatial_layer",
-    data: layer,
-    has_more: false,
-    next_cursor: null,
-  });
-}
-
-const selectionA: ForecastSelection = {
+const selectionLead6: ForecastSelection = {
   model: "gfs",
   variable: "temperature_2m",
   initialTime: "2026-08-13T00:00:00Z",
   leadTimeHours: 6,
 };
 
-const layerA: SpatialLayer = {
-  tile_url_template:
-    "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=6&initial_time=2026-08-13T00:00:00Z",
-  min_zoom: 0,
-  max_zoom: 9,
-  lead_time_hours: 6,
-  legend: {
-    unit: "°C",
-    stops: [
-      [-40, "#0000ff"],
-      [40, "#ff0000"],
-    ],
-  },
+const selectionLead12: ForecastSelection = {
+  model: "gfs",
+  variable: "temperature_2m",
+  initialTime: "2026-08-13T00:00:00Z",
+  leadTimeHours: 12,
 };
 
-const selectionB: ForecastSelection = {
+const selectionPrecip: ForecastSelection = {
   model: "gfs",
   variable: "precipitation_rate",
   initialTime: "2026-08-13T00:00:00Z",
   leadTimeHours: 6,
 };
 
-const layerB: SpatialLayer = {
-  tile_url_template:
-    "/v1/maps/gfs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours=6&initial_time=2026-08-13T00:00:00Z",
-  min_zoom: 0,
-  max_zoom: 9,
-  lead_time_hours: 6,
-  legend: {
-    unit: "mm/h",
-    stops: [
-      [0, "#ffffff"],
-      [50, "#0000ff"],
-    ],
-  },
+const selection06Z: ForecastSelection = {
+  model: "gfs",
+  variable: "temperature_2m",
+  initialTime: "2026-08-13T06:00:00Z",
+  leadTimeHours: 6,
 };
 
-const selectionC: ForecastSelection = {
+const selectionGefs: ForecastSelection = {
   model: "gefs",
   variable: "temperature_2m",
   initialTime: "2026-08-13T00:00:00Z",
   leadTimeHours: 12,
 };
 
-const layerC: SpatialLayer = {
-  tile_url_template:
-    "/v1/maps/gefs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=12&initial_time=2026-08-13T00:00:00Z",
-  min_zoom: 0,
-  max_zoom: 9,
-  lead_time_hours: 12,
-  legend: {
-    unit: "°C",
-    stops: [
-      [-40, "#313695"],
-      [45, "#a50026"],
-    ],
-  },
-};
-
-function mockContextValue(selection: ForecastSelection | null) {
+function mockContextValue(
+  selection: ForecastSelection | null,
+  options?: {
+    availability?: ForecastAvailability | null;
+    status?: "idle" | "loading" | "success" | "error";
+    error?: string | null;
+  }
+) {
   return {
-    availability: null,
-    status: "success" as const,
-    error: null,
+    availability: options?.availability !== undefined ? options.availability : mockAvailability,
+    status: options?.status ?? "success",
+    error: options?.error ?? null,
     selection,
     validTime: null,
     options: {
@@ -120,226 +172,148 @@ function mockContextValue(selection: ForecastSelection | null) {
   };
 }
 
-beforeEach(() => {
-  mockFetch.mockReset();
-  globalThis.fetch = mockFetch as unknown as typeof fetch;
-});
-
-describe("useMapLayer", () => {
-  it("is idle with null selection", () => {
+describe("useMapLayer (synchronous authoritative layer resolution)", () => {
+  it("returns null when selection is null", () => {
     mockUseForecastSelection.mockReturnValue(mockContextValue(null));
     const { result } = renderHook(() => useMapLayer());
 
     expect(result.current.layer).toBeNull();
     expect(result.current.loading).toBe(false);
     expect(result.current.error).toBeNull();
-    expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it("fetches metadata for active selection", async () => {
-    mockFetch.mockResolvedValueOnce(layerResponse(layerA));
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionA));
-
+  it("returns null and loading=true while availability is loading", () => {
+    mockUseForecastSelection.mockReturnValue(
+      mockContextValue(null, { availability: null, status: "loading" })
+    );
     const { result } = renderHook(() => useMapLayer());
 
-    expect(result.current.loading).toBe(true);
-    await waitFor(() => expect(result.current.loading).toBe(false));
-
-    expect(mockFetch).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "/v1/maps?model=gfs&variable=temperature_2m&level=surface&lead_time_hours=6&initial_time=2026-08-13T00%3A00%3A00Z"
-      ),
-      expect.any(Object)
-    );
-    expect(result.current.layer).toEqual(layerA);
-    expect(result.current.error).toBeNull();
-  });
-
-  it("starts request B immediately while request A is still pending", async () => {
-    let resolveA!: (value: Response) => void;
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((resolve) => (resolveA = resolve))
-    );
-    mockFetch.mockResolvedValueOnce(layerResponse(layerB));
-
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionA));
-    const { result, rerender } = renderHook(() => useMapLayer());
-
-    expect(result.current.loading).toBe(true);
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-
-    // Switch selection to B before A resolves
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionB));
-    rerender();
-
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-    expect(mockFetch).toHaveBeenLastCalledWith(
-      expect.stringContaining("variable=precipitation_rate"),
-      expect.any(Object)
-    );
-
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    expect(result.current.layer).toEqual(layerB);
-
-    // Clean up unresolved promise
-    resolveA(layerResponse(layerA));
-  });
-
-  it("never allows a stale A success to overwrite B", async () => {
-    let resolveA!: (value: Response) => void;
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((resolve) => (resolveA = resolve))
-    );
-    mockFetch.mockResolvedValueOnce(layerResponse(layerB));
-
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionA));
-    const { result, rerender } = renderHook(() => useMapLayer());
-
-    // Switch to B
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionB));
-    rerender();
-
-    // B succeeds
-    await waitFor(() => expect(result.current.layer).toEqual(layerB));
-    expect(result.current.loading).toBe(false);
-
-    // Stale A resolves late
-    await act(async () => {
-      resolveA(layerResponse(layerA));
-    });
-
-    // Layer must remain B
-    expect(result.current.layer).toEqual(layerB);
-    expect(result.current.loading).toBe(false);
-    expect(result.current.error).toBeNull();
-  });
-
-  it("never allows a stale A error to affect B", async () => {
-    let rejectA!: (reason: unknown) => void;
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((_, reject) => (rejectA = reject))
-    );
-    mockFetch.mockResolvedValueOnce(layerResponse(layerB));
-
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionA));
-    const { result, rerender } = renderHook(() => useMapLayer());
-
-    // Switch to B
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionB));
-    rerender();
-
-    // B succeeds
-    await waitFor(() => expect(result.current.layer).toEqual(layerB));
-    expect(result.current.error).toBeNull();
-
-    // Stale A rejects with a non-abort network error
-    await act(async () => {
-      rejectA(new TypeError("Network error"));
-    });
-
-    // Layer remains B and no error is surfaced
-    expect(result.current.layer).toEqual(layerB);
-    expect(result.current.error).toBeNull();
-    expect(result.current.loading).toBe(false);
-  });
-
-  it("never allows a stale A completion to clear B loading state", async () => {
-    let resolveA!: (value: Response) => void;
-    let resolveB!: (value: Response) => void;
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((resolve) => (resolveA = resolve))
-    );
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((resolve) => (resolveB = resolve))
-    );
-
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionA));
-    const { result, rerender } = renderHook(() => useMapLayer());
-
-    // Switch to B; both A and B are now pending
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionB));
-    rerender();
-
-    expect(result.current.loading).toBe(true);
-
-    // A completes while B is still pending
-    await act(async () => {
-      resolveA(layerResponse(layerA));
-    });
-
-    // Loading must still be true because B is pending
-    expect(result.current.loading).toBe(true);
-
-    // Now B completes
-    await act(async () => {
-      resolveB(layerResponse(layerB));
-    });
-
-    expect(result.current.loading).toBe(false);
-    expect(result.current.layer).toEqual(layerB);
-  });
-
-  it("leaves only C authoritative in a rapid A -> B -> C sequence", async () => {
-    let resolveA!: (value: Response) => void;
-    let rejectB!: (reason: unknown) => void;
-    let resolveC!: (value: Response) => void;
-
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((resolve) => (resolveA = resolve))
-    );
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((_, reject) => (rejectB = reject))
-    );
-    mockFetch.mockImplementationOnce(
-      () => new Promise<Response>((resolve) => (resolveC = resolve))
-    );
-
-    // A starts
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionA));
-    const { result, rerender } = renderHook(() => useMapLayer());
-
-    // Switch to B
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionB));
-    rerender();
-
-    // Switch to C
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionC));
-    rerender();
-
-    expect(result.current.loading).toBe(true);
-    expect(mockFetch).toHaveBeenCalledTimes(3);
-
-    // Out of order: A resolves, B rejects with 500 error, C resolves
-    await act(async () => {
-      resolveA(layerResponse(layerA));
-    });
     expect(result.current.layer).toBeNull();
     expect(result.current.loading).toBe(true);
-
-    await act(async () => {
-      rejectB(new TypeError("Server error 500"));
-    });
-    expect(result.current.error).toBeNull();
-    expect(result.current.loading).toBe(true);
-
-    await act(async () => {
-      resolveC(layerResponse(layerC));
-    });
-
-    // Only C's result commits
-    expect(result.current.loading).toBe(false);
-    expect(result.current.layer).toEqual(layerC);
     expect(result.current.error).toBeNull();
   });
 
-  it("surfaces an error message when the active request fails", async () => {
-    mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionA));
-
+  it("surfaces availability errors", () => {
+    mockUseForecastSelection.mockReturnValue(
+      mockContextValue(null, {
+        availability: null,
+        status: "error",
+        error: "Unable to load forecast data.",
+      })
+    );
     const { result } = renderHook(() => useMapLayer());
 
-    await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.layer).toBeNull();
-    expect(result.current.error).toBe("Network request failed.");
+    expect(result.current.loading).toBe(false);
+    expect(result.current.error).toBe("Unable to load forecast data.");
+  });
+
+  it("synchronously resolves authoritative SpatialLayer for initial selection", () => {
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
+    const { result } = renderHook(() => useMapLayer());
+
+    expect(result.current.loading).toBe(false);
+    expect(result.current.error).toBeNull();
+    expect(result.current.layer).toEqual<SpatialLayer>({
+      tile_url_template:
+        "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=6&initial_time=2026-08-13T00%3A00%3A00Z",
+      min_zoom: 0,
+      max_zoom: 9,
+      lead_time_hours: 6,
+      legend: {
+        unit: "°C",
+        stops: [
+          [-40, "#0000ff"],
+          [40, "#ff0000"],
+        ],
+      },
+    });
+  });
+
+  it("synchronously transitions on lead time change (+6h -> +12h) without metadata network delay", () => {
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
+    const { result, rerender } = renderHook(() => useMapLayer());
+
+    expect(result.current.layer?.lead_time_hours).toBe(6);
+
+    // Transition to lead 12h
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead12));
+    rerender();
+
+    // Immediately authoritative without waiting for an HTTP roundtrip
+    expect(result.current.layer?.lead_time_hours).toBe(12);
+    expect(result.current.layer?.tile_url_template).toContain("lead_time_hours=12");
+  });
+
+  it("synchronously transitions on variable change (temperature_2m -> precipitation_rate)", () => {
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
+    const { result, rerender } = renderHook(() => useMapLayer());
+
+    expect(result.current.layer?.legend.unit).toBe("°C");
+
+    // Transition to precipitation
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionPrecip));
+    rerender();
+
+    expect(result.current.layer?.legend.unit).toBe("mm/h");
+    expect(result.current.layer?.tile_url_template).toContain("precipitation_rate");
+  });
+
+  it("synchronously transitions on initial time change (00Z -> 06Z)", () => {
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
+    const { result, rerender } = renderHook(() => useMapLayer());
+
+    expect(result.current.layer?.tile_url_template).toContain("2026-08-13T00%3A00%3A00Z");
+
+    // Transition to 06Z cycle
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selection06Z));
+    rerender();
+
+    expect(result.current.layer?.tile_url_template).toContain("2026-08-13T06%3A00%3A00Z");
+  });
+
+  it("synchronously transitions on model change (GFS -> GEFS)", () => {
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
+    const { result, rerender } = renderHook(() => useMapLayer());
+
+    expect(result.current.layer?.tile_url_template).toContain("/v1/maps/gfs/");
+
+    // Transition to GEFS
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionGefs));
+    rerender();
+
+    expect(result.current.layer?.tile_url_template).toContain("/v1/maps/gefs/");
+    expect(result.current.layer?.lead_time_hours).toBe(12);
+  });
+
+  it("leaves only C authoritative in rapid A -> B -> C transitions with zero lag", () => {
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
+    const { result, rerender } = renderHook(() => useMapLayer());
+
+    expect(result.current.layer?.lead_time_hours).toBe(6);
+
+    // Rapid switch B
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead12));
+    rerender();
+    expect(result.current.layer?.lead_time_hours).toBe(12);
+
+    // Rapid switch C
+    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionGefs));
+    rerender();
+    expect(result.current.layer?.lead_time_hours).toBe(12);
+    expect(result.current.layer?.tile_url_template).toContain("/v1/maps/gefs/");
+  });
+
+  it("returns null when selection refers to an unavailable lead time", () => {
+    const invalidSelection: ForecastSelection = {
+      model: "gfs",
+      variable: "temperature_2m",
+      initialTime: "2026-08-13T00:00:00Z",
+      leadTimeHours: 999, // not in availability
+    };
+    mockUseForecastSelection.mockReturnValue(mockContextValue(invalidSelection));
+    const { result } = renderHook(() => useMapLayer());
+
+    expect(result.current.layer).toBeNull();
   });
 });

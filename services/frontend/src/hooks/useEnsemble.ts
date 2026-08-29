@@ -42,14 +42,13 @@ export function useEnsemble(
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (location === null || model === null) {
+    if (location === null || model === null || leads.length === 0) {
       setByLead(new Map());
       setStatus("idle");
       setError(null);
       return;
     }
 
-    const activeLeads = leads.length > 0 ? leads : [0];
     const controller = new AbortController();
     let active = true;
     const results = new Map<number, EnsembleStatisticsData>();
@@ -59,7 +58,7 @@ export function useEnsemble(
     setStatus("loading");
     setError(null);
 
-    for (const lead of activeLeads) {
+    for (const lead of leads) {
       getEnsembleStatistics({
         latitude: location.latitude,
         longitude: location.longitude,
@@ -80,7 +79,7 @@ export function useEnsemble(
         })
         .finally(() => {
           settled += 1;
-          if (active && settled === activeLeads.length) {
+          if (active && settled === leads.length) {
             if (results.size > 0) {
               setByLead(new Map(results));
               setStatus("success");

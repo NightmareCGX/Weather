@@ -72,6 +72,19 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         lead_time_hours: LEAD_TIMES,
                       },
                     ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "°C",
+                        stops: [
+                          [-40, "#313695"],
+                          [45, "#a50026"],
+                        ],
+                      },
+                    },
                   },
                   {
                     id: "precipitation_rate",
@@ -83,6 +96,19 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         lead_time_hours: LEAD_TIMES,
                       },
                     ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "mm/h",
+                        stops: [
+                          [0, "#ffffff"],
+                          [40, "#54278f"],
+                        ],
+                      },
+                    },
                   },
                 ],
               },
@@ -101,6 +127,19 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         lead_time_hours: LEAD_TIMES,
                       },
                     ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "°C",
+                        stops: [
+                          [-40, "#313695"],
+                          [45, "#a50026"],
+                        ],
+                      },
+                    },
                   },
                 ],
               },

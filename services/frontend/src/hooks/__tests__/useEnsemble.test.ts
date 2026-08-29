@@ -97,19 +97,14 @@ describe("useEnsemble", () => {
     expect(result.current.error).not.toBeNull();
   });
 
-  it("defaults to a single 0-hour request when no leads are provided", async () => {
-    mockFetch.mockResolvedValueOnce(statsResponse(0));
-
+  it("stays idle and does not issue premature requests when leads array is empty", () => {
     const { result } = renderHook(() =>
       useEnsemble(location, [], "temperature_2m", { model: "gefs" })
     );
 
-    await waitFor(() => expect(result.current.status).toBe("success"));
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    expect(mockFetch).toHaveBeenCalledWith(
-      "/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&lead_time_hours=0",
-      expect.any(Object)
-    );
+    expect(result.current.status).toBe("idle");
+    expect(result.current.byLead.size).toBe(0);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("never issues a request with a metadata/coordinate field as the variable", async () => {

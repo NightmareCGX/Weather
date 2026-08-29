@@ -30,9 +30,12 @@ from api.models.entities import (
 from api.schemas import (
     ForecastAvailabilityData,
     InitialTimeAvailability,
+    LayerDescriptor,
     ModelAvailability,
+    SpatialLayerLegend,
     VariableAvailability,
 )
+from api.services.tiles import MAX_ZOOM, MIN_ZOOM, _color_stops
 
 
 @dataclass
@@ -143,12 +146,26 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                     reverse=True,
                 )
             ]
+            stops: list[list[float | str]] = [
+                [float(value), f"#{red:02x}{green:02x}{blue:02x}"]
+                for value, (red, green, blue) in _color_stops(variable_code)
+            ]
+            layer = LayerDescriptor(
+                tile_url_template=(
+                    f"/v1/maps/{model_id}/{variable_code}/surface/{{z}}/{{x}}/{{y}}.png"
+                    f"?lead_time_hours={{lead_time_hours}}&initial_time={{initial_time}}"
+                ),
+                min_zoom=MIN_ZOOM,
+                max_zoom=MAX_ZOOM,
+                legend=SpatialLayerLegend(unit=variable_acc.unit, stops=stops),
+            )
             variables.append(
                 VariableAvailability(
                     id=variable_code,
                     name=variable_acc.name,
                     unit=variable_acc.unit,
                     initial_times=initial_times,
+                    layer=layer,
                 )
             )
         models.append(
