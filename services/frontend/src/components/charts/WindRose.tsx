@@ -36,10 +36,7 @@ export function WindRose({ windRose }: WindRoseProps) {
   const center = 140;
 
   // Find max sector probability to scale lengths
-  const maxProb = Math.max(
-    0.2,
-    ...windRose.sectors.map((s) => s.probability)
-  );
+  const maxProb = Math.max(0.2, ...windRose.sectors.map((s) => s.probability));
 
   return (
     <div className="flex flex-col items-center">
@@ -102,8 +99,7 @@ export function WindRose({ windRose }: WindRoseProps) {
                   const binProb = sectorData.bins[binKey] ?? 0;
                   if (binProb <= 0) return null;
 
-                  const binRadialHeight =
-                    ((maxRadius - centerRadius) * (binProb / maxProb));
+                  const binRadialHeight = (maxRadius - centerRadius) * (binProb / maxProb);
                   const rInner = currentRadius;
                   const rOuter = currentRadius + binRadialHeight;
                   currentRadius = rOuter;
@@ -200,7 +196,7 @@ export function WindRose({ windRose }: WindRoseProps) {
             if (!sec) return null;
             const totalMembers =
               windRose.member_count ??
-              (windRose.calm_count + windRose.sectors.reduce((sum, s) => sum + s.count, 0));
+              windRose.calm_count + windRose.sectors.reduce((sum, s) => sum + s.count, 0);
             return (
               <span>
                 <strong>{sec.sector}</strong>: {formatPercent(sec.probability)} ({sec.count}/

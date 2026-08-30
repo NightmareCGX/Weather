@@ -204,17 +204,30 @@ export function resolveSpatialLayer(
     return null;
   }
 
-  const { tile_url_template, min_zoom, max_zoom, legend } = variable.layer;
+  const { tile_url_template, min_zoom, max_zoom, legend, vector_field_url_template } =
+    variable.layer;
   // Substitute selection parameters into the backend-supplied URL template pattern
   const tileUrl = tile_url_template
     .replace("{lead_time_hours}", String(selection.leadTimeHours))
     .replace("{initial_time}", encodeURIComponent(selection.initialTime));
 
-  return {
+  let vectorFieldUrl: string | null = null;
+  if (vector_field_url_template) {
+    vectorFieldUrl = vector_field_url_template
+      .replace("{lead_time_hours}", String(selection.leadTimeHours))
+      .replace("{initial_time}", encodeURIComponent(selection.initialTime));
+  }
+
+  const layerResult: SpatialLayer = {
     tile_url_template: tileUrl,
     min_zoom,
     max_zoom,
     lead_time_hours: selection.leadTimeHours,
     legend,
   };
+  if (vectorFieldUrl !== null) {
+    layerResult.vector_field_url_template = vectorFieldUrl;
+  }
+
+  return layerResult;
 }

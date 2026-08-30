@@ -68,6 +68,16 @@ export class MockMap {
   getLayer = jest.fn((id: string) => (this.layers.has(id) ? { id } : undefined));
   loaded = jest.fn(() => this.isLoaded);
   isStyleLoaded = jest.fn(() => this._isStyleLoaded);
+  getBounds = jest.fn(() => ({
+    getSouth: () => -85,
+    getNorth: () => 85,
+    getWest: () => -180,
+    getEast: () => 180,
+  }));
+  project = jest.fn(([lng, lat]: [number, number]) => ({
+    x: (lng + 180) * 2,
+    y: (90 - lat) * 2,
+  }));
   remove = jest.fn(() => {
     this.removed = true;
   });

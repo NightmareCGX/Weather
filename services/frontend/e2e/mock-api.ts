@@ -62,6 +62,35 @@ const DEFAULT_WEATHER_TILE = createPngTile(50, 150, 250, 255);
 const DEFAULT_OSM_TILE = createPngTile(240, 240, 240, 255);
 
 /**
+ * Pure in-memory quantized Int16 (WNDQ) binary payload generator for vector field testing.
+ */
+export function createMockVectorFieldBuffer(latCount = 4, lonCount = 4): Buffer {
+  const numPoints = latCount * lonCount;
+  const buf = Buffer.alloc(36 + numPoints * 4);
+  buf.write("WNDQ", 0, 4, "ascii");
+  buf.writeUInt8(1, 4); // version
+  buf.writeUInt8(1, 5); // flags
+  buf.writeUInt16LE(0, 6); // reserved
+  buf.writeFloatLE(0.01, 8); // scale
+  buf.writeFloatLE(90.0, 12); // lat_start
+  buf.writeFloatLE(-0.5, 16); // lat_step
+  buf.writeUInt32LE(latCount, 20);
+  buf.writeFloatLE(0.0, 24); // lon_start
+  buf.writeFloatLE(0.5, 28); // lon_step
+  buf.writeUInt32LE(lonCount, 32);
+
+  const uOffset = 36;
+  const vOffset = 36 + numPoints * 2;
+  for (let i = 0; i < numPoints; i++) {
+    buf.writeInt16LE(1000, uOffset + i * 2); // 10 m/s
+    buf.writeInt16LE(-500, vOffset + i * 2); // -5 m/s
+  }
+  return buf;
+}
+
+const DEFAULT_VECTOR_FIELD_PAYLOAD = createMockVectorFieldBuffer(10, 10);
+
+/**
  * Deterministic `/v1/*` API mocks for Playwright E2E tests.
  *
  * The fixtures mirror the repository's API test fixtures
@@ -289,6 +318,8 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                           [140, "#49006a"],
                         ],
                       },
+                      vector_field_url_template:
+                        "/v1/maps/gfs/wind_10m/vector-field?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
                     },
                   },
                 ],
@@ -440,6 +471,8 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                           [140, "#49006a"],
                         ],
                       },
+                      vector_field_url_template:
+                        "/v1/maps/gefs/wind_10m/vector-field?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
                     },
                   },
                 ],
@@ -533,6 +566,15 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
   );
   await page.route("**/v1/maps/**/*.png", (route) =>
     route.fulfill({ status: 200, contentType: "image/png", body: DEFAULT_WEATHER_TILE })
+  );
+
+  // Serve quantized binary vector field for flow animation
+  await page.route("**/v1/maps/**/vector-field*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/octet-stream",
+      body: DEFAULT_VECTOR_FIELD_PAYLOAD,
+    })
   );
 
   // The base style uses OSM raster tiles.
@@ -747,14 +789,54 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
         calm_percentage: 10.0,
         calm_count: 3,
         sectors: [
-          { sector: "N", count: 3, probability: 0.1, bins: { light: 0.05, moderate: 0.05, strong: 0.0, gale: 0.0 } },
-          { sector: "NE", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-          { sector: "E", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-          { sector: "SE", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-          { sector: "S", count: 6, probability: 0.2, bins: { light: 0.05, moderate: 0.1, strong: 0.05, gale: 0.0 } },
-          { sector: "SW", count: 18, probability: 0.6, bins: { light: 0.1, moderate: 0.3, strong: 0.15, gale: 0.05 } },
-          { sector: "W", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-          { sector: "NW", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
+          {
+            sector: "N",
+            count: 3,
+            probability: 0.1,
+            bins: { light: 0.05, moderate: 0.05, strong: 0.0, gale: 0.0 },
+          },
+          {
+            sector: "NE",
+            count: 0,
+            probability: 0.0,
+            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+          },
+          {
+            sector: "E",
+            count: 0,
+            probability: 0.0,
+            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+          },
+          {
+            sector: "SE",
+            count: 0,
+            probability: 0.0,
+            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+          },
+          {
+            sector: "S",
+            count: 6,
+            probability: 0.2,
+            bins: { light: 0.05, moderate: 0.1, strong: 0.05, gale: 0.0 },
+          },
+          {
+            sector: "SW",
+            count: 18,
+            probability: 0.6,
+            bins: { light: 0.1, moderate: 0.3, strong: 0.15, gale: 0.05 },
+          },
+          {
+            sector: "W",
+            count: 0,
+            probability: 0.0,
+            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+          },
+          {
+            sector: "NW",
+            count: 0,
+            probability: 0.0,
+            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+          },
         ],
       };
     }

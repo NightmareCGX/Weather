@@ -165,6 +165,10 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                     min_zoom=MIN_ZOOM,
                     max_zoom=MAX_ZOOM,
                     legend=SpatialLayerLegend(unit="km/h", stops=stops_wind),
+                    vector_field_url_template=(
+                        f"/v1/maps/{model_id}/wind_10m/vector-field"
+                        f"?lead_time_hours={{lead_time_hours}}&initial_time={{initial_time}}"
+                    ),
                 )
                 variables.append(
                     VariableAvailability(

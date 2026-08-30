@@ -25,7 +25,7 @@ const WeatherMap = dynamic(() => import("@/components/map/WeatherMap").then((m) 
  * preserved.
  */
 export default function HomePage() {
-  const { validTime } = useForecastSelection();
+  const { validTime, options } = useForecastSelection();
   const { layer, loading, error } = useMapLayer();
   const { selectedLocation, selectLocation } = useSelectedLocation();
 
@@ -58,6 +58,7 @@ export default function HomePage() {
               layer={layer}
               selectedLocation={selectedLocation}
               validTime={validTime}
+              availableLeads={options.leadTimes}
               onSelect={selectLocation}
             />
           )}

@@ -1,24 +1,36 @@
 """Unit tests for domain 10 m wind mathematics and conventions."""
 
-from __future__ import annotations
-
 import math
 
 import numpy as np
 import pytest
-from domain.exceptions import EmptyEnsembleError, InvalidEnsembleError, InvalidThresholdError
+from domain.exceptions import (
+    EmptyEnsembleError,
+    InvalidEnsembleError,
+    InvalidGridError,
+    InvalidThresholdError,
+)
 from domain.models.wind import (
     CARDINAL_DIRECTIONS_8,
+    EARTH_RADIUS_METERS,
+    VECTOR_FIELD_FLAG_INT16,
+    VECTOR_FIELD_HEADER_SIZE,
+    VECTOR_FIELD_MAGIC,
+    VectorGridMetadata,
+    advect_particle,
     compute_consensus_vector,
     compute_directional_probability,
     compute_wind_rose,
+    decode_vector_field_int16,
     derive_ensemble_mean_scalar_speed,
     derive_ensemble_mean_vector,
     derive_ensemble_member_speeds,
     derive_meteorological_direction,
     derive_meteorological_direction_array,
     derive_wind_speed,
+    encode_vector_field_int16,
     get_cardinal_direction,
+    sample_vector_bilinear,
 )
 
 
@@ -412,3 +424,299 @@ def test_compute_directional_probability_errors() -> None:
         compute_directional_probability([1.0], [1.0, 2.0], sector="N")
     with pytest.raises(InvalidEnsembleError):
         compute_directional_probability([float("nan")], [1.0], sector="N")
+
+
+def test_vector_grid_metadata_validation() -> None:
+    meta = VectorGridMetadata(
+        lat_start=90.0,
+        lat_step=-0.5,
+        lat_count=361,
+        lon_start=0.0,
+        lon_step=0.5,
+        lon_count=720,
+        scale=0.01,
+    )
+    assert meta.lat_count == 361
+    assert meta.lon_count == 720
+    assert meta.scale == 0.01
+
+    with pytest.raises(InvalidGridError, match="at least 2"):
+        VectorGridMetadata(
+            lat_start=0, lat_step=1, lat_count=1, lon_start=0, lon_step=1, lon_count=10
+        )
+    with pytest.raises(InvalidGridError, match="at least 2"):
+        VectorGridMetadata(
+            lat_start=0, lat_step=1, lat_count=10, lon_start=0, lon_step=1, lon_count=1
+        )
+    with pytest.raises(InvalidGridError, match="non-zero"):
+        VectorGridMetadata(
+            lat_start=0, lat_step=0, lat_count=10, lon_start=0, lon_step=1, lon_count=10
+        )
+    with pytest.raises(InvalidGridError, match="non-zero"):
+        VectorGridMetadata(
+            lat_start=0, lat_step=1, lat_count=10, lon_start=0, lon_step=0, lon_count=10
+        )
+    with pytest.raises(InvalidThresholdError, match="positive"):
+        VectorGridMetadata(
+            lat_start=0,
+            lat_step=1,
+            lat_count=10,
+            lon_start=0,
+            lon_step=1,
+            lon_count=10,
+            scale=0.0,
+        )
+    with pytest.raises(InvalidThresholdError, match="positive"):
+        VectorGridMetadata(
+            lat_start=0,
+            lat_step=1,
+            lat_count=10,
+            lon_start=0,
+            lon_step=1,
+            lon_count=10,
+            scale=-0.01,
+        )
+    with pytest.raises(InvalidThresholdError, match="finite"):
+        VectorGridMetadata(
+            lat_start=0,
+            lat_step=1,
+            lat_count=10,
+            lon_start=0,
+            lon_step=1,
+            lon_count=10,
+            scale=float("nan"),
+        )
+    with pytest.raises(InvalidGridError, match="finite"):
+        VectorGridMetadata(
+            lat_start=float("nan"), lat_step=1, lat_count=10, lon_start=0, lon_step=1, lon_count=10
+        )
+    with pytest.raises(InvalidGridError, match="finite"):
+        VectorGridMetadata(
+            lat_start=0, lat_step=1, lat_count=10, lon_start=float("inf"), lon_step=1, lon_count=10
+        )
+
+
+def test_vector_field_encode_decode_roundtrip() -> None:
+    u = np.array([[10.123, -5.678], [0.0, 45.5]], dtype=np.float32)
+    v = np.array([[-12.345, 8.901], [0.49, -0.49]], dtype=np.float32)
+
+    encoded = encode_vector_field_int16(
+        u,
+        v,
+        lat_start=90.0,
+        lat_step=-0.5,
+        lon_start=0.0,
+        lon_step=0.5,
+        scale=0.01,
+    )
+    assert len(encoded) == VECTOR_FIELD_HEADER_SIZE + 2 * 2 * 4
+
+    u_dec, v_dec, meta = decode_vector_field_int16(encoded)
+    assert meta.lat_start == 90.0
+    assert meta.lat_step == -0.5
+    assert meta.lat_count == 2
+    assert meta.lon_start == 0.0
+    assert meta.lon_step == 0.5
+    assert meta.lon_count == 2
+    assert pytest.approx(meta.scale) == 0.01
+
+    # Precision tolerance is scale / 2 (0.005 m/s)
+    np.testing.assert_allclose(u_dec, u, atol=0.0051)
+    np.testing.assert_allclose(v_dec, v, atol=0.0051)
+
+
+def test_vector_field_encode_errors() -> None:
+    u_1d = np.array([1.0, 2.0], dtype=np.float32)
+    v_1d = np.array([1.0, 2.0], dtype=np.float32)
+    with pytest.raises(InvalidGridError, match="2-dimensional"):
+        encode_vector_field_int16(u_1d, v_1d, lat_start=0, lat_step=1, lon_start=0, lon_step=1)
+
+    u_2d = np.ones((2, 2), dtype=np.float32)
+    v_mismatch = np.ones((2, 3), dtype=np.float32)
+    with pytest.raises(InvalidGridError, match="Shape mismatch"):
+        encode_vector_field_int16(
+            u_2d, v_mismatch, lat_start=0, lat_step=1, lon_start=0, lon_step=1
+        )
+
+    u_nan = np.array([[1.0, float("nan")], [0.0, 0.0]], dtype=np.float32)
+    with pytest.raises(InvalidGridError, match="finite numeric values"):
+        encode_vector_field_int16(u_nan, u_2d, lat_start=0, lat_step=1, lon_start=0, lon_step=1)
+
+
+def test_vector_field_decode_errors() -> None:
+    with pytest.raises(ValueError, match="Payload too short"):
+        decode_vector_field_int16(b"SHORT")
+
+    # Corrupt magic
+    bad_magic = b"XXXX" + b"\x00" * (VECTOR_FIELD_HEADER_SIZE - 4)
+    with pytest.raises(ValueError, match="Invalid magic"):
+        decode_vector_field_int16(bad_magic)
+
+    # Valid magic but bad version
+    import struct
+
+    header_bad_ver = struct.pack(
+        "<4sBBHf ffIffI",
+        VECTOR_FIELD_MAGIC,
+        2,  # bad version
+        VECTOR_FIELD_FLAG_INT16,
+        0,
+        0.01,
+        90.0,
+        -0.5,
+        2,
+        0.0,
+        0.5,
+        2,
+    )
+    with pytest.raises(ValueError, match="Unsupported version"):
+        decode_vector_field_int16(header_bad_ver)
+
+    # Bad flags
+    header_bad_flags = struct.pack(
+        "<4sBBHf ffIffI",
+        VECTOR_FIELD_MAGIC,
+        1,
+        0,  # bad flags
+        0,
+        0.01,
+        90.0,
+        -0.5,
+        2,
+        0.0,
+        0.5,
+        2,
+    )
+    with pytest.raises(ValueError, match="Unsupported flags"):
+        decode_vector_field_int16(header_bad_flags)
+
+    # Payload size mismatch
+    header_valid = struct.pack(
+        "<4sBBHf ffIffI",
+        VECTOR_FIELD_MAGIC,
+        1,
+        1,
+        0,
+        0.01,
+        90.0,
+        -0.5,
+        10,
+        0.0,
+        0.5,
+        10,
+    )
+    with pytest.raises(ValueError, match="Payload size mismatch"):
+        decode_vector_field_int16(header_valid + b"\x00" * 10)
+
+
+def test_advect_particle() -> None:
+    # Pure northward motion from equator (lat 0, lon 0)
+    # v = 100 m/s for 3600 seconds -> distance = 360,000 m
+    # dlat = 360,000 / 6,371,000 * (180 / pi) = 3.2374 deg
+    new_lat, new_lon = advect_particle(0.0, 0.0, 0.0, 100.0, dt_seconds=3600.0)
+    expected_dlat = (100.0 * 3600.0 / EARTH_RADIUS_METERS) * (180.0 / math.pi)
+    assert pytest.approx(new_lat) == expected_dlat
+    assert pytest.approx(new_lon) == 0.0
+
+    # Pure eastward motion across the dateline (lat 0, lon 179)
+    # u = 100 m/s for 3600s -> dlon = 3.2374 deg -> new lon = 182.2374 -> wrapped to -177.7626
+    new_lat, new_lon = advect_particle(0.0, 179.0, 100.0, 0.0, dt_seconds=3600.0)
+    assert pytest.approx(new_lat) == 0.0
+    assert pytest.approx(new_lon) == 179.0 + expected_dlat - 360.0
+
+    # Westward motion crossing -180 (lat 0, lon -179)
+    new_lat, new_lon = advect_particle(0.0, -179.0, -100.0, 0.0, dt_seconds=3600.0)
+    assert pytest.approx(new_lon) == -179.0 - expected_dlat + 360.0
+
+    # High latitude pole clamp
+    new_lat, new_lon = advect_particle(
+        88.0, 0.0, 100.0, 100.0, dt_seconds=3600.0, lat_clamp=85.0
+    )
+    assert new_lat == 85.0
+    assert not math.isinf(new_lon) and not math.isnan(new_lon)
+
+    # South pole clamp
+    new_lat, new_lon = advect_particle(
+        -88.0, 0.0, -100.0, -100.0, dt_seconds=3600.0, lat_clamp=85.0
+    )
+    assert new_lat == -85.0
+
+    # Exact boundary dateline wrap: new_lon lands at +180.0
+    new_lat, new_lon = advect_particle(0.0, 180.0, 0.0, 0.0)
+    assert new_lat == 0.0
+    assert new_lon == 180.0
+
+    # NaN inputs return NaN
+    assert math.isnan(advect_particle(float("nan"), 0.0, 1.0, 1.0)[0])
+    assert math.isnan(advect_particle(0.0, float("nan"), 1.0, 1.0)[0])
+    assert math.isnan(advect_particle(0.0, 0.0, float("nan"), 1.0)[0])
+    assert math.isnan(advect_particle(0.0, 0.0, 1.0, float("nan"))[0])
+
+
+def test_sample_vector_bilinear() -> None:
+    meta = VectorGridMetadata(
+        lat_start=90.0,
+        lat_step=-1.0,
+        lat_count=3,  # rows: 90, 89, 88
+        lon_start=0.0,
+        lon_step=1.0,
+        lon_count=4,  # cols: 0, 1, 2, 3
+        scale=0.01,
+    )
+    # U increases with lon, V increases with lat
+    u_grid = np.array([
+        [0.0, 1.0, 2.0, 3.0],
+        [0.0, 1.0, 2.0, 3.0],
+        [0.0, 1.0, 2.0, 3.0],
+    ], dtype=np.float32)
+
+    v_grid = np.array([
+        [10.0, 10.0, 10.0, 10.0],
+        [5.0,  5.0,  5.0,  5.0],
+        [0.0,  0.0,  0.0,  0.0],
+    ], dtype=np.float32)
+
+    # Exact node sampling
+    u_val, v_val = sample_vector_bilinear(u_grid, v_grid, meta, 90.0, 0.0)
+    assert pytest.approx(u_val) == 0.0
+    assert pytest.approx(v_val) == 10.0
+
+    # Exact midpoint sampling
+    u_val, v_val = sample_vector_bilinear(u_grid, v_grid, meta, 89.5, 1.5)
+    assert pytest.approx(u_val) == 1.5
+    assert pytest.approx(v_val) == 7.5
+
+    # Longitude wrapping: lon = 3.5 wraps to between col 3 (3.0) and col 0 (0.0)
+    # u is 3.0 at col 3 and 0.0 at col 0 -> midpoint is 1.5
+    u_val, v_val = sample_vector_bilinear(u_grid, v_grid, meta, 90.0, 3.5)
+    assert pytest.approx(u_val) == 1.5
+
+    # Negative longitude wrapping: lon = -0.5 is same as 3.5
+    u_val, v_val = sample_vector_bilinear(u_grid, v_grid, meta, 90.0, -0.5)
+    assert pytest.approx(u_val) == 1.5
+
+    # Target latitude clamped out of bounds
+    u_val, v_val = sample_vector_bilinear(u_grid, v_grid, meta, 95.0, 0.0)
+    assert pytest.approx(u_val) == 0.0
+    assert pytest.approx(v_val) == 10.0
+
+    u_val, v_val = sample_vector_bilinear(u_grid, v_grid, meta, 80.0, 0.0)
+    assert pytest.approx(v_val) == 0.0
+
+    # Negative lon_start grid convention [-180, 180]
+    meta_neg = VectorGridMetadata(
+        lat_start=90.0,
+        lat_step=-1.0,
+        lat_count=3,
+        lon_start=-180.0,
+        lon_step=1.0,
+        lon_count=4,
+        scale=0.01,
+    )
+    u_val, _ = sample_vector_bilinear(u_grid, v_grid, meta_neg, 90.0, -180.0)
+    assert pytest.approx(u_val) == 0.0
+
+    # NaN inputs return NaN
+    assert math.isnan(sample_vector_bilinear(u_grid, v_grid, meta, float("nan"), 0.0)[0])
+    assert math.isnan(sample_vector_bilinear(u_grid, v_grid, meta, 0.0, float("nan"))[0])
+

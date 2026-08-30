@@ -224,6 +224,7 @@ export interface LayerDescriptor {
   min_zoom: number;
   max_zoom: number;
   legend: SpatialLayerLegend;
+  vector_field_url_template?: string | null;
 }
 
 /** A forecast variable and the initial times available for it. */
@@ -254,6 +255,23 @@ export interface SpatialLayer {
   max_zoom: number;
   lead_time_hours: number;
   legend: SpatialLayerLegend;
+  vector_field_url_template?: string | null;
+}
+
+export interface VectorGridMetadata {
+  lat_start: number;
+  lat_step: number;
+  lat_count: number;
+  lon_start: number;
+  lon_step: number;
+  lon_count: number;
+  scale: number;
+}
+
+export interface VectorFieldData {
+  meta: VectorGridMetadata;
+  u: Float32Array;
+  v: Float32Array;
 }
 
 /** Universal list/single-response envelope (docs/API.md section 2.3). */

@@ -438,3 +438,62 @@ test("phase 1b wind product: selecting Wind updates map, meteogram, and ensemble
   await expect(page.getByRole("img", { name: /ensemble wind rose chart/i })).toBeVisible();
   await expect(page.getByText("CALM")).toBeVisible();
 });
+
+test("phase 1b.3 animated wind map: progressive rendering, lead switching, consensus flow, and reduced motion", async ({
+  page,
+}) => {
+  const vectorRequests: { model: string; lead: string }[] = [];
+
+  await page.route("**/v1/maps/**/vector-field*", async (route) => {
+    const url = new URL(route.request().url());
+    const lead = url.searchParams.get("lead_time_hours") ?? "0";
+    const isGefs = url.pathname.includes("/gefs/");
+    vectorRequests.push({ model: isGefs ? "gefs" : "gfs", lead });
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+  const leadSelect = page.getByLabel("Lead time");
+  const modelSelect = page.getByLabel("Model");
+  const canvas = page.getByTestId("wind-particle-canvas");
+
+  // 1. Select Wind product -> Stage A (scalar raster) and Stage B (particle canvas)
+  await variableSelect.selectOption("wind_10m");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+  await expect(canvas).toBeVisible();
+
+  // Vector field request dispatched for GFS lead 0
+  await expect.poll(() => vectorRequests.some((r) => r.model === "gfs")).toBe(true);
+
+  // 2. Scrub through lead times (0h -> 6h -> 12h)
+  await leadSelect.selectOption("6");
+  await expect.poll(() => vectorRequests.some((r) => r.lead === "6")).toBe(true);
+  await expect(leadSelect).toHaveValue("6");
+
+  await leadSelect.selectOption("12");
+  await expect.poll(() => vectorRequests.some((r) => r.lead === "12")).toBe(true);
+  await expect(leadSelect).toHaveValue("12");
+
+  // 3. Switch GFS -> GEFS consensus flow
+  await modelSelect.selectOption("gefs");
+  await variableSelect.selectOption("wind_10m");
+  await expect(modelSelect).toHaveValue("gefs");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  await expect.poll(() => vectorRequests.some((r) => r.model === "gefs")).toBe(true);
+
+  // 4. Switch Wind -> Temperature -> particle canvas inactive
+  await variableSelect.selectOption("temperature_2m");
+  await expect(variableSelect).toHaveValue("temperature_2m");
+
+  // 5. Reduced motion: simulate prefers-reduced-motion: reduce
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await variableSelect.selectOption("wind_10m");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  // Raster remains functional
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+});

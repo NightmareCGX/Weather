@@ -18,6 +18,7 @@ performed at the presentation/API boundary.
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass
 from typing import Any, overload
 
@@ -25,7 +26,12 @@ import numpy as np
 import numpy.typing as npt
 
 from domain.ensemble.interval import probability_confidence_interval
-from domain.exceptions import EmptyEnsembleError, InvalidEnsembleError, InvalidThresholdError
+from domain.exceptions import (
+    EmptyEnsembleError,
+    InvalidEnsembleError,
+    InvalidGridError,
+    InvalidThresholdError,
+)
 
 #: Policy threshold below which wind speed is classified as calm (m/s).
 #: In calm conditions, wind direction is physically undefined.
@@ -545,3 +551,309 @@ def compute_directional_probability(
     prob = matched / n
     ci = probability_confidence_interval(prob, n)
     return prob, ci
+
+
+VECTOR_FIELD_MAGIC = b"WNDQ"
+VECTOR_FIELD_VERSION = 1
+VECTOR_FIELD_FLAG_INT16 = 1
+VECTOR_FIELD_HEADER_FMT = "<4sBBHf ffIffI"
+VECTOR_FIELD_HEADER_SIZE = struct.calcsize(VECTOR_FIELD_HEADER_FMT)
+EARTH_RADIUS_METERS = 6371000.0
+
+
+@dataclass(frozen=True)
+class VectorGridMetadata:
+    """Metadata describing a quantized 2-D vector wind grid.
+
+    Attributes:
+        lat_start: Latitude coordinate of row index 0.
+        lat_step: Uniform latitude step between adjacent rows.
+        lat_count: Number of latitude rows.
+        lon_start: Longitude coordinate of column index 0.
+        lon_step: Uniform longitude step between adjacent columns.
+        lon_count: Number of longitude columns.
+        scale: Physical scale factor (e.g. 0.01 for 0.01 m/s precision).
+    """
+
+    lat_start: float
+    lat_step: float
+    lat_count: int
+    lon_start: float
+    lon_step: float
+    lon_count: int
+    scale: float = 0.01
+
+    def __post_init__(self) -> None:
+        if self.lat_count < 2 or self.lon_count < 2:
+            raise InvalidGridError(
+                "Vector grid must have at least 2 latitude rows and 2 longitude columns."
+            )
+        if self.lat_step == 0.0 or self.lon_step == 0.0:
+            raise InvalidGridError("Vector grid step sizes must be non-zero.")
+        if self.scale <= 0.0 or not math.isfinite(self.scale):
+            raise InvalidThresholdError(
+                f"Scale factor must be positive and finite, got {self.scale}"
+            )
+        if not (math.isfinite(self.lat_start) and math.isfinite(self.lon_start)):
+            raise InvalidGridError("Vector grid coordinates must be finite.")
+
+
+def encode_vector_field_int16(
+    u: npt.NDArray[np.floating[Any]],
+    v: npt.NDArray[np.floating[Any]],
+    *,
+    lat_start: float,
+    lat_step: float,
+    lon_start: float,
+    lon_step: float,
+    scale: float = 0.01,
+) -> bytes:
+    """Encode a 2-D (lat, lon) wind vector field to quantized Int16 binary.
+
+    Args:
+        u: 2-D array of zonal wind velocity (m/s).
+        v: 2-D array of meridional wind velocity (m/s).
+        lat_start: Latitude of row 0.
+        lat_step: Uniform latitude spacing.
+        lon_start: Longitude of column 0.
+        lon_step: Uniform longitude spacing.
+        scale: Precision scale factor (m/s per discrete int16 quantum).
+
+    Returns:
+        Packed bytes with 36-byte header followed by contiguous u then v int16 buffers.
+
+    Raises:
+        InvalidGridError: If shapes mismatch, ndim != 2, or axes are degenerate.
+        InvalidThresholdError: If scale <= 0.
+    """
+    u_arr = np.asarray(u, dtype=np.float32)
+    v_arr = np.asarray(v, dtype=np.float32)
+
+    if u_arr.ndim != 2 or v_arr.ndim != 2:
+        raise InvalidGridError("u and v fields must be 2-dimensional (lat, lon) arrays.")
+    if u_arr.shape != v_arr.shape:
+        raise InvalidGridError(f"Shape mismatch: u {u_arr.shape} vs v {v_arr.shape}.")
+    if not np.all(np.isfinite(u_arr)) or not np.all(np.isfinite(v_arr)):
+        raise InvalidGridError("Vector fields must contain finite numeric values.")
+
+    meta = VectorGridMetadata(
+        lat_start=lat_start,
+        lat_step=lat_step,
+        lat_count=u_arr.shape[0],
+        lon_start=lon_start,
+        lon_step=lon_step,
+        lon_count=u_arr.shape[1],
+        scale=scale,
+    )
+
+    header = struct.pack(
+        VECTOR_FIELD_HEADER_FMT,
+        VECTOR_FIELD_MAGIC,
+        VECTOR_FIELD_VERSION,
+        VECTOR_FIELD_FLAG_INT16,
+        0,  # reserved
+        float(meta.scale),
+        float(meta.lat_start),
+        float(meta.lat_step),
+        meta.lat_count,
+        float(meta.lon_start),
+        float(meta.lon_step),
+        meta.lon_count,
+    )
+
+    u_i16 = np.clip(np.round(u_arr / meta.scale), -32768, 32767).astype("<i2")
+    v_i16 = np.clip(np.round(v_arr / meta.scale), -32768, 32767).astype("<i2")
+
+    return bytes(header + u_i16.tobytes() + v_i16.tobytes())
+
+
+def decode_vector_field_int16(
+    raw_bytes: bytes,
+) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], VectorGridMetadata]:
+    """Decode a quantized Int16 binary wind vector field.
+
+    Args:
+        raw_bytes: Binary payload starting with 36-byte WNDQ header.
+
+    Returns:
+        Tuple of (u_field_mps, v_field_mps, metadata).
+
+    Raises:
+        ValueError: If magic, version, flags, or payload size is invalid.
+    """
+    if len(raw_bytes) < VECTOR_FIELD_HEADER_SIZE:
+        raise ValueError(
+            f"Payload too short: {len(raw_bytes)} bytes < header size {VECTOR_FIELD_HEADER_SIZE}."
+        )
+
+    header = raw_bytes[:VECTOR_FIELD_HEADER_SIZE]
+    (
+        magic,
+        ver,
+        flags,
+        _res,
+        scale,
+        lat_start,
+        lat_step,
+        lat_count,
+        lon_start,
+        lon_step,
+        lon_count,
+    ) = struct.unpack(VECTOR_FIELD_HEADER_FMT, header)
+
+    if magic != VECTOR_FIELD_MAGIC:
+        raise ValueError(f"Invalid magic header: {magic!r}, expected {VECTOR_FIELD_MAGIC!r}.")
+    if ver != VECTOR_FIELD_VERSION:
+        raise ValueError(f"Unsupported version: {ver}, expected {VECTOR_FIELD_VERSION}.")
+    if flags != VECTOR_FIELD_FLAG_INT16:
+        raise ValueError(f"Unsupported flags: {flags}, expected {VECTOR_FIELD_FLAG_INT16}.")
+
+    meta = VectorGridMetadata(
+        lat_start=float(lat_start),
+        lat_step=float(lat_step),
+        lat_count=int(lat_count),
+        lon_start=float(lon_start),
+        lon_step=float(lon_step),
+        lon_count=int(lon_count),
+        scale=float(scale),
+    )
+
+    num_points = meta.lat_count * meta.lon_count
+    expected_payload_len = VECTOR_FIELD_HEADER_SIZE + num_points * 2 * 2
+    if len(raw_bytes) != expected_payload_len:
+        raise ValueError(
+            f"Payload size mismatch: got {len(raw_bytes)} bytes, expected {expected_payload_len} "
+            f"for {meta.lat_count}x{meta.lon_count} grid."
+        )
+
+    offset = VECTOR_FIELD_HEADER_SIZE
+    u_bytes_len = num_points * 2
+    u_i16 = np.frombuffer(raw_bytes, dtype="<i2", count=num_points, offset=offset).reshape(
+        (meta.lat_count, meta.lon_count)
+    )
+    offset += u_bytes_len
+    v_i16 = np.frombuffer(raw_bytes, dtype="<i2", count=num_points, offset=offset).reshape(
+        (meta.lat_count, meta.lon_count)
+    )
+
+    u_mps = (u_i16.astype(np.float32) * meta.scale)
+    v_mps = (v_i16.astype(np.float32) * meta.scale)
+
+    return u_mps, v_mps, meta
+
+
+def advect_particle(
+    lat: float,
+    lon: float,
+    u: float,
+    v: float,
+    *,
+    dt_seconds: float = 60.0,
+    lat_clamp: float = 85.0,
+    earth_radius_m: float = EARTH_RADIUS_METERS,
+) -> tuple[float, float]:
+    """Advance a geographic particle position given local (u, v) velocity in m/s.
+
+    Accounts for meridional curvature (Earth radius) and zonal convergence
+    at high latitudes (cos(lat)), with pole clamp to avoid numerical singularity.
+
+    Args:
+        lat: Current latitude in [-90, 90] degrees.
+        lon: Current longitude in degrees.
+        u: Zonal wind speed in m/s (eastward positive).
+        v: Meridional wind speed in m/s (northward positive).
+        dt_seconds: Advection step duration in seconds.
+        lat_clamp: Latitude threshold in degrees beyond which cos(lat) is clamped.
+        earth_radius_m: Mean Earth radius in meters.
+
+    Returns:
+        Tuple of (new_latitude, new_longitude) with normalized longitude in [-180, 180].
+    """
+    if math.isnan(lat) or math.isnan(lon) or math.isnan(u) or math.isnan(v):
+        return float("nan"), float("nan")
+
+    # Clamped latitude for numerical stability in 1/cos(lat)
+    clamped_lat = max(-lat_clamp, min(lat_clamp, lat))
+    rad_lat = math.radians(clamped_lat)
+    cos_lat = max(math.cos(rad_lat), math.cos(math.radians(lat_clamp)))
+
+    # Angular displacement (degrees)
+    # dlat = (v * dt) / R * (180 / pi)
+    dlat_deg = (v * dt_seconds / earth_radius_m) * (180.0 / math.pi)
+    # dlon = (u * dt) / (R * cos(lat)) * (180 / pi)
+    dlon_deg = (u * dt_seconds / (earth_radius_m * cos_lat)) * (180.0 / math.pi)
+
+    new_lat = max(-lat_clamp, min(lat_clamp, lat + dlat_deg))
+    new_lon = lon + dlon_deg
+
+    # Normalize longitude to [-180, 180]
+    norm_lon = ((new_lon + 180.0) % 360.0) - 180.0
+    if norm_lon == -180.0 and new_lon > 0:
+        norm_lon = 180.0
+
+    return new_lat, norm_lon
+
+
+def sample_vector_bilinear(
+    u_grid: npt.NDArray[np.floating[Any]],
+    v_grid: npt.NDArray[np.floating[Any]],
+    meta: VectorGridMetadata,
+    lat: float,
+    lon: float,
+) -> tuple[float, float]:
+    """Bilinear interpolation of U and V velocity components at (lat, lon).
+
+    Args:
+        u_grid: 2-D array of shape (lat_count, lon_count).
+        v_grid: 2-D array of shape (lat_count, lon_count).
+        meta: VectorGridMetadata describing grid coordinates.
+        lat: Target latitude.
+        lon: Target longitude.
+
+    Returns:
+        Interpolated (u, v) in m/s.
+    """
+    if math.isnan(lat) or math.isnan(lon):
+        return float("nan"), float("nan")
+
+    # Row fractional index
+    row_f = (lat - meta.lat_start) / meta.lat_step
+    row_f = max(0.0, min(float(meta.lat_count - 1), row_f))
+
+    # Longitude alignment into [lon_start, lon_start + span]
+    lon_norm = lon % 360.0
+    aligned_lon = lon_norm if meta.lon_start >= 0.0 else ((lon + 180.0) % 360.0) - 180.0
+
+    col_f = (aligned_lon - meta.lon_start) / meta.lon_step
+    # Periodic longitude wrapping for global grids
+    col_f = col_f % float(meta.lon_count)
+
+    r0 = int(math.floor(row_f))
+    r1 = min(meta.lat_count - 1, r0 + 1)
+    dr = row_f - r0
+
+    c0 = int(math.floor(col_f))
+    c1 = (c0 + 1) % meta.lon_count
+    dc = col_f - c0
+
+    # 4-corner weights
+    w00 = (1.0 - dr) * (1.0 - dc)
+    w01 = (1.0 - dr) * dc
+    w10 = dr * (1.0 - dc)
+    w11 = dr * dc
+
+    u_val = float(
+        w00 * u_grid[r0, c0]
+        + w01 * u_grid[r0, c1]
+        + w10 * u_grid[r1, c0]
+        + w11 * u_grid[r1, c1]
+    )
+    v_val = float(
+        w00 * v_grid[r0, c0]
+        + w01 * v_grid[r0, c1]
+        + w10 * v_grid[r1, c0]
+        + w11 * v_grid[r1, c1]
+    )
+
+    return u_val, v_val
+

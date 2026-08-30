@@ -108,6 +108,7 @@ class LayerDescriptor(BaseModel):
     min_zoom: int
     max_zoom: int
     legend: SpatialLayerLegend
+    vector_field_url_template: str | None = None
 
 
 class InitialTimeAvailability(BaseModel):
@@ -367,6 +368,7 @@ class SpatialLayerData(BaseModel):
     max_zoom: int
     lead_time_hours: int
     legend: SpatialLayerLegend
+    vector_field_url_template: str | None = None
 
 
 class SpatialLayerEnvelope(BaseModel):

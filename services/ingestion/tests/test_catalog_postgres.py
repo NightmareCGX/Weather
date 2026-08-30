@@ -276,7 +276,7 @@ def test_cli_production_entrypoint_ingests_and_serves(
         _fake_download,
     )
 
-    from ingestion.cli import main
+    from ingestion.cli import DEFAULT_VARIABLES, main
 
     code = main(
         [
@@ -295,7 +295,7 @@ def test_cli_production_entrypoint_ingests_and_serves(
         ]
     )
     assert code == 0
-    assert captured_variables == [("temperature_2m", "precipitation_rate")]
+    assert captured_variables == [tuple(v.code for v in DEFAULT_VARIABLES)]
 
     # The run is recorded as ready with the store path.
     with Session(engine) as session:

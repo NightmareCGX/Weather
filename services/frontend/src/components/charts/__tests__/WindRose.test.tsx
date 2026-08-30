@@ -8,14 +8,54 @@ const MOCK_WIND_ROSE: WindRoseType = {
   calm_count: 3,
   calm_percentage: 10.0,
   sectors: [
-    { sector: "N", count: 6, probability: 0.2, bins: { light: 0.05, moderate: 0.1, strong: 0.05, gale: 0.0 } },
-    { sector: "NE", count: 3, probability: 0.1, bins: { light: 0.1, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-    { sector: "E", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-    { sector: "SE", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-    { sector: "S", count: 3, probability: 0.1, bins: { light: 0.0, moderate: 0.1, strong: 0.0, gale: 0.0 } },
-    { sector: "SW", count: 15, probability: 0.5, bins: { light: 0.1, moderate: 0.2, strong: 0.15, gale: 0.05 } },
-    { sector: "W", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
-    { sector: "NW", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
+    {
+      sector: "N",
+      count: 6,
+      probability: 0.2,
+      bins: { light: 0.05, moderate: 0.1, strong: 0.05, gale: 0.0 },
+    },
+    {
+      sector: "NE",
+      count: 3,
+      probability: 0.1,
+      bins: { light: 0.1, moderate: 0.0, strong: 0.0, gale: 0.0 },
+    },
+    {
+      sector: "E",
+      count: 0,
+      probability: 0.0,
+      bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+    },
+    {
+      sector: "SE",
+      count: 0,
+      probability: 0.0,
+      bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+    },
+    {
+      sector: "S",
+      count: 3,
+      probability: 0.1,
+      bins: { light: 0.0, moderate: 0.1, strong: 0.0, gale: 0.0 },
+    },
+    {
+      sector: "SW",
+      count: 15,
+      probability: 0.5,
+      bins: { light: 0.1, moderate: 0.2, strong: 0.15, gale: 0.05 },
+    },
+    {
+      sector: "W",
+      count: 0,
+      probability: 0.0,
+      bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+    },
+    {
+      sector: "NW",
+      count: 0,
+      probability: 0.0,
+      bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+    },
   ],
 };
 
