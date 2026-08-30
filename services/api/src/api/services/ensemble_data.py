@@ -23,6 +23,8 @@ from domain.ensemble import (
     ensemble_spread,
     estimate_ensemble_pdf,
     probability_above_threshold,
+    probability_at_or_above_threshold,
+    probability_at_or_below_threshold,
     probability_below_threshold,
     probability_between_thresholds,
     probability_confidence_interval,
@@ -85,7 +87,7 @@ def build_probability_forecast(
     longitude: float,
     variable: str,
     threshold: float,
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     lead_time_hours: int,
     model: str,
     threshold_max: float | None = None,
@@ -243,7 +245,7 @@ def _require_ensemble_model(db: Session, model: str) -> None:
 def _probability(
     members: list[float],
     threshold: float,
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     threshold_max: float | None,
 ) -> float:
     """Compute the empirical exceedance probability for the operator.
@@ -257,8 +259,12 @@ def _probability(
     try:
         if operator == "gt":
             return probability_above_threshold(members, threshold)
+        if operator == "gte":
+            return probability_at_or_above_threshold(members, threshold)
         if operator == "lt":
             return probability_below_threshold(members, threshold)
+        if operator == "lte":
+            return probability_at_or_below_threshold(members, threshold)
         if threshold_max is None:
             raise HTTPException(
                 status_code=_STATUS_INVALID_INPUT,

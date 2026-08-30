@@ -50,6 +50,50 @@ const availabilityPayload = {
               },
             ],
           },
+          {
+            id: "relative_humidity_2m",
+            name: "Relative Humidity",
+            unit: "%",
+            initial_times: [
+              {
+                value: "2026-08-13T00:00:00Z",
+                lead_time_hours: [6],
+              },
+            ],
+          },
+          {
+            id: "wind_gust",
+            name: "Wind Gust",
+            unit: "km/h",
+            initial_times: [
+              {
+                value: "2026-08-13T00:00:00Z",
+                lead_time_hours: [6],
+              },
+            ],
+          },
+          {
+            id: "visibility",
+            name: "Visibility",
+            unit: "m",
+            initial_times: [
+              {
+                value: "2026-08-13T00:00:00Z",
+                lead_time_hours: [6],
+              },
+            ],
+          },
+          {
+            id: "snow_depth",
+            name: "Snow Depth",
+            unit: "m",
+            initial_times: [
+              {
+                value: "2026-08-13T00:00:00Z",
+                lead_time_hours: [6],
+              },
+            ],
+          },
         ],
       },
     ],
@@ -92,6 +136,11 @@ describe("LayerControls (data-driven)", () => {
     // Only the database-driven options appear.
     expect(screen.getByText("Global Forecast System")).toBeInTheDocument();
     expect(screen.getByText("2-Meter Temperature")).toBeInTheDocument();
+    expect(screen.getByText("Precipitation Rate")).toBeInTheDocument();
+    expect(screen.getByText("Relative Humidity")).toBeInTheDocument();
+    expect(screen.getByText("Wind Gust")).toBeInTheDocument();
+    expect(screen.getByText("Visibility")).toBeInTheDocument();
+    expect(screen.getByText("Snow Depth")).toBeInTheDocument();
     expect(screen.getByText("2026-08-13 00Z")).toBeInTheDocument();
     expect(screen.getByText("+6h")).toBeInTheDocument();
   });

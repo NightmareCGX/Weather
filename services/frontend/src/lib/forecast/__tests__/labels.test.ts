@@ -24,11 +24,19 @@ describe("labels", () => {
     expect(meta.temperature_2m).toEqual({ name: "2-Meter Temperature", unit: "°C" });
     // Fallback applies when the catalog does not carry a known default.
     expect(meta.precipitation_rate).toEqual({ name: "Precipitation Rate", unit: "mm/h" });
+    expect(meta.relative_humidity_2m).toEqual({ name: "Relative Humidity", unit: "%" });
+    expect(meta.wind_gust).toEqual({ name: "Wind Gust", unit: "km/h" });
+    expect(meta.visibility).toEqual({ name: "Visibility", unit: "m" });
+    expect(meta.snow_depth).toEqual({ name: "Snow Depth", unit: "m" });
   });
 
   it("falls back for a missing or empty catalog", () => {
     expect(buildVariableMeta(null).temperature_2m.unit).toBe("°C");
     expect(buildVariableMeta([]).precipitation_rate.name).toBe("Precipitation Rate");
+    expect(buildVariableMeta([]).relative_humidity_2m.unit).toBe("%");
+    expect(buildVariableMeta([]).wind_gust.unit).toBe("km/h");
+    expect(buildVariableMeta([]).visibility.name).toBe("Visibility");
+    expect(buildVariableMeta([]).snow_depth.name).toBe("Snow Depth");
   });
 
   it("formats values with units", () => {

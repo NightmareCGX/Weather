@@ -171,6 +171,102 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                       },
                     },
                   },
+                  {
+                    id: "relative_humidity_2m",
+                    name: "Relative Humidity",
+                    unit: "%",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/relative_humidity_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "%",
+                        stops: [
+                          [0, "#8c510a"],
+                          [100, "#01665e"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "wind_gust",
+                    name: "Wind Gust",
+                    unit: "km/h",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/wind_gust/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "km/h",
+                        stops: [
+                          [0, "#f7f7f7"],
+                          [150, "#49006a"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "visibility",
+                    name: "Visibility",
+                    unit: "m",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/visibility/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "m",
+                        stops: [
+                          [0, "#49006a"],
+                          [24000, "#ffffff"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "snow_depth",
+                    name: "Snow Depth",
+                    unit: "m",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/snow_depth/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "m",
+                        stops: [
+                          [0, "#ffffff"],
+                          [2.5, "#1a0040"],
+                        ],
+                      },
+                    },
+                  },
                 ],
               },
               {
@@ -198,6 +294,102 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         stops: [
                           [-40, "#313695"],
                           [45, "#a50026"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "relative_humidity_2m",
+                    name: "Relative Humidity",
+                    unit: "%",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/relative_humidity_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "%",
+                        stops: [
+                          [0, "#8c510a"],
+                          [100, "#01665e"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "wind_gust",
+                    name: "Wind Gust",
+                    unit: "km/h",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/wind_gust/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "km/h",
+                        stops: [
+                          [0, "#f7f7f7"],
+                          [150, "#49006a"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "visibility",
+                    name: "Visibility",
+                    unit: "m",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/visibility/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "m",
+                        stops: [
+                          [0, "#49006a"],
+                          [24000, "#ffffff"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "snow_depth",
+                    name: "Snow Depth",
+                    unit: "m",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/snow_depth/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "m",
+                        stops: [
+                          [0, "#ffffff"],
+                          [2.5, "#1a0040"],
                         ],
                       },
                     },
@@ -313,6 +505,30 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
               object: "variable",
               name: "Precipitation Rate",
               unit: "mm/h",
+            },
+            {
+              id: "relative_humidity_2m",
+              object: "variable",
+              name: "Relative Humidity",
+              unit: "%",
+            },
+            {
+              id: "wind_gust",
+              object: "variable",
+              name: "Wind Gust",
+              unit: "km/h",
+            },
+            {
+              id: "visibility",
+              object: "variable",
+              name: "Visibility",
+              unit: "m",
+            },
+            {
+              id: "snow_depth",
+              object: "variable",
+              name: "Snow Depth",
+              unit: "m",
             },
           ],
           "list"

@@ -341,3 +341,58 @@ test("state sync regression: GFS precipitation -> GEFS switch queries temperatur
   await expect(appAlerts).toHaveCount(0);
   await expect(page.getByText(/Failed to load/i)).toHaveCount(0);
 });
+
+test("phase 1a variable expansion: switching through all Phase 1A variables updates map and legend", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+  const legend = page.getByTestId("legend-gradient");
+
+  // 1. Relative humidity
+  await variableSelect.selectOption("relative_humidity_2m");
+  await expect(variableSelect).toHaveValue("relative_humidity_2m");
+  await expect(legend).toBeVisible();
+
+  // 2. Wind gust
+  await variableSelect.selectOption("wind_gust");
+  await expect(variableSelect).toHaveValue("wind_gust");
+  await expect(legend).toBeVisible();
+
+  // 3. Visibility
+  await variableSelect.selectOption("visibility");
+  await expect(variableSelect).toHaveValue("visibility");
+  await expect(legend).toBeVisible();
+
+  // 4. Snow depth
+  await variableSelect.selectOption("snow_depth");
+  await expect(variableSelect).toHaveValue("snow_depth");
+  await expect(legend).toBeVisible();
+
+  // Ensure no error alert was produced during rapid switching
+  const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
+  await expect(appAlerts).toHaveCount(0);
+});
+
+test("phase 1a gefs variable selection: selecting GEFS relative humidity updates ensemble panel", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+
+  const variableSelect = page.getByLabel("Variable");
+  await variableSelect.selectOption("relative_humidity_2m");
+
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
+  ).toBeVisible();
+});

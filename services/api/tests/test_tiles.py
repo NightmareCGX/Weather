@@ -269,3 +269,33 @@ def test_tile_cache_serves_identical_requests():
     _tile_cache_set(key, b"PNG-DATA")
     assert _tile_cache_get(key) == b"PNG-DATA"
     _tile_cache.clear()
+
+
+def test_phase1a_color_stops_and_data_ranges():
+    """Phase 1A variables define monotonically increasing color stops and valid data ranges."""
+    from api.services.tiles import _color_stops, _data_range
+
+    phase1a_vars = [
+        "temperature_2m",
+        "precipitation_rate",
+        "relative_humidity_2m",
+        "wind_gust",
+        "visibility",
+        "snow_depth",
+    ]
+    for var in phase1a_vars:
+        stops = _color_stops(var)
+        assert len(stops) >= 2
+        # Values must be strictly increasing
+        values = [val for val, rgb in stops]
+        assert all(values[i] < values[i + 1] for i in range(len(values) - 1))
+        # Colors must be valid RGB triplets in [0, 255]
+        for val, (r, g, b) in stops:
+            assert 0 <= r <= 255
+            assert 0 <= g <= 255
+            assert 0 <= b <= 255
+
+        d_min, d_max = _data_range(var)
+        assert d_min < d_max
+        assert d_min <= values[0]
+        assert d_max >= values[-1]

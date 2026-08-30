@@ -22,6 +22,7 @@ from ingestion.core.base import (
 )
 from ingestion.core.config import IngestionSettings, settings
 from ingestion.providers.noaa.idx_parser import (
+    DEFAULT_SELECTION_VARIABLES,
     IdxParseError,
     parse_idx,
     select_records,
@@ -254,7 +255,7 @@ class NOAAConnector(BaseConnector):
         lead_time_hours: int,
         destination: Path,
         member: int | None = None,
-        variables: tuple[str, ...] = ("temperature_2m", "precipitation_rate"),
+        variables: tuple[str, ...] = DEFAULT_SELECTION_VARIABLES,
     ) -> Path:
         """Download a GRIB2 file to ``destination`` using selective byte ranges.
 

@@ -7,6 +7,8 @@ import numpy.typing as npt
 import pytest
 from domain.ensemble import (
     probability_above_threshold,
+    probability_at_or_above_threshold,
+    probability_at_or_below_threshold,
     probability_below_threshold,
     probability_between_thresholds,
 )
@@ -47,6 +49,33 @@ class TestProbabilityAboveThreshold:
         assert probability_above_threshold(array, 25.0) == pytest.approx(0.4)
 
 
+class TestProbabilityAtOrAboveThreshold:
+    def test_partial_above(self) -> None:
+        # Members at or above 25: {30, 40}.
+        assert probability_at_or_above_threshold(MEMBERS, 25.0) == pytest.approx(0.4)
+
+    def test_inclusive_gte_includes_equal_member(self) -> None:
+        # Member exactly 10 MUST count: {10, 20, 30, 40} -> 4/5 = 0.8
+        assert probability_at_or_above_threshold(MEMBERS, 10.0) == pytest.approx(0.8)
+
+    def test_none_above(self) -> None:
+        assert probability_at_or_above_threshold(MEMBERS, 45.0) == pytest.approx(0.0)
+
+    def test_all_above(self) -> None:
+        assert probability_at_or_above_threshold(MEMBERS, 0.0) == pytest.approx(1.0)
+
+    def test_single_element(self) -> None:
+        assert probability_at_or_above_threshold([5.0], 5.0) == pytest.approx(1.0)
+        assert probability_at_or_above_threshold([5.0], 7.0) == pytest.approx(0.0)
+
+    def test_returns_float(self) -> None:
+        assert isinstance(probability_at_or_above_threshold(MEMBERS, 25.0), float)
+
+    def test_accepts_numpy_array(self) -> None:
+        array: npt.NDArray[np.float64] = np.asarray(MEMBERS, dtype=np.float64)
+        assert probability_at_or_above_threshold(array, 20.0) == pytest.approx(0.6)
+
+
 class TestProbabilityBelowThreshold:
     def test_partial_below(self) -> None:
         # Members below 25: {0, 10, 20}.
@@ -72,6 +101,33 @@ class TestProbabilityBelowThreshold:
     def test_accepts_numpy_array(self) -> None:
         array: npt.NDArray[np.float64] = np.asarray(MEMBERS, dtype=np.float64)
         assert probability_below_threshold(array, 25.0) == pytest.approx(0.6)
+
+
+class TestProbabilityAtOrBelowThreshold:
+    def test_partial_below(self) -> None:
+        # Members at or below 25: {0, 10, 20}.
+        assert probability_at_or_below_threshold(MEMBERS, 25.0) == pytest.approx(0.6)
+
+    def test_inclusive_lte_includes_equal_member(self) -> None:
+        # Member exactly 10 MUST count: {0, 10} -> 2/5 = 0.4
+        assert probability_at_or_below_threshold(MEMBERS, 10.0) == pytest.approx(0.4)
+
+    def test_none_below(self) -> None:
+        assert probability_at_or_below_threshold(MEMBERS, -5.0) == pytest.approx(0.0)
+
+    def test_all_below(self) -> None:
+        assert probability_at_or_below_threshold(MEMBERS, 40.0) == pytest.approx(1.0)
+
+    def test_single_element(self) -> None:
+        assert probability_at_or_below_threshold([5.0], 5.0) == pytest.approx(1.0)
+        assert probability_at_or_below_threshold([5.0], 3.0) == pytest.approx(0.0)
+
+    def test_returns_float(self) -> None:
+        assert isinstance(probability_at_or_below_threshold(MEMBERS, 25.0), float)
+
+    def test_accepts_numpy_array(self) -> None:
+        array: npt.NDArray[np.float64] = np.asarray(MEMBERS, dtype=np.float64)
+        assert probability_at_or_below_threshold(array, 20.0) == pytest.approx(0.6)
 
 
 class TestProbabilityBetweenThresholds:

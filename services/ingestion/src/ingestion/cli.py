@@ -497,6 +497,30 @@ DEFAULT_VARIABLES: tuple[VariableSpec, ...] = (
         unit="mm/h",
         source_code="prate",
     ),
+    VariableSpec(
+        code="relative_humidity_2m",
+        name="2-Meter Relative Humidity",
+        unit="%",
+        source_code="r2",
+    ),
+    VariableSpec(
+        code="wind_gust",
+        name="Wind Gust",
+        unit="km/h",
+        source_code="gust",
+    ),
+    VariableSpec(
+        code="visibility",
+        name="Visibility",
+        unit="m",
+        source_code="vis",
+    ),
+    VariableSpec(
+        code="snow_depth",
+        name="Snow Depth",
+        unit="m",
+        source_code="sde",
+    ),
 )
 
 #: Center metadata keyed by ``center_id``.

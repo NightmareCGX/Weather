@@ -85,9 +85,15 @@ class ResolvedLocation:
 _SI_TO_IMPERIAL: dict[str, tuple[str, Callable[[float], float]]] = {
     "°C": ("°F", lambda celsius: celsius * 9.0 / 5.0 + 32.0),
     "mm/h": ("in/h", lambda mm: mm / 25.4),
-    # km/h → mph. No km/h variable is currently implemented, but the entry must
-    # label the converted value as mph (the conversion factor is applied).
     "km/h": ("mph", lambda kmh: kmh * 0.621371),
+    "%": ("%", lambda rh: rh),
+    "m": ("mi", lambda m: m / 1609.344),
+}
+
+#: Variable-specific conversions taking precedence over generic unit matching.
+_VARIABLE_IMPERIAL_CONVERSIONS: dict[str, tuple[str, Callable[[float], float]]] = {
+    "snow_depth": ("in", lambda m: m * 39.3700787),
+    "visibility": ("mi", lambda m: m / 1609.344),
 }
 
 
@@ -351,7 +357,9 @@ def build_point_forecast(
         }
         for var_code in var_codes:
             value = values_by_var[var_code]
-            entry[var_code] = _convert_value(value, units_by_code[var_code], units)
+            entry[var_code] = _convert_value(
+                value, units_by_code[var_code], units, var_code=var_code
+            )
         forecasts.append(ForecastSeries(**entry))
 
     if not forecasts:
@@ -1054,14 +1062,23 @@ def _ascending(values: list[float]) -> tuple[list[float], bool]:
     return list(values), False
 
 
-def _convert_value(value: float, si_unit: str | None, units: str) -> float:
+def _convert_value(
+    value: float,
+    si_unit: str | None,
+    units: str,
+    var_code: str | None = None,
+) -> float:
     """Convert a value to imperial units when requested and supported.
 
-    Conversion is applied only when ``units=imperial`` and the variable's
-    registered unit matches a known SI/imperial pair; otherwise the value is
-    returned unconverted.
+    Conversion is applied only when ``units=imperial`` and either a
+    variable-specific conversion is defined or the registered unit matches a
+    known SI/imperial pair; otherwise the value is returned unconverted.
     """
-    if units != "imperial" or si_unit is None:
+    if units != "imperial":
+        return value
+    if var_code is not None and var_code in _VARIABLE_IMPERIAL_CONVERSIONS:
+        return float(_VARIABLE_IMPERIAL_CONVERSIONS[var_code][1](value))
+    if si_unit is None:
         return value
     conversion = _SI_TO_IMPERIAL.get(si_unit)
     if conversion is None:

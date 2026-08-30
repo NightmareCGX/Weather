@@ -56,6 +56,34 @@ SURFACE_FIELD_FILTERS: dict[str, dict[str, object]] = {
         "level": 0,
         "stepType": "instant",
     },
+    # GRIB shortName ``2r`` = "2 metre relative humidity" (paramId 260242), %.
+    "r2": {
+        "shortName": "2r",
+        "typeOfLevel": "heightAboveGround",
+        "level": 2,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``gust`` = "Wind speed (gust)" (paramId 260065), m/s.
+    "gust": {
+        "shortName": "gust",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``vis`` = "Visibility" (paramId 3020), m.
+    "vis": {
+        "shortName": "vis",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``sde`` = "Snow depth" (paramId 3066), m.
+    "sde": {
+        "shortName": "sde",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "instant",
+    },
 }
 
 

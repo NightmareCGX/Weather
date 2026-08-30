@@ -111,6 +111,46 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
             (20.0, (123, 65, 115)),
             (40.0, (84, 39, 136)),
         ]
+    if variable_code == "relative_humidity_2m":
+        return [
+            (0.0, (140, 81, 10)),
+            (20.0, (216, 179, 101)),
+            (40.0, (246, 232, 195)),
+            (60.0, (199, 234, 229)),
+            (80.0, (90, 180, 172)),
+            (100.0, (1, 102, 94)),
+        ]
+    if variable_code == "wind_gust":
+        return [
+            (0.0, (247, 247, 247)),
+            (20.0, (204, 235, 197)),
+            (40.0, (168, 221, 181)),
+            (60.0, (78, 179, 211)),
+            (80.0, (43, 140, 190)),
+            (100.0, (8, 88, 158)),
+            (120.0, (122, 1, 119)),
+            (150.0, (73, 0, 106)),
+        ]
+    if variable_code == "visibility":
+        return [
+            (0.0, (73, 0, 106)),
+            (500.0, (174, 1, 126)),
+            (1000.0, (247, 104, 161)),
+            (3000.0, (251, 180, 185)),
+            (6000.0, (254, 235, 226)),
+            (10000.0, (240, 249, 232)),
+            (24000.0, (255, 255, 255)),
+        ]
+    if variable_code == "snow_depth":
+        return [
+            (0.0, (255, 255, 255)),
+            (0.02, (224, 243, 248)),
+            (0.10, (171, 217, 233)),
+            (0.25, (116, 173, 209)),
+            (0.50, (69, 117, 180)),
+            (1.00, (49, 54, 149)),
+            (2.50, (26, 0, 64)),
+        ]
     return [
         (-40.0, (49, 54, 149)),
         (-20.0, (69, 117, 180)),
@@ -126,7 +166,15 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
 def _data_range(variable_code: str) -> tuple[float, float]:
     """Return the fixed (min, max) data range used to normalize a variable."""
     if variable_code == "precipitation_rate":
-        return (0.0, 25.0)
+        return (0.0, 40.0)
+    if variable_code == "relative_humidity_2m":
+        return (0.0, 100.0)
+    if variable_code == "wind_gust":
+        return (0.0, 150.0)
+    if variable_code == "visibility":
+        return (0.0, 24000.0)
+    if variable_code == "snow_depth":
+        return (0.0, 2.5)
     return (-40.0, 45.0)
 
 

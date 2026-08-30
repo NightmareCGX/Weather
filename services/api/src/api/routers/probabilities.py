@@ -61,7 +61,7 @@ def get_probability(
     variable: Annotated[str, Query(description="A forecast variable code.")],
     threshold: Annotated[float, Query(description="The probability threshold.")],
     operator: Annotated[
-        Literal["gt", "lt", "between"],
+        Literal["gt", "gte", "lt", "lte", "between"],
         Query(description="Threshold comparison operator."),
     ],
     lead_time_hours: Annotated[
@@ -142,13 +142,13 @@ def get_probability(
 
 
 def _validate_threshold_bounds(
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     threshold: float,
     threshold_max: float | None,
 ) -> None:
     """Enforce the ``between``/``threshold_max`` pairing rules.
 
-    ``between`` requires ``threshold_max``; ``gt``/``lt`` reject it. An
+    ``between`` requires ``threshold_max``; ``gt``/``gte``/``lt``/``lte`` reject it. An
     out-of-range ordering (``threshold_max < threshold``) is surfaced later by
     the domain math as a 422.
     """
@@ -157,7 +157,7 @@ def _validate_threshold_bounds(
             status_code=422,
             detail="threshold_max is required when operator is 'between'.",
         )
-    if operator in ("gt", "lt") and threshold_max is not None:
+    if operator in ("gt", "gte", "lt", "lte") and threshold_max is not None:
         raise HTTPException(
             status_code=422,
             detail="threshold_max is only valid when operator is 'between'.",
@@ -170,7 +170,7 @@ def _compute(
     lon: float,
     variable: str,
     threshold: float,
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     lead_time_hours: int,
     model: str,
     threshold_max: float | None,

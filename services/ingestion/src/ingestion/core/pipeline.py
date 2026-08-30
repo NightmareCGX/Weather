@@ -247,6 +247,15 @@ _SOURCE_TO_CANONICAL: dict[
     # rate conversion is a pure ×3600 (s-1 → h-1). This is a rate conversion,
     # not an accumulation conversion.
     "mm/h": {"kgm-2s-1": lambda array: array * 3600.0},
+    # Wind gust ``gust`` is m/s; canonical is km/h (x3.6).
+    "km/h": {
+        "ms-1": lambda array: array * 3.6,
+        "m/s": lambda array: array * 3.6,
+    },
+    # Relative humidity is %; canonical is %.
+    "%": {"%": lambda array: array},
+    # Visibility and snow depth are meters; canonical is meters.
+    "m": {"m": lambda array: array},
 }
 
 
