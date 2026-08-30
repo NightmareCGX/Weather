@@ -174,4 +174,33 @@ describe("useEnsembleDistribution", () => {
     expect(result.current.data?.lead_time_hours).toBe(24);
     expect(result.current.data?.members).toEqual([34, 35, 36, 37, 38]);
   });
+
+  it("Test F: clears previous distribution data immediately upon parameter transition", async () => {
+    mockFetch.mockResolvedValueOnce(distResponse(0, [10, 11, 12]));
+
+    let resolveLead12!: (value: Response) => void;
+    mockFetch.mockImplementationOnce(() => new Promise<Response>((r) => (resolveLead12 = r)));
+
+    const { result, rerender } = renderHook(
+      ({ lead }: { lead: number }) =>
+        useEnsembleDistribution(location, lead, "temperature_2m", { model: "gefs" }),
+      { initialProps: { lead: 0 } }
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.data).not.toBeNull();
+
+    // Rerender with lead: 12
+    rerender({ lead: 12 });
+
+    // Assert previous data is cleared immediately and status is loading
+    expect(result.current.status).toBe("loading");
+    expect(result.current.data).toBeNull();
+
+    // Settle the second request
+    resolveLead12(distResponse(12, [20, 21, 22]));
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.data?.lead_time_hours).toBe(12);
+  });
 });

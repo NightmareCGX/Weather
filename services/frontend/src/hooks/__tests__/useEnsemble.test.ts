@@ -142,4 +142,37 @@ describe("useEnsemble", () => {
     expect(result.current.byLead.size).toBe(0);
     expect(mockFetch).not.toHaveBeenCalled();
   });
+
+  it("Test F: clears previous byLead map immediately upon variable parameter transition", async () => {
+    mockFetch.mockResolvedValueOnce(statsResponse(0));
+    mockFetch.mockResolvedValueOnce(statsResponse(6));
+
+    let resolveTemp0!: (value: Response) => void;
+    let resolveTemp6!: (value: Response) => void;
+    mockFetch.mockImplementationOnce(() => new Promise<Response>((r) => (resolveTemp0 = r)));
+    mockFetch.mockImplementationOnce(() => new Promise<Response>((r) => (resolveTemp6 = r)));
+
+    const { result, rerender } = renderHook(
+      ({ variable }: { variable: string }) =>
+        useEnsemble(location, [0, 6], variable, { model: "gefs" }),
+      { initialProps: { variable: "precipitation_rate" } }
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.byLead.size).toBe(2);
+
+    // Rerender with variable: "temperature_2m"
+    rerender({ variable: "temperature_2m" });
+
+    // Assert previous data is cleared immediately and status is loading
+    expect(result.current.status).toBe("loading");
+    expect(result.current.byLead.size).toBe(0);
+
+    // Resolve the pending temperature responses
+    resolveTemp0(statsResponse(0));
+    resolveTemp6(statsResponse(6));
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.byLead.size).toBe(2);
+  });
 });
