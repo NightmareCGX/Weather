@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo } from "react";
 
-import { getMapLayer, RequestAbortedError } from "@/lib/api/client";
 import type { SpatialLayer } from "@/lib/api/types";
 import { useForecastSelection } from "@/context/forecast-selection";
+import { resolveSpatialLayer } from "@/lib/forecast/availability";
 
 export interface UseMapLayerResult {
   layer: SpatialLayer | null;
@@ -13,60 +13,28 @@ export interface UseMapLayerResult {
 }
 
 /**
- * Fetches `/v1/maps` metadata whenever the forecast selection (model /
- * variable / initial time / lead time) changes.
+ * Synchronously derives the authoritative MapLibre raster layer from the cached
+ * forecast availability state whenever the forecast selection changes.
  *
- * The layer is only requested when a full, valid selection exists. A stale
- * response from a previous selection is cancelled and ignored, so changing the
- * model/variable/initial time/lead time always loads the metadata (and thus
- * the tile layer) for the *current* selection. `/v1/maps` now validates the
- * selection against the catalog, so a 404 means "no forecast for this
- * selection" and is surfaced as a user-facing message rather than a raw
- * technical error.
+ * By resolving the authoritative SpatialLayer directly from backend-supplied
+ * availability metadata (tile URL template pattern, zoom bounds, and legend stops),
+ * selector transitions (model, variable, initial time, lead time) are instantaneous
+ * and eliminate the sequential `/v1/maps` metadata network roundtrip.
+ *
+ * As soon as selection B becomes authoritative in state, layer B becomes
+ * authoritative immediately, allowing WeatherMap to replace the MapLibre
+ * source without retaining stale layer A during an asynchronous transition.
  */
 export function useMapLayer(): UseMapLayerResult {
-  const { selection } = useForecastSelection();
-  const [layer, setLayer] = useState<SpatialLayer | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { availability, selection, status, error: availabilityError } = useForecastSelection();
 
-  useEffect(() => {
-    if (selection === null) {
-      setLayer(null);
-      setError(null);
-      setLoading(false);
-      return;
-    }
+  const layer = useMemo(
+    () => resolveSpatialLayer(availability, selection),
+    [availability, selection]
+  );
 
-    const controller = new AbortController();
-    let active = true;
-    setLoading(true);
-    setError(null);
-
-    getMapLayer({
-      model: selection.model,
-      variable: selection.variable,
-      leadTimeHours: selection.leadTimeHours,
-      initialTime: selection.initialTime,
-      signal: controller.signal,
-    })
-      .then((next) => {
-        if (!active) return;
-        setLayer(next);
-        setLoading(false);
-      })
-      .catch((err: unknown) => {
-        if (!active || err instanceof RequestAbortedError) return;
-        setLayer(null);
-        setError(err instanceof Error ? err.message : "Unable to load forecast data.");
-        setLoading(false);
-      });
-
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [selection]);
+  const loading = status === "loading";
+  const error = availabilityError;
 
   return { layer, loading, error };
 }

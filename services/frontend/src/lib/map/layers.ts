@@ -27,7 +27,10 @@ export function applyWeatherLayer(map: Map, layer: SpatialLayer): void {
     id: "weather",
     type: "raster",
     source: "weather",
-    paint: { "raster-opacity": 0.6 },
+    paint: {
+      "raster-opacity": 0.6,
+      "raster-fade-duration": 0,
+    },
   });
 }
 

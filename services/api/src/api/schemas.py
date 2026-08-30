@@ -94,6 +94,22 @@ class ListEnvelope(BaseModel, Generic[T]):
     next_cursor: str | None = None
 
 
+class SpatialLayerLegend(BaseModel):
+    """The legend of a spatial layer (API.md section 4.1)."""
+
+    unit: str
+    stops: list[list[float | str]]
+
+
+class LayerDescriptor(BaseModel):
+    """The spatial layer descriptor for rendering map tiles and legends."""
+
+    tile_url_template: str
+    min_zoom: int
+    max_zoom: int
+    legend: SpatialLayerLegend
+
+
 class InitialTimeAvailability(BaseModel):
     """One available forecast initialization (cycle time) of a variable.
 
@@ -123,12 +139,15 @@ class VariableAvailability(BaseModel):
         unit: The registered SI unit string (e.g. ``°C``).
         initial_times: The initial times with data for this
             model/variable, newest first.
+        layer: Authoritative map layer descriptor for rendering tiles and
+            legends without an extra metadata roundtrip.
     """
 
     id: str
     name: str
     unit: str
     initial_times: list[InitialTimeAvailability]
+    layer: LayerDescriptor | None = None
 
 
 class ModelAvailability(BaseModel):
@@ -331,13 +350,6 @@ class ProbabilityForecastEnvelope(BaseModel):
     data: ProbabilityForecastData
     has_more: bool = False
     next_cursor: str | None = None
-
-
-class SpatialLayerLegend(BaseModel):
-    """The legend of a spatial layer (API.md section 4.1)."""
-
-    unit: str
-    stops: list[list[float | str]]
 
 
 class SpatialLayerData(BaseModel):

@@ -153,3 +153,93 @@ test("api failure: useful error state and graceful degradation", async ({ page }
   await expect(page.getByTestId("weather-map")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Weather Platform" })).toBeVisible();
 });
+
+test("forecast map transition: selecting B while A tiles are in flight immediately dispatches B", async ({
+  page,
+}) => {
+  const dispatchedLeads: string[] = [];
+  let delayedResolve: (() => void) | null = null;
+  const holdPromise = new Promise<void>((resolve) => {
+    delayedResolve = resolve;
+  });
+
+  // Intercept tile requests with controlled delay for lead_time_hours=6
+  await page.route("**/v1/maps/**/*.png*", async (route) => {
+    const url = new URL(route.request().url());
+    const lead = url.searchParams.get("lead_time_hours") ?? "unknown";
+    dispatchedLeads.push(lead);
+
+    if (lead === "6") {
+      // Hold lead=6 requests in flight until released
+      await holdPromise;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "image/png",
+      headers: { "Cache-Control": "no-cache" },
+      body: Buffer.alloc(0),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  // Clear initial 0h requests
+  dispatchedLeads.length = 0;
+
+  // 1. User selects +6h (tiles will be held in flight)
+  const leadSelect = page.getByLabel("Lead time");
+  await leadSelect.selectOption("6");
+
+  // Verify lead=6 tile requests are dispatched and currently in flight
+  await expect.poll(() => dispatchedLeads.includes("6")).toBe(true);
+
+  // 2. While lead=6 tiles are in flight, user switches to +12h
+  await leadSelect.selectOption("12");
+
+  // Invariant: Lead=12 requests MUST be dispatched immediately without waiting for lead=6
+  await expect.poll(() => dispatchedLeads.includes("12")).toBe(true);
+
+  // Release the held lead=6 requests
+  if (delayedResolve) {
+    (delayedResolve as () => void)();
+  }
+
+  // The selector value remains authoritative at +12h
+  await expect(leadSelect).toHaveValue("12");
+});
+
+test("forecast map rapid transition: A -> B -> C rapidly switches and C is authoritative", async ({
+  page,
+}) => {
+  const dispatchedLeads: string[] = [];
+
+  await page.route("**/v1/maps/**/*.png*", async (route) => {
+    const url = new URL(route.request().url());
+    const lead = url.searchParams.get("lead_time_hours") ?? "unknown";
+    dispatchedLeads.push(lead);
+    // Simulate realistic network delay
+    await new Promise((r) => setTimeout(r, 100));
+    await route.fulfill({
+      status: 200,
+      contentType: "image/png",
+      headers: { "Cache-Control": "no-cache" },
+      body: Buffer.alloc(0),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  dispatchedLeads.length = 0;
+  const leadSelect = page.getByLabel("Lead time");
+
+  // Rapidly switch through 6h -> 12h -> 18h
+  await leadSelect.selectOption("6");
+  await leadSelect.selectOption("12");
+  await leadSelect.selectOption("18");
+
+  // All transitions should have triggered without dropping
+  await expect.poll(() => dispatchedLeads.includes("18")).toBe(true);
+  await expect(leadSelect).toHaveValue("18");
+});

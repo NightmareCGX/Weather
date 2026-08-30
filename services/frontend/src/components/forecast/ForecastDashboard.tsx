@@ -138,7 +138,7 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
               The body distinguishes "ensemble data unavailable" from a genuine
               request error, and never renders a misleading heading for a
               deterministic model. */}
-          {ensemble.status === "loading" && (
+          {(pointStatus === "loading" || ensemble.status === "loading") && (
             <p role="status" className="text-sm text-slate-500">
               Loading ensemble statistics…
             </p>

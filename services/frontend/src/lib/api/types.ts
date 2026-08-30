@@ -187,12 +187,27 @@ export interface InitialTimeAvailability {
   lead_time_hours: number[];
 }
 
+export type LegendStop = readonly [number, string];
+
+export interface SpatialLayerLegend {
+  unit: string;
+  stops: LegendStop[];
+}
+
+export interface LayerDescriptor {
+  tile_url_template: string;
+  min_zoom: number;
+  max_zoom: number;
+  legend: SpatialLayerLegend;
+}
+
 /** A forecast variable and the initial times available for it. */
 export interface VariableAvailability {
   id: string;
   name: string;
   unit: string;
   initial_times: InitialTimeAvailability[];
+  layer?: LayerDescriptor | null;
 }
 
 /** A forecast model and the variables available for it. */
@@ -206,13 +221,6 @@ export interface ModelAvailability {
 /** The payload of the forecast availability endpoint. */
 export interface ForecastAvailability {
   models: ModelAvailability[];
-}
-
-export type LegendStop = readonly [number, string];
-
-export interface SpatialLayerLegend {
-  unit: string;
-  stops: LegendStop[];
 }
 
 export interface SpatialLayer {

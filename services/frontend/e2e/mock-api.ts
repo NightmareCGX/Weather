@@ -1,4 +1,65 @@
+import zlib from "zlib";
 import type { Page } from "@playwright/test";
+
+/**
+ * Pure in-memory 256x256 solid-color RGBA PNG generator for MapLibre raster tile testing.
+ */
+export function createPngTile(r: number, g: number, b: number, a: number = 255): Buffer {
+  const width = 256;
+  const height = 256;
+  const rowSize = 1 + width * 4;
+  const raw = Buffer.alloc(height * rowSize);
+  for (let y = 0; y < height; y++) {
+    const rowOffset = y * rowSize;
+    raw[rowOffset] = 0;
+    for (let x = 0; x < width; x++) {
+      const pxOffset = rowOffset + 1 + x * 4;
+      raw[pxOffset] = r;
+      raw[pxOffset + 1] = g;
+      raw[pxOffset + 2] = b;
+      raw[pxOffset + 3] = a;
+    }
+  }
+  const deflated = zlib.deflateSync(raw);
+  function crc32(buf: Buffer): number {
+    let crc = -1;
+    for (let i = 0; i < buf.length; i++) {
+      let byte = buf[i];
+      for (let j = 0; j < 8; j++) {
+        const bit = (crc ^ byte) & 1;
+        crc = (crc >>> 1) ^ (bit ? 0xedb88320 : 0);
+        byte >>>= 1;
+      }
+    }
+    return (crc ^ -1) >>> 0;
+  }
+  function chunk(type: string, data: Buffer): Buffer {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length, 0);
+    const typeAndData = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(typeAndData), 0);
+    return Buffer.concat([len, typeAndData, crc]);
+  }
+  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  return Buffer.concat([
+    sig,
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflated),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+const DEFAULT_WEATHER_TILE = createPngTile(50, 150, 250, 255);
+const DEFAULT_OSM_TILE = createPngTile(240, 240, 240, 255);
 
 /**
  * Deterministic `/v1/*` API mocks for Playwright E2E tests.
@@ -72,6 +133,19 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         lead_time_hours: LEAD_TIMES,
                       },
                     ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "°C",
+                        stops: [
+                          [-40, "#313695"],
+                          [45, "#a50026"],
+                        ],
+                      },
+                    },
                   },
                   {
                     id: "precipitation_rate",
@@ -83,6 +157,19 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         lead_time_hours: LEAD_TIMES,
                       },
                     ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "mm/h",
+                        stops: [
+                          [0, "#ffffff"],
+                          [40, "#54278f"],
+                        ],
+                      },
+                    },
                   },
                 ],
               },
@@ -101,6 +188,19 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         lead_time_hours: LEAD_TIMES,
                       },
                     ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "°C",
+                        stops: [
+                          [-40, "#313695"],
+                          [45, "#a50026"],
+                        ],
+                      },
+                    },
                   },
                 ],
               },
@@ -187,16 +287,17 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
     });
   });
 
-  // The weather layer's tile template points at `/v1/maps/{model}/{variable}/
-  // {level}/{z}/{x}/{y}.png`. The backend serves no tile imagery, so fulfill
-  // those image requests with a 204 so MapLibre does not log tile errors or
-  // cascade coordinate-resolution reads while the base map keeps rendering.
-  await page.route("**/v1/maps/**/*.png?*", (route) => route.fulfill({ status: 204, body: "" }));
-  await page.route("**/v1/maps/**/*.png", (route) => route.fulfill({ status: 204, body: "" }));
+  // Serve valid PNG tiles so MapLibre GL JS successfully decodes raster textures.
+  await page.route("**/v1/maps/**/*.png?*", (route) =>
+    route.fulfill({ status: 200, contentType: "image/png", body: DEFAULT_WEATHER_TILE })
+  );
+  await page.route("**/v1/maps/**/*.png", (route) =>
+    route.fulfill({ status: 200, contentType: "image/png", body: DEFAULT_WEATHER_TILE })
+  );
 
-  // The base style uses OSM raster tiles; block them offline too.
+  // The base style uses OSM raster tiles.
   await page.route("https://tile.openstreetmap.org/**", (route) =>
-    route.fulfill({ status: 204, body: "" })
+    route.fulfill({ status: 200, contentType: "image/png", body: DEFAULT_OSM_TILE })
   );
 
   await page.route("**/v1/variables", (route) =>
