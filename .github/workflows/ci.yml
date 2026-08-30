@@ -2,18 +2,19 @@
 #
 # GitHub Actions CI for the Global Probabilistic Weather Forecasting Platform.
 #
-# Job graph (8 jobs):
+# Job graph (9 jobs):
 #   Leaf jobs (no `needs`, run in parallel):
-#     python-quality       — Ruff + MyPy (domain/api/ingestion) + contracts/config install/import validation
-#     domain-tests         — pytest (offline, 100% coverage gate)
-#     api-tests            — pytest with isolated PostgreSQL + Redis service containers
-#     ingestion-tests      — pytest with isolated PostgreSQL + Redis + MinIO, WEATHER_TEST_MINIO=1
-#     frontend-unit        — npm ci + Jest
-#     frontend-lint-build  — lint + typecheck + format:check + next build
+#     python-quality              — Ruff + MyPy (domain/api/ingestion) + contracts/config install/import validation
+#     domain-tests                — pytest (offline, 100% coverage gate)
+#     api-tests                   — pytest with isolated PostgreSQL + Redis service containers
+#     ingestion-tests             — pytest with isolated PostgreSQL + Redis + MinIO (Linux), WEATHER_TEST_MINIO=1
+#     ingestion-lifecycle-windows — pytest targeted S3 lifecycle regression with native MinIO (Windows)
+#     frontend-unit               — npm ci + Jest
+#     frontend-lint-build         — lint + typecheck + format:check + next build
 #   Dependent jobs:
-#     frontend-e2e         — needs: [frontend-lint-build]; Playwright chromium, npm run e2e
-#     container-builds     — needs: [python-quality, domain-tests, api-tests, ingestion-tests,
-#                                   frontend-unit, frontend-lint-build, frontend-e2e]
+#     frontend-e2e                — needs: [frontend-lint-build]; Playwright chromium, npm run e2e
+#     container-builds            — needs: [python-quality, domain-tests, api-tests, ingestion-tests,
+#                                           ingestion-lifecycle-windows, frontend-unit, frontend-lint-build, frontend-e2e]
 #
 # The API and ingestion suites both run `DROP SCHEMA public CASCADE` and
 # `FLUSHALL` on the same DATABASE_URL/REDIS_URL in their tests. Each job owns
@@ -361,6 +362,85 @@ jobs:
           PY
 
   # ---------------------------------------------------------------------------
+  # Ingestion S3 lifecycle regression tests: native Windows execution with real MinIO.
+  # Validates asyncio ProactorEventLoop completion-port socket lifecycle and verifies
+  # zero cross-loop errors, zero unclosed ClientSessions, and zero unhandled task exceptions.
+  # ---------------------------------------------------------------------------
+  ingestion-lifecycle-windows:
+    name: Ingestion S3 lifecycle regression (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: python -m pip install poetry==2.4.1
+
+      - name: Install ingestion dependencies
+        working-directory: services/ingestion
+        run: poetry install --no-interaction
+
+      - name: Download and start MinIO (Windows)
+        shell: powershell
+        run: |
+          $minioDir = "$env:TEMP\minio_bin"
+          New-Item -ItemType Directory -Force -Path $minioDir | Out-Null
+          $minioExe = "$minioDir\minio.exe"
+          # Download pinned release matching Linux container RELEASE.2024-12-18T13-15-44Z
+          Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2024-12-18T13-15-44Z" -OutFile $minioExe -UseBasicParsing
+          $dataDir = "$env:TEMP\minio_data"
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          $env:MINIO_ROOT_USER = "minio_admin"
+          $env:MINIO_ROOT_PASSWORD = "minio_password"
+          $proc = Start-Process -FilePath $minioExe -ArgumentList "server", $dataDir, "--address", "127.0.0.1:9000" -PassThru
+          Set-Content -Path "$env:TEMP\minio_pid.txt" -Value $proc.Id
+
+          # Poll MinIO health endpoint until live
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+              try {
+                  $resp = Invoke-WebRequest -Uri "http://127.0.0.1:9000/minio/health/live" -UseBasicParsing -TimeoutSec 2
+                  if ($resp.StatusCode -eq 200) {
+                      $ready = $true
+                      Write-Host "MinIO is ready."
+                      break
+                  }
+              } catch {
+                  Start-Sleep -Seconds 1
+              }
+          }
+          if (-not $ready) {
+              throw "MinIO failed to become ready within 30 seconds on Windows"
+          }
+
+      - name: Create bucket and run S3 lifecycle regression tests
+        shell: powershell
+        env:
+          WEATHER_TEST_MINIO: '1'
+          MINIO_ENDPOINT: 127.0.0.1:9000
+          MINIO_ACCESS_KEY: minio_admin
+          MINIO_SECRET_KEY: minio_password
+          MINIO_SECURE: 'false'
+          MINIO_BUCKET_NAME: weather-data
+        run: |
+          cd services/ingestion
+          poetry run python -c "import boto3; s3 = boto3.client('s3', endpoint_url='http://127.0.0.1:9000', aws_access_key_id='minio_admin', aws_secret_access_key='minio_password'); s3.create_bucket(Bucket='weather-data')"
+          poetry run pytest -v -W error::ResourceWarning tests/test_s3_reuse_optimization.py
+
+      - name: Stop MinIO
+        if: always()
+        shell: powershell
+        run: |
+          if (Test-Path "$env:TEMP\minio_pid.txt") {
+              $pid = Get-Content "$env:TEMP\minio_pid.txt"
+              Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+          }
+
+  # ---------------------------------------------------------------------------
   # Frontend unit tests: Jest (jsdom, offline; maplibre mocked).
   # ---------------------------------------------------------------------------
   frontend-unit:
@@ -469,6 +549,7 @@ jobs:
       - domain-tests
       - api-tests
       - ingestion-tests
+      - ingestion-lifecycle-windows
       - frontend-unit
       - frontend-lint-build
       - frontend-e2e
