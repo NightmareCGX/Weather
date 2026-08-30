@@ -214,6 +214,83 @@ describe("WeatherMap", () => {
     );
   });
 
+  it("transitions across all four selector dimensions (model, variable, initial time, lead time)", () => {
+    const { rerender } = renderMap();
+    const [map] = getInstances();
+
+    // 1. Lead time transition
+    const leadLayer: SpatialLayer = {
+      ...layer,
+      lead_time_hours: 18,
+      tile_url_template:
+        "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=18&initial_time=2026-08-13T00%3A00%3A00Z",
+    };
+    rerender(
+      <WeatherMap layer={leadLayer} selectedLocation={null} validTime={null} onSelect={jest.fn()} />
+    );
+    expect(map.addSource).toHaveBeenLastCalledWith(
+      "weather",
+      expect.objectContaining({ tiles: [leadLayer.tile_url_template] })
+    );
+
+    // 2. Variable transition
+    const variableLayer: SpatialLayer = {
+      ...layer,
+      tile_url_template:
+        "/v1/maps/gfs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours=18&initial_time=2026-08-13T00%3A00%3A00Z",
+    };
+    rerender(
+      <WeatherMap
+        layer={variableLayer}
+        selectedLocation={null}
+        validTime={null}
+        onSelect={jest.fn()}
+      />
+    );
+    expect(map.addSource).toHaveBeenLastCalledWith(
+      "weather",
+      expect.objectContaining({ tiles: [variableLayer.tile_url_template] })
+    );
+
+    // 3. Initial time transition
+    const initialTimeLayer: SpatialLayer = {
+      ...layer,
+      tile_url_template:
+        "/v1/maps/gfs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours=18&initial_time=2026-08-13T06%3A00%3A00Z",
+    };
+    rerender(
+      <WeatherMap
+        layer={initialTimeLayer}
+        selectedLocation={null}
+        validTime={null}
+        onSelect={jest.fn()}
+      />
+    );
+    expect(map.addSource).toHaveBeenLastCalledWith(
+      "weather",
+      expect.objectContaining({ tiles: [initialTimeLayer.tile_url_template] })
+    );
+
+    // 4. Model transition
+    const modelLayer: SpatialLayer = {
+      ...layer,
+      tile_url_template:
+        "/v1/maps/gefs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours=18&initial_time=2026-08-13T06%3A00%3A00Z",
+    };
+    rerender(
+      <WeatherMap
+        layer={modelLayer}
+        selectedLocation={null}
+        validTime={null}
+        onSelect={jest.fn()}
+      />
+    );
+    expect(map.addSource).toHaveBeenLastCalledWith(
+      "weather",
+      expect.objectContaining({ tiles: [modelLayer.tile_url_template] })
+    );
+  });
+
   it("removes the map on unmount", () => {
     const { unmount } = renderMap();
     const [map] = getInstances();

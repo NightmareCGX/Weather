@@ -36,8 +36,10 @@ interface WeatherMapProps {
 export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: WeatherMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
+  const isStyleReadyRef = useRef<boolean>(false);
   const markerRef = useRef<maplibregl.Marker | null>(null);
   const layerRef = useRef<SpatialLayer | null>(layer);
+  const appliedLayerRef = useRef<SpatialLayer | null>(null);
   // Keep the click callback fresh without recreating the map (the create
   // effect must run once with an empty dependency array).
   const onSelectRef = useRef(onSelect);
@@ -68,18 +70,30 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
       }
       onSelectRef.current(coordinatesToSelectedLocation(lngLat.lat, lngLat.lng));
     };
-    // Only enable point selection after the style has loaded so the map has
-    // resolved geographic coordinates for click events (avoids racing
-    // maplibre's own coordinate resolution during tile load).
-    map.on("load", () => {
+    // Track base style readiness: once the base map style has loaded, forecast
+    // raster tile requests must never block or delay subsequent layer transitions.
+    const handleLoad = () => {
+      if (isStyleReadyRef.current) {
+        return;
+      }
+      isStyleReadyRef.current = true;
       map.on("click", handleClick);
       if (layerRef.current !== null) {
+        appliedLayerRef.current = layerRef.current;
         applyWeatherLayer(map, layerRef.current);
       }
-    });
+    };
+    if (map.isStyleLoaded()) {
+      handleLoad();
+    } else {
+      map.on("load", handleLoad);
+    }
 
     return () => {
+      isStyleReadyRef.current = false;
+      appliedLayerRef.current = null;
       map.off("click", handleClick);
+      map.off("load", handleLoad);
       if (markerRef.current !== null) {
         markerRef.current.remove();
         markerRef.current = null;
@@ -92,9 +106,13 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
   useEffect(() => {
     layerRef.current = layer;
     const map = mapRef.current;
-    if (map === null || !map.isStyleLoaded()) {
+    if (map === null || !isStyleReadyRef.current) {
       return;
     }
+    if (appliedLayerRef.current === layer) {
+      return;
+    }
+    appliedLayerRef.current = layer;
     if (layer === null) {
       removeWeatherLayer(map);
       return;
