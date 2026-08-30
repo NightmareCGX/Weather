@@ -365,3 +365,266 @@ def test_cleanup_clears_both_caches():
 
     assert data_fs2 is not data_fs1
     assert ctrl_fs2 is not ctrl_fs1
+
+
+# =============================================================================
+# Test L: ClientCreatorContext Contract (Weak-Referenceable & Hashable)
+# =============================================================================
+def test_client_creator_context_weak_referenceable_and_hashable():
+    """Verify that aiobotocore.session.ClientCreatorContext meets the WeakKeyDictionary contract."""
+    import aiobotocore.session
+    import weakref
+
+    async def _dummy():
+        pass
+
+    coro = _dummy()
+    try:
+        ctx = aiobotocore.session.ClientCreatorContext(coro)
+        # 1. Weak referenceable
+        ref = weakref.ref(ctx)
+        assert ref() is ctx
+
+        # 2. Hashable and usable as dict key
+        d: weakref.WeakKeyDictionary[object, str] = weakref.WeakKeyDictionary()
+        d[ctx] = "open_state"
+        assert d[ctx] == "open_state"
+        assert len(d) == 1
+
+        # 3. Clean GC eviction
+        del ctx, ref
+        import gc
+        gc.collect()
+        assert len(d) == 0
+    finally:
+        coro.close()
+
+
+# =============================================================================
+# Test M: Active Foreign Event Loop Reset (No Cross-Loop Errors)
+# =============================================================================
+def test_s3_fs_reset_during_active_event_loop():
+    """Verify that resetting/garbage-collecting an S3FileSystem while an active asyncio loop runs on the main thread emits zero cross-loop errors or unhandled task exceptions."""
+    import asyncio
+    import gc
+    import warnings
+
+    captured_loop_exceptions: list[dict[str, object]] = []
+
+    async def _active_loop_workflow():
+        loop = asyncio.get_running_loop()
+
+        def _handler(loop, context):
+            captured_loop_exceptions.append(context)
+
+        loop.set_exception_handler(_handler)
+
+        # 1. Initialize control S3FileSystem and establish connection on fsspecIO loop
+        fs = get_control_s3_fs()
+        # Perform a sync operation on fsspecIO loop (e.g. exists check)
+        try:
+            fs.exists("weather-data/__commit__/v1/version")
+        except Exception:
+            pass
+
+        # 2. Trigger reset_s3_fs() while THIS asyncio loop is actively running on the main thread
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always", ResourceWarning)
+
+            reset_s3_fs()
+            del fs
+            gc.collect()
+
+            # Yield control to the event loop so any erroneously scheduled create_task would fire
+            await asyncio.sleep(0.3)
+
+            # Assert zero unclosed resource warnings
+            unclosed_warnings = [
+                w for w in recorded_warnings
+                if issubclass(w.category, ResourceWarning) and "unclosed" in str(w.message).lower()
+            ]
+            assert len(unclosed_warnings) == 0, f"Observed unclosed ResourceWarnings: {unclosed_warnings}"
+
+        # Assert zero loop exception-handler captures
+        assert len(captured_loop_exceptions) == 0, f"Captured unhandled loop exceptions: {captured_loop_exceptions}"
+
+    asyncio.run(_active_loop_workflow())
+
+
+# =============================================================================
+# Test N: Multi-Wave / Multi-Loop Execution Across Distinct Loops
+# =============================================================================
+def test_multi_wave_s3_reuse_and_cleanup(tmp_path):
+    """Verify that multiple sequential waves across distinct asyncio loops reuse S3FileSystem cleanly and shut down with zero errors."""
+    import asyncio
+    import gc
+    from ingestion.core.s3 import close_wave_data_s3_fs, shutdown_s3_fs
+
+    store = str(tmp_path / "multi_wave_test.zarr")
+    write_protocol_version(store, MARKER_V1)
+
+    async def _wave_1():
+        # Control plane operation
+        ctrl_fs = get_control_s3_fs()
+        assert ctrl_fs is not None
+
+        # Data plane operation on worker thread
+        data_fs = get_s3_fs()
+        assert data_fs is not None
+
+        close_wave_data_s3_fs()
+        await asyncio.sleep(0.1)
+
+    async def _wave_2():
+        ctrl_fs = get_control_s3_fs()
+        assert ctrl_fs is not None
+
+        data_fs = get_s3_fs()
+        assert data_fs is not None
+
+        close_wave_data_s3_fs()
+        await asyncio.sleep(0.1)
+
+    # Wave 1 on Loop 1
+    asyncio.run(_wave_1())
+    gc.collect()
+
+    # Wave 2 on Loop 2
+    asyncio.run(_wave_2())
+    gc.collect()
+
+    # Top-level process shutdown
+    assert shutdown_s3_fs() is True
+
+
+# =============================================================================
+# Test O: Worker Strong Registry Lifecycle
+# =============================================================================
+def test_executor_workers_strong_registry_cleanup():
+    """Verify that worker-thread data filesystems are strongly held in registry and cleanly closed on wave teardown."""
+    import gc
+    from ingestion.core.s3 import (
+        _active_data_filesystems,
+        _data_registry_lock,
+        close_wave_data_s3_fs,
+    )
+
+    barrier = threading.Barrier(4)
+
+    def _worker_task(worker_id: int):
+        barrier.wait()
+        fs = get_s3_fs()
+        # Verify instance is in strong registry
+        with _data_registry_lock:
+            assert id(fs) in _active_data_filesystems
+            assert _active_data_filesystems[id(fs)] is fs
+        return id(fs)
+
+    threads = []
+    worker_fs_ids = set()
+    lock = threading.Lock()
+
+    def _thread_target(i: int):
+        fs_id = _worker_task(i)
+        with lock:
+            worker_fs_ids.add(fs_id)
+
+    for i in range(4):
+        t = threading.Thread(target=_thread_target, args=(i,))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    # Verify 4 distinct worker filesystem instances are currently in active registry
+    with _data_registry_lock:
+        active_ids = set(_active_data_filesystems.keys())
+        assert worker_fs_ids.issubset(active_ids)
+        assert len(_active_data_filesystems) == 4
+
+    # Close wave data filesystems
+    success = close_wave_data_s3_fs()
+    assert success is True
+
+    # Strong registry must be drained
+    with _data_registry_lock:
+        assert len(_active_data_filesystems) == 0
+
+    # Force GC to ensure all dead worker filesystems cause zero finalizer errors
+    gc.collect()
+
+
+# =============================================================================
+# Test P: Explicit Close + Later Finalizer Idempotency
+# =============================================================================
+def test_explicit_close_and_later_finalizer_idempotent():
+    """Verify that explicit fs.close() followed by weakref finalizer invocation is safe and idempotent (no double-close exception)."""
+    import gc
+    import fsspec.asyn
+    from ingestion.core.s3 import (
+        IngestionS3FileSystem,
+        LifecycleState,
+        _get_or_create_close_state,
+    )
+
+    fs = IngestionS3FileSystem(anon=True, client_kwargs={"endpoint_url": "http://127.0.0.1:9000"})
+    # Connect on fsspecIO loop
+    fsspec.asyn.sync(fs.loop, fs.set_session)
+
+    s3creator = getattr(fs, "_s3creator")
+    assert s3creator is not None
+    close_state = _get_or_create_close_state(s3creator)
+    assert close_state.state == LifecycleState.OPEN
+
+    # 1. Explicit close
+    assert fs.close() is True
+    assert close_state.state == LifecycleState.CLOSED
+    assert getattr(fs, "_s3") is None
+    assert getattr(fs, "_s3creator") is None
+
+    # 2. Invoke finalizer callback directly with the original s3creator
+    # Must NOT raise AssertionError: Session was never entered and state must stay CLOSED
+    IngestionS3FileSystem.close_session(fs.loop, s3creator)
+    assert close_state.state == LifecycleState.CLOSED
+
+    # 3. Force GC
+    del fs, s3creator
+    gc.collect()
+
+
+# =============================================================================
+# Test Q: Close Failure Retry Semantics
+# =============================================================================
+def test_close_failure_retry_semantics():
+    """Verify that if a close attempt fails/times out, state transitions to CLOSE_FAILED, references are kept, and a subsequent attempt retries successfully."""
+    import fsspec.asyn
+    from unittest.mock import patch
+    from ingestion.core.s3 import (
+        IngestionS3FileSystem,
+        LifecycleState,
+        _get_or_create_close_state,
+    )
+
+    fs = IngestionS3FileSystem(anon=True, client_kwargs={"endpoint_url": "http://127.0.0.1:9000"})
+    fsspec.asyn.sync(fs.loop, fs.set_session)
+
+    s3creator = getattr(fs, "_s3creator")
+    close_state = _get_or_create_close_state(s3creator)
+    assert close_state.state == LifecycleState.OPEN
+
+    # 1. Simulate a transient failure during sync close
+    with patch.object(fsspec.asyn, "sync", side_effect=fsspec.asyn.FSTimeoutError("Simulated timeout")):
+        success = fs.close()
+        assert success is False
+        assert close_state.state == LifecycleState.CLOSE_FAILED
+        # References must NOT be cleared on failure
+        assert getattr(fs, "_s3creator") is not None
+
+    # 2. Retry close without error
+    success = fs.close()
+    assert success is True
+    assert close_state.state == LifecycleState.CLOSED
+    assert getattr(fs, "_s3creator") is None
+    assert getattr(fs, "_s3") is None
+

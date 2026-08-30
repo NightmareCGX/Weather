@@ -692,12 +692,17 @@ def _run_ingest(args: argparse.Namespace) -> int:
         return 0
 
     failed = 0
-    for spec in run_specs:
-        try:
-            _ingest_one_run(spec, args)
-        except (CycleStoreMismatchError, LeadTimeMismatchError, Exception) as exc:  # noqa: BLE001 - report every run failure
-            failed += 1
-            print(f"run FAILED: model={spec.model} cycle={spec.cycle_time}: {exc}")
+    try:
+        for spec in run_specs:
+            try:
+                _ingest_one_run(spec, args)
+            except (CycleStoreMismatchError, LeadTimeMismatchError, Exception) as exc:  # noqa: BLE001 - report every run failure
+                failed += 1
+                print(f"run FAILED: model={spec.model} cycle={spec.cycle_time}: {exc}")
+    finally:
+        from ingestion.core.s3 import shutdown_s3_fs
+
+        shutdown_s3_fs()
     if failed:
         print(f"{failed}/{len(run_specs)} run(s) failed.")
         return 1
@@ -1425,6 +1430,9 @@ async def _run_wave(
         fin_conn.close()
         engine.dispose()
         executor.shutdown(wait=True)
+        from ingestion.core.s3 import close_wave_data_s3_fs
+
+        close_wave_data_s3_fs()
         decode_pool.shutdown()
         ui_stop_event.set()
         ui_task.cancel()
@@ -1439,11 +1447,6 @@ async def _run_wave(
     if not no_progress:
         print("\n" + report)
     logger.info("Startup timeline breakdown:\n%s", report)
-
-    if cancelled:
-        raise asyncio.CancelledError
-
-    return status
 
     if cancelled:
         raise asyncio.CancelledError

@@ -7,7 +7,7 @@
 #     python-quality       — Ruff + MyPy (domain/api/ingestion) + contracts/config install/import validation
 #     domain-tests         — pytest (offline, 100% coverage gate)
 #     api-tests            — pytest with isolated PostgreSQL + Redis service containers
-#     ingestion-tests      — pytest with isolated PostgreSQL + Redis + MinIO, WEATHER_TEST_MINIO=1
+#     ingestion-tests      — pytest with isolated PostgreSQL + Redis + MinIO, WEATHER_TEST_MINIO=1, -W error::ResourceWarning
 #     frontend-unit        — npm ci + Jest
 #     frontend-lint-build  — lint + typecheck + format:check + next build
 #   Dependent jobs:
@@ -307,10 +307,12 @@ jobs:
               raise SystemExit("MinIO not ready")
           PY
 
-      # Run the full suite ONCE (includes the real MinIO S3 Zarr round-trip and
-      # test_catalog_postgres.py). JUnit report provides pytest-native evidence.
+      # Run the full suite ONCE (includes the real MinIO S3 Zarr round-trip,
+      # test_catalog_postgres.py, and the S3 lifecycle regression tests).
+      # Strict ResourceWarning promotion ensures unclosed ClientSessions or
+      # connectors fail the build immediately. JUnit report provides pytest-native evidence.
       - name: Run ingestion tests (with JUnit report)
-        run: cd services/ingestion && poetry run pytest --junitxml=ingestion-junit.xml
+        run: cd services/ingestion && poetry run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml
 
       # Prove the approved MinIO round-trip executed and PASSED (not skipped)
       # from the pytest-native JUnit report — no stdout parsing.
@@ -328,11 +330,10 @@ jobs:
           print("MinIO round-trip executed and passed (not skipped)")
           PY
 
-      # The Zarr region-write concurrency correctness suite is a required Linux
-      # CI gate. The PG-backed advisory-lock tests and the MinIO marker tests
-      # must run and PASS (not skip) — the correctness suite is not silently
-      # optional.
-      - name: Verify concurrency correctness tests ran and passed (not skipped)
+      # The Zarr region-write concurrency correctness suite and S3 lifecycle
+      # regression suite are required Linux CI gates. The PG-backed advisory-lock
+      # tests, MinIO marker tests, and S3 lifecycle tests must run and PASS (not skip).
+      - name: Verify concurrency correctness and S3 lifecycle tests ran and passed (not skipped)
         run: |
           python - <<'PY'
           import xml.etree.ElementTree as ET
@@ -349,15 +350,20 @@ jobs:
               "test_cross_process_disjoint_deterministic_writes",
               "test_cross_process_conflicting_ensemble_serializes",
               "test_cross_process_four_way_conflict_no_lost_members",
+              "test_s3_fs_reset_during_active_event_loop",
+              "test_multi_wave_s3_reuse_and_cleanup",
+              "test_executor_workers_strong_registry_cleanup",
+              "test_explicit_close_and_later_finalizer_idempotent",
+              "test_close_failure_retry_semantics",
           ]
           for name in required:
               test = root.find(f".//testcase[@name='{name}']")
-              assert test is not None, f"required concurrency test {name!r} not found"
+              assert test is not None, f"required test {name!r} not found"
               assert test.find("failure") is None and test.find("error") is None, \
-                  f"concurrency test {name!r} FAILED"
+                  f"test {name!r} FAILED"
               assert test.find("skipped") is None, \
-                  f"concurrency test {name!r} was SKIPPED"
-          print("All required concurrency tests executed and passed (not skipped)")
+                  f"test {name!r} was SKIPPED"
+          print("All required concurrency and S3 lifecycle tests executed and passed (not skipped)")
           PY
 
   # ---------------------------------------------------------------------------
