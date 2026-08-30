@@ -44,6 +44,30 @@ test("search → forecast: select a city and render the point forecast dashboard
   ).toBeVisible();
 });
 
+test("place search → resolution → forecast: selecting a place suggestion resolves coordinates and opens dashboard", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const input = page.getByLabel(/Search for a city/);
+  await expect(input).toBeVisible();
+
+  await input.fill("Boulder");
+  const option = searchResults(page)
+    .getByRole("option", { name: /Boulder/ })
+    .first();
+  await expect(option).toBeVisible();
+
+  await option.click();
+
+  // Selecting a place triggers /v1/search/places/:id resolution to coordinates (40.0150, -105.2705)
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText("Boulder, CO", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
+  ).toBeVisible();
+});
+
 test("map click → forecast: selecting a coordinate opens the dashboard", async ({ page }) => {
   await page.goto("/");
 

@@ -48,10 +48,6 @@ export function useSearch(query: string): UseSearchResult {
   // when the query returns to empty (a new search session begins).
   const [sessionToken, setSessionToken] = useState<string>(() => newSessionToken());
 
-  // Track the latest query for a terminal-state guard (avoid setting state on
-  // a stale timer after unmount or a newer query).
-  const queryRef = useRef(query);
-  queryRef.current = query;
   // Track whether the previous render had an active (>= MIN) query, so we can
   // detect the empty->active transition and mint a new session token without a
   // setState-in-effect loop.
@@ -63,15 +59,16 @@ export function useSearch(query: string): UseSearchResult {
   sessionTokenRef.current = sessionToken;
 
   useEffect(() => {
+    let active = true;
     const trimmed = query.trim();
-    const active = trimmed.length >= MIN_QUERY_LENGTH;
-    if (active && !wasActiveRef.current) {
+    const isQueryActive = trimmed.length >= MIN_QUERY_LENGTH;
+    if (isQueryActive && !wasActiveRef.current) {
       // A new search session begins: fresh token for Google billing.
       setSessionToken(newSessionToken());
     }
-    wasActiveRef.current = active;
+    wasActiveRef.current = isQueryActive;
 
-    if (!active) {
+    if (!isQueryActive) {
       setResults([]);
       setStatus("idle");
       setError(null);
@@ -90,25 +87,22 @@ export function useSearch(query: string): UseSearchResult {
         signal: controller.signal,
       })
         .then((next) => {
-          // Only the most recent query may publish results.
-          if (queryRef.current.trim() === trimmed) {
-            setResults(next);
-            setStatus("success");
-          }
+          if (!active) return;
+          setResults(next);
+          setStatus("success");
         })
         .catch((err: unknown) => {
-          if (err instanceof RequestAbortedError) {
+          if (!active || err instanceof RequestAbortedError) {
             return; // A newer query superseded this one; stay silent.
           }
-          if (queryRef.current.trim() === trimmed) {
-            setResults([]);
-            setError(err instanceof Error ? err.message : "Failed to search locations.");
-            setStatus("error");
-          }
+          setResults([]);
+          setError(err instanceof Error ? err.message : "Failed to search locations.");
+          setStatus("error");
         });
     }, DEBOUNCE_MS);
 
     return () => {
+      active = false;
       window.clearTimeout(timer);
       controller.abort();
     };

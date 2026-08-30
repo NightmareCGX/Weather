@@ -355,12 +355,48 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
         latitude: 38.19,
         longitude: -106.82,
       },
+      {
+        id: "place_boulder",
+        object: "place",
+        name: "Boulder, CO",
+        place_id: "ChIJ_boulder_mock_place",
+        region: "Colorado",
+        country: "USA",
+        elevation_m: null,
+        latitude: null as unknown as number,
+        longitude: null as unknown as number,
+      },
     ];
     const matches = all.filter((item) => item.name.toLowerCase().includes(q));
     route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(envelope(matches, "list")),
+    });
+  });
+
+  await page.route("**/v1/search/places/*", (route) => {
+    const url = new URL(route.request().url());
+    const placeId = decodeURIComponent(url.pathname.split("/").pop() ?? "");
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(
+        envelope(
+          {
+            id: `resolved_${placeId}`,
+            object: "place",
+            name: "Boulder, CO",
+            place_id: placeId,
+            region: "Colorado",
+            country: "USA",
+            elevation_m: 1655,
+            latitude: 40.015,
+            longitude: -105.2705,
+          },
+          "search_result"
+        )
+      ),
     });
   });
 
