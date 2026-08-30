@@ -104,6 +104,8 @@ export const FORECAST_ENTRY_METADATA_FIELDS: ReadonlySet<string> = new Set([
   "lead_time_hours",
   "valid_time",
   "cycle_time",
+  "wind_direction_10m",
+  "wind_cardinal_10m",
 ]);
 
 /**
@@ -156,6 +158,27 @@ export interface EnsemblePDF {
   density: number[];
 }
 
+export interface ConsensusVector {
+  speed: number;
+  direction: number | null;
+  cardinal: string;
+  coherence: number;
+}
+
+export interface WindRoseSector {
+  sector: string;
+  count: number;
+  probability: number;
+  bins: Record<string, number>;
+}
+
+export interface WindRose {
+  calm_percentage: number;
+  calm_count: number;
+  sectors: WindRoseSector[];
+  member_count?: number;
+}
+
 /**
  * The payload of ensemble statistics (API.md section 5.1).
  *
@@ -174,6 +197,8 @@ export interface EnsembleStatisticsData {
   statistics: EnsembleStatistics;
   members?: number[];
   pdf?: EnsemblePDF | null;
+  consensus_vector?: ConsensusVector | null;
+  wind_rose?: WindRose | null;
 }
 
 /**

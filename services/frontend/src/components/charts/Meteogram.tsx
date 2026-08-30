@@ -12,7 +12,7 @@ import {
 } from "recharts";
 
 import { toMeteogramSeries } from "@/lib/forecast/transform";
-import { formatValue } from "@/lib/forecast/labels";
+import { formatValue, formatWindDirection } from "@/lib/forecast/labels";
 import { formatDayHourUtc } from "@/lib/forecast/time";
 import type { ForecastEntry } from "@/lib/api/types";
 
@@ -36,12 +36,17 @@ interface MeteogramProps {
  * series stays continuous; the tooltip reports the raw value or "n/a".
  */
 export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
-  const data = toMeteogramSeries(forecasts, variableCode).map((point) => ({
-    lead_time_hours: point.lead_time_hours,
-    valid_time: point.valid_time,
-    label: formatDayHourUtc(point.valid_time),
-    value: point.value,
-  }));
+  const data = toMeteogramSeries(forecasts, variableCode).map((point, index) => {
+    const entry = forecasts[index];
+    return {
+      lead_time_hours: point.lead_time_hours,
+      valid_time: point.valid_time,
+      label: formatDayHourUtc(point.valid_time),
+      value: point.value,
+      wind_direction_10m: entry?.wind_direction_10m as number | null | undefined,
+      wind_cardinal_10m: entry?.wind_cardinal_10m as string | null | undefined,
+    };
+  });
 
   const isPrecipitation =
     meta.unit === "mm/h" || meta.unit === "in/h" || variableCode.startsWith("precip");
@@ -74,10 +79,16 @@ export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
               domain={isPrecipitation ? [0, "auto"] : ["auto", "auto"]}
             />
             <Tooltip
-              formatter={(value: number | string, name: string) => [
-                typeof value === "number" ? formatValue(value, meta.unit) : "n/a",
-                meta.name,
-              ]}
+              formatter={(value: number | string, _name: string, item: any) => {
+                if (typeof value !== "number") return ["n/a", meta.name];
+                if (variableCode === "wind_10m") {
+                  const dir = item?.payload?.wind_direction_10m;
+                  const card = item?.payload?.wind_cardinal_10m;
+                  const dirLabel = formatWindDirection(dir, card);
+                  return [`${formatValue(value, meta.unit)} (${dirLabel})`, meta.name];
+                }
+                return [formatValue(value, meta.unit), meta.name];
+              }}
               labelFormatter={(label: string) => `${label} UTC`}
               contentStyle={{ fontSize: 12 }}
             />

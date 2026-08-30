@@ -521,6 +521,18 @@ DEFAULT_VARIABLES: tuple[VariableSpec, ...] = (
         unit="m",
         source_code="sde",
     ),
+    VariableSpec(
+        code="wind_u_10m",
+        name="10-Meter U Wind Component",
+        unit="m/s",
+        source_code="u10",
+    ),
+    VariableSpec(
+        code="wind_v_10m",
+        name="10-Meter V Wind Component",
+        unit="m/s",
+        source_code="v10",
+    ),
 )
 
 #: Center metadata keyed by ``center_id``.

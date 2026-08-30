@@ -38,6 +38,10 @@ from api.schemas import (
 from api.services.tiles import MAX_ZOOM, MIN_ZOOM, _color_stops
 
 
+#: Internal platform variables that are not exposed as public user-facing products.
+INTERNAL_VARIABLES: frozenset[str] = frozenset({"wind_u_10m", "wind_v_10m"})
+
+
 @dataclass
 class _VariableAccumulator:
     """Accumulator of one variable's availability rows during the query.
@@ -133,7 +137,48 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
     for model_id in sorted(by_model):
         model_acc = by_model[model_id]
         variables: list[VariableAvailability] = []
+        # Synthesize public wind_10m product when both wind_u_10m and wind_v_10m exist
+        if "wind_u_10m" in model_acc.variables and "wind_v_10m" in model_acc.variables:
+            u_acc = model_acc.variables["wind_u_10m"]
+            v_acc = model_acc.variables["wind_v_10m"]
+            common_cycles = set(u_acc.initial_times.keys()).intersection(v_acc.initial_times.keys())
+            initial_times_wind: list[InitialTimeAvailability] = []
+            for cycle_time in sorted(common_cycles, reverse=True):
+                common_leads = u_acc.initial_times[cycle_time].intersection(v_acc.initial_times[cycle_time])
+                if common_leads:
+                    initial_times_wind.append(
+                        InitialTimeAvailability(
+                            value=cycle_time,
+                            lead_time_hours=sorted(common_leads),
+                        )
+                    )
+            if initial_times_wind:
+                stops_wind: list[list[float | str]] = [
+                    [float(value), f"#{red:02x}{green:02x}{blue:02x}"]
+                    for value, (red, green, blue) in _color_stops("wind_10m")
+                ]
+                layer_wind = LayerDescriptor(
+                    tile_url_template=(
+                        f"/v1/maps/{model_id}/wind_10m/surface/{{z}}/{{x}}/{{y}}.png"
+                        f"?lead_time_hours={{lead_time_hours}}&initial_time={{initial_time}}"
+                    ),
+                    min_zoom=MIN_ZOOM,
+                    max_zoom=MAX_ZOOM,
+                    legend=SpatialLayerLegend(unit="km/h", stops=stops_wind),
+                )
+                variables.append(
+                    VariableAvailability(
+                        id="wind_10m",
+                        name="10-Meter Wind",
+                        unit="km/h",
+                        initial_times=initial_times_wind,
+                        layer=layer_wind,
+                    )
+                )
+
         for variable_code in sorted(model_acc.variables):
+            if variable_code in INTERNAL_VARIABLES:
+                continue
             variable_acc = model_acc.variables[variable_code]
             initial_times = [
                 InitialTimeAvailability(
@@ -168,6 +213,7 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                     layer=layer,
                 )
             )
+        variables.sort(key=lambda v: v.id)
         models.append(
             ModelAvailability(
                 id=model_id,

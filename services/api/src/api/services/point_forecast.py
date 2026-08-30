@@ -30,6 +30,11 @@ from domain.exceptions import (
 )
 from domain.geo.coordinates import validate_coordinates
 from domain.geo.grid import RegularGrid
+from domain.models.wind import (
+    CALM_WIND_THRESHOLD_MPS,
+    derive_meteorological_direction,
+    get_cardinal_direction,
+)
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -94,6 +99,7 @@ _SI_TO_IMPERIAL: dict[str, tuple[str, Callable[[float], float]]] = {
 _VARIABLE_IMPERIAL_CONVERSIONS: dict[str, tuple[str, Callable[[float], float]]] = {
     "snow_depth": ("in", lambda m: m * 39.3700787),
     "visibility": ("mi", lambda m: m / 1609.344),
+    "wind_10m": ("mph", lambda kmh: kmh * 0.621371),
 }
 
 
@@ -356,10 +362,24 @@ def build_point_forecast(
             "cycle_time": cycle_time,
         }
         for var_code in var_codes:
-            value = values_by_var[var_code]
-            entry[var_code] = _convert_value(
-                value, units_by_code[var_code], units, var_code=var_code
-            )
+            if var_code == "wind_10m":
+                raw_kmh = float(values_by_var["wind_10m"])
+                converted_speed = _convert_value(
+                    raw_kmh, "km/h", units, var_code="wind_10m"
+                )
+                entry["wind_10m"] = converted_speed
+                direction_deg = values_by_var.get("_wind_direction_10m")
+                entry["wind_direction_10m"] = (
+                    round(float(direction_deg), 1)
+                    if direction_deg is not None and not math.isnan(float(direction_deg))
+                    else None
+                )
+                entry["wind_cardinal_10m"] = str(values_by_var.get("_wind_cardinal_10m", "CALM"))
+            else:
+                value = float(values_by_var[var_code])
+                entry[var_code] = _convert_value(
+                    value, units_by_code[var_code], units, var_code=var_code
+                )
         forecasts.append(ForecastSeries(**entry))
 
     if not forecasts:
@@ -559,7 +579,7 @@ def gated_point_interpolations(
     lead: int,
     latitude: float,
     longitude: float,
-) -> dict[str, float] | None:
+) -> dict[str, Any] | None:
     """Interpolate every requested variable at a point/lead under the gate.
 
     A single SHARED gate session opens the lazy store, derives the grid
@@ -570,10 +590,53 @@ def gated_point_interpolations(
     """
     from api.core.reader_gate import gated_read_dataset_with_selector
 
-    def select_and_interpolate(dataset: xr.Dataset) -> dict[str, float]:
+    def select_and_interpolate(dataset: xr.Dataset) -> dict[str, Any]:
         grid, lat_desc, lon_desc = _derive_grid(dataset)
-        out: dict[str, float] = {}
+        out: dict[str, Any] = {}
         for var_code in var_codes:
+            if var_code == "wind_10m":
+                if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            "Variable 'wind_10m' requires 'wind_u_10m' and 'wind_v_10m' in the forecast dataset."
+                        ),
+                    )
+                field_u = dataset["wind_u_10m"]
+                field_v = dataset["wind_v_10m"]
+                if "lead_time_hours" in field_u.dims:
+                    field_u = field_u.sel(lead_time_hours=lead)
+                if "lead_time_hours" in field_v.dims:
+                    field_v = field_v.sel(lead_time_hours=lead)
+                if field_u.ndim not in (2, 3) or field_v.ndim not in (2, 3):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "Variable 'wind_10m' components are not 2-D/3-D (member) surface fields; "
+                            "vertical-level variables are not supported."
+                        ),
+                    )
+                u_val = float(
+                    _interpolate_neighborhood(
+                        field_u, grid, lat_desc, lon_desc, latitude, longitude
+                    )
+                )
+                v_val = float(
+                    _interpolate_neighborhood(
+                        field_v, grid, lat_desc, lon_desc, latitude, longitude
+                    )
+                )
+                speed_mps = math.hypot(u_val, v_val)
+                speed_kmh = speed_mps * 3.6
+                direction_deg = derive_meteorological_direction(
+                    u_val, v_val, calm_threshold=CALM_WIND_THRESHOLD_MPS
+                )
+                cardinal_str = get_cardinal_direction(direction_deg) if direction_deg is not None else "CALM"
+                out["wind_10m"] = speed_kmh
+                out["_wind_direction_10m"] = direction_deg if direction_deg is not None else float("nan")
+                out["_wind_cardinal_10m"] = cardinal_str
+                continue
+
             if var_code not in dataset.data_vars:
                 raise HTTPException(
                     status_code=404,
@@ -827,6 +890,10 @@ def _resolve_lead_times(
     return selected
 
 
+#: Internal platform variables that are not returned in default point forecasts.
+INTERNAL_VARIABLES: frozenset[str] = frozenset({"wind_u_10m", "wind_v_10m"})
+
+
 def _resolve_variables(
     db: Session,
     source: _CycleMetadata | xr.Dataset,
@@ -836,19 +903,23 @@ def _resolve_variables(
 
     When ``variables`` is ``None`` the default set is the documented
     ``forecast_variables`` catalog intersected with the variables present in
-    the dataset/store. This explicit allowlist ensures auxiliary or non-surface
-    dataset variables are never accidentally exposed or interpolated (API.md
-    does not define a default variable list; the catalog is the platform's
-    documented forecast-variable vocabulary). Provided codes are validated
-    against the ``forecast_variables`` catalog.
+    the dataset/store, excluding internal platform dependency variables (e.g.
+    raw vector components). This explicit allowlist ensures auxiliary or
+    non-surface dataset variables are never accidentally exposed or
+    interpolated (API.md does not define a default variable list; the catalog
+    is the platform's documented forecast-variable vocabulary). Provided codes
+    are validated against the ``forecast_variables`` catalog.
     """
     if variables is None:
-        catalog = _catalog_variable_codes(db)
+        catalog = set(_catalog_variable_codes(db) - INTERNAL_VARIABLES)
         present = (
             set(source.var_names)
             if isinstance(source, _CycleMetadata)
             else {str(name) for name in source.data_vars}
         )
+        if "wind_u_10m" in present and "wind_v_10m" in present:
+            present.add("wind_10m")
+            catalog.add("wind_10m")
         return sorted(catalog.intersection(present))
     missing = _missing_catalog_variables(db, variables)
     if missing:
@@ -870,6 +941,14 @@ def _missing_catalog_variables(db: Session, variables: list[str]) -> list[str]:
         ForecastVariable.variable_code.in_(variables)
     )
     known = set(db.execute(stmt).scalars().all())
+    if "wind_10m" in variables:
+        u_v_count = db.execute(
+            select(ForecastVariable.variable_code).where(
+                ForecastVariable.variable_code.in_(["wind_u_10m", "wind_v_10m", "wind_10m"])
+            )
+        ).scalars().all()
+        if len(u_v_count) >= 2 or "wind_10m" in u_v_count:
+            known.add("wind_10m")
     return [code for code in variables if code not in known]
 
 
@@ -882,6 +961,8 @@ def _variable_units(db: Session, var_codes: list[str]) -> dict[str, str | None]:
     units: dict[str, str | None] = {}
     for code, unit in db.execute(stmt).all():
         units[code] = unit
+    if "wind_10m" in var_codes:
+        units["wind_10m"] = "km/h"
     return {code: units.get(code) for code in var_codes}
 
 

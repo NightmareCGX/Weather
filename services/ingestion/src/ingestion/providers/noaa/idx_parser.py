@@ -242,6 +242,8 @@ DEFAULT_SELECTION_VARIABLES: tuple[str, ...] = (
     "wind_gust",
     "visibility",
     "snow_depth",
+    "wind_u_10m",
+    "wind_v_10m",
 )
 
 
@@ -273,6 +275,12 @@ def select_gfs_records(
     * ``snow_depth``: Matches parameter ``"SNOD"`` at level ``"surface"``.
       At lead 0, matches ``"anl"`` or ``"0 hour fcst"``; at lead > 0, matches
       ``f"{lead_time_hours} hour fcst"``.
+    * ``wind_u_10m``: Matches parameter ``"UGRD"`` at level
+      ``"10 m above ground"``. At lead 0, matches ``"anl"`` or ``"0 hour fcst"``;
+      at lead > 0, matches ``f"{lead_time_hours} hour fcst"``.
+    * ``wind_v_10m``: Matches parameter ``"VGRD"`` at level
+      ``"10 m above ground"``. At lead 0, matches ``"anl"`` or ``"0 hour fcst"``;
+      at lead > 0, matches ``f"{lead_time_hours} hour fcst"``.
 
     Args:
         records: Parsed ``.idx`` records.
@@ -382,6 +390,40 @@ def select_gfs_records(
                 for rec in records
                 if rec.parameter == "SNOD"
                 and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_u_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "UGRD"
+                and rec.level_description == "10 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_v_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "VGRD"
+                and rec.level_description == "10 m above ground"
                 and _matches_step(rec.forecast_description, lead_time_hours)
             ]
             _record_selection(
@@ -571,6 +613,42 @@ def select_gefs_records(
                 for rec in records
                 if rec.parameter == "SNOD"
                 and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_u_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "UGRD"
+                and rec.level_description == "10 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_v_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "VGRD"
+                and rec.level_description == "10 m above ground"
                 and _matches_step(rec.forecast_description, lead_time_hours)
                 and _matches_gefs_member(rec.ensemble_description, member)
             ]

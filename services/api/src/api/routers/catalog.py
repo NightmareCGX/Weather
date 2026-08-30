@@ -159,12 +159,23 @@ def list_variables(
     db: Session = Depends(get_db),
 ) -> ListEnvelope[VariableOut]:
     """Retrieve standardized physical meteorological variables."""
-    stmt = select(ForecastVariable)
+    stmt = select(ForecastVariable).where(
+        ForecastVariable.variable_code.not_in(["wind_u_10m", "wind_v_10m"])
+    )
     page = paginate(db, stmt, ForecastVariable.variable_code, pagination)
     data = [
         VariableOut(id=variable.variable_code, name=variable.name, unit=variable.unit)
         for variable in page.items
     ]
+    if not any(v.id == "wind_10m" for v in data):
+        u_exists = db.execute(
+            select(ForecastVariable.variable_code).where(
+                ForecastVariable.variable_code == "wind_u_10m"
+            )
+        ).scalar_one_or_none()
+        if u_exists is not None:
+            data.append(VariableOut(id="wind_10m", name="10-Meter Wind", unit="km/h"))
+            data.sort(key=lambda v: v.id)
     return _envelope(response, data, page, CACHE_CONTROL_DAILY)
 
 

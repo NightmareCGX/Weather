@@ -259,6 +259,64 @@ def test_tile_cache_key_distinguishes_tile_coordinates():
     assert len({a, b, c}) == 3
 
 
+def test_wind_10m_tile_slice_deterministic():
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _derive_grid, _slice_field
+
+    ds = xr.Dataset(
+        data_vars={
+            "wind_u_10m": (("lead_time_hours", "latitude", "longitude"), np.ones((1, 4, 4)) * 3.0),
+            "wind_v_10m": (("lead_time_hours", "latitude", "longitude"), np.ones((1, 4, 4)) * 4.0),
+        },
+        coords={
+            "lead_time_hours": [6],
+            "latitude": [38.0, 38.25, 38.5, 38.75],
+            "longitude": [-107.0, -106.75, -106.5, -106.25],
+        },
+    )
+    grid = _derive_grid(ds)
+    field, lat_axis, lon_axis = _slice_field(
+        ds, "wind_10m", 6, grid, np.array([[38.5]]), np.array([[-106.5]])
+    )
+    # speed is hypot(3, 4) * 3.6 = 5.0 * 3.6 = 18.0 km/h
+    np.testing.assert_allclose(field, 18.0)
+
+
+def test_wind_10m_tile_slice_ensemble_mean():
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _derive_grid, _slice_field
+
+    # 2 members: member 0 (u=3, v=4 -> speed=5), member 1 (u=6, v=8 -> speed=10)
+    # mean scalar speed is (5 + 10) / 2 = 7.5 m/s = 27.0 km/h
+    u_data = np.zeros((2, 1, 4, 4))
+    u_data[0] = 3.0
+    u_data[1] = 6.0
+    v_data = np.zeros((2, 1, 4, 4))
+    v_data[0] = 4.0
+    v_data[1] = 8.0
+
+    ds = xr.Dataset(
+        data_vars={
+            "wind_u_10m": (("member", "lead_time_hours", "latitude", "longitude"), u_data),
+            "wind_v_10m": (("member", "lead_time_hours", "latitude", "longitude"), v_data),
+        },
+        coords={
+            "member": [1, 2],
+            "lead_time_hours": [6],
+            "latitude": [38.0, 38.25, 38.5, 38.75],
+            "longitude": [-107.0, -106.75, -106.5, -106.25],
+        },
+    )
+    grid = _derive_grid(ds)
+    field, lat_axis, lon_axis = _slice_field(
+        ds, "wind_10m", 6, grid, np.array([[38.5]]), np.array([[-106.5]])
+    )
+    # mean scalar speed is 27.0 km/h
+    np.testing.assert_allclose(field, 27.0)
+
+
 def test_tile_cache_serves_identical_requests():
     """A repeated identical tile request is served from the server cache."""
     from api.services.tiles import _tile_cache, _tile_cache_get, _tile_cache_set, _tile_cache_key

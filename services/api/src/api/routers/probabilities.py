@@ -79,6 +79,15 @@ def get_probability(
             )
         ),
     ] = None,
+    direction_sector: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional 8-point cardinal sector for directional wind probabilities "
+                "(e.g. 'SW', 'N')."
+            )
+        ),
+    ] = None,
     # Optional cycle pinning (GAP-2): additive and non-breaking.
     initial_time: Annotated[
         str | None,
@@ -108,6 +117,7 @@ def get_probability(
         operator=operator,
         lead_time_hours=lead_time_hours,
         threshold_max=threshold_max,
+        direction_sector=direction_sector,
         cycle_time=resolve_latest_run_cycle_time(db, model, initial_time),
         serving_generation=resolve_latest_run_serving_generation(
             db, model, initial_time
@@ -116,7 +126,7 @@ def get_probability(
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&threshold={threshold}"
         f"&operator={operator}&lead_time_hours={lead_time_hours}"
-        f"&model={model}&threshold_max={threshold_max}&initial_time={initial_time}"
+        f"&model={model}&threshold_max={threshold_max}&direction_sector={direction_sector}&initial_time={initial_time}"
     )
 
     envelope = _cache.compute_or_retrieve(
@@ -133,6 +143,7 @@ def get_probability(
             lead_time_hours,
             model,
             threshold_max,
+            direction_sector,
             initial_time,
         ),
         model_type=ProbabilityForecastEnvelope,
@@ -174,6 +185,7 @@ def _compute(
     lead_time_hours: int,
     model: str,
     threshold_max: float | None,
+    direction_sector: str | None,
     initial_time: str | None,
 ) -> ProbabilityForecastEnvelope:
     data = build_probability_forecast(
@@ -186,6 +198,7 @@ def _compute(
         lead_time_hours=lead_time_hours,
         model=model,
         threshold_max=threshold_max,
+        direction_sector=direction_sector,
         initial_time=initial_time,
     )
     return ProbabilityForecastEnvelope(data=data)

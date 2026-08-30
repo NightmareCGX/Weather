@@ -256,6 +256,11 @@ _SOURCE_TO_CANONICAL: dict[
     "%": {"%": lambda array: array},
     # Visibility and snow depth are meters; canonical is meters.
     "m": {"m": lambda array: array},
+    # Wind vector components are m/s; canonical is m/s.
+    "m/s": {
+        "ms-1": lambda array: array,
+        "m/s": lambda array: array,
+    },
 }
 
 

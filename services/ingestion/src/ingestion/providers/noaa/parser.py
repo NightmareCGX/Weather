@@ -84,6 +84,20 @@ SURFACE_FIELD_FILTERS: dict[str, dict[str, object]] = {
         "level": 0,
         "stepType": "instant",
     },
+    # GRIB shortName ``10u`` = "10 metre U wind component" (paramId 165), m/s.
+    "u10": {
+        "shortName": "10u",
+        "typeOfLevel": "heightAboveGround",
+        "level": 10,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``10v`` = "10 metre V wind component" (paramId 166), m/s.
+    "v10": {
+        "shortName": "10v",
+        "typeOfLevel": "heightAboveGround",
+        "level": 10,
+        "stepType": "instant",
+    },
 }
 
 

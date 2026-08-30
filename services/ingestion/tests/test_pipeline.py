@@ -293,6 +293,33 @@ def test_normalize_snow_depth_preserves_meters() -> None:
     assert normalized["snow_depth"].attrs["units"] == "m"
 
 
+def test_normalize_wind_u_and_v_preserves_m_s_and_signed_values() -> None:
+    """UGRD/VGRD (m/s) are preserved as canonical m/s including negative signs."""
+    dataset = _dataset_with_units(
+        "wind_u_10m",
+        [[-12.5, 8.4], [-5.0, 15.2]],
+        source_unit="m s**-1",
+    )
+    variables = (VariableSpec("wind_u_10m", "10-Meter U Wind Component", "m/s", "u10"),)
+    normalized = _normalize_canonical_units(dataset, variables)
+    u_vals = normalized["wind_u_10m"].values
+    assert float(u_vals[0, 0]) == pytest.approx(-12.5, abs=1e-9)
+    assert float(u_vals[0, 1]) == pytest.approx(8.4, abs=1e-9)
+    assert normalized["wind_u_10m"].attrs["units"] == "m/s"
+
+    dataset_v = _dataset_with_units(
+        "wind_v_10m",
+        [[7.5, -14.2], [0.0, -3.1]],
+        source_unit="m/s",
+    )
+    variables_v = (VariableSpec("wind_v_10m", "10-Meter V Wind Component", "m/s", "v10"),)
+    normalized_v = _normalize_canonical_units(dataset_v, variables_v)
+    v_vals = normalized_v["wind_v_10m"].values
+    assert float(v_vals[0, 1]) == pytest.approx(-14.2, abs=1e-9)
+    assert float(v_vals[1, 0]) == pytest.approx(0.0, abs=1e-9)
+    assert normalized_v["wind_v_10m"].attrs["units"] == "m/s"
+
+
 def test_normalize_leaves_already_canonical_values_unchanged() -> None:
     """A variable already in the canonical unit is left numerically untouched."""
     dataset = _dataset_with_units(

@@ -160,6 +160,14 @@ def test_point_imperial_units(client):
     assert abs(entry["precipitation_rate"] - expected_precip_in) < 1e-9
 
 
+def test_point_units_conversion_wind_10m() -> None:
+    val_metric = _convert_value(50.0, "km/h", "metric", var_code="wind_10m")
+    assert val_metric == 50.0
+
+    val_imperial = _convert_value(50.0, "km/h", "imperial", var_code="wind_10m")
+    assert val_imperial == pytest.approx(50.0 * 0.621371, abs=1e-5)
+
+
 def test_point_generated_at_deterministic(client):
     lat = LAT_START + 0.125
     lon = LON_START + 0.125

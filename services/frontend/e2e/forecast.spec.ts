@@ -396,3 +396,45 @@ test("phase 1a gefs variable selection: selecting GEFS relative humidity updates
     page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
   ).toBeVisible();
 });
+
+test("phase 1b wind product: selecting Wind updates map, meteogram, and ensemble Wind Rose", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+
+  // 1. Verify raw U/V are not present in variable options
+  const options = await variableSelect.locator("option").allTextContents();
+  expect(options).not.toContain("10-Meter U Wind Component");
+  expect(options).not.toContain("10-Meter V Wind Component");
+  expect(options).toContain("10-Meter Wind");
+
+  // 2. Select Wind product
+  await variableSelect.selectOption("wind_10m");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+
+  // 3. Search and select a city to view the point forecast
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // 4. Verify meteograms include 10-Meter Wind
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /10-Meter Wind hourly forecast over lead time/ })
+  ).toBeVisible();
+
+  // 5. Switch to GEFS model to test Ensemble Wind Rose
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+  await variableSelect.selectOption("wind_10m");
+
+  // 6. Verify Ensemble Statistics and Wind Rose appear
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(page.getByText(/Wind Direction & Speed Distribution \(Wind Rose\)/)).toBeVisible();
+  await expect(page.getByRole("img", { name: /ensemble wind rose chart/i })).toBeVisible();
+  await expect(page.getByText("CALM")).toBeVisible();
+});

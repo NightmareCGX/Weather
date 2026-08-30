@@ -131,6 +131,17 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
             (120.0, (122, 1, 119)),
             (150.0, (73, 0, 106)),
         ]
+    if variable_code in ("wind_10m", "wind_speed_10m"):
+        return [
+            (0.0, (255, 255, 255)),
+            (10.0, (199, 233, 192)),
+            (25.0, (116, 196, 118)),
+            (40.0, (65, 171, 93)),
+            (60.0, (66, 146, 198)),
+            (80.0, (8, 81, 156)),
+            (100.0, (122, 1, 119)),
+            (140.0, (73, 0, 106)),
+        ]
     if variable_code == "visibility":
         return [
             (0.0, (73, 0, 106)),
@@ -171,6 +182,8 @@ def _data_range(variable_code: str) -> tuple[float, float]:
         return (0.0, 100.0)
     if variable_code == "wind_gust":
         return (0.0, 150.0)
+    if variable_code in ("wind_10m", "wind_speed_10m"):
+        return (0.0, 140.0)
     if variable_code == "visibility":
         return (0.0, 24000.0)
     if variable_code == "snow_depth":
@@ -656,6 +669,66 @@ def _slice_field(
     Raises:
         ValueError: If the variable is missing or not a 2-D surface field.
     """
+    if variable in ("wind_10m", "wind_speed_10m"):
+        if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
+            raise ValueError("Variables 'wind_u_10m' and 'wind_v_10m' must be in the dataset.")
+        field_u = dataset["wind_u_10m"]
+        field_v = dataset["wind_v_10m"]
+        if "lead_time_hours" in field_u.dims:
+            field_u = field_u.sel(lead_time_hours=lead)
+        if "lead_time_hours" in field_v.dims:
+            field_v = field_v.sel(lead_time_hours=lead)
+
+        lat_axis_full = field_u.latitude.values
+        lon_axis_full = field_u.longitude.values
+        lat_min = float(pixel_lats.min())
+        lat_max = float(pixel_lats.max())
+        lon_native_min = float(lon_native.min())
+        lon_native_max = float(lon_native.max())
+
+        lat_step = float(lat_axis_full[1] - lat_axis_full[0]) if len(lat_axis_full) > 1 else 1.0
+        lon_step = float(lon_axis_full[1] - lon_axis_full[0]) if len(lon_axis_full) > 1 else 1.0
+        lo_lat = float(max(min(lat_axis_full[0], lat_axis_full[-1]), lat_min - abs(lat_step)))
+        hi_lat = float(min(max(lat_axis_full[-1], lat_axis_full[0]), lat_max + abs(lat_step)))
+        lo_lon = float(max(min(lon_axis_full[0], lon_axis_full[-1]), lon_native_min - abs(lon_step)))
+        hi_lon = float(min(max(lon_axis_full[-1], lon_axis_full[0]), lon_native_max + abs(lon_step)))
+        if lo_lat > hi_lat or lo_lon > hi_lon:
+            return (
+                np.full((1, 1), np.nan),
+                np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
+                np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
+            )
+        sliced_u = field_u.sel(
+            latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
+            longitude=slice(hi_lon, lo_lon) if grid.lon_reversed else slice(lo_lon, hi_lon),
+        )
+        sliced_v = field_v.sel(
+            latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
+            longitude=slice(hi_lon, lo_lon) if grid.lon_reversed else slice(lo_lon, hi_lon),
+        )
+        if "member" in sliced_u.dims:
+            # Mean scalar wind speed across ensemble members: mean(hypot(u_i, v_i))
+            speed_members = np.hypot(sliced_u.values, sliced_v.values)
+            values = np.mean(speed_members, axis=0) * 3.6
+        else:
+            values = np.hypot(sliced_u.values, sliced_v.values) * 3.6
+
+        lat_sliced = np.asarray(sliced_u.latitude.values, dtype=float)
+        lon_sliced = np.asarray(sliced_u.longitude.values, dtype=float)
+        if values.shape[0] == 0 or values.shape[1] == 0:
+            return (
+                np.full((1, 1), np.nan),
+                np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
+                np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
+            )
+        if len(lat_sliced) > 1 and lat_sliced[-1] < lat_sliced[0]:
+            values = values[::-1, :]
+            lat_sliced = lat_sliced[::-1]
+        if len(lon_sliced) > 1 and lon_sliced[-1] < lon_sliced[0]:
+            values = values[:, ::-1]
+            lon_sliced = lon_sliced[::-1]
+        return (values, lat_sliced, lon_sliced)
+
     if variable not in dataset.data_vars:
         raise ValueError(f"Variable '{variable}' is not in the dataset.")
 
@@ -899,15 +972,18 @@ def _require_model_variable(db: Session, model: str, variable: str) -> None:
     ).scalar_one_or_none()
     if model_found is None:
         raise HTTPException(status_code=404, detail=f"Model '{model}' was not found.")
-    variable_found = db.execute(
-        select(ForecastVariable.variable_code).where(
-            ForecastVariable.variable_code == variable
-        )
-    ).scalar_one_or_none()
-    if variable_found is None:
-        raise HTTPException(
-            status_code=404, detail=f"Variable '{variable}' was not found."
-        )
+
+    check_vars = ["wind_u_10m", "wind_v_10m"] if variable == "wind_10m" else [variable]
+    for var in check_vars:
+        variable_found = db.execute(
+            select(ForecastVariable.variable_code).where(
+                ForecastVariable.variable_code == var
+            )
+        ).scalar_one_or_none()
+        if variable_found is None:
+            raise HTTPException(
+                status_code=404, detail=f"Variable '{variable}' was not found."
+            )
 
 
 def _require_product(
@@ -920,23 +996,25 @@ def _require_product(
     """Raise 404 if no forecast product row exists for the selection."""
     from fastapi import HTTPException
 
-    product = db.execute(
-        select(ForecastProduct.id).where(
-            ForecastProduct.run_id == run.id,
-            ForecastProduct.variable_id == variable,
-            ForecastProduct.product_type == level,
-            ForecastProduct.lead_time_hours == lead_time_hours,
-        )
-    ).scalar_one_or_none()
-    if product is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No forecast product is available for run '{run.id}', "
-                f"variable '{variable}', level '{level}', lead "
-                f"'{lead_time_hours}h'."
-            ),
-        )
+    check_vars = ["wind_u_10m", "wind_v_10m"] if variable == "wind_10m" else [variable]
+    for var in check_vars:
+        product = db.execute(
+            select(ForecastProduct.id).where(
+                ForecastProduct.run_id == run.id,
+                ForecastProduct.variable_id == var,
+                ForecastProduct.product_type == level,
+                ForecastProduct.lead_time_hours == lead_time_hours,
+            )
+        ).scalar_one_or_none()
+        if product is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No forecast product is available for run '{run.id}', "
+                    f"variable '{variable}', level '{level}', lead "
+                    f"'{lead_time_hours}h'."
+                ),
+            )
 
 
 def _parse_cycle_time(value: str) -> datetime:

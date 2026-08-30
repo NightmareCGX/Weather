@@ -267,6 +267,30 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                       },
                     },
                   },
+                  {
+                    id: "wind_10m",
+                    name: "10-Meter Wind",
+                    unit: "km/h",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/wind_10m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "km/h",
+                        stops: [
+                          [0, "#ffffff"],
+                          [140, "#49006a"],
+                        ],
+                      },
+                    },
+                  },
                 ],
               },
               {
@@ -390,6 +414,30 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         stops: [
                           [0, "#ffffff"],
                           [2.5, "#1a0040"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "wind_10m",
+                    name: "10-Meter Wind",
+                    unit: "km/h",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/wind_10m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "km/h",
+                        stops: [
+                          [0, "#ffffff"],
+                          [140, "#49006a"],
                         ],
                       },
                     },
@@ -530,6 +578,12 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
               name: "Snow Depth",
               unit: "m",
             },
+            {
+              id: "wind_10m",
+              object: "variable",
+              name: "10-Meter Wind",
+              unit: "km/h",
+            },
           ],
           "list"
         )
@@ -625,6 +679,9 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       valid_time: `2026-07-21T${String(lead).padStart(2, "0")}:00:00Z`,
       temperature_2m: temperatureAt(lat, lon, lead),
       precipitation_rate: precipitationAt(lead),
+      wind_10m: 25.4,
+      wind_direction_10m: 225.0,
+      wind_cardinal_10m: "SW",
     }));
     route.fulfill({
       status: 200,
@@ -670,6 +727,7 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       p75: sorted[3],
       p90: sorted[4],
     };
+    const variable = url.searchParams.get("variable") ?? "temperature_2m";
     // Production-contract-faithful: `members` and `pdf` are returned only when the
     // request opts in with `include_members=true`.
     const payload: Record<string, unknown> = {
@@ -678,6 +736,28 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       member_count: members.length,
       statistics: stats,
     };
+    if (variable === "wind_10m") {
+      payload.consensus_vector = {
+        speed: 24.5,
+        direction: 220.0,
+        cardinal: "SW",
+        coherence: 0.95,
+      };
+      payload.wind_rose = {
+        calm_percentage: 10.0,
+        calm_count: 3,
+        sectors: [
+          { sector: "N", count: 3, probability: 0.1, bins: { light: 0.05, moderate: 0.05, strong: 0.0, gale: 0.0 } },
+          { sector: "NE", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
+          { sector: "E", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
+          { sector: "SE", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
+          { sector: "S", count: 6, probability: 0.2, bins: { light: 0.05, moderate: 0.1, strong: 0.05, gale: 0.0 } },
+          { sector: "SW", count: 18, probability: 0.6, bins: { light: 0.1, moderate: 0.3, strong: 0.15, gale: 0.05 } },
+          { sector: "W", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
+          { sector: "NW", count: 0, probability: 0.0, bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 } },
+        ],
+      };
+    }
     if (includeMembers) {
       payload.members = members;
       payload.pdf = {
