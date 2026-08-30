@@ -516,4 +516,285 @@ describe("ForecastDashboard", () => {
 
     expect(mockUsePointForecast).toHaveBeenCalledWith(location, { model: "gfs" });
   });
+
+  it("Test A: derives ensemble variable and leads from authoritative selection when switching GFS precipitation -> GEFS", () => {
+    // Reported Bug: User was on GFS with precipitation_rate. User switches to
+    // GEFS, which normalizes selection.variable to temperature_2m.
+    // Stale point forecast may still return precipitation_rate or be loading.
+    // The ensemble panel must immediately query GEFS + temperature_2m with options.leadTimes.
+    mockSelectionContext({
+      selection: {
+        model: "gefs",
+        variable: "temperature_2m",
+        initialTime: "2026-08-13T00:00:00Z",
+        leadTimeHours: 6,
+      },
+      options: {
+        models: [
+          { id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] },
+          { id: "gefs", name: "Global Ensemble Forecast System", is_ensemble: true, variables: [] },
+        ],
+        model: {
+          id: "gefs",
+          name: "Global Ensemble Forecast System",
+          is_ensemble: true,
+          variables: [],
+        },
+        variables: [
+          { id: "temperature_2m", name: "2-Meter Temperature", unit: "°C", initial_times: [] },
+        ],
+        initialTimes: [{ value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 6, 12, 18] }],
+        variable: {
+          id: "temperature_2m",
+          name: "2-Meter Temperature",
+          unit: "°C",
+          initial_times: [],
+        },
+        initialTime: { value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 6, 12, 18] },
+        leadTimes: [0, 6, 12, 18],
+      },
+    });
+    // Point forecast is either still loading or holds stale GFS precipitation
+    mockUsePointForecast.mockReturnValue({
+      forecast: {
+        location: { latitude: 38.19, longitude: -106.82, elevation_m: null, resolved_via: "city" },
+        generated_at: "2026-07-21T00:00:00Z",
+        model: "gfs",
+        forecasts: [
+          { lead_time_hours: 0, valid_time: "2026-07-21T00:00:00Z", precipitation_rate: 12.5 },
+        ],
+      },
+      status: "loading",
+      error: null,
+    });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "loading",
+      error: null,
+      model: "gefs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    // Assert useEnsemble receives authoritative model (gefs), variable (temperature_2m), and options.leadTimes
+    expect(mockUseEnsemble).toHaveBeenCalledWith(
+      location,
+      [0, 6, 12, 18],
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+    expect(mockUseEnsemble).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "precipitation_rate",
+      expect.anything()
+    );
+
+    // Assert useEnsembleDistribution receives authoritative variable (temperature_2m) and selected lead (6)
+    expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
+      location,
+      6,
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+    expect(mockUseEnsembleDistribution).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "precipitation_rate",
+      expect.anything()
+    );
+  });
+
+  it("Test B: stale point forecast response keys never pollute ensemble variable or lead authority", () => {
+    mockSelectionContext({
+      selection: {
+        model: "gefs",
+        variable: "temperature_2m",
+        initialTime: "2026-08-13T00:00:00Z",
+        leadTimeHours: 12,
+      },
+      options: {
+        models: [
+          { id: "gefs", name: "Global Ensemble Forecast System", is_ensemble: true, variables: [] },
+        ],
+        model: {
+          id: "gefs",
+          name: "Global Ensemble Forecast System",
+          is_ensemble: true,
+          variables: [],
+        },
+        variables: [
+          { id: "temperature_2m", name: "2-Meter Temperature", unit: "°C", initial_times: [] },
+        ],
+        initialTimes: [{ value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 6, 12, 18, 24] }],
+        variable: {
+          id: "temperature_2m",
+          name: "2-Meter Temperature",
+          unit: "°C",
+          initial_times: [],
+        },
+        initialTime: { value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 6, 12, 18, 24] },
+        leadTimes: [0, 6, 12, 18, 24],
+      },
+    });
+    // Point forecast has arbitrary other keys and leads [0, 48]
+    mockUsePointForecast.mockReturnValue({
+      forecast: {
+        location: { latitude: 38.19, longitude: -106.82, elevation_m: null, resolved_via: "city" },
+        generated_at: "2026-07-21T00:00:00Z",
+        model: "gfs",
+        forecasts: [
+          { lead_time_hours: 0, valid_time: "2026-07-21T00:00:00Z", unknown_legacy_variable: 99 },
+          { lead_time_hours: 48, valid_time: "2026-07-21T06:00:00Z", unknown_legacy_variable: 100 },
+        ],
+      },
+      status: "success",
+      error: null,
+    });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "idle",
+      error: null,
+      model: "gefs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    // Leads come from options.leadTimes [0, 6, 12, 18, 24], NOT point forecast [0, 48]
+    expect(mockUseEnsemble).toHaveBeenCalledWith(
+      location,
+      [0, 6, 12, 18, 24],
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+    expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
+      location,
+      12,
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+  });
+
+  it("Test C: variable switch within GEFS immediately propagates to all ensemble consumers", () => {
+    mockSelectionContext({
+      selection: {
+        model: "gefs",
+        variable: "total_precipitation",
+        initialTime: "2026-08-13T00:00:00Z",
+        leadTimeHours: 6,
+      },
+      options: {
+        models: [
+          { id: "gefs", name: "Global Ensemble Forecast System", is_ensemble: true, variables: [] },
+        ],
+        model: {
+          id: "gefs",
+          name: "Global Ensemble Forecast System",
+          is_ensemble: true,
+          variables: [],
+        },
+        variables: [
+          { id: "total_precipitation", name: "Total Precipitation", unit: "mm", initial_times: [] },
+        ],
+        initialTimes: [{ value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 6, 12] }],
+        variable: {
+          id: "total_precipitation",
+          name: "Total Precipitation",
+          unit: "mm",
+          initial_times: [],
+        },
+        initialTime: { value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 6, 12] },
+        leadTimes: [0, 6, 12],
+      },
+    });
+    mockUsePointForecast.mockReturnValue({ forecast: null, status: "loading", error: null });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "idle",
+      error: null,
+      model: "gefs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    expect(mockUseEnsemble).toHaveBeenCalledWith(
+      location,
+      [0, 6, 12],
+      "total_precipitation",
+      expect.objectContaining({ model: "gefs" })
+    );
+    expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
+      location,
+      6,
+      "total_precipitation",
+      expect.objectContaining({ model: "gefs" })
+    );
+  });
+
+  it("Test E: initial-time switch with differing lead set uses options.leadTimes for new cycle", () => {
+    // 06Z cycle only has leads [0, 6, 12] whereas previous cycle had [0, 6, 12, 18, 24]
+    mockSelectionContext({
+      selection: {
+        model: "gefs",
+        variable: "temperature_2m",
+        initialTime: "2026-08-13T06:00:00Z",
+        leadTimeHours: 0,
+      },
+      options: {
+        models: [
+          { id: "gefs", name: "Global Ensemble Forecast System", is_ensemble: true, variables: [] },
+        ],
+        model: {
+          id: "gefs",
+          name: "Global Ensemble Forecast System",
+          is_ensemble: true,
+          variables: [],
+        },
+        variables: [
+          { id: "temperature_2m", name: "2-Meter Temperature", unit: "°C", initial_times: [] },
+        ],
+        initialTimes: [{ value: "2026-08-13T06:00:00Z", lead_time_hours: [0, 6, 12] }],
+        variable: {
+          id: "temperature_2m",
+          name: "2-Meter Temperature",
+          unit: "°C",
+          initial_times: [],
+        },
+        initialTime: { value: "2026-08-13T06:00:00Z", lead_time_hours: [0, 6, 12] },
+        leadTimes: [0, 6, 12],
+      },
+    });
+    mockUsePointForecast.mockReturnValue({
+      forecast: {
+        location: { latitude: 38.19, longitude: -106.82, elevation_m: null, resolved_via: "city" },
+        generated_at: "2026-07-21T00:00:00Z",
+        model: "gefs",
+        forecasts: [
+          { lead_time_hours: 0, valid_time: "2026-07-21T00:00:00Z", temperature_2m: 10 },
+          { lead_time_hours: 6, valid_time: "2026-07-21T06:00:00Z", temperature_2m: 12 },
+          { lead_time_hours: 12, valid_time: "2026-07-21T12:00:00Z", temperature_2m: 14 },
+          { lead_time_hours: 18, valid_time: "2026-07-21T18:00:00Z", temperature_2m: 16 },
+          { lead_time_hours: 24, valid_time: "2026-07-22T00:00:00Z", temperature_2m: 18 },
+        ],
+      },
+      status: "success",
+      error: null,
+    });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "idle",
+      error: null,
+      model: "gefs",
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    // Assert ensemble leads strictly match options.leadTimes [0, 6, 12], not the point forecast's 5 leads
+    expect(mockUseEnsemble).toHaveBeenCalledWith(
+      location,
+      [0, 6, 12],
+      "temperature_2m",
+      expect.objectContaining({ model: "gefs" })
+    );
+  });
 });

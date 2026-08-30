@@ -117,4 +117,34 @@ describe("usePointForecast", () => {
     await waitFor(() => expect(result.current.status).toBe("error"));
     expect(result.current.forecast).toBeNull();
   });
+
+  it("Test F: clears previous forecast immediately upon model parameter transition", async () => {
+    mockFetch.mockResolvedValueOnce(forecastResponse(38.19, -106.82));
+    let resolveGefs!: (value: Response) => void;
+    mockFetch.mockImplementationOnce(
+      () => new Promise<Response>((resolve) => (resolveGefs = resolve))
+    );
+
+    const { result, rerender } = renderHook(({ model }) => usePointForecast(aspen, { model }), {
+      initialProps: { model: "gfs" },
+    });
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.forecast).not.toBeNull();
+
+    // Rerender with model: "gefs"
+    rerender({ model: "gefs" });
+
+    // Assert forecast is immediately cleared to null and status is loading
+    expect(result.current.status).toBe("loading");
+    expect(result.current.forecast).toBeNull();
+
+    // Settle the second request
+    await act(async () => {
+      resolveGefs(forecastResponse(38.19, -106.82));
+    });
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.forecast).not.toBeNull();
+  });
 });

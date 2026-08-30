@@ -45,6 +45,7 @@ export function usePointForecast(
 
     const controller = new AbortController();
     let active = true;
+    setForecast(null);
     setStatus("loading");
     setError(null);
 

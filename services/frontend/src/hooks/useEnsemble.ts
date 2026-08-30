@@ -55,6 +55,7 @@ export function useEnsemble(
     let settled = 0;
     let firstError: string | null = null;
 
+    setByLead(new Map());
     setStatus("loading");
     setError(null);
 

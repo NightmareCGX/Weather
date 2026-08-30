@@ -11,7 +11,7 @@ import { useEnsemble } from "@/hooks/useEnsemble";
 import { useEnsembleDistribution } from "@/hooks/useEnsembleDistribution";
 import { useVariablesCatalog } from "@/hooks/useVariablesCatalog";
 import { useForecastSelection } from "@/context/forecast-selection";
-import { forecastLeadTimes, forecastVariableCodes } from "@/lib/forecast/transform";
+import { forecastVariableCodes } from "@/lib/forecast/transform";
 import { buildVariableMeta } from "@/lib/forecast/labels";
 import type { SelectedLocation } from "@/lib/api/types";
 
@@ -68,28 +68,30 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
   const variableMeta = useVariablesCatalog();
   const meta = useMemo(() => buildVariableMeta(variableMeta.variables), [variableMeta.variables]);
 
-  const leads = useMemo(
-    () => (forecast !== null ? forecastLeadTimes(forecast.forecasts) : []),
-    [forecast]
-  );
   const variableCodes = useMemo(
     () => (forecast !== null ? forecastVariableCodes(forecast.forecasts) : []),
     [forecast]
   );
 
-  // The ensemble view is anchored to the first forecast variable so it stays
-  // meaningful even when multiple variables are present.
-  const ensembleVariable = variableCodes[0] ?? "temperature_2m";
+  // The ensemble view derives its variable and lead parameters from the
+  // authoritative normalized forecast selection (and availability options),
+  // NEVER from the asynchronous point-forecast response. This ensures model,
+  // variable, and cycle switches immediately update the ensemble requests
+  // rather than requesting variables from stale point payloads.
+  const ensembleVariable =
+    selection?.variable ?? options.variable?.id ?? options.variables[0]?.id ?? "temperature_2m";
+
+  const ensembleLeads = options.leadTimes;
 
   // Only run ensemble requests for an actual ensemble model. For a
   // deterministic model there is no member axis, so the panel shows the empty
   // state rather than requesting a hard-coded model.
   const ensembleModel = selectedModelIsEnsemble ? selectedModel : null;
-  const ensemble = useEnsemble(location, leads, ensembleVariable, {
+  const ensemble = useEnsemble(location, ensembleLeads, ensembleVariable, {
     model: ensembleModel,
   });
 
-  const distributionLead = selection?.leadTimeHours ?? leads[0] ?? 0;
+  const distributionLead = selection?.leadTimeHours ?? options.leadTimes[0] ?? 0;
   const distribution = useEnsembleDistribution(location, distributionLead, ensembleVariable, {
     model: ensembleModel,
   });

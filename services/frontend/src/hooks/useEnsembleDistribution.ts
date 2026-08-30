@@ -47,6 +47,7 @@ export function useEnsembleDistribution(
 
     const controller = new AbortController();
     let active = true;
+    setData(null);
     setStatus("loading");
     setError(null);
 

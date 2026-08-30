@@ -243,3 +243,77 @@ test("forecast map rapid transition: A -> B -> C rapidly switches and C is autho
   await expect.poll(() => dispatchedLeads.includes("18")).toBe(true);
   await expect(leadSelect).toHaveValue("18");
 });
+
+test("state sync regression: GFS precipitation -> GEFS switch queries temperature without stale precipitation error", async ({
+  page,
+}) => {
+  const ensembleRequests: { model: string; variable: string; lead: string }[] = [];
+
+  // Track all /v1/ensembles requests
+  await page.route("**/v1/ensembles?*", async (route) => {
+    const url = new URL(route.request().url());
+    const model = url.searchParams.get("model") ?? "unknown";
+    const variable = url.searchParams.get("variable") ?? "unknown";
+    const lead = url.searchParams.get("lead_time_hours") ?? "0";
+    ensembleRequests.push({ model, variable, lead });
+
+    // Fallback or continue default mock
+    await route.fallback();
+  });
+
+  // Delay /v1/points responses by 200ms to realistically exercise the async transition window
+  await page.route("**/v1/points?*", async (route) => {
+    await new Promise((r) => setTimeout(r, 200));
+    await route.fallback();
+  });
+
+  await page.goto("/");
+
+  // 1. Select a location to open the dashboard
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+
+  // 2. Select Precipitation Rate on GFS
+  const variableSelect = page.getByLabel("Variable");
+  await variableSelect.selectOption("precipitation_rate");
+  await expect(variableSelect).toHaveValue("precipitation_rate");
+
+  // Clear any previous ensemble requests
+  ensembleRequests.length = 0;
+
+  // 3. Switch model to GEFS
+  // ForecastSelectionProvider normalizes GEFS to default variable: temperature_2m
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+
+  // 4. Verify authoritative selection and UI agreement
+  await expect(modelSelect).toHaveValue("gefs");
+  await expect(variableSelect).toHaveValue("temperature_2m");
+
+  // 5. Ensemble Statistics (GEFS) panel must appear and render without error
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
+  ).toBeVisible();
+
+  // 6. Assert that ALL ensemble requests dispatched for GEFS used temperature_2m
+  await expect.poll(() => ensembleRequests.length > 0).toBe(true);
+  for (const req of ensembleRequests) {
+    if (req.model === "gefs") {
+      expect(req.variable).toBe("temperature_2m");
+    }
+  }
+
+  // Ensure NO request ever went out requesting GEFS + precipitation_rate
+  const invalidRequests = ensembleRequests.filter(
+    (req) => req.model === "gefs" && req.variable === "precipitation_rate"
+  );
+  expect(invalidRequests).toHaveLength(0);
+
+  // 7. Ensure no application error alert exists on the page
+  const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
+  await expect(appAlerts).toHaveCount(0);
+  await expect(page.getByText(/Failed to load/i)).toHaveCount(0);
+});
