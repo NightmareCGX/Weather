@@ -51,7 +51,6 @@ describe("useSearch", () => {
   });
 
   it("supersedes stale requests when the query changes quickly", async () => {
-    // A deferred promise for the first query that we will resolve later.
     let resolveFirst!: (value: Response) => void;
     mockFetch.mockImplementationOnce(
       () => new Promise<Response>((resolve) => (resolveFirst = resolve))
@@ -95,10 +94,124 @@ describe("useSearch", () => {
     const { result } = renderHook(() => useSearch("Aspen"));
     advanceDebounce();
 
-    // The aborted request is silent: no error state is ever set.
     await act(async () => {
       await Promise.resolve();
     });
     expect(result.current.error).toBeNull();
+  });
+
+  it("A -> B -> A: prevents stale A1 request from committing over newer A2 request", async () => {
+    let resolveA1!: (value: Response) => void;
+    let resolveA2!: (value: Response) => void;
+
+    mockFetch
+      // Request A1 ("Denver")
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => (resolveA1 = resolve)))
+      // Request B ("Boulder")
+      .mockResolvedValueOnce(
+        envelopeList([{ id: "city_boulder", object: "city", name: "Boulder City" }])
+      )
+      // Request A2 ("Denver")
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => (resolveA2 = resolve)));
+
+    const { result, rerender } = renderHook(({ q }) => useSearch(q), {
+      initialProps: { q: "Denver" },
+    });
+    advanceDebounce();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    // Switch to Boulder
+    rerender({ q: "Boulder" });
+    advanceDebounce();
+
+    // Switch back to Denver
+    rerender({ q: "Denver" });
+    advanceDebounce();
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+
+    // Stale A1 resolves with stale data
+    await act(async () => {
+      resolveA1(
+        envelopeList([{ id: "city_denver_stale", object: "city", name: "Denver Stale A1" }])
+      );
+    });
+
+    // A1 must NOT commit
+    expect(result.current.results).not.toEqual([
+      expect.objectContaining({ name: "Denver Stale A1" }),
+    ]);
+
+    // A2 resolves with fresh data
+    await act(async () => {
+      resolveA2(
+        envelopeList([{ id: "city_denver_fresh", object: "city", name: "Denver Fresh A2" }])
+      );
+    });
+
+    // A2 commits
+    expect(result.current.results).toEqual([expect.objectContaining({ name: "Denver Fresh A2" })]);
+    expect(result.current.status).toBe("success");
+  });
+
+  it("stale autocomplete failure: old rejected request does not replace current results or error", async () => {
+    let rejectA1!: (error: unknown) => void;
+    mockFetch
+      // Request A1 ("Denver")
+      .mockImplementationOnce((_, init) => {
+        return new Promise<Response>((_, reject) => {
+          rejectA1 = reject;
+          init?.signal?.addEventListener("abort", () => {
+            // Signal aborted
+          });
+        });
+      })
+      // Request B ("Boulder")
+      .mockResolvedValueOnce(
+        envelopeList([{ id: "city_boulder", object: "city", name: "Boulder City" }])
+      );
+
+    const { result, rerender } = renderHook(({ q }) => useSearch(q), {
+      initialProps: { q: "Denver" },
+    });
+    advanceDebounce();
+
+    // Switch to Boulder and let B succeed
+    rerender({ q: "Boulder" });
+    advanceDebounce();
+
+    await waitFor(() => {
+      expect(result.current.status).toBe("success");
+      expect(result.current.results).toHaveLength(1);
+      expect(result.current.results[0].name).toBe("Boulder City");
+    });
+
+    // Stale A1 rejects with non-abort error
+    await act(async () => {
+      rejectA1(new TypeError("Network error on old query"));
+    });
+
+    // Current state for Boulder remains intact
+    expect(result.current.status).toBe("success");
+    expect(result.current.results[0].name).toBe("Boulder City");
+    expect(result.current.error).toBeNull();
+  });
+
+  it("unmount: pending autocomplete request does not commit state after cleanup", async () => {
+    let resolveA!: (value: Response) => void;
+    mockFetch.mockImplementationOnce(
+      () => new Promise<Response>((resolve) => (resolveA = resolve))
+    );
+
+    const { result, unmount } = renderHook(() => useSearch("Denver"));
+    advanceDebounce();
+
+    unmount();
+
+    await act(async () => {
+      resolveA(envelopeList([{ id: "city_denver", object: "city", name: "Denver" }]));
+    });
+
+    // No error or unexpected commit
+    expect(result.current.results).toEqual([]);
   });
 });

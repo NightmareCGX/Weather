@@ -31,7 +31,16 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const { results, status, error, sessionToken } = useSearch(query);
-  const [resolving, setResolving] = useState(false);
+
+  const resolveGenerationRef = useRef(0);
+  const resolveAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      resolveGenerationRef.current += 1;
+      resolveAbortRef.current?.abort();
+    };
+  }, []);
 
   const listboxId = `${id}-listbox`;
   const optionId = (index: number) => `${id}-option-${index}`;
@@ -49,18 +58,25 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
   const selectIndex = (index: number) => {
     const result = results[index];
     if (result === undefined) return;
-    setResolving(true);
+
+    // Invalidate prior place resolution and cancel any in-flight network request.
+    resolveAbortRef.current?.abort();
+    const generation = ++resolveGenerationRef.current;
+
     if (result.object === "place" && typeof result.place_id === "string") {
       // A place suggestion carries no coordinates yet; resolve the canonical
       // place (name + lat/lon + region) before updating the map/forecast. The
       // same session token is reused so Google bills one session.
-      resolvePlace({ placeId: result.place_id, sessionToken })
+      const controller = new AbortController();
+      resolveAbortRef.current = controller;
+
+      resolvePlace({ placeId: result.place_id, sessionToken, signal: controller.signal })
         .then((resolved) => {
-          setResolving(false);
+          if (generation !== resolveGenerationRef.current) return;
           onSelect(searchResultToSelectedLocation(resolved));
         })
         .catch((err: unknown) => {
-          setResolving(false);
+          if (generation !== resolveGenerationRef.current) return;
           if (err instanceof RequestAbortedError) return;
           // Fall back to the suggestion's display text so the UI degrades
           // gracefully; the map simply won't recenter to real coordinates.
@@ -68,7 +84,6 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
         });
     } else {
       selectResult(result);
-      setResolving(false);
     }
     setQuery("");
     setOpen(false);
