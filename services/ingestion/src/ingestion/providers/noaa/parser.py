@@ -56,6 +56,83 @@ SURFACE_FIELD_FILTERS: dict[str, dict[str, object]] = {
         "level": 0,
         "stepType": "instant",
     },
+    # GRIB shortName ``2r`` = "2 metre relative humidity" (paramId 260242), %.
+    "r2": {
+        "shortName": "2r",
+        "typeOfLevel": "heightAboveGround",
+        "level": 2,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``gust`` = "Wind speed (gust)" (paramId 260065), m/s.
+    "gust": {
+        "shortName": "gust",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``vis`` = "Visibility" (paramId 3020), m.
+    "vis": {
+        "shortName": "vis",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``sde`` = "Snow depth" (paramId 3066), m.
+    "sde": {
+        "shortName": "sde",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``10u`` = "10 metre U wind component" (paramId 165), m/s.
+    "u10": {
+        "shortName": "10u",
+        "typeOfLevel": "heightAboveGround",
+        "level": 10,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``10v`` = "10 metre V wind component" (paramId 166), m/s.
+    "v10": {
+        "shortName": "10v",
+        "typeOfLevel": "heightAboveGround",
+        "level": 10,
+        "stepType": "instant",
+    },
+    # GRIB shortName ``tp`` = "Total Precipitation" (paramId 228228), kg m-2.
+    "tp": {
+        "shortName": "tp",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "accum",
+    },
+    # GRIB shortName ``crain`` = "Categorical rain" (paramId 260031), (Code table 4.222).
+    "crain": {
+        "shortName": "crain",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "avg",
+    },
+    # GRIB shortName ``csnow`` = "Categorical snow" (paramId 260032), (Code table 4.222).
+    "csnow": {
+        "shortName": "csnow",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "avg",
+    },
+    # GRIB shortName ``cfrzr`` = "Categorical freezing rain" (paramId 260034), (Code table 4.222).
+    "cfrzr": {
+        "shortName": "cfrzr",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "avg",
+    },
+    # GRIB shortName ``cicep`` = "Categorical ice pellets" (paramId 260033), (Code table 4.222).
+    "cicep": {
+        "shortName": "cicep",
+        "typeOfLevel": "surface",
+        "level": 0,
+        "stepType": "avg",
+    },
 }
 
 

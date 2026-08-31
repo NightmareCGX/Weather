@@ -31,6 +31,12 @@ export interface VariableMeta {
 export const FALLBACK_VARIABLE_META: Record<string, VariableMeta> = {
   temperature_2m: { name: "Temperature (2 m)", unit: "°C" },
   precipitation_rate: { name: "Precipitation Rate", unit: "mm/h" },
+  precipitation_amount_3h: { name: "3-Hour Precipitation", unit: "mm" },
+  relative_humidity_2m: { name: "Relative Humidity", unit: "%" },
+  wind_gust: { name: "Wind Gust", unit: "km/h" },
+  visibility: { name: "Visibility", unit: "m" },
+  snow_depth: { name: "Snow Depth", unit: "m" },
+  wind_10m: { name: "Wind (10 m)", unit: "km/h" },
 };
 
 /**
@@ -86,4 +92,25 @@ export function formatPercent(value: number): string {
 /** Format a probability with its 95% confidence interval. */
 export function formatProbabilityRange(probability: number, ci: readonly [number, number]): string {
   return `${formatPercent(probability)} (95% CI ${formatPercent(ci[0])}–${formatPercent(ci[1])})`;
+}
+
+/**
+ * Format meteorological wind direction with optional cardinal label.
+ *
+ * @example
+ *   formatWindDirection(225.0, "SW") // "225° SW"
+ *   formatWindDirection(null, "CALM") // "Calm"
+ */
+export function formatWindDirection(
+  directionDeg: number | null | undefined,
+  cardinal?: string | null
+): string {
+  if (directionDeg == null || cardinal === "CALM") {
+    return "Calm";
+  }
+  const rounded = Math.round(directionDeg);
+  if (cardinal) {
+    return `${rounded}° ${cardinal}`;
+  }
+  return `${rounded}°`;
 }

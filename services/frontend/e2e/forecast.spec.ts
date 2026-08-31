@@ -341,3 +341,250 @@ test("state sync regression: GFS precipitation -> GEFS switch queries temperatur
   await expect(appAlerts).toHaveCount(0);
   await expect(page.getByText(/Failed to load/i)).toHaveCount(0);
 });
+
+test("phase 1a variable expansion: switching through all Phase 1A variables updates map and legend", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+  const legend = page.getByTestId("legend-gradient");
+
+  // 1. Relative humidity
+  await variableSelect.selectOption("relative_humidity_2m");
+  await expect(variableSelect).toHaveValue("relative_humidity_2m");
+  await expect(legend).toBeVisible();
+
+  // 2. Wind gust
+  await variableSelect.selectOption("wind_gust");
+  await expect(variableSelect).toHaveValue("wind_gust");
+  await expect(legend).toBeVisible();
+
+  // 3. Visibility
+  await variableSelect.selectOption("visibility");
+  await expect(variableSelect).toHaveValue("visibility");
+  await expect(legend).toBeVisible();
+
+  // 4. Snow depth
+  await variableSelect.selectOption("snow_depth");
+  await expect(variableSelect).toHaveValue("snow_depth");
+  await expect(legend).toBeVisible();
+
+  // Ensure no error alert was produced during rapid switching
+  const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
+  await expect(appAlerts).toHaveCount(0);
+});
+
+test("phase 1a gefs variable selection: selecting GEFS relative humidity updates ensemble panel", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+
+  const variableSelect = page.getByLabel("Variable");
+  await variableSelect.selectOption("relative_humidity_2m");
+
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
+  ).toBeVisible();
+});
+
+test("phase 1b wind product: selecting Wind updates map, meteogram, and ensemble Wind Rose", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+
+  // 1. Verify raw U/V are not present in variable options
+  const options = await variableSelect.locator("option").allTextContents();
+  expect(options).not.toContain("10-Meter U Wind Component");
+  expect(options).not.toContain("10-Meter V Wind Component");
+  expect(options).toContain("10-Meter Wind");
+
+  // 2. Select Wind product
+  await variableSelect.selectOption("wind_10m");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+
+  // 3. Search and select a city to view the point forecast
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // 4. Verify meteograms include 10-Meter Wind
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /10-Meter Wind hourly forecast over lead time/ })
+  ).toBeVisible();
+
+  // 5. Switch to GEFS model to test Ensemble Wind Rose
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+  await variableSelect.selectOption("wind_10m");
+
+  // 6. Verify Ensemble Statistics and Wind Rose appear
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(page.getByText(/Wind Direction & Speed Distribution \(Wind Rose\)/)).toBeVisible();
+  await expect(page.getByRole("img", { name: /ensemble wind rose chart/i })).toBeVisible();
+  await expect(page.getByText("CALM")).toBeVisible();
+});
+
+test("phase 1b.3 animated wind map: progressive rendering, lead switching, consensus flow, and reduced motion", async ({
+  page,
+}) => {
+  const vectorRequests: { model: string; lead: string }[] = [];
+
+  await page.route("**/v1/maps/**/vector-field*", async (route) => {
+    const url = new URL(route.request().url());
+    const lead = url.searchParams.get("lead_time_hours") ?? "0";
+    const isGefs = url.pathname.includes("/gefs/");
+    vectorRequests.push({ model: isGefs ? "gefs" : "gfs", lead });
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+  const leadSelect = page.getByLabel("Lead time");
+  const modelSelect = page.getByLabel("Model");
+  const canvas = page.getByTestId("wind-particle-canvas");
+
+  // 1. Select Wind product -> Stage A (scalar raster) and Stage B (particle canvas)
+  await variableSelect.selectOption("wind_10m");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+  await expect(canvas).toBeVisible();
+
+  // Vector field request dispatched for GFS lead 0
+  await expect.poll(() => vectorRequests.some((r) => r.model === "gfs")).toBe(true);
+
+  // 2. Scrub through lead times (0h -> 6h -> 12h)
+  await leadSelect.selectOption("6");
+  await expect.poll(() => vectorRequests.some((r) => r.lead === "6")).toBe(true);
+  await expect(leadSelect).toHaveValue("6");
+
+  await leadSelect.selectOption("12");
+  await expect.poll(() => vectorRequests.some((r) => r.lead === "12")).toBe(true);
+  await expect(leadSelect).toHaveValue("12");
+
+  // 3. Switch GFS -> GEFS consensus flow
+  await modelSelect.selectOption("gefs");
+  await variableSelect.selectOption("wind_10m");
+  await expect(modelSelect).toHaveValue("gefs");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  await expect.poll(() => vectorRequests.some((r) => r.model === "gefs")).toBe(true);
+
+  // 4. Switch Wind -> Temperature -> particle canvas inactive
+  await variableSelect.selectOption("temperature_2m");
+  await expect(variableSelect).toHaveValue("temperature_2m");
+
+  // 5. Reduced motion: simulate prefers-reduced-motion: reduce
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await variableSelect.selectOption("wind_10m");
+  await expect(variableSelect).toHaveValue("wind_10m");
+  // Raster remains functional
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+});
+
+test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase support, and map UX", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+
+  // 1. Invariant: Raw categorical flags (crain, csnow, cfrzr, cicep) are NEVER present in selectors
+  const options = await variableSelect.locator("option").allTextContents();
+  expect(options).not.toContain("crain");
+  expect(options).not.toContain("csnow");
+  expect(options).not.toContain("cfrzr");
+  expect(options).not.toContain("cicep");
+  expect(options).toContain("3-Hour Precipitation");
+
+  // 2. Select 3-Hour Precipitation on GFS
+  await variableSelect.selectOption("precipitation_amount_3h");
+  await expect(variableSelect).toHaveValue("precipitation_amount_3h");
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+  await expect(page.getByText("3-Hour Precipitation (mm)")).toBeVisible();
+
+  // 3. Search and select a city to inspect Point Forecast meteogram
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /3-Hour Precipitation hourly forecast over lead time/ })
+  ).toBeVisible();
+
+  // Verify Phase legend badges in meteogram
+  await expect(page.getByText("Phases:")).toBeVisible();
+  await expect(page.getByText("Rain", { exact: true })).toBeVisible();
+  await expect(page.getByText("Snow", { exact: true })).toBeVisible();
+  await expect(page.getByText("Freezing Rain", { exact: true })).toBeVisible();
+  await expect(page.getByText("Ice Pellets", { exact: true })).toBeVisible();
+  await expect(page.getByText("Mixed", { exact: true })).toBeVisible();
+
+  // Scroll meteogram into view and screenshot
+  const precipMeteogram = page.getByRole("img", {
+    name: /3-Hour Precipitation hourly forecast over lead time/,
+  });
+  await precipMeteogram.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: "e2e/screenshots/1c3-gfs-precipitation.png" });
+
+  // 4. Switch to GEFS ensemble model with 3-Hour Precipitation
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+  await variableSelect.selectOption("precipitation_amount_3h");
+
+  // 5. Verify GEFS Ensemble Phase Support 100% composition visualization
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(page.getByText(/Ensemble Phase Support/)).toBeVisible();
+  const phaseChart = page.getByRole("img", {
+    name: /ensemble phase support composition/i,
+  });
+  await expect(phaseChart).toBeVisible();
+
+  // Scroll phase support into view and screenshot
+  await phaseChart.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: "e2e/screenshots/1c3-gefs-phase-support.png" });
+
+  // Verify all 6 physical phase breakdown values and no mixed segment
+  await expect(page.getByTestId("phase-segment-dry")).toBeVisible();
+  await expect(page.getByTestId("phase-segment-rain")).toBeVisible();
+  await expect(page.getByTestId("phase-segment-snow")).toBeVisible();
+  await expect(page.getByTestId("phase-segment-freezing_rain")).toBeVisible();
+  await expect(page.getByTestId("phase-segment-ice_pellets")).toBeVisible();
+  await expect(page.getByTestId("phase-segment-unknown")).toBeVisible();
+  await expect(page.locator('[data-testid="phase-segment-mixed"]')).toHaveCount(0);
+
+  // Verify percentages
+  await expect(page.getByText("52%").first()).toBeVisible(); // Rain
+  await expect(page.getByText("26%").first()).toBeVisible(); // Snow
+  await expect(page.getByText("10%").first()).toBeVisible(); // Dry
+  await expect(page.getByText("8%").first()).toBeVisible(); // Freezing Rain
+  await expect(page.getByText("3%").first()).toBeVisible(); // Ice Pellets
+  await expect(page.getByText("1%").first()).toBeVisible(); // Unknown
+
+  // Verify secondary transition frequency
+  await expect(page.getByText(/Member Phase Transitions/)).toBeVisible();
+  await expect(page.getByText("Rain → Snow")).toBeVisible();
+  await expect(page.getByText("· 27%")).toBeVisible();
+
+  // Ensure no error alert exists
+  const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
+  await expect(appAlerts).toHaveCount(0);
+});

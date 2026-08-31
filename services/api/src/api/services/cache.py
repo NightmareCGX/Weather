@@ -330,6 +330,8 @@ def build_probability_cache_key(
     operator: str,
     lead_time_hours: int,
     threshold_max: float | None,
+    direction_sector: str | None = None,
+    phase: str | None = None,
     cycle_time: str | None = None,
     serving_generation: str | None = None,
 ) -> str:
@@ -353,6 +355,8 @@ def build_probability_cache_key(
         "operator": operator,
         "lead_time_hours": lead_time_hours,
         "threshold_max": threshold_max,
+        "direction_sector": direction_sector,
+        "phase": phase,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "probability:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

@@ -30,6 +30,12 @@ from domain.exceptions import (
 )
 from domain.geo.coordinates import validate_coordinates
 from domain.geo.grid import RegularGrid
+from domain.models.precipitation import classify_precipitation_phase
+from domain.models.wind import (
+    CALM_WIND_THRESHOLD_MPS,
+    derive_meteorological_direction,
+    get_cardinal_direction,
+)
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -85,9 +91,18 @@ class ResolvedLocation:
 _SI_TO_IMPERIAL: dict[str, tuple[str, Callable[[float], float]]] = {
     "°C": ("°F", lambda celsius: celsius * 9.0 / 5.0 + 32.0),
     "mm/h": ("in/h", lambda mm: mm / 25.4),
-    # km/h → mph. No km/h variable is currently implemented, but the entry must
-    # label the converted value as mph (the conversion factor is applied).
+    "mm": ("in", lambda mm: mm / 25.4),
     "km/h": ("mph", lambda kmh: kmh * 0.621371),
+    "%": ("%", lambda rh: rh),
+    "m": ("mi", lambda m: m / 1609.344),
+}
+
+#: Variable-specific conversions taking precedence over generic unit matching.
+_VARIABLE_IMPERIAL_CONVERSIONS: dict[str, tuple[str, Callable[[float], float]]] = {
+    "snow_depth": ("in", lambda m: m * 39.3700787),
+    "visibility": ("mi", lambda m: m / 1609.344),
+    "wind_10m": ("mph", lambda kmh: kmh * 0.621371),
+    "precipitation_amount_3h": ("in", lambda mm: mm / 25.4),
 }
 
 
@@ -350,8 +365,43 @@ def build_point_forecast(
             "cycle_time": cycle_time,
         }
         for var_code in var_codes:
-            value = values_by_var[var_code]
-            entry[var_code] = _convert_value(value, units_by_code[var_code], units)
+            if var_code == "wind_10m":
+                raw_kmh = float(values_by_var["wind_10m"])
+                converted_speed = _convert_value(
+                    raw_kmh, "km/h", units, var_code="wind_10m"
+                )
+                entry["wind_10m"] = converted_speed
+                direction_deg = values_by_var.get("_wind_direction_10m")
+                entry["wind_direction_10m"] = (
+                    round(float(direction_deg), 1)
+                    if direction_deg is not None and not math.isnan(float(direction_deg))
+                    else None
+                )
+                entry["wind_cardinal_10m"] = str(values_by_var.get("_wind_cardinal_10m", "CALM"))
+            elif var_code == "precipitation_amount_3h":
+                raw_mm = values_by_var.get("precipitation_amount_3h")
+                if raw_mm is None or (isinstance(raw_mm, float) and math.isnan(raw_mm)):
+                    entry["precipitation_amount_3h"] = None
+                    entry["precipitation_type"] = "none"
+                    entry["precipitation_transition"] = "none"
+                    entry["precipitation_start_type"] = "none"
+                    entry["precipitation_end_type"] = "none"
+                    entry["precipitation_evidence"] = "exact"
+                else:
+                    converted = _convert_value(
+                        float(raw_mm), "mm", units, var_code="precipitation_amount_3h"
+                    )
+                    entry["precipitation_amount_3h"] = converted
+                    entry["precipitation_type"] = str(values_by_var.get("_precipitation_type", "none"))
+                    entry["precipitation_transition"] = str(values_by_var.get("_precipitation_transition", "none"))
+                    entry["precipitation_start_type"] = str(values_by_var.get("_precipitation_start_type", "none"))
+                    entry["precipitation_end_type"] = str(values_by_var.get("_precipitation_end_type", "none"))
+                    entry["precipitation_evidence"] = str(values_by_var.get("_precipitation_evidence", "exact"))
+            else:
+                value = float(values_by_var[var_code])
+                entry[var_code] = _convert_value(
+                    value, units_by_code[var_code], units, var_code=var_code
+                )
         forecasts.append(ForecastSeries(**entry))
 
     if not forecasts:
@@ -551,7 +601,7 @@ def gated_point_interpolations(
     lead: int,
     latitude: float,
     longitude: float,
-) -> dict[str, float] | None:
+) -> dict[str, Any] | None:
     """Interpolate every requested variable at a point/lead under the gate.
 
     A single SHARED gate session opens the lazy store, derives the grid
@@ -562,10 +612,151 @@ def gated_point_interpolations(
     """
     from api.core.reader_gate import gated_read_dataset_with_selector
 
-    def select_and_interpolate(dataset: xr.Dataset) -> dict[str, float]:
+    def select_and_interpolate(dataset: xr.Dataset) -> dict[str, Any]:
         grid, lat_desc, lon_desc = _derive_grid(dataset)
-        out: dict[str, float] = {}
+        out: dict[str, Any] = {}
         for var_code in var_codes:
+            if var_code == "wind_10m":
+                if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            "Variable 'wind_10m' requires 'wind_u_10m' and 'wind_v_10m' in the forecast dataset."
+                        ),
+                    )
+                field_u = dataset["wind_u_10m"]
+                field_v = dataset["wind_v_10m"]
+                if "lead_time_hours" in field_u.dims:
+                    field_u = field_u.sel(lead_time_hours=lead)
+                if "lead_time_hours" in field_v.dims:
+                    field_v = field_v.sel(lead_time_hours=lead)
+                if field_u.ndim not in (2, 3) or field_v.ndim not in (2, 3):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "Variable 'wind_10m' components are not 2-D/3-D (member) surface fields; "
+                            "vertical-level variables are not supported."
+                        ),
+                    )
+                u_val = float(
+                    _interpolate_neighborhood(
+                        field_u, grid, lat_desc, lon_desc, latitude, longitude
+                    )
+                )
+                v_val = float(
+                    _interpolate_neighborhood(
+                        field_v, grid, lat_desc, lon_desc, latitude, longitude
+                    )
+                )
+                speed_mps = math.hypot(u_val, v_val)
+                speed_kmh = speed_mps * 3.6
+                direction_deg = derive_meteorological_direction(
+                    u_val, v_val, calm_threshold=CALM_WIND_THRESHOLD_MPS
+                )
+                cardinal_str = get_cardinal_direction(direction_deg) if direction_deg is not None else "CALM"
+                out["wind_10m"] = speed_kmh
+                out["_wind_direction_10m"] = direction_deg if direction_deg is not None else float("nan")
+                out["_wind_cardinal_10m"] = cardinal_str
+                continue
+
+            if var_code == "precipitation_amount_3h":
+                if "precipitation_amount_3h" not in dataset.data_vars:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Variable 'precipitation_amount_3h' is not available in the forecast dataset.",
+                    )
+                field_p = dataset["precipitation_amount_3h"]
+                if "lead_time_hours" in field_p.dims:
+                    field_p = field_p.sel(lead_time_hours=lead)
+                amt_val = float(
+                    _interpolate_neighborhood(
+                        field_p, grid, lat_desc, lon_desc, latitude, longitude
+                    )
+                )
+                out["precipitation_amount_3h"] = amt_val
+
+                # Optional categorical flags interpolation
+                flags_curr: dict[str, int] = {}
+                for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                    if f_code in dataset.data_vars:
+                        f_field = dataset[f_code]
+                        if "lead_time_hours" in f_field.dims:
+                            f_field = f_field.sel(lead_time_hours=lead)
+                        f_val = float(
+                            _interpolate_neighborhood(
+                                f_field, grid, lat_desc, lon_desc, latitude, longitude
+                            )
+                        )
+                        flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+
+                # Optional t2m
+                t2m_val: float | None = None
+                if "temperature_2m" in dataset.data_vars:
+                    t_field = dataset["temperature_2m"]
+                    if "lead_time_hours" in t_field.dims:
+                        t_field = t_field.sel(lead_time_hours=lead)
+                    t2m_val = float(
+                        _interpolate_neighborhood(
+                            t_field, grid, lat_desc, lon_desc, latitude, longitude
+                        )
+                    )
+
+                # Predecessor contextual evidence for 6-hour reset leads (t=6, 12, 18, 24, ...)
+                amt_prev: float | None = None
+                flags_prev: dict[str, int] | None = None
+                t2m_start: float | None = None
+
+                if lead % 6 == 0 and lead > 0:
+                    pred_lead = lead - 3
+                    leads_in_ds = [
+                        int(v)
+                        for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+                    ]
+                    if pred_lead in leads_in_ds:
+                        p_field_prev = dataset["precipitation_amount_3h"].sel(
+                            lead_time_hours=pred_lead
+                        )
+                        amt_prev = float(
+                            _interpolate_neighborhood(
+                                p_field_prev, grid, lat_desc, lon_desc, latitude, longitude
+                            )
+                        )
+                        f_prev = {}
+                        for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                            if f_code in dataset.data_vars:
+                                f_field_p = dataset[f_code].sel(lead_time_hours=pred_lead)
+                                f_p_val = float(
+                                    _interpolate_neighborhood(
+                                        f_field_p, grid, lat_desc, lon_desc, latitude, longitude
+                                    )
+                                )
+                                f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
+                        if f_prev:
+                            flags_prev = f_prev
+
+                        if "temperature_2m" in dataset.data_vars:
+                            t_field_p = dataset["temperature_2m"].sel(lead_time_hours=pred_lead)
+                            t2m_start = float(
+                                _interpolate_neighborhood(
+                                    t_field_p, grid, lat_desc, lon_desc, latitude, longitude
+                                )
+                            )
+
+                phase_state = classify_precipitation_phase(
+                    amt_val,
+                    flags_curr if flags_curr else None,
+                    amount_prev=amt_prev,
+                    flags_prev=flags_prev,
+                    t2m_start=t2m_start,
+                    t2m_end=t2m_val,
+                )
+                out["_precipitation_type"] = phase_state.interval_type.value
+                out["_precipitation_transition"] = phase_state.transition.value
+                out["_precipitation_start_type"] = phase_state.start_type.value
+                out["_precipitation_end_type"] = phase_state.end_type.value
+                out["_precipitation_evidence"] = phase_state.evidence.value
+                continue
+
             if var_code not in dataset.data_vars:
                 raise HTTPException(
                     status_code=404,
@@ -819,6 +1010,10 @@ def _resolve_lead_times(
     return selected
 
 
+#: Internal platform variables that are not returned in default point forecasts.
+INTERNAL_VARIABLES: frozenset[str] = frozenset({"wind_u_10m", "wind_v_10m"})
+
+
 def _resolve_variables(
     db: Session,
     source: _CycleMetadata | xr.Dataset,
@@ -828,19 +1023,23 @@ def _resolve_variables(
 
     When ``variables`` is ``None`` the default set is the documented
     ``forecast_variables`` catalog intersected with the variables present in
-    the dataset/store. This explicit allowlist ensures auxiliary or non-surface
-    dataset variables are never accidentally exposed or interpolated (API.md
-    does not define a default variable list; the catalog is the platform's
-    documented forecast-variable vocabulary). Provided codes are validated
-    against the ``forecast_variables`` catalog.
+    the dataset/store, excluding internal platform dependency variables (e.g.
+    raw vector components). This explicit allowlist ensures auxiliary or
+    non-surface dataset variables are never accidentally exposed or
+    interpolated (API.md does not define a default variable list; the catalog
+    is the platform's documented forecast-variable vocabulary). Provided codes
+    are validated against the ``forecast_variables`` catalog.
     """
     if variables is None:
-        catalog = _catalog_variable_codes(db)
+        catalog = set(_catalog_variable_codes(db) - INTERNAL_VARIABLES)
         present = (
             set(source.var_names)
             if isinstance(source, _CycleMetadata)
             else {str(name) for name in source.data_vars}
         )
+        if "wind_u_10m" in present and "wind_v_10m" in present:
+            present.add("wind_10m")
+            catalog.add("wind_10m")
         return sorted(catalog.intersection(present))
     missing = _missing_catalog_variables(db, variables)
     if missing:
@@ -862,6 +1061,14 @@ def _missing_catalog_variables(db: Session, variables: list[str]) -> list[str]:
         ForecastVariable.variable_code.in_(variables)
     )
     known = set(db.execute(stmt).scalars().all())
+    if "wind_10m" in variables:
+        u_v_count = db.execute(
+            select(ForecastVariable.variable_code).where(
+                ForecastVariable.variable_code.in_(["wind_u_10m", "wind_v_10m", "wind_10m"])
+            )
+        ).scalars().all()
+        if len(u_v_count) >= 2 or "wind_10m" in u_v_count:
+            known.add("wind_10m")
     return [code for code in variables if code not in known]
 
 
@@ -874,6 +1081,8 @@ def _variable_units(db: Session, var_codes: list[str]) -> dict[str, str | None]:
     units: dict[str, str | None] = {}
     for code, unit in db.execute(stmt).all():
         units[code] = unit
+    if "wind_10m" in var_codes:
+        units["wind_10m"] = "km/h"
     return {code: units.get(code) for code in var_codes}
 
 
@@ -1054,14 +1263,23 @@ def _ascending(values: list[float]) -> tuple[list[float], bool]:
     return list(values), False
 
 
-def _convert_value(value: float, si_unit: str | None, units: str) -> float:
+def _convert_value(
+    value: float,
+    si_unit: str | None,
+    units: str,
+    var_code: str | None = None,
+) -> float:
     """Convert a value to imperial units when requested and supported.
 
-    Conversion is applied only when ``units=imperial`` and the variable's
-    registered unit matches a known SI/imperial pair; otherwise the value is
-    returned unconverted.
+    Conversion is applied only when ``units=imperial`` and either a
+    variable-specific conversion is defined or the registered unit matches a
+    known SI/imperial pair; otherwise the value is returned unconverted.
     """
-    if units != "imperial" or si_unit is None:
+    if units != "imperial":
+        return value
+    if var_code is not None and var_code in _VARIABLE_IMPERIAL_CONVERSIONS:
+        return float(_VARIABLE_IMPERIAL_CONVERSIONS[var_code][1](value))
+    if si_unit is None:
         return value
     conversion = _SI_TO_IMPERIAL.get(si_unit)
     if conversion is None:

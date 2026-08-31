@@ -104,6 +104,13 @@ export const FORECAST_ENTRY_METADATA_FIELDS: ReadonlySet<string> = new Set([
   "lead_time_hours",
   "valid_time",
   "cycle_time",
+  "wind_direction_10m",
+  "wind_cardinal_10m",
+  "precipitation_type",
+  "precipitation_transition",
+  "precipitation_start_type",
+  "precipitation_end_type",
+  "precipitation_evidence",
 ]);
 
 /**
@@ -156,6 +163,56 @@ export interface EnsemblePDF {
   density: number[];
 }
 
+export interface ConsensusVector {
+  speed: number;
+  direction: number | null;
+  cardinal: string;
+  coherence: number;
+}
+
+export interface WindRoseSector {
+  sector: string;
+  count: number;
+  probability: number;
+  bins: Record<string, number>;
+}
+
+export interface WindRose {
+  calm_percentage: number;
+  calm_count: number;
+  sectors: WindRoseSector[];
+  member_count?: number;
+}
+
+export type PrecipitationType =
+  "none" | "rain" | "snow" | "freezing_rain" | "ice_pellets" | "mixed" | "unknown";
+
+export type PhysicalPhase = "dry" | "rain" | "snow" | "freezing_rain" | "ice_pellets" | "unknown";
+
+export type PrecipitationTransition =
+  | "none"
+  | "persistent_rain"
+  | "persistent_snow"
+  | "persistent_freezing_rain"
+  | "persistent_ice_pellets"
+  | "dry_to_rain"
+  | "dry_to_snow"
+  | "dry_to_freezing_rain"
+  | "dry_to_ice_pellets"
+  | "wet_to_dry"
+  | "rain_to_snow"
+  | "snow_to_rain"
+  | "rain_to_freezing_rain"
+  | "freezing_rain_to_rain"
+  | "snow_to_freezing_rain"
+  | "freezing_rain_to_snow"
+  | "snow_to_ice_pellets"
+  | "ice_pellets_to_snow"
+  | "mixed_transition"
+  | "unknown";
+
+export type EvidenceState = "exact" | "strongly_inferred" | "ambiguous";
+
 /**
  * The payload of ensemble statistics (API.md section 5.1).
  *
@@ -174,6 +231,10 @@ export interface EnsembleStatisticsData {
   statistics: EnsembleStatistics;
   members?: number[];
   pdf?: EnsemblePDF | null;
+  consensus_vector?: ConsensusVector | null;
+  wind_rose?: WindRose | null;
+  phase_support?: Record<string, number> | null;
+  transition_frequency?: Record<string, number> | null;
 }
 
 /**
@@ -199,6 +260,7 @@ export interface LayerDescriptor {
   min_zoom: number;
   max_zoom: number;
   legend: SpatialLayerLegend;
+  vector_field_url_template?: string | null;
 }
 
 /** A forecast variable and the initial times available for it. */
@@ -229,6 +291,23 @@ export interface SpatialLayer {
   max_zoom: number;
   lead_time_hours: number;
   legend: SpatialLayerLegend;
+  vector_field_url_template?: string | null;
+}
+
+export interface VectorGridMetadata {
+  lat_start: number;
+  lat_step: number;
+  lat_count: number;
+  lon_start: number;
+  lon_step: number;
+  lon_count: number;
+  scale: number;
+}
+
+export interface VectorFieldData {
+  meta: VectorGridMetadata;
+  u: Float32Array;
+  v: Float32Array;
 }
 
 /** Universal list/single-response envelope (docs/API.md section 2.3). */

@@ -6,6 +6,8 @@ import { SelectedLocationSummary } from "@/components/forecast/SelectedLocationS
 import { Meteogram } from "@/components/charts/Meteogram";
 import { EnsembleChart } from "@/components/charts/EnsembleChart";
 import { EnsembleDistribution } from "@/components/charts/EnsembleDistribution";
+import { EnsemblePhaseSupport } from "@/components/charts/EnsemblePhaseSupport";
+import { WindRose } from "@/components/charts/WindRose";
 import { usePointForecast } from "@/hooks/usePointForecast";
 import { useEnsemble } from "@/hooks/useEnsemble";
 import { useEnsembleDistribution } from "@/hooks/useEnsembleDistribution";
@@ -174,6 +176,27 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
             selectedLead={distributionLead}
             variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
           />
+
+          {ensembleVariable === "wind_10m" && distribution.data?.wind_rose && (
+            <div className="mt-4 rounded border border-slate-200 bg-slate-50/50 p-3">
+              <h4 className="mb-1 text-center text-xs font-semibold text-slate-700">
+                10m Wind Direction & Speed Distribution (Wind Rose)
+              </h4>
+              <p className="mb-2 text-center text-[11px] text-slate-500">
+                Lead {distributionLead}h · 30 ensemble members
+              </p>
+              <WindRose windRose={distribution.data.wind_rose} />
+            </div>
+          )}
+
+          {ensembleVariable === "precipitation_amount_3h" && distribution.data?.phase_support && (
+            <EnsemblePhaseSupport
+              phaseSupport={distribution.data.phase_support}
+              transitionFrequency={distribution.data.transition_frequency}
+              selectedLead={distributionLead}
+              memberCount={distribution.data.member_count}
+            />
+          )}
         </section>
       )}
     </div>

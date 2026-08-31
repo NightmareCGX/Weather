@@ -131,15 +131,69 @@ def get_spatial_layer(
     if initial_time is not None:
         template_path += f"&initial_time={initial_time}"
 
+    vector_field_template: str | None = None
+    if variable in ("wind_10m", "wind_speed_10m"):
+        vector_field_template = (
+            f"/v1/maps/{model}/wind_10m/vector-field"
+            f"?lead_time_hours={lead_time_hours}"
+        )
+        if initial_time is not None:
+            vector_field_template += f"&initial_time={initial_time}"
+
     data = SpatialLayerData(
         tile_url_template=template_path,
         min_zoom=MIN_ZOOM,
         max_zoom=MAX_ZOOM,
         lead_time_hours=lead_time_hours,
         legend=SpatialLayerLegend(unit=unit, stops=_legend_stops(variable)),
+        vector_field_url_template=vector_field_template,
     )
     response.headers["Cache-Control"] = CACHE_CONTROL_MAPS
     return SpatialLayerEnvelope(data=data)
+
+
+@router.get(
+    "/maps/{model}/wind_10m/vector-field",
+    response_class=StarletteResponse,
+    summary="Get 10-meter wind vector field for flow animation",
+)
+def get_wind_vector_field(
+    model: str,
+    lead_time_hours: Annotated[
+        int, Query(ge=0, description="Forecast offset hours from cycle time.")
+    ],
+    initial_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC cycle time pinning the model run."
+            )
+        ),
+    ] = None,
+    db: Session = DB,
+) -> StarletteResponse:
+    """Return the quantized Int16 binary wind vector field for particle flow animation.
+
+    For GFS: returns canonical zonal (u) and meridional (v) velocity components.
+    For GEFS: returns the consensus mean vector field (mean(u_i), mean(v_i)).
+    """
+    from api.services.vector_field import render_vector_field_binary
+
+    try:
+        payload = render_vector_field_binary(
+            db,
+            model=model,
+            lead_time_hours=lead_time_hours,
+            initial_time=initial_time,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return StarletteResponse(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": CACHE_CONTROL_TILE},
+    )
 
 
 @router.get(

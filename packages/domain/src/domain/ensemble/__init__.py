@@ -22,6 +22,8 @@ from domain.ensemble.interval import probability_confidence_interval
 from domain.ensemble.pdf import EnsemblePDF, estimate_ensemble_pdf
 from domain.ensemble.probability import (
     probability_above_threshold,
+    probability_at_or_above_threshold,
+    probability_at_or_below_threshold,
     probability_below_threshold,
     probability_between_thresholds,
 )
@@ -40,6 +42,8 @@ __all__ = [
     "ensemble_spread",
     "estimate_ensemble_pdf",
     "probability_above_threshold",
+    "probability_at_or_above_threshold",
+    "probability_at_or_below_threshold",
     "probability_below_threshold",
     "probability_between_thresholds",
     "probability_confidence_interval",

@@ -13,8 +13,10 @@ the length of that coordinate, which drives every calculation. The
 here.
 """
 
+import math
 from typing import Any, Literal
 
+import numpy as np
 import xarray as xr
 from domain.ensemble import (
     ensemble_mean,
@@ -23,6 +25,8 @@ from domain.ensemble import (
     ensemble_spread,
     estimate_ensemble_pdf,
     probability_above_threshold,
+    probability_at_or_above_threshold,
+    probability_at_or_below_threshold,
     probability_below_threshold,
     probability_between_thresholds,
     probability_confidence_interval,
@@ -37,17 +41,33 @@ from domain.exceptions import (
     PointOutsideGridError,
 )
 from domain.geo.coordinates import validate_coordinates
+from domain.models.precipitation import (
+    PhysicalPhase,
+    PrecipitationPhaseState,
+    aggregate_ensemble_phase_support,
+    classify_precipitation_phase,
+    compute_joint_amount_phase_support,
+    compute_transition_frequencies,
+)
+from domain.models.wind import (
+    compute_consensus_vector,
+    compute_directional_probability,
+    compute_wind_rose,
+)
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.models.entities import Model
 from api.schemas import (
+    ConsensusVectorOut,
     EnsemblePDF,
     EnsembleStatistics,
     EnsembleStatisticsData,
     ProbabilityForecastData,
     ProbabilityLocation,
+    WindRoseOut,
+    WindRoseSectorOut,
 )
 from api.services.point_forecast import (
     _derive_grid,
@@ -85,10 +105,12 @@ def build_probability_forecast(
     longitude: float,
     variable: str,
     threshold: float,
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     lead_time_hours: int,
     model: str,
     threshold_max: float | None = None,
+    direction_sector: str | None = None,
+    phase: str | None = None,
     initial_time: str | None = None,
 ) -> ProbabilityForecastData:
     """Build an exceedance probability forecast for a resolved point.
@@ -105,11 +127,16 @@ def build_probability_forecast(
         longitude: Longitude in decimal degrees.
         variable: A documented ``forecast_variables`` catalog code.
         threshold: The probability threshold (lower bound for ``between``).
-        operator: ``gt``, ``lt``, or ``between``.
+        operator: ``gt``, ``gte``, ``lt``, ``lte``, or ``between``.
         lead_time_hours: Forecast offset hours from the run's cycle time.
         model: A single ensemble model identifier.
         threshold_max: The upper bound of ``between``; required only when
             ``operator == "between"``.
+        direction_sector: Optional 8-point cardinal direction sector for wind
+            probabilities (e.g. 'SW', 'N').
+        phase: Optional physical precipitation phase (e.g. 'snow', 'rain',
+            'freezing_rain', 'ice_pellets') for joint exceedance support.
+        initial_time: Optional cycle pinning string.
 
     Returns:
         The probability forecast payload.
@@ -126,11 +153,52 @@ def build_probability_forecast(
     _resolve_variables(db, metadata, [variable])
     assert run.zarr_store_path is not None
 
-    members = _gated_member_values(
-        str(run.zarr_store_path), variable, leads[0], latitude, longitude
-    )
-    probability = _probability(members, threshold, operator, threshold_max)
-    lower, upper = probability_confidence_interval(probability, len(members))
+    if variable == "wind_10m":
+        u_members, v_members = _gated_wind_member_vectors(
+            str(run.zarr_store_path), leads[0], latitude, longitude
+        )
+        if direction_sector is not None:
+            # Convert speed threshold in km/h to m/s for canonical directional probability
+            speed_mps = threshold / 3.6
+            try:
+                probability, (lower, upper) = compute_directional_probability(
+                    u_members,
+                    v_members,
+                    sector=direction_sector,
+                    speed_threshold=speed_mps,
+                    operator=operator,
+                )
+            except InvalidThresholdError as exc:
+                raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
+        else:
+            members_kmh = [math.hypot(u, v) * 3.6 for u, v in zip(u_members, v_members, strict=True)]
+            probability = _probability(members_kmh, threshold, operator, threshold_max)
+            lower, upper = probability_confidence_interval(probability, len(members_kmh))
+    elif variable == "precipitation_amount_3h" and phase is not None:
+        members, precip_states = _gated_precipitation_member_states(
+            str(run.zarr_store_path), leads[0], latitude, longitude
+        )
+        try:
+            target_phase = PhysicalPhase(phase.lower())
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=_STATUS_INVALID_INPUT,
+                detail=f"Unknown physical phase {phase!r}. Valid phases: {[p.value for p in PhysicalPhase]}",
+            ) from exc
+        try:
+            probability = compute_joint_amount_phase_support(
+                precip_states, threshold_mm=threshold, phase=target_phase
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
+        lower, upper = probability_confidence_interval(probability, len(precip_states))
+    else:
+        members = _gated_member_values(
+            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+        )
+        probability = _probability(members, threshold, operator, threshold_max)
+        lower, upper = probability_confidence_interval(probability, len(members))
+
     data: dict[str, Any] = {
         "location": ProbabilityLocation(latitude=latitude, longitude=longitude),
         "variable": variable,
@@ -142,6 +210,10 @@ def build_probability_forecast(
     }
     if operator == "between":
         data["threshold_max"] = threshold_max
+    if direction_sector is not None:
+        data["direction_sector"] = direction_sector
+    if phase is not None:
+        data["phase"] = phase
     return ProbabilityForecastData(**data)
 
 
@@ -179,6 +251,7 @@ def build_ensemble_statistics(
         lead_time_hours: Forecast offset hours from the run's cycle time.
         include_members: Whether to attach the raw member values used to
             compute the statistics.
+        initial_time: Optional cycle pinning string.
 
     Returns:
         The ensemble statistics payload.
@@ -195,9 +268,63 @@ def build_ensemble_statistics(
     _resolve_variables(db, metadata, [variable])
     assert run.zarr_store_path is not None
 
-    members = _gated_member_values(
-        str(run.zarr_store_path), variable, leads[0], latitude, longitude
-    )
+    consensus_payload: ConsensusVectorOut | None = None
+    wind_rose_payload: WindRoseOut | None = None
+    phase_support_payload: dict[str, float] | None = None
+    transition_freq_payload: dict[str, float] | None = None
+
+    if variable == "wind_10m":
+        u_members, v_members = _gated_wind_member_vectors(
+            str(run.zarr_store_path), leads[0], latitude, longitude
+        )
+        members = [math.hypot(u, v) * 3.6 for u, v in zip(u_members, v_members, strict=True)]
+
+        # Consensus flow vector in km/h
+        consensus = compute_consensus_vector(u_members, v_members)
+        consensus_payload = ConsensusVectorOut(
+            speed=round(consensus.speed_mps * 3.6, 2),
+            direction=round(consensus.direction_deg, 1) if consensus.direction_deg is not None else None,
+            cardinal=consensus.cardinal,
+            coherence=round(consensus.coherence, 4),
+        )
+
+        # 8-Sector Wind Rose
+        rose = compute_wind_rose(u_members, v_members)
+        wind_rose_payload = WindRoseOut(
+            calm_percentage=round(rose.calm_probability * 100.0, 1),
+            calm_count=rose.calm_count,
+            sectors=[
+                WindRoseSectorOut(
+                    sector=s.sector,
+                    count=s.count,
+                    probability=round(s.probability, 4),
+                    bins={k: round(v, 4) for k, v in s.bins.items()},
+                )
+                for s in rose.sectors
+            ],
+        )
+    elif variable == "precipitation_amount_3h":
+        amounts, precip_states = _gated_precipitation_member_states(
+            str(run.zarr_store_path), leads[0], latitude, longitude
+        )
+        # At lead 0 (or all-NaN accumulation), compute statistics against 0.0 baseline
+        if all(math.isnan(m) for m in amounts):
+            members = [0.0] * len(amounts)
+        else:
+            members = amounts
+
+        support_map = aggregate_ensemble_phase_support(precip_states)
+        phase_support_payload = {p.value: round(v, 4) for p, v in support_map.items()}
+
+        freq_map = compute_transition_frequencies(precip_states)
+        transition_freq_payload = {
+            t.value: round(v, 4) for t, v in freq_map.items() if v > 0.0
+        }
+    else:
+        members = _gated_member_values(
+            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+        )
+
     pdf_payload: EnsemblePDF | None = None
     if include_members:
         domain_pdf = estimate_ensemble_pdf(members)
@@ -220,6 +347,10 @@ def build_ensemble_statistics(
         ),
         members=members if include_members else None,
         pdf=pdf_payload if include_members else None,
+        consensus_vector=consensus_payload,
+        wind_rose=wind_rose_payload,
+        phase_support=phase_support_payload,
+        transition_frequency=transition_freq_payload,
     )
 
 
@@ -243,7 +374,7 @@ def _require_ensemble_model(db: Session, model: str) -> None:
 def _probability(
     members: list[float],
     threshold: float,
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     threshold_max: float | None,
 ) -> float:
     """Compute the empirical exceedance probability for the operator.
@@ -257,8 +388,12 @@ def _probability(
     try:
         if operator == "gt":
             return probability_above_threshold(members, threshold)
+        if operator == "gte":
+            return probability_at_or_above_threshold(members, threshold)
         if operator == "lt":
             return probability_below_threshold(members, threshold)
+        if operator == "lte":
+            return probability_at_or_below_threshold(members, threshold)
         if threshold_max is None:
             raise HTTPException(
                 status_code=_STATUS_INVALID_INPUT,
@@ -353,3 +488,246 @@ def _gated_member_values(
         return values
 
     return gated_read_dataset_with_selector(store_path, select_and_interpolate)
+
+
+def _gated_wind_member_vectors(
+    store_path: str,
+    lead: int,
+    latitude: float,
+    longitude: float,
+) -> tuple[list[float], list[float]]:
+    """Interpolate ensemble member u and v vectors at a point and lead time.
+
+    Returns:
+        A tuple of (u_members, v_members) where each is a 1-D list in m/s across
+        ensemble members in coordinate order.
+    """
+    from api.core.reader_gate import gated_read_dataset_with_selector
+
+    def select_and_interpolate(dataset: xr.Dataset) -> tuple[list[float], list[float]]:
+        if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
+            raise HTTPException(
+                status_code=404,
+                detail="Variables 'wind_u_10m' and 'wind_v_10m' are not available in the forecast dataset.",
+            )
+        field_u = dataset["wind_u_10m"]
+        field_v = dataset["wind_v_10m"]
+        if "member" not in field_u.dims or "member" not in field_v.dims:
+            raise HTTPException(
+                status_code=422,
+                detail="Wind variables have no ensemble member dimension in the forecast dataset.",
+            )
+        if "lead_time_hours" in field_u.dims:
+            field_u = field_u.sel(lead_time_hours=lead)
+        if "lead_time_hours" in field_v.dims:
+            field_v = field_v.sel(lead_time_hours=lead)
+
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        member_count = int(dataset.coords["member"].size)
+        u_vals: list[float] = []
+        v_vals: list[float] = []
+        for member_index in range(member_count):
+            mf_u = field_u.isel(member=member_index)
+            mf_v = field_v.isel(member=member_index)
+            if mf_u.ndim != 2 or mf_v.ndim != 2:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Wind variables are not 2-D surface fields per member.",
+                )
+            try:
+                u_vals.append(
+                    _interpolate_neighborhood(
+                        mf_u,
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+                v_vals.append(
+                    _interpolate_neighborhood(
+                        mf_v,
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+            except PointOutsideGridError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No forecast data covers the requested location: {exc}",
+                ) from exc
+            except InvalidGridError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="The forecast dataset grid is invalid.",
+                ) from exc
+        return u_vals, v_vals
+
+    return gated_read_dataset_with_selector(store_path, select_and_interpolate)
+
+
+def _gated_precipitation_member_states(
+    store_path: str,
+    lead: int,
+    latitude: float,
+    longitude: float,
+) -> tuple[list[float], list[PrecipitationPhaseState]]:
+    """Extract per-member precipitation amounts and classify their phase states under the gate."""
+    from api.core.reader_gate import gated_read_dataset_with_selector
+
+    def select_and_classify(dataset: xr.Dataset) -> tuple[list[float], list[PrecipitationPhaseState]]:
+        if "precipitation_amount_3h" not in dataset.data_vars:
+            raise HTTPException(
+                status_code=404,
+                detail="Variable 'precipitation_amount_3h' is not available in the forecast dataset.",
+            )
+        field_amt = dataset["precipitation_amount_3h"]
+        if "member" not in field_amt.dims:
+            raise HTTPException(
+                status_code=422,
+                detail="Variable 'precipitation_amount_3h' has no ensemble member dimension in the forecast dataset.",
+            )
+        if "lead_time_hours" in field_amt.dims:
+            field_amt = field_amt.sel(lead_time_hours=lead)
+
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        member_count = int(dataset.coords["member"].size)
+
+        cat_fields = {}
+        for c in ("crain", "csnow", "cfrzr", "cicep"):
+            if c in dataset.data_vars:
+                f = dataset[c]
+                if "lead_time_hours" in f.dims:
+                    f = f.sel(lead_time_hours=lead)
+                cat_fields[c] = f
+
+        t2m_field = None
+        if "temperature_2m" in dataset.data_vars:
+            t = dataset["temperature_2m"]
+            if "lead_time_hours" in t.dims:
+                t = t.sel(lead_time_hours=lead)
+            t2m_field = t
+
+        # Predecessor fields for 6-hour reset leads (t=6, 12, 18, 24, ...)
+        pred_fields_avail = False
+        pred_field_amt = None
+        pred_cat_fields = {}
+        pred_t2m_field = None
+
+        if lead % 6 == 0 and lead > 0:
+            pred_lead = lead - 3
+            leads_in_ds = [
+                int(v)
+                for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+            ]
+            if pred_lead in leads_in_ds:
+                pred_fields_avail = True
+                pred_field_amt = dataset["precipitation_amount_3h"].sel(lead_time_hours=pred_lead)
+                for c in ("crain", "csnow", "cfrzr", "cicep"):
+                    if c in dataset.data_vars:
+                        pred_cat_fields[c] = dataset[c].sel(lead_time_hours=pred_lead)
+                if "temperature_2m" in dataset.data_vars:
+                    pred_t2m_field = dataset["temperature_2m"].sel(lead_time_hours=pred_lead)
+
+        amounts: list[float] = []
+        states: list[PrecipitationPhaseState] = []
+
+        for member_index in range(member_count):
+            amt_val = float(
+                _interpolate_neighborhood(
+                    field_amt.isel(member=member_index),
+                    grid,
+                    lat_descending,
+                    lon_descending,
+                    latitude,
+                    longitude,
+                )
+            )
+            amounts.append(amt_val)
+
+            flags: dict[str, int] = {}
+            for c, c_field in cat_fields.items():
+                c_val = float(
+                    _interpolate_neighborhood(
+                        c_field.isel(member=member_index),
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+                flags[c] = 1 if c_val >= 0.5 else 0
+
+            t_val: float | None = None
+            if t2m_field is not None:
+                t_val = float(
+                    _interpolate_neighborhood(
+                        t2m_field.isel(member=member_index),
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+
+            amt_prev: float | None = None
+            flags_prev: dict[str, int] | None = None
+            t_start_val: float | None = None
+
+            if pred_fields_avail and pred_field_amt is not None:
+                amt_prev = float(
+                    _interpolate_neighborhood(
+                        pred_field_amt.isel(member=member_index),
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+                if pred_cat_fields:
+                    f_p = {}
+                    for c, c_p_field in pred_cat_fields.items():
+                        c_p_val = float(
+                            _interpolate_neighborhood(
+                                c_p_field.isel(member=member_index),
+                                grid,
+                                lat_descending,
+                                lon_descending,
+                                latitude,
+                                longitude,
+                            )
+                        )
+                        f_p[c] = 1 if c_p_val >= 0.5 else 0
+                    flags_prev = f_p
+                if pred_t2m_field is not None:
+                    t_start_val = float(
+                        _interpolate_neighborhood(
+                            pred_t2m_field.isel(member=member_index),
+                            grid,
+                            lat_descending,
+                            lon_descending,
+                            latitude,
+                            longitude,
+                        )
+                    )
+
+            st = classify_precipitation_phase(
+                amt_val,
+                flags if flags else None,
+                amount_prev=amt_prev,
+                flags_prev=flags_prev,
+                t2m_start=t_start_val,
+                t2m_end=t_val,
+            )
+            states.append(st)
+
+        return amounts, states
+
+    return gated_read_dataset_with_selector(store_path, select_and_classify)

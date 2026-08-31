@@ -9,6 +9,8 @@ import type {
   SearchResult,
   SpatialLayer,
   VariableResource,
+  VectorFieldData,
+  VectorGridMetadata,
 } from "./types";
 
 /**
@@ -284,4 +286,117 @@ export async function getEnsembleStatistics({
 
 export async function listVariables(signal?: AbortSignal): Promise<VariableResource[]> {
   return request<VariableResource[]>(`/variables`, { signal });
+}
+
+export const VECTOR_FIELD_HEADER_SIZE = 36;
+export const VECTOR_FIELD_MAGIC = "WNDQ";
+
+/**
+ * Decodes a raw binary ArrayBuffer payload encoded in the quantized Int16 (WNDQ) format.
+ *
+ * Converts compact Int16 U/V buffers into Float32Array fields for high-performance
+ * particle sampling in the animation loop.
+ */
+export function decodeVectorFieldBinary(
+  buffer: ArrayBuffer,
+  byteOffset = 0,
+  byteLength = buffer.byteLength
+): VectorFieldData {
+  if (byteLength < VECTOR_FIELD_HEADER_SIZE) {
+    throw new Error(
+      `Vector field payload too short: ${byteLength} < ${VECTOR_FIELD_HEADER_SIZE} bytes.`
+    );
+  }
+
+  const view = new DataView(buffer, byteOffset, byteLength);
+  const magic = String.fromCharCode(
+    view.getUint8(0),
+    view.getUint8(1),
+    view.getUint8(2),
+    view.getUint8(3)
+  );
+  if (magic !== VECTOR_FIELD_MAGIC) {
+    throw new Error(`Invalid vector field magic: ${magic}, expected ${VECTOR_FIELD_MAGIC}.`);
+  }
+
+  const version = view.getUint8(4);
+  if (version !== 1) {
+    throw new Error(`Unsupported vector field version: ${version}.`);
+  }
+
+  const flags = view.getUint8(5);
+  if (flags !== 1) {
+    throw new Error(`Unsupported vector field flags: ${flags}.`);
+  }
+
+  const scale = view.getFloat32(8, true);
+  const lat_start = view.getFloat32(12, true);
+  const lat_step = view.getFloat32(16, true);
+  const lat_count = view.getUint32(20, true);
+  const lon_start = view.getFloat32(24, true);
+  const lon_step = view.getFloat32(28, true);
+  const lon_count = view.getUint32(32, true);
+
+  const num_points = lat_count * lon_count;
+  const expectedSize = VECTOR_FIELD_HEADER_SIZE + num_points * 2 * 2;
+  if (byteLength !== expectedSize) {
+    throw new Error(
+      `Vector field payload size mismatch: got ${byteLength} bytes, expected ${expectedSize} for ${lat_count}x${lon_count} grid.`
+    );
+  }
+
+  const meta: VectorGridMetadata = {
+    lat_start,
+    lat_step,
+    lat_count,
+    lon_start,
+    lon_step,
+    lon_count,
+    scale,
+  };
+
+  const u_offset = byteOffset + VECTOR_FIELD_HEADER_SIZE;
+  const v_offset = u_offset + num_points * 2;
+
+  // Use typed Int16 views into the ArrayBuffer
+  const u_i16 = new Int16Array(buffer, u_offset, num_points);
+  const v_i16 = new Int16Array(buffer, v_offset, num_points);
+
+  const u = new Float32Array(num_points);
+  const v = new Float32Array(num_points);
+
+  for (let i = 0; i < num_points; i++) {
+    u[i] = u_i16[i] * scale;
+    v[i] = v_i16[i] * scale;
+  }
+
+  return { meta, u, v };
+}
+
+/**
+ * Fetch and decode the binary vector field from the given vector field URL.
+ */
+export async function getVectorField(url: string, signal?: AbortSignal): Promise<VectorFieldData> {
+  const fullPath = url.startsWith(API_PREFIX)
+    ? url
+    : `${API_PREFIX}${url.startsWith("/") ? "" : "/"}${url}`;
+  let response: Response;
+  try {
+    response = await fetch(fullPath, {
+      signal,
+      headers: { Accept: "application/octet-stream" },
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new RequestAbortedError();
+    }
+    throw new ApiError("Network request failed.", 0, "network_error", "network_error", null, null);
+  }
+
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  return decodeVectorFieldBinary(arrayBuffer);
 }

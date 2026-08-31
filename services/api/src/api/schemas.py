@@ -108,6 +108,7 @@ class LayerDescriptor(BaseModel):
     min_zoom: int
     max_zoom: int
     legend: SpatialLayerLegend
+    vector_field_url_template: str | None = None
 
 
 class InitialTimeAvailability(BaseModel):
@@ -320,11 +321,13 @@ class ProbabilityForecastData(BaseModel):
     location: ProbabilityLocation
     variable: str
     threshold: float
-    operator: Literal["gt", "lt", "between"]
+    operator: str
     lead_time_hours: int
     probability: float
     confidence_interval_95: list[float]
     threshold_max: float | None = None
+    direction_sector: str | None = None
+    phase: str | None = None
 
     @model_serializer
     def _serialize_threshold_max(self) -> dict[str, object]:
@@ -340,6 +343,10 @@ class ProbabilityForecastData(BaseModel):
         }
         if self.operator == "between" and self.threshold_max is not None:
             payload["threshold_max"] = self.threshold_max
+        if self.direction_sector is not None:
+            payload["direction_sector"] = self.direction_sector
+        if self.phase is not None:
+            payload["phase"] = self.phase
         return payload
 
 
@@ -364,6 +371,7 @@ class SpatialLayerData(BaseModel):
     max_zoom: int
     lead_time_hours: int
     legend: SpatialLayerLegend
+    vector_field_url_template: str | None = None
 
 
 class SpatialLayerEnvelope(BaseModel):
@@ -395,6 +403,32 @@ class EnsemblePDF(BaseModel):
     density: list[float]
 
 
+class ConsensusVectorOut(BaseModel):
+    """Ensemble consensus vector flow metrics for wind products."""
+
+    speed: float
+    direction: float | None = None
+    cardinal: str
+    coherence: float
+
+
+class WindRoseSectorOut(BaseModel):
+    """One 45-degree directional sector in an ensemble Wind Rose."""
+
+    sector: str
+    count: int
+    probability: float
+    bins: dict[str, float]
+
+
+class WindRoseOut(BaseModel):
+    """8-sector Wind Rose representing speed x direction ensemble distribution."""
+
+    calm_percentage: float
+    calm_count: int
+    sectors: list[WindRoseSectorOut]
+
+
 class EnsembleStatisticsData(BaseModel):
     """The payload of ensemble statistics (API.md section 5.1).
 
@@ -413,6 +447,10 @@ class EnsembleStatisticsData(BaseModel):
     statistics: EnsembleStatistics
     members: list[float] | None = None
     pdf: EnsemblePDF | None = None
+    consensus_vector: ConsensusVectorOut | None = None
+    wind_rose: WindRoseOut | None = None
+    phase_support: dict[str, float] | None = None
+    transition_frequency: dict[str, float] | None = None
 
     @model_serializer
     def _serialize_distribution_fields(self) -> dict[str, object]:
@@ -426,6 +464,14 @@ class EnsembleStatisticsData(BaseModel):
         if self.members is not None:
             payload["members"] = self.members
             payload["pdf"] = self.pdf
+        if self.consensus_vector is not None:
+            payload["consensus_vector"] = self.consensus_vector
+        if self.wind_rose is not None:
+            payload["wind_rose"] = self.wind_rose
+        if self.phase_support is not None:
+            payload["phase_support"] = self.phase_support
+        if self.transition_frequency is not None:
+            payload["transition_frequency"] = self.transition_frequency
         return payload
 
 

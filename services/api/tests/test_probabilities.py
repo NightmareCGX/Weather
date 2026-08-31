@@ -248,3 +248,59 @@ def test_probability_between_inverted_thresholds_422(client):
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_probability_service_operators_phase1a_variables():
+    """_probability correctly evaluates gt, gte, lt, lte, between across Phase 1A variable ranges."""
+    from api.services.ensemble_data import _probability
+
+    # Visibility members: [500, 1000, 1500, 3000, 5000] meters (fog hazard < 1000m or <= 1000m)
+    vis_members = [500.0, 1000.0, 1500.0, 3000.0, 5000.0]
+    # Low-visibility hazard probability (strict < 1000m): {500} -> 1/5 = 0.2
+    assert _probability(vis_members, 1000.0, "lt", None) == pytest.approx(0.2)
+    # Low-visibility hazard probability (inclusive <= 1000m): {500, 1000} -> 2/5 = 0.4
+    assert _probability(vis_members, 1000.0, "lte", None) == pytest.approx(0.4)
+
+    # Wind gust members: [30, 45, 60, 75, 90] km/h (severe wind warning >= 60 km/h)
+    gust_members = [30.0, 45.0, 60.0, 75.0, 90.0]
+    # High-gust hazard (strict > 60 km/h): {75, 90} -> 2/5 = 0.4
+    assert _probability(gust_members, 60.0, "gt", None) == pytest.approx(0.4)
+    # High-gust hazard (inclusive >= 60 km/h): {60, 75, 90} -> 3/5 = 0.6
+    assert _probability(gust_members, 60.0, "gte", None) == pytest.approx(0.6)
+
+    # Relative humidity members: [60, 70, 80, 90, 95] %
+    rh_members = [60.0, 70.0, 80.0, 90.0, 95.0]
+    assert _probability(rh_members, 80.0, "gte", None) == pytest.approx(0.6)
+    assert _probability(rh_members, 80.0, "gt", None) == pytest.approx(0.4)
+
+    # Snow depth members: [0.0, 0.05, 0.10, 0.20, 0.30] meters
+    snod_members = [0.0, 0.05, 0.10, 0.20, 0.30]
+    assert _probability(snod_members, 0.10, "gte", None) == pytest.approx(0.6)
+    assert _probability(snod_members, 0.05, "between", 0.20) == pytest.approx(0.6)
+
+
+def test_probability_joint_precipitation_amount_and_phase(client):
+    """Joint exceedance probability conditioned on physical phase."""
+    resp = client.get(
+        f"/v1/probabilities?lat={LAT}&lon={LON}"
+        f"&variable=precipitation_amount_3h&threshold=2.0&operator=gte"
+        f"&lead_time_hours={LEAD}&phase=rain"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    data = body["data"]
+    assert data["variable"] == "precipitation_amount_3h"
+    assert data["phase"] == "rain"
+    assert 0.0 <= data["probability"] <= 1.0
+
+
+def test_probability_unknown_phase_422(client):
+    """Unknown phase parameter raises 422."""
+    resp = client.get(
+        f"/v1/probabilities?lat={LAT}&lon={LON}"
+        f"&variable=precipitation_amount_3h&threshold=2.0&operator=gte"
+        f"&lead_time_hours={LEAD}&phase=invalid_phase"
+    )
+    assert resp.status_code == 422
+    assert "Unknown physical phase" in resp.json()["error"]["message"]

@@ -41,6 +41,32 @@ def probability_above_threshold(
     return _empirical_fraction(members, lambda values: values > validated_threshold)
 
 
+def probability_at_or_above_threshold(
+    members: Sequence[float | int] | npt.NDArray[np.float64], threshold: float
+) -> float:
+    """Return the fraction of members greater than or equal to a threshold.
+
+    A member equal to the threshold counts (inclusive ``>=``).
+
+    Args:
+        members: Ensemble member values as a sequence of ints/floats or a
+            NumPy array.
+        threshold: Threshold value.
+
+    Returns:
+        The fraction of members at or above the threshold as a ``float`` in
+        ``[0, 1]``.
+
+    Raises:
+        EmptyEnsembleError: If the sequence is empty.
+        InvalidEnsembleError: If the input is not a one-dimensional numeric
+            sequence, or contains non-finite values.
+        InvalidThresholdError: If the threshold is not a finite number.
+    """
+    validated_threshold = _validate_threshold(threshold)
+    return _empirical_fraction(members, lambda values: values >= validated_threshold)
+
+
 def probability_below_threshold(
     members: Sequence[float | int] | npt.NDArray[np.float64], threshold: float
 ) -> float:
@@ -65,6 +91,32 @@ def probability_below_threshold(
     """
     validated_threshold = _validate_threshold(threshold)
     return _empirical_fraction(members, lambda values: values < validated_threshold)
+
+
+def probability_at_or_below_threshold(
+    members: Sequence[float | int] | npt.NDArray[np.float64], threshold: float
+) -> float:
+    """Return the fraction of members less than or equal to a threshold.
+
+    A member equal to the threshold counts (inclusive ``<=``).
+
+    Args:
+        members: Ensemble member values as a sequence of ints/floats or a
+            NumPy array.
+        threshold: Threshold value.
+
+    Returns:
+        The fraction of members at or below the threshold as a ``float`` in
+        ``[0, 1]``.
+
+    Raises:
+        EmptyEnsembleError: If the sequence is empty.
+        InvalidEnsembleError: If the input is not a one-dimensional numeric
+            sequence, or contains non-finite values.
+        InvalidThresholdError: If the threshold is not a finite number.
+    """
+    validated_threshold = _validate_threshold(threshold)
+    return _empirical_fraction(members, lambda values: values <= validated_threshold)
 
 
 def probability_between_thresholds(

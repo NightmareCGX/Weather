@@ -61,7 +61,7 @@ def get_probability(
     variable: Annotated[str, Query(description="A forecast variable code.")],
     threshold: Annotated[float, Query(description="The probability threshold.")],
     operator: Annotated[
-        Literal["gt", "lt", "between"],
+        Literal["gt", "gte", "lt", "lte", "between"],
         Query(description="Threshold comparison operator."),
     ],
     lead_time_hours: Annotated[
@@ -76,6 +76,24 @@ def get_probability(
             description=(
                 "Upper bound of the 'between' operator (required only when "
                 "operator=between)."
+            )
+        ),
+    ] = None,
+    direction_sector: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional 8-point cardinal sector for directional wind probabilities "
+                "(e.g. 'SW', 'N')."
+            )
+        ),
+    ] = None,
+    phase: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional physical precipitation phase (e.g. 'snow', 'rain', 'freezing_rain', 'ice_pellets') "
+                "for joint exceedance probability."
             )
         ),
     ] = None,
@@ -108,6 +126,8 @@ def get_probability(
         operator=operator,
         lead_time_hours=lead_time_hours,
         threshold_max=threshold_max,
+        direction_sector=direction_sector,
+        phase=phase,
         cycle_time=resolve_latest_run_cycle_time(db, model, initial_time),
         serving_generation=resolve_latest_run_serving_generation(
             db, model, initial_time
@@ -116,7 +136,8 @@ def get_probability(
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&threshold={threshold}"
         f"&operator={operator}&lead_time_hours={lead_time_hours}"
-        f"&model={model}&threshold_max={threshold_max}&initial_time={initial_time}"
+        f"&model={model}&threshold_max={threshold_max}&direction_sector={direction_sector}"
+        f"&phase={phase}&initial_time={initial_time}"
     )
 
     envelope = _cache.compute_or_retrieve(
@@ -133,6 +154,8 @@ def get_probability(
             lead_time_hours,
             model,
             threshold_max,
+            direction_sector,
+            phase,
             initial_time,
         ),
         model_type=ProbabilityForecastEnvelope,
@@ -142,13 +165,13 @@ def get_probability(
 
 
 def _validate_threshold_bounds(
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     threshold: float,
     threshold_max: float | None,
 ) -> None:
     """Enforce the ``between``/``threshold_max`` pairing rules.
 
-    ``between`` requires ``threshold_max``; ``gt``/``lt`` reject it. An
+    ``between`` requires ``threshold_max``; ``gt``/``gte``/``lt``/``lte`` reject it. An
     out-of-range ordering (``threshold_max < threshold``) is surfaced later by
     the domain math as a 422.
     """
@@ -157,7 +180,7 @@ def _validate_threshold_bounds(
             status_code=422,
             detail="threshold_max is required when operator is 'between'.",
         )
-    if operator in ("gt", "lt") and threshold_max is not None:
+    if operator in ("gt", "gte", "lt", "lte") and threshold_max is not None:
         raise HTTPException(
             status_code=422,
             detail="threshold_max is only valid when operator is 'between'.",
@@ -170,10 +193,12 @@ def _compute(
     lon: float,
     variable: str,
     threshold: float,
-    operator: Literal["gt", "lt", "between"],
+    operator: Literal["gt", "gte", "lt", "lte", "between"],
     lead_time_hours: int,
     model: str,
     threshold_max: float | None,
+    direction_sector: str | None,
+    phase: str | None,
     initial_time: str | None,
 ) -> ProbabilityForecastEnvelope:
     data = build_probability_forecast(
@@ -186,6 +211,8 @@ def _compute(
         lead_time_hours=lead_time_hours,
         model=model,
         threshold_max=threshold_max,
+        direction_sector=direction_sector,
+        phase=phase,
         initial_time=initial_time,
     )
     return ProbabilityForecastEnvelope(data=data)

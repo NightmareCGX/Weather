@@ -160,6 +160,14 @@ def test_point_imperial_units(client):
     assert abs(entry["precipitation_rate"] - expected_precip_in) < 1e-9
 
 
+def test_point_units_conversion_wind_10m() -> None:
+    val_metric = _convert_value(50.0, "km/h", "metric", var_code="wind_10m")
+    assert val_metric == 50.0
+
+    val_imperial = _convert_value(50.0, "km/h", "imperial", var_code="wind_10m")
+    assert val_imperial == pytest.approx(50.0 * 0.621371, abs=1e-5)
+
+
 def test_point_generated_at_deterministic(client):
     lat = LAT_START + 0.125
     lon = LON_START + 0.125
@@ -294,11 +302,55 @@ def test_convert_value_metric_noop():
 
 def test_convert_kmh_to_mph_label():
     """The km/h imperial entry converts the value and labels it mph."""
+    assert _convert_value(100.0, "km/h", "imperial") == pytest.approx(62.1371, rel=1e-4)
+
+
+def test_point_precipitation_amount_3h_and_phase_state(client):
+    """precipitation_amount_3h returns amount and detailed phase state."""
+    lat = LAT_START + 0.125
+    lon = LON_START + 0.125
+    resp = client.get(
+        f"/v1/points?lat={lat}&lon={lon}&models=gfs&variables=precipitation_amount_3h,temperature_2m"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    data = body["data"]
+    by_lead = {entry["lead_time_hours"]: entry for entry in data["forecasts"]}
+
+    # Lead 0: amount is None (NaN in Zarr), phase is none
+    lead0 = by_lead[0]
+    assert lead0["precipitation_amount_3h"] is None
+    assert lead0["precipitation_type"] == "none"
+    assert lead0["precipitation_transition"] == "none"
+    assert lead0["precipitation_start_type"] == "none"
+    assert lead0["precipitation_end_type"] == "none"
+    assert lead0["precipitation_evidence"] == "exact"
+
+    # Lead 6: amount > 0, crain=1 -> rain
+    lead6 = by_lead[6]
+    assert lead6["precipitation_amount_3h"] == pytest.approx(2.4, abs=1e-4)
+    assert lead6["precipitation_type"] == "rain"
+    assert lead6["precipitation_transition"] == "persistent_rain"
+    assert lead6["precipitation_start_type"] == "rain"
+    assert lead6["precipitation_end_type"] == "rain"
+    assert lead6["precipitation_evidence"] == "exact"
     from api.services.point_forecast import _SI_TO_IMPERIAL
 
     label, convert = _SI_TO_IMPERIAL["km/h"]
     assert label == "mph"
     assert convert(10.0) == pytest.approx(6.21371, abs=1e-9)
+
+
+def test_convert_phase1a_variables_imperial():
+    """Phase 1A variables convert to their appropriate imperial representations."""
+    # Relative humidity: % -> %
+    assert _convert_value(85.0, "%", "imperial", var_code="relative_humidity_2m") == 85.0
+    # Wind gust: km/h -> mph
+    assert _convert_value(100.0, "km/h", "imperial", var_code="wind_gust") == pytest.approx(62.1371, abs=1e-4)
+    # Visibility: m -> mi (1609.344m = 1mi)
+    assert _convert_value(16093.44, "m", "imperial", var_code="visibility") == pytest.approx(10.0, abs=1e-4)
+    # Snow depth: m -> in (1m = 39.3700787in)
+    assert _convert_value(0.254, "m", "imperial", var_code="snow_depth") == pytest.approx(10.0, abs=1e-4)
 
 
 def _make_key(cycle_time: str | None = None):

@@ -29,6 +29,11 @@ jest.mock("../../charts/EnsembleDistribution", () => ({
     <div data-testid="ensemble-distribution" data-selected-lead={selectedLead} />
   ),
 }));
+jest.mock("../../charts/EnsemblePhaseSupport", () => ({
+  EnsemblePhaseSupport: ({ selectedLead }: { selectedLead?: number }) => (
+    <div data-testid="ensemble-phase-support" data-selected-lead={selectedLead} />
+  ),
+}));
 
 const mockUsePointForecast = usePointForecast as jest.MockedFunction<typeof usePointForecast>;
 const mockUseEnsemble = useEnsemble as jest.MockedFunction<typeof useEnsemble>;
@@ -796,5 +801,147 @@ describe("ForecastDashboard", () => {
       "temperature_2m",
       expect.objectContaining({ model: "gefs" })
     );
+  });
+
+  it("renders EnsemblePhaseSupport when GEFS precipitation_amount_3h is selected with phase_support", () => {
+    mockSelectionContext({
+      selection: {
+        model: "gefs",
+        variable: "precipitation_amount_3h",
+        initialTime: "2026-08-13T00:00:00Z",
+        leadTimeHours: 6,
+      },
+      options: {
+        models: [
+          { id: "gefs", name: "Global Ensemble Forecast System", is_ensemble: true, variables: [] },
+        ],
+        model: {
+          id: "gefs",
+          name: "Global Ensemble Forecast System",
+          is_ensemble: true,
+          variables: [],
+        },
+        variables: [
+          {
+            id: "precipitation_amount_3h",
+            name: "3-Hour Precipitation",
+            unit: "mm",
+            initial_times: [],
+          },
+        ],
+        initialTimes: [{ value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 3, 6, 9, 12] }],
+        variable: {
+          id: "precipitation_amount_3h",
+          name: "3-Hour Precipitation",
+          unit: "mm",
+          initial_times: [],
+        },
+        initialTime: { value: "2026-08-13T00:00:00Z", lead_time_hours: [0, 3, 6, 9, 12] },
+        leadTimes: [0, 3, 6, 9, 12],
+      },
+    });
+
+    mockUsePointForecast.mockReturnValue({
+      forecast: {
+        location: { latitude: 38.19, longitude: -106.82, elevation_m: null, resolved_via: "city" },
+        generated_at: "2026-07-21T00:00:00Z",
+        model: "gefs",
+        forecasts: [
+          {
+            lead_time_hours: 0,
+            valid_time: "2026-07-21T00:00:00Z",
+            precipitation_amount_3h: undefined,
+            precipitation_type: "none",
+            precipitation_transition: "none",
+          },
+          {
+            lead_time_hours: 6,
+            valid_time: "2026-07-21T06:00:00Z",
+            precipitation_amount_3h: 5.1,
+            precipitation_type: "mixed",
+            precipitation_transition: "rain_to_snow",
+          },
+        ],
+      },
+      status: "success",
+      error: null,
+    });
+
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map([
+        [
+          6,
+          {
+            model: "gefs",
+            lead_time_hours: 6,
+            member_count: 30,
+            statistics: {
+              mean: 4.5,
+              median: 4.2,
+              spread: 1.5,
+              p10: 2.0,
+              p25: 3.1,
+              p50: 4.2,
+              p75: 5.8,
+              p90: 7.2,
+            },
+            phase_support: {
+              dry: 0.1,
+              rain: 0.5,
+              snow: 0.3,
+              freezing_rain: 0.05,
+              ice_pellets: 0.03,
+              unknown: 0.02,
+            },
+          },
+        ],
+      ]),
+      status: "success",
+      error: null,
+      model: "gefs",
+    });
+
+    mockUseEnsembleDistribution.mockReturnValue({
+      data: {
+        model: "gefs",
+        lead_time_hours: 6,
+        member_count: 30,
+        statistics: {
+          mean: 4.5,
+          median: 4.2,
+          spread: 1.5,
+          p10: 2.0,
+          p25: 3.1,
+          p50: 4.2,
+          p75: 5.8,
+          p90: 7.2,
+        },
+        members: [2.0, 3.5, 4.2, 5.8, 7.2],
+        phase_support: {
+          dry: 0.1,
+          rain: 0.5,
+          snow: 0.3,
+          freezing_rain: 0.05,
+          ice_pellets: 0.03,
+          unknown: 0.02,
+        },
+        transition_frequency: {
+          rain_to_snow: 0.27,
+        },
+      },
+      status: "success",
+      error: null,
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    // Renders the single precipitation_amount_3h meteogram and excludes metadata fields
+    const meteograms = screen.getAllByTestId("meteogram");
+    expect(meteograms).toHaveLength(1);
+    expect(meteograms[0]).toHaveTextContent("precipitation_amount_3h");
+
+    // Ensemble phase support component is rendered
+    expect(screen.getByTestId("ensemble-phase-support")).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-phase-support")).toHaveAttribute("data-selected-lead", "6");
   });
 });

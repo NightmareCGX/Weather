@@ -234,10 +234,28 @@ def parse_idx(text: str) -> list[IdxRecord]:
     return records
 
 
+#: Default canonical variables selected by GFS/GEFS record selectors.
+DEFAULT_SELECTION_VARIABLES: tuple[str, ...] = (
+    "temperature_2m",
+    "precipitation_rate",
+    "precipitation_amount_3h",
+    "crain",
+    "csnow",
+    "cfrzr",
+    "cicep",
+    "relative_humidity_2m",
+    "wind_gust",
+    "visibility",
+    "snow_depth",
+    "wind_u_10m",
+    "wind_v_10m",
+)
+
+
 def select_gfs_records(
     records: list[IdxRecord],
     lead_time_hours: int,
-    variables: tuple[str, ...] = ("temperature_2m", "precipitation_rate"),
+    variables: tuple[str, ...] = DEFAULT_SELECTION_VARIABLES,
 ) -> SelectionResult:
     """Select required GFS GRIB2 records from parsed .idx records.
 
@@ -250,6 +268,24 @@ def select_gfs_records(
       (e.g. ``f"{lead_time_hours} hour fcst"`` or ``"0 hour fcst"`` / ``"anl"``),
       and explicitly rejects time-averaged variants (``"ave fcst"``) or
       accumulated variants (``"acc fcst"``).
+    * ``relative_humidity_2m``: Matches parameter ``"RH"`` at level
+      ``"2 m above ground"``. At lead 0, matches ``"anl"`` or ``"0 hour fcst"``;
+      at lead > 0, matches ``f"{lead_time_hours} hour fcst"``.
+    * ``wind_gust``: Matches parameter ``"GUST"`` at level ``"surface"``.
+      At lead 0, matches ``"anl"`` or ``"0 hour fcst"``; at lead > 0, matches
+      ``f"{lead_time_hours} hour fcst"``.
+    * ``visibility``: Matches parameter ``"VIS"`` at level ``"surface"``.
+      At lead 0, matches ``"anl"`` or ``"0 hour fcst"``; at lead > 0, matches
+      ``f"{lead_time_hours} hour fcst"``.
+    * ``snow_depth``: Matches parameter ``"SNOD"`` at level ``"surface"``.
+      At lead 0, matches ``"anl"`` or ``"0 hour fcst"``; at lead > 0, matches
+      ``f"{lead_time_hours} hour fcst"``.
+    * ``wind_u_10m``: Matches parameter ``"UGRD"`` at level
+      ``"10 m above ground"``. At lead 0, matches ``"anl"`` or ``"0 hour fcst"``;
+      at lead > 0, matches ``f"{lead_time_hours} hour fcst"``.
+    * ``wind_v_10m``: Matches parameter ``"VGRD"`` at level
+      ``"10 m above ground"``. At lead 0, matches ``"anl"`` or ``"0 hour fcst"``;
+      at lead > 0, matches ``f"{lead_time_hours} hour fcst"``.
 
     Args:
         records: Parsed ``.idx`` records.
@@ -274,28 +310,14 @@ def select_gfs_records(
                 and rec.level_description == "2 m above ground"
                 and _matches_step(rec.forecast_description, lead_time_hours)
             ]
-            if len(matches) == 1:
-                rec = matches[0]
-                variable_selections[var] = VariableSelection(
-                    variable_code=var,
-                    status=SelectionStatus.SELECTED,
-                    record=rec,
-                    matched_records=tuple(matches),
-                )
-                all_selected.append(rec)
-            elif len(matches) == 0:
-                variable_selections[var] = VariableSelection(
-                    variable_code=var,
-                    status=SelectionStatus.REQUIRED_BUT_MISSING,
-                )
-                missing_required.append(var)
-            else:
-                variable_selections[var] = VariableSelection(
-                    variable_code=var,
-                    status=SelectionStatus.AMBIGUOUS,
-                    matched_records=tuple(matches),
-                )
-                ambiguous.append(var)
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
 
         elif var == "precipitation_rate":
             matches = [
@@ -307,28 +329,189 @@ def select_gfs_records(
                 and "ave fcst" not in rec.forecast_description
                 and "acc fcst" not in rec.forecast_description
             ]
-            if len(matches) == 1:
-                rec = matches[0]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "relative_humidity_2m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "RH"
+                and rec.level_description == "2 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_gust":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "GUST"
+                and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "visibility":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "VIS"
+                and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "snow_depth":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "SNOD"
+                and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_u_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "UGRD"
+                and rec.level_description == "10 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_v_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "VGRD"
+                and rec.level_description == "10 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "precipitation_amount_3h":
+            if lead_time_hours == 0:
+                # Analysis time has zero accumulation duration; no GRIB record required
                 variable_selections[var] = VariableSelection(
                     variable_code=var,
                     status=SelectionStatus.SELECTED,
-                    record=rec,
-                    matched_records=tuple(matches),
+                    record=None,
                 )
-                all_selected.append(rec)
-            elif len(matches) == 0:
-                variable_selections[var] = VariableSelection(
-                    variable_code=var,
-                    status=SelectionStatus.REQUIRED_BUT_MISSING,
-                )
-                missing_required.append(var)
             else:
+                expected_desc = _expected_apcp_description(lead_time_hours)
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == "APCP"
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                    ]
+                    # If multiple identical matches exist (e.g. GFS f003/f006 duplicate lines),
+                    # pick the first one (the 6h-resetting family).
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
+
+        elif var in ("crain", "csnow", "cfrzr", "cicep"):
+            if lead_time_hours == 0:
+                # Analysis time has no interval-average categorical flags
                 variable_selections[var] = VariableSelection(
                     variable_code=var,
-                    status=SelectionStatus.AMBIGUOUS,
-                    matched_records=tuple(matches),
+                    status=SelectionStatus.SELECTED,
+                    record=None,
                 )
-                ambiguous.append(var)
+            else:
+                expected_desc = _expected_categorical_description(lead_time_hours)
+                param_name = var.upper()
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == param_name
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
 
         else:
             variable_selections[var] = VariableSelection(
@@ -349,11 +532,44 @@ def select_gfs_records(
     )
 
 
+def _record_selection(
+    var: str,
+    matches: list[IdxRecord],
+    variable_selections: dict[str, VariableSelection],
+    all_selected: list[IdxRecord],
+    missing_required: list[str],
+    ambiguous: list[str],
+) -> None:
+    """Helper to record matches into variable selection and error buckets."""
+    if len(matches) == 1:
+        rec = matches[0]
+        variable_selections[var] = VariableSelection(
+            variable_code=var,
+            status=SelectionStatus.SELECTED,
+            record=rec,
+            matched_records=tuple(matches),
+        )
+        all_selected.append(rec)
+    elif len(matches) == 0:
+        variable_selections[var] = VariableSelection(
+            variable_code=var,
+            status=SelectionStatus.REQUIRED_BUT_MISSING,
+        )
+        missing_required.append(var)
+    else:
+        variable_selections[var] = VariableSelection(
+            variable_code=var,
+            status=SelectionStatus.AMBIGUOUS,
+            matched_records=tuple(matches),
+        )
+        ambiguous.append(var)
+
+
 def select_gefs_records(
     records: list[IdxRecord],
     member: int,
     lead_time_hours: int,
-    variables: tuple[str, ...] = ("temperature_2m", "precipitation_rate"),
+    variables: tuple[str, ...] = DEFAULT_SELECTION_VARIABLES,
 ) -> SelectionResult:
     """Select required GEFS GRIB2 records from parsed .idx records.
 
@@ -364,6 +580,14 @@ def select_gefs_records(
       instantaneous ``prate`` (they provide accumulated ``APCP``). This variable
       is marked :attr:`SelectionStatus.UNSUPPORTED` and does **not** trigger
       missing-required errors or full-file fallback.
+    * ``relative_humidity_2m``: Matches parameter ``"RH"`` at level
+      ``"2 m above ground"`` and matching ensemble tag.
+    * ``wind_gust``: Matches parameter ``"GUST"`` at level ``"surface"``
+      and matching ensemble tag.
+    * ``visibility``: Matches parameter ``"VIS"`` at level ``"surface"``
+      and matching ensemble tag.
+    * ``snow_depth``: Matches parameter ``"SNOD"`` at level ``"surface"``
+      and matching ensemble tag.
 
     Args:
         records: Parsed ``.idx`` records.
@@ -390,28 +614,14 @@ def select_gefs_records(
                 and _matches_step(rec.forecast_description, lead_time_hours)
                 and _matches_gefs_member(rec.ensemble_description, member)
             ]
-            if len(matches) == 1:
-                rec = matches[0]
-                variable_selections[var] = VariableSelection(
-                    variable_code=var,
-                    status=SelectionStatus.SELECTED,
-                    record=rec,
-                    matched_records=tuple(matches),
-                )
-                all_selected.append(rec)
-            elif len(matches) == 0:
-                variable_selections[var] = VariableSelection(
-                    variable_code=var,
-                    status=SelectionStatus.REQUIRED_BUT_MISSING,
-                )
-                missing_required.append(var)
-            else:
-                variable_selections[var] = VariableSelection(
-                    variable_code=var,
-                    status=SelectionStatus.AMBIGUOUS,
-                    matched_records=tuple(matches),
-                )
-                ambiguous.append(var)
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
 
         elif var == "precipitation_rate":
             # GEFS pgrb2s has no instant prate; unsupported by product design
@@ -420,6 +630,185 @@ def select_gefs_records(
                 status=SelectionStatus.UNSUPPORTED,
             )
             unsupported.append(var)
+
+        elif var == "relative_humidity_2m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "RH"
+                and rec.level_description == "2 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_gust":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "GUST"
+                and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "visibility":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "VIS"
+                and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "snow_depth":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "SNOD"
+                and rec.level_description == "surface"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_u_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "UGRD"
+                and rec.level_description == "10 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "wind_v_10m":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "VGRD"
+                and rec.level_description == "10 m above ground"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
+
+        elif var == "precipitation_amount_3h":
+            if lead_time_hours == 0:
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_apcp_description(lead_time_hours)
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == "APCP"
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                        and _matches_gefs_member(rec.ensemble_description, member)
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
+
+        elif var in ("crain", "csnow", "cfrzr", "cicep"):
+            if lead_time_hours == 0:
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_categorical_description(lead_time_hours)
+                param_name = var.upper()
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == param_name
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                        and _matches_gefs_member(rec.ensemble_description, member)
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
 
         else:
             variable_selections[var] = VariableSelection(
@@ -443,7 +832,7 @@ def select_records(
     model: str,
     records: list[IdxRecord],
     lead_time_hours: int,
-    variables: tuple[str, ...] = ("temperature_2m", "precipitation_rate"),
+    variables: tuple[str, ...] = DEFAULT_SELECTION_VARIABLES,
     member: int | None = None,
 ) -> SelectionResult:
     """Dispatch product-aware record selection for a given model.
@@ -475,6 +864,38 @@ def _matches_step(desc: str, lead_time_hours: int) -> bool:
     if lead_time_hours == 0:
         return clean in ("anl", "0 hour fcst", "0 hour fcst:")
     return clean == f"{lead_time_hours} hour fcst"
+
+
+def _expected_apcp_description(lead_time_hours: int) -> str | None:
+    """Return the expected 6-hour-resetting APCP forecast description string.
+
+    * For leads 3, 9, 15, 21, ... (lead % 6 == 3): "[lead-3]-[lead] hour acc fcst"
+    * For leads 6, 12, 18, 24, ... (lead % 6 == 0): "[lead-6]-[lead] hour acc fcst"
+    * Non-standard/non-3h leads return None.
+    """
+    if lead_time_hours <= 0:
+        return None
+    if lead_time_hours % 6 == 3:
+        return f"{lead_time_hours - 3}-{lead_time_hours} hour acc fcst"
+    if lead_time_hours % 6 == 0:
+        return f"{lead_time_hours - 6}-{lead_time_hours} hour acc fcst"
+    return None
+
+
+def _expected_categorical_description(lead_time_hours: int) -> str | None:
+    """Return the expected 6-hour-resetting categorical average forecast description.
+
+    * For leads 3, 9, 15, 21, ... (lead % 6 == 3): "[lead-3]-[lead] hour ave fcst"
+    * For leads 6, 12, 18, 24, ... (lead % 6 == 0): "[lead-6]-[lead] hour ave fcst"
+    * Non-standard/non-3h leads return None.
+    """
+    if lead_time_hours <= 0:
+        return None
+    if lead_time_hours % 6 == 3:
+        return f"{lead_time_hours - 3}-{lead_time_hours} hour ave fcst"
+    if lead_time_hours % 6 == 0:
+        return f"{lead_time_hours - 6}-{lead_time_hours} hour ave fcst"
+    return None
 
 
 def _matches_gefs_member(ens_desc: str, target_member: int) -> bool:

@@ -62,6 +62,11 @@ def build_forecast_dataset() -> xr.Dataset:
         + 0.5 * lead_grid
     )
     precipitation = 0.5 * lead_grid
+    precip_amount_3h = np.where(lead_grid == 0, np.nan, 0.4 * lead_grid)
+    crain = np.where((lead_grid > 0) & (temperature > 0), 1, 0).astype(np.uint8)
+    csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
+    cfrzr = np.zeros_like(temperature, dtype=np.uint8)
+    cicep = np.zeros_like(temperature, dtype=np.uint8)
 
     return xr.Dataset(
         data_vars={
@@ -72,6 +77,26 @@ def build_forecast_dataset() -> xr.Dataset:
             "precipitation_rate": (
                 ("lead_time_hours", "latitude", "longitude"),
                 precipitation,
+            ),
+            "precipitation_amount_3h": (
+                ("lead_time_hours", "latitude", "longitude"),
+                precip_amount_3h,
+            ),
+            "crain": (
+                ("lead_time_hours", "latitude", "longitude"),
+                crain,
+            ),
+            "csnow": (
+                ("lead_time_hours", "latitude", "longitude"),
+                csnow,
+            ),
+            "cfrzr": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cfrzr,
+            ),
+            "cicep": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cicep,
             ),
         },
         coords={
@@ -137,6 +162,11 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
             + 2.0 * member_grid
         )
         precipitation = 0.5 * lead_grid + 1.0 * member_grid
+        precip_amount_3h = np.where(lead_grid == 0, np.nan, 0.4 * lead_grid + 0.2 * member_grid)
+        crain = np.where((lead_grid > 0) & (temperature > 0), 1, 0).astype(np.uint8)
+        csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
+        cfrzr = np.zeros_like(temperature, dtype=np.uint8)
+        cicep = np.zeros_like(temperature, dtype=np.uint8)
         return xr.Dataset(
             data_vars={
                 "temperature_2m": (
@@ -146,6 +176,26 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
                 "precipitation_rate": (
                     ("member", "lead_time_hours", "latitude", "longitude"),
                     precipitation,
+                ),
+                "precipitation_amount_3h": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    precip_amount_3h,
+                ),
+                "crain": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    crain,
+                ),
+                "csnow": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    csnow,
+                ),
+                "cfrzr": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    cfrzr,
+                ),
+                "cicep": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    cicep,
                 ),
             },
             coords={
@@ -164,6 +214,11 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
         + 0.5 * lead_grid
     )
     precipitation = 0.5 * lead_grid
+    precip_amount_3h = np.where(lead_grid == 0, np.nan, 0.4 * lead_grid)
+    crain = np.where((lead_grid > 0) & (temperature > 0), 1, 0).astype(np.uint8)
+    csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
+    cfrzr = np.zeros_like(temperature, dtype=np.uint8)
+    cicep = np.zeros_like(temperature, dtype=np.uint8)
     return xr.Dataset(
         data_vars={
             "temperature_2m": (
@@ -173,6 +228,26 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
             "precipitation_rate": (
                 ("lead_time_hours", "latitude", "longitude"),
                 precipitation,
+            ),
+            "precipitation_amount_3h": (
+                ("lead_time_hours", "latitude", "longitude"),
+                precip_amount_3h,
+            ),
+            "crain": (
+                ("lead_time_hours", "latitude", "longitude"),
+                crain,
+            ),
+            "csnow": (
+                ("lead_time_hours", "latitude", "longitude"),
+                csnow,
+            ),
+            "cfrzr": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cfrzr,
+            ),
+            "cicep": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cicep,
             ),
         },
         coords={
@@ -245,6 +320,7 @@ MEMBER_INDICES = list(range(MEMBER_COUNT))
 GEFS_FIXTURE_VARIABLES: tuple[str, ...] = (
     "temperature_2m",
     "precipitation_rate",
+    "precipitation_amount_3h",
 )
 
 #: The canonical set of GFS (deterministic) variables the fixture GFS store
@@ -252,6 +328,7 @@ GEFS_FIXTURE_VARIABLES: tuple[str, ...] = (
 GFS_FIXTURE_VARIABLES: tuple[str, ...] = (
     "temperature_2m",
     "precipitation_rate",
+    "precipitation_amount_3h",
 )
 
 
@@ -286,6 +363,11 @@ def build_ensemble_dataset() -> xr.Dataset:
         + 2.0 * member_grid
     )
     precipitation = 0.5 * lead_grid + 1.0 * member_grid
+    precip_amount_3h = np.where(lead_grid == 0, np.nan, 0.4 * lead_grid + 0.2 * member_grid)
+    crain = np.where((lead_grid > 0) & (temperature > 0), 1, 0).astype(np.uint8)
+    csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
+    cfrzr = np.zeros_like(temperature, dtype=np.uint8)
+    cicep = np.zeros_like(temperature, dtype=np.uint8)
 
     return xr.Dataset(
         data_vars={
@@ -296,6 +378,26 @@ def build_ensemble_dataset() -> xr.Dataset:
             "precipitation_rate": (
                 ("member", "lead_time_hours", "latitude", "longitude"),
                 precipitation,
+            ),
+            "precipitation_amount_3h": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                precip_amount_3h,
+            ),
+            "crain": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                crain,
+            ),
+            "csnow": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                csnow,
+            ),
+            "cfrzr": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                cfrzr,
+            ),
+            "cicep": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                cicep,
             ),
         },
         coords={
@@ -335,3 +437,13 @@ def ensemble_temperature_at(
 def ensemble_precipitation_at(member: int, lead: int) -> float:
     """Expected metric ensemble precipitation at a member and lead time."""
     return 0.5 * lead + 1.0 * member
+
+
+def ensemble_precipitation_amount_at(member: int, lead: int) -> float:
+    """Expected metric ensemble 3h precipitation amount at a member and lead time."""
+    return 0.4 * lead + 0.2 * member
+
+
+def precipitation_amount_at(lead: int) -> float:
+    """Expected metric deterministic 3h precipitation amount at a lead time."""
+    return 0.4 * lead

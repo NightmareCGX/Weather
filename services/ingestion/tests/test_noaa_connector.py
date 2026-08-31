@@ -225,10 +225,99 @@ async def test_download_selective_gfs_aws_success(tmp_path: Path) -> None:
 
     dest = tmp_path / "selective_gfs.grib2"
     async with NOAAConnector(conn_settings=_settings()) as connector:
-        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+        out = await connector.download(
+            "gfs", CYCLE, 0, 6, dest, variables=("temperature_2m", "precipitation_rate")
+        )
 
     assert out == dest
     assert dest.read_bytes() == chunk1 + chunk2
+
+
+@respx.mock
+async def test_download_selective_gfs_phase1a_variables_success(tmp_path: Path) -> None:
+    """GFS selective download for all Phase 1A variables fetches expected messages."""
+    chunk_rh = _make_mock_grib2(b"rh-data")
+    chunk_gust = _make_mock_grib2(b"gust-data")
+    chunk_vis = _make_mock_grib2(b"vis-data")
+    chunk_snod = _make_mock_grib2(b"snod-data")
+    l_rh, l_gust, l_vis, l_snod = len(chunk_rh), len(chunk_gust), len(chunk_vis), len(chunk_snod)
+
+    idx_text = (
+        f"1:0:d=2026072100:RH:2 m above ground:6 hour fcst:\n"
+        f"2:{l_rh}:d=2026072100:GUST:surface:6 hour fcst:\n"
+        f"3:{l_rh + l_gust}:d=2026072100:VIS:surface:6 hour fcst:\n"
+        f"4:{l_rh + l_gust + l_vis}:d=2026072100:SNOD:surface:6 hour fcst:\n"
+        f"5:{l_rh + l_gust + l_vis + l_snod}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+    )
+    respx.get(f"{AWS_GFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+
+    total_bytes = l_rh + l_gust + l_vis + l_snod + 5000
+    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes=0-{l_rh - 1}"}).mock(
+        return_value=httpx.Response(
+            206, content=chunk_rh, headers={"Content-Range": f"bytes 0-{l_rh - 1}/{total_bytes}"}
+        )
+    )
+    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={l_rh}-{l_rh + l_gust - 1}"}).mock(
+        return_value=httpx.Response(
+            206, content=chunk_gust, headers={"Content-Range": f"bytes {l_rh}-{l_rh + l_gust - 1}/{total_bytes}"}
+        )
+    )
+    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={l_rh + l_gust}-{l_rh + l_gust + l_vis - 1}"}).mock(
+        return_value=httpx.Response(
+            206, content=chunk_vis, headers={"Content-Range": f"bytes {l_rh + l_gust}-{l_rh + l_gust + l_vis - 1}/{total_bytes}"}
+        )
+    )
+    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={l_rh + l_gust + l_vis}-{l_rh + l_gust + l_vis + l_snod - 1}"}).mock(
+        return_value=httpx.Response(
+            206, content=chunk_snod, headers={"Content-Range": f"bytes {l_rh + l_gust + l_vis}-{l_rh + l_gust + l_vis + l_snod - 1}/{total_bytes}"}
+        )
+    )
+
+    dest = tmp_path / "selective_gfs_phase1a.grib2"
+    vars_phase1a = ("relative_humidity_2m", "wind_gust", "visibility", "snow_depth")
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download("gfs", CYCLE, 0, 6, dest, variables=vars_phase1a)
+
+    assert out == dest
+    assert dest.read_bytes() == chunk_rh + chunk_gust + chunk_vis + chunk_snod
+
+
+@respx.mock
+async def test_download_selective_gefs_phase1a_variables_success(tmp_path: Path) -> None:
+    """GEFS selective download for Phase 1A variables fetches member-specific messages."""
+    chunk_rh = _make_mock_grib2(b"rh-gefs-01")
+    chunk_gust = _make_mock_grib2(b"gust-gefs-01")
+    l_rh, l_gust = len(chunk_rh), len(chunk_gust)
+
+    idx_text = (
+        f"1:0:d=2026072100:RH:2 m above ground:6 hour fcst:ENS=+01\n"
+        f"2:{l_rh}:d=2026072100:GUST:surface:6 hour fcst:ENS=+01\n"
+        f"3:{l_rh + l_gust}:d=2026072100:APCP:surface:0-6 hour acc fcst:ENS=+01\n"
+    )
+    respx.get(f"{AWS_GEFS_006_URL}.idx").mock(
+        return_value=httpx.Response(200, text=idx_text)
+    )
+    respx.get(AWS_GEFS_006_URL, headers={"Range": f"bytes=0-{l_rh - 1}"}).mock(
+        return_value=httpx.Response(
+            206, content=chunk_rh, headers={"Content-Range": f"bytes 0-{l_rh - 1}/50000"}
+        )
+    )
+    respx.get(AWS_GEFS_006_URL, headers={"Range": f"bytes={l_rh}-{l_rh + l_gust - 1}"}).mock(
+        return_value=httpx.Response(
+            206, content=chunk_gust, headers={"Content-Range": f"bytes {l_rh}-{l_rh + l_gust - 1}/50000"}
+        )
+    )
+
+    dest = tmp_path / "selective_gefs_phase1a.grib2"
+    async with NOAAConnector(conn_settings=_settings()) as connector:
+        out = await connector.download(
+            "gefs", CYCLE, 0, 6, dest, member=1, variables=("relative_humidity_2m", "wind_gust")
+        )
+
+    assert out == dest
+    assert dest.read_bytes() == chunk_rh + chunk_gust
 
 
 @respx.mock
@@ -254,7 +343,9 @@ async def test_download_selective_gefs_member_aws_success(tmp_path: Path) -> Non
 
     dest = tmp_path / "selective_gefs.grib2"
     async with NOAAConnector(conn_settings=_settings()) as connector:
-        out = await connector.download("gefs", CYCLE, 6, 240, dest, member=17)
+        out = await connector.download(
+            "gefs", CYCLE, 6, 240, dest, member=17, variables=("temperature_2m",)
+        )
 
     assert out == dest
     assert dest.read_bytes() == chunk
@@ -288,7 +379,9 @@ async def test_download_gefs_long_lead_025deg_exists_success(tmp_path: Path) -> 
 
     dest = tmp_path / "future_gefs_252.grib2"
     async with NOAAConnector(conn_settings=_settings()) as connector:
-        out = await connector.download("gefs", CYCLE, 6, 252, dest, member=17)
+        out = await connector.download(
+            "gefs", CYCLE, 6, 252, dest, member=17, variables=("temperature_2m",)
+        )
 
     assert out == dest
     assert dest.read_bytes() == chunk
@@ -328,7 +421,9 @@ async def test_download_gefs_long_lead_025deg_aws_404_falls_back_to_nomads_025de
 
     dest = tmp_path / "nomads_gefs_252.grib2"
     async with NOAAConnector(conn_settings=_settings()) as connector:
-        out = await connector.download("gefs", CYCLE, 6, 252, dest, member=17)
+        out = await connector.download(
+            "gefs", CYCLE, 6, 252, dest, member=17, variables=("temperature_2m",)
+        )
 
     assert out == dest
     assert dest.read_bytes() == chunk
@@ -485,7 +580,9 @@ async def test_download_aws_404_falls_back_to_nomads(tmp_path: Path) -> None:
 
     dest = tmp_path / "nomads_fallback.grib2"
     async with NOAAConnector(conn_settings=_settings()) as connector:
-        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+        out = await connector.download(
+            "gfs", CYCLE, 0, 6, dest, variables=("temperature_2m", "precipitation_rate")
+        )
 
     assert out == dest
     assert dest.read_bytes() == chunk1 + chunk2
@@ -630,7 +727,9 @@ async def test_download_selective_later_range_returns_200_fallback(
 
     dest = tmp_path / "gfs_later_200.grib2"
     async with NOAAConnector(conn_settings=_settings()) as connector:
-        out = await connector.download("gfs", CYCLE, 0, 6, dest)
+        out = await connector.download(
+            "gfs", CYCLE, 0, 6, dest, variables=("temperature_2m", "precipitation_rate")
+        )
 
     assert out == dest
     result_bytes = dest.read_bytes()

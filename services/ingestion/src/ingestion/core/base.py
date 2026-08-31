@@ -68,6 +68,21 @@ class LiveStoreOverwriteError(IngestionError):
     """
 
 
+class DeaccumulationError(IngestionError):
+    """Raised when precipitation de-accumulation subtraction fails an invariant."""
+
+
+class MissingPredecessorLeadError(DeaccumulationError):
+    """Raised when a 6-hour reset lead cannot find its required predecessor lead."""
+
+
+#: Maximum negative residual (in mm) tolerated during precipitation de-accumulation.
+#: This bound accounts for upstream GRIB simple packing quantization differences
+#: (e.g. GEFS f003 packed at 0.01 mm vs f006 packed at 0.1 mm) where rounding
+#: can yield small negative residuals down to -0.09 mm.
+DEACCUMULATION_TOLERANCE_MM: float = 0.10
+
+
 class BaseConnector(ABC):
     """Base interface implemented by all upstream model connectors.
 

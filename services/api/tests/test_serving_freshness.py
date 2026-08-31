@@ -47,10 +47,12 @@ def _make_forecast_dataset(
     lead_grid, lat_grid, lon_grid = np.meshgrid(lead_arr, lat, lon, indexing="ij")
     temperature = (base_temp + 0.5 * lead_grid).astype(np.float32)
     precipitation = (0.5 * lead_grid).astype(np.float32)
+    amount_3h = np.where(lead_grid == 0, np.nan, 0.4 * lead_grid).astype(np.float32)
     return xr.Dataset(
         data_vars={
             "temperature_2m": (("lead_time_hours", "latitude", "longitude"), temperature),
             "precipitation_rate": (("lead_time_hours", "latitude", "longitude"), precipitation),
+            "precipitation_amount_3h": (("lead_time_hours", "latitude", "longitude"), amount_3h),
         },
         coords={
             "lead_time_hours": leads,

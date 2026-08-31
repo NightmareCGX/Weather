@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
 import type { SelectedLocation, SpatialLayer } from "@/lib/api/types";
 import { buildBaseStyle } from "@/lib/map/baseStyle";
 import { applyWeatherLayer, removeWeatherLayer } from "@/lib/map/layers";
 import { coordinatesToSelectedLocation } from "@/lib/forecast/selection";
+import { WindParticleAnimation } from "@/lib/map/windParticles";
+import { useVectorField } from "@/hooks/useVectorField";
 
 interface WeatherMapProps {
   /** `/v1/maps` metadata for the weather layer, or null while loading/erroring. */
@@ -15,35 +17,52 @@ interface WeatherMapProps {
   selectedLocation: SelectedLocation | null;
   /** The valid time of the current selection; drives layer keying. */
   validTime: string | null;
+  /** Available forecast lead hours for prefetch (optional). */
+  availableLeads?: number[];
   /** Fired with a coordinate location when the user clicks the map. */
   onSelect: (location: SelectedLocation) => void;
 }
 
 /**
- * MapLibre GL JS map wrapper.
+ * MapLibre GL JS map wrapper with progressive wind particle animation overlay.
  *
  * The map is created once on mount and destroyed on unmount; the create
  * effect is idempotent under React 18 strict mode (mount -> cleanup ->
  * mount). The weather layer is configured from `/v1/maps` metadata whenever
- * that metadata changes. Because `/v1/maps` is metadata-only, the backend
- * serves no tile imagery: missing tiles 404 and MapLibre keeps rendering the
- * base map — accepted graceful degradation.
+ * that metadata changes.
  *
- * Milestone 13 adds point selection: clicking the map fires `onSelect` with
- * the clicked coordinates, and the shared {@link selectedLocation} drives a
- * marker. The map component stays presentation-only (props + callbacks).
+ * For wind layers (Phase 1B.3):
+ * - Stage A: Immediately renders the scalar wind speed raster.
+ * - Stage B: In parallel, requests the quantized Int16 vector field and starts
+ *   smooth Canvas 2D particle animation overlay once vector data arrives.
  */
-export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: WeatherMapProps) {
+export function WeatherMap({
+  layer,
+  selectedLocation,
+  validTime,
+  availableLeads,
+  onSelect,
+}: WeatherMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const isStyleReadyRef = useRef<boolean>(false);
   const markerRef = useRef<maplibregl.Marker | null>(null);
+  const animRef = useRef<WindParticleAnimation | null>(null);
   const layerRef = useRef<SpatialLayer | null>(layer);
   const appliedLayerRef = useRef<SpatialLayer | null>(null);
   // Keep the click callback fresh without recreating the map (the create
   // effect must run once with an empty dependency array).
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
+
+  // Progressive vector field fetching and prefetching in parallel
+  const { field } = useVectorField({
+    vectorFieldUrl: layer?.vector_field_url_template ?? null,
+    availableLeads,
+    currentLead: layer?.lead_time_hours,
+    enabled: layer !== null && Boolean(layer.vector_field_url_template),
+  });
 
   useEffect(() => {
     if (mapRef.current !== null || containerRef.current === null) {
@@ -60,29 +79,30 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
     map.addControl(new maplibregl.NavigationControl(), "top-right");
 
     const handleClick = (event: maplibregl.MapMouseEvent) => {
-      // MapLibre can deliver a click event before the style/canvas has
-      // resolved coordinates (e.g. while raster tiles are still loading).
-      // Guard so a coordinate-less event never crashes the map or trips the
-      // Next.js error boundary.
       const lngLat = event.lngLat;
       if (lngLat === undefined) {
         return;
       }
       onSelectRef.current(coordinatesToSelectedLocation(lngLat.lat, lngLat.lng));
     };
-    // Track base style readiness: once the base map style has loaded, forecast
-    // raster tile requests must never block or delay subsequent layer transitions.
+
     const handleLoad = () => {
       if (isStyleReadyRef.current) {
         return;
       }
       isStyleReadyRef.current = true;
       map.on("click", handleClick);
+
+      if (canvasRef.current !== null && animRef.current === null) {
+        animRef.current = new WindParticleAnimation(canvasRef.current, map);
+      }
+
       if (layerRef.current !== null) {
         appliedLayerRef.current = layerRef.current;
         applyWeatherLayer(map, layerRef.current);
       }
     };
+
     if (map.isStyleLoaded()) {
       handleLoad();
     } else {
@@ -94,6 +114,10 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
       appliedLayerRef.current = null;
       map.off("click", handleClick);
       map.off("load", handleLoad);
+      if (animRef.current !== null) {
+        animRef.current.destroy();
+        animRef.current = null;
+      }
       if (markerRef.current !== null) {
         markerRef.current.remove();
         markerRef.current = null;
@@ -103,6 +127,7 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
     };
   }, []);
 
+  // Update scalar raster layer
   useEffect(() => {
     layerRef.current = layer;
     const map = mapRef.current;
@@ -120,6 +145,18 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
     applyWeatherLayer(map, layer);
   }, [layer]);
 
+  // Synchronize vector field with particle animation engine
+  useEffect(() => {
+    if (animRef.current === null) {
+      return;
+    }
+    if (layer === null || !layer.vector_field_url_template) {
+      animRef.current.setField(null);
+      return;
+    }
+    animRef.current.setField(field);
+  }, [field, layer]);
+
   // Keep the selection marker in sync with the shared selected location.
   useEffect(() => {
     const map = mapRef.current;
@@ -134,9 +171,6 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
       return;
     }
     if (markerRef.current === null) {
-      // Set the marker's coordinates before adding it to the map: maplibre's
-      // `Marker.addTo` reads `this._lngLat` during `_update`, so adding an
-      // un-positioned marker throws (reading `.lng` of undefined).
       markerRef.current = new maplibregl.Marker({ color: "#1d4ed8" })
         .setLngLat([selectedLocation.longitude, selectedLocation.latitude])
         .addTo(map);
@@ -145,5 +179,13 @@ export function WeatherMap({ layer, selectedLocation, validTime, onSelect }: Wea
     }
   }, [selectedLocation]);
 
-  return <div ref={containerRef} className="h-full w-full" data-testid="weather-map" />;
+  return (
+    <div ref={containerRef} className="relative h-full w-full" data-testid="weather-map">
+      <canvas
+        ref={canvasRef}
+        className="pointer-events-none absolute inset-0 z-10 h-full w-full"
+        data-testid="wind-particle-canvas"
+      />
+    </div>
+  );
 }

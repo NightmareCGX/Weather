@@ -1,9 +1,11 @@
 import {
   ApiError,
+  decodeVectorFieldBinary,
   getEnsembleStatistics,
   getForecastAvailability,
   getMapLayer,
   getPointForecast,
+  getVectorField,
   listModels,
   listVariables,
   RequestAbortedError,
@@ -367,6 +369,84 @@ describe("getEnsembleStatistics", () => {
     );
     expect(data.members).toEqual([15.5, 17.5, 19.5, 21.5, 23.5]);
     expect(data.members?.length).toBe(5);
+  });
+});
+
+describe("decodeVectorFieldBinary & getVectorField", () => {
+  function createTestBinary(
+    lat_count = 2,
+    lon_count = 2,
+    magic = "WNDQ",
+    version = 1,
+    flags = 1,
+    scale = 0.01
+  ): ArrayBuffer {
+    const num_pts = lat_count * lon_count;
+    const buf = new ArrayBuffer(36 + num_pts * 4);
+    const view = new DataView(buf);
+    for (let i = 0; i < 4; i++) {
+      view.setUint8(i, magic.charCodeAt(i));
+    }
+    view.setUint8(4, version);
+    view.setUint8(5, flags);
+    view.setUint16(6, 0, true);
+    view.setFloat32(8, scale, true);
+    view.setFloat32(12, 90.0, true);
+    view.setFloat32(16, -0.5, true);
+    view.setUint32(20, lat_count, true);
+    view.setFloat32(24, 0.0, true);
+    view.setFloat32(28, 0.5, true);
+    view.setUint32(32, lon_count, true);
+
+    const u_i16 = new Int16Array(buf, 36, num_pts);
+    const v_i16 = new Int16Array(buf, 36 + num_pts * 2, num_pts);
+    for (let i = 0; i < num_pts; i++) {
+      u_i16[i] = (i + 1) * 100; // u = 1.0, 2.0, 3.0, 4.0
+      v_i16[i] = -(i + 1) * 50; // v = -0.5, -1.0, -1.5, -2.0
+    }
+    return buf;
+  }
+
+  it("decodes valid quantized Int16 vector field binary buffer", () => {
+    const buf = createTestBinary(2, 2);
+    const decoded = decodeVectorFieldBinary(buf);
+
+    expect(decoded.meta.lat_count).toBe(2);
+    expect(decoded.meta.lon_count).toBe(2);
+    expect(decoded.meta.lat_start).toBeCloseTo(90.0);
+    expect(decoded.meta.lat_step).toBeCloseTo(-0.5);
+    expect(decoded.meta.scale).toBeCloseTo(0.01);
+
+    expect(decoded.u).toHaveLength(4);
+    expect(decoded.v).toHaveLength(4);
+    expect(decoded.u[0]).toBeCloseTo(1.0);
+    expect(decoded.v[0]).toBeCloseTo(-0.5);
+    expect(decoded.u[3]).toBeCloseTo(4.0);
+    expect(decoded.v[3]).toBeCloseTo(-2.0);
+  });
+
+  it("throws on invalid magic header", () => {
+    const buf = createTestBinary(2, 2, "BADM");
+    expect(() => decodeVectorFieldBinary(buf)).toThrow(/Invalid vector field magic/);
+  });
+
+  it("throws on payload size mismatch", () => {
+    const buf = createTestBinary(2, 2);
+    const truncated = buf.slice(0, 40);
+    expect(() => decodeVectorFieldBinary(truncated)).toThrow(/payload size mismatch/i);
+  });
+
+  it("fetches and decodes binary vector field via getVectorField", async () => {
+    const buf = createTestBinary(2, 2);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      arrayBuffer: () => Promise.resolve(buf),
+    } as Response);
+
+    const data = await getVectorField("/maps/gfs/wind_10m/vector-field?lead_time_hours=6");
+    expect(data.meta.lat_count).toBe(2);
+    expect(data.u[0]).toBeCloseTo(1.0);
   });
 });
 

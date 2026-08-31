@@ -4,6 +4,7 @@ import {
   formatPercent,
   formatProbabilityRange,
   formatValue,
+  formatWindDirection,
 } from "@/lib/forecast/labels";
 import {
   coordinatesToSelectedLocation,
@@ -24,17 +25,34 @@ describe("labels", () => {
     expect(meta.temperature_2m).toEqual({ name: "2-Meter Temperature", unit: "°C" });
     // Fallback applies when the catalog does not carry a known default.
     expect(meta.precipitation_rate).toEqual({ name: "Precipitation Rate", unit: "mm/h" });
+    expect(meta.relative_humidity_2m).toEqual({ name: "Relative Humidity", unit: "%" });
+    expect(meta.wind_gust).toEqual({ name: "Wind Gust", unit: "km/h" });
+    expect(meta.visibility).toEqual({ name: "Visibility", unit: "m" });
+    expect(meta.snow_depth).toEqual({ name: "Snow Depth", unit: "m" });
+    expect(meta.wind_10m).toEqual({ name: "Wind (10 m)", unit: "km/h" });
   });
 
   it("falls back for a missing or empty catalog", () => {
     expect(buildVariableMeta(null).temperature_2m.unit).toBe("°C");
     expect(buildVariableMeta([]).precipitation_rate.name).toBe("Precipitation Rate");
+    expect(buildVariableMeta([]).relative_humidity_2m.unit).toBe("%");
+    expect(buildVariableMeta([]).wind_gust.unit).toBe("km/h");
+    expect(buildVariableMeta([]).visibility.name).toBe("Visibility");
+    expect(buildVariableMeta([]).snow_depth.name).toBe("Snow Depth");
+    expect(buildVariableMeta([]).wind_10m.name).toBe("Wind (10 m)");
   });
 
   it("formats values with units", () => {
     expect(formatValue(15, "°C")).toBe("15 °C");
     expect(formatValue(15.234, "mm/h")).toBe("15.23 mm/h");
     expect(formatValue(3, "")).toBe("3");
+  });
+
+  it("formats wind direction and calm status", () => {
+    expect(formatWindDirection(225, "SW")).toBe("225° SW");
+    expect(formatWindDirection(0, "N")).toBe("0° N");
+    expect(formatWindDirection(null, "CALM")).toBe("Calm");
+    expect(formatWindDirection(undefined)).toBe("Calm");
   });
 
   it("formats percents and probability ranges", () => {

@@ -71,6 +71,7 @@ from ingestion.core.catalog import RunCatalogSpec, VariableSpec
 from ingestion.core.pipeline import (
     _apply_variable_mapping,
     _normalize_canonical_units,
+    _normalize_precipitation_increments,
     _validate_requested_lead,
     _validate_requested_member,
 )
@@ -496,6 +497,72 @@ DEFAULT_VARIABLES: tuple[VariableSpec, ...] = (
         name="Precipitation Rate",
         unit="mm/h",
         source_code="prate",
+    ),
+    VariableSpec(
+        code="precipitation_amount_3h",
+        name="3-Hour Precipitation Amount",
+        unit="mm",
+        source_code="tp",
+    ),
+    VariableSpec(
+        code="crain",
+        name="Categorical Rain Flag",
+        unit="flag",
+        source_code="crain",
+    ),
+    VariableSpec(
+        code="csnow",
+        name="Categorical Snow Flag",
+        unit="flag",
+        source_code="csnow",
+    ),
+    VariableSpec(
+        code="cfrzr",
+        name="Categorical Freezing Rain Flag",
+        unit="flag",
+        source_code="cfrzr",
+    ),
+    VariableSpec(
+        code="cicep",
+        name="Categorical Ice Pellets Flag",
+        unit="flag",
+        source_code="cicep",
+    ),
+    VariableSpec(
+        code="relative_humidity_2m",
+        name="2-Meter Relative Humidity",
+        unit="%",
+        source_code="r2",
+    ),
+    VariableSpec(
+        code="wind_gust",
+        name="Wind Gust",
+        unit="km/h",
+        source_code="gust",
+    ),
+    VariableSpec(
+        code="visibility",
+        name="Visibility",
+        unit="m",
+        source_code="vis",
+    ),
+    VariableSpec(
+        code="snow_depth",
+        name="Snow Depth",
+        unit="m",
+        source_code="sde",
+    ),
+    VariableSpec(
+        code="wind_u_10m",
+        name="10-Meter U Wind Component",
+        unit="m/s",
+        source_code="u10",
+    ),
+    VariableSpec(
+        code="wind_v_10m",
+        name="10-Meter V Wind Component",
+        unit="m/s",
+        source_code="v10",
     ),
 )
 
@@ -1005,6 +1072,9 @@ async def _run_wave(
         timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
     )
     cancel_event = threading.Event()
+    write_completed_events: dict[tuple[int | None, int], asyncio.Event] = {
+        item: asyncio.Event() for item in items
+    }
     executor = ThreadPoolExecutor(max_workers=plan.write_concurrency)
     # The persistent decode pool: up to ``plan.decode_concurrency`` reusable worker
     # processes each holding independent cfgrib/ecCodes native state.
@@ -1057,7 +1127,9 @@ async def _run_wave(
         t_dec_start = time.monotonic()
         try:
             seed_future = decode_pool.submit(seed_dest)
-            seed_dataset = _decode_and_normalize(seed_future, catalog_spec)
+            seed_dataset = _decode_and_normalize(
+                seed_future, catalog_spec, store_path=store_path, member=seed_member
+            )
             _validate_requested_lead(seed_dataset, seed_lead)
             _validate_requested_member(seed_dataset, seed_member)
             tracker.record_milestone("seed_decode_complete")
@@ -1212,6 +1284,7 @@ async def _run_wave(
                     tracker.on_write_complete(
                         seed_member, seed_lead, duration_ms=wr_dur
                     )
+                    write_completed_events[seed_item].set()
                 except Exception as exc:  # noqa: BLE001 - report failure
                     wr_dur = (time.monotonic() - t_wr_start) * 1000.0
                     tracker.on_write_failed(
@@ -1220,6 +1293,7 @@ async def _run_wave(
                     failures.append(
                         f"{spec.model} member={seed_member} lead={seed_lead}: {exc}"
                     )
+                    write_completed_events[seed_item].set()
 
                 if cancel_requested:
                     raise asyncio.CancelledError
@@ -1281,7 +1355,27 @@ async def _run_wave(
                     decode_fut = decode_pool.submit(dest)
                     try:
                         raw_ds = await asyncio.wrap_future(decode_fut)
-                        ds = _apply_variable_mapping(raw_ds, catalog_spec.variables)
+                        # Predecessor coordination for 6h-reset leads requiring de-accumulation
+                        if (
+                            lead % 6 == 0
+                            and lead > 0
+                            and any(
+                                v.code == "precipitation_amount_3h"
+                                for v in catalog_spec.variables
+                            )
+                        ):
+                            pred_item = (member, lead - 3)
+                            if pred_item in write_completed_events:
+                                await write_completed_events[pred_item].wait()
+                                if cancel_event.is_set():
+                                    return
+                        ds = _normalize_precipitation_increments(
+                            raw_ds,
+                            catalog_spec.variables,
+                            store_path=store_path,
+                            member=member,
+                        )
+                        ds = _apply_variable_mapping(ds, catalog_spec.variables)
                         ds = _normalize_canonical_units(ds, catalog_spec.variables)
                         ds.attrs["model_id"] = catalog_spec.model_id
                         _validate_requested_lead(ds, lead)
@@ -1298,6 +1392,7 @@ async def _run_wave(
                         failures.append(
                             f"{spec.model} member={member} lead={lead} decode: {exc}"
                         )
+                        write_completed_events[(member, lead)].set()
                         return
 
                 # Stage 4: Bounded write admission (application-level backpressure BEFORE thread submission)
@@ -1341,6 +1436,7 @@ async def _run_wave(
                         tracker.on_write_complete(
                             member, lead, duration_ms=wr_dur
                         )
+                        write_completed_events[(member, lead)].set()
                     except Exception as exc:  # noqa: BLE001 - report write failure
                         wr_dur = (time.monotonic() - t_wr_start) * 1000.0
                         tracker.on_write_failed(
@@ -1349,6 +1445,7 @@ async def _run_wave(
                         failures.append(
                             f"{spec.model} member={member} lead={lead} write: {exc}"
                         )
+                        write_completed_events[(member, lead)].set()
                     finally:
                         # Drop local dataset reference so memory is freed promptly
                         ds = None
@@ -1457,22 +1554,30 @@ async def _run_wave(
 def _decode_and_normalize(
     future: "concurrent.futures.Future[xr.Dataset]",
     catalog_spec: RunCatalogSpec,
+    *,
+    store_path: str | None = None,
+    predecessor_array: Any | None = None,
+    member: int | None = None,
 ) -> xr.Dataset:
     """Await a decode worker result and normalize it in the parent process.
 
     The GRIB decode itself happened inside an isolated decode worker process
     (the native ecCodes boundary). Here the parent receives the raw-normalized
     dataset — transported via pickling — and applies the pure-numpy platform
-    normalization that must stay in the orchestrator: variable-name mapping to
-    the platform vocabulary, canonical-unit conversion, and the model-id
-    attribute. A worker process that died during decode (a native ecCodes
-    abort) surfaces here as ``concurrent.futures.process.BrokenProcessPool``
-    (its ``result()`` raises), which the caller records as a per-file failure —
-    the parent stays alive and the region is never committed.
+    normalization that must stay in the orchestrator: precipitation accumulation
+    de-accumulation, variable-name mapping to the platform vocabulary,
+    canonical-unit conversion, and the model-id attribute. A worker process that
+    died during decode (a native ecCodes abort) surfaces here as
+    ``concurrent.futures.process.BrokenProcessPool`` (its ``result()`` raises),
+    which the caller records as a per-file failure — the parent stays alive and
+    the region is never committed.
 
     Args:
         future: The decode-pool future for the staged GRIB2 file.
         catalog_spec: The run's catalog metadata (variable specs + model id).
+        store_path: Optional store path for predecessor lookup at 6h leads.
+        predecessor_array: Optional explicit predecessor 2D array.
+        member: Optional member identity for ensemble predecessor lookup.
 
     Returns:
         The mapped, canonical-unit, model-tagged dataset.
@@ -1483,6 +1588,13 @@ def _decode_and_normalize(
             accounting.
     """
     ds = future.result()
+    ds = _normalize_precipitation_increments(
+        ds,
+        catalog_spec.variables,
+        store_path=store_path,
+        predecessor_array=predecessor_array,
+        member=member,
+    )
     ds = _apply_variable_mapping(ds, catalog_spec.variables)
     ds = _normalize_canonical_units(ds, catalog_spec.variables)
     ds.attrs["model_id"] = catalog_spec.model_id

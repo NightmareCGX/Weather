@@ -151,22 +151,34 @@ def test_select_gfs_records_success() -> None:
         "3:1500:d=2026082600:SPFH:2 m above ground:6 hour fcst:",
         "4:2500:d=2026082600:PRATE:surface:6 hour fcst:",
         "5:3500:d=2026082600:PRATE:surface:0-6 hour ave fcst:",
-        "6:4500:d=2026082600:APCP:surface:0-6 hour acc fcst:",
+        "6:4500:d=2026082600:RH:2 m above ground:6 hour fcst:",
+        "7:5500:d=2026082600:GUST:surface:6 hour fcst:",
+        "8:6500:d=2026082600:VIS:surface:6 hour fcst:",
+        "9:7500:d=2026082600:SNOD:surface:6 hour fcst:",
+        "10:8500:d=2026082600:UGRD:10 m above ground:6 hour fcst:",
+        "11:9500:d=2026082600:VGRD:10 m above ground:6 hour fcst:",
+        "12:10500:d=2026082600:APCP:surface:0-6 hour acc fcst:",
+        "13:11500:d=2026082600:CSNOW:surface:0-6 hour ave fcst:",
+        "14:12500:d=2026082600:CICEP:surface:0-6 hour ave fcst:",
+        "15:13500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:",
+        "16:14500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:",
     ]
     records = parse_idx("\n".join(lines))
     result = select_gfs_records(records, lead_time_hours=6)
 
     assert result.is_valid
-    assert len(result.selected_records) == 2
+    assert len(result.selected_records) == 13
     assert result.missing_required == ()
     assert result.ambiguous == ()
 
     # Selected records are strictly sorted by start_offset
-    assert result.selected_records[0].parameter == "TMP"
+    params = [r.parameter for r in result.selected_records]
+    assert params == [
+        "TMP", "PRATE", "RH", "GUST", "VIS", "SNOD", "UGRD", "VGRD",
+        "APCP", "CSNOW", "CICEP", "CFRZR", "CRAIN"
+    ]
     assert result.selected_records[0].start_offset == 500
     assert result.selected_records[0].end_offset == 1499
-
-    assert result.selected_records[1].parameter == "PRATE"
     assert result.selected_records[1].start_offset == 2500
     assert result.selected_records[1].end_offset == 3499
 
@@ -176,14 +188,76 @@ def test_select_gfs_records_lead_zero_analysis() -> None:
         "1:0:d=2026082600:PRMSL:mean sea level:anl:",
         "2:500:d=2026082600:TMP:2 m above ground:anl:",
         "3:1500:d=2026082600:PRATE:surface:anl:",
-        "4:2500:d=2026082600:UGRD:10 m above ground:anl:",
+        "4:2500:d=2026082600:RH:2 m above ground:anl:",
+        "5:3500:d=2026082600:GUST:surface:anl:",
+        "6:4500:d=2026082600:VIS:surface:anl:",
+        "7:5500:d=2026082600:SNOD:surface:anl:",
+        "8:6500:d=2026082600:UGRD:10 m above ground:anl:",
+        "9:7500:d=2026082600:VGRD:10 m above ground:anl:",
     ]
     records = parse_idx("\n".join(lines))
     result = select_gfs_records(records, lead_time_hours=0)
     assert result.is_valid
-    assert len(result.selected_records) == 2
-    assert result.selected_records[0].parameter == "TMP"
-    assert result.selected_records[1].parameter == "PRATE"
+    # APCP and categorical flags at lead 0 are selected with record=None (no bytes downloaded)
+    assert len(result.selected_records) == 8
+    assert result.variable_selections["precipitation_amount_3h"].status == SelectionStatus.SELECTED
+    assert result.variable_selections["precipitation_amount_3h"].record is None
+    assert result.variable_selections["crain"].status == SelectionStatus.SELECTED
+    assert result.variable_selections["crain"].record is None
+    params = [r.parameter for r in result.selected_records]
+    assert params == ["TMP", "PRATE", "RH", "GUST", "VIS", "SNOD", "UGRD", "VGRD"]
+
+
+def test_select_gfs_records_categorical_ave_vs_instant() -> None:
+    """GFS selector chooses interval-average categorical flags over instantaneous."""
+    lines = [
+        "1:0:d=2026082600:CSNOW:surface:6 hour fcst:",
+        "2:500:d=2026082600:CICEP:surface:6 hour fcst:",
+        "3:1500:d=2026082600:CFRZR:surface:6 hour fcst:",
+        "4:2500:d=2026082600:CRAIN:surface:6 hour fcst:",
+        "5:3500:d=2026082600:CSNOW:surface:0-6 hour ave fcst:",
+        "6:4500:d=2026082600:CICEP:surface:0-6 hour ave fcst:",
+        "7:5500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:",
+        "8:6500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:",
+    ]
+    records = parse_idx("\n".join(lines))
+    result = select_gfs_records(
+        records,
+        lead_time_hours=6,
+        variables=("crain", "csnow", "cfrzr", "cicep"),
+    )
+    assert result.is_valid
+    assert len(result.selected_records) == 4
+    # Verified: selected records are the 'ave fcst' records
+    for r in result.selected_records:
+        assert r.forecast_description == "0-6 hour ave fcst"
+    assert result.selected_records[0].start_offset == 3500
+
+
+def test_select_gfs_records_apcp_patterns() -> None:
+    # Test 3h lead (e.g. f009 -> 6-9 hour acc fcst)
+    lines_f009 = [
+        "1:0:d=2026082600:TMP:2 m above ground:9 hour fcst:",
+        "2:500:d=2026082600:APCP:surface:6-9 hour acc fcst:",
+        "3:1500:d=2026082600:APCP:surface:0-9 hour acc fcst:",  # Continuous total (rejected)
+    ]
+    records_f009 = parse_idx("\n".join(lines_f009))
+    result_f009 = select_gfs_records(records_f009, lead_time_hours=9, variables=("precipitation_amount_3h",))
+    assert result_f009.is_valid
+    assert len(result_f009.selected_records) == 1
+    assert result_f009.selected_records[0].forecast_description == "6-9 hour acc fcst"
+
+    # Test 6h lead (e.g. f012 -> 6-12 hour acc fcst)
+    lines_f012 = [
+        "1:0:d=2026082600:TMP:2 m above ground:12 hour fcst:",
+        "2:500:d=2026082600:APCP:surface:6-12 hour acc fcst:",
+        "3:1500:d=2026082600:APCP:surface:0-12 hour acc fcst:",  # Continuous total (rejected)
+    ]
+    records_f012 = parse_idx("\n".join(lines_f012))
+    result_f012 = select_gfs_records(records_f012, lead_time_hours=12, variables=("precipitation_amount_3h",))
+    assert result_f012.is_valid
+    assert len(result_f012.selected_records) == 1
+    assert result_f012.selected_records[0].forecast_description == "6-12 hour acc fcst"
 
 
 def test_select_gfs_records_excludes_averaged_and_accumulated_prate() -> None:
@@ -194,7 +268,11 @@ def test_select_gfs_records_excludes_averaged_and_accumulated_prate() -> None:
         "4:2500:d=2026082600:PRATE:surface:6 hour fcst:",
     ]
     records = parse_idx("\n".join(lines))
-    result = select_gfs_records(records, lead_time_hours=6)
+    result = select_gfs_records(
+        records,
+        lead_time_hours=6,
+        variables=("temperature_2m", "precipitation_rate"),
+    )
     assert result.is_valid
     assert len(result.selected_records) == 2
     # Only instant PRATE is selected
@@ -210,10 +288,17 @@ def test_select_gfs_missing_required_variable() -> None:
         "2:500:d=2026082600:SPFH:2 m above ground:6 hour fcst:",
     ]
     records = parse_idx("\n".join(lines))
-    result = select_gfs_records(records, lead_time_hours=6)
+    result = select_gfs_records(
+        records,
+        lead_time_hours=6,
+        variables=("temperature_2m", "precipitation_rate"),
+    )
     assert not result.is_valid
     assert "precipitation_rate" in result.missing_required
-    assert result.variable_selections["precipitation_rate"].status == SelectionStatus.REQUIRED_BUT_MISSING
+    assert (
+        result.variable_selections["precipitation_rate"].status
+        == SelectionStatus.REQUIRED_BUT_MISSING
+    )
 
 
 def test_select_gfs_ambiguous_variable() -> None:
@@ -223,28 +308,96 @@ def test_select_gfs_ambiguous_variable() -> None:
         "3:1500:d=2026082600:PRATE:surface:6 hour fcst:",
     ]
     records = parse_idx("\n".join(lines))
-    result = select_gfs_records(records, lead_time_hours=6)
+    result = select_gfs_records(
+        records,
+        lead_time_hours=6,
+        variables=("temperature_2m", "precipitation_rate"),
+    )
     assert not result.is_valid
     assert "temperature_2m" in result.ambiguous
-    assert result.variable_selections["temperature_2m"].status == SelectionStatus.AMBIGUOUS
+    assert (
+        result.variable_selections["temperature_2m"].status
+        == SelectionStatus.AMBIGUOUS
+    )
 
 
 def test_select_gefs_records_success() -> None:
     lines = [
         "1:0:d=2026082600:VIS:surface:6 hour fcst:ENS=+17",
         "2:500:d=2026082600:TMP:2 m above ground:6 hour fcst:ENS=+17",
-        "3:1500:d=2026082600:APCP:surface:0-6 hour acc fcst:ENS=+17",
+        "3:1500:d=2026082600:GUST:surface:6 hour fcst:ENS=+17",
+        "4:2500:d=2026082600:RH:2 m above ground:6 hour fcst:ENS=+17",
+        "5:3500:d=2026082600:SNOD:surface:6 hour fcst:ENS=+17",
+        "6:4500:d=2026082600:UGRD:10 m above ground:6 hour fcst:ENS=+17",
+        "7:5500:d=2026082600:VGRD:10 m above ground:6 hour fcst:ENS=+17",
+        "8:6500:d=2026082600:APCP:surface:0-6 hour acc fcst:ENS=+17",
+        "9:7500:d=2026082600:CSNOW:surface:0-6 hour ave fcst:ENS=+17",
+        "10:8500:d=2026082600:CICEP:surface:0-6 hour ave fcst:ENS=+17",
+        "11:9500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:ENS=+17",
+        "12:10500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:ENS=+17",
     ]
     records = parse_idx("\n".join(lines))
     result = select_gefs_records(records, member=17, lead_time_hours=6)
     assert result.is_valid
-    assert len(result.selected_records) == 1
-    assert result.selected_records[0].parameter == "TMP"
-    assert result.selected_records[0].ensemble_description == "ENS=+17"
+    assert len(result.selected_records) == 12
+    params = [r.parameter for r in result.selected_records]
+    assert params == [
+        "VIS", "TMP", "GUST", "RH", "SNOD", "UGRD", "VGRD",
+        "APCP", "CSNOW", "CICEP", "CFRZR", "CRAIN"
+    ]
+    for r in result.selected_records:
+        assert r.ensemble_description == "ENS=+17"
     # PRATE is classified as UNSUPPORTED, not missing_required
-    assert result.variable_selections["precipitation_rate"].status == SelectionStatus.UNSUPPORTED
+    assert (
+        result.variable_selections["precipitation_rate"].status
+        == SelectionStatus.UNSUPPORTED
+    )
     assert "precipitation_rate" in result.unsupported
     assert result.missing_required == ()
+
+
+def test_select_gefs_records_apcp_patterns() -> None:
+    lines_f003 = [
+        "1:0:d=2026082600:VIS:surface:3 hour fcst:ENS=+01",
+        "2:500:d=2026082600:APCP:surface:0-3 hour acc fcst:ENS=+01",
+    ]
+    records_f003 = parse_idx("\n".join(lines_f003))
+    result_f003 = select_gefs_records(records_f003, member=1, lead_time_hours=3, variables=("precipitation_amount_3h",))
+    assert result_f003.is_valid
+    assert len(result_f003.selected_records) == 1
+    assert result_f003.selected_records[0].forecast_description == "0-3 hour acc fcst"
+
+    lines_f009 = [
+        "1:0:d=2026082600:VIS:surface:9 hour fcst:ENS=+01",
+        "2:500:d=2026082600:APCP:surface:6-9 hour acc fcst:ENS=+01",
+    ]
+    records_f009 = parse_idx("\n".join(lines_f009))
+    result_f009 = select_gefs_records(records_f009, member=1, lead_time_hours=9, variables=("precipitation_amount_3h",))
+    assert result_f009.is_valid
+    assert len(result_f009.selected_records) == 1
+    assert result_f009.selected_records[0].forecast_description == "6-9 hour acc fcst"
+
+
+def test_select_gefs_records_categorical_patterns() -> None:
+    """GEFS categorical selection matches 3h/6h ave fcst and respects member tags."""
+    lines = [
+        "1:0:d=2026082600:CSNOW:surface:0-6 hour ave fcst:ENS=+05",
+        "2:500:d=2026082600:CICEP:surface:0-6 hour ave fcst:ENS=+05",
+        "3:1500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:ENS=+05",
+        "4:2500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:ENS=+05",
+    ]
+    records = parse_idx("\n".join(lines))
+    result = select_gefs_records(
+        records,
+        member=5,
+        lead_time_hours=6,
+        variables=("crain", "csnow", "cfrzr", "cicep"),
+    )
+    assert result.is_valid
+    assert len(result.selected_records) == 4
+    for r in result.selected_records:
+        assert r.ensemble_description == "ENS=+05"
+        assert r.forecast_description == "0-6 hour ave fcst"
 
 
 def test_select_gefs_member_mismatch() -> None:
@@ -263,10 +416,32 @@ def test_select_records_dispatch() -> None:
     gfs_lines = [
         "1:0:d=2026082600:TMP:2 m above ground:6 hour fcst:",
         "2:500:d=2026082600:PRATE:surface:6 hour fcst:",
+        "3:1500:d=2026082600:RH:2 m above ground:6 hour fcst:",
+        "4:2500:d=2026082600:GUST:surface:6 hour fcst:",
+        "5:3500:d=2026082600:VIS:surface:6 hour fcst:",
+        "6:4500:d=2026082600:SNOD:surface:6 hour fcst:",
+        "7:5500:d=2026082600:UGRD:10 m above ground:6 hour fcst:",
+        "8:6500:d=2026082600:VGRD:10 m above ground:6 hour fcst:",
+        "9:7500:d=2026082600:APCP:surface:0-6 hour acc fcst:",
+        "10:8500:d=2026082600:CSNOW:surface:0-6 hour ave fcst:",
+        "11:9500:d=2026082600:CICEP:surface:0-6 hour ave fcst:",
+        "12:10500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:",
+        "13:11500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:",
     ]
     records = parse_idx("\n".join(gfs_lines))
     res_gfs = select_records("gfs", records, lead_time_hours=6)
     assert res_gfs.is_valid
+    assert len(res_gfs.selected_records) == 13
+
+    # Test explicit variable subset
+    res_subset = select_records(
+        "gfs",
+        records,
+        lead_time_hours=6,
+        variables=("temperature_2m", "wind_gust"),
+    )
+    assert res_subset.is_valid
+    assert len(res_subset.selected_records) == 2
 
     with pytest.raises(ValueError, match="member must be provided"):
         select_records("gefs", records, lead_time_hours=6)

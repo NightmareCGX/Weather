@@ -35,9 +35,12 @@ from sqlalchemy.orm import Session
 
 from ingestion.core.base import (
     CycleStoreMismatchError,
+    DEACCUMULATION_TOLERANCE_MM,
+    DeaccumulationError,
     IngestionError,
     LeadTimeMismatchError,
     LiveStoreOverwriteError,
+    MissingPredecessorLeadError,
     StoreSchemaMismatchError,
 )
 from ingestion.core.catalog import (
@@ -247,7 +250,263 @@ _SOURCE_TO_CANONICAL: dict[
     # rate conversion is a pure ×3600 (s-1 → h-1). This is a rate conversion,
     # not an accumulation conversion.
     "mm/h": {"kgm-2s-1": lambda array: array * 3600.0},
+    # Wind gust ``gust`` is m/s; canonical is km/h (x3.6).
+    "km/h": {
+        "ms-1": lambda array: array * 3.6,
+        "m/s": lambda array: array * 3.6,
+    },
+    # Relative humidity is %; canonical is %.
+    "%": {"%": lambda array: array},
+    # Visibility and snow depth are meters; canonical is meters.
+    "m": {"m": lambda array: array},
+    # Wind vector components are m/s; canonical is m/s.
+    "m/s": {
+        "ms-1": lambda array: array,
+        "m/s": lambda array: array,
+    },
+    # Total precipitation ``tp`` is kg m-2; canonical is mm (liquid water equivalent, x1.0).
+    "mm": {
+        "kgm-2": lambda array: array,
+        "kg/m2": lambda array: array,
+        "kg/m^2": lambda array: array,
+        "mm": lambda array: array,
+    },
+    # Categorical precipitation flags (crain, csnow, cfrzr, cicep) are binary indicators (Code table 4.222).
+    "flag": {
+        "(codetable4.222)": lambda array: np.asarray(array, dtype=np.uint8),
+        "codetable4.222": lambda array: np.asarray(array, dtype=np.uint8),
+        "flag": lambda array: np.asarray(array, dtype=np.uint8),
+        "0/1flag": lambda array: np.asarray(array, dtype=np.uint8),
+        "numeric": lambda array: np.asarray(array, dtype=np.uint8),
+    },
 }
+
+
+def deaccumulate_precipitation(
+    current_accum: npt.NDArray[Any],
+    predecessor_accum: npt.NDArray[Any],
+    *,
+    tolerance: float = DEACCUMULATION_TOLERANCE_MM,
+) -> npt.NDArray[np.float32]:
+    """Derive 3-hour precipitation increment by subtracting predecessor accumulation.
+
+    Computes ``increment = current_accum - predecessor_accum`` and applies
+    quantization-aware tolerance clamping:
+    * Non-negative increments are retained as-is.
+    * Negative residuals within ``[-tolerance, 0.0)`` (caused by upstream GRIB
+      packing scale differences between 3h and 6h files) are clamped to ``0.0``.
+    * Negative residuals strictly below ``-tolerance`` violate physical and
+      quantization invariants and raise :class:`DeaccumulationError`.
+
+    Args:
+        current_accum: Current interval accumulation array (e.g. [t-6, t]).
+        predecessor_accum: Predecessor interval accumulation array (e.g. [t-6, t-3]).
+        tolerance: Maximum tolerable negative residual in mm (default: 0.10 mm).
+
+    Returns:
+        The normalized 3-hour precipitation increment array (dtype float32).
+
+    Raises:
+        DeaccumulationError: If shape mismatch or negative residual exceeds tolerance.
+    """
+    curr = np.asarray(current_accum, dtype=np.float64)
+    pred = np.asarray(predecessor_accum, dtype=np.float64)
+    if curr.shape != pred.shape:
+        raise DeaccumulationError(
+            f"Cannot de-accumulate precipitation: shape mismatch between current "
+            f"{curr.shape} and predecessor {pred.shape}."
+        )
+    diff = curr - pred
+    valid_mask = ~np.isnan(diff)
+    if np.any(valid_mask):
+        min_residual = float(np.min(diff[valid_mask]))
+        if min_residual < -tolerance:
+            raise DeaccumulationError(
+                f"Precipitation de-accumulation negative residual {min_residual:.4f} mm "
+                f"exceeds tolerance bound {-tolerance:.4f} mm."
+            )
+    clamped = np.where((diff < 0.0) & (diff >= -tolerance), 0.0, diff)
+    return np.asarray(clamped, dtype=np.float32)
+
+
+def read_predecessor_precipitation(
+    store_path: str,
+    lead_time_hours: int,
+    *,
+    member: int | None = None,
+) -> npt.NDArray[np.float32]:
+    """Read a committed precipitation_amount_3h slice from a cycle's Zarr store.
+
+    Used by the ingestion normalizer when deriving 3-hour increments for
+    6-hour-reset leads (t=6, 12, 18, 24, ...).
+
+    Args:
+        store_path: Path/URL to the target Zarr store.
+        lead_time_hours: The predecessor lead time (e.g. lead - 3).
+        member: Ensemble member index (None for deterministic).
+
+    Returns:
+        2D numpy array of predecessor precipitation amounts (dtype float32).
+
+    Raises:
+        MissingPredecessorLeadError: If store does not exist, lead is missing,
+            or slice is completely uncommitted (all NaN).
+    """
+    if not store_exists(store_path):
+        raise MissingPredecessorLeadError(
+            f"Cannot read predecessor precipitation: store {store_path!r} does not exist."
+        )
+    ds = read_dataset(store_path)
+    if "precipitation_amount_3h" not in ds.data_vars:
+        raise MissingPredecessorLeadError(
+            f"Cannot read predecessor precipitation: variable 'precipitation_amount_3h' "
+            f"is missing from store {store_path!r}."
+        )
+    if "lead_time_hours" not in ds.coords:
+        raise MissingPredecessorLeadError(
+            f"Cannot read predecessor precipitation: no 'lead_time_hours' coordinate in {store_path!r}."
+        )
+    lead_vals = [int(v) for v in np.atleast_1d(ds.coords["lead_time_hours"].values).reshape(-1)]
+    if int(lead_time_hours) not in lead_vals:
+        raise MissingPredecessorLeadError(
+            f"Predecessor lead {lead_time_hours} is not in store's lead coordinates {lead_vals}."
+        )
+
+    var = ds["precipitation_amount_3h"]
+    if member is not None:
+        if "member" not in ds.coords:
+            raise MissingPredecessorLeadError(
+                f"Expected ensemble store with 'member' coordinate in {store_path!r}."
+            )
+        member_vals = [int(v) for v in np.atleast_1d(ds.coords["member"].values).reshape(-1)]
+        if int(member) not in member_vals:
+            raise MissingPredecessorLeadError(
+                f"Predecessor member {member} is not in store's member coordinates {member_vals}."
+            )
+        slice_da = var.sel(member=member, lead_time_hours=lead_time_hours)
+    else:
+        slice_da = var.sel(lead_time_hours=lead_time_hours)
+
+    vals = np.asarray(slice_da.values, dtype=np.float32)
+    if np.all(np.isnan(vals)):
+        raise MissingPredecessorLeadError(
+            f"Predecessor lead {lead_time_hours} (member={member}) in {store_path!r} "
+            "is uncommitted (contains only NaN values)."
+        )
+    return vals
+
+
+def _normalize_precipitation_increments(
+    dataset: xr.Dataset,
+    variables: tuple[VariableSpec, ...],
+    *,
+    store_path: str | None = None,
+    predecessor_array: npt.NDArray[Any] | None = None,
+    member: int | None = None,
+) -> xr.Dataset:
+    """Normalize precipitation accumulation fields to canonical 3-hour increments.
+
+    Canonical contract:
+    * lead == 0: precipitation_amount_3h is NaN (no 3h interval precedes analysis).
+    * lead % 6 == 3 (e.g. 3, 9, 15, ...): direct upstream APCP is [t-3, t].
+    * lead % 6 == 0 and lead > 0 (e.g. 6, 12, 18, ...): upstream APCP is [t-6, t].
+      Derived as amount_3h(t) = APCP[t-6, t] - APCP[t-6, t-3] using predecessor.
+
+    Args:
+        dataset: The decoded dataset (carrying raw shortNames or mapped codes).
+        variables: Run's catalog variable specifications.
+        store_path: Optional store path for predecessor lookup at 6h leads.
+        predecessor_array: Optional explicit predecessor 2D array.
+        member: Optional member identity for ensemble predecessor lookup.
+
+    Returns:
+        The dataset with normalized precipitation_amount_3h values.
+    """
+    has_precip_spec = any(
+        v.code in ("precipitation_amount_3h", "crain", "csnow", "cfrzr", "cicep")
+        for v in variables
+    )
+    if not has_precip_spec:
+        return dataset
+
+    if "lead_time_hours" not in dataset.coords:
+        return dataset
+    lead_val = int(np.asarray(dataset.coords["lead_time_hours"].values).reshape(-1)[0])
+
+    precip_var_name = None
+    if "precipitation_amount_3h" in dataset.data_vars:
+        precip_var_name = "precipitation_amount_3h"
+    elif "tp" in dataset.data_vars:
+        precip_var_name = "tp"
+
+    # Case 1: Analysis time (lead == 0)
+    if lead_val == 0:
+        if precip_var_name is not None:
+            dataset[precip_var_name].values = np.full_like(
+                dataset[precip_var_name].values, np.nan, dtype=np.float32
+            )
+            dataset[precip_var_name].attrs["units"] = "mm"
+        else:
+            if dataset.data_vars:
+                ref_var = next(iter(dataset.data_vars.values()))
+                nan_arr = np.full_like(ref_var.values, np.nan, dtype=np.float32)
+                dataset["tp"] = xr.DataArray(
+                    nan_arr,
+                    dims=ref_var.dims,
+                    coords=ref_var.coords,
+                    attrs={"units": "mm", "long_name": "3-Hour Precipitation Amount"},
+                )
+        for cat_code in ("crain", "csnow", "cfrzr", "cicep"):
+            if any(v.code == cat_code for v in variables):
+                if cat_code in dataset.data_vars:
+                    dataset[cat_code].values = np.zeros_like(
+                        dataset[cat_code].values, dtype=np.uint8
+                    )
+                    dataset[cat_code].attrs["units"] = "flag"
+                elif dataset.data_vars:
+                    ref_var = next(iter(dataset.data_vars.values()))
+                    dataset[cat_code] = xr.DataArray(
+                        np.zeros_like(ref_var.values, dtype=np.uint8),
+                        dims=ref_var.dims,
+                        coords=ref_var.coords,
+                        attrs={"units": "flag"},
+                    )
+        return dataset
+
+    if precip_var_name is None:
+        return dataset
+
+    # Case 2: Direct 3-hour lead (lead % 6 == 3)
+    if lead_val % 6 == 3:
+        dataset[precip_var_name].values = np.asarray(
+            dataset[precip_var_name].values, dtype=np.float32
+        )
+        dataset[precip_var_name].attrs["units"] = "mm"
+        return dataset
+
+    # Case 3: Differenced 6-hour lead (lead % 6 == 0)
+    if lead_val % 6 == 0:
+        pred_lead = lead_val - 3
+        if predecessor_array is None:
+            if store_path is None:
+                raise MissingPredecessorLeadError(
+                    f"Cannot de-accumulate lead {lead_val}: no store_path or predecessor_array provided."
+                )
+            predecessor_array = read_predecessor_precipitation(
+                store_path, pred_lead, member=member
+            )
+
+        curr_vals = dataset[precip_var_name].values
+        orig_shape = curr_vals.shape
+        curr_2d = np.squeeze(curr_vals)
+        pred_2d = np.squeeze(predecessor_array)
+
+        diff_2d = deaccumulate_precipitation(curr_2d, pred_2d)
+        dataset[precip_var_name].values = diff_2d.reshape(orig_shape)
+        dataset[precip_var_name].attrs["units"] = "mm"
+        return dataset
+
+    return dataset
 
 
 def _apply_variable_mapping(
@@ -418,6 +677,12 @@ def ingest_grib_file(
         )
 
     dataset = parse_grib2(grib_path)
+    dataset = _normalize_precipitation_increments(
+        dataset,
+        spec.variables,
+        store_path=store_path,
+        member=member,
+    )
     dataset = _apply_variable_mapping(dataset, spec.variables)
     dataset = _normalize_canonical_units(dataset, spec.variables)
     # Record the model so the Zarr store is self-describing about its forecast

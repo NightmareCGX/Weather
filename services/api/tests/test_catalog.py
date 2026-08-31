@@ -108,6 +108,8 @@ def test_variables_contract(client):
     assert variables["temperature_2m"]["name"] == "2-Meter Temperature"
     assert variables["temperature_2m"]["unit"] == "°C"
     assert variables["precipitation_rate"]["unit"] == "mm/h"
+    assert "wind_u_10m" not in variables
+    assert "wind_v_10m" not in variables
     for variable in body["data"]:
         assert variable["object"] == "variable"
 
