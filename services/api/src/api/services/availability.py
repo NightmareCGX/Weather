@@ -39,7 +39,9 @@ from api.services.tiles import MAX_ZOOM, MIN_ZOOM, _color_stops
 
 
 #: Internal platform variables that are not exposed as public user-facing products.
-INTERNAL_VARIABLES: frozenset[str] = frozenset({"wind_u_10m", "wind_v_10m"})
+INTERNAL_VARIABLES: frozenset[str] = frozenset(
+    {"wind_u_10m", "wind_v_10m", "crain", "csnow", "cfrzr", "cicep"}
+)
 
 
 @dataclass

@@ -238,6 +238,11 @@ def parse_idx(text: str) -> list[IdxRecord]:
 DEFAULT_SELECTION_VARIABLES: tuple[str, ...] = (
     "temperature_2m",
     "precipitation_rate",
+    "precipitation_amount_3h",
+    "crain",
+    "csnow",
+    "cfrzr",
+    "cicep",
     "relative_humidity_2m",
     "wind_gust",
     "visibility",
@@ -434,6 +439,79 @@ def select_gfs_records(
                 missing_required,
                 ambiguous,
             )
+
+        elif var == "precipitation_amount_3h":
+            if lead_time_hours == 0:
+                # Analysis time has zero accumulation duration; no GRIB record required
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_apcp_description(lead_time_hours)
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == "APCP"
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                    ]
+                    # If multiple identical matches exist (e.g. GFS f003/f006 duplicate lines),
+                    # pick the first one (the 6h-resetting family).
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
+
+        elif var in ("crain", "csnow", "cfrzr", "cicep"):
+            if lead_time_hours == 0:
+                # Analysis time has no interval-average categorical flags
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_categorical_description(lead_time_hours)
+                param_name = var.upper()
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == param_name
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
 
         else:
             variable_selections[var] = VariableSelection(
@@ -661,6 +739,77 @@ def select_gefs_records(
                 ambiguous,
             )
 
+        elif var == "precipitation_amount_3h":
+            if lead_time_hours == 0:
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_apcp_description(lead_time_hours)
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == "APCP"
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                        and _matches_gefs_member(rec.ensemble_description, member)
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
+
+        elif var in ("crain", "csnow", "cfrzr", "cicep"):
+            if lead_time_hours == 0:
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_categorical_description(lead_time_hours)
+                param_name = var.upper()
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == param_name
+                        and rec.level_description == "surface"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                        and _matches_gefs_member(rec.ensemble_description, member)
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
+
         else:
             variable_selections[var] = VariableSelection(
                 variable_code=var,
@@ -715,6 +864,38 @@ def _matches_step(desc: str, lead_time_hours: int) -> bool:
     if lead_time_hours == 0:
         return clean in ("anl", "0 hour fcst", "0 hour fcst:")
     return clean == f"{lead_time_hours} hour fcst"
+
+
+def _expected_apcp_description(lead_time_hours: int) -> str | None:
+    """Return the expected 6-hour-resetting APCP forecast description string.
+
+    * For leads 3, 9, 15, 21, ... (lead % 6 == 3): "[lead-3]-[lead] hour acc fcst"
+    * For leads 6, 12, 18, 24, ... (lead % 6 == 0): "[lead-6]-[lead] hour acc fcst"
+    * Non-standard/non-3h leads return None.
+    """
+    if lead_time_hours <= 0:
+        return None
+    if lead_time_hours % 6 == 3:
+        return f"{lead_time_hours - 3}-{lead_time_hours} hour acc fcst"
+    if lead_time_hours % 6 == 0:
+        return f"{lead_time_hours - 6}-{lead_time_hours} hour acc fcst"
+    return None
+
+
+def _expected_categorical_description(lead_time_hours: int) -> str | None:
+    """Return the expected 6-hour-resetting categorical average forecast description.
+
+    * For leads 3, 9, 15, 21, ... (lead % 6 == 3): "[lead-3]-[lead] hour ave fcst"
+    * For leads 6, 12, 18, 24, ... (lead % 6 == 0): "[lead-6]-[lead] hour ave fcst"
+    * Non-standard/non-3h leads return None.
+    """
+    if lead_time_hours <= 0:
+        return None
+    if lead_time_hours % 6 == 3:
+        return f"{lead_time_hours - 3}-{lead_time_hours} hour ave fcst"
+    if lead_time_hours % 6 == 0:
+        return f"{lead_time_hours - 6}-{lead_time_hours} hour ave fcst"
+    return None
 
 
 def _matches_gefs_member(ens_desc: str, target_member: int) -> bool:

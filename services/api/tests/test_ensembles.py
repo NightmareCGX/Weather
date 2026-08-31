@@ -316,3 +316,31 @@ def test_ensembles_include_members_degenerate_returns_pdf_null(monkeypatch, clie
     assert data["statistics"]["spread"] == 0.0
     assert "pdf" in data
     assert data["pdf"] is None
+
+
+def test_ensembles_precipitation_amount_3h_and_phase_support(client):
+    """Ensemble statistics for precipitation_amount_3h includes phase_support."""
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        f"&variable=precipitation_amount_3h&lead_time_hours={LEAD}"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    data = body["data"]
+    assert data["model"] == "gefs"
+    assert data["member_count"] == MEMBER_COUNT
+
+    # Phase support is present and sums to 1.0
+    assert "phase_support" in data
+    ps = data["phase_support"]
+    assert "rain" in ps
+    assert "snow" in ps
+    assert "dry" in ps
+    assert "freezing_rain" in ps
+    assert "ice_pellets" in ps
+    assert "unknown" in ps
+    assert sum(ps.values()) == pytest.approx(1.0, abs=1e-4)
+
+    # Transition frequency is present
+    assert "transition_frequency" in data

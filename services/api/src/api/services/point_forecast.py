@@ -30,6 +30,7 @@ from domain.exceptions import (
 )
 from domain.geo.coordinates import validate_coordinates
 from domain.geo.grid import RegularGrid
+from domain.models.precipitation import classify_precipitation_phase
 from domain.models.wind import (
     CALM_WIND_THRESHOLD_MPS,
     derive_meteorological_direction,
@@ -90,6 +91,7 @@ class ResolvedLocation:
 _SI_TO_IMPERIAL: dict[str, tuple[str, Callable[[float], float]]] = {
     "°C": ("°F", lambda celsius: celsius * 9.0 / 5.0 + 32.0),
     "mm/h": ("in/h", lambda mm: mm / 25.4),
+    "mm": ("in", lambda mm: mm / 25.4),
     "km/h": ("mph", lambda kmh: kmh * 0.621371),
     "%": ("%", lambda rh: rh),
     "m": ("mi", lambda m: m / 1609.344),
@@ -100,6 +102,7 @@ _VARIABLE_IMPERIAL_CONVERSIONS: dict[str, tuple[str, Callable[[float], float]]] 
     "snow_depth": ("in", lambda m: m * 39.3700787),
     "visibility": ("mi", lambda m: m / 1609.344),
     "wind_10m": ("mph", lambda kmh: kmh * 0.621371),
+    "precipitation_amount_3h": ("in", lambda mm: mm / 25.4),
 }
 
 
@@ -375,6 +378,25 @@ def build_point_forecast(
                     else None
                 )
                 entry["wind_cardinal_10m"] = str(values_by_var.get("_wind_cardinal_10m", "CALM"))
+            elif var_code == "precipitation_amount_3h":
+                raw_mm = values_by_var.get("precipitation_amount_3h")
+                if raw_mm is None or (isinstance(raw_mm, float) and math.isnan(raw_mm)):
+                    entry["precipitation_amount_3h"] = None
+                    entry["precipitation_type"] = "none"
+                    entry["precipitation_transition"] = "none"
+                    entry["precipitation_start_type"] = "none"
+                    entry["precipitation_end_type"] = "none"
+                    entry["precipitation_evidence"] = "exact"
+                else:
+                    converted = _convert_value(
+                        float(raw_mm), "mm", units, var_code="precipitation_amount_3h"
+                    )
+                    entry["precipitation_amount_3h"] = converted
+                    entry["precipitation_type"] = str(values_by_var.get("_precipitation_type", "none"))
+                    entry["precipitation_transition"] = str(values_by_var.get("_precipitation_transition", "none"))
+                    entry["precipitation_start_type"] = str(values_by_var.get("_precipitation_start_type", "none"))
+                    entry["precipitation_end_type"] = str(values_by_var.get("_precipitation_end_type", "none"))
+                    entry["precipitation_evidence"] = str(values_by_var.get("_precipitation_evidence", "exact"))
             else:
                 value = float(values_by_var[var_code])
                 entry[var_code] = _convert_value(
@@ -635,6 +657,104 @@ def gated_point_interpolations(
                 out["wind_10m"] = speed_kmh
                 out["_wind_direction_10m"] = direction_deg if direction_deg is not None else float("nan")
                 out["_wind_cardinal_10m"] = cardinal_str
+                continue
+
+            if var_code == "precipitation_amount_3h":
+                if "precipitation_amount_3h" not in dataset.data_vars:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Variable 'precipitation_amount_3h' is not available in the forecast dataset.",
+                    )
+                field_p = dataset["precipitation_amount_3h"]
+                if "lead_time_hours" in field_p.dims:
+                    field_p = field_p.sel(lead_time_hours=lead)
+                amt_val = float(
+                    _interpolate_neighborhood(
+                        field_p, grid, lat_desc, lon_desc, latitude, longitude
+                    )
+                )
+                out["precipitation_amount_3h"] = amt_val
+
+                # Optional categorical flags interpolation
+                flags_curr: dict[str, int] = {}
+                for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                    if f_code in dataset.data_vars:
+                        f_field = dataset[f_code]
+                        if "lead_time_hours" in f_field.dims:
+                            f_field = f_field.sel(lead_time_hours=lead)
+                        f_val = float(
+                            _interpolate_neighborhood(
+                                f_field, grid, lat_desc, lon_desc, latitude, longitude
+                            )
+                        )
+                        flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+
+                # Optional t2m
+                t2m_val: float | None = None
+                if "temperature_2m" in dataset.data_vars:
+                    t_field = dataset["temperature_2m"]
+                    if "lead_time_hours" in t_field.dims:
+                        t_field = t_field.sel(lead_time_hours=lead)
+                    t2m_val = float(
+                        _interpolate_neighborhood(
+                            t_field, grid, lat_desc, lon_desc, latitude, longitude
+                        )
+                    )
+
+                # Predecessor contextual evidence for 6-hour reset leads (t=6, 12, 18, 24, ...)
+                amt_prev: float | None = None
+                flags_prev: dict[str, int] | None = None
+                t2m_start: float | None = None
+
+                if lead % 6 == 0 and lead > 0:
+                    pred_lead = lead - 3
+                    leads_in_ds = [
+                        int(v)
+                        for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+                    ]
+                    if pred_lead in leads_in_ds:
+                        p_field_prev = dataset["precipitation_amount_3h"].sel(
+                            lead_time_hours=pred_lead
+                        )
+                        amt_prev = float(
+                            _interpolate_neighborhood(
+                                p_field_prev, grid, lat_desc, lon_desc, latitude, longitude
+                            )
+                        )
+                        f_prev = {}
+                        for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                            if f_code in dataset.data_vars:
+                                f_field_p = dataset[f_code].sel(lead_time_hours=pred_lead)
+                                f_p_val = float(
+                                    _interpolate_neighborhood(
+                                        f_field_p, grid, lat_desc, lon_desc, latitude, longitude
+                                    )
+                                )
+                                f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
+                        if f_prev:
+                            flags_prev = f_prev
+
+                        if "temperature_2m" in dataset.data_vars:
+                            t_field_p = dataset["temperature_2m"].sel(lead_time_hours=pred_lead)
+                            t2m_start = float(
+                                _interpolate_neighborhood(
+                                    t_field_p, grid, lat_desc, lon_desc, latitude, longitude
+                                )
+                            )
+
+                phase_state = classify_precipitation_phase(
+                    amt_val,
+                    flags_curr if flags_curr else None,
+                    amount_prev=amt_prev,
+                    flags_prev=flags_prev,
+                    t2m_start=t2m_start,
+                    t2m_end=t2m_val,
+                )
+                out["_precipitation_type"] = phase_state.interval_type.value
+                out["_precipitation_transition"] = phase_state.transition.value
+                out["_precipitation_start_type"] = phase_state.start_type.value
+                out["_precipitation_end_type"] = phase_state.end_type.value
+                out["_precipitation_evidence"] = phase_state.evidence.value
                 continue
 
             if var_code not in dataset.data_vars:

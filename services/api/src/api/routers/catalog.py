@@ -160,7 +160,9 @@ def list_variables(
 ) -> ListEnvelope[VariableOut]:
     """Retrieve standardized physical meteorological variables."""
     stmt = select(ForecastVariable).where(
-        ForecastVariable.variable_code.not_in(["wind_u_10m", "wind_v_10m"])
+        ForecastVariable.variable_code.not_in(
+            ["wind_u_10m", "wind_v_10m", "crain", "csnow", "cfrzr", "cicep"]
+        )
     )
     page = paginate(db, stmt, ForecastVariable.variable_code, pagination)
     data = [

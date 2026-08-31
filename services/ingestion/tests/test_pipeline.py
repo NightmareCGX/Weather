@@ -1062,3 +1062,238 @@ def test_snapshot_in_memory_validation_catches_cycle_mismatch(tmp_path) -> None:
     with pytest.raises(CycleStoreMismatchError, match="Refusing to merge"):
         _validate_store_identity_from_snapshot(ds, snapshot, snapshot.store_path)
 
+
+# --- Phase 1C.1A Precipitation Amount Foundation Tests ---
+
+
+def test_deaccumulate_precipitation_positive() -> None:
+    """Positive 6h minus 3h difference derives exact 3h increment."""
+    from ingestion.core.pipeline import deaccumulate_precipitation
+
+    curr = np.array([[5.0, 10.0], [0.0, 3.5]], dtype=np.float32)
+    pred = np.array([[2.0, 3.0], [0.0, 1.0]], dtype=np.float32)
+    result = deaccumulate_precipitation(curr, pred)
+    expected = np.array([[3.0, 7.0], [0.0, 2.5]], dtype=np.float32)
+    np.testing.assert_allclose(result, expected, rtol=1e-5)
+
+
+def test_deaccumulate_precipitation_tolerance_clamping() -> None:
+    """Small negative residual within tolerance bound [-0.10, 0.0) is clamped to 0.0."""
+    from ingestion.core.pipeline import deaccumulate_precipitation
+
+    # Simulates GEFS packing quantization difference where f003 has 0.05 mm and f006 rounds to 0.0 mm
+    curr = np.array([[5.0, 0.0], [1.0, 2.0]], dtype=np.float32)
+    pred = np.array([[2.0, 0.08], [1.0, 1.5]], dtype=np.float32)
+    result = deaccumulate_precipitation(curr, pred, tolerance=0.10)
+    expected = np.array([[3.0, 0.0], [0.0, 0.5]], dtype=np.float32)
+    np.testing.assert_allclose(result, expected, rtol=1e-5)
+
+
+def test_deaccumulate_precipitation_rejects_large_negative() -> None:
+    """Negative residual exceeding tolerance bound (< -0.10 mm) raises DeaccumulationError."""
+    from ingestion.core.base import DeaccumulationError
+    from ingestion.core.pipeline import deaccumulate_precipitation
+
+    curr = np.array([[5.0, 0.0], [1.0, 2.0]], dtype=np.float32)
+    pred = np.array([[2.0, 0.25], [1.0, 1.5]], dtype=np.float32)  # diff = -0.25 mm < -0.10 mm
+    with pytest.raises(DeaccumulationError, match="exceeds tolerance bound"):
+        deaccumulate_precipitation(curr, pred, tolerance=0.10)
+
+
+def test_deaccumulate_precipitation_shape_mismatch() -> None:
+    """Shape mismatch between current and predecessor raises DeaccumulationError."""
+    from ingestion.core.base import DeaccumulationError
+    from ingestion.core.pipeline import deaccumulate_precipitation
+
+    curr = np.array([[5.0, 1.0]], dtype=np.float32)
+    pred = np.array([[2.0, 1.0], [0.0, 0.0]], dtype=np.float32)
+    with pytest.raises(DeaccumulationError, match="shape mismatch"):
+        deaccumulate_precipitation(curr, pred)
+
+
+def test_read_predecessor_precipitation_deterministic_and_ensemble(tmp_path) -> None:
+    """read_predecessor_precipitation extracts correct 2D slice for det and ens stores."""
+    import xarray as xr
+    from ingestion.core.pipeline import read_predecessor_precipitation
+    from ingestion.core.zarr_writer import write_dataset
+
+    # Deterministic store
+    det_store = str(tmp_path / "det_precip.zarr")
+    ds_det = xr.Dataset(
+        data_vars={
+            "precipitation_amount_3h": (
+                ("lead_time_hours", "latitude", "longitude"),
+                np.array([[[1.5, 2.5], [0.0, 4.0]]], dtype=np.float32),
+            )
+        },
+        coords={
+            "lead_time_hours": [3],
+            "latitude": [10.0, 20.0],
+            "longitude": [30.0, 40.0],
+        },
+    )
+    write_dataset(ds_det, det_store)
+    slice_det = read_predecessor_precipitation(det_store, 3)
+    np.testing.assert_allclose(slice_det, [[1.5, 2.5], [0.0, 4.0]], rtol=1e-5)
+
+    # Ensemble store
+    ens_store = str(tmp_path / "ens_precip.zarr")
+    ds_ens = xr.Dataset(
+        data_vars={
+            "precipitation_amount_3h": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                np.array([[[[3.0, 6.0], [1.0, 0.5]]]], dtype=np.float32),
+            )
+        },
+        coords={
+            "member": [17],
+            "lead_time_hours": [3],
+            "latitude": [10.0, 20.0],
+            "longitude": [30.0, 40.0],
+        },
+    )
+    write_dataset(ds_ens, ens_store)
+    slice_ens = read_predecessor_precipitation(ens_store, 3, member=17)
+    np.testing.assert_allclose(slice_ens, [[3.0, 6.0], [1.0, 0.5]], rtol=1e-5)
+
+
+def test_read_predecessor_precipitation_missing_errors(tmp_path) -> None:
+    """Missing store, missing variable, or uncommitted lead raises MissingPredecessorLeadError."""
+    import xarray as xr
+    from ingestion.core.base import MissingPredecessorLeadError
+    from ingestion.core.pipeline import read_predecessor_precipitation
+    from ingestion.core.zarr_writer import write_dataset
+
+    # Non-existent store
+    with pytest.raises(MissingPredecessorLeadError, match="does not exist"):
+        read_predecessor_precipitation(str(tmp_path / "nonexistent.zarr"), 3)
+
+    # Store without precipitation_amount_3h
+    store_no_precip = str(tmp_path / "no_precip.zarr")
+    ds = xr.Dataset(
+        data_vars={"t2m": (("lead_time_hours", "latitude", "longitude"), np.ones((1, 2, 2)))},
+        coords={"lead_time_hours": [3], "latitude": [10.0, 20.0], "longitude": [30.0, 40.0]},
+    )
+    write_dataset(ds, store_no_precip)
+    with pytest.raises(MissingPredecessorLeadError, match="is missing"):
+        read_predecessor_precipitation(store_no_precip, 3)
+
+    # Uncommitted (all NaN) lead
+    store_nan = str(tmp_path / "nan_precip.zarr")
+    ds_nan = xr.Dataset(
+        data_vars={
+            "precipitation_amount_3h": (
+                ("lead_time_hours", "latitude", "longitude"),
+                np.full((1, 2, 2), np.nan, dtype=np.float32),
+            )
+        },
+        coords={"lead_time_hours": [3], "latitude": [10.0, 20.0], "longitude": [30.0, 40.0]},
+    )
+    write_dataset(ds_nan, store_nan)
+    with pytest.raises(MissingPredecessorLeadError, match="is uncommitted"):
+        read_predecessor_precipitation(store_nan, 3)
+
+
+def test_normalize_precipitation_increments_lead_zero_nan() -> None:
+    """Lead 0 normalizes precipitation_amount_3h to NaN (no interval preceding analysis)."""
+    import xarray as xr
+    from ingestion.core.pipeline import _normalize_precipitation_increments
+
+    ds = xr.Dataset(
+        data_vars={"temperature_2m": (("lead_time_hours", "latitude", "longitude"), np.ones((1, 2, 2)))},
+        coords={"lead_time_hours": [0], "latitude": [10.0, 20.0], "longitude": [30.0, 40.0]},
+    )
+    variables = (
+        VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),
+        VariableSpec("precipitation_amount_3h", "3-Hour Precipitation Amount", "mm", "tp"),
+    )
+    normalized = _normalize_precipitation_increments(ds, variables)
+    assert "tp" in normalized.data_vars
+    assert np.all(np.isnan(normalized["tp"].values))
+
+
+def test_normalize_precipitation_increments_direct_3h() -> None:
+    """Lead % 6 == 3 (e.g. lead 3, lead 9) keeps direct upstream accumulation."""
+    import xarray as xr
+    from ingestion.core.pipeline import _normalize_precipitation_increments
+
+    ds = xr.Dataset(
+        data_vars={"tp": (("lead_time_hours", "latitude", "longitude"), np.array([[[2.5, 4.0], [0.0, 1.2]]], dtype=np.float32))},
+        coords={"lead_time_hours": [9], "latitude": [10.0, 20.0], "longitude": [30.0, 40.0]},
+    )
+    variables = (VariableSpec("precipitation_amount_3h", "3-Hour Precipitation Amount", "mm", "tp"),)
+    normalized = _normalize_precipitation_increments(ds, variables)
+    np.testing.assert_allclose(normalized["tp"].values, [[[2.5, 4.0], [0.0, 1.2]]], rtol=1e-5)
+
+
+def test_normalize_precipitation_increments_differenced_6h() -> None:
+    """Lead % 6 == 0 (e.g. lead 6, lead 12) de-accumulates against predecessor array."""
+    import xarray as xr
+    from ingestion.core.pipeline import _normalize_precipitation_increments
+
+    ds = xr.Dataset(
+        data_vars={"tp": (("lead_time_hours", "latitude", "longitude"), np.array([[[6.0, 10.0], [1.0, 3.0]]], dtype=np.float32))},
+        coords={"lead_time_hours": [12], "latitude": [10.0, 20.0], "longitude": [30.0, 40.0]},
+    )
+    variables = (VariableSpec("precipitation_amount_3h", "3-Hour Precipitation Amount", "mm", "tp"),)
+    pred = np.array([[2.0, 4.0], [1.0, 1.0]], dtype=np.float32)
+    normalized = _normalize_precipitation_increments(ds, variables, predecessor_array=pred)
+    np.testing.assert_allclose(normalized["tp"].values, [[[4.0, 6.0], [0.0, 2.0]]], rtol=1e-5)
+
+
+def test_normalize_precipitation_preserves_mm() -> None:
+    """Upstream kg m**-2 maps to canonical mm with 1.0 factor."""
+    from ingestion.core.pipeline import _normalize_canonical_units
+
+    dataset = _dataset_with_units(
+        "precipitation_amount_3h",
+        [[5.25, 0.0], [12.1, 3.4]],
+        source_unit="kg m**-2",
+    )
+    variables = (VariableSpec("precipitation_amount_3h", "3-Hour Precipitation Amount", "mm", "tp"),)
+    normalized = _normalize_canonical_units(dataset, variables)
+    np.testing.assert_allclose(
+        normalized["precipitation_amount_3h"].values,
+        [[5.25, 0.0], [12.1, 3.4]],
+        rtol=1e-5,
+    )
+    assert normalized["precipitation_amount_3h"].attrs["units"] == "mm"
+
+
+def test_normalize_categorical_flags_preserves_flag_unit_and_uint8() -> None:
+    """Categorical precipitation flags map to flag unit and uint8 values."""
+    from ingestion.core.pipeline import _normalize_canonical_units
+
+    for code in ("crain", "csnow", "cfrzr", "cicep"):
+        dataset = _dataset_with_units(
+            code,
+            [[1, 0], [0, 1]],
+            source_unit="(Code table 4.222)",
+        )
+        variables = (VariableSpec(code, f"Categorical {code}", "flag", code),)
+        normalized = _normalize_canonical_units(dataset, variables)
+        assert normalized[code].attrs["units"] == "flag"
+        assert normalized[code].values.dtype == np.uint8
+        np.testing.assert_array_equal(normalized[code].values, [[1, 0], [0, 1]])
+
+
+def test_normalize_categorical_flags_lead_zero_zeros() -> None:
+    """Lead 0 normalizes categorical flags to all-zero uint8 arrays."""
+    import xarray as xr
+    from ingestion.core.pipeline import _normalize_precipitation_increments
+
+    ds = xr.Dataset(
+        data_vars={"temperature_2m": (("lead_time_hours", "latitude", "longitude"), np.ones((1, 2, 2)))},
+        coords={"lead_time_hours": [0], "latitude": [10.0, 20.0], "longitude": [30.0, 40.0]},
+    )
+    variables = (
+        VariableSpec("temperature_2m", "2-Meter Temperature", "°C", "t2m"),
+        VariableSpec("crain", "Categorical Rain", "flag", "crain"),
+        VariableSpec("csnow", "Categorical Snow", "flag", "csnow"),
+    )
+    normalized = _normalize_precipitation_increments(ds, variables)
+    assert "crain" in normalized.data_vars
+    assert "csnow" in normalized.data_vars
+    assert normalized["crain"].values.dtype == np.uint8
+    np.testing.assert_array_equal(normalized["crain"].values, [[[0, 0], [0, 0]]])
+

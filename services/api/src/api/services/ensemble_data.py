@@ -16,6 +16,7 @@ here.
 import math
 from typing import Any, Literal
 
+import numpy as np
 import xarray as xr
 from domain.ensemble import (
     ensemble_mean,
@@ -40,6 +41,14 @@ from domain.exceptions import (
     PointOutsideGridError,
 )
 from domain.geo.coordinates import validate_coordinates
+from domain.models.precipitation import (
+    PhysicalPhase,
+    PrecipitationPhaseState,
+    aggregate_ensemble_phase_support,
+    classify_precipitation_phase,
+    compute_joint_amount_phase_support,
+    compute_transition_frequencies,
+)
 from domain.models.wind import (
     compute_consensus_vector,
     compute_directional_probability,
@@ -101,6 +110,7 @@ def build_probability_forecast(
     model: str,
     threshold_max: float | None = None,
     direction_sector: str | None = None,
+    phase: str | None = None,
     initial_time: str | None = None,
 ) -> ProbabilityForecastData:
     """Build an exceedance probability forecast for a resolved point.
@@ -124,6 +134,8 @@ def build_probability_forecast(
             ``operator == "between"``.
         direction_sector: Optional 8-point cardinal direction sector for wind
             probabilities (e.g. 'SW', 'N').
+        phase: Optional physical precipitation phase (e.g. 'snow', 'rain',
+            'freezing_rain', 'ice_pellets') for joint exceedance support.
         initial_time: Optional cycle pinning string.
 
     Returns:
@@ -162,6 +174,24 @@ def build_probability_forecast(
             members_kmh = [math.hypot(u, v) * 3.6 for u, v in zip(u_members, v_members, strict=True)]
             probability = _probability(members_kmh, threshold, operator, threshold_max)
             lower, upper = probability_confidence_interval(probability, len(members_kmh))
+    elif variable == "precipitation_amount_3h" and phase is not None:
+        members, precip_states = _gated_precipitation_member_states(
+            str(run.zarr_store_path), leads[0], latitude, longitude
+        )
+        try:
+            target_phase = PhysicalPhase(phase.lower())
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=_STATUS_INVALID_INPUT,
+                detail=f"Unknown physical phase {phase!r}. Valid phases: {[p.value for p in PhysicalPhase]}",
+            ) from exc
+        try:
+            probability = compute_joint_amount_phase_support(
+                precip_states, threshold_mm=threshold, phase=target_phase
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
+        lower, upper = probability_confidence_interval(probability, len(precip_states))
     else:
         members = _gated_member_values(
             str(run.zarr_store_path), variable, leads[0], latitude, longitude
@@ -182,6 +212,8 @@ def build_probability_forecast(
         data["threshold_max"] = threshold_max
     if direction_sector is not None:
         data["direction_sector"] = direction_sector
+    if phase is not None:
+        data["phase"] = phase
     return ProbabilityForecastData(**data)
 
 
@@ -238,6 +270,8 @@ def build_ensemble_statistics(
 
     consensus_payload: ConsensusVectorOut | None = None
     wind_rose_payload: WindRoseOut | None = None
+    phase_support_payload: dict[str, float] | None = None
+    transition_freq_payload: dict[str, float] | None = None
 
     if variable == "wind_10m":
         u_members, v_members = _gated_wind_member_vectors(
@@ -269,6 +303,23 @@ def build_ensemble_statistics(
                 for s in rose.sectors
             ],
         )
+    elif variable == "precipitation_amount_3h":
+        amounts, precip_states = _gated_precipitation_member_states(
+            str(run.zarr_store_path), leads[0], latitude, longitude
+        )
+        # At lead 0 (or all-NaN accumulation), compute statistics against 0.0 baseline
+        if all(math.isnan(m) for m in amounts):
+            members = [0.0] * len(amounts)
+        else:
+            members = amounts
+
+        support_map = aggregate_ensemble_phase_support(precip_states)
+        phase_support_payload = {p.value: round(v, 4) for p, v in support_map.items()}
+
+        freq_map = compute_transition_frequencies(precip_states)
+        transition_freq_payload = {
+            t.value: round(v, 4) for t, v in freq_map.items() if v > 0.0
+        }
     else:
         members = _gated_member_values(
             str(run.zarr_store_path), variable, leads[0], latitude, longitude
@@ -298,6 +349,8 @@ def build_ensemble_statistics(
         pdf=pdf_payload if include_members else None,
         consensus_vector=consensus_payload,
         wind_rose=wind_rose_payload,
+        phase_support=phase_support_payload,
+        transition_frequency=transition_freq_payload,
     )
 
 
@@ -515,3 +568,166 @@ def _gated_wind_member_vectors(
         return u_vals, v_vals
 
     return gated_read_dataset_with_selector(store_path, select_and_interpolate)
+
+
+def _gated_precipitation_member_states(
+    store_path: str,
+    lead: int,
+    latitude: float,
+    longitude: float,
+) -> tuple[list[float], list[PrecipitationPhaseState]]:
+    """Extract per-member precipitation amounts and classify their phase states under the gate."""
+    from api.core.reader_gate import gated_read_dataset_with_selector
+
+    def select_and_classify(dataset: xr.Dataset) -> tuple[list[float], list[PrecipitationPhaseState]]:
+        if "precipitation_amount_3h" not in dataset.data_vars:
+            raise HTTPException(
+                status_code=404,
+                detail="Variable 'precipitation_amount_3h' is not available in the forecast dataset.",
+            )
+        field_amt = dataset["precipitation_amount_3h"]
+        if "member" not in field_amt.dims:
+            raise HTTPException(
+                status_code=422,
+                detail="Variable 'precipitation_amount_3h' has no ensemble member dimension in the forecast dataset.",
+            )
+        if "lead_time_hours" in field_amt.dims:
+            field_amt = field_amt.sel(lead_time_hours=lead)
+
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        member_count = int(dataset.coords["member"].size)
+
+        cat_fields = {}
+        for c in ("crain", "csnow", "cfrzr", "cicep"):
+            if c in dataset.data_vars:
+                f = dataset[c]
+                if "lead_time_hours" in f.dims:
+                    f = f.sel(lead_time_hours=lead)
+                cat_fields[c] = f
+
+        t2m_field = None
+        if "temperature_2m" in dataset.data_vars:
+            t = dataset["temperature_2m"]
+            if "lead_time_hours" in t.dims:
+                t = t.sel(lead_time_hours=lead)
+            t2m_field = t
+
+        # Predecessor fields for 6-hour reset leads (t=6, 12, 18, 24, ...)
+        pred_fields_avail = False
+        pred_field_amt = None
+        pred_cat_fields = {}
+        pred_t2m_field = None
+
+        if lead % 6 == 0 and lead > 0:
+            pred_lead = lead - 3
+            leads_in_ds = [
+                int(v)
+                for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+            ]
+            if pred_lead in leads_in_ds:
+                pred_fields_avail = True
+                pred_field_amt = dataset["precipitation_amount_3h"].sel(lead_time_hours=pred_lead)
+                for c in ("crain", "csnow", "cfrzr", "cicep"):
+                    if c in dataset.data_vars:
+                        pred_cat_fields[c] = dataset[c].sel(lead_time_hours=pred_lead)
+                if "temperature_2m" in dataset.data_vars:
+                    pred_t2m_field = dataset["temperature_2m"].sel(lead_time_hours=pred_lead)
+
+        amounts: list[float] = []
+        states: list[PrecipitationPhaseState] = []
+
+        for member_index in range(member_count):
+            amt_val = float(
+                _interpolate_neighborhood(
+                    field_amt.isel(member=member_index),
+                    grid,
+                    lat_descending,
+                    lon_descending,
+                    latitude,
+                    longitude,
+                )
+            )
+            amounts.append(amt_val)
+
+            flags: dict[str, int] = {}
+            for c, c_field in cat_fields.items():
+                c_val = float(
+                    _interpolate_neighborhood(
+                        c_field.isel(member=member_index),
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+                flags[c] = 1 if c_val >= 0.5 else 0
+
+            t_val: float | None = None
+            if t2m_field is not None:
+                t_val = float(
+                    _interpolate_neighborhood(
+                        t2m_field.isel(member=member_index),
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+
+            amt_prev: float | None = None
+            flags_prev: dict[str, int] | None = None
+            t_start_val: float | None = None
+
+            if pred_fields_avail and pred_field_amt is not None:
+                amt_prev = float(
+                    _interpolate_neighborhood(
+                        pred_field_amt.isel(member=member_index),
+                        grid,
+                        lat_descending,
+                        lon_descending,
+                        latitude,
+                        longitude,
+                    )
+                )
+                if pred_cat_fields:
+                    f_p = {}
+                    for c, c_p_field in pred_cat_fields.items():
+                        c_p_val = float(
+                            _interpolate_neighborhood(
+                                c_p_field.isel(member=member_index),
+                                grid,
+                                lat_descending,
+                                lon_descending,
+                                latitude,
+                                longitude,
+                            )
+                        )
+                        f_p[c] = 1 if c_p_val >= 0.5 else 0
+                    flags_prev = f_p
+                if pred_t2m_field is not None:
+                    t_start_val = float(
+                        _interpolate_neighborhood(
+                            pred_t2m_field.isel(member=member_index),
+                            grid,
+                            lat_descending,
+                            lon_descending,
+                            latitude,
+                            longitude,
+                        )
+                    )
+
+            st = classify_precipitation_phase(
+                amt_val,
+                flags if flags else None,
+                amount_prev=amt_prev,
+                flags_prev=flags_prev,
+                t2m_start=t_start_val,
+                t2m_end=t_val,
+            )
+            states.append(st)
+
+        return amounts, states
+
+    return gated_read_dataset_with_selector(store_path, select_and_classify)

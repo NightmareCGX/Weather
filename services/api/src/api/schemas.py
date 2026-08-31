@@ -327,6 +327,7 @@ class ProbabilityForecastData(BaseModel):
     confidence_interval_95: list[float]
     threshold_max: float | None = None
     direction_sector: str | None = None
+    phase: str | None = None
 
     @model_serializer
     def _serialize_threshold_max(self) -> dict[str, object]:
@@ -344,6 +345,8 @@ class ProbabilityForecastData(BaseModel):
             payload["threshold_max"] = self.threshold_max
         if self.direction_sector is not None:
             payload["direction_sector"] = self.direction_sector
+        if self.phase is not None:
+            payload["phase"] = self.phase
         return payload
 
 
@@ -446,6 +449,8 @@ class EnsembleStatisticsData(BaseModel):
     pdf: EnsemblePDF | None = None
     consensus_vector: ConsensusVectorOut | None = None
     wind_rose: WindRoseOut | None = None
+    phase_support: dict[str, float] | None = None
+    transition_frequency: dict[str, float] | None = None
 
     @model_serializer
     def _serialize_distribution_fields(self) -> dict[str, object]:
@@ -463,6 +468,10 @@ class EnsembleStatisticsData(BaseModel):
             payload["consensus_vector"] = self.consensus_vector
         if self.wind_rose is not None:
             payload["wind_rose"] = self.wind_rose
+        if self.phase_support is not None:
+            payload["phase_support"] = self.phase_support
+        if self.transition_frequency is not None:
+            payload["transition_frequency"] = self.transition_frequency
         return payload
 
 

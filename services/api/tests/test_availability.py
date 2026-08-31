@@ -22,9 +22,15 @@ def test_availability_contract(client):
     by_id = {model["id"]: model for model in models}
     gfs = by_id["gfs"]
     assert gfs["is_ensemble"] is False
-    assert {v["id"] for v in gfs["variables"]} == {"temperature_2m", "precipitation_rate"}
+    assert {v["id"] for v in gfs["variables"]} == {
+        "temperature_2m",
+        "precipitation_rate",
+        "precipitation_amount_3h",
+    }
     assert "wind_u_10m" not in {v["id"] for v in gfs["variables"]}
     assert "wind_v_10m" not in {v["id"] for v in gfs["variables"]}
+    assert "crain" not in {v["id"] for v in gfs["variables"]}
+    assert "csnow" not in {v["id"] for v in gfs["variables"]}
 
     # temperature_2m availability for the ready gfs run at 2026-07-21T00:00Z
     # with leads [0, 6, 12, 18] (the fixture dataset's lead coordinate).

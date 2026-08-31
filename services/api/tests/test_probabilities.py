@@ -277,3 +277,30 @@ def test_probability_service_operators_phase1a_variables():
     snod_members = [0.0, 0.05, 0.10, 0.20, 0.30]
     assert _probability(snod_members, 0.10, "gte", None) == pytest.approx(0.6)
     assert _probability(snod_members, 0.05, "between", 0.20) == pytest.approx(0.6)
+
+
+def test_probability_joint_precipitation_amount_and_phase(client):
+    """Joint exceedance probability conditioned on physical phase."""
+    resp = client.get(
+        f"/v1/probabilities?lat={LAT}&lon={LON}"
+        f"&variable=precipitation_amount_3h&threshold=2.0&operator=gte"
+        f"&lead_time_hours={LEAD}&phase=rain"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    data = body["data"]
+    assert data["variable"] == "precipitation_amount_3h"
+    assert data["phase"] == "rain"
+    assert 0.0 <= data["probability"] <= 1.0
+
+
+def test_probability_unknown_phase_422(client):
+    """Unknown phase parameter raises 422."""
+    resp = client.get(
+        f"/v1/probabilities?lat={LAT}&lon={LON}"
+        f"&variable=precipitation_amount_3h&threshold=2.0&operator=gte"
+        f"&lead_time_hours={LEAD}&phase=invalid_phase"
+    )
+    assert resp.status_code == 422
+    assert "Unknown physical phase" in resp.json()["error"]["message"]

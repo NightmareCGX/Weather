@@ -47,6 +47,9 @@ def _member_expected_value(variable: str, member: int, lat: float, lon: float, l
         return ensemble_temperature_at(member, lat, lon, lead)
     if variable == "precipitation_rate":
         return ensemble_precipitation_at(member, lead)
+    if variable == "precipitation_amount_3h":
+        from tests.fixtures import ensemble_precipitation_amount_at
+        return ensemble_precipitation_amount_at(member, lead)
     raise KeyError(variable)
 
 
@@ -184,7 +187,12 @@ def test_gefs_availability_browser_walkthrough(client):
     for variable in sorted(advertised):
         entry = next(v for v in gefs["variables"] if v["id"] == variable)
         initial = entry["initial_times"][0]
-        lead = initial["lead_time_hours"][0]
+        # For interval accumulation fields (which are NaN at lead 0), use lead > 0 if available
+        lead = (
+            initial["lead_time_hours"][1]
+            if variable == "precipitation_amount_3h" and len(initial["lead_time_hours"]) > 1
+            else initial["lead_time_hours"][0]
+        )
         initial_time = initial["value"]
 
         # Map metadata (the browser requests this first to build the tile URL).
@@ -240,8 +248,13 @@ def test_gfs_point_unchanged(client, variable):
     # deterministic field exactly (the ensemble path never alters it).
     if variable == "temperature_2m":
         expected = temperature_at(LAT, LON, LEAD)
-    else:
+    elif variable == "precipitation_rate":
         expected = precipitation_at(LEAD)
+    elif variable == "precipitation_amount_3h":
+        from tests.fixtures import precipitation_amount_at
+        expected = precipitation_amount_at(LEAD)
+    else:
+        raise KeyError(variable)
     assert abs(float(entry[variable]) - expected) < 1e-9
 
 

@@ -1,6 +1,19 @@
-"""Domain data structures and functions for forecast points and wind fields."""
+"""Domain data structures and functions for forecast points, wind fields, and precipitation."""
 
 from domain.models.point import ForecastPoint
+from domain.models.precipitation import (
+    TRACE_THRESHOLD_MM,
+    EvidenceState,
+    PhysicalPhase,
+    PrecipitationPhaseState,
+    PrecipitationTransition,
+    PrecipitationType,
+    aggregate_ensemble_phase_support,
+    classify_precipitation_phase,
+    compute_joint_amount_phase_support,
+    compute_phase_weights,
+    compute_transition_frequencies,
+)
 from domain.models.wind import (
     CALM_WIND_THRESHOLD_MPS,
     CARDINAL_DIRECTIONS_8,
@@ -26,12 +39,23 @@ __all__ = [
     "CARDINAL_DIRECTIONS_8",
     "CARDINAL_DIRECTIONS_16",
     "ConsensusVectorData",
+    "EvidenceState",
     "ForecastPoint",
+    "PhysicalPhase",
+    "PrecipitationPhaseState",
+    "PrecipitationTransition",
+    "PrecipitationType",
+    "TRACE_THRESHOLD_MM",
     "WIND_ROSE_SPEED_BINS_MPS",
     "WindRoseData",
     "WindRoseSector",
+    "aggregate_ensemble_phase_support",
+    "classify_precipitation_phase",
     "compute_consensus_vector",
     "compute_directional_probability",
+    "compute_joint_amount_phase_support",
+    "compute_phase_weights",
+    "compute_transition_frequencies",
     "compute_wind_rose",
     "derive_ensemble_mean_scalar_speed",
     "derive_ensemble_mean_vector",

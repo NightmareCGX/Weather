@@ -100,7 +100,7 @@ def _pixel_lonlat(zoom: int, x: int, y: int, px: int, py: int) -> tuple[float, f
 
 def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]:
     """Return the (value, RGB) color stops for a variable's display ramp."""
-    if variable_code == "precipitation_rate":
+    if variable_code in ("precipitation_rate", "precipitation_amount_3h"):
         return [
             (0.0, (255, 255, 255)),
             (0.5, (194, 230, 153)),
@@ -176,7 +176,7 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
 
 def _data_range(variable_code: str) -> tuple[float, float]:
     """Return the fixed (min, max) data range used to normalize a variable."""
-    if variable_code == "precipitation_rate":
+    if variable_code in ("precipitation_rate", "precipitation_amount_3h"):
         return (0.0, 40.0)
     if variable_code == "relative_humidity_2m":
         return (0.0, 100.0)

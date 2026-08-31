@@ -147,6 +147,19 @@ def _seed_verification_observations(session: Session) -> None:
             for lead in lead_times
         ]
     )
+    session.add_all(
+        [
+            ForecastProduct(
+                id=f"product_gfs_precipitation_amount_3h_{lead}",
+                run_id="run_2026072100_gfs",
+                variable_id="precipitation_amount_3h",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=lead,
+            )
+            for lead in lead_times
+        ]
+    )
     # The ready gefs run also has forecast products so the availability and map
     # metadata endpoints advertise it (a ready run without products is not
     # servable and must not be advertised).
@@ -169,6 +182,19 @@ def _seed_verification_observations(session: Session) -> None:
                 id=f"product_gefs_precipitation_rate_{lead}",
                 run_id="run_2026072100_gefs",
                 variable_id="precipitation_rate",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=lead,
+            )
+            for lead in lead_times
+        ]
+    )
+    session.add_all(
+        [
+            ForecastProduct(
+                id=f"product_gefs_precipitation_amount_3h_{lead}",
+                run_id="run_2026072100_gefs",
+                variable_id="precipitation_amount_3h",
                 grid_id="global_025deg",
                 product_type="surface",
                 lead_time_hours=lead,
@@ -330,6 +356,12 @@ def seed_data(migrated_db, tmp_zarr_stores):
             name="Precipitation Rate",
             unit="mm/h",
         )
+        precip_amount_3h = ForecastVariable(
+            id="var_precipitation_amount_3h",
+            variable_code="precipitation_amount_3h",
+            name="3-Hour Precipitation Amount",
+            unit="mm",
+        )
         global_grid = ForecastGrid(
             id="grid_global_025deg",
             grid_code="global_025deg",
@@ -355,6 +387,7 @@ def seed_data(migrated_db, tmp_zarr_stores):
                 *ensemble_members,
                 temperature,
                 precipitation,
+                precip_amount_3h,
                 global_grid,
                 downscaled_grid,
             ]
