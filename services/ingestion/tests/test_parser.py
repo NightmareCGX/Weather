@@ -186,11 +186,17 @@ def test_parse_grib2_merged_integrity() -> None:
         ds.longitude.values[1] - ds.longitude.values[0],
     )
 
-    # No conflicting scalar level coordinates.
-    assert "heightAboveGround" in ds.coords
-    assert "surface" in ds.coords
-    assert float(ds.heightAboveGround) == pytest.approx(2.0)
-    assert float(ds.surface) == pytest.approx(0.0)
+    # Transient scalar GRIB level coordinates are stripped during normalization.
+    assert "heightAboveGround" not in ds.coords
+    assert "surface" not in ds.coords
+    assert "isobaricInhPa" not in ds.coords
+    assert "meanSea" not in ds.coords
+
+    # Platform coordinates are preserved.
+    assert "time" in ds.coords
+    assert "lead_time_hours" in ds.coords
+    assert "latitude" in ds.coords
+    assert "longitude" in ds.coords
 
 
 def test_parse_grib2_empty_file_no_fields_raises(tmp_path: Path) -> None:
@@ -344,4 +350,172 @@ def test_parse_grib2_selective_vs_full_equivalence(tmp_path: Path) -> None:
 
     for coord in ds_full.coords:
         assert np.array_equal(ds_full[coord].values, ds_sel[coord].values)
+
+
+def test_parse_grib2_gfs_multi_height_succeeds(tmp_path: Path) -> None:
+    """GFS decode with multiple heightAboveGround levels (2m + 10m) merges without conflict.
+
+    Regression test: Prior to stripping transient GRIB level coordinates during
+    normalization, combining 2 m fields (2t, 2r -> heightAboveGround=2) and 10 m
+    fields (10u, 10v -> heightAboveGround=10) caused xr.merge to raise MergeError.
+    """
+    from eccodes import (
+        codes_grib_new_from_samples,
+        codes_release,
+        codes_set,
+        codes_set_values,
+        codes_write,
+    )
+
+    def _write_msg(f, sn: str, tol: str, lvl: int, st: str = "instant", val: float = 1.0) -> None:
+        msg = codes_grib_new_from_samples("GRIB2")
+        codes_set(msg, "dataDate", 20260829)
+        codes_set(msg, "dataTime", 1800)
+        codes_set(msg, "stepType", st)
+        codes_set(msg, "stepRange", "6")
+        codes_set(msg, "stepUnits", "h")
+        codes_set(msg, "shortName", sn)
+        codes_set(msg, "typeOfLevel", tol)
+        codes_set(msg, "level", lvl)
+        codes_set(msg, "gridType", "regular_ll")
+        codes_set(msg, "Ni", 10)
+        codes_set(msg, "Nj", 5)
+        codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+        codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+        codes_set(msg, "latitudeOfLastGridPointInDegrees", 36.0)
+        codes_set(msg, "longitudeOfLastGridPointInDegrees", 259.0)
+        codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
+        codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
+        codes_set_values(msg, np.full((5, 10), val, dtype=np.float32).ravel())
+        codes_write(msg, f)
+        codes_release(msg)
+
+    path = tmp_path / "gfs_multi_height.grib2"
+    with path.open("wb") as f:
+        # 2m fields (heightAboveGround = 2)
+        _write_msg(f, "2t", "heightAboveGround", 2, "instant", 280.0)
+        _write_msg(f, "2r", "heightAboveGround", 2, "instant", 75.0)
+        # 10m fields (heightAboveGround = 10)
+        _write_msg(f, "10u", "heightAboveGround", 10, "instant", 5.0)
+        _write_msg(f, "10v", "heightAboveGround", 10, "instant", -3.0)
+        # Surface fields (surface = 0)
+        _write_msg(f, "gust", "surface", 0, "instant", 12.0)
+        _write_msg(f, "vis", "surface", 0, "instant", 10000.0)
+        _write_msg(f, "sde", "surface", 0, "instant", 0.05)
+        _write_msg(f, "tp", "surface", 0, "accum", 2.5)
+        _write_msg(f, "crain", "surface", 0, "avg", 1.0)
+        _write_msg(f, "csnow", "surface", 0, "avg", 0.0)
+        _write_msg(f, "cfrzr", "surface", 0, "avg", 0.0)
+        _write_msg(f, "cicep", "surface", 0, "avg", 0.0)
+
+    ds = parse_grib2(path)
+
+    expected_vars = {
+        "t2m",
+        "r2",
+        "u10",
+        "v10",
+        "gust",
+        "vis",
+        "sde",
+        "tp",
+        "crain",
+        "csnow",
+        "cfrzr",
+        "cicep",
+    }
+    assert expected_vars.issubset(set(ds.data_vars))
+
+    # All variables share the 2D grid
+    for var in expected_vars:
+        assert ds[var].dims == ("latitude", "longitude")
+        assert ds[var].shape == (5, 10)
+
+    # Lead time is preserved
+    assert ds.lead_time_hours.values == 6
+
+    # Transient scalar GRIB coordinates are absent
+    for scalar_coord in (
+        "heightAboveGround",
+        "surface",
+        "atmosphere",
+        "cloudCeiling",
+        "entireAtmosphere",
+        "meanSea",
+    ):
+        assert scalar_coord not in ds.coords
+
+    # Required platform coordinates are present
+    assert "latitude" in ds.coords
+    assert "longitude" in ds.coords
+    assert "time" in ds.coords
+    assert "lead_time_hours" in ds.coords
+
+
+def test_parse_grib2_gefs_multi_height_preserves_member_dimension(tmp_path: Path) -> None:
+    """GEFS multi-height decode preserves ensemble member dimension without level coordinate conflicts."""
+    from eccodes import (
+        codes_grib_new_from_samples,
+        codes_release,
+        codes_set,
+        codes_set_values,
+        codes_write,
+    )
+
+    def _write_gefs_msg(
+        f, sn: str, tol: str, lvl: int, member_num: int, st: str = "instant", val: float = 1.0
+    ) -> None:
+        msg = codes_grib_new_from_samples("GRIB2")
+        codes_set(msg, "dataDate", 20260829)
+        codes_set(msg, "dataTime", 1800)
+        codes_set(msg, "stepType", st)
+        codes_set(msg, "stepRange", "6")
+        codes_set(msg, "stepUnits", "h")
+        codes_set(msg, "shortName", sn)
+        codes_set(msg, "typeOfLevel", tol)
+        codes_set(msg, "level", lvl)
+        codes_set(msg, "productDefinitionTemplateNumber", 1)
+        codes_set(msg, "perturbationNumber", member_num)
+        codes_set(msg, "numberOfForecastsInEnsemble", 30)
+        codes_set(msg, "typeOfEnsembleForecast", 3)
+        codes_set(msg, "gridType", "regular_ll")
+        codes_set(msg, "Ni", 10)
+        codes_set(msg, "Nj", 5)
+        codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+        codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+        codes_set(msg, "latitudeOfLastGridPointInDegrees", 36.0)
+        codes_set(msg, "longitudeOfLastGridPointInDegrees", 259.0)
+        codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
+        codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
+        codes_set_values(msg, np.full((5, 10), val, dtype=np.float32).ravel())
+        codes_write(msg, f)
+        codes_release(msg)
+
+    path = tmp_path / "gefs_multi_height.grib2"
+    with path.open("wb") as f:
+        for member in (1, 2):
+            _write_gefs_msg(f, "2t", "heightAboveGround", 2, member, "instant", 280.0 + member)
+            _write_gefs_msg(f, "2r", "heightAboveGround", 2, member, "instant", 70.0 + member)
+            _write_gefs_msg(f, "10u", "heightAboveGround", 10, member, "instant", 4.0 + member)
+            _write_gefs_msg(f, "10v", "heightAboveGround", 10, member, "instant", -2.0 + member)
+            _write_gefs_msg(f, "gust", "surface", 0, member, "instant", 10.0 + member)
+            _write_gefs_msg(f, "vis", "surface", 0, member, "instant", 9000.0)
+            _write_gefs_msg(f, "sde", "surface", 0, member, "instant", 0.0)
+
+    ds = parse_grib2(path)
+
+    expected_vars = {"t2m", "r2", "u10", "v10", "gust", "vis", "sde"}
+    assert expected_vars.issubset(set(ds.data_vars))
+
+    # Ensemble dimension is preserved
+    assert "member" in ds.dims
+    assert list(ds.coords["member"].values) == [1, 2]
+
+    for var in expected_vars:
+        assert ds[var].dims == ("member", "latitude", "longitude")
+        assert ds[var].shape == (2, 5, 10)
+
+    # Transient scalar GRIB coordinates are absent
+    for scalar_coord in ("heightAboveGround", "surface", "atmosphere", "cloudCeiling"):
+        assert scalar_coord not in ds.coords
 

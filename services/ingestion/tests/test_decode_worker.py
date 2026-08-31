@@ -207,6 +207,74 @@ def test_pool_mixed_gfs_and_gefs_workload(decode_pool, tmp_path, gefs_files) -> 
         assert any(name in ds.data_vars for name in ("t2m", "prate"))
 
 
+def test_pool_decodes_multi_height_gfs_and_gefs(decode_pool, tmp_path) -> None:
+    """The decode pool decodes multi-height GFS and GEFS files without coordinate conflicts."""
+    from eccodes import (
+        codes_grib_new_from_samples,
+        codes_release,
+        codes_set,
+        codes_set_values,
+        codes_write,
+    )
+
+    def _write_msg(f, sn: str, tol: str, lvl: int, member: int | None = None) -> None:
+        msg = codes_grib_new_from_samples("GRIB2")
+        codes_set(msg, "dataDate", 20260829)
+        codes_set(msg, "dataTime", 1800)
+        codes_set(msg, "stepType", "instant")
+        codes_set(msg, "stepRange", "6")
+        codes_set(msg, "stepUnits", "h")
+        codes_set(msg, "shortName", sn)
+        codes_set(msg, "typeOfLevel", tol)
+        codes_set(msg, "level", lvl)
+        if member is not None:
+            codes_set(msg, "productDefinitionTemplateNumber", 1)
+            codes_set(msg, "perturbationNumber", member)
+            codes_set(msg, "numberOfForecastsInEnsemble", 30)
+            codes_set(msg, "typeOfEnsembleForecast", 3)
+        codes_set(msg, "gridType", "regular_ll")
+        codes_set(msg, "Ni", 5)
+        codes_set(msg, "Nj", 5)
+        codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+        codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+        codes_set(msg, "latitudeOfLastGridPointInDegrees", 36.0)
+        codes_set(msg, "longitudeOfLastGridPointInDegrees", 254.0)
+        codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
+        codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
+        codes_set_values(msg, np.full((5, 5), 1.0, dtype=np.float32).ravel())
+        codes_write(msg, f)
+        codes_release(msg)
+
+    # 1. Multi-height GFS file (2m temperature + 10m wind + surface gust)
+    gfs_path = tmp_path / "gfs_multi_h.grib2"
+    with gfs_path.open("wb") as f:
+        _write_msg(f, "2t", "heightAboveGround", 2)
+        _write_msg(f, "10u", "heightAboveGround", 10)
+        _write_msg(f, "gust", "surface", 0)
+
+    # 2. Multi-height GEFS file (member 5 with 2m temperature + 10m wind)
+    gefs_path = tmp_path / "gefs_multi_h.grib2"
+    with gefs_path.open("wb") as f:
+        _write_msg(f, "2t", "heightAboveGround", 2, member=5)
+        _write_msg(f, "10u", "heightAboveGround", 10, member=5)
+
+    gfs_fut = decode_pool.submit(str(gfs_path))
+    gefs_fut = decode_pool.submit(str(gefs_path))
+
+    ds_gfs = gfs_fut.result()
+    ds_gefs = gefs_fut.result()
+
+    assert set(ds_gfs.data_vars) == {"t2m", "u10", "gust"}
+    assert "member" not in ds_gfs.dims
+    assert "heightAboveGround" not in ds_gfs.coords
+    assert "surface" not in ds_gfs.coords
+
+    assert set(ds_gefs.data_vars) == {"t2m", "u10"}
+    assert "member" in ds_gefs.coords
+    assert int(np.asarray(ds_gefs.coords["member"].values).reshape(-1)[0]) == 5
+    assert "heightAboveGround" not in ds_gefs.coords
+
+
 # ---------------------------------------------------------------------------
 # 6-7. GFS has no member; GEFS retains member identity
 # ---------------------------------------------------------------------------

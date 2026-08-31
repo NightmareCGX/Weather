@@ -149,6 +149,30 @@ SURFACE_FIELD_FILTERS: dict[str, dict[str, object]] = {
     },
 }
 
+#: Transient scalar GRIB level/location coordinates emitted by cfgrib for
+#: single-message surface, near-surface, or single-layer atmospheric fields.
+#: These coordinates reflect message-level GRIB decoding metadata rather than
+#: normalized platform dataset dimensions. The platform encodes vertical semantics
+#: authoritatively in canonical variable identities (e.g. ``temperature_2m``,
+#: ``wind_u_10m``, ``cloud_ceiling``), and downstream Zarr/API schemas do not model
+#: or depend on these scalar coordinates. Stripping them during normalization
+#: prevents false MergeError conflicts across fields with different vertical levels
+#: (e.g. 2 m vs 10 m).
+#:
+#: Note on pressure levels: ``isobaricInhPa`` is intentionally excluded here as
+#: multi-level pressure products may model pressure as a dimension in future
+#: extensions; the surface parser path does not ingest pressure levels.
+GRIB_SCALAR_LEVEL_COORDS: frozenset[str] = frozenset(
+    {
+        "heightAboveGround",
+        "surface",
+        "atmosphere",
+        "cloudCeiling",
+        "entireAtmosphere",
+        "meanSea",
+    }
+)
+
 
 def parse_grib2(path: str | Path) -> xr.Dataset:
     """Decode a single GRIB2 file into a normalized, in-memory Dataset.
@@ -248,7 +272,12 @@ def normalize(dataset: xr.Dataset) -> xr.Dataset:
     if "number" in dataset.dims or "number" in dataset.coords:
         dataset = dataset.rename({"number": "member"})
 
-    normalized = dataset.drop_vars(["step", "valid_time"], errors="ignore")
+    # Drop raw GRIB temporal offsets (step, valid_time) and transient scalar GRIB
+    # level/location coordinates. Dimensions (latitude, longitude, member), the
+    # cycle reference coordinate ('time'), and the derived 'lead_time_hours' coordinate
+    # are preserved.
+    drop_coords = ["step", "valid_time", *GRIB_SCALAR_LEVEL_COORDS]
+    normalized = dataset.drop_vars(drop_coords, errors="ignore")
     normalized = normalized.assign_coords(lead_time_hours=lead_time_hours)
     # Record the cycle/reference time from the GRIB ``time`` coordinate so the
     # Zarr store is self-describing: its forecast-run identity can be recovered
