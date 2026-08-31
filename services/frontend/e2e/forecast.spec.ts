@@ -588,3 +588,60 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
   await expect(appAlerts).toHaveCount(0);
 });
+
+test("cloud products: 3-Hour Cloud Cover and Cloud Ceiling point, meteogram, map, and GEFS ensemble distribution", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  const variableSelect = page.getByLabel("Variable");
+
+  // 1. Verify Cloud Cover and Cloud Ceiling options are present
+  const options = await variableSelect.locator("option").allTextContents();
+  expect(options).toContain("3-Hour Cloud Cover");
+  expect(options).toContain("Cloud Ceiling Height");
+
+  // 2. Select 3-Hour Cloud Cover on GFS
+  await variableSelect.selectOption("cloud_cover_3h");
+  await expect(variableSelect).toHaveValue("cloud_cover_3h");
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+  await expect(page.getByText("3-Hour Cloud Cover (%)")).toBeVisible();
+
+  // 3. Search and select a city to inspect Point Forecast meteograms
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /3-Hour Cloud Cover hourly forecast over lead time/ })
+  ).toBeVisible();
+
+  // 4. Select Cloud Ceiling on GFS
+  await variableSelect.selectOption("cloud_ceiling");
+  await expect(variableSelect).toHaveValue("cloud_ceiling");
+  await expect(page.getByTestId("legend-gradient")).toBeVisible();
+
+  await expect(
+    page.getByRole("img", { name: /Cloud Ceiling Height hourly forecast over lead time/ })
+  ).toBeVisible();
+
+  // 5. Switch to GEFS ensemble model with Cloud Ceiling
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+  await variableSelect.selectOption("cloud_ceiling");
+
+  // Verify GEFS Ensemble Unlimited Ceiling probability tile and statistics
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(page.getByText(/Unlimited Ceiling Probability/i)).toBeVisible();
+  await expect(page.getByText("40%")).toBeVisible(); // P(Unlimited) = 0.40
+
+  // 6. Switch to GEFS ensemble model with 3-Hour Cloud Cover
+  await variableSelect.selectOption("cloud_cover_3h");
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+
+  // Ensure no error alert exists
+  const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
+  await expect(appAlerts).toHaveCount(0);
+});

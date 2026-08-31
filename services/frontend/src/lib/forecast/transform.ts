@@ -76,14 +76,14 @@ export function forecastLeadTimes(forecasts: ForecastEntry[]): number[] {
 /** A single point of the ensemble-over-time fan chart. */
 export interface EnsembleChartPoint {
   lead_time_hours: number;
-  mean: number;
-  median: number;
-  spread: number;
-  p10: number;
-  p25: number;
-  p50: number;
-  p75: number;
-  p90: number;
+  mean: number | null;
+  median: number | null;
+  spread: number | null;
+  p10: number | null;
+  p25: number | null;
+  p50: number | null;
+  p75: number | null;
+  p90: number | null;
 }
 
 /**
@@ -103,7 +103,18 @@ export function toEnsembleChartData(
     if (data === undefined) {
       throw new Error(`Missing ensemble data for lead ${lead}.`);
     }
-    return { lead_time_hours: lead, ...data.statistics };
+    const stats = data.statistics;
+    return {
+      lead_time_hours: lead,
+      mean: stats.mean ?? null,
+      median: stats.median ?? null,
+      spread: stats.spread ?? null,
+      p10: stats.p10 ?? null,
+      p25: stats.p25 ?? null,
+      p50: stats.p50 ?? null,
+      p75: stats.p75 ?? null,
+      p90: stats.p90 ?? null,
+    };
   });
 }
 
@@ -134,16 +145,39 @@ export interface EnsembleFanPoint {
 export function toEnsembleFanData(
   ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>
 ): EnsembleFanPoint[] {
-  return toEnsembleChartData(ensembleByLead).map((point) => ({
-    lead_time_hours: point.lead_time_hours,
-    p10Base: point.p10,
-    p90Height: point.p90 - point.p10,
-    p25Base: point.p25,
-    p75Height: point.p75 - point.p25,
-    median: point.median,
-    mean: point.mean,
-    spread: point.spread,
-  }));
+  return toEnsembleChartData(ensembleByLead)
+    .filter(
+      (
+        point
+      ): point is EnsembleChartPoint & {
+        p10: number;
+        p25: number;
+        p50: number;
+        p75: number;
+        p90: number;
+        mean: number;
+        median: number;
+        spread: number;
+      } =>
+        point.p10 !== null &&
+        point.p25 !== null &&
+        point.p50 !== null &&
+        point.p75 !== null &&
+        point.p90 !== null &&
+        point.mean !== null &&
+        point.median !== null &&
+        point.spread !== null
+    )
+    .map((point) => ({
+      lead_time_hours: point.lead_time_hours,
+      p10Base: point.p10,
+      p90Height: point.p90 - point.p10,
+      p25Base: point.p25,
+      p75Height: point.p75 - point.p25,
+      median: point.median,
+      mean: point.mean,
+      spread: point.spread,
+    }));
 }
 
 /** A single histogram bin. */
@@ -329,15 +363,15 @@ export function distributionXDomain(
  */
 export function ensembleStatisticsEntries(
   statistics: EnsembleStatistics
-): Array<[key: string, value: number]> {
+): Array<[key: string, value: number | null]> {
   return [
-    ["mean", statistics.mean],
-    ["median", statistics.median],
-    ["spread", statistics.spread],
-    ["p10", statistics.p10],
-    ["p25", statistics.p25],
-    ["p50", statistics.p50],
-    ["p75", statistics.p75],
-    ["p90", statistics.p90],
+    ["mean", statistics.mean ?? null],
+    ["median", statistics.median ?? null],
+    ["spread", statistics.spread ?? null],
+    ["p10", statistics.p10 ?? null],
+    ["p25", statistics.p25 ?? null],
+    ["p50", statistics.p50 ?? null],
+    ["p75", statistics.p75 ?? null],
+    ["p90", statistics.p90 ?? null],
   ];
 }

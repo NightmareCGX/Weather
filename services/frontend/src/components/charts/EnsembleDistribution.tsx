@@ -21,7 +21,7 @@ import {
   toMemberDots,
   toPdfPoints,
 } from "@/lib/forecast/transform";
-import { formatValue } from "@/lib/forecast/labels";
+import { formatPercent, formatValue } from "@/lib/forecast/labels";
 import { formatLeadTimeHours } from "@/lib/forecast/time";
 import type { DistributionStatus } from "@/hooks/useEnsembleDistribution";
 import type { EnsembleStatisticsData } from "@/lib/api/types";
@@ -90,8 +90,11 @@ export function EnsembleDistribution({
     );
   }
 
-  const members = data.members;
-  if (members === undefined || members.length === 0) {
+  const isCeiling = data.unlimited_probability !== undefined && data.unlimited_probability !== null;
+  const rawMembers = data.members;
+  const members = isCeiling ? (rawMembers?.filter((m) => m < 19990) ?? []) : (rawMembers ?? []);
+
+  if (rawMembers === undefined || rawMembers.length === 0) {
     return (
       <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
         <p className="text-xs text-slate-600">
@@ -102,12 +105,42 @@ export function EnsembleDistribution({
     );
   }
 
+  const memberCount = data.member_count;
+  const unlimitedProb = data.unlimited_probability;
+  const finiteCount = data.finite_member_count ?? members.length;
+
+  if (isCeiling && finiteCount < 10) {
+    return (
+      <div className="mt-4 space-y-3">
+        <div className="flex items-center justify-between rounded-lg border border-sky-200 bg-sky-50 px-4 py-3">
+          <div>
+            <div className="text-xs font-semibold text-sky-800">Unlimited Ceiling Probability</div>
+            <div className="text-xl font-bold text-sky-950">
+              {unlimitedProb !== undefined && unlimitedProb !== null
+                ? formatPercent(unlimitedProb)
+                : "—"}
+            </div>
+          </div>
+          <div className="text-right text-xs text-sky-700">
+            {data.unlimited_member_count ?? memberCount - finiteCount} /{" "}
+            {data.valid_member_count ?? memberCount} members
+          </div>
+        </div>
+        <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
+          <p className="text-xs text-slate-600">
+            Only {finiteCount} members predict a finite ceiling (minimum 10 required for continuous
+            distribution).
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   const bins = histogramBins(members);
   const dots = toMemberDots(members);
   const summary = distributionSummary(members);
   const pdfPoints = toPdfPoints(data.pdf);
   const [xMin, xMax] = distributionXDomain(summary, data.pdf);
-  const memberCount = data.member_count;
 
   // Prepare bin data points with explicit x coordinate for numeric XAxis
   const binChartData = bins.map((bin) => ({
@@ -118,132 +151,151 @@ export function EnsembleDistribution({
   }));
 
   return (
-    <div className="mt-4">
-      <div className="mb-1 flex items-baseline justify-between">
-        <h4 className="text-sm font-medium text-slate-800">
-          Member distribution · {formatLeadTimeHours(selectedLead)}
-        </h4>
-        <span className="text-xs text-slate-500">{memberCount} members</span>
-      </div>
-
-      <dl className="mb-2 grid grid-cols-4 gap-2 text-center text-xs">
-        <StatCell label="Min" value={summary.min} />
-        <StatCell label="Max" value={summary.max} />
-        <StatCell label="Mean" value={summary.mean} />
-        <StatCell label="StdDev" value={summary.stdDev} />
-      </dl>
-
-      <div
-        role="img"
-        aria-label={`Histogram and PDF of ${memberCount} ensemble members for ${variableLabel}`}
-        className="h-44 w-full"
-      >
-        <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart data={binChartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-            <XAxis
-              type="number"
-              dataKey="x"
-              domain={[xMin, xMax]}
-              tickFormatter={(value: number) => value.toFixed(1)}
-              tick={{ fontSize: 10, fill: "#64748b" }}
-              tickLine={false}
-            />
-            <YAxis
-              yAxisId="left"
-              allowDecimals={false}
-              tick={{ fontSize: 10, fill: "#64748b" }}
-              tickLine={false}
-              axisLine={false}
-              width={32}
-            />
-            <YAxis
-              yAxisId="right"
-              orientation="right"
-              allowDecimals={true}
-              tick={{ fontSize: 10, fill: "#64748b" }}
-              tickLine={false}
-              axisLine={false}
-              width={38}
-              tickFormatter={(v: number) => v.toFixed(2)}
-            />
-            <Tooltip
-              formatter={(value: number, name: string) => [
-                name === "Probability density" ? value.toFixed(4) : value,
-                name === "Probability density" ? "Probability density" : "Members",
-              ]}
-              labelFormatter={(label) => `Value ≈ ${Number(label).toFixed(2)}`}
-              contentStyle={{ fontSize: 12 }}
-            />
-            <Bar
-              yAxisId="left"
-              dataKey="count"
-              isAnimationActive={false}
-              radius={[2, 2, 0, 0]}
-              name="Member count"
-              barSize={32}
-            >
-              {bins.map((bin, index) => (
-                <Cell
-                  key={`${bin.start}-${bin.end}`}
-                  fill={HISTOGRAM_COLORS[index % HISTOGRAM_COLORS.length]}
-                />
-              ))}
-            </Bar>
-            {pdfPoints.length > 0 && (
-              <Line
-                yAxisId="right"
-                data={pdfPoints}
-                dataKey="density"
-                type="linear"
-                stroke="#d97706"
-                strokeWidth={2}
-                dot={false}
-                isAnimationActive={false}
-                name="Probability density"
-              />
-            )}
-          </ComposedChart>
-        </ResponsiveContainer>
-      </div>
-
-      <div
-        role="img"
-        aria-label={`Member values for ${variableLabel} at ${formatLeadTimeHours(selectedLead)}`}
-        className="mt-2 h-12 w-full"
-      >
-        <ResponsiveContainer width="100%" height="100%">
-          <ScatterChart margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
-            <XAxis
-              type="number"
-              dataKey="value"
-              tick={{ fontSize: 10, fill: "#64748b" }}
-              tickLine={false}
-              domain={[xMin, xMax]}
-            />
-            <YAxis hide domain={[0, 1]} />
-            <Tooltip
-              cursor={{ strokeDasharray: "3 3" }}
-              formatter={(value: number) => [formatValue(value, ""), "Member value"]}
-              labelFormatter={() => ""}
-              contentStyle={{ fontSize: 12 }}
-            />
-            <Scatter data={dots} dataKey="value" fill={ACCENT} isAnimationActive={false} />
-          </ScatterChart>
-        </ResponsiveContainer>
-      </div>
-
-      {data.pdf === null && (
-        <p className="mt-1 text-[11px] text-amber-700">
-          Continuous probability density is unavailable for this lead time (insufficient spread
-          across members).
-        </p>
+    <div className="mt-4 space-y-3">
+      {isCeiling && unlimitedProb !== undefined && unlimitedProb !== null && (
+        <div className="flex items-center justify-between rounded-lg border border-sky-200 bg-sky-50 px-4 py-3">
+          <div>
+            <div className="text-xs font-semibold text-sky-800">Unlimited Ceiling Probability</div>
+            <div className="text-xl font-bold text-sky-950">{formatPercent(unlimitedProb)}</div>
+          </div>
+          <div className="text-right text-xs text-sky-700">
+            {data.unlimited_member_count ?? memberCount - finiteCount} /{" "}
+            {data.valid_member_count ?? memberCount} members
+          </div>
+        </div>
       )}
 
-      <p className="mt-1 text-[11px] text-slate-400">
-        Histogram bars and dots show the discrete ensemble member sample. The continuous curve shows
-        the canonical Gaussian kernel density estimate (probability density).
-      </p>
+      <div>
+        <div className="mb-1 flex items-baseline justify-between">
+          <h4 className="text-sm font-medium text-slate-800">
+            {isCeiling
+              ? `Conditional finite distribution · ${formatLeadTimeHours(selectedLead)}`
+              : `Member distribution · ${formatLeadTimeHours(selectedLead)}`}
+          </h4>
+          <span className="text-xs text-slate-500">
+            {isCeiling ? `${finiteCount} finite members` : `${memberCount} members`}
+          </span>
+        </div>
+
+        <dl className="mb-2 grid grid-cols-4 gap-2 text-center text-xs">
+          <StatCell label="Min" value={summary.min} />
+          <StatCell label="Max" value={summary.max} />
+          <StatCell label="Mean" value={summary.mean} />
+          <StatCell label="StdDev" value={summary.stdDev} />
+        </dl>
+
+        <div
+          role="img"
+          aria-label={`Histogram and PDF of ${members.length} ensemble members for ${variableLabel}`}
+          className="h-44 w-full"
+        >
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart data={binChartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+              <XAxis
+                type="number"
+                dataKey="x"
+                domain={[xMin, xMax]}
+                tickFormatter={(value: number) => value.toFixed(1)}
+                tick={{ fontSize: 10, fill: "#64748b" }}
+                tickLine={false}
+              />
+              <YAxis
+                yAxisId="left"
+                allowDecimals={false}
+                tick={{ fontSize: 10, fill: "#64748b" }}
+                tickLine={false}
+                axisLine={false}
+                width={32}
+              />
+              <YAxis
+                yAxisId="right"
+                orientation="right"
+                allowDecimals={true}
+                tick={{ fontSize: 10, fill: "#64748b" }}
+                tickLine={false}
+                axisLine={false}
+                width={38}
+                tickFormatter={(v: number) => v.toFixed(2)}
+              />
+              <Tooltip
+                formatter={(value: number, name: string) => [
+                  name === "Probability density" ? value.toFixed(4) : value,
+                  name === "Probability density" ? "Probability density" : "Members",
+                ]}
+                labelFormatter={(label) => `Value ≈ ${Number(label).toFixed(2)}`}
+                contentStyle={{ fontSize: 12 }}
+              />
+              <Bar
+                yAxisId="left"
+                dataKey="count"
+                isAnimationActive={false}
+                radius={[2, 2, 0, 0]}
+                name="Member count"
+                barSize={32}
+              >
+                {bins.map((bin, index) => (
+                  <Cell
+                    key={`${bin.start}-${bin.end}`}
+                    fill={HISTOGRAM_COLORS[index % HISTOGRAM_COLORS.length]}
+                  />
+                ))}
+              </Bar>
+              {pdfPoints.length > 0 && (
+                <Line
+                  yAxisId="right"
+                  data={pdfPoints}
+                  dataKey="density"
+                  type="linear"
+                  stroke="#d97706"
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive={false}
+                  name="Probability density"
+                />
+              )}
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div
+          role="img"
+          aria-label={`Member values for ${variableLabel} at ${formatLeadTimeHours(selectedLead)}`}
+          className="mt-2 h-12 w-full"
+        >
+          <ResponsiveContainer width="100%" height="100%">
+            <ScatterChart margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+              <XAxis
+                type="number"
+                dataKey="value"
+                tick={{ fontSize: 10, fill: "#64748b" }}
+                tickLine={false}
+                domain={[xMin, xMax]}
+              />
+              <YAxis hide domain={[0, 1]} />
+              <Tooltip
+                cursor={{ strokeDasharray: "3 3" }}
+                formatter={(value: number) => [formatValue(value, ""), "Member value"]}
+                labelFormatter={() => ""}
+                contentStyle={{ fontSize: 12 }}
+              />
+              <Scatter data={dots} dataKey="value" fill={ACCENT} isAnimationActive={false} />
+            </ScatterChart>
+          </ResponsiveContainer>
+        </div>
+
+        {data.pdf === null && (
+          <p className="mt-1 text-[11px] text-amber-700">
+            Continuous probability density is unavailable for this lead time (insufficient spread
+            across members).
+          </p>
+        )}
+
+        <p className="mt-1 text-[11px] text-slate-400">
+          Histogram bars and dots show the discrete ensemble member sample. The continuous curve
+          shows the canonical Gaussian kernel density estimate (probability density).
+        </p>
+      </div>
     </div>
   );
 }

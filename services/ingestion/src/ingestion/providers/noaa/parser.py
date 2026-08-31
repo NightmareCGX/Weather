@@ -133,6 +133,20 @@ SURFACE_FIELD_FILTERS: dict[str, dict[str, object]] = {
         "level": 0,
         "stepType": "avg",
     },
+    # GRIB shortName ``tcc`` = "Total cloud cover" (paramId 228164), %.
+    "tcc": {
+        "shortName": "tcc",
+        "typeOfLevel": "atmosphere",
+        "level": 0,
+        "stepType": "avg",
+    },
+    # GRIB shortName ``gh`` = "Geopotential height / cloud ceiling", gpm (meters).
+    "gh": {
+        "shortName": "gh",
+        "typeOfLevel": "cloudCeiling",
+        "level": 0,
+        "stepType": "instant",
+    },
 }
 
 

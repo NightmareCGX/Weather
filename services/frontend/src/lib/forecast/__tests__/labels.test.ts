@@ -1,6 +1,7 @@
 import type { VariableResource } from "@/lib/api/types";
 import {
   buildVariableMeta,
+  formatCloudCeiling,
   formatPercent,
   formatProbabilityRange,
   formatValue,
@@ -30,6 +31,8 @@ describe("labels", () => {
     expect(meta.visibility).toEqual({ name: "Visibility", unit: "m" });
     expect(meta.snow_depth).toEqual({ name: "Snow Depth", unit: "m" });
     expect(meta.wind_10m).toEqual({ name: "Wind (10 m)", unit: "km/h" });
+    expect(meta.cloud_cover_3h).toEqual({ name: "Cloud Cover", unit: "%" });
+    expect(meta.cloud_ceiling).toEqual({ name: "Cloud Ceiling", unit: "m" });
   });
 
   it("falls back for a missing or empty catalog", () => {
@@ -40,12 +43,23 @@ describe("labels", () => {
     expect(buildVariableMeta([]).visibility.name).toBe("Visibility");
     expect(buildVariableMeta([]).snow_depth.name).toBe("Snow Depth");
     expect(buildVariableMeta([]).wind_10m.name).toBe("Wind (10 m)");
+    expect(buildVariableMeta([]).cloud_cover_3h.name).toBe("Cloud Cover");
+    expect(buildVariableMeta([]).cloud_ceiling.name).toBe("Cloud Ceiling");
   });
 
   it("formats values with units", () => {
     expect(formatValue(15, "°C")).toBe("15 °C");
     expect(formatValue(15.234, "mm/h")).toBe("15.23 mm/h");
     expect(formatValue(3, "")).toBe("3");
+    expect(formatValue(72, "%")).toBe("72 %");
+  });
+
+  it("formats cloud ceiling with unlimited handling", () => {
+    expect(formatCloudCeiling(1200, "m")).toBe("1,200 m");
+    expect(formatCloudCeiling(3000, "ft")).toBe("3,000 ft");
+    expect(formatCloudCeiling(null, "m")).toBe("Unlimited");
+    expect(formatCloudCeiling(20000, "m")).toBe("Unlimited");
+    expect(formatCloudCeiling(1200, "m", true)).toBe("Unlimited");
   });
 
   it("formats wind direction and calm status", () => {

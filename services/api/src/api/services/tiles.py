@@ -162,6 +162,24 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
             (1.00, (49, 54, 149)),
             (2.50, (26, 0, 64)),
         ]
+    if variable_code == "cloud_cover_3h":
+        return [
+            (0.0, (255, 255, 255)),
+            (20.0, (220, 225, 230)),
+            (40.0, (180, 190, 205)),
+            (60.0, (140, 155, 175)),
+            (80.0, (90, 105, 125)),
+            (100.0, (50, 60, 75)),
+        ]
+    if variable_code == "cloud_ceiling":
+        return [
+            (0.0, (165, 0, 38)),
+            (150.0, (215, 48, 39)),
+            (300.0, (254, 224, 144)),
+            (900.0, (145, 191, 219)),
+            (1500.0, (69, 117, 180)),
+            (3000.0, (255, 255, 255)),
+        ]
     return [
         (-40.0, (49, 54, 149)),
         (-20.0, (69, 117, 180)),
@@ -188,6 +206,10 @@ def _data_range(variable_code: str) -> tuple[float, float]:
         return (0.0, 24000.0)
     if variable_code == "snow_depth":
         return (0.0, 2.5)
+    if variable_code == "cloud_cover_3h":
+        return (0.0, 100.0)
+    if variable_code == "cloud_ceiling":
+        return (0.0, 3000.0)
     return (-40.0, 45.0)
 
 
@@ -502,9 +524,12 @@ def _render_window_to_png(
     # Fully vectorized color mapping: clamp, interpolate across the stop ramp
     # per RGB channel with ``np.interp``, and build the RGBA scanlines with
     # NumPy (no 65,536-iteration Python loop).
-    finite = np.isfinite(values) & valid
+    if variable == "cloud_ceiling":
+        finite = np.isfinite(values) & valid & (values < 19990.0)
+    else:
+        finite = np.isfinite(values) & valid
     rgba = np.zeros((TILE_SIZE, TILE_SIZE, 4), dtype=np.uint8)
-    rgba[..., 3] = 255
+    rgba[..., 3] = 0  # Default fully transparent (nodata/unlimited/outside grid)
     if np.any(finite):
         clamped = np.clip(values[finite], data_min, data_max)
         stop_values = np.asarray([stop[0] for stop in stops], dtype=np.float64)
@@ -517,6 +542,7 @@ def _render_window_to_png(
         rgba[rows_f, cols_f, 0] = red
         rgba[rows_f, cols_f, 1] = green
         rgba[rows_f, cols_f, 2] = blue
+        rgba[rows_f, cols_f, 3] = 255
 
     png = encode_rgba_png(rgba.tobytes(), TILE_SIZE, TILE_SIZE)
     _tile_cache_set(cache_key, png)
@@ -780,13 +806,18 @@ def _slice_field(
     # After the spatial crop, reduce the member axis (GEFS ensemble mean). Only
     # the window's chunks are read for the reduction now.
     if "member" in sliced.dims:
-        sliced = sliced.mean(dim="member", keep_attrs=True)
-    # The shared reduction returns a 2-D ``(latitude, longitude)`` surface; a
-    # field that is still not 2-D after lead selection and member reduction is
-    # not a renderable surface (the tile endpoint surfaces this as a 422).
-    if sliced.ndim != 2:
-        raise ValueError(f"Variable '{variable}' is not a 2-D surface field.")
-    values = np.asarray(sliced.values, dtype=float)
+        if variable == "cloud_ceiling":
+            raw_members = np.asarray(sliced.values, dtype=float)
+            unlimited_mask = raw_members >= 19990.0
+            finite_members = np.where(unlimited_mask, np.nan, raw_members)
+            with np.errstate(all="ignore"):
+                values = np.nanmean(finite_members, axis=0)
+        else:
+            sliced = sliced.mean(dim="member", keep_attrs=True)
+            values = np.asarray(sliced.values, dtype=float)
+    else:
+        values = np.asarray(sliced.values, dtype=float)
+
     lat_sliced = np.asarray(sliced.latitude.values, dtype=float)
     lon_sliced = np.asarray(sliced.longitude.values, dtype=float)
     # A band containing no coordinate (possible on coarse/irregular axes)

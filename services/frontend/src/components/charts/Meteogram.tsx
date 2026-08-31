@@ -13,7 +13,7 @@ import {
 } from "recharts";
 
 import { toMeteogramSeries } from "@/lib/forecast/transform";
-import { formatValue, formatWindDirection } from "@/lib/forecast/labels";
+import { formatCloudCeiling, formatValue, formatWindDirection } from "@/lib/forecast/labels";
 import { formatDayHourUtc } from "@/lib/forecast/time";
 import {
   getPointForecastPhaseLabel,
@@ -63,6 +63,8 @@ const KNOWN_TRANSITION_GRADIENTS = [
  */
 export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
   const isPrecipAmount3h = variableCode === "precipitation_amount_3h";
+  const isCloudCover = variableCode === "cloud_cover_3h";
+  const isCloudCeiling = variableCode === "cloud_ceiling";
   const isPrecipitation =
     meta.unit === "mm/h" ||
     meta.unit === "in/h" ||
@@ -82,11 +84,22 @@ export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
       lead_time_hours: point.lead_time_hours,
     };
 
+    const rawVal = point.value;
+    const isUnlimitedCeiling =
+      isCloudCeiling &&
+      (rawVal === null ||
+        rawVal === undefined ||
+        rawVal >= 19990 ||
+        Boolean(entry?.cloud_ceiling_unlimited));
+    const plotValue = isCloudCeiling && isUnlimitedCeiling ? null : rawVal;
+
     return {
       lead_time_hours: point.lead_time_hours,
       valid_time: point.valid_time,
       label: formatDayHourUtc(point.valid_time),
-      value: point.value,
+      value: plotValue,
+      rawValue: rawVal,
+      isUnlimitedCeiling,
       wind_direction_10m: entry?.wind_direction_10m as number | null | undefined,
       wind_cardinal_10m: entry?.wind_cardinal_10m as string | null | undefined,
       precipEntry,
@@ -186,7 +199,7 @@ export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
               tickLine={false}
               axisLine={false}
               width={46}
-              domain={isPrecipitation ? [0, "auto"] : ["auto", "auto"]}
+              domain={isCloudCover ? [0, 100] : isPrecipitation ? [0, "auto"] : ["auto", "auto"]}
             />
             <Tooltip
               formatter={(value: any, _name: string, item: any) => {
@@ -198,6 +211,21 @@ export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
                   }
                   const phaseLabel = getPointForecastPhaseLabel(precipEntry);
                   return [`${formatValue(value, meta.unit)} · ${phaseLabel}`, meta.name];
+                }
+
+                if (isCloudCover) {
+                  if (value === null || typeof value !== "number") {
+                    return ["— (Analysis / f000)", meta.name];
+                  }
+                  return [`${formatValue(value, "%")} (3h avg)`, meta.name];
+                }
+
+                if (isCloudCeiling) {
+                  const isUnlim = item?.payload?.isUnlimitedCeiling;
+                  if (isUnlim || value === null || typeof value !== "number") {
+                    return ["Unlimited", meta.name];
+                  }
+                  return [formatCloudCeiling(value, meta.unit), meta.name];
                 }
 
                 if (typeof value !== "number") return ["n/a", meta.name];

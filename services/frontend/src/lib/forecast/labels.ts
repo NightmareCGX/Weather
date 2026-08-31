@@ -37,6 +37,8 @@ export const FALLBACK_VARIABLE_META: Record<string, VariableMeta> = {
   visibility: { name: "Visibility", unit: "m" },
   snow_depth: { name: "Snow Depth", unit: "m" },
   wind_10m: { name: "Wind (10 m)", unit: "km/h" },
+  cloud_cover_3h: { name: "Cloud Cover", unit: "%" },
+  cloud_ceiling: { name: "Cloud Ceiling", unit: "m" },
 };
 
 /**
@@ -92,6 +94,25 @@ export function formatPercent(value: number): string {
 /** Format a probability with its 95% confidence interval. */
 export function formatProbabilityRange(probability: number, ci: readonly [number, number]): string {
   return `${formatPercent(probability)} (95% CI ${formatPercent(ci[0])}–${formatPercent(ci[1])})`;
+}
+
+/**
+ * Format cloud ceiling height with unlimited sentinel handling.
+ *
+ * @example
+ *   formatCloudCeiling(1200, "m") // "1,200 m"
+ *   formatCloudCeiling(null, "m", true) // "Unlimited"
+ *   formatCloudCeiling(20000, "m") // "Unlimited"
+ */
+export function formatCloudCeiling(
+  value: number | null | undefined,
+  unit: string = "m",
+  isUnlimited: boolean = false
+): string {
+  if (isUnlimited || value === null || value === undefined || value >= 19990) {
+    return "Unlimited";
+  }
+  return `${Math.round(value).toLocaleString()} ${unit}`;
 }
 
 /**

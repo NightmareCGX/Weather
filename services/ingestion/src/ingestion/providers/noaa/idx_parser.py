@@ -249,6 +249,8 @@ DEFAULT_SELECTION_VARIABLES: tuple[str, ...] = (
     "snow_depth",
     "wind_u_10m",
     "wind_v_10m",
+    "cloud_cover_3h",
+    "cloud_ceiling",
 )
 
 
@@ -512,6 +514,58 @@ def select_gfs_records(
                         missing_required,
                         ambiguous,
                     )
+
+        elif var == "cloud_cover_3h":
+            if lead_time_hours == 0:
+                # Analysis time has no interval-average cloud cover record
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_categorical_description(lead_time_hours)
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == "TCDC"
+                        and rec.level_description == "entire atmosphere"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
+
+        elif var == "cloud_ceiling":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "HGT"
+                and rec.level_description == "cloud ceiling"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
 
         else:
             variable_selections[var] = VariableSelection(
@@ -809,6 +863,60 @@ def select_gefs_records(
                         missing_required,
                         ambiguous,
                     )
+
+        elif var == "cloud_cover_3h":
+            if lead_time_hours == 0:
+                # Analysis time has no interval-average cloud cover record
+                variable_selections[var] = VariableSelection(
+                    variable_code=var,
+                    status=SelectionStatus.SELECTED,
+                    record=None,
+                )
+            else:
+                expected_desc = _expected_categorical_description(lead_time_hours)
+                if expected_desc is None:
+                    variable_selections[var] = VariableSelection(
+                        variable_code=var,
+                        status=SelectionStatus.UNSUPPORTED,
+                    )
+                    unsupported.append(var)
+                else:
+                    matches = [
+                        rec
+                        for rec in records
+                        if rec.parameter == "TCDC"
+                        and rec.level_description == "entire atmosphere"
+                        and rec.forecast_description.strip().lower() == expected_desc
+                        and _matches_gefs_member(rec.ensemble_description, member)
+                    ]
+                    if len(matches) > 1:
+                        matches = [matches[0]]
+                    _record_selection(
+                        var,
+                        matches,
+                        variable_selections,
+                        all_selected,
+                        missing_required,
+                        ambiguous,
+                    )
+
+        elif var == "cloud_ceiling":
+            matches = [
+                rec
+                for rec in records
+                if rec.parameter == "HGT"
+                and rec.level_description == "cloud ceiling"
+                and _matches_step(rec.forecast_description, lead_time_hours)
+                and _matches_gefs_member(rec.ensemble_description, member)
+            ]
+            _record_selection(
+                var,
+                matches,
+                variable_selections,
+                all_selected,
+                missing_required,
+                ambiguous,
+            )
 
         else:
             variable_selections[var] = VariableSelection(
