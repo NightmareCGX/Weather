@@ -14,9 +14,10 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import overload
+from typing import Any, overload
 
 import numpy as np
+from numpy.typing import NDArray
 
 #: Engineering guardrail tolerance for reset-window reconstruction (percentage points).
 #: Accounts for upstream GRIB2 packing quantization and radiation timestep averaging.
@@ -83,25 +84,25 @@ def reconstruct_cloud_cover_3h(
 
 @overload
 def reconstruct_cloud_cover_3h(
-    current_6h_avg: np.ndarray,
-    prev_3h_avg: np.ndarray,
+    current_6h_avg: NDArray[np.floating[Any]],
+    prev_3h_avg: NDArray[np.floating[Any]],
     tolerance: float = ...,
-) -> np.ndarray: ...
+) -> NDArray[np.floating[Any]]: ...
 
 
 @overload
 def reconstruct_cloud_cover_3h(
-    current_6h_avg: float | np.ndarray,
-    prev_3h_avg: float | np.ndarray,
+    current_6h_avg: float | NDArray[np.floating[Any]],
+    prev_3h_avg: float | NDArray[np.floating[Any]],
     tolerance: float = ...,
-) -> float | np.ndarray: ...
+) -> float | NDArray[np.floating[Any]]: ...
 
 
 def reconstruct_cloud_cover_3h(
-    current_6h_avg: float | np.ndarray,
-    prev_3h_avg: float | np.ndarray,
+    current_6h_avg: float | NDArray[np.floating[Any]],
+    prev_3h_avg: float | NDArray[np.floating[Any]],
     tolerance: float = CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT,
-) -> float | np.ndarray:
+) -> float | NDArray[np.floating[Any]]:
     r"""Reconstruct 3-hour interval-averaged cloud cover at 6-hour reset leads.
 
     At reset leads ($f006, f012, \dots$), upstream GRIB provides the 6-hour average
@@ -183,7 +184,7 @@ def classify_cloud_ceiling(
 
 
 def cloud_cover_ensemble_summary(
-    members: Sequence[float | int | None] | np.ndarray,
+    members: Sequence[float | int | None] | NDArray[np.floating[Any]],
     percentiles: Sequence[float] = (10, 25, 50, 75, 90),
     min_valid: int = CLOUD_COVER_MIN_VALID_MEMBERS,
 ) -> CloudCoverEnsembleSummary | None:
@@ -232,7 +233,7 @@ def cloud_cover_ensemble_summary(
 
 
 def cloud_ceiling_ensemble_summary(
-    members: Sequence[float | int | None] | np.ndarray,
+    members: Sequence[float | int | None] | NDArray[np.floating[Any]],
     percentiles: Sequence[float] = (10, 25, 50, 75, 90),
     min_finite: int = CLOUD_CEILING_MIN_FINITE_MEMBERS,
     min_valid: int = CLOUD_COVER_MIN_VALID_MEMBERS,
@@ -308,7 +309,7 @@ def cloud_ceiling_ensemble_summary(
 
 
 def compute_low_ceiling_probability(
-    members: Sequence[float | int | None] | np.ndarray,
+    members: Sequence[float | int | None] | NDArray[np.floating[Any]],
     threshold_m: float,
     min_valid: int = CLOUD_COVER_MIN_VALID_MEMBERS,
     sentinel_threshold: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_M,

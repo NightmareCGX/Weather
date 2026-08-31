@@ -11,6 +11,7 @@ from domain.models.cloud import (
     compute_low_ceiling_probability,
     reconstruct_cloud_cover_3h,
 )
+from numpy.typing import NDArray
 
 
 class TestCloudCoverReconstruction:
@@ -65,7 +66,7 @@ class TestCloudCoverReconstruction:
         c6 = np.array([50.0, 20.0, 18.0, 17.5, 76.0, 77.5, 10.0, 80.0, np.nan], dtype=np.float64)
         c3 = np.array([40.0, 40.0, 40.0, 40.0, 50.0, 50.0, 40.0, 50.0, 50.0], dtype=np.float64)
 
-        result: np.ndarray = reconstruct_cloud_cover_3h(c6, c3)
+        result: NDArray[np.float64] = reconstruct_cloud_cover_3h(c6, c3)
         expected = np.array(
             [60.0, 0.0, 0.0, 0.0, 100.0, 100.0, np.nan, np.nan, np.nan], dtype=np.float64
         )
@@ -76,7 +77,7 @@ class TestCloudCoverReconstruction:
     def test_reconstruct_array_float32_preservation(self) -> None:
         c6 = np.array([50.0, 18.0], dtype=np.float32)
         c3 = np.array([40.0, 40.0], dtype=np.float32)
-        result: np.ndarray = reconstruct_cloud_cover_3h(c6, c3)
+        result: NDArray[np.float32] = reconstruct_cloud_cover_3h(c6, c3)
         assert result.dtype == np.float32
         assert result[0] == 60.0
         assert result[1] == 0.0
