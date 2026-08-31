@@ -106,6 +106,11 @@ export const FORECAST_ENTRY_METADATA_FIELDS: ReadonlySet<string> = new Set([
   "cycle_time",
   "wind_direction_10m",
   "wind_cardinal_10m",
+  "precipitation_type",
+  "precipitation_transition",
+  "precipitation_start_type",
+  "precipitation_end_type",
+  "precipitation_evidence",
 ]);
 
 /**
@@ -179,6 +184,35 @@ export interface WindRose {
   member_count?: number;
 }
 
+export type PrecipitationType =
+  "none" | "rain" | "snow" | "freezing_rain" | "ice_pellets" | "mixed" | "unknown";
+
+export type PhysicalPhase = "dry" | "rain" | "snow" | "freezing_rain" | "ice_pellets" | "unknown";
+
+export type PrecipitationTransition =
+  | "none"
+  | "persistent_rain"
+  | "persistent_snow"
+  | "persistent_freezing_rain"
+  | "persistent_ice_pellets"
+  | "dry_to_rain"
+  | "dry_to_snow"
+  | "dry_to_freezing_rain"
+  | "dry_to_ice_pellets"
+  | "wet_to_dry"
+  | "rain_to_snow"
+  | "snow_to_rain"
+  | "rain_to_freezing_rain"
+  | "freezing_rain_to_rain"
+  | "snow_to_freezing_rain"
+  | "freezing_rain_to_snow"
+  | "snow_to_ice_pellets"
+  | "ice_pellets_to_snow"
+  | "mixed_transition"
+  | "unknown";
+
+export type EvidenceState = "exact" | "strongly_inferred" | "ambiguous";
+
 /**
  * The payload of ensemble statistics (API.md section 5.1).
  *
@@ -199,6 +233,8 @@ export interface EnsembleStatisticsData {
   pdf?: EnsemblePDF | null;
   consensus_vector?: ConsensusVector | null;
   wind_rose?: WindRose | null;
+  phase_support?: Record<string, number> | null;
+  transition_frequency?: Record<string, number> | null;
 }
 
 /**

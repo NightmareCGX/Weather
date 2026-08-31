@@ -68,6 +68,8 @@ test-results/
 playwright-report/
 blob-report/
 playwright/.cache/
+screenshots/
+**/screenshots/
 
 # CLI download staging (created by weather-ingest --download-dir default)
 downloads/

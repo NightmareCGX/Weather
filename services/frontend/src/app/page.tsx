@@ -63,7 +63,7 @@ export default function HomePage() {
             />
           )}
 
-          <Legend layer={layer} />
+          <Legend layer={layer} variableName={options.variable?.name} />
         </main>
 
         {selectedLocation !== null && (

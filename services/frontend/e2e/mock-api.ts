@@ -201,6 +201,36 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                     },
                   },
                   {
+                    id: "precipitation_amount_3h",
+                    name: "3-Hour Precipitation",
+                    unit: "mm",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/precipitation_amount_3h/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "mm",
+                        stops: [
+                          [0, "#ffffff"],
+                          [0.5, "#c2e699"],
+                          [1.0, "#78c679"],
+                          [2.5, "#31a354"],
+                          [5.0, "#197278"],
+                          [10.0, "#314e8f"],
+                          [20.0, "#7b4173"],
+                          [40.0, "#542788"],
+                        ],
+                      },
+                    },
+                  },
+                  {
                     id: "relative_humidity_2m",
                     name: "Relative Humidity",
                     unit: "%",
@@ -475,6 +505,36 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         "/v1/maps/gefs/wind_10m/vector-field?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
                     },
                   },
+                  {
+                    id: "precipitation_amount_3h",
+                    name: "3-Hour Precipitation",
+                    unit: "mm",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/precipitation_amount_3h/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "mm",
+                        stops: [
+                          [0, "#ffffff"],
+                          [0.5, "#c2e699"],
+                          [1.0, "#78c679"],
+                          [2.5, "#31a354"],
+                          [5.0, "#197278"],
+                          [10.0, "#314e8f"],
+                          [20.0, "#7b4173"],
+                          [40.0, "#542788"],
+                        ],
+                      },
+                    },
+                  },
                 ],
               },
             ],
@@ -595,6 +655,12 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
               object: "variable",
               name: "Precipitation Rate",
               unit: "mm/h",
+            },
+            {
+              id: "precipitation_amount_3h",
+              object: "variable",
+              name: "3-Hour Precipitation",
+              unit: "mm",
             },
             {
               id: "relative_humidity_2m",
@@ -721,6 +787,13 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       valid_time: `2026-07-21T${String(lead).padStart(2, "0")}:00:00Z`,
       temperature_2m: temperatureAt(lat, lon, lead),
       precipitation_rate: precipitationAt(lead),
+      precipitation_amount_3h: lead === 0 ? undefined : lead === 6 ? 4.2 : 5.1,
+      precipitation_type: lead === 0 ? "none" : lead === 6 ? "rain" : "mixed",
+      precipitation_transition:
+        lead === 0 ? "none" : lead === 6 ? "persistent_rain" : "rain_to_snow",
+      precipitation_start_type: lead === 0 ? "none" : lead === 6 ? "rain" : "rain",
+      precipitation_end_type: lead === 0 ? "none" : lead === 6 ? "rain" : "snow",
+      precipitation_evidence: "exact",
       wind_10m: 25.4,
       wind_direction_10m: 225.0,
       wind_cardinal_10m: "SW",
@@ -838,6 +911,20 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
             bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
           },
         ],
+      };
+    }
+    if (variable === "precipitation_amount_3h") {
+      payload.phase_support = {
+        dry: 0.1,
+        rain: 0.52,
+        snow: 0.26,
+        freezing_rain: 0.08,
+        ice_pellets: 0.03,
+        unknown: 0.01,
+      };
+      payload.transition_frequency = {
+        rain_to_snow: 0.27,
+        persistent_rain: 0.25,
       };
     }
     if (includeMembers) {

@@ -68,11 +68,17 @@ describe("FORECAST_ENTRY_METADATA_FIELDS", () => {
     // The additive cross-cycle provenance field must never render as a
     // variable or be sent as /v1/ensembles?variable=….
     expect(FORECAST_ENTRY_METADATA_FIELDS.has("cycle_time")).toBe(true);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_type")).toBe(true);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_transition")).toBe(true);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_start_type")).toBe(true);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_end_type")).toBe(true);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_evidence")).toBe(true);
   });
 
   it("does not classify real forecast variables as metadata", () => {
     expect(FORECAST_ENTRY_METADATA_FIELDS.has("temperature_2m")).toBe(false);
     expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_rate")).toBe(false);
+    expect(FORECAST_ENTRY_METADATA_FIELDS.has("precipitation_amount_3h")).toBe(false);
   });
 
   it("exposes the guards for every field in the set and for variables", () => {
@@ -110,6 +116,35 @@ describe("forecastVariableCodes", () => {
       "temperature_2m",
       "precipitation_rate",
     ]);
+  });
+
+  it("extracts precipitation_amount_3h while excluding all transition metadata", () => {
+    const precipEntries: ForecastEntry[] = [
+      {
+        lead_time_hours: 0,
+        valid_time: "2026-07-21T00:00:00Z",
+        cycle_time: "2026-07-21T00:00:00Z",
+        precipitation_amount_3h: undefined,
+        precipitation_type: "none",
+        precipitation_transition: "none",
+        precipitation_start_type: "none",
+        precipitation_end_type: "none",
+        precipitation_evidence: "exact",
+      },
+      {
+        lead_time_hours: 3,
+        valid_time: "2026-07-21T03:00:00Z",
+        cycle_time: "2026-07-21T00:00:00Z",
+        precipitation_amount_3h: 4.2,
+        precipitation_type: "rain",
+        precipitation_transition: "persistent_rain",
+        precipitation_start_type: "rain",
+        precipitation_end_type: "rain",
+        precipitation_evidence: "exact",
+      },
+    ];
+
+    expect(forecastVariableCodes(precipEntries)).toEqual(["precipitation_amount_3h"]);
   });
 });
 

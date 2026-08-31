@@ -6,6 +6,7 @@ import { SelectedLocationSummary } from "@/components/forecast/SelectedLocationS
 import { Meteogram } from "@/components/charts/Meteogram";
 import { EnsembleChart } from "@/components/charts/EnsembleChart";
 import { EnsembleDistribution } from "@/components/charts/EnsembleDistribution";
+import { EnsemblePhaseSupport } from "@/components/charts/EnsemblePhaseSupport";
 import { WindRose } from "@/components/charts/WindRose";
 import { usePointForecast } from "@/hooks/usePointForecast";
 import { useEnsemble } from "@/hooks/useEnsemble";
@@ -186,6 +187,15 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
               </p>
               <WindRose windRose={distribution.data.wind_rose} />
             </div>
+          )}
+
+          {ensembleVariable === "precipitation_amount_3h" && distribution.data?.phase_support && (
+            <EnsemblePhaseSupport
+              phaseSupport={distribution.data.phase_support}
+              transitionFrequency={distribution.data.transition_frequency}
+              selectedLead={distributionLead}
+              memberCount={distribution.data.member_count}
+            />
           )}
         </section>
       )}

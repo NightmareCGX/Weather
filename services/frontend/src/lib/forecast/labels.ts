@@ -31,6 +31,7 @@ export interface VariableMeta {
 export const FALLBACK_VARIABLE_META: Record<string, VariableMeta> = {
   temperature_2m: { name: "Temperature (2 m)", unit: "°C" },
   precipitation_rate: { name: "Precipitation Rate", unit: "mm/h" },
+  precipitation_amount_3h: { name: "3-Hour Precipitation", unit: "mm" },
   relative_humidity_2m: { name: "Relative Humidity", unit: "%" },
   wind_gust: { name: "Wind Gust", unit: "km/h" },
   visibility: { name: "Visibility", unit: "m" },
