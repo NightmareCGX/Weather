@@ -162,12 +162,14 @@ def test_select_gfs_records_success() -> None:
         "14:12500:d=2026082600:CICEP:surface:0-6 hour ave fcst:",
         "15:13500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:",
         "16:14500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:",
+        "17:15500:d=2026082600:TCDC:entire atmosphere:0-6 hour ave fcst:",
+        "18:16500:d=2026082600:HGT:cloud ceiling:6 hour fcst:",
     ]
     records = parse_idx("\n".join(lines))
     result = select_gfs_records(records, lead_time_hours=6)
 
     assert result.is_valid
-    assert len(result.selected_records) == 13
+    assert len(result.selected_records) == 15
     assert result.missing_required == ()
     assert result.ambiguous == ()
 
@@ -175,7 +177,7 @@ def test_select_gfs_records_success() -> None:
     params = [r.parameter for r in result.selected_records]
     assert params == [
         "TMP", "PRATE", "RH", "GUST", "VIS", "SNOD", "UGRD", "VGRD",
-        "APCP", "CSNOW", "CICEP", "CFRZR", "CRAIN"
+        "APCP", "CSNOW", "CICEP", "CFRZR", "CRAIN", "TCDC", "HGT"
     ]
     assert result.selected_records[0].start_offset == 500
     assert result.selected_records[0].end_offset == 1499
@@ -194,18 +196,23 @@ def test_select_gfs_records_lead_zero_analysis() -> None:
         "7:5500:d=2026082600:SNOD:surface:anl:",
         "8:6500:d=2026082600:UGRD:10 m above ground:anl:",
         "9:7500:d=2026082600:VGRD:10 m above ground:anl:",
+        "10:8500:d=2026082600:HGT:cloud ceiling:anl:",
     ]
     records = parse_idx("\n".join(lines))
     result = select_gfs_records(records, lead_time_hours=0)
     assert result.is_valid
-    # APCP and categorical flags at lead 0 are selected with record=None (no bytes downloaded)
-    assert len(result.selected_records) == 8
+    # APCP, categorical flags, and cloud_cover_3h at lead 0 are selected with record=None (no bytes downloaded)
+    assert len(result.selected_records) == 9
     assert result.variable_selections["precipitation_amount_3h"].status == SelectionStatus.SELECTED
     assert result.variable_selections["precipitation_amount_3h"].record is None
+    assert result.variable_selections["cloud_cover_3h"].status == SelectionStatus.SELECTED
+    assert result.variable_selections["cloud_cover_3h"].record is None
     assert result.variable_selections["crain"].status == SelectionStatus.SELECTED
     assert result.variable_selections["crain"].record is None
+    assert result.variable_selections["cloud_ceiling"].status == SelectionStatus.SELECTED
+    assert result.variable_selections["cloud_ceiling"].record is not None
     params = [r.parameter for r in result.selected_records]
-    assert params == ["TMP", "PRATE", "RH", "GUST", "VIS", "SNOD", "UGRD", "VGRD"]
+    assert params == ["TMP", "PRATE", "RH", "GUST", "VIS", "SNOD", "UGRD", "VGRD", "HGT"]
 
 
 def test_select_gfs_records_categorical_ave_vs_instant() -> None:
@@ -335,15 +342,17 @@ def test_select_gefs_records_success() -> None:
         "10:8500:d=2026082600:CICEP:surface:0-6 hour ave fcst:ENS=+17",
         "11:9500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:ENS=+17",
         "12:10500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:ENS=+17",
+        "13:11500:d=2026082600:TCDC:entire atmosphere:0-6 hour ave fcst:ENS=+17",
+        "14:12500:d=2026082600:HGT:cloud ceiling:6 hour fcst:ENS=+17",
     ]
     records = parse_idx("\n".join(lines))
     result = select_gefs_records(records, member=17, lead_time_hours=6)
     assert result.is_valid
-    assert len(result.selected_records) == 12
+    assert len(result.selected_records) == 14
     params = [r.parameter for r in result.selected_records]
     assert params == [
         "VIS", "TMP", "GUST", "RH", "SNOD", "UGRD", "VGRD",
-        "APCP", "CSNOW", "CICEP", "CFRZR", "CRAIN"
+        "APCP", "CSNOW", "CICEP", "CFRZR", "CRAIN", "TCDC", "HGT"
     ]
     for r in result.selected_records:
         assert r.ensemble_description == "ENS=+17"
@@ -354,6 +363,60 @@ def test_select_gefs_records_success() -> None:
     )
     assert "precipitation_rate" in result.unsupported
     assert result.missing_required == ()
+
+
+def test_select_gfs_records_cloud_cover_and_ceiling() -> None:
+    lines = [
+        "1:0:d=2026082600:TCDC:entire atmosphere:6 hour fcst:",  # Instantaneous (rejected)
+        "2:500:d=2026082600:TCDC:entire atmosphere:0-6 hour ave fcst:",  # Interval average (selected)
+        "3:1500:d=2026082600:HGT:cloud ceiling:6 hour fcst:",
+    ]
+    records = parse_idx("\n".join(lines))
+    result = select_gfs_records(
+        records,
+        lead_time_hours=6,
+        variables=("cloud_cover_3h", "cloud_ceiling"),
+    )
+    assert result.is_valid
+    assert len(result.selected_records) == 2
+    assert result.variable_selections["cloud_cover_3h"].record is not None
+    assert result.variable_selections["cloud_cover_3h"].record.forecast_description == "0-6 hour ave fcst"
+    assert result.variable_selections["cloud_cover_3h"].record.start_offset == 500
+    assert result.variable_selections["cloud_ceiling"].record is not None
+    assert result.variable_selections["cloud_ceiling"].record.start_offset == 1500
+
+
+def test_select_gefs_records_cloud_cover_and_ceiling() -> None:
+    lines_f000 = [
+        "1:0:d=2026082600:HGT:cloud ceiling:anl:ENS=+02",
+    ]
+    records_f000 = parse_idx("\n".join(lines_f000))
+    result_f000 = select_gefs_records(
+        records_f000,
+        member=2,
+        lead_time_hours=0,
+        variables=("cloud_cover_3h", "cloud_ceiling"),
+    )
+    assert result_f000.is_valid
+    assert len(result_f000.selected_records) == 1
+    assert result_f000.variable_selections["cloud_cover_3h"].status == SelectionStatus.SELECTED
+    assert result_f000.variable_selections["cloud_cover_3h"].record is None
+    assert result_f000.variable_selections["cloud_ceiling"].record is not None
+
+    lines_f003 = [
+        "1:0:d=2026082600:TCDC:entire atmosphere:0-3 hour ave fcst:ENS=+02",
+        "2:500:d=2026082600:HGT:cloud ceiling:3 hour fcst:ENS=+02",
+    ]
+    records_f003 = parse_idx("\n".join(lines_f003))
+    result_f003 = select_gefs_records(
+        records_f003,
+        member=2,
+        lead_time_hours=3,
+        variables=("cloud_cover_3h", "cloud_ceiling"),
+    )
+    assert result_f003.is_valid
+    assert len(result_f003.selected_records) == 2
+    assert result_f003.variable_selections["cloud_cover_3h"].record.forecast_description == "0-3 hour ave fcst"
 
 
 def test_select_gefs_records_apcp_patterns() -> None:
@@ -427,11 +490,13 @@ def test_select_records_dispatch() -> None:
         "11:9500:d=2026082600:CICEP:surface:0-6 hour ave fcst:",
         "12:10500:d=2026082600:CFRZR:surface:0-6 hour ave fcst:",
         "13:11500:d=2026082600:CRAIN:surface:0-6 hour ave fcst:",
+        "14:12500:d=2026082600:TCDC:entire atmosphere:0-6 hour ave fcst:",
+        "15:13500:d=2026082600:HGT:cloud ceiling:6 hour fcst:",
     ]
     records = parse_idx("\n".join(gfs_lines))
     res_gfs = select_records("gfs", records, lead_time_hours=6)
     assert res_gfs.is_valid
-    assert len(res_gfs.selected_records) == 13
+    assert len(res_gfs.selected_records) == 15
 
     # Test explicit variable subset
     res_subset = select_records(

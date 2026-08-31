@@ -352,6 +352,54 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         "/v1/maps/gfs/wind_10m/vector-field?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
                     },
                   },
+                  {
+                    id: "cloud_cover_3h",
+                    name: "3-Hour Cloud Cover",
+                    unit: "%",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/cloud_cover_3h/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "%",
+                        stops: [
+                          [0, "#ffffff"],
+                          [100, "#323c4b"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "cloud_ceiling",
+                    name: "Cloud Ceiling Height",
+                    unit: "m",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gfs/cloud_ceiling/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "m",
+                        stops: [
+                          [0, "#a50026"],
+                          [3000, "#ffffff"],
+                        ],
+                      },
+                    },
+                  },
                 ],
               },
               {
@@ -535,6 +583,54 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                       },
                     },
                   },
+                  {
+                    id: "cloud_cover_3h",
+                    name: "3-Hour Cloud Cover",
+                    unit: "%",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/cloud_cover_3h/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "%",
+                        stops: [
+                          [0, "#ffffff"],
+                          [100, "#323c4b"],
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    id: "cloud_ceiling",
+                    name: "Cloud Ceiling Height",
+                    unit: "m",
+                    initial_times: [
+                      {
+                        value: "2026-08-13T00:00:00Z",
+                        lead_time_hours: LEAD_TIMES,
+                      },
+                    ],
+                    layer: {
+                      tile_url_template:
+                        "/v1/maps/gefs/cloud_ceiling/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
+                      min_zoom: 0,
+                      max_zoom: 9,
+                      legend: {
+                        unit: "m",
+                        stops: [
+                          [0, "#a50026"],
+                          [3000, "#ffffff"],
+                        ],
+                      },
+                    },
+                  },
                 ],
               },
             ],
@@ -692,6 +788,18 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
               name: "10-Meter Wind",
               unit: "km/h",
             },
+            {
+              id: "cloud_cover_3h",
+              object: "variable",
+              name: "3-Hour Cloud Cover",
+              unit: "%",
+            },
+            {
+              id: "cloud_ceiling",
+              object: "variable",
+              name: "Cloud Ceiling Height",
+              unit: "m",
+            },
           ],
           "list"
         )
@@ -797,6 +905,9 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       wind_10m: 25.4,
       wind_direction_10m: 225.0,
       wind_cardinal_10m: "SW",
+      cloud_cover_3h: lead === 0 ? null : 65.0,
+      cloud_ceiling: lead === 18 ? null : 1200.0,
+      cloud_ceiling_unlimited: lead === 18,
     }));
     route.fulfill({
       status: 200,
@@ -925,6 +1036,35 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       payload.transition_frequency = {
         rain_to_snow: 0.27,
         persistent_rain: 0.25,
+      };
+    }
+    if (variable === "cloud_cover_3h") {
+      payload.valid_member_count = 30;
+      payload.statistics = {
+        mean: 65.0,
+        median: 65.0,
+        spread: 10.0,
+        p10: 50.0,
+        p25: 58.0,
+        p50: 65.0,
+        p75: 72.0,
+        p90: 80.0,
+      };
+    }
+    if (variable === "cloud_ceiling") {
+      payload.unlimited_probability = 0.4;
+      payload.valid_member_count = 30;
+      payload.finite_member_count = 18;
+      payload.unlimited_member_count = 12;
+      payload.statistics = {
+        mean: 2100.0,
+        median: 2100.0,
+        spread: 500.0,
+        p10: 1200.0,
+        p25: 1600.0,
+        p50: 2100.0,
+        p75: 2800.0,
+        p90: 3500.0,
       };
     }
     if (includeMembers) {

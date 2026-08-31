@@ -50,6 +50,10 @@ def _member_expected_value(variable: str, member: int, lat: float, lon: float, l
     if variable == "precipitation_amount_3h":
         from tests.fixtures import ensemble_precipitation_amount_at
         return ensemble_precipitation_amount_at(member, lead)
+    if variable == "cloud_cover_3h":
+        return 20.0 + 2.0 * lead + 1.0 * member
+    if variable == "cloud_ceiling":
+        return 20000.0 if member >= 4 else 1000.0 + 50.0 * lead + 20.0 * member
     raise KeyError(variable)
 
 
@@ -144,11 +148,18 @@ def test_gefs_ensemble_statistics(client, variable):
     d = resp.json()["data"]
     assert d["member_count"] == len(MEMBER_INDICES)
     stats = d["statistics"]
-    for key in ("mean", "median", "spread", "p10", "p25", "p50", "p75", "p90"):
-        assert abs(float(stats[key]) - expected[key]) < 1e-9
+
+    if variable == "cloud_ceiling":
+        # Cloud ceiling has 1 unlimited member (member 4) out of 5 (P(Unlimited) = 0.2)
+        # and 4 finite members (< 10 threshold), so conditional percentiles are None
+        assert d["unlimited_probability"] == pytest.approx(0.2, abs=1e-4)
+        assert stats["mean"] is None
+    else:
+        for key in ("mean", "median", "spread", "p10", "p25", "p50", "p75", "p90"):
+            assert abs(float(stats[key]) - expected[key]) < 1e-9
 
 
-@pytest.mark.parametrize("variable", GEFS_FIXTURE_VARIABLES)
+@pytest.mark.parametrize("variable", [v for v in GEFS_FIXTURE_VARIABLES if v != "cloud_ceiling"])
 def test_gefs_ensemble_mean_matches_point_and_map(client, variable):
     """Cross-surface invariant: Hourly Forecast == Ensemble Statistics.mean.
 
@@ -253,6 +264,10 @@ def test_gfs_point_unchanged(client, variable):
     elif variable == "precipitation_amount_3h":
         from tests.fixtures import precipitation_amount_at
         expected = precipitation_amount_at(LEAD)
+    elif variable == "cloud_cover_3h":
+        expected = 20.0 + 2.0 * LEAD
+    elif variable == "cloud_ceiling":
+        expected = 1000.0 + 50.0 * LEAD
     else:
         raise KeyError(variable)
     assert abs(float(entry[variable]) - expected) < 1e-9

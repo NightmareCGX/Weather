@@ -145,14 +145,14 @@ export interface PointForecast {
 
 /** Ensemble dispersion statistics (API.md section 5.1). */
 export interface EnsembleStatistics {
-  mean: number;
-  median: number;
-  spread: number;
-  p10: number;
-  p25: number;
-  p50: number;
-  p75: number;
-  p90: number;
+  mean?: number | null;
+  median?: number | null;
+  spread?: number | null;
+  p10?: number | null;
+  p25?: number | null;
+  p50?: number | null;
+  p75?: number | null;
+  p90?: number | null;
 }
 
 /**
@@ -235,6 +235,10 @@ export interface EnsembleStatisticsData {
   wind_rose?: WindRose | null;
   phase_support?: Record<string, number> | null;
   transition_frequency?: Record<string, number> | null;
+  valid_member_count?: number | null;
+  unlimited_probability?: number | null;
+  finite_member_count?: number | null;
+  unlimited_member_count?: number | null;
 }
 
 /**

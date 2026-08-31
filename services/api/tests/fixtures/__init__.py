@@ -67,6 +67,8 @@ def build_forecast_dataset() -> xr.Dataset:
     csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
     cfrzr = np.zeros_like(temperature, dtype=np.uint8)
     cicep = np.zeros_like(temperature, dtype=np.uint8)
+    cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid)
+    cloud_ceiling = np.where(lead_grid == 18, 20000.0, 1000.0 + 50.0 * lead_grid)
 
     return xr.Dataset(
         data_vars={
@@ -97,6 +99,14 @@ def build_forecast_dataset() -> xr.Dataset:
             "cicep": (
                 ("lead_time_hours", "latitude", "longitude"),
                 cicep,
+            ),
+            "cloud_cover_3h": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cloud_cover_3h,
+            ),
+            "cloud_ceiling": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cloud_ceiling,
             ),
         },
         coords={
@@ -167,6 +177,8 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
         csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
         cfrzr = np.zeros_like(temperature, dtype=np.uint8)
         cicep = np.zeros_like(temperature, dtype=np.uint8)
+        cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid + 1.0 * member_grid)
+        cloud_ceiling = np.where(member_grid >= 20, 20000.0, 1000.0 + 50.0 * lead_grid + 20.0 * member_grid)
         return xr.Dataset(
             data_vars={
                 "temperature_2m": (
@@ -197,6 +209,14 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
                     ("member", "lead_time_hours", "latitude", "longitude"),
                     cicep,
                 ),
+                "cloud_cover_3h": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    cloud_cover_3h,
+                ),
+                "cloud_ceiling": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    cloud_ceiling,
+                ),
             },
             coords={
                 "member": MEMBER_INDICES,
@@ -219,6 +239,8 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
     csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
     cfrzr = np.zeros_like(temperature, dtype=np.uint8)
     cicep = np.zeros_like(temperature, dtype=np.uint8)
+    cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid)
+    cloud_ceiling = np.where(lead_grid == 18, 20000.0, 1000.0 + 50.0 * lead_grid)
     return xr.Dataset(
         data_vars={
             "temperature_2m": (
@@ -248,6 +270,14 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
             "cicep": (
                 ("lead_time_hours", "latitude", "longitude"),
                 cicep,
+            ),
+            "cloud_cover_3h": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cloud_cover_3h,
+            ),
+            "cloud_ceiling": (
+                ("lead_time_hours", "latitude", "longitude"),
+                cloud_ceiling,
             ),
         },
         coords={
@@ -321,6 +351,8 @@ GEFS_FIXTURE_VARIABLES: tuple[str, ...] = (
     "temperature_2m",
     "precipitation_rate",
     "precipitation_amount_3h",
+    "cloud_cover_3h",
+    "cloud_ceiling",
 )
 
 #: The canonical set of GFS (deterministic) variables the fixture GFS store
@@ -329,6 +361,8 @@ GFS_FIXTURE_VARIABLES: tuple[str, ...] = (
     "temperature_2m",
     "precipitation_rate",
     "precipitation_amount_3h",
+    "cloud_cover_3h",
+    "cloud_ceiling",
 )
 
 
@@ -368,6 +402,8 @@ def build_ensemble_dataset() -> xr.Dataset:
     csnow = np.where((lead_grid > 0) & (temperature <= 0), 1, 0).astype(np.uint8)
     cfrzr = np.zeros_like(temperature, dtype=np.uint8)
     cicep = np.zeros_like(temperature, dtype=np.uint8)
+    cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid + 1.0 * member_grid)
+    cloud_ceiling = np.where(member_grid >= 4, 20000.0, 1000.0 + 50.0 * lead_grid + 20.0 * member_grid)
 
     return xr.Dataset(
         data_vars={
@@ -398,6 +434,14 @@ def build_ensemble_dataset() -> xr.Dataset:
             "cicep": (
                 ("member", "lead_time_hours", "latitude", "longitude"),
                 cicep,
+            ),
+            "cloud_cover_3h": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                cloud_cover_3h,
+            ),
+            "cloud_ceiling": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                cloud_ceiling,
             ),
         },
         coords={

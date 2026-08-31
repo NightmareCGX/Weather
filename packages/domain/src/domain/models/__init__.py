@@ -1,5 +1,21 @@
-"""Domain data structures and functions for forecast points, wind fields, and precipitation."""
+"""Domain data structures and functions for forecast points, wind, precipitation, and clouds."""
 
+from domain.models.cloud import (
+    CLOUD_CEILING_MIN_FINITE_MEMBERS,
+    CLOUD_CEILING_UNLIMITED_SENTINEL_M,
+    CLOUD_CEILING_UNLIMITED_THRESHOLD_M,
+    CLOUD_COVER_MIN_VALID_MEMBERS,
+    CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT,
+    METERS_TO_FEET,
+    CloudCeilingClassification,
+    CloudCeilingEnsembleSummary,
+    CloudCoverEnsembleSummary,
+    classify_cloud_ceiling,
+    cloud_ceiling_ensemble_summary,
+    cloud_cover_ensemble_summary,
+    compute_low_ceiling_probability,
+    reconstruct_cloud_cover_3h,
+)
 from domain.models.point import ForecastPoint
 from domain.models.precipitation import (
     TRACE_THRESHOLD_MM,
@@ -38,9 +54,18 @@ __all__ = [
     "CALM_WIND_THRESHOLD_MPS",
     "CARDINAL_DIRECTIONS_8",
     "CARDINAL_DIRECTIONS_16",
+    "CLOUD_CEILING_MIN_FINITE_MEMBERS",
+    "CLOUD_CEILING_UNLIMITED_SENTINEL_M",
+    "CLOUD_CEILING_UNLIMITED_THRESHOLD_M",
+    "CLOUD_COVER_MIN_VALID_MEMBERS",
+    "CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT",
+    "CloudCeilingClassification",
+    "CloudCeilingEnsembleSummary",
+    "CloudCoverEnsembleSummary",
     "ConsensusVectorData",
     "EvidenceState",
     "ForecastPoint",
+    "METERS_TO_FEET",
     "PhysicalPhase",
     "PrecipitationPhaseState",
     "PrecipitationTransition",
@@ -50,10 +75,14 @@ __all__ = [
     "WindRoseData",
     "WindRoseSector",
     "aggregate_ensemble_phase_support",
+    "classify_cloud_ceiling",
     "classify_precipitation_phase",
+    "cloud_ceiling_ensemble_summary",
+    "cloud_cover_ensemble_summary",
     "compute_consensus_vector",
     "compute_directional_probability",
     "compute_joint_amount_phase_support",
+    "compute_low_ceiling_probability",
     "compute_phase_weights",
     "compute_transition_frequencies",
     "compute_wind_rose",
@@ -64,4 +93,5 @@ __all__ = [
     "derive_meteorological_direction_array",
     "derive_wind_speed",
     "get_cardinal_direction",
+    "reconstruct_cloud_cover_3h",
 ]

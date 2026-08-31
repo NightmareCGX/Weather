@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import xarray as xr
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -897,6 +898,111 @@ def test_stale_catalog_reconciles_to_committed_store(
     assert leads == {0, 6}
     run = session.query(ModelRunRecord).one()
     assert run.status == "partial"
+
+
+def test_normalize_cloud_cover_lead_zero_is_nan() -> None:
+    """At lead 0, cloud_cover_3h is stored as NaN because no 3h interval precedes it."""
+    from ingestion.core.pipeline import _normalize_cloud_cover_intervals
+
+    ds = xr.Dataset(
+        data_vars={
+            "tcc": (("latitude", "longitude"), np.array([[50.0, 60.0], [70.0, 80.0]])),
+        },
+        coords={
+            "latitude": [0.0, 1.0],
+            "longitude": [0.0, 1.0],
+            "lead_time_hours": [0],
+        },
+    )
+    variables = (
+        VariableSpec("cloud_cover_3h", "3-Hour Cloud Cover", "%", "tcc"),
+    )
+    res = _normalize_cloud_cover_intervals(ds, variables)
+    assert "tcc" in res.data_vars
+    assert np.isnan(res["tcc"].values).all()
+    assert res["tcc"].attrs["units"] == "%"
+
+
+def test_normalize_cloud_cover_direct_3h_lead() -> None:
+    """At direct 3h leads (f003, f009, ...), upstream TCDC is used directly with clipping."""
+    from ingestion.core.pipeline import _normalize_cloud_cover_intervals
+
+    ds = xr.Dataset(
+        data_vars={
+            "tcc": (("latitude", "longitude"), np.array([[50.0, -1.0], [100.0, 102.0]])),
+        },
+        coords={
+            "latitude": [0.0, 1.0],
+            "longitude": [0.0, 1.0],
+            "lead_time_hours": [3],
+        },
+    )
+    variables = (
+        VariableSpec("cloud_cover_3h", "3-Hour Cloud Cover", "%", "tcc"),
+    )
+    res = _normalize_cloud_cover_intervals(ds, variables)
+    assert res["tcc"].values[0, 0] == 50.0
+    assert res["tcc"].values[0, 1] == 0.0  # Clipped -1 -> 0
+    assert res["tcc"].values[1, 0] == 100.0
+    assert res["tcc"].values[1, 1] == 100.0  # Clipped 102 -> 100
+    assert res["tcc"].attrs["units"] == "%"
+
+
+def test_normalize_cloud_cover_reset_6h_lead_with_guardrail() -> None:
+    """At 6h reset leads, interval reconstruction x = 2*C6 - C3 is applied with guardrail."""
+    from ingestion.core.pipeline import _normalize_cloud_cover_intervals
+
+    # C6: 50%, 18% (undershoot -> 0), 76% (overshoot -> 100), 10% (invalid low -> NaN), 80% (invalid high -> NaN)
+    # C3: 40%, 40%, 50%, 40%, 50%
+    curr_6h = np.array([[50.0, 18.0], [76.0, 10.0]])
+    pred_3h = np.array([[40.0, 40.0], [50.0, 40.0]])
+
+    ds = xr.Dataset(
+        data_vars={
+            "tcc": (("latitude", "longitude"), curr_6h),
+        },
+        coords={
+            "latitude": [0.0, 1.0],
+            "longitude": [0.0, 1.0],
+            "lead_time_hours": [6],
+        },
+    )
+    variables = (
+        VariableSpec("cloud_cover_3h", "3-Hour Cloud Cover", "%", "tcc"),
+    )
+    res = _normalize_cloud_cover_intervals(ds, variables, predecessor_array=pred_3h)
+    vals = res["tcc"].values
+    assert vals[0, 0] == 60.0  # 2*50 - 40 = 60
+    assert vals[0, 1] == 0.0   # 2*18 - 40 = -4 -> 0
+    assert vals[1, 0] == 100.0 # 2*76 - 50 = 102 -> 100
+    assert np.isnan(vals[1, 1]) # 2*10 - 40 = -20 -> NaN
+
+
+def test_read_predecessor_cloud_cover(tmp_path) -> None:
+    """read_predecessor_cloud_cover reads committed cloud_cover_3h slice from Zarr."""
+    from ingestion.core.pipeline import read_predecessor_cloud_cover
+
+    store_path = str(tmp_path / "cloud_test.zarr")
+    ds = xr.Dataset(
+        data_vars={
+            "cloud_cover_3h": (
+                ("lead_time_hours", "latitude", "longitude"),
+                np.array([[[np.nan, np.nan], [np.nan, np.nan]], [[45.0, 55.0], [65.0, 75.0]]], dtype=np.float32),
+            ),
+        },
+        coords={
+            "lead_time_hours": [0, 3],
+            "latitude": [0.0, 1.0],
+            "longitude": [0.0, 1.0],
+        },
+    )
+    write_dataset(ds, store_path)
+
+    pred = read_predecessor_cloud_cover(store_path, 3)
+    assert pred.shape == (2, 2)
+    assert pred[0, 0] == 45.0
+    assert pred[1, 1] == 75.0
+
 
 
 def test_external_shrink_not_hidden_by_subset_readiness(

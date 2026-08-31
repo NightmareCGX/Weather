@@ -103,6 +103,7 @@ _VARIABLE_IMPERIAL_CONVERSIONS: dict[str, tuple[str, Callable[[float], float]]] 
     "visibility": ("mi", lambda m: m / 1609.344),
     "wind_10m": ("mph", lambda kmh: kmh * 0.621371),
     "precipitation_amount_3h": ("in", lambda mm: mm / 25.4),
+    "cloud_ceiling": ("ft", lambda m: m * 3.28084),
 }
 
 
@@ -397,6 +398,28 @@ def build_point_forecast(
                     entry["precipitation_start_type"] = str(values_by_var.get("_precipitation_start_type", "none"))
                     entry["precipitation_end_type"] = str(values_by_var.get("_precipitation_end_type", "none"))
                     entry["precipitation_evidence"] = str(values_by_var.get("_precipitation_evidence", "exact"))
+            elif var_code == "cloud_cover_3h":
+                raw_cc = values_by_var.get("cloud_cover_3h")
+                if raw_cc is None or (isinstance(raw_cc, float) and math.isnan(raw_cc)):
+                    entry["cloud_cover_3h"] = None
+                else:
+                    entry["cloud_cover_3h"] = round(float(raw_cc), 1)
+            elif var_code == "cloud_ceiling":
+                raw_ceil = values_by_var.get("cloud_ceiling")
+                if raw_ceil is None or (isinstance(raw_ceil, float) and math.isnan(raw_ceil)):
+                    entry["cloud_ceiling"] = None
+                    entry["cloud_ceiling_unlimited"] = False
+                else:
+                    val_m = float(raw_ceil)
+                    if val_m >= 19990.0:
+                        entry["cloud_ceiling"] = None
+                        entry["cloud_ceiling_unlimited"] = True
+                    else:
+                        converted = _convert_value(
+                            val_m, "m", units, var_code="cloud_ceiling"
+                        )
+                        entry["cloud_ceiling"] = round(converted, 1)
+                        entry["cloud_ceiling_unlimited"] = False
             else:
                 value = float(values_by_var[var_code])
                 entry[var_code] = _convert_value(

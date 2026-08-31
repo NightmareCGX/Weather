@@ -26,6 +26,8 @@ def test_availability_contract(client):
         "temperature_2m",
         "precipitation_rate",
         "precipitation_amount_3h",
+        "cloud_cover_3h",
+        "cloud_ceiling",
     }
     assert "wind_u_10m" not in {v["id"] for v in gfs["variables"]}
     assert "wind_v_10m" not in {v["id"] for v in gfs["variables"]}

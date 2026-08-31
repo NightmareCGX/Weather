@@ -41,6 +41,11 @@ from domain.exceptions import (
     PointOutsideGridError,
 )
 from domain.geo.coordinates import validate_coordinates
+from domain.models.cloud import (
+    cloud_ceiling_ensemble_summary,
+    cloud_cover_ensemble_summary,
+    compute_low_ceiling_probability,
+)
 from domain.models.precipitation import (
     PhysicalPhase,
     PrecipitationPhaseState,
@@ -192,6 +197,31 @@ def build_probability_forecast(
         except ValueError as exc:
             raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
         lower, upper = probability_confidence_interval(probability, len(precip_states))
+    elif variable == "cloud_ceiling" and operator in ("lt", "lte"):
+        members = _gated_member_values(
+            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+        )
+        prob = compute_low_ceiling_probability(members, threshold_m=threshold)
+        if prob is None:
+            raise HTTPException(
+                status_code=_STATUS_INVALID_INPUT,
+                detail="Insufficient valid members for cloud ceiling probability (requires >= 21).",
+            )
+        valid_n = sum(1 for m in members if not math.isnan(m) and float(m) >= 0.0)
+        lower, upper = probability_confidence_interval(prob, valid_n)
+        probability = prob
+    elif variable == "cloud_cover_3h":
+        members = _gated_member_values(
+            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+        )
+        valid_members = [float(m) for m in members if not math.isnan(m) and 0.0 <= float(m) <= 100.0]
+        if len(valid_members) < 21:
+            raise HTTPException(
+                status_code=_STATUS_INVALID_INPUT,
+                detail="Insufficient valid members for cloud cover probability (requires >= 21).",
+            )
+        probability = _probability(valid_members, threshold, operator, threshold_max)
+        lower, upper = probability_confidence_interval(probability, len(valid_members))
     else:
         members = _gated_member_values(
             str(run.zarr_store_path), variable, leads[0], latitude, longitude
@@ -272,6 +302,11 @@ def build_ensemble_statistics(
     wind_rose_payload: WindRoseOut | None = None
     phase_support_payload: dict[str, float] | None = None
     transition_freq_payload: dict[str, float] | None = None
+    valid_member_count_payload: int | None = None
+    unlimited_prob_payload: float | None = None
+    finite_member_count_payload: int | None = None
+    unlimited_member_count_payload: int | None = None
+    stats: EnsembleStatistics | None = None
 
     if variable == "wind_10m":
         u_members, v_members = _gated_wind_member_vectors(
@@ -320,6 +355,72 @@ def build_ensemble_statistics(
         transition_freq_payload = {
             t.value: round(v, 4) for t, v in freq_map.items() if v > 0.0
         }
+    elif variable == "cloud_cover_3h":
+        members = _gated_member_values(
+            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+        )
+        min_v = 21 if len(members) >= 21 else 1
+        cc_summary = cloud_cover_ensemble_summary(members, min_valid=min_v)
+        if cc_summary is not None:
+            stats = EnsembleStatistics(
+                mean=float(cc_summary.mean),
+                median=float(cc_summary.median),
+                spread=float(cc_summary.spread),
+                p10=float(cc_summary.percentiles["p10"]),
+                p25=float(cc_summary.percentiles["p25"]),
+                p50=float(cc_summary.percentiles["p50"]),
+                p75=float(cc_summary.percentiles["p75"]),
+                p90=float(cc_summary.percentiles["p90"]),
+            )
+            valid_member_count_payload = cc_summary.valid_member_count
+        else:
+            stats = EnsembleStatistics(
+                mean=None, median=None, spread=None,
+                p10=None, p25=None, p50=None, p75=None, p90=None
+            )
+            valid_member_count_payload = sum(
+                1 for m in members if not math.isnan(m) and 0.0 <= float(m) <= 100.0
+            )
+    elif variable == "cloud_ceiling":
+        members = _gated_member_values(
+            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+        )
+        min_v = 21 if len(members) >= 21 else 1
+        ceil_summary = cloud_ceiling_ensemble_summary(
+            members,
+            min_finite=10,
+            min_valid=min_v,
+        )
+        if ceil_summary is not None:
+            unlimited_prob_payload = round(ceil_summary.unlimited_probability, 4)
+            valid_member_count_payload = ceil_summary.valid_member_count
+            finite_member_count_payload = ceil_summary.finite_member_count
+            unlimited_member_count_payload = ceil_summary.unlimited_member_count
+            if ceil_summary.conditional_percentiles_m is not None:
+                stats = EnsembleStatistics(
+                    mean=float(ceil_summary.conditional_mean_m) if ceil_summary.conditional_mean_m is not None else None,
+                    median=float(ceil_summary.conditional_median_m) if ceil_summary.conditional_median_m is not None else None,
+                    spread=float(ceil_summary.conditional_spread_m) if ceil_summary.conditional_spread_m is not None else None,
+                    p10=float(ceil_summary.conditional_percentiles_m["p10"]),
+                    p25=float(ceil_summary.conditional_percentiles_m["p25"]),
+                    p50=float(ceil_summary.conditional_percentiles_m["p50"]),
+                    p75=float(ceil_summary.conditional_percentiles_m["p75"]),
+                    p90=float(ceil_summary.conditional_percentiles_m["p90"]),
+                )
+            else:
+                stats = EnsembleStatistics(
+                    mean=None, median=None, spread=None,
+                    p10=None, p25=None, p50=None, p75=None, p90=None
+                )
+        else:
+            stats = EnsembleStatistics(
+                mean=None, median=None, spread=None,
+                p10=None, p25=None, p50=None, p75=None, p90=None
+            )
+            unlimited_prob_payload = None
+            valid_member_count_payload = 0
+            finite_member_count_payload = 0
+            unlimited_member_count_payload = 0
     else:
         members = _gated_member_values(
             str(run.zarr_store_path), variable, leads[0], latitude, longitude
@@ -327,15 +428,14 @@ def build_ensemble_statistics(
 
     pdf_payload: EnsemblePDF | None = None
     if include_members:
-        domain_pdf = estimate_ensemble_pdf(members)
+        # Filter non-finite/sentinel values for PDF if needed
+        valid_pdf_members = [m for m in members if not math.isnan(m) and m < 19990.0] if variable == "cloud_ceiling" else [m for m in members if not math.isnan(m)]
+        domain_pdf = estimate_ensemble_pdf(valid_pdf_members) if len(valid_pdf_members) >= 2 else None
         if domain_pdf is not None:
             pdf_payload = EnsemblePDF(x=domain_pdf.x, density=domain_pdf.density)
 
-    return EnsembleStatisticsData(
-        model=model,
-        lead_time_hours=lead_time_hours,
-        member_count=len(members),
-        statistics=EnsembleStatistics(
+    if stats is None:
+        stats = EnsembleStatistics(
             mean=ensemble_mean(members),
             median=ensemble_median(members),
             spread=ensemble_spread(members),
@@ -344,13 +444,23 @@ def build_ensemble_statistics(
             p50=ensemble_percentile(members, 50),
             p75=ensemble_percentile(members, 75),
             p90=ensemble_percentile(members, 90),
-        ),
+        )
+
+    return EnsembleStatisticsData(
+        model=model,
+        lead_time_hours=lead_time_hours,
+        member_count=len(members),
+        statistics=stats,
         members=members if include_members else None,
         pdf=pdf_payload if include_members else None,
         consensus_vector=consensus_payload,
         wind_rose=wind_rose_payload,
         phase_support=phase_support_payload,
         transition_frequency=transition_freq_payload,
+        valid_member_count=valid_member_count_payload,
+        unlimited_probability=unlimited_prob_payload,
+        finite_member_count=finite_member_count_payload,
+        unlimited_member_count=unlimited_member_count_payload,
     )
 
 

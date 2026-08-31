@@ -71,6 +71,7 @@ from ingestion.core.catalog import RunCatalogSpec, VariableSpec
 from ingestion.core.pipeline import (
     _apply_variable_mapping,
     _normalize_canonical_units,
+    _normalize_cloud_cover_intervals,
     _normalize_precipitation_increments,
     _validate_requested_lead,
     _validate_requested_member,
@@ -563,6 +564,18 @@ DEFAULT_VARIABLES: tuple[VariableSpec, ...] = (
         name="10-Meter V Wind Component",
         unit="m/s",
         source_code="v10",
+    ),
+    VariableSpec(
+        code="cloud_cover_3h",
+        name="3-Hour Cloud Cover",
+        unit="%",
+        source_code="tcc",
+    ),
+    VariableSpec(
+        code="cloud_ceiling",
+        name="Cloud Ceiling Height",
+        unit="m",
+        source_code="gh",
     ),
 )
 
@@ -1355,12 +1368,12 @@ async def _run_wave(
                     decode_fut = decode_pool.submit(dest)
                     try:
                         raw_ds = await asyncio.wrap_future(decode_fut)
-                        # Predecessor coordination for 6h-reset leads requiring de-accumulation
+                        # Predecessor coordination for 6h-reset leads requiring de-accumulation / reconstruction
                         if (
                             lead % 6 == 0
                             and lead > 0
                             and any(
-                                v.code == "precipitation_amount_3h"
+                                v.code in ("precipitation_amount_3h", "cloud_cover_3h")
                                 for v in catalog_spec.variables
                             )
                         ):
@@ -1371,6 +1384,12 @@ async def _run_wave(
                                     return
                         ds = _normalize_precipitation_increments(
                             raw_ds,
+                            catalog_spec.variables,
+                            store_path=store_path,
+                            member=member,
+                        )
+                        ds = _normalize_cloud_cover_intervals(
+                            ds,
                             catalog_spec.variables,
                             store_path=store_path,
                             member=member,
@@ -1589,6 +1608,13 @@ def _decode_and_normalize(
     """
     ds = future.result()
     ds = _normalize_precipitation_increments(
+        ds,
+        catalog_spec.variables,
+        store_path=store_path,
+        predecessor_array=predecessor_array,
+        member=member,
+    )
+    ds = _normalize_cloud_cover_intervals(
         ds,
         catalog_spec.variables,
         store_path=store_path,

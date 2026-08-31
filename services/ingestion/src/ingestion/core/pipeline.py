@@ -33,6 +33,10 @@ import xarray as xr
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
+from domain.models.cloud import (
+    CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT,
+    reconstruct_cloud_cover_3h,
+)
 from ingestion.core.base import (
     CycleStoreMismatchError,
     DEACCUMULATION_TOLERANCE_MM,
@@ -255,10 +259,13 @@ _SOURCE_TO_CANONICAL: dict[
         "ms-1": lambda array: array * 3.6,
         "m/s": lambda array: array * 3.6,
     },
-    # Relative humidity is %; canonical is %.
+    # Relative humidity and cloud cover are %; canonical is %.
     "%": {"%": lambda array: array},
-    # Visibility and snow depth are meters; canonical is meters.
-    "m": {"m": lambda array: array},
+    # Visibility, snow depth, and cloud ceiling are meters; canonical is meters.
+    "m": {
+        "m": lambda array: array,
+        "gpm": lambda array: array,
+    },
     # Wind vector components are m/s; canonical is m/s.
     "m/s": {
         "ms-1": lambda array: array,
@@ -509,6 +516,174 @@ def _normalize_precipitation_increments(
     return dataset
 
 
+def read_predecessor_cloud_cover(
+    store_path: str,
+    lead_time_hours: int,
+    *,
+    member: int | None = None,
+) -> npt.NDArray[np.float32]:
+    """Read a committed cloud_cover_3h slice from a cycle's Zarr store.
+
+    Used by the ingestion normalizer when reconstructing 3-hour interval averages for
+    6-hour-reset leads (t=6, 12, 18, 24, ...).
+
+    Args:
+        store_path: Path/URL to the target Zarr store.
+        lead_time_hours: The predecessor lead time (e.g. lead - 3).
+        member: Ensemble member index (None for deterministic).
+
+    Returns:
+        2D numpy array of predecessor cloud cover percentages (dtype float32).
+
+    Raises:
+        MissingPredecessorLeadError: If store does not exist, lead is missing,
+            or slice is completely uncommitted (all NaN).
+    """
+    if not store_exists(store_path):
+        raise MissingPredecessorLeadError(
+            f"Cannot read predecessor cloud cover: store {store_path!r} does not exist."
+        )
+    ds = read_dataset(store_path)
+    if "cloud_cover_3h" not in ds.data_vars:
+        raise MissingPredecessorLeadError(
+            f"Cannot read predecessor cloud cover: variable 'cloud_cover_3h' "
+            f"is missing from store {store_path!r}."
+        )
+    if "lead_time_hours" not in ds.coords:
+        raise MissingPredecessorLeadError(
+            f"Cannot read predecessor cloud cover: no 'lead_time_hours' coordinate in {store_path!r}."
+        )
+    lead_vals = [int(v) for v in np.atleast_1d(ds.coords["lead_time_hours"].values).reshape(-1)]
+    if int(lead_time_hours) not in lead_vals:
+        raise MissingPredecessorLeadError(
+            f"Predecessor lead {lead_time_hours} is not in store's lead coordinates {lead_vals}."
+        )
+
+    var = ds["cloud_cover_3h"]
+    if member is not None:
+        if "member" not in ds.coords:
+            raise MissingPredecessorLeadError(
+                f"Expected ensemble store with 'member' coordinate in {store_path!r}."
+            )
+        member_vals = [int(v) for v in np.atleast_1d(ds.coords["member"].values).reshape(-1)]
+        if int(member) not in member_vals:
+            raise MissingPredecessorLeadError(
+                f"Predecessor member {member} is not in store's member coordinates {member_vals}."
+            )
+        slice_da = var.sel(member=member, lead_time_hours=lead_time_hours)
+    else:
+        slice_da = var.sel(lead_time_hours=lead_time_hours)
+
+    vals = np.asarray(slice_da.values, dtype=np.float32)
+    if np.all(np.isnan(vals)):
+        raise MissingPredecessorLeadError(
+            f"Predecessor lead {lead_time_hours} (member={member}) in {store_path!r} "
+            "is uncommitted (contains only NaN values)."
+        )
+    return vals
+
+
+def _normalize_cloud_cover_intervals(
+    dataset: xr.Dataset,
+    variables: tuple[VariableSpec, ...],
+    *,
+    store_path: str | None = None,
+    predecessor_array: npt.NDArray[Any] | None = None,
+    member: int | None = None,
+) -> xr.Dataset:
+    """Normalize cloud cover interval-average fields to canonical preceding 3-hour averages.
+
+    Canonical contract:
+    * lead == 0: cloud_cover_3h is NaN (no preceding 3h interval exists).
+    * lead % 6 == 3 (e.g. 3, 9, 15, ...): direct upstream TCDC is already [t-3, t].
+    * lead % 6 == 0 and lead > 0 (e.g. 6, 12, 18, ...): upstream TCDC is [t-6, t].
+      Derived as C_3h(t) = 2 * TCDC[t-6, t] - C_3h[t-6, t-3] using predecessor,
+      guarded by CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT (±5%).
+
+    Args:
+        dataset: The decoded dataset (carrying raw shortNames or mapped codes).
+        variables: Run's catalog variable specifications.
+        store_path: Optional store path for predecessor lookup at 6h leads.
+        predecessor_array: Optional explicit predecessor 2D array.
+        member: Optional member identity for ensemble predecessor lookup.
+
+    Returns:
+        The dataset with normalized cloud_cover_3h values.
+    """
+    has_cloud_spec = any(v.code == "cloud_cover_3h" for v in variables)
+    if not has_cloud_spec:
+        return dataset
+
+    if "lead_time_hours" not in dataset.coords:
+        return dataset
+    lead_val = int(np.asarray(dataset.coords["lead_time_hours"].values).reshape(-1)[0])
+
+    cloud_var_name = None
+    if "cloud_cover_3h" in dataset.data_vars:
+        cloud_var_name = "cloud_cover_3h"
+    elif "tcc" in dataset.data_vars:
+        cloud_var_name = "tcc"
+
+    # Case 1: Analysis time (lead == 0)
+    if lead_val == 0:
+        if cloud_var_name is not None:
+            dataset[cloud_var_name].values = np.full_like(
+                dataset[cloud_var_name].values, np.nan, dtype=np.float32
+            )
+            dataset[cloud_var_name].attrs["units"] = "%"
+        else:
+            if dataset.data_vars:
+                ref_var = next(iter(dataset.data_vars.values()))
+                nan_arr = np.full_like(ref_var.values, np.nan, dtype=np.float32)
+                dataset["tcc"] = xr.DataArray(
+                    nan_arr,
+                    dims=ref_var.dims,
+                    coords=ref_var.coords,
+                    attrs={"units": "%", "long_name": "3-Hour Total Cloud Cover"},
+                )
+        return dataset
+
+    if cloud_var_name is None:
+        return dataset
+
+    # Case 2: Direct 3-hour lead (lead % 6 == 3)
+    if lead_val % 6 == 3:
+        raw_vals = np.asarray(dataset[cloud_var_name].values, dtype=np.float32)
+        clipped = np.clip(raw_vals, 0.0, 100.0)
+        dataset[cloud_var_name].values = clipped
+        dataset[cloud_var_name].attrs["units"] = "%"
+        return dataset
+
+    # Case 3: Reconstructed 6-hour reset lead (lead % 6 == 0)
+    if lead_val % 6 == 0:
+        pred_lead = lead_val - 3
+        if predecessor_array is None:
+            if store_path is None:
+                raise MissingPredecessorLeadError(
+                    f"Cannot reconstruct cloud cover for lead {lead_val}: "
+                    "no store_path or predecessor_array provided."
+                )
+            predecessor_array = read_predecessor_cloud_cover(
+                store_path, pred_lead, member=member
+            )
+
+        curr_vals = dataset[cloud_var_name].values
+        orig_shape = curr_vals.shape
+        curr_2d = np.squeeze(curr_vals)
+        pred_2d = np.squeeze(predecessor_array)
+
+        reconstructed_2d = reconstruct_cloud_cover_3h(
+            curr_2d, pred_2d, tolerance=CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT
+        )
+        dataset[cloud_var_name].values = np.asarray(
+            reconstructed_2d, dtype=np.float32
+        ).reshape(orig_shape)
+        dataset[cloud_var_name].attrs["units"] = "%"
+        return dataset
+
+    return dataset
+
+
 def _apply_variable_mapping(
     dataset: xr.Dataset,
     variables: tuple[VariableSpec, ...],
@@ -678,6 +853,12 @@ def ingest_grib_file(
 
     dataset = parse_grib2(grib_path)
     dataset = _normalize_precipitation_increments(
+        dataset,
+        spec.variables,
+        store_path=store_path,
+        member=member,
+    )
+    dataset = _normalize_cloud_cover_intervals(
         dataset,
         spec.variables,
         store_path=store_path,

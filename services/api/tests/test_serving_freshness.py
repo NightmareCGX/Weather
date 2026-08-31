@@ -48,11 +48,15 @@ def _make_forecast_dataset(
     temperature = (base_temp + 0.5 * lead_grid).astype(np.float32)
     precipitation = (0.5 * lead_grid).astype(np.float32)
     amount_3h = np.where(lead_grid == 0, np.nan, 0.4 * lead_grid).astype(np.float32)
+    cloud_cover = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid).astype(np.float32)
+    cloud_ceil = np.where(lead_grid == 18, 20000.0, 1000.0 + 50.0 * lead_grid).astype(np.float32)
     return xr.Dataset(
         data_vars={
             "temperature_2m": (("lead_time_hours", "latitude", "longitude"), temperature),
             "precipitation_rate": (("lead_time_hours", "latitude", "longitude"), precipitation),
             "precipitation_amount_3h": (("lead_time_hours", "latitude", "longitude"), amount_3h),
+            "cloud_cover_3h": (("lead_time_hours", "latitude", "longitude"), cloud_cover),
+            "cloud_ceiling": (("lead_time_hours", "latitude", "longitude"), cloud_ceil),
         },
         coords={
             "lead_time_hours": leads,

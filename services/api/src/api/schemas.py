@@ -386,14 +386,14 @@ class SpatialLayerEnvelope(BaseModel):
 class EnsembleStatistics(BaseModel):
     """Ensemble dispersion statistics (API.md section 5.1)."""
 
-    mean: float
-    median: float
-    spread: float
-    p10: float
-    p25: float
-    p50: float
-    p75: float
-    p90: float
+    mean: float | None = None
+    median: float | None = None
+    spread: float | None = None
+    p10: float | None = None
+    p25: float | None = None
+    p50: float | None = None
+    p75: float | None = None
+    p90: float | None = None
 
 
 class EnsemblePDF(BaseModel):
@@ -451,6 +451,10 @@ class EnsembleStatisticsData(BaseModel):
     wind_rose: WindRoseOut | None = None
     phase_support: dict[str, float] | None = None
     transition_frequency: dict[str, float] | None = None
+    valid_member_count: int | None = None
+    unlimited_probability: float | None = None
+    finite_member_count: int | None = None
+    unlimited_member_count: int | None = None
 
     @model_serializer
     def _serialize_distribution_fields(self) -> dict[str, object]:
@@ -472,6 +476,14 @@ class EnsembleStatisticsData(BaseModel):
             payload["phase_support"] = self.phase_support
         if self.transition_frequency is not None:
             payload["transition_frequency"] = self.transition_frequency
+        if self.valid_member_count is not None:
+            payload["valid_member_count"] = self.valid_member_count
+        if self.unlimited_probability is not None:
+            payload["unlimited_probability"] = self.unlimited_probability
+        if self.finite_member_count is not None:
+            payload["finite_member_count"] = self.finite_member_count
+        if self.unlimited_member_count is not None:
+            payload["unlimited_member_count"] = self.unlimited_member_count
         return payload
 
 
