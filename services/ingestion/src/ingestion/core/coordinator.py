@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import random
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
@@ -47,6 +49,7 @@ from domain.locks import (
 )
 from ingestion.core.base import (
     StoreSchemaMismatchError,
+    is_retryable_storage_error,
 )
 from ingestion.core.catalog import (
     CommittedState,
@@ -531,64 +534,106 @@ class RunCoordinator:
                         f"region (member={member}, lead={lead}) is not owned by "
                         f"generation {generation}"
                     )
-                # Generation-ownership confirmed: write the data using snapshot
-                _commit_region(
-                    dataset,
-                    self.store_path,
-                    member=member,
-                    expected_lead_time_hours=expected_leads,
-                    expected_members=expected_members,
-                    snapshot=snapshot,
-                )
-                # Compute the physical object inventory for the COMPLETE marker from snapshot
+                # Generation-ownership confirmed: bounded retry for transient storage writes
                 from ingestion.core.inventory import (
                     expected_write_set_fingerprint,
                     region_expected_object_keys,
                     verify_expected_object_keys,
                 )
 
-                expected_keys = region_expected_object_keys(
-                    self.store_path,
-                    member=member,
-                    lead_index=lead_index,
-                    data_var_paths=snapshot.data_var_paths,
-                    zarray_cache=snapshot.zarray_by_var,
-                    zattrs_cache=snapshot.zattrs_by_var,
-                    member_index_cache=snapshot.member_index_map,
-                )
-                existing_keys = verify_expected_object_keys(
-                    self.store_path,
-                    expected_keys,
-                    member=member,
-                    lead_index=lead_index,
-                    zarray_cache=snapshot.zarray_by_var,
-                    zattrs_cache=snapshot.zattrs_by_var,
-                    member_index_cache=snapshot.member_index_map,
-                )
-                # Real-data writes materialize all expected chunks; an expected
-                # chunk that is absent is an all-fill omission.
-                required = [k for k in expected_keys if k in existing_keys]
-                omitted = [k for k in expected_keys if k not in existing_keys]
-                # Write COMPLETE marker (last store-side operation).
-                write_region_marker(
-                    self.store_path,
-                    lead_time_hours=lead,
-                    member=member,
-                    payload={
-                        "protocol_version": 1,
-                        "state": "complete",
-                        "generation": generation,
-                        "logical_region": {
-                            "lead_time_hours": lead,
-                            **({"member": member} if member is not None else {}),
-                        },
-                        "expected_write_set_fingerprint": expected_write_set_fingerprint(
-                            required, omitted
-                        ),
-                        "required_materialized_object_keys": required,
-                        "intentionally_omitted_fill_chunks": omitted,
-                    },
-                )
+                max_attempts = 3
+                base_delay = 0.2
+                max_delay = 2.0
+
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        # 1. Write the data region using snapshot
+                        _commit_region(
+                            dataset,
+                            self.store_path,
+                            member=member,
+                            expected_lead_time_hours=expected_leads,
+                            expected_members=expected_members,
+                            snapshot=snapshot,
+                        )
+                        # 2. Compute physical object inventory for COMPLETE marker from snapshot
+                        expected_keys = region_expected_object_keys(
+                            self.store_path,
+                            member=member,
+                            lead_index=lead_index,
+                            data_var_paths=snapshot.data_var_paths,
+                            zarray_cache=snapshot.zarray_by_var,
+                            zattrs_cache=snapshot.zattrs_by_var,
+                            member_index_cache=snapshot.member_index_map,
+                        )
+                        existing_keys = verify_expected_object_keys(
+                            self.store_path,
+                            expected_keys,
+                            member=member,
+                            lead_index=lead_index,
+                            zarray_cache=snapshot.zarray_by_var,
+                            zattrs_cache=snapshot.zattrs_by_var,
+                            member_index_cache=snapshot.member_index_map,
+                        )
+                        # Real-data writes materialize all expected chunks; an expected
+                        # chunk that is absent is an all-fill omission.
+                        required = [k for k in expected_keys if k in existing_keys]
+                        omitted = [k for k in expected_keys if k not in existing_keys]
+                        # 3. Write COMPLETE marker (last store-side operation).
+                        write_region_marker(
+                            self.store_path,
+                            lead_time_hours=lead,
+                            member=member,
+                            payload={
+                                "protocol_version": 1,
+                                "state": "complete",
+                                "generation": generation,
+                                "logical_region": {
+                                    "lead_time_hours": lead,
+                                    **({"member": member} if member is not None else {}),
+                                },
+                                "expected_write_set_fingerprint": expected_write_set_fingerprint(
+                                    required, omitted
+                                ),
+                                "required_materialized_object_keys": required,
+                                "intentionally_omitted_fill_chunks": omitted,
+                            },
+                        )
+                        if attempt > 1:
+                            logger.info(
+                                "Region write succeeded on retry: member=%s lead=%d attempt=%d/%d",
+                                member,
+                                lead,
+                                attempt,
+                                max_attempts,
+                            )
+                        break
+                    except Exception as exc:
+                        if attempt < max_attempts and is_retryable_storage_error(exc):
+                            jitter = random.uniform(0.0, 0.1)
+                            backoff = min(max_delay, base_delay * (2 ** (attempt - 1))) + jitter
+                            logger.warning(
+                                "Transient storage failure on region write (member=%s lead=%d attempt=%d/%d): %s; "
+                                "retrying in %.2fs",
+                                member,
+                                lead,
+                                attempt,
+                                max_attempts,
+                                exc,
+                                backoff,
+                            )
+                            time.sleep(backoff)
+                            continue
+                        logger.error(
+                            "Region write failed (member=%s lead=%d attempt=%d/%d retryable=%s): %s",
+                            member,
+                            lead,
+                            attempt,
+                            max_attempts,
+                            is_retryable_storage_error(exc),
+                            exc,
+                        )
+                        raise
             finally:
                 co.release_region_locks(region_ids)
         finally:

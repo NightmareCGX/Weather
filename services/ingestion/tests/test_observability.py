@@ -992,9 +992,9 @@ def test_gefs_510_region_startup_delay_measurement(session: Session, tmp_path, m
                 "8",
             ]
         )
-    assert code == 0
     out = stdout_capture.getvalue()
     print("\n--- CAPTURED GEFS 510-REGION TIMELINE REPORT ---\n" + out)
+    assert code == 0
     assert "INGESTION STARTUP TIMELINE REPORT" in out
     assert "Total Target Regions: 510" in out
     assert "Pre-Update Marker PUTs" in out

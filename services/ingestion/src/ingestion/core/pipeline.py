@@ -23,6 +23,7 @@ worker (e.g. a future Celery task) can call; the console entrypoint
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,7 @@ from domain.models.cloud import (
 )
 from ingestion.core.base import (
     CycleStoreMismatchError,
-    DEACCUMULATION_TOLERANCE_MM,
+    DEACCUMULATION_CLAMP_BOUND_MM,
     DeaccumulationError,
     IngestionError,
     LeadTimeMismatchError,
@@ -62,6 +63,8 @@ from ingestion.core.zarr_writer import (
     store_exists,
 )
 from ingestion.providers.noaa.parser import parse_grib2
+
+logger = logging.getLogger(__name__)
 
 
 class UnitNormalizationError(IngestionError):
@@ -293,28 +296,30 @@ def deaccumulate_precipitation(
     current_accum: npt.NDArray[Any],
     predecessor_accum: npt.NDArray[Any],
     *,
-    tolerance: float = DEACCUMULATION_TOLERANCE_MM,
+    tolerance: float = DEACCUMULATION_CLAMP_BOUND_MM,
 ) -> npt.NDArray[np.float32]:
     """Derive 3-hour precipitation increment by subtracting predecessor accumulation.
 
-    Computes ``increment = current_accum - predecessor_accum`` and applies
-    quantization-aware tolerance clamping:
-    * Non-negative increments are retained as-is.
-    * Negative residuals within ``[-tolerance, 0.0)`` (caused by upstream GRIB
-      packing scale differences between 3h and 6h files) are clamped to ``0.0``.
-    * Negative residuals strictly below ``-tolerance`` violate physical and
-      quantization invariants and raise :class:`DeaccumulationError`.
+    Computes ``increment = current_accum - predecessor_accum`` elementwise:
+    * Non-negative increments (residual >= 0.0 mm) are preserved as-is.
+    * Negative residuals within ``[-tolerance, 0.0)`` mm (exact bound at ``-0.50 mm``)
+      caused by upstream GRIB packing scale differences between 3h and 6h files are
+      clamped to ``0.0 mm``.
+    * Negative residuals strictly below ``-tolerance`` (< -0.50 mm) violate physical
+      bounds and are set to ``NaN`` elementwise without failing the task.
+    * Existing NaNs in input arrays are preserved as ``NaN``.
+    * Input arrays are never mutated.
 
     Args:
         current_accum: Current interval accumulation array (e.g. [t-6, t]).
         predecessor_accum: Predecessor interval accumulation array (e.g. [t-6, t-3]).
-        tolerance: Maximum tolerable negative residual in mm (default: 0.10 mm).
+        tolerance: Clamping bound in mm for negative residuals (default: 0.50 mm).
 
     Returns:
         The normalized 3-hour precipitation increment array (dtype float32).
 
     Raises:
-        DeaccumulationError: If shape mismatch or negative residual exceeds tolerance.
+        DeaccumulationError: If shape mismatch between current and predecessor arrays.
     """
     curr = np.asarray(current_accum, dtype=np.float64)
     pred = np.asarray(predecessor_accum, dtype=np.float64)
@@ -324,16 +329,38 @@ def deaccumulate_precipitation(
             f"{curr.shape} and predecessor {pred.shape}."
         )
     diff = curr - pred
+    result = np.full_like(diff, np.nan, dtype=np.float32)
     valid_mask = ~np.isnan(diff)
-    if np.any(valid_mask):
+
+    # 1. Non-negative residuals preserved as-is
+    ge_zero = valid_mask & (diff >= 0.0)
+    result[ge_zero] = np.asarray(diff[ge_zero], dtype=np.float32)
+
+    # 2. Negative residuals within [-tolerance, 0.0) clamped to 0.0 mm (exact bound at -0.50 mm)
+    bound = float(tolerance)
+    clamped_mask = valid_mask & (diff < 0.0) & (diff >= -bound)
+    result[clamped_mask] = 0.0
+
+    # 3. Negative residuals < -bound remain NaN in result
+    invalidated_mask = valid_mask & (diff < -bound)
+
+    # QC Observability logging
+    clamped_count = int(np.count_nonzero(clamped_mask))
+    invalidated_count = int(np.count_nonzero(invalidated_mask))
+    if clamped_count > 0 or invalidated_count > 0:
         min_residual = float(np.min(diff[valid_mask]))
-        if min_residual < -tolerance:
-            raise DeaccumulationError(
-                f"Precipitation de-accumulation negative residual {min_residual:.4f} mm "
-                f"exceeds tolerance bound {-tolerance:.4f} mm."
-            )
-    clamped = np.where((diff < 0.0) & (diff >= -tolerance), 0.0, diff)
-    return np.asarray(clamped, dtype=np.float32)
+        logger.warning(
+            "Precipitation de-accumulation negative residuals detected: "
+            "clamped_count=%d (in [-%0.2f, 0.0) mm -> 0.0 mm), "
+            "invalidated_count=%d (< -%0.2f mm -> NaN), min_residual=%.4f mm",
+            clamped_count,
+            bound,
+            invalidated_count,
+            bound,
+            min_residual,
+        )
+
+    return result
 
 
 def read_predecessor_precipitation(
