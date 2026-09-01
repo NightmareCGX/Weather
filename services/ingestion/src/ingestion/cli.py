@@ -62,11 +62,16 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import xarray as xr
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
-from ingestion.core.base import CycleStoreMismatchError, LeadTimeMismatchError
+from ingestion.core.base import (
+    CycleStoreMismatchError,
+    LeadTimeMismatchError,
+    PredecessorState,
+)
 from ingestion.core.catalog import RunCatalogSpec, VariableSpec
 from ingestion.core.pipeline import (
     _apply_variable_mapping,
@@ -1088,6 +1093,11 @@ async def _run_wave(
     write_completed_events: dict[tuple[int | None, int], asyncio.Event] = {
         item: asyncio.Event() for item in items
     }
+    decode_completed_events: dict[tuple[int | None, int], asyncio.Event] = {
+        item: asyncio.Event() for item in items
+    }
+    predecessor_states: dict[tuple[int | None, int], PredecessorState] = {}
+    predecessor_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=plan.write_concurrency)
     # The persistent decode pool: up to ``plan.decode_concurrency`` reusable worker
     # processes each holding independent cfgrib/ecCodes native state.
@@ -1143,8 +1153,30 @@ async def _run_wave(
             seed_dataset = _decode_and_normalize(
                 seed_future, catalog_spec, store_path=store_path, member=seed_member
             )
+
+            raw_precip_for_future = None
+            if "tp" in seed_dataset.data_vars:
+                raw_precip_for_future = np.copy(seed_dataset["tp"].values)
+            elif "precipitation_amount_3h" in seed_dataset.data_vars:
+                raw_precip_for_future = np.copy(seed_dataset["precipitation_amount_3h"].values)
+
+            raw_cloud_for_future = None
+            if "tcc" in seed_dataset.data_vars:
+                raw_cloud_for_future = np.copy(seed_dataset["tcc"].values)
+            elif "cloud_cover_3h" in seed_dataset.data_vars:
+                raw_cloud_for_future = np.copy(seed_dataset["cloud_cover_3h"].values)
+
             _validate_requested_lead(seed_dataset, seed_lead)
             _validate_requested_member(seed_dataset, seed_member)
+
+            if raw_precip_for_future is not None or raw_cloud_for_future is not None:
+                with predecessor_lock:
+                    predecessor_states[seed_item] = PredecessorState(
+                        precip_raw=raw_precip_for_future,
+                        cloud_raw=raw_cloud_for_future,
+                    )
+            decode_completed_events[seed_item].set()
+
             tracker.record_milestone("seed_decode_complete")
             tracker.on_decode_complete(
                 seed_member,
@@ -1152,6 +1184,7 @@ async def _run_wave(
                 duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
             )
         except Exception:
+            decode_completed_events[seed_item].set()
             tracker.on_decode_failed(
                 seed_member,
                 seed_lead,
@@ -1353,7 +1386,25 @@ async def _run_wave(
                         failures.append(
                             f"{spec.model} member={member} lead={lead} download: {exc}"
                         )
+                        decode_completed_events[(member, lead)].set()
+                        write_completed_events[(member, lead)].set()
                         return
+
+                # Predecessor coordination for 6h-reset leads requiring de-accumulation / reconstruction.
+                # Waiting occurs OUTSIDE and BEFORE acquiring decode_sem to prevent semaphore inversion.
+                if (
+                    lead % 6 == 0
+                    and lead > 0
+                    and any(
+                        v.code in ("precipitation_amount_3h", "cloud_cover_3h")
+                        for v in catalog_spec.variables
+                    )
+                ):
+                    pred_item = (member, lead - 3)
+                    if pred_item in decode_completed_events:
+                        await decode_completed_events[pred_item].wait()
+                        if cancel_event.is_set():
+                            return
 
                 # Stage 3: Bounded decode (ProcessPool execution + parent normalization)
                 # ZERO DB connections checked out during this compute-intensive phase.
@@ -1367,42 +1418,53 @@ async def _run_wave(
                     t_dec_start = time.monotonic()
                     decode_fut = decode_pool.submit(dest)
                     try:
-                        raw_ds = await asyncio.wrap_future(decode_fut)
-                        # Predecessor coordination for 6h-reset leads requiring de-accumulation / reconstruction
-                        if (
-                            lead % 6 == 0
-                            and lead > 0
-                            and any(
-                                v.code in ("precipitation_amount_3h", "cloud_cover_3h")
-                                for v in catalog_spec.variables
-                            )
-                        ):
+                        # Retrieve and consume predecessor raw state if this is a 6h reset lead
+                        pred_precip = None
+                        pred_cloud = None
+                        if lead % 6 == 0 and lead > 0:
                             pred_item = (member, lead - 3)
-                            if pred_item in write_completed_events:
-                                await write_completed_events[pred_item].wait()
-                                if cancel_event.is_set():
-                                    return
-                        ds = _normalize_precipitation_increments(
-                            raw_ds,
-                            catalog_spec.variables,
+                            with predecessor_lock:
+                                pred_state = predecessor_states.pop(pred_item, None)
+                            if pred_state is not None:
+                                pred_precip = pred_state.precip_raw
+                                pred_cloud = pred_state.cloud_raw
+
+                        ds = _decode_and_normalize(
+                            decode_fut,
+                            catalog_spec,
                             store_path=store_path,
+                            predecessor_array=pred_precip,
+                            predecessor_cloud_array=pred_cloud,
                             member=member,
                         )
-                        ds = _normalize_cloud_cover_intervals(
-                            ds,
-                            catalog_spec.variables,
-                            store_path=store_path,
-                            member=member,
-                        )
-                        ds = _apply_variable_mapping(ds, catalog_spec.variables)
-                        ds = _normalize_canonical_units(ds, catalog_spec.variables)
-                        ds.attrs["model_id"] = catalog_spec.model_id
                         _validate_requested_lead(ds, lead)
                         _validate_requested_member(ds, member)
+
+                        # Store raw arrays for future dependent leads
+                        raw_precip_for_future = None
+                        if "tp" in ds.data_vars:
+                            raw_precip_for_future = np.copy(ds["tp"].values)
+                        elif "precipitation_amount_3h" in ds.data_vars:
+                            raw_precip_for_future = np.copy(ds["precipitation_amount_3h"].values)
+
+                        raw_cloud_for_future = None
+                        if "tcc" in ds.data_vars:
+                            raw_cloud_for_future = np.copy(ds["tcc"].values)
+                        elif "cloud_cover_3h" in ds.data_vars:
+                            raw_cloud_for_future = np.copy(ds["cloud_cover_3h"].values)
+
+                        if raw_precip_for_future is not None or raw_cloud_for_future is not None:
+                            with predecessor_lock:
+                                predecessor_states[(member, lead)] = PredecessorState(
+                                    precip_raw=raw_precip_for_future,
+                                    cloud_raw=raw_cloud_for_future,
+                                )
+
                         dec_dur = (time.monotonic() - t_dec_start) * 1000.0
                         tracker.on_decode_complete(
                             member, lead, duration_ms=dec_dur
                         )
+                        decode_completed_events[(member, lead)].set()
                     except Exception as exc:  # noqa: BLE001 - report decode failure
                         dec_dur = (time.monotonic() - t_dec_start) * 1000.0
                         tracker.on_decode_failed(
@@ -1411,6 +1473,7 @@ async def _run_wave(
                         failures.append(
                             f"{spec.model} member={member} lead={lead} decode: {exc}"
                         )
+                        decode_completed_events[(member, lead)].set()
                         write_completed_events[(member, lead)].set()
                         return
 
@@ -1576,6 +1639,7 @@ def _decode_and_normalize(
     *,
     store_path: str | None = None,
     predecessor_array: Any | None = None,
+    predecessor_cloud_array: Any | None = None,
     member: int | None = None,
 ) -> xr.Dataset:
     """Await a decode worker result and normalize it in the parent process.
@@ -1595,7 +1659,8 @@ def _decode_and_normalize(
         future: The decode-pool future for the staged GRIB2 file.
         catalog_spec: The run's catalog metadata (variable specs + model id).
         store_path: Optional store path for predecessor lookup at 6h leads.
-        predecessor_array: Optional explicit predecessor 2D array.
+        predecessor_array: Optional explicit predecessor 2D array for precipitation.
+        predecessor_cloud_array: Optional explicit predecessor 2D array for cloud cover.
         member: Optional member identity for ensemble predecessor lookup.
 
     Returns:
@@ -1614,11 +1679,16 @@ def _decode_and_normalize(
         predecessor_array=predecessor_array,
         member=member,
     )
+    cloud_pred = (
+        predecessor_cloud_array
+        if predecessor_cloud_array is not None
+        else predecessor_array
+    )
     ds = _normalize_cloud_cover_intervals(
         ds,
         catalog_spec.variables,
         store_path=store_path,
-        predecessor_array=predecessor_array,
+        predecessor_array=cloud_pred,
         member=member,
     )
     ds = _apply_variable_mapping(ds, catalog_spec.variables)

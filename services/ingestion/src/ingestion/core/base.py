@@ -1,8 +1,10 @@
 """Provider-agnostic connector interfaces and domain exceptions."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 
 class IngestionError(Exception):
@@ -76,11 +78,119 @@ class MissingPredecessorLeadError(DeaccumulationError):
     """Raised when a 6-hour reset lead cannot find its required predecessor lead."""
 
 
-#: Maximum negative residual (in mm) tolerated during precipitation de-accumulation.
-#: This bound accounts for upstream GRIB simple packing quantization differences
-#: (e.g. GEFS f003 packed at 0.01 mm vs f006 packed at 0.1 mm) where rounding
-#: can yield small negative residuals down to -0.09 mm.
-DEACCUMULATION_TOLERANCE_MM: float = 0.10
+#: Negative residual clamping bound (in mm) for precipitation de-accumulation.
+#: Residuals in [-DEACCUMULATION_CLAMP_BOUND_MM, 0.0) mm (caused by upstream GRIB
+#: simple packing quantization differences between 3h and 6h files) are clamped to 0.0 mm.
+#: Residuals strictly below -DEACCUMULATION_CLAMP_BOUND_MM are marked NaN elementwise
+#: without failing the task.
+DEACCUMULATION_CLAMP_BOUND_MM: float = 0.50
+DEACCUMULATION_TOLERANCE_MM: float = DEACCUMULATION_CLAMP_BOUND_MM
+
+
+@dataclass
+class PredecessorState:
+    """Retained raw meteorological state for predecessor normalization."""
+
+    precip_raw: Any | None = None
+    cloud_raw: Any | None = None
+
+
+def is_retryable_storage_error(exc: BaseException) -> bool:
+    """Classify whether an exception from the storage/Zarr layer is a transient retryable error.
+
+    Retryable error classes:
+    * EndpointConnectionError, ConnectionClosedError, ConnectTimeoutError, ReadTimeoutError
+    * Transient aiobotocore / botocore ClientError (5xx, RequestTimeout, SlowDown, ServiceUnavailable)
+    * Built-in transient socket/OS transport errors (ConnectionResetError, ConnectionRefusedError,
+      TimeoutError, socket.timeout, BrokenPipeError)
+    * s3fs / fsspec transient transport errors
+
+    Deterministic non-retryable errors (never retried):
+    * Schema / Dimension / Coordinate / Data validation errors
+    * Programming errors (ValueError, TypeError, KeyError, AttributeError)
+    * ClientError 4xx (e.g. 400, 403, 404)
+    """
+    if isinstance(exc, IngestionError):
+        return False
+    if isinstance(
+        exc,
+        (
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+            AttributeError,
+            AssertionError,
+            NotImplementedError,
+        ),
+    ):
+        return False
+
+    import socket
+
+    if isinstance(
+        exc,
+        (
+            ConnectionResetError,
+            ConnectionRefusedError,
+            ConnectionAbortedError,
+            TimeoutError,
+            BrokenPipeError,
+            socket.timeout,
+        ),
+    ):
+        return True
+
+    exc_type_name = type(exc).__name__
+
+    if exc_type_name in (
+        "EndpointConnectionError",
+        "ConnectionClosedError",
+        "ConnectTimeoutError",
+        "ReadTimeoutError",
+        "ProxyConnectionError",
+        "HTTPClientError",
+    ):
+        return True
+
+    if exc_type_name == "ClientError" or hasattr(exc, "response"):
+        response = getattr(exc, "response", {})
+        if isinstance(response, dict):
+            status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status_code and status_code in (429, 500, 502, 503, 504):
+                return True
+            error_code = response.get("Error", {}).get("Code")
+            if error_code in (
+                "RequestTimeout",
+                "RequestTimeoutException",
+                "PriorRequestNotComplete",
+                "SlowDown",
+                "BandwidthLimitExceeded",
+                "ServiceUnavailable",
+                "InternalError",
+                "RequestTimeTooSkewed",
+            ):
+                return True
+
+    if isinstance(exc, OSError):
+        msg = str(exc).lower()
+        if any(
+            t in msg
+            for t in (
+                "could not connect to the endpoint",
+                "connection reset",
+                "connection refused",
+                "connection closed",
+                "timed out",
+                "timeout",
+                "broken pipe",
+                "network is unreachable",
+                "remote disconnected",
+            )
+        ):
+            return True
+
+    return False
 
 
 class BaseConnector(ABC):

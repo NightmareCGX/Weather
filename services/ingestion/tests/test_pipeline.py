@@ -1195,15 +1195,17 @@ def test_deaccumulate_precipitation_tolerance_clamping() -> None:
     np.testing.assert_allclose(result, expected, rtol=1e-5)
 
 
-def test_deaccumulate_precipitation_rejects_large_negative() -> None:
-    """Negative residual exceeding tolerance bound (< -0.10 mm) raises DeaccumulationError."""
-    from ingestion.core.base import DeaccumulationError
+def test_deaccumulate_precipitation_elementwise_negative_residuals() -> None:
+    """Negative residuals in [-0.50, 0.0) mm are clamped to 0.0 mm; < -0.50 mm become NaN."""
     from ingestion.core.pipeline import deaccumulate_precipitation
 
-    curr = np.array([[5.0, 0.0], [1.0, 2.0]], dtype=np.float32)
-    pred = np.array([[2.0, 0.25], [1.0, 1.5]], dtype=np.float32)  # diff = -0.25 mm < -0.10 mm
-    with pytest.raises(DeaccumulationError, match="exceeds tolerance bound"):
-        deaccumulate_precipitation(curr, pred, tolerance=0.10)
+    curr = np.array([[5.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    pred = np.array([[2.0, 0.25], [1.0, 0.80]], dtype=np.float32)  # diff = [3.0, -0.25], [0.0, -0.80]
+    result = deaccumulate_precipitation(curr, pred, tolerance=0.50)
+    assert result[0, 0] == pytest.approx(3.0, abs=1e-5)
+    assert result[0, 1] == pytest.approx(0.0, abs=1e-5)  # -0.25 clamped to 0.0
+    assert result[1, 0] == pytest.approx(0.0, abs=1e-5)  # 0.0 preserved
+    assert np.isnan(result[1, 1])                         # -0.80 invalidated to NaN
 
 
 def test_deaccumulate_precipitation_shape_mismatch() -> None:
