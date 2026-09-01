@@ -100,6 +100,9 @@ class ModelRun(Base):
     ensemble_members = relationship(
         "EnsembleMember", back_populates="run", cascade="all, delete-orphan"
     )
+    ensemble_member_products = relationship(
+        "EnsembleMemberProduct", back_populates="run", cascade="all, delete-orphan"
+    )
     forecast_products = relationship(
         "ForecastProduct", back_populates="run", cascade="all, delete-orphan"
     )
@@ -118,6 +121,26 @@ class EnsembleMember(Base):
     )
 
     run = relationship("ModelRun", back_populates="ensemble_members")
+
+
+class EnsembleMemberProduct(Base):
+    __tablename__ = "ensemble_member_products"
+
+    id = Column(String, primary_key=True)
+    run_id = Column(String, ForeignKey("model_runs.id"), nullable=False)
+    member_index = Column(Integer, nullable=False)
+    lead_time_hours = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "member_index",
+            "lead_time_hours",
+            name="uq_ensemble_member_product",
+        ),
+    )
+
+    run = relationship("ModelRun", back_populates="ensemble_member_products")
 
 
 class ForecastVariable(Base):

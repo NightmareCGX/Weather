@@ -1,23 +1,24 @@
 """Ensemble data construction: per-member Zarr slicing and domain math.
 
 This service backs the ``/v1/probabilities`` and ``/v1/ensembles`` endpoints
-(API.md sections 3.1 and 5.1). It reuses the pure, stable helpers from
-``api.services.point_forecast`` (run resolution, lead-time resolution,
-variable resolution, grid derivation) and adds per-member interpolation so the
-Milestone 7 domain math in ``domain.ensemble`` can operate on a flat 1-D array
-of member values at a point.
-
-The ``member`` axis is read from the run's Zarr dataset; ``member_count`` is
-the length of that coordinate, which drives every calculation. The
-``ensemble_members`` catalog rows are metadata only and are not consulted
-here.
+(API.md sections 3.1 and 5.1). It enforces the 85% member-coverage lead and cell
+serving thresholds, queries committed member indices from the catalog, filters out
+unavailable members, and operates strictly on finite participating samples.
 """
 
+from __future__ import annotations
+
+import logging
 import math
 from typing import Any, Literal
 
 import numpy as np
 import xarray as xr
+from domain.coverage import (
+    get_expected_members,
+    is_cell_statistically_valid,
+    is_lead_servable,
+)
 from domain.ensemble import (
     ensemble_mean,
     ensemble_median,
@@ -63,7 +64,12 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.models.entities import Model
+from api.models.entities import (
+    EnsembleMemberProduct,
+    Model,
+    ModelRun,
+    ModelVersion,
+)
 from api.schemas import (
     ConsensusVectorOut,
     EnsemblePDF,
@@ -75,32 +81,129 @@ from api.schemas import (
     WindRoseSectorOut,
 )
 from api.services.point_forecast import (
+    _CycleMetadata,
     _derive_grid,
     _interpolate_neighborhood,
-    _resolve_lead_times,
-    _resolve_ready_dataset,
+    _parse_cycle_time,
     _resolve_variables,
+    gated_cycle_metadata,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Error status code for invalid probability/ensemble inputs.
 _STATUS_INVALID_INPUT = 422
 
+#: ModelRun lifecycle statuses eligible for serving.
+SERVING_ELIGIBLE_STATUSES: tuple[str, ...] = ("ready", "processing", "partial")
+
 
 def _validate_coordinates(latitude: float, longitude: float) -> None:
-    """Validate WGS 84 coordinates, mapping the domain error to 422.
-
-    Args:
-        latitude: Latitude in decimal degrees.
-        longitude: Longitude in decimal degrees.
-
-    Raises:
-        HTTPException: 422 when the coordinates fall outside the valid WGS 84
-            bounds.
-    """
+    """Validate WGS 84 coordinates, mapping the domain error to 422."""
     try:
         validate_coordinates(latitude, longitude)
     except InvalidCoordinatesError as exc:
         raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
+
+
+def _resolve_eligible_ensemble_run_and_members(
+    db: Session,
+    model: str,
+    lead_time_hours: int,
+    initial_time: str | None = None,
+) -> tuple[ModelRun, _CycleMetadata, tuple[int, ...]]:
+    """Return the newest eligible ensemble run and its committed member indices.
+
+    For the given model and lead_time_hours, finds the newest run in ('ready',
+    'processing', 'partial') where the lead is servable (coverage >= 85% of
+    expected_members).
+
+    When initial_time is provided, pins to that exact cycle; if that cycle is not
+    eligible or store is unreadable, raises HTTP 404.
+    When initial_time is omitted, searches newest-to-oldest eligible cycles and
+    returns the first readable one.
+
+    Returns:
+        (run, metadata, available_member_indices)
+
+    Raises:
+        HTTPException: 404 if no eligible run is found.
+    """
+    expected_members = get_expected_members(model, default_if_unknown=30)
+    stmt = (
+        select(ModelRun)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model)
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
+        .where(ModelRun.zarr_store_path.isnot(None))
+    )
+    if initial_time is not None:
+        stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
+    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    runs = list(db.execute(stmt).scalars().all())
+    if not runs:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No forecast run with data was found for model '{model}'"
+            + (f" and initial time '{initial_time}'." if initial_time else "."),
+        )
+
+    for run in runs:
+        member_rows = db.execute(
+            select(EnsembleMemberProduct.member_index).where(
+                EnsembleMemberProduct.run_id == run.id,
+                EnsembleMemberProduct.lead_time_hours == lead_time_hours,
+            )
+        ).scalars().all()
+        avail_members = tuple(sorted(int(m) for m in member_rows))
+
+        # If no EnsembleMemberProduct rows (legacy store or test mock without pair rows),
+        # probe store to see if lead coordinate exists and run is ready
+        if not avail_members:
+            assert run.zarr_store_path is not None
+            try:
+                metadata = gated_cycle_metadata(str(run.zarr_store_path))
+                if lead_time_hours in metadata.lead_times and run.status == "ready":
+                    avail_members = tuple(range(1, expected_members + 1))
+            except Exception:
+                continue
+
+        if not is_lead_servable(len(avail_members), expected_members):
+            if initial_time is not None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Forecast lead {lead_time_hours}h for model '{model}' at cycle '{initial_time}' "
+                        f"is not servable ({len(avail_members)}/{expected_members} members < 85% threshold)."
+                    ),
+                )
+            continue
+
+        assert run.zarr_store_path is not None
+        try:
+            metadata = gated_cycle_metadata(str(run.zarr_store_path))
+        except Exception as exc:
+            logger.warning("Skipping unreadable Zarr store for run %s: %s", run.id, exc)
+            continue
+
+        if lead_time_hours not in metadata.lead_times:
+            if initial_time is not None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Lead {lead_time_hours}h not found in store for cycle '{initial_time}'.",
+                )
+            continue
+
+        return run, metadata, avail_members
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No eligible forecast run with sufficient member coverage (>= 85%) "
+            f"was found for model '{model}' at lead {lead_time_hours}h."
+        ),
+    )
 
 
 def build_probability_forecast(
@@ -118,57 +221,38 @@ def build_probability_forecast(
     phase: str | None = None,
     initial_time: str | None = None,
 ) -> ProbabilityForecastData:
-    """Build an exceedance probability forecast for a resolved point.
-
-    The newest ``status='ready'`` run with a non-null ``zarr_store_path`` is
-    selected for the (ensemble) model. Member values are bilinearly
-    interpolated to the location at the requested lead time, and the empirical
-    exceedance probability plus its Wilson 95% confidence interval are
-    computed by ``domain.ensemble``.
-
-    Args:
-        db: Database session.
-        latitude: Latitude in decimal degrees.
-        longitude: Longitude in decimal degrees.
-        variable: A documented ``forecast_variables`` catalog code.
-        threshold: The probability threshold (lower bound for ``between``).
-        operator: ``gt``, ``gte``, ``lt``, ``lte``, or ``between``.
-        lead_time_hours: Forecast offset hours from the run's cycle time.
-        model: A single ensemble model identifier.
-        threshold_max: The upper bound of ``between``; required only when
-            ``operator == "between"``.
-        direction_sector: Optional 8-point cardinal direction sector for wind
-            probabilities (e.g. 'SW', 'N').
-        phase: Optional physical precipitation phase (e.g. 'snow', 'rain',
-            'freezing_rain', 'ice_pellets') for joint exceedance support.
-        initial_time: Optional cycle pinning string.
-
-    Returns:
-        The probability forecast payload.
-
-    Raises:
-        HTTPException: 422 for invalid input (domain math failures), 404 when
-            no ready run, unknown model/variable, absent lead time, or the
-            location is outside the grid, 500 for invalid grid data.
-    """
+    """Build an exceedance probability forecast for a resolved point."""
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    run, metadata = _resolve_ready_dataset(db, model, initial_time=initial_time)
-    leads = _resolve_lead_times(metadata, lead_time_hours, lead_time_hours)
+    expected_members = get_expected_members(model, default_if_unknown=30)
+    run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
+        db, model, lead_time_hours, initial_time=initial_time
+    )
     _resolve_variables(db, metadata, [variable])
     assert run.zarr_store_path is not None
 
     if variable == "wind_10m":
         u_members, v_members = _gated_wind_member_vectors(
-            str(run.zarr_store_path), leads[0], latitude, longitude
+            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
         )
+        finite_pairs = [
+            (u, v)
+            for u, v in zip(u_members, v_members, strict=True)
+            if math.isfinite(u) and math.isfinite(v)
+        ]
+        if not is_cell_statistically_valid(len(finite_pairs), expected_members):
+            raise HTTPException(
+                status_code=404,
+                detail=f"No forecast data covers the requested location with sufficient member coverage (finite {len(finite_pairs)}/{expected_members} < 85%).",
+            )
+        u_finite = [p[0] for p in finite_pairs]
+        v_finite = [p[1] for p in finite_pairs]
         if direction_sector is not None:
-            # Convert speed threshold in km/h to m/s for canonical directional probability
             speed_mps = threshold / 3.6
             try:
                 probability, (lower, upper) = compute_directional_probability(
-                    u_members,
-                    v_members,
+                    u_finite,
+                    v_finite,
                     sector=direction_sector,
                     speed_threshold=speed_mps,
                     operator=operator,
@@ -176,13 +260,19 @@ def build_probability_forecast(
             except InvalidThresholdError as exc:
                 raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
         else:
-            members_kmh = [math.hypot(u, v) * 3.6 for u, v in zip(u_members, v_members, strict=True)]
+            members_kmh = [math.hypot(u, v) * 3.6 for u, v in zip(u_finite, v_finite, strict=True)]
             probability = _probability(members_kmh, threshold, operator, threshold_max)
             lower, upper = probability_confidence_interval(probability, len(members_kmh))
     elif variable == "precipitation_amount_3h" and phase is not None:
-        members, precip_states = _gated_precipitation_member_states(
-            str(run.zarr_store_path), leads[0], latitude, longitude
+        amounts, precip_states = _gated_precipitation_member_states(
+            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
         )
+        finite_states = [st for amt, st in zip(amounts, precip_states, strict=True) if math.isfinite(amt)]
+        if not is_cell_statistically_valid(len(finite_states), expected_members):
+            raise HTTPException(
+                status_code=404,
+                detail=f"No forecast data covers the requested location with sufficient member coverage (finite {len(finite_states)}/{expected_members} < 85%).",
+            )
         try:
             target_phase = PhysicalPhase(phase.lower())
         except ValueError as exc:
@@ -192,42 +282,54 @@ def build_probability_forecast(
             ) from exc
         try:
             probability = compute_joint_amount_phase_support(
-                precip_states, threshold_mm=threshold, phase=target_phase
+                finite_states, threshold_mm=threshold, phase=target_phase
             )
         except ValueError as exc:
             raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
-        lower, upper = probability_confidence_interval(probability, len(precip_states))
+        lower, upper = probability_confidence_interval(probability, len(finite_states))
     elif variable == "cloud_ceiling" and operator in ("lt", "lte"):
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
         )
-        prob = compute_low_ceiling_probability(members, threshold_m=threshold)
+        finite_members = [m for m in members if math.isfinite(m)]
+        if not is_cell_statistically_valid(len(finite_members), expected_members):
+            raise HTTPException(
+                status_code=404,
+                detail=f"No forecast data covers the requested location with sufficient member coverage (finite {len(finite_members)}/{expected_members} < 85%).",
+            )
+        prob = compute_low_ceiling_probability(finite_members, threshold_m=threshold)
         if prob is None:
             raise HTTPException(
-                status_code=_STATUS_INVALID_INPUT,
-                detail="Insufficient valid members for cloud ceiling probability (requires >= 21).",
+                status_code=404,
+                detail="Insufficient valid members for cloud ceiling probability.",
             )
-        valid_n = sum(1 for m in members if not math.isnan(m) and float(m) >= 0.0)
+        valid_n = sum(1 for m in finite_members if float(m) >= 0.0)
         lower, upper = probability_confidence_interval(prob, valid_n)
         probability = prob
     elif variable == "cloud_cover_3h":
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
         )
-        valid_members = [float(m) for m in members if not math.isnan(m) and 0.0 <= float(m) <= 100.0]
-        if len(valid_members) < 21:
+        valid_members = [float(m) for m in members if math.isfinite(m) and 0.0 <= float(m) <= 100.0]
+        if not is_cell_statistically_valid(len(valid_members), expected_members):
             raise HTTPException(
-                status_code=_STATUS_INVALID_INPUT,
-                detail="Insufficient valid members for cloud cover probability (requires >= 21).",
+                status_code=404,
+                detail=f"No forecast data covers the requested location with sufficient member coverage (valid {len(valid_members)}/{expected_members} < 85%).",
             )
         probability = _probability(valid_members, threshold, operator, threshold_max)
         lower, upper = probability_confidence_interval(probability, len(valid_members))
     else:
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
         )
-        probability = _probability(members, threshold, operator, threshold_max)
-        lower, upper = probability_confidence_interval(probability, len(members))
+        finite_members = [m for m in members if math.isfinite(m)]
+        if not is_cell_statistically_valid(len(finite_members), expected_members):
+            raise HTTPException(
+                status_code=404,
+                detail=f"No forecast data covers the requested location with sufficient member coverage (finite {len(finite_members)}/{expected_members} < 85%).",
+            )
+        probability = _probability(finite_members, threshold, operator, threshold_max)
+        lower, upper = probability_confidence_interval(probability, len(finite_members))
 
     data: dict[str, Any] = {
         "location": ProbabilityLocation(latitude=latitude, longitude=longitude),
@@ -258,43 +360,13 @@ def build_ensemble_statistics(
     include_members: bool = False,
     initial_time: str | None = None,
 ) -> EnsembleStatisticsData:
-    """Build ensemble statistics for a resolved point.
-
-    The newest ``status='ready'`` run with a non-null ``zarr_store_path`` is
-    selected for the (ensemble) model. Member values are bilinearly
-    interpolated to the location at the requested lead time, and the mean,
-    median, population spread, and P10/P25/P50/P75/P90 percentiles are
-    computed by ``domain.ensemble``.
-
-    When ``include_members`` is true, the genuine raw member values (the exact
-    same array the statistics are computed from, in dataset ``member``-
-    coordinate order) are attached to the payload. This is an opt-in,
-    additive extension for the Ensemble Distribution View: statistics-only
-    requests (the default) stay lightweight and omit the member array.
-
-    Args:
-        db: Database session.
-        latitude: Latitude in decimal degrees.
-        longitude: Longitude in decimal degrees.
-        variable: A documented ``forecast_variables`` catalog code.
-        model: A single ensemble model identifier.
-        lead_time_hours: Forecast offset hours from the run's cycle time.
-        include_members: Whether to attach the raw member values used to
-            compute the statistics.
-        initial_time: Optional cycle pinning string.
-
-    Returns:
-        The ensemble statistics payload.
-
-    Raises:
-        HTTPException: 422 for invalid input (domain math failures), 404 when
-            no ready run, unknown model/variable, absent lead time, or the
-            location is outside the grid, 500 for invalid grid data.
-    """
+    """Build ensemble statistics for a resolved point."""
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
-    run, metadata = _resolve_ready_dataset(db, model, initial_time=initial_time)
-    leads = _resolve_lead_times(metadata, lead_time_hours, lead_time_hours)
+    expected_members = get_expected_members(model, default_if_unknown=30)
+    run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
+        db, model, lead_time_hours, initial_time=initial_time
+    )
     _resolve_variables(db, metadata, [variable])
     assert run.zarr_store_path is not None
 
@@ -307,106 +379,133 @@ def build_ensemble_statistics(
     finite_member_count_payload: int | None = None
     unlimited_member_count_payload: int | None = None
     stats: EnsembleStatistics | None = None
+    participating_members: list[float] = []
 
     if variable == "wind_10m":
         u_members, v_members = _gated_wind_member_vectors(
-            str(run.zarr_store_path), leads[0], latitude, longitude
+            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
         )
-        members = [math.hypot(u, v) * 3.6 for u, v in zip(u_members, v_members, strict=True)]
+        finite_pairs = [
+            (u, v)
+            for u, v in zip(u_members, v_members, strict=True)
+            if math.isfinite(u) and math.isfinite(v)
+        ]
+        u_fin = [p[0] for p in finite_pairs]
+        v_fin = [p[1] for p in finite_pairs]
+        participating_members = [math.hypot(u, v) * 3.6 for u, v in zip(u_fin, v_fin, strict=True)]
+        valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
 
-        # Consensus flow vector in km/h
-        consensus = compute_consensus_vector(u_members, v_members)
-        consensus_payload = ConsensusVectorOut(
-            speed=round(consensus.speed_mps * 3.6, 2),
-            direction=round(consensus.direction_deg, 1) if consensus.direction_deg is not None else None,
-            cardinal=consensus.cardinal,
-            coherence=round(consensus.coherence, 4),
-        )
-
-        # 8-Sector Wind Rose
-        rose = compute_wind_rose(u_members, v_members)
-        wind_rose_payload = WindRoseOut(
-            calm_percentage=round(rose.calm_probability * 100.0, 1),
-            calm_count=rose.calm_count,
-            sectors=[
-                WindRoseSectorOut(
-                    sector=s.sector,
-                    count=s.count,
-                    probability=round(s.probability, 4),
-                    bins={k: round(v, 4) for k, v in s.bins.items()},
-                )
-                for s in rose.sectors
-            ],
-        )
+        if valid_cell and u_fin:
+            consensus = compute_consensus_vector(u_fin, v_fin)
+            consensus_payload = ConsensusVectorOut(
+                speed=round(consensus.speed_mps * 3.6, 2),
+                direction=round(consensus.direction_deg, 1) if consensus.direction_deg is not None else None,
+                cardinal=consensus.cardinal,
+                coherence=round(consensus.coherence, 4),
+            )
+            rose = compute_wind_rose(u_fin, v_fin)
+            wind_rose_payload = WindRoseOut(
+                calm_percentage=round(rose.calm_probability * 100.0, 1),
+                calm_count=rose.calm_count,
+                sectors=[
+                    WindRoseSectorOut(
+                        sector=s.sector,
+                        count=s.count,
+                        probability=round(s.probability, 4),
+                        bins={k: round(v, 4) for k, v in s.bins.items()},
+                    )
+                    for s in rose.sectors
+                ],
+            )
     elif variable == "precipitation_amount_3h":
         amounts, precip_states = _gated_precipitation_member_states(
-            str(run.zarr_store_path), leads[0], latitude, longitude
+            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
         )
-        # At lead 0 (or all-NaN accumulation), compute statistics against 0.0 baseline
         if all(math.isnan(m) for m in amounts):
-            members = [0.0] * len(amounts)
+            participating_members = [0.0] * len(amounts)
+            finite_states = precip_states
         else:
-            members = amounts
+            finite_pairs_p = [
+                (amt, st) for amt, st in zip(amounts, precip_states, strict=True) if math.isfinite(amt)
+            ]
+            participating_members = [p[0] for p in finite_pairs_p]
+            finite_states = [p[1] for p in finite_pairs_p]
 
-        support_map = aggregate_ensemble_phase_support(precip_states)
-        phase_support_payload = {p.value: round(v, 4) for p, v in support_map.items()}
-
-        freq_map = compute_transition_frequencies(precip_states)
-        transition_freq_payload = {
-            t.value: round(v, 4) for t, v in freq_map.items() if v > 0.0
-        }
+        valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
+        if valid_cell and finite_states:
+            support_map = aggregate_ensemble_phase_support(finite_states)
+            phase_support_payload = {p.value: round(v, 4) for p, v in support_map.items()}
+            freq_map = compute_transition_frequencies(finite_states)
+            transition_freq_payload = {
+                t.value: round(v, 4) for t, v in freq_map.items() if v > 0.0
+            }
     elif variable == "cloud_cover_3h":
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
         )
-        min_v = 21 if len(members) >= 21 else 1
-        cc_summary = cloud_cover_ensemble_summary(members, min_valid=min_v)
-        if cc_summary is not None:
-            stats = EnsembleStatistics(
-                mean=float(cc_summary.mean),
-                median=float(cc_summary.median),
-                spread=float(cc_summary.spread),
-                p10=float(cc_summary.percentiles["p10"]),
-                p25=float(cc_summary.percentiles["p25"]),
-                p50=float(cc_summary.percentiles["p50"]),
-                p75=float(cc_summary.percentiles["p75"]),
-                p90=float(cc_summary.percentiles["p90"]),
-            )
-            valid_member_count_payload = cc_summary.valid_member_count
+        participating_members = [float(m) for m in members if math.isfinite(m) and 0.0 <= float(m) <= 100.0]
+        valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
+        if valid_cell:
+            min_v = 21 if len(participating_members) >= 21 else 1
+            cc_summary = cloud_cover_ensemble_summary(participating_members, min_valid=min_v)
+            if cc_summary is not None:
+                stats = EnsembleStatistics(
+                    mean=float(cc_summary.mean),
+                    median=float(cc_summary.median),
+                    spread=float(cc_summary.spread),
+                    p10=float(cc_summary.percentiles["p10"]),
+                    p25=float(cc_summary.percentiles["p25"]),
+                    p50=float(cc_summary.percentiles["p50"]),
+                    p75=float(cc_summary.percentiles["p75"]),
+                    p90=float(cc_summary.percentiles["p90"]),
+                )
+                valid_member_count_payload = cc_summary.valid_member_count
+            else:
+                stats = EnsembleStatistics(
+                    mean=None, median=None, spread=None,
+                    p10=None, p25=None, p50=None, p75=None, p90=None
+                )
+                valid_member_count_payload = len(participating_members)
         else:
             stats = EnsembleStatistics(
                 mean=None, median=None, spread=None,
                 p10=None, p25=None, p50=None, p75=None, p90=None
             )
-            valid_member_count_payload = sum(
-                1 for m in members if not math.isnan(m) and 0.0 <= float(m) <= 100.0
-            )
+            valid_member_count_payload = len(participating_members)
     elif variable == "cloud_ceiling":
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
         )
-        min_v = 21 if len(members) >= 21 else 1
-        ceil_summary = cloud_ceiling_ensemble_summary(
-            members,
-            min_finite=10,
-            min_valid=min_v,
-        )
-        if ceil_summary is not None:
-            unlimited_prob_payload = round(ceil_summary.unlimited_probability, 4)
-            valid_member_count_payload = ceil_summary.valid_member_count
-            finite_member_count_payload = ceil_summary.finite_member_count
-            unlimited_member_count_payload = ceil_summary.unlimited_member_count
-            if ceil_summary.conditional_percentiles_m is not None:
-                stats = EnsembleStatistics(
-                    mean=float(ceil_summary.conditional_mean_m) if ceil_summary.conditional_mean_m is not None else None,
-                    median=float(ceil_summary.conditional_median_m) if ceil_summary.conditional_median_m is not None else None,
-                    spread=float(ceil_summary.conditional_spread_m) if ceil_summary.conditional_spread_m is not None else None,
-                    p10=float(ceil_summary.conditional_percentiles_m["p10"]),
-                    p25=float(ceil_summary.conditional_percentiles_m["p25"]),
-                    p50=float(ceil_summary.conditional_percentiles_m["p50"]),
-                    p75=float(ceil_summary.conditional_percentiles_m["p75"]),
-                    p90=float(ceil_summary.conditional_percentiles_m["p90"]),
-                )
+        participating_members = [float(m) for m in members if math.isfinite(m) and float(m) >= 0.0]
+        valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
+        if valid_cell:
+            min_v = 21 if len(participating_members) >= 21 else 1
+            ceil_summary = cloud_ceiling_ensemble_summary(
+                participating_members,
+                min_finite=10,
+                min_valid=min_v,
+            )
+            if ceil_summary is not None:
+                unlimited_prob_payload = round(ceil_summary.unlimited_probability, 4)
+                valid_member_count_payload = ceil_summary.valid_member_count
+                finite_member_count_payload = ceil_summary.finite_member_count
+                unlimited_member_count_payload = ceil_summary.unlimited_member_count
+                if ceil_summary.conditional_percentiles_m is not None:
+                    stats = EnsembleStatistics(
+                        mean=float(ceil_summary.conditional_mean_m) if ceil_summary.conditional_mean_m is not None else None,
+                        median=float(ceil_summary.conditional_median_m) if ceil_summary.conditional_median_m is not None else None,
+                        spread=float(ceil_summary.conditional_spread_m) if ceil_summary.conditional_spread_m is not None else None,
+                        p10=float(ceil_summary.conditional_percentiles_m["p10"]),
+                        p25=float(ceil_summary.conditional_percentiles_m["p25"]),
+                        p50=float(ceil_summary.conditional_percentiles_m["p50"]),
+                        p75=float(ceil_summary.conditional_percentiles_m["p75"]),
+                        p90=float(ceil_summary.conditional_percentiles_m["p90"]),
+                    )
+                else:
+                    stats = EnsembleStatistics(
+                        mean=None, median=None, spread=None,
+                        p10=None, p25=None, p50=None, p75=None, p90=None
+                    )
             else:
                 stats = EnsembleStatistics(
                     mean=None, median=None, spread=None,
@@ -417,41 +516,53 @@ def build_ensemble_statistics(
                 mean=None, median=None, spread=None,
                 p10=None, p25=None, p50=None, p75=None, p90=None
             )
-            unlimited_prob_payload = None
-            valid_member_count_payload = 0
-            finite_member_count_payload = 0
-            unlimited_member_count_payload = 0
     else:
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, leads[0], latitude, longitude
+            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
         )
+        participating_members = [m for m in members if math.isfinite(m)]
+        valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
 
     pdf_payload: EnsemblePDF | None = None
     if include_members:
-        # Filter non-finite/sentinel values for PDF if needed
-        valid_pdf_members = [m for m in members if not math.isnan(m) and m < 19990.0] if variable == "cloud_ceiling" else [m for m in members if not math.isnan(m)]
-        domain_pdf = estimate_ensemble_pdf(valid_pdf_members) if len(valid_pdf_members) >= 2 else None
+        valid_pdf_members = (
+            [m for m in participating_members if m < 19990.0]
+            if variable == "cloud_ceiling"
+            else participating_members
+        )
+        domain_pdf = (
+            estimate_ensemble_pdf(valid_pdf_members)
+            if len(valid_pdf_members) >= 2
+            else None
+        )
         if domain_pdf is not None:
             pdf_payload = EnsemblePDF(x=domain_pdf.x, density=domain_pdf.density)
 
     if stats is None:
-        stats = EnsembleStatistics(
-            mean=ensemble_mean(members),
-            median=ensemble_median(members),
-            spread=ensemble_spread(members),
-            p10=ensemble_percentile(members, 10),
-            p25=ensemble_percentile(members, 25),
-            p50=ensemble_percentile(members, 50),
-            p75=ensemble_percentile(members, 75),
-            p90=ensemble_percentile(members, 90),
-        )
+        valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
+        if valid_cell and participating_members:
+            stats = EnsembleStatistics(
+                mean=ensemble_mean(participating_members),
+                median=ensemble_median(participating_members),
+                spread=ensemble_spread(participating_members),
+                p10=ensemble_percentile(participating_members, 10),
+                p25=ensemble_percentile(participating_members, 25),
+                p50=ensemble_percentile(participating_members, 50),
+                p75=ensemble_percentile(participating_members, 75),
+                p90=ensemble_percentile(participating_members, 90),
+            )
+        else:
+            stats = EnsembleStatistics(
+                mean=None, median=None, spread=None,
+                p10=None, p25=None, p50=None, p75=None, p90=None
+            )
 
     return EnsembleStatisticsData(
         model=model,
         lead_time_hours=lead_time_hours,
-        member_count=len(members),
+        member_count=len(participating_members),
         statistics=stats,
-        members=members if include_members else None,
+        members=participating_members if include_members else None,
         pdf=pdf_payload if include_members else None,
         consensus_vector=consensus_payload,
         wind_rose=wind_rose_payload,
@@ -487,14 +598,7 @@ def _probability(
     operator: Literal["gt", "gte", "lt", "lte", "between"],
     threshold_max: float | None,
 ) -> float:
-    """Compute the empirical exceedance probability for the operator.
-
-    Domain exceptions are mapped to 422 here so the router stays thin.
-
-    Raises:
-        HTTPException: 422 when the domain math rejects the input (empty or
-            invalid member array, invalid threshold, or ``upper < lower``).
-    """
+    """Compute the empirical exceedance probability for the operator."""
     try:
         if operator == "gt":
             return probability_above_threshold(members, threshold)
@@ -525,22 +629,9 @@ def _gated_member_values(
     lead: int,
     latitude: float,
     longitude: float,
+    available_member_indices: tuple[int, ...] | None = None,
 ) -> list[float]:
-    """Interpolate each ensemble member's field at a point and lead time.
-
-    Phase 1 remediation: a single SHARED gate session opens the lazy store and
-    interpolates every member's 2x2 neighborhood around the point — reading
-    only the tiny spatial window per member, never the full global ensemble
-    field.
-
-    Returns a flat 1-D list of member values in the dataset's ``member``
-    coordinate order, suitable for the ``domain.ensemble`` functions.
-
-    Raises:
-        HTTPException: 404 when the variable is absent from the dataset or the
-            location is outside the grid, 500 for invalid grid data or a
-            non-2-D per-member field.
-    """
+    """Interpolate each committed ensemble member's field at a point and lead time."""
     from api.core.reader_gate import gated_read_dataset_with_selector
 
     def select_and_interpolate(dataset: xr.Dataset) -> list[float]:
@@ -562,10 +653,20 @@ def _gated_member_values(
             field = field.sel(lead_time_hours=lead)
 
         grid, lat_descending, lon_descending = _derive_grid(dataset)
-        member_count = int(dataset.coords["member"].size)
+        member_coords = dataset.coords["member"].values
+        member_val_to_pos = {
+            int(v): i for i, v in enumerate(np.atleast_1d(member_coords).reshape(-1))
+        }
+
+        if available_member_indices is not None:
+            target_members = [m for m in available_member_indices if m in member_val_to_pos]
+        else:
+            target_members = sorted(member_val_to_pos.keys())
+
         values: list[float] = []
-        for member_index in range(member_count):
-            member_field = field.isel(member=member_index)
+        for member_num in target_members:
+            member_pos = member_val_to_pos[member_num]
+            member_field = field.isel(member=member_pos)
             if member_field.ndim != 2:
                 raise HTTPException(
                     status_code=500,
@@ -576,13 +677,15 @@ def _gated_member_values(
                 )
             try:
                 values.append(
-                    _interpolate_neighborhood(
-                        member_field,
-                        grid,
-                        lat_descending,
-                        lon_descending,
-                        latitude,
-                        longitude,
+                    float(
+                        _interpolate_neighborhood(
+                            member_field,
+                            grid,
+                            lat_descending,
+                            lon_descending,
+                            latitude,
+                            longitude,
+                        )
                     )
                 )
             except PointOutsideGridError as exc:
@@ -605,13 +708,9 @@ def _gated_wind_member_vectors(
     lead: int,
     latitude: float,
     longitude: float,
+    available_member_indices: tuple[int, ...] | None = None,
 ) -> tuple[list[float], list[float]]:
-    """Interpolate ensemble member u and v vectors at a point and lead time.
-
-    Returns:
-        A tuple of (u_members, v_members) where each is a 1-D list in m/s across
-        ensemble members in coordinate order.
-    """
+    """Interpolate committed ensemble member u and v vectors at a point and lead time."""
     from api.core.reader_gate import gated_read_dataset_with_selector
 
     def select_and_interpolate(dataset: xr.Dataset) -> tuple[list[float], list[float]]:
@@ -633,12 +732,22 @@ def _gated_wind_member_vectors(
             field_v = field_v.sel(lead_time_hours=lead)
 
         grid, lat_descending, lon_descending = _derive_grid(dataset)
-        member_count = int(dataset.coords["member"].size)
+        member_coords = dataset.coords["member"].values
+        member_val_to_pos = {
+            int(v): i for i, v in enumerate(np.atleast_1d(member_coords).reshape(-1))
+        }
+
+        if available_member_indices is not None:
+            target_members = [m for m in available_member_indices if m in member_val_to_pos]
+        else:
+            target_members = sorted(member_val_to_pos.keys())
+
         u_vals: list[float] = []
         v_vals: list[float] = []
-        for member_index in range(member_count):
-            mf_u = field_u.isel(member=member_index)
-            mf_v = field_v.isel(member=member_index)
+        for member_num in target_members:
+            member_pos = member_val_to_pos[member_num]
+            mf_u = field_u.isel(member=member_pos)
+            mf_v = field_v.isel(member=member_pos)
             if mf_u.ndim != 2 or mf_v.ndim != 2:
                 raise HTTPException(
                     status_code=500,
@@ -646,23 +755,27 @@ def _gated_wind_member_vectors(
                 )
             try:
                 u_vals.append(
-                    _interpolate_neighborhood(
-                        mf_u,
-                        grid,
-                        lat_descending,
-                        lon_descending,
-                        latitude,
-                        longitude,
+                    float(
+                        _interpolate_neighborhood(
+                            mf_u,
+                            grid,
+                            lat_descending,
+                            lon_descending,
+                            latitude,
+                            longitude,
+                        )
                     )
                 )
                 v_vals.append(
-                    _interpolate_neighborhood(
-                        mf_v,
-                        grid,
-                        lat_descending,
-                        lon_descending,
-                        latitude,
-                        longitude,
+                    float(
+                        _interpolate_neighborhood(
+                            mf_v,
+                            grid,
+                            lat_descending,
+                            lon_descending,
+                            latitude,
+                            longitude,
+                        )
                     )
                 )
             except PointOutsideGridError as exc:
@@ -685,6 +798,7 @@ def _gated_precipitation_member_states(
     lead: int,
     latitude: float,
     longitude: float,
+    available_member_indices: tuple[int, ...] | None = None,
 ) -> tuple[list[float], list[PrecipitationPhaseState]]:
     """Extract per-member precipitation amounts and classify their phase states under the gate."""
     from api.core.reader_gate import gated_read_dataset_with_selector
@@ -705,7 +819,15 @@ def _gated_precipitation_member_states(
             field_amt = field_amt.sel(lead_time_hours=lead)
 
         grid, lat_descending, lon_descending = _derive_grid(dataset)
-        member_count = int(dataset.coords["member"].size)
+        member_coords = dataset.coords["member"].values
+        member_val_to_pos = {
+            int(v): i for i, v in enumerate(np.atleast_1d(member_coords).reshape(-1))
+        }
+
+        if available_member_indices is not None:
+            target_members = [m for m in available_member_indices if m in member_val_to_pos]
+        else:
+            target_members = sorted(member_val_to_pos.keys())
 
         cat_fields = {}
         for c in ("crain", "csnow", "cfrzr", "cicep"):
@@ -746,10 +868,11 @@ def _gated_precipitation_member_states(
         amounts: list[float] = []
         states: list[PrecipitationPhaseState] = []
 
-        for member_index in range(member_count):
+        for member_num in target_members:
+            member_pos = member_val_to_pos[member_num]
             amt_val = float(
                 _interpolate_neighborhood(
-                    field_amt.isel(member=member_index),
+                    field_amt.isel(member=member_pos),
                     grid,
                     lat_descending,
                     lon_descending,
@@ -763,7 +886,7 @@ def _gated_precipitation_member_states(
             for c, c_field in cat_fields.items():
                 c_val = float(
                     _interpolate_neighborhood(
-                        c_field.isel(member=member_index),
+                        c_field.isel(member=member_pos),
                         grid,
                         lat_descending,
                         lon_descending,
@@ -777,7 +900,7 @@ def _gated_precipitation_member_states(
             if t2m_field is not None:
                 t_val = float(
                     _interpolate_neighborhood(
-                        t2m_field.isel(member=member_index),
+                        t2m_field.isel(member=member_pos),
                         grid,
                         lat_descending,
                         lon_descending,
@@ -793,7 +916,7 @@ def _gated_precipitation_member_states(
             if pred_fields_avail and pred_field_amt is not None:
                 amt_prev = float(
                     _interpolate_neighborhood(
-                        pred_field_amt.isel(member=member_index),
+                        pred_field_amt.isel(member=member_pos),
                         grid,
                         lat_descending,
                         lon_descending,
@@ -806,7 +929,7 @@ def _gated_precipitation_member_states(
                     for c, c_p_field in pred_cat_fields.items():
                         c_p_val = float(
                             _interpolate_neighborhood(
-                                c_p_field.isel(member=member_index),
+                                c_p_field.isel(member=member_pos),
                                 grid,
                                 lat_descending,
                                 lon_descending,
@@ -819,7 +942,7 @@ def _gated_precipitation_member_states(
                 if pred_t2m_field is not None:
                     t_start_val = float(
                         _interpolate_neighborhood(
-                            pred_t2m_field.isel(member=member_index),
+                            pred_t2m_field.isel(member=member_pos),
                             grid,
                             lat_descending,
                             lon_descending,

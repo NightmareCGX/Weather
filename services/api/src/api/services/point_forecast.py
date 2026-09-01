@@ -54,6 +54,9 @@ from api.services.elevation import get_elevation_provider
 
 logger = logging.getLogger(__name__)
 
+#: ModelRun statuses eligible for serving candidate discovery.
+SERVING_ELIGIBLE_STATUSES: tuple[str, ...] = ("ready", "processing", "partial")
+
 #: ``resolved_via`` value for a location resolved from raw coordinates.
 RESOLVED_VIA_COORDINATES = "coordinates"
 #: ``resolved_via`` value for a location resolved from a city record.
@@ -493,7 +496,7 @@ def _select_min_lead_winners(
         .join(ModelVersion.model)
         .join(ForecastProduct, ForecastProduct.run_id == ModelRun.id)
         .where(Model.model_id == model)
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     candidates_by_valid: dict[datetime, set[tuple[datetime, int]]] = {}
@@ -526,7 +529,7 @@ def _select_min_lead_winners(
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
         .where(Model.model_id == model)
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     for run in db.execute(runs_stmt).scalars().all():
@@ -571,7 +574,7 @@ def _resolve_cycle_store_path(
             .join(ModelRun.model_version)
             .join(ModelVersion.model)
             .where(Model.model_id == model)
-            .where(ModelRun.status == "ready")
+            .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
             .where(ModelRun.zarr_store_path.isnot(None))
             .where(ModelRun.cycle_time == cycle_time)
         )
@@ -861,7 +864,7 @@ def resolve_latest_run_serving_generation(
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
         .where(Model.model_id == model)
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     if initial_time is not None:
@@ -880,12 +883,12 @@ def resolve_latest_run_serving_generation(
 def resolve_latest_run_cycle_time(
     db: Session, model: str, initial_time: str | None = None
 ) -> str | None:
-    """Return the resolved ready run's cycle time for a model, or ``None``.
+    """Return the resolved run's cycle time for a model, or ``None``.
 
     The cache key for a point/probability/ensemble request must include the
     resolved forecast run's cycle so a cached response for one cycle never
     satisfies a request for another (ACCEPTANCE_REMEDIATION_PLAN §9). This is a
-    lightweight DB lookup (the newest ``ready`` run with a store, optionally
+    lightweight DB lookup (the newest eligible run with a store, optionally
     pinned to a specific cycle via ``initial_time``); the heavy store open
     happens in the compute path.
 
@@ -897,14 +900,14 @@ def resolve_latest_run_cycle_time(
 
     Returns:
         The run's ``cycle_time`` as an ISO 8601 UTC string, or ``None`` when no
-        matching ready run exists.
+        matching run exists.
     """
     stmt = (
         select(ModelRun.cycle_time)
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
         .where(Model.model_id == model)
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     if initial_time is not None:
@@ -930,13 +933,14 @@ def _parse_cycle_time(value: str) -> datetime:
 def _resolve_ready_dataset(
     db: Session, model_id: str, initial_time: str | None = None
 ) -> tuple[ModelRun, _CycleMetadata]:
-    """Return the newest ready run for a model whose Zarr store opens.
+    """Return the newest eligible run for a model whose Zarr store opens.
 
-    Ready runs are ordered newest-first; each candidate's store is probed in
-    turn (bounded metadata read under the SHARED gate) and the first readable
-    one is returned with its cycle metadata. A corrupted, truncated, or
-    momentarily-unreachable store on the newest run therefore falls through to
-    the next-newest readable run instead of failing the request.
+    Runs in ready, processing, and partial statuses are ordered newest-first;
+    each candidate's store is probed in turn (bounded metadata read under the
+    SHARED gate) and the first readable one is returned with its cycle metadata.
+    A corrupted, truncated, or momentarily-unreachable store on the newest run
+    therefore falls through to the next-newest readable run instead of failing
+    the request.
 
     Args:
         db: Database session.
@@ -945,12 +949,12 @@ def _resolve_ready_dataset(
             provided, only the run at that cycle is considered (GAP-2).
 
     Returns:
-        A ``(run, metadata)`` pair for the first readable ready run, where
+        A ``(run, metadata)`` pair for the first readable eligible run, where
         ``metadata`` exposes the store's lead times and variable names (no
         gridded data materialized).
 
     Raises:
-        HTTPException: 404 when no ready run exists or none of the ready runs
+        HTTPException: 404 when no eligible run exists or none of the runs
             has a readable store.
     """
     stmt = (
@@ -958,7 +962,7 @@ def _resolve_ready_dataset(
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
         .where(Model.model_id == model_id)
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     if initial_time is not None:

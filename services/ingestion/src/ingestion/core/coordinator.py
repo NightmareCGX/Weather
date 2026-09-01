@@ -838,6 +838,156 @@ class RunCoordinator:
             co.release_exclusive_gate()
             co.release_admission()
 
+    def publish_settled_lead(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        spec: RunCatalogSpec,
+        lead_time_hours: int,
+        expected_members: tuple[int, ...],
+    ) -> None:
+        """Publish a settled forecast lead to the catalog and advance serving generation.
+
+        Executed after all expected member tasks for a specific lead have settled.
+        Reads COMPLETE markers for that lead, reconciles catalog rows (forecast_products
+        and ensemble_member_products), updates manifest.json with a new serving generation,
+        and commits the database transaction.
+
+        Does NOT mark the overall run status as 'ready' (status remains 'processing' or 'partial').
+        """
+        co = StoreLockCoordinator(
+            conn,
+            store_path=self.store_path,
+            endpoint=self.endpoint,
+            secure=self.secure,
+            timeout_seconds=self.timeout_seconds,
+        )
+        co.acquire_admission()
+        co.acquire_exclusive_gate()
+        try:
+            mode = read_protocol_version(self.store_path)
+            committed_for_lead: set[int] = set()
+            if spec.is_ensemble:
+                members_to_check = expected_members if expected_members else tuple(range(1, 31))
+                for member_num in members_to_check:
+                    try:
+                        marker = read_region_marker(
+                            self.store_path, lead_time_hours=lead_time_hours, member=member_num
+                        )
+                        if marker.get("state") == "complete" and self._marker_evidence_valid(
+                            f"mem{member_num:03d}_L{lead_time_hours:04d}", marker
+                        ):
+                            committed_for_lead.add(member_num)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    marker = read_region_marker(
+                        self.store_path, lead_time_hours=lead_time_hours, member=None
+                    )
+                    if marker.get("state") == "complete" and self._marker_evidence_valid(
+                        f"det_L{lead_time_hours:04d}", marker
+                    ):
+                        committed_for_lead.add(0)
+                except Exception:
+                    pass
+
+            with Session(bind=conn) as db:
+                run = db.get(ModelRunRecord, run_id)
+                if run is None:
+                    return
+
+                from ingestion.core.catalog import (
+                    EnsembleMemberProductRecord,
+                    EnsembleMemberRecord,
+                    ProductRecord,
+                    _get_or_create,
+                )
+
+                if spec.is_ensemble:
+                    for member_num in sorted(committed_for_lead):
+                        _get_or_create(
+                            db,
+                            EnsembleMemberRecord,
+                            (EnsembleMemberRecord.run_id == run.id)
+                            & (EnsembleMemberRecord.member_index == member_num),
+                            {
+                                "id": f"member_{member_num}_{run.id}",
+                                "run_id": run.id,
+                                "member_index": member_num,
+                                "member_name": f"{spec.model_id}_member_{member_num}",
+                            },
+                        )
+                        _get_or_create(
+                            db,
+                            EnsembleMemberProductRecord,
+                            (EnsembleMemberProductRecord.run_id == run.id)
+                            & (EnsembleMemberProductRecord.member_index == member_num)
+                            & (EnsembleMemberProductRecord.lead_time_hours == lead_time_hours),
+                            {
+                                "id": f"member_product_{member_num}_{lead_time_hours}_{run.id}",
+                                "run_id": run.id,
+                                "member_index": member_num,
+                                "lead_time_hours": lead_time_hours,
+                            },
+                        )
+
+                if committed_for_lead and spec.variables:
+                    grid_code = spec.grid_id
+                    product_type = spec.product_type
+                    zarr_chunk_path = spec.zarr_store_path or run.zarr_store_path
+                    for v in spec.variables:
+                        _get_or_create(
+                            db,
+                            ProductRecord,
+                            (ProductRecord.run_id == run.id)
+                            & (ProductRecord.variable_id == v.code)
+                            & (ProductRecord.grid_id == grid_code)
+                            & (ProductRecord.product_type == product_type)
+                            & (ProductRecord.lead_time_hours == lead_time_hours),
+                            {
+                                "id": (
+                                    f"product_{run.id}_{v.code}_{grid_code}_"
+                                    f"{product_type}_{lead_time_hours}"
+                                ),
+                                "run_id": run.id,
+                                "variable_id": v.code,
+                                "grid_id": grid_code,
+                                "product_type": product_type,
+                                "lead_time_hours": lead_time_hours,
+                                "zarr_chunk_path": zarr_chunk_path,
+                            },
+                        )
+                db.commit()
+
+            # Advance manifest generation with new serving fingerprint
+            run_identity = {
+                "model_version_id": spec.version_string,
+                "cycle_time": spec.cycle_time.isoformat(),
+                "is_ensemble": spec.is_ensemble,
+            }
+            store_schema_fp = _store_schema_fingerprint(self.store_path)
+            generation = _new_generation()
+            manifest_payload = {
+                "manifest_schema_version": 1,
+                "store_protocol_mode": mode,
+                "generation": generation,
+                "run_identity": run_identity,
+                "canonical_store_identity_hash": _store_identity_hash(self.store_path),
+                "serving_state_fingerprint": sha256_hex("lead_pub", str(lead_time_hours), generation),
+                "committed_state_fingerprint": sha256_hex(
+                    "lead_committed", str(lead_time_hours), str(sorted(committed_for_lead))
+                ),
+                "store_schema_fingerprint": store_schema_fp,
+                "region_marker_set_fingerprint": "",
+                "legacy_region_evidence_fingerprint": None,
+            }
+            write_manifest(self.store_path, manifest_payload)
+        finally:
+            co.release_exclusive_gate()
+            co.release_admission()
+
     def _marker_evidence_valid(
         self,
         region_id: str,

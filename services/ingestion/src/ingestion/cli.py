@@ -1298,6 +1298,40 @@ async def _run_wave(
 
         loop = asyncio.get_event_loop()
 
+        # Track pending tasks per lead for intermediate settled-lead publication
+        expected_members_for_lead = spec.members if spec.members else (None,)
+        lead_pending: dict[int, set[int | None]] = {
+            lead_val: set(expected_members_for_lead) for lead_val in spec.lead_time_hours
+        }
+        lead_settle_lock = threading.Lock()
+        published_leads: set[int] = set()
+        run_id_for_pub = _resolve_run_id(catalog_spec, store_path)
+
+        def _check_and_publish_lead(lead_val: int) -> None:
+            if lead_val in published_leads:
+                return
+            published_leads.add(lead_val)
+            pub_conn = engine.connect()
+            try:
+                coordinator.publish_settled_lead(
+                    pub_conn,
+                    run_id=run_id_for_pub,
+                    spec=catalog_spec,
+                    lead_time_hours=lead_val,
+                    expected_members=spec.members,
+                )
+            except Exception as exc:
+                logger.warning("Settled-lead publication failed for lead %d: %s", lead_val, exc)
+            finally:
+                pub_conn.close()
+
+        def _on_item_settled(member_val: int | None, lead_val: int) -> None:
+            with lead_settle_lock:
+                if lead_val in lead_pending:
+                    lead_pending[lead_val].discard(member_val)
+                    if not lead_pending[lead_val]:
+                        _check_and_publish_lead(lead_val)
+
         # Seed task: starts immediately after pre-update under write_sem admission
         async def _run_seed_task() -> None:
             if cancel_event.is_set():
@@ -1331,6 +1365,7 @@ async def _run_wave(
                         seed_member, seed_lead, duration_ms=wr_dur
                     )
                     write_completed_events[seed_item].set()
+                    _on_item_settled(seed_member, seed_lead)
                 except Exception as exc:  # noqa: BLE001 - report failure
                     wr_dur = (time.monotonic() - t_wr_start) * 1000.0
                     tracker.on_write_failed(
@@ -1340,6 +1375,7 @@ async def _run_wave(
                         f"{spec.model} member={seed_member} lead={seed_lead}: {exc}"
                     )
                     write_completed_events[seed_item].set()
+                    _on_item_settled(seed_member, seed_lead)
 
                 if cancel_requested:
                     raise asyncio.CancelledError
@@ -1388,6 +1424,7 @@ async def _run_wave(
                         )
                         decode_completed_events[(member, lead)].set()
                         write_completed_events[(member, lead)].set()
+                        _on_item_settled(member, lead)
                         return
 
                 # Predecessor coordination for 6h-reset leads requiring de-accumulation / reconstruction.
@@ -1475,6 +1512,7 @@ async def _run_wave(
                         )
                         decode_completed_events[(member, lead)].set()
                         write_completed_events[(member, lead)].set()
+                        _on_item_settled(member, lead)
                         return
 
                 # Stage 4: Bounded write admission (application-level backpressure BEFORE thread submission)
@@ -1519,6 +1557,7 @@ async def _run_wave(
                             member, lead, duration_ms=wr_dur
                         )
                         write_completed_events[(member, lead)].set()
+                        _on_item_settled(member, lead)
                     except Exception as exc:  # noqa: BLE001 - report write failure
                         wr_dur = (time.monotonic() - t_wr_start) * 1000.0
                         tracker.on_write_failed(
@@ -1528,6 +1567,7 @@ async def _run_wave(
                             f"{spec.model} member={member} lead={lead} write: {exc}"
                         )
                         write_completed_events[(member, lead)].set()
+                        _on_item_settled(member, lead)
                     finally:
                         # Drop local dataset reference so memory is freed promptly
                         ds = None

@@ -86,6 +86,9 @@ class IngestionSettings(BaseSettings):
     #: Matched to MARKER_GET_CONCURRENCY / MARKER_PUT_CONCURRENCY without excess socket allocation.
     S3_CONTROL_MAX_POOL_CONNECTIONS: Any = 32
 
+    #: Minimum member coverage ratio for serving eligibility (Phase 3).
+    ENSEMBLE_MIN_COVERAGE_RATIO: float = 0.85
+
     @model_validator(mode="after")
     def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
         pool_size = int(self.DB_POOL_SIZE)
@@ -141,3 +144,6 @@ class IngestionSettings(BaseSettings):
 
 
 settings = IngestionSettings()
+
+from domain.coverage import set_min_coverage_ratio  # noqa: E402
+set_min_coverage_ratio(settings.ENSEMBLE_MIN_COVERAGE_RATIO)

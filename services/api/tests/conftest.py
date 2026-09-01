@@ -22,12 +22,14 @@ from geoalchemy2 import WKTElement
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from domain.coverage import register_expected_members
 from alembic import command
 from api.core.database import get_db
 from api.main import app
 from api.models.entities import (
     City,
     EnsembleMember,
+    EnsembleMemberProduct,
     ForecastCenter,
     ForecastGrid,
     ForecastProduct,
@@ -40,6 +42,7 @@ from api.models.entities import (
     VerificationObservation,
 )
 from tests.fixtures import (
+    MEMBER_COUNT,
     MEMBER_INDICES,
     write_ensemble_zarr,
     write_forecast_zarr,
@@ -256,6 +259,18 @@ def _seed_verification_observations(session: Session) -> None:
     )
     session.add_all(
         [
+            EnsembleMemberProduct(
+                id=f"emp_gefs_{m}_{lead}",
+                run_id="run_2026072100_gefs",
+                member_index=m,
+                lead_time_hours=lead,
+            )
+            for m in MEMBER_INDICES
+            for lead in lead_times
+        ]
+    )
+    session.add_all(
+        [
             VerificationObservation(
                 id="obs_20260721_06z_temperature_2m",
                 station_id="KASE",
@@ -339,6 +354,7 @@ def _seed_locations(session: Session) -> None:
 @pytest.fixture(scope="module")
 def seed_data(migrated_db, tmp_zarr_stores):
     """Seed deterministic catalog and location rows used by the contract tests."""
+    register_expected_members("gefs", MEMBER_COUNT)
     with Session(migrated_db) as session:
         noaa = ForecastCenter(
             id="center_noaa",

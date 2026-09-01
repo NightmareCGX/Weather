@@ -110,14 +110,19 @@ def _select_and_encode_vector_field(
 
     if "member" in field_u.dims:
         # GEFS consensus vector: mean_u = mean(u_i), mean_v = mean(v_i)
-        u_members = field_u.values[:, ::stride, ::stride]
-        v_members = field_v.values[:, ::stride, ::stride]
-        u_val = np.mean(u_members, axis=0)
-        v_val = np.mean(v_members, axis=0)
+        u_members = np.asarray(field_u.values[:, ::stride, ::stride], dtype=float)
+        v_members = np.asarray(field_v.values[:, ::stride, ::stride], dtype=float)
+        with np.errstate(all="ignore"):
+            u_val = np.nanmean(u_members, axis=0)
+            v_val = np.nanmean(v_members, axis=0)
+        u_val = np.where(np.isfinite(u_val), u_val, 0.0)
+        v_val = np.where(np.isfinite(v_val), v_val, 0.0)
     else:
         # GFS deterministic flow
-        u_val = field_u.values[::stride, ::stride]
-        v_val = field_v.values[::stride, ::stride]
+        u_val = np.asarray(field_u.values[::stride, ::stride], dtype=float)
+        v_val = np.asarray(field_v.values[::stride, ::stride], dtype=float)
+        u_val = np.where(np.isfinite(u_val), u_val, 0.0)
+        v_val = np.where(np.isfinite(v_val), v_val, 0.0)
 
     lat_step = float((lat_raw[-1] - lat_raw[0]) / (len(lat_raw) - 1) * stride) if len(lat_raw) > 1 else 1.0
     lon_step = float((lon_raw[-1] - lon_raw[0]) / (len(lon_raw) - 1) * stride) if len(lon_raw) > 1 else 1.0
