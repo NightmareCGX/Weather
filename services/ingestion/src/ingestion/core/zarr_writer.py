@@ -469,8 +469,181 @@ def commit_region(
     if drop_vars:
         target = target.drop_vars(drop_vars)
 
+    # Fast path: bounded concurrent chunk PUT emission
+    try:
+        encoded_chunks = encode_region_chunks(
+            target,
+            store=store,
+            lead_index=lead_index,
+            member_index=member_index,
+        )
+    except Exception:
+        encoded_chunks = []
+
+    if encoded_chunks:
+        write_encoded_chunks(store, encoded_chunks, concurrency=16)
+        return os.fspath(store) if isinstance(store, PathLike) else str(store)
+
     target.to_zarr(resolved, mode="r+", region=region)
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
+
+
+def encode_region_chunks(
+    dataset: xr.Dataset,
+    store: str | PathLike[str] | Mapping[str, bytes],
+    *,
+    lead_index: int,
+    member_index: int | None = None,
+) -> list[tuple[str, bytes]]:
+    """Encode an xarray region dataset into Zarr-compatible (chunk_key, compressed_bytes).
+
+    Inspects the target Zarr store's array metadata to match exact chunk shapes,
+    compressors, and fill values without hardcoding dimension extents.
+
+    Args:
+        dataset: The normalized single-lead (and optional single-member) dataset.
+        store: The target store to inspect for array chunk geometries.
+        lead_index: Positional index along the lead_time_hours dimension.
+        member_index: Positional index along the member dimension (or None).
+
+    Returns:
+        List of (chunk_relative_key, compressed_bytes) tuples.
+    """
+    resolved = _resolve_store(store)
+    root = zarr.open_group(resolved, mode="r")
+    encoded_chunks: list[tuple[str, bytes]] = []
+
+    for name, da in dataset.data_vars.items():
+        var_name = str(name)
+        if var_name not in root:
+            continue
+        zarr_arr = root[var_name]
+        chunks = zarr_arr.chunks
+        if len(chunks) == 4:
+            if chunks[0] != 1 or chunks[1] != 1:
+                raise ValueError(
+                    f"encode_region_chunks requires member=1 and lead=1 chunk size, got {chunks}"
+                )
+        elif len(chunks) == 3:
+            if chunks[0] != 1:
+                raise ValueError(
+                    f"encode_region_chunks requires lead=1 chunk size, got {chunks}"
+                )
+        else:
+            raise ValueError(f"Unsupported chunk dimensionality: {len(chunks)}")
+
+        compressor = zarr_arr.compressor
+        fill_val = zarr_arr.fill_value
+        dtype = zarr_arr.dtype
+
+        arr = da.values
+        arr_2d = np.squeeze(arr)
+        if arr_2d.ndim != 2:
+            continue
+        lat_size, lon_size = arr_2d.shape
+
+        lat_chunk = chunks[-2]
+        lon_chunk = chunks[-1]
+
+        lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
+        lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
+
+        has_member = member_index is not None and len(chunks) == 4
+
+        for r_i in range(lat_chunks):
+            lat_start = r_i * lat_chunk
+            lat_end = min((r_i + 1) * lat_chunk, lat_size)
+            sub_lat = lat_end - lat_start
+
+            for c_i in range(lon_chunks):
+                lon_start = c_i * lon_chunk
+                lon_end = min((c_i + 1) * lon_chunk, lon_size)
+                sub_lon = lon_end - lon_start
+
+                f_val = (
+                    fill_val
+                    if fill_val is not None
+                    else (np.nan if np.issubdtype(dtype, np.floating) else 0)
+                )
+                chunk_buf = np.full(chunks, f_val, dtype=dtype)
+                if has_member:
+                    chunk_buf[0, 0, :sub_lat, :sub_lon] = arr_2d[
+                        lat_start:lat_end, lon_start:lon_end
+                    ]
+                    key = f"{var_name}/{member_index}.{lead_index}.{r_i}.{c_i}"
+                else:
+                    chunk_buf[0, :sub_lat, :sub_lon] = arr_2d[
+                        lat_start:lat_end, lon_start:lon_end
+                    ]
+                    key = f"{var_name}/{lead_index}.{r_i}.{c_i}"
+
+                raw_bytes = chunk_buf.tobytes(order=zarr_arr.order or "C")
+                comp_bytes = (
+                    compressor.encode(raw_bytes)
+                    if compressor is not None
+                    else raw_bytes
+                )
+                encoded_chunks.append((key, comp_bytes))
+
+    return encoded_chunks
+
+
+def write_encoded_chunks(
+    store: str | PathLike[str] | Mapping[str, bytes],
+    encoded_chunks: list[tuple[str, bytes]],
+    *,
+    concurrency: int = 16,
+) -> None:
+    """Write encoded Zarr chunks to S3/local store with bounded parallelism.
+
+    Args:
+        store: Target store path or mapping.
+        encoded_chunks: Sequence of (chunk_key, compressed_bytes) tuples.
+        concurrency: Maximum concurrent chunk PUT operations.
+    """
+    if not encoded_chunks:
+        return
+
+    path = os.fspath(store) if isinstance(store, (str, PathLike)) else None
+    if path and path.startswith("s3://"):
+        import asyncio
+        from typing import Any, cast
+        import fsspec.asyn  # type: ignore[import-untyped]
+        from ingestion.core.s3 import resolve_s3_mapper
+
+        resolved_map = cast(Any, resolve_s3_mapper(path, settings))
+        fs = resolved_map.fs
+        root = resolved_map.root
+
+        async def _put_all() -> None:
+            sem = asyncio.Semaphore(concurrency)
+
+            async def _put_one(key: str, data: bytes) -> None:
+                async with sem:
+                    await fs._pipe_file(f"{root}/{key}", data)
+
+            await asyncio.gather(*(_put_one(k, d) for k, d in encoded_chunks))
+
+        fsspec.asyn.sync(fs.loop, _put_all)
+        return
+
+    if path and (
+        path.startswith("file://")
+        or os.path.isabs(path)
+        or os.path.exists(os.path.dirname(path) or ".")
+    ):
+        local_dir = path[len("file://") :] if path.startswith("file://") else path
+        for key, data in encoded_chunks:
+            full = os.path.join(local_dir, *key.split("/"))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as f:
+                f.write(data)
+        return
+
+    resolved = _resolve_store(store)
+    if isinstance(resolved, MutableMapping):
+        for key, data in encoded_chunks:
+            resolved[key] = data
 
 
 def _coordinate_index(

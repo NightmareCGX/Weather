@@ -208,18 +208,11 @@ async def test_download_selective_gfs_aws_success(tmp_path: Path) -> None:
     )
 
     total_bytes = len1 + len2 + 5000
-    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes=0-{len1 - 1}"}).mock(
+    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes=0-{len1 + len2 - 1}"}).mock(
         return_value=httpx.Response(
             206,
-            content=chunk1,
-            headers={"Content-Range": f"bytes 0-{len1 - 1}/{total_bytes}"},
-        )
-    )
-    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={len1}-{len1 + len2 - 1}"}).mock(
-        return_value=httpx.Response(
-            206,
-            content=chunk2,
-            headers={"Content-Range": f"bytes {len1}-{len1 + len2 - 1}/{total_bytes}"},
+            content=chunk1 + chunk2,
+            headers={"Content-Range": f"bytes 0-{len1 + len2 - 1}/{total_bytes}"},
         )
     )
 
@@ -254,24 +247,15 @@ async def test_download_selective_gfs_phase1a_variables_success(tmp_path: Path) 
     )
 
     total_bytes = l_rh + l_gust + l_vis + l_snod + 5000
-    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes=0-{l_rh - 1}"}).mock(
+    respx.get(
+        AWS_GFS_006_URL, headers={"Range": f"bytes=0-{l_rh + l_gust + l_vis + l_snod - 1}"}
+    ).mock(
         return_value=httpx.Response(
-            206, content=chunk_rh, headers={"Content-Range": f"bytes 0-{l_rh - 1}/{total_bytes}"}
-        )
-    )
-    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={l_rh}-{l_rh + l_gust - 1}"}).mock(
-        return_value=httpx.Response(
-            206, content=chunk_gust, headers={"Content-Range": f"bytes {l_rh}-{l_rh + l_gust - 1}/{total_bytes}"}
-        )
-    )
-    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={l_rh + l_gust}-{l_rh + l_gust + l_vis - 1}"}).mock(
-        return_value=httpx.Response(
-            206, content=chunk_vis, headers={"Content-Range": f"bytes {l_rh + l_gust}-{l_rh + l_gust + l_vis - 1}/{total_bytes}"}
-        )
-    )
-    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={l_rh + l_gust + l_vis}-{l_rh + l_gust + l_vis + l_snod - 1}"}).mock(
-        return_value=httpx.Response(
-            206, content=chunk_snod, headers={"Content-Range": f"bytes {l_rh + l_gust + l_vis}-{l_rh + l_gust + l_vis + l_snod - 1}/{total_bytes}"}
+            206,
+            content=chunk_rh + chunk_gust + chunk_vis + chunk_snod,
+            headers={
+                "Content-Range": f"bytes 0-{l_rh + l_gust + l_vis + l_snod - 1}/{total_bytes}"
+            },
         )
     )
 
@@ -299,14 +283,11 @@ async def test_download_selective_gefs_phase1a_variables_success(tmp_path: Path)
     respx.get(f"{AWS_GEFS_006_URL}.idx").mock(
         return_value=httpx.Response(200, text=idx_text)
     )
-    respx.get(AWS_GEFS_006_URL, headers={"Range": f"bytes=0-{l_rh - 1}"}).mock(
+    respx.get(AWS_GEFS_006_URL, headers={"Range": f"bytes=0-{l_rh + l_gust - 1}"}).mock(
         return_value=httpx.Response(
-            206, content=chunk_rh, headers={"Content-Range": f"bytes 0-{l_rh - 1}/50000"}
-        )
-    )
-    respx.get(AWS_GEFS_006_URL, headers={"Range": f"bytes={l_rh}-{l_rh + l_gust - 1}"}).mock(
-        return_value=httpx.Response(
-            206, content=chunk_gust, headers={"Content-Range": f"bytes {l_rh}-{l_rh + l_gust - 1}/50000"}
+            206,
+            content=chunk_rh + chunk_gust,
+            headers={"Content-Range": f"bytes 0-{l_rh + l_gust - 1}/50000"},
         )
     )
 
@@ -563,18 +544,11 @@ async def test_download_aws_404_falls_back_to_nomads(tmp_path: Path) -> None:
     respx.get(f"{NOMADS_GFS_006_URL}.idx").mock(
         return_value=httpx.Response(200, text=nomads_idx_text)
     )
-    respx.get(NOMADS_GFS_006_URL, headers={"Range": f"bytes=0-{len1 - 1}"}).mock(
+    respx.get(NOMADS_GFS_006_URL, headers={"Range": f"bytes=0-{len1 + len2 - 1}"}).mock(
         return_value=httpx.Response(
             206,
-            content=chunk1,
-            headers={"Content-Range": f"bytes 0-{len1 - 1}/50000"},
-        )
-    )
-    respx.get(NOMADS_GFS_006_URL, headers={"Range": f"bytes={len1}-{len1 + len2 - 1}"}).mock(
-        return_value=httpx.Response(
-            206,
-            content=chunk2,
-            headers={"Content-Range": f"bytes {len1}-{len1 + len2 - 1}/50000"},
+            content=chunk1 + chunk2,
+            headers={"Content-Range": f"bytes 0-{len1 + len2 - 1}/50000"},
         )
     )
 
@@ -707,8 +681,9 @@ async def test_download_selective_later_range_returns_200_fallback(
 
     idx_text = (
         f"1:0:d=2026072100:TMP:2 m above ground:6 hour fcst:\n"
-        f"2:{len1}:d=2026072100:PRATE:surface:6 hour fcst:\n"
-        f"3:{len1 + 500}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+        f"2:{len1}:d=2026072100:SPFH:2 m above ground:6 hour fcst:\n"
+        f"3:{len1 + 500}:d=2026072100:PRATE:surface:6 hour fcst:\n"
+        f"4:{len1 + 1000}:d=2026072100:HGT:surface:6 hour fcst:\n"
     )
     respx.get(f"{AWS_GFS_006_URL}.idx").mock(
         return_value=httpx.Response(200, text=idx_text)
@@ -721,7 +696,7 @@ async def test_download_selective_later_range_returns_200_fallback(
             headers={"Content-Range": f"bytes 0-{len1 - 1}/50000"},
         )
     )
-    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={len1}-{len1 + 499}"}).mock(
+    respx.get(AWS_GFS_006_URL, headers={"Range": f"bytes={len1 + 500}-{len1 + 999}"}).mock(
         return_value=httpx.Response(200, content=full_content)
     )
 

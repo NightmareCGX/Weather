@@ -24,6 +24,7 @@ from ingestion.core.config import IngestionSettings, settings
 from ingestion.providers.noaa.idx_parser import (
     DEFAULT_SELECTION_VARIABLES,
     IdxParseError,
+    merge_adjacent_records,
     parse_idx,
     select_records,
 )
@@ -84,9 +85,18 @@ class NOAAConnector(BaseConnector):
                 settings instance.
         """
         self._settings = conn_settings or settings
+        max_connections = int(getattr(self._settings, "HTTP_MAX_CONNECTIONS", 100))
+        max_keepalive = int(getattr(self._settings, "HTTP_MAX_KEEPALIVE_CONNECTIONS", 50))
+        keepalive_expiry = float(getattr(self._settings, "HTTP_KEEPALIVE_EXPIRY_SECONDS", 30.0))
+        limits = httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive,
+            keepalive_expiry=keepalive_expiry,
+        )
         self._client = httpx.AsyncClient(
             timeout=self._settings.REQUEST_TIMEOUT_SECONDS,
             headers={"User-Agent": self._settings.NOAA_USER_AGENT},
+            limits=limits,
         )
 
     async def __aenter__(self) -> Self:
@@ -464,14 +474,18 @@ class NOAAConnector(BaseConnector):
                 if not selection.selected_records:
                     raise SelectiveFallbackError("no_records_selected")
 
-                # 4. Sequential single-range requests in original source order
+                # 4. Adjacent-merged range requests in original source order (Gap=0, 0% extra bytes)
+                record_groups = merge_adjacent_records(selection.selected_records, max_gap=0)
                 total_downloaded = 0
+                fallback_full_bytes: bytes | None = None
                 with temp_dest.open("wb") as handle:
-                    for rec in selection.selected_records:
+                    for group in record_groups:
+                        start_offset = group[0].start_offset
+                        end_offset = group[-1].end_offset
                         range_header = (
-                            f"bytes={rec.start_offset}-{rec.end_offset}"
-                            if rec.end_offset is not None
-                            else f"bytes={rec.start_offset}-"
+                            f"bytes={start_offset}-{end_offset}"
+                            if end_offset is not None
+                            else f"bytes={start_offset}-"
                         )
                         async with self._client.stream(
                             "GET", url, headers={"Range": range_header}
@@ -481,17 +495,14 @@ class NOAAConnector(BaseConnector):
                                     f"Requested file not found: {url}"
                                 )
                             if resp.status_code == 200:
-                                # Upstream ignored Range header. Stream full response directly
+                                # Upstream ignored Range header. Capture full response directly
                                 # to destination as an immediate in-stream fallback.
-                                handle.close()
-                                temp_dest.unlink(missing_ok=True)
                                 logger.warning(
                                     "Server returned 200 OK instead of 206 for Range request; "
                                     "streaming full file directly."
                                 )
-                                return await self._stream_response_to_file(
-                                    resp, destination
-                                )
+                                fallback_full_bytes = await resp.aread()
+                                break
                             if resp.status_code == 416:
                                 raise SelectiveFallbackError(
                                     "range_not_satisfiable_416"
@@ -501,7 +512,7 @@ class NOAAConnector(BaseConnector):
                                     f"Upstream returned HTTP {resp.status_code}: {url}",
                                     request=resp.request,
                                     response=resp,
-                                    )
+                                )
                             if resp.status_code != 206:
                                 raise SelectiveFallbackError(
                                     f"range_unexpected_status_{resp.status_code}"
@@ -517,15 +528,15 @@ class NOAAConnector(BaseConnector):
                                 )
                             cr_start = int(match.group(1))
                             cr_end = int(match.group(2))
-                            if cr_start != rec.start_offset:
+                            if cr_start != start_offset:
                                 raise SelectiveFallbackError(
                                     "range_content_mismatch",
-                                    f"Start offset mismatch: expected {rec.start_offset}, got {cr_start}",
+                                    f"Start offset mismatch: expected {start_offset}, got {cr_start}",
                                 )
-                            if rec.end_offset is not None and cr_end != rec.end_offset:
+                            if end_offset is not None and cr_end != end_offset:
                                 raise SelectiveFallbackError(
                                     "range_content_mismatch",
-                                    f"End offset mismatch: expected {rec.end_offset}, got {cr_end}",
+                                    f"End offset mismatch: expected {end_offset}, got {cr_end}",
                                 )
 
                             chunk = await resp.aread()
@@ -538,50 +549,75 @@ class NOAAConnector(BaseConnector):
                                     f"Truncated body: expected {expected_len} bytes, got {len(chunk)}",
                                 )
 
-                            # Binary GRIB validation
-                            if not chunk.startswith(b"GRIB"):
-                                raise SelectiveFallbackError(
-                                    "grib_magic_invalid",
-                                    "Chunk missing 'GRIB' magic header",
+                            # Binary GRIB message validation across all messages in group
+                            offset = 0
+                            for rec in group:
+                                if offset + 4 > len(chunk) or chunk[offset : offset + 4] != b"GRIB":
+                                    raise SelectiveFallbackError(
+                                        "grib_magic_invalid",
+                                        f"Chunk missing 'GRIB' magic header at offset {offset}",
+                                    )
+                                if offset + 16 > len(chunk):
+                                    raise SelectiveFallbackError(
+                                        "grib_length_invalid",
+                                        f"Chunk shorter than Section 0 header at offset {offset}",
+                                    )
+                                declared_len = int.from_bytes(
+                                    chunk[offset + 8 : offset + 16], byteorder="big", signed=False
                                 )
-                            if not chunk.endswith(b"7777"):
-                                raise SelectiveFallbackError(
-                                    "grib_terminator_invalid",
-                                    "Chunk missing '7777' terminator",
-                                )
-                            # Section 0 total declared length check (octets 9-16)
-                            if len(chunk) < 16:
+                                if declared_len <= 0 or offset + declared_len > len(chunk):
+                                    raise SelectiveFallbackError(
+                                        "grib_length_invalid",
+                                        f"GRIB declared length {declared_len} invalid at offset {offset}",
+                                    )
+                                if rec.byte_length is not None and declared_len != rec.byte_length:
+                                    raise SelectiveFallbackError(
+                                        "grib_length_invalid",
+                                        f"GRIB Section 0 length {declared_len} != expected record length {rec.byte_length}",
+                                    )
+                                if chunk[offset + declared_len - 4 : offset + declared_len] != b"7777":
+                                    raise SelectiveFallbackError(
+                                        "grib_terminator_invalid",
+                                        f"Chunk missing '7777' terminator for record #{rec.record_number}",
+                                    )
+                                offset += declared_len
+
+                            if offset != len(chunk):
                                 raise SelectiveFallbackError(
                                     "grib_length_invalid",
-                                    "Chunk shorter than Section 0 header",
-                                )
-                            declared_len = int.from_bytes(
-                                chunk[8:16], byteorder="big", signed=False
-                            )
-                            if declared_len != len(chunk):
-                                raise SelectiveFallbackError(
-                                    "grib_length_invalid",
-                                    f"GRIB Section 0 declared length {declared_len} != chunk length {len(chunk)}",
+                                    f"GRIB decoded cumulative length {offset} != chunk length {len(chunk)}",
                                 )
 
                             handle.write(chunk)
                             total_downloaded += len(chunk)
 
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                    if fallback_full_bytes is None:
+                        handle.flush()
+                        os.fsync(handle.fileno())
+
+                if fallback_full_bytes is not None:
+                    temp_dest.unlink(missing_ok=True)
+                    temp_dest_full = destination.with_suffix(f".tmp.{uuid.uuid4().hex}.grib2")
+                    with temp_dest_full.open("wb") as h_full:
+                        h_full.write(fallback_full_bytes)
+                        h_full.flush()
+                        os.fsync(h_full.fileno())
+                    temp_dest_full.replace(destination)
+                    return destination
 
                 # Atomic publish
                 temp_dest.replace(destination)
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
                 logger.info(
                     "download_complete: model=%s cycle=%sT%02dZ lead=%d member=%s "
-                    "mode=selective records_selected=%d downloaded_bytes=%d duration_ms=%d",
+                    "mode=selective records_selected=%d range_requests=%d downloaded_bytes=%d duration_ms=%d",
                     model,
                     cycle_date,
                     cycle_hour,
                     lead_time_hours,
                     member,
                     len(selection.selected_records),
+                    len(record_groups),
                     total_downloaded,
                     elapsed_ms,
                 )

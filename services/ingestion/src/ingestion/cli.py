@@ -943,6 +943,7 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     failures: list[str] = []
 
     # Each (member, lead) work item, or just (lead) for deterministic.
+    # Lead-major ordering for ensemble models enables early progressive publication per settled lead.
     if spec.model != "gefs":
         items: list[tuple[int | None, int]] = [
             (None, lead) for lead in sorted(spec.lead_time_hours)
@@ -950,8 +951,8 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     else:
         items = [
             (member, lead)
-            for member in sorted(spec.members)
             for lead in sorted(spec.lead_time_hours)
+            for member in sorted(spec.members)
         ]
 
     status = asyncio.run(
@@ -1026,6 +1027,7 @@ async def _run_wave(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     # Each (member, lead) work item, or just (lead) for deterministic.
+    # Lead-major ordering for ensemble models enables early progressive publication per settled lead.
     if spec.model != "gefs":
         items: list[tuple[int | None, int]] = [
             (None, lead) for lead in sorted(spec.lead_time_hours)
@@ -1033,8 +1035,8 @@ async def _run_wave(
     else:
         items = [
             (member, lead)
-            for member in sorted(spec.members)
             for lead in sorted(spec.lead_time_hours)
+            for member in sorted(spec.members)
         ]
 
     seed_item = items[0]
