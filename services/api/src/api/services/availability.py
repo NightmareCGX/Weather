@@ -1,15 +1,14 @@
 """Forecast availability discovery: what forecast data the platform can serve.
 
-This service answers "what forecasts actually exist" by querying the
-PostgreSQL catalog — the single source of truth for available models,
-variables, initial times, and lead times. Nothing here is hard-coded: the
-nested ``model -> variable -> initial_time -> lead_time`` structure is built
-from real ``model_runs`` (``status='ready'``) joined to ``forecast_products``
-(one row per variable x lead time) and the ``forecast_variables`` /
-``models`` catalogs.
-
-The router stays thin (ENGINEERING_CONTRACT section 2): it validates query
-parameters and serializes the structure this service builds.
+This service answers "what forecasts actually exist and are servable" by querying
+the PostgreSQL catalog — the single source of truth for available models,
+variables, initial times, lead times, and ensemble member coverage. Nothing here
+is hard-coded: the nested ``model -> variable -> initial_time -> lead_time``
+structure is built from real ``model_runs`` in ``ready``, ``processing``, or
+``partial`` lifecycle states joined to ``forecast_products`` (one row per
+variable x lead time), ``ensemble_member_products`` (committed member pairs),
+and the ``forecast_variables`` / ``models`` catalogs. Failed runs are strictly
+excluded.
 """
 
 from __future__ import annotations
@@ -17,10 +16,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import select
+from domain.coverage import (
+    compute_coverage_ratio,
+    get_expected_members,
+    is_lead_servable,
+)
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.models.entities import (
+    EnsembleMemberProduct,
     ForecastProduct,
     ForecastVariable,
     Model,
@@ -31,17 +36,29 @@ from api.schemas import (
     ForecastAvailabilityData,
     InitialTimeAvailability,
     LayerDescriptor,
+    LeadAvailabilityOut,
     ModelAvailability,
     SpatialLayerLegend,
     VariableAvailability,
 )
 from api.services.tiles import MAX_ZOOM, MIN_ZOOM, _color_stops
 
-
 #: Internal platform variables that are not exposed as public user-facing products.
 INTERNAL_VARIABLES: frozenset[str] = frozenset(
     {"wind_u_10m", "wind_v_10m", "crain", "csnow", "cfrzr", "cicep"}
 )
+
+#: Valid model run lifecycle statuses eligible for availability discovery.
+SERVING_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"ready", "processing", "partial"})
+
+
+@dataclass
+class _CycleInfo:
+    """Tracking structure for a single cycle run's available leads."""
+
+    run_id: str
+    status: str
+    leads: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -51,12 +68,12 @@ class _VariableAccumulator:
     Attributes:
         name: Human-readable variable name.
         unit: Registered SI unit string.
-        initial_times: Map of cycle time to the set of available lead hours.
+        initial_times: Map of cycle time to cycle info.
     """
 
     name: str
     unit: str
-    initial_times: dict[datetime, set[int]] = field(default_factory=dict)
+    initial_times: dict[datetime, _CycleInfo] = field(default_factory=dict)
 
 
 @dataclass
@@ -77,20 +94,17 @@ class _ModelAccumulator:
 def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
     """Build the nested model/variable/initial-time/lead-time availability.
 
-    Only models with at least one ``ready`` run that has ``forecast_products``
-    rows are included, so the returned structure reflects exactly what the
-    serving tier can serve (a model row with no ready run or no products is
-    not advertised). ``forecast_products`` is authoritative for the
-    model/variable/lead combinations, so the availability always matches the
-    catalog rows written by ingestion.
+    Queries runs in ``ready``, ``processing``, and ``partial`` statuses that
+    have committed ``forecast_products`` rows. Enforces the 85% member-coverage
+    serving threshold for the simple ``lead_time_hours`` list while exposing rich
+    per-lead coverage descriptors in ``leads``.
 
     Args:
         db: Database session.
 
     Returns:
         The availability payload, with models ordered by model id, variables
-        by variable code, initial times newest-first, and lead times
-        ascending.
+        by variable code, initial times newest-first, and lead times ascending.
     """
     rows = db.execute(
         select(
@@ -100,7 +114,9 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             ForecastVariable.variable_code,
             ForecastVariable.name,
             ForecastVariable.unit,
+            ModelRun.id,
             ModelRun.cycle_time,
+            ModelRun.status,
             ForecastProduct.lead_time_hours,
         )
         .select_from(ModelRun)
@@ -111,8 +127,23 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             ForecastVariable,
             ForecastVariable.variable_code == ForecastProduct.variable_id,
         )
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
     ).all()
+
+    # Pre-query committed ensemble member counts per (run_id, lead_time_hours)
+    emp_rows = db.execute(
+        select(
+            EnsembleMemberProduct.run_id,
+            EnsembleMemberProduct.lead_time_hours,
+            func.count(EnsembleMemberProduct.member_index),
+        ).group_by(
+            EnsembleMemberProduct.run_id,
+            EnsembleMemberProduct.lead_time_hours,
+        )
+    ).all()
+    emp_counts: dict[tuple[str, int], int] = {
+        (str(r_id), int(lead)): int(cnt) for r_id, lead, cnt in emp_rows
+    }
 
     by_model: dict[str, _ModelAccumulator] = {}
     for (
@@ -122,7 +153,9 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
         variable_code,
         variable_name,
         variable_unit,
+        run_id,
         cycle_time,
+        run_status,
         lead,
     ) in rows:
         model_acc = by_model.setdefault(
@@ -133,12 +166,20 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             variable_code,
             _VariableAccumulator(name=variable_name, unit=variable_unit),
         )
-        variable_acc.initial_times.setdefault(cycle_time, set()).add(lead)
+        cycle_info = variable_acc.initial_times.setdefault(
+            cycle_time,
+            _CycleInfo(run_id=run_id, status=run_status),
+        )
+        cycle_info.leads.add(int(lead))
 
     models: list[ModelAvailability] = []
     for model_id in sorted(by_model):
         model_acc = by_model[model_id]
+        expected_members = get_expected_members(
+            model_id, default_if_unknown=30 if model_acc.is_ensemble else 1
+        )
         variables: list[VariableAvailability] = []
+
         # Synthesize public wind_10m product when both wind_u_10m and wind_v_10m exist
         if "wind_u_10m" in model_acc.variables and "wind_v_10m" in model_acc.variables:
             u_acc = model_acc.variables["wind_u_10m"]
@@ -146,12 +187,38 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             common_cycles = set(u_acc.initial_times.keys()).intersection(v_acc.initial_times.keys())
             initial_times_wind: list[InitialTimeAvailability] = []
             for cycle_time in sorted(common_cycles, reverse=True):
-                common_leads = u_acc.initial_times[cycle_time].intersection(v_acc.initial_times[cycle_time])
+                u_info = u_acc.initial_times[cycle_time]
+                v_info = v_acc.initial_times[cycle_time]
+                common_leads = u_info.leads.intersection(v_info.leads)
                 if common_leads:
+                    servable_leads: list[int] = []
+                    rich_leads: list[LeadAvailabilityOut] = []
+                    for lead in sorted(common_leads):
+                        if model_acc.is_ensemble:
+                            avail_u = emp_counts.get((u_info.run_id, lead), 0)
+                            avail_v = emp_counts.get((v_info.run_id, lead), 0)
+                            avail_count = min(avail_u, avail_v)
+                        else:
+                            avail_count = 1
+                        ratio = compute_coverage_ratio(avail_count, expected_members)
+                        servable = is_lead_servable(avail_count, expected_members)
+                        if servable:
+                            servable_leads.append(lead)
+                        rich_leads.append(
+                            LeadAvailabilityOut(
+                                lead_time_hours=lead,
+                                available_members=avail_count,
+                                expected_members=expected_members,
+                                coverage_ratio=ratio,
+                                servable=servable,
+                            )
+                        )
                     initial_times_wind.append(
                         InitialTimeAvailability(
                             value=cycle_time,
-                            lead_time_hours=sorted(common_leads),
+                            lead_time_hours=servable_leads,
+                            status=u_info.status,
+                            leads=rich_leads,
                         )
                     )
             if initial_times_wind:
@@ -186,17 +253,41 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             if variable_code in INTERNAL_VARIABLES:
                 continue
             variable_acc = model_acc.variables[variable_code]
-            initial_times = [
-                InitialTimeAvailability(
-                    value=cycle_time,
-                    lead_time_hours=sorted(leads),
+            initial_times: list[InitialTimeAvailability] = []
+            for cycle_time, cycle_info in sorted(
+                variable_acc.initial_times.items(),
+                key=lambda item: item[0],
+                reverse=True,
+            ):
+                servable_leads = []
+                rich_leads = []
+                for lead in sorted(cycle_info.leads):
+                    if model_acc.is_ensemble:
+                        avail_count = emp_counts.get((cycle_info.run_id, lead), 0)
+                    else:
+                        avail_count = 1
+                    ratio = compute_coverage_ratio(avail_count, expected_members)
+                    servable = is_lead_servable(avail_count, expected_members)
+                    if servable:
+                        servable_leads.append(lead)
+                    rich_leads.append(
+                        LeadAvailabilityOut(
+                            lead_time_hours=lead,
+                            available_members=avail_count,
+                            expected_members=expected_members,
+                            coverage_ratio=ratio,
+                            servable=servable,
+                        )
+                    )
+                initial_times.append(
+                    InitialTimeAvailability(
+                        value=cycle_time,
+                        lead_time_hours=servable_leads,
+                        status=cycle_info.status,
+                        leads=rich_leads,
+                    )
                 )
-                for cycle_time, leads in sorted(
-                    variable_acc.initial_times.items(),
-                    key=lambda item: item[0],
-                    reverse=True,
-                )
-            ]
+
             stops: list[list[float | str]] = [
                 [float(value), f"#{red:02x}{green:02x}{blue:02x}"]
                 for value, (red, green, blue) in _color_stops(variable_code)

@@ -197,7 +197,8 @@ class _ReaderGateSession:
         """Fresh Core revalidation of run status + path on the lock Connection.
 
         Returns ``(ok, path)``; when ``ok`` is False the caller falls back to
-        the next candidate.
+        the next candidate. Valid statuses for reading are 'ready', 'processing',
+        and 'partial'. Runs in 'failed' status are rejected.
         """
         assert self._conn is not None
         row = self._conn.execute(
@@ -210,7 +211,9 @@ class _ReaderGateSession:
         if row is None:
             return False, None
         status, path = row
-        return (status == "ready" and path == self._store_path), path
+        return (
+            status in ("ready", "processing", "partial") and path == self._store_path
+        ), path
 
     def release(self) -> None:
         if self._gate_held:

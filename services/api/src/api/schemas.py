@@ -111,6 +111,16 @@ class LayerDescriptor(BaseModel):
     vector_field_url_template: str | None = None
 
 
+class LeadAvailabilityOut(BaseModel):
+    """Rich lead-level availability and member-coverage metadata."""
+
+    lead_time_hours: int
+    available_members: int
+    expected_members: int
+    coverage_ratio: float
+    servable: bool
+
+
 class InitialTimeAvailability(BaseModel):
     """One available forecast initialization (cycle time) of a variable.
 
@@ -118,12 +128,16 @@ class InitialTimeAvailability(BaseModel):
         value: The run's ``cycle_time`` in ISO 8601 UTC. ``valid_time`` for a
             given lead is derived as ``value + lead_time_hours``
             (DATABASE.md section 1).
-        lead_time_hours: The forecast offset hours available for this
-            model/variable/initial time, ascending.
+        lead_time_hours: The publicly servable forecast offset hours available
+            for this model/variable/initial time (coverage >= 85%), ascending.
+        status: The run lifecycle status (e.g. 'ready', 'processing', 'partial').
+        leads: Rich lead-level coverage descriptors including below-threshold leads.
     """
 
     value: datetime
     lead_time_hours: list[int]
+    status: str | None = None
+    leads: list[LeadAvailabilityOut] | None = None
 
     @field_serializer("value")
     def _serialize_value(self, value: datetime) -> str:

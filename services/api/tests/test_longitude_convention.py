@@ -27,11 +27,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from domain.coverage import register_expected_members
 from alembic import command
 from api.core.database import get_db
 from api.main import app
 from api.models.entities import (
     EnsembleMember,
+    EnsembleMemberProduct,
     ForecastCenter,
     ForecastVariable,
     Model,
@@ -40,6 +42,7 @@ from api.models.entities import (
 )
 from tests.fixtures import (
     LAT_START,
+    LEAD_TIMES,
     LON_START,
     MEMBER_COUNT,
     MEMBER_INDICES,
@@ -160,6 +163,17 @@ def longitude_client(tmp_path_factory):
             name="Precipitation Rate",
             unit="mm/h",
         )
+        register_expected_members("gefs_0_360", MEMBER_COUNT)
+        ensemble_member_products = [
+            EnsembleMemberProduct(
+                id=f"emp_gefs_0_360_{i}_{lead}",
+                run_id="run_2026072100_gefs_0_360",
+                member_index=i,
+                lead_time_hours=lead,
+            )
+            for i in MEMBER_INDICES
+            for lead in LEAD_TIMES
+        ]
         session.add_all(
             [
                 noaa,
@@ -170,6 +184,7 @@ def longitude_client(tmp_path_factory):
                 run_gfs,
                 run_gefs,
                 *ensemble_members,
+                *ensemble_member_products,
                 temperature,
                 precipitation,
             ]

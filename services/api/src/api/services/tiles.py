@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from api.core.png import encode_rgba_png
 from api.models.entities import (
+    EnsembleMemberProduct,
     ForecastProduct,
     ForecastVariable,
     Model,
@@ -48,6 +49,9 @@ from api.models.entities import (
     ModelVersion,
 )
 from api.services.point_forecast import _axis_values
+
+#: ModelRun lifecycle statuses eligible for serving.
+SERVING_ELIGIBLE_STATUSES: tuple[str, ...] = ("ready", "processing", "partial")
 
 #: Tile size in pixels (standard MapLibre raster tile).
 TILE_SIZE = 256
@@ -349,6 +353,9 @@ def render_tile_png(
     if cached is not None:
         return cached
 
+    from domain.coverage import get_expected_members
+    expected_members = get_expected_members(model, default_if_unknown=1)
+
     from api.core import reader_gate
     from api.core.database import SessionLocal
 
@@ -390,6 +397,7 @@ def render_tile_png(
                     zoom=zoom,
                     x=x,
                     y=y,
+                    expected_members=expected_members,
                 ),
             )
         except Exception:  # noqa: BLE001 - unreadable/no-longer-ready store
@@ -432,6 +440,7 @@ def _select_tile_window(
     zoom: int,
     x: int,
     y: int,
+    expected_members: int = 1,
 ) -> _TileWindow:
     """Gate-time selector: read only the tile's geographic window from the store.
 
@@ -462,7 +471,7 @@ def _select_tile_window(
     lon_native = _align_longitudes(grid, pixel_lons)
 
     field, lat_axis, lon_axis = _slice_field(
-        dataset, variable, lead, grid, pixel_lats, lon_native
+        dataset, variable, lead, grid, pixel_lats, lon_native, expected_members=expected_members
     )
     # ``_slice_field`` already materializes the bounded window. Return the
     # window + its axes + the grid so rendering needs no store access.
@@ -647,54 +656,9 @@ def _slice_field(
     grid: _TileGrid,
     pixel_lats: npt.NDArray[np.float64],
     lon_native: npt.NDArray[np.float64],
+    expected_members: int = 1,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Return the 2-D ascending field and its sliced axes for the tile bounds.
-
-    **Phase 1 remediation ordering:** the spatial crop happens **before** any
-    ensemble-member reduction. For a GEFS ``(member, lead, lat, lon)`` store,
-    cropping to the tile's geographic window first means only the Zarr chunks
-    overlapping the window are read; the subsequent ``mean(dim="member")``
-    operates on that small window (verified numerically identical to the old
-    mean-then-crop ordering, and ~1,500x fewer chunk reads). Deterministic
-    (GFS) fields have no ``member`` axis and are returned unchanged.
-
-    The field is cropped to the tile's latitude / native-longitude bounds so
-    only the Zarr chunks overlapping the tile are read. The returned axes are
-    the sliced **ascending** ``latitude`` / ``longitude`` arrays, used to index
-    the field with nearest-neighbor lookup.
-
-    **No negative-step indexing on the lazy backend.** A negative-step slice
-    composed onto a lazily-indexed chunked Zarr array can crash inside xarray's
-    indexer decomposition (``xarray.core.indexing._decompose_slice`` computes
-    ``range(start, stop, step)[-1]``, which raises ``IndexError: range object
-    index out of range`` for any *empty* negative-step slice) at certain
-    latitude/window combinations. Instead, the label-slice arguments are
-    ordered to match each stored axis's own monotonic direction (descending
-    source axis -> ``slice(hi, lo)``), which xarray translates into a plain
-    positive-step positional read; the bounded window is then normalized to
-    ascending orientation *in memory* after materialization (a tiny reverse on
-    an already-small array).
-
-    When the tile does not intersect the grid, a 1x1 NaN field with the full
-    axes is returned so the caller's mask renders every pixel transparent.
-
-    Args:
-        dataset: The run's Zarr dataset.
-        variable: The forecast variable code.
-        lead: The lead time to select.
-        grid: The derived regular grid.
-        pixel_lats: 2-D array of pixel latitudes.
-        lon_native: 2-D array of pixel longitudes aligned to the grid's native
-            convention.
-
-    Returns:
-        A ``(values, lat_axis, lon_axis)`` tuple where ``values`` is the
-        ascending ``(lat, lon)`` slice and ``lat_axis``/``lon_axis`` are the
-        ascending coordinate arrays of the slice.
-
-    Raises:
-        ValueError: If the variable is missing or not a 2-D surface field.
-    """
+    """Return the 2-D ascending field and its sliced axes for the tile bounds."""
     if variable in ("wind_10m", "wind_speed_10m"):
         if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
             raise ValueError("Variables 'wind_u_10m' and 'wind_v_10m' must be in the dataset.")
@@ -734,8 +698,17 @@ def _slice_field(
         )
         if "member" in sliced_u.dims:
             # Mean scalar wind speed across ensemble members: mean(hypot(u_i, v_i))
-            speed_members = np.hypot(sliced_u.values, sliced_v.values)
-            values = np.mean(speed_members, axis=0) * 3.6
+            from domain.coverage import is_cell_statistically_valid
+
+            u_vals = np.asarray(sliced_u.values, dtype=float)
+            v_vals = np.asarray(sliced_v.values, dtype=float)
+            finite_mask = np.isfinite(u_vals) & np.isfinite(v_vals)
+            finite_counts = np.sum(finite_mask, axis=0)
+            valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
+            speed_members = np.hypot(u_vals, v_vals)
+            with np.errstate(all="ignore"):
+                mean_speed = np.nanmean(speed_members, axis=0) * 3.6
+                values = np.where(valid_cells, mean_speed, np.nan)
         else:
             values = np.hypot(sliced_u.values, sliced_v.values) * 3.6
 
@@ -759,9 +732,6 @@ def _slice_field(
         raise ValueError(f"Variable '{variable}' is not in the dataset.")
 
     field = dataset[variable]
-    # Phase 1: crop the spatial window FIRST (while the array is lazy), then
-    # reduce the member axis. Cropping before member-reduction reads only the
-    # chunks overlapping the tile instead of the full global field.
     if "lead_time_hours" in field.dims:
         field = field.sel(lead_time_hours=lead)
 
@@ -772,14 +742,6 @@ def _slice_field(
     lon_native_min = float(lon_native.min())
     lon_native_max = float(lon_native.max())
 
-    # Pixel-perfect edge handling: the crop must contain every grid cell that a
-    # full-field nearest-neighbor lookup could select for the tile's pixel band.
-    # A pixel anywhere within half a cell of the band's min/max resolves to the
-    # cell JUST OUTSIDE the band, so cropping to the pixel values themselves is
-    # one cell short at every tile border (edge pixels clamp to the inner cell,
-    # a tile-aligned 1-cell band of wrong values). Expand the scalar bounds by
-    # one full grid step each side; full-field nearest-neighbor then selects the
-    # identical cell. Still bounded: +1 cell per edge, not full-global.
     lat_step = float(lat_axis_full[1] - lat_axis_full[0]) if len(lat_axis_full) > 1 else 1.0
     lon_step = float(lon_axis_full[1] - lon_axis_full[0]) if len(lon_axis_full) > 1 else 1.0
     lo_lat = float(max(min(lat_axis_full[0], lat_axis_full[-1]), lat_min - abs(lat_step)))
@@ -787,51 +749,46 @@ def _slice_field(
     lo_lon = float(max(min(lon_axis_full[0], lon_axis_full[-1]), lon_native_min - abs(lon_step)))
     hi_lon = float(min(max(lon_axis_full[-1], lon_axis_full[0]), lon_native_max + abs(lon_step)))
     if lo_lat > hi_lat or lo_lon > hi_lon:
-        # The tile is entirely outside the grid; return a transparent field
-        # carrying the full axes so nearest-index lookups stay in bounds.
         return (
             np.full((1, 1), np.nan),
             np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
             np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
         )
-    # Direction-aware label slices: a stored-descending axis receives
-    # ``(hi, lo)`` so xarray derives a POSITIVE-step positional slice for the
-    # backend (never a negative-step one). Empty selections (no coordinate in
-    # the band, possible on coarse grids) degrade gracefully to zero-length
-    # windows instead of tripping negative-step decomposition.
     sliced = field.sel(
         latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
         longitude=slice(hi_lon, lo_lon) if grid.lon_reversed else slice(lo_lon, hi_lon),
     )
-    # After the spatial crop, reduce the member axis (GEFS ensemble mean). Only
-    # the window's chunks are read for the reduction now.
     if "member" in sliced.dims:
+        from domain.coverage import is_cell_statistically_valid
+
+        raw_members = np.asarray(sliced.values, dtype=float)
         if variable == "cloud_ceiling":
-            raw_members = np.asarray(sliced.values, dtype=float)
+            valid_mask = np.isfinite(raw_members) & (raw_members >= 0.0)
+            valid_counts = np.sum(valid_mask, axis=0)
+            valid_cells = is_cell_statistically_valid(valid_counts, expected_members)
             unlimited_mask = raw_members >= 19990.0
             finite_members = np.where(unlimited_mask, np.nan, raw_members)
             with np.errstate(all="ignore"):
-                values = np.nanmean(finite_members, axis=0)
+                mean_vals = np.nanmean(finite_members, axis=0)
+                values = np.where(valid_cells, mean_vals, np.nan)
         else:
-            sliced = sliced.mean(dim="member", keep_attrs=True)
-            values = np.asarray(sliced.values, dtype=float)
+            finite_mask = np.isfinite(raw_members)
+            finite_counts = np.sum(finite_mask, axis=0)
+            valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
+            with np.errstate(all="ignore"):
+                mean_vals = np.nanmean(raw_members, axis=0)
+                values = np.where(valid_cells, mean_vals, np.nan)
     else:
         values = np.asarray(sliced.values, dtype=float)
 
     lat_sliced = np.asarray(sliced.latitude.values, dtype=float)
     lon_sliced = np.asarray(sliced.longitude.values, dtype=float)
-    # A band containing no coordinate (possible on coarse/irregular axes)
-    # yields a zero-length window; render it as fully transparent via the
-    # same fallback the outside-the-grid path uses.
     if values.shape[0] == 0 or values.shape[1] == 0:
         return (
             np.full((1, 1), np.nan),
             np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
             np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
         )
-    # Normalize to the renderer's ascending-axis contract IN MEMORY (bounded,
-    # already-materialized): reverse stored-descending windows after release of
-    # the backend selection, never on the lazy object.
     if len(lat_sliced) > 1 and lat_sliced[-1] < lat_sliced[0]:
         values = values[::-1, :]
         lat_sliced = lat_sliced[::-1]
@@ -865,7 +822,7 @@ def check_available(
 ) -> None:
     """Validate (without reading Zarr) that a map selection is servable.
 
-    Checks the catalog only: the model/variable exist, a ``ready`` run exists
+    Checks the catalog only: the model/variable exist, an eligible run exists
     for the model (optionally pinned to ``initial_time``), and a matching
     ``forecast_products`` row exists for the run/variable/level/lead. Raises
     404/422 exactly as the tile renderer would, without opening the store —
@@ -876,13 +833,15 @@ def check_available(
         HTTPException: 422 for an unsupported level, 404 when the selection is
             not available.
     """
-    run = _resolve_ready_run(
+    _resolve_run_store_path(
         db,
         model=model,
+        variable=variable,
+        level=level,
+        lead_time_hours=lead_time_hours,
         initial_time=initial_time,
+        excluded=set(),
     )
-    _require_model_variable(db, model, variable)
-    _require_product(db, run, variable, level, lead_time_hours)
 
 
 def _resolve_ready_run(
@@ -891,10 +850,10 @@ def _resolve_ready_run(
     model: str,
     initial_time: str | None,
 ) -> ModelRun:
-    """Resolve the newest ready run for a model, optionally pinned by cycle.
+    """Resolve the newest eligible run for a model, optionally pinned by cycle.
 
     Raises:
-        HTTPException: 404 when no ready run matches.
+        HTTPException: 404 when no eligible run matches.
     """
     from fastapi import HTTPException
 
@@ -903,7 +862,7 @@ def _resolve_ready_run(
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
         .where(Model.model_id == model)
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     if initial_time is not None:
@@ -915,7 +874,7 @@ def _resolve_ready_run(
         raise HTTPException(
             status_code=404,
             detail=(
-                f"No ready forecast run with data was found for model '{model}'"
+                f"No eligible forecast run with data was found for model '{model}'"
                 + (f" and initial time '{initial_time}'." if initial_time else ".")
             ),
         )
@@ -932,34 +891,38 @@ def _resolve_run_store_path(
     initial_time: str | None,
     excluded: set[str],
 ) -> str:
-    """Resolve the ready run's Zarr store path for a tile request (catalog only).
+    """Resolve the eligible run's Zarr store path for a tile request (catalog only).
 
     This is the **DB metadata phase** of the tile render. It validates the
-    model/variable/level, selects the newest ready run with a store (optionally
-    pinned to ``initial_time``), and confirms a matching ``forecast_products``
-    row exists. Only cheap catalog queries run here; the caller releases the
-    session/connection before any Zarr read.
+    model/variable/level, selects the newest eligible run with a store (optionally
+    pinned to ``initial_time``), checks ensemble member coverage (>= 85%), and
+    confirms a matching ``forecast_products`` row exists. Only cheap catalog
+    queries run here; the caller releases the session/connection before any
+    Zarr read.
 
     ``excluded`` holds store paths already tried and found unreadable, so the
-    broken-newest-store recovery path falls through to the next-newest ready
-    run (mirroring the legacy ``_resolve_run_and_field`` fallback).
+    broken-newest-store recovery path falls through to the next-newest eligible
+    run.
 
     Raises:
         HTTPException: 404 when the model/variable/level/lead combination is
             not available, 422 for an unsupported level.
     """
     from fastapi import HTTPException
+    from domain.coverage import get_expected_members, is_lead_servable
 
     if level != "surface":
         raise HTTPException(status_code=422, detail=f"Unsupported level '{level}'.")
     _require_model_variable(db, model, variable)
+
+    expected_members = get_expected_members(model, default_if_unknown=1)
 
     stmt = (
         select(ModelRun)
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
         .where(Model.model_id == model)
-        .where(ModelRun.status == "ready")
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     if initial_time is not None:
@@ -979,19 +942,51 @@ def _resolve_run_store_path(
             detail=(
                 f"No readable forecast run with data was found for model '{model}'."
                 if excluded
-                else f"No ready forecast run with data was found for model '{model}'"
+                else f"No eligible forecast run with data was found for model '{model}'"
                 + (f" and initial time '{initial_time}'." if initial_time else ".")
             ),
         )
 
     for run in candidates:
         assert run.zarr_store_path is not None
-        # ``_require_product`` raises 404 when the newest matching run lacks
-        # this exact variable/level/lead product (no fallback to older runs),
-        # preserving the legacy selection semantics.
-        _require_product(db, run, variable, level, lead_time_hours)
-        return str(run.zarr_store_path)
-    raise AssertionError("unreachable: every candidate raised in _require_product")
+        # Check ensemble member coverage if model is ensemble
+        if expected_members > 1:
+            member_rows = db.execute(
+                select(EnsembleMemberProduct.member_index).where(
+                    EnsembleMemberProduct.run_id == run.id,
+                    EnsembleMemberProduct.lead_time_hours == lead_time_hours,
+                )
+            ).scalars().all()
+            avail_members = tuple(member_rows)
+            # If no pair rows (legacy store / test fixture), allow ready runs
+            if not avail_members and run.status == "ready":
+                avail_members = tuple(range(1, expected_members + 1))
+            if not is_lead_servable(len(avail_members), expected_members):
+                if initial_time is not None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            f"Lead {lead_time_hours}h for model '{model}' at cycle '{initial_time}' "
+                            f"is not servable ({len(avail_members)}/{expected_members} members < 85%)."
+                        ),
+                    )
+                continue
+
+        try:
+            _require_product(db, run, variable, level, lead_time_hours)
+            return str(run.zarr_store_path)
+        except HTTPException:
+            if initial_time is not None:
+                raise
+            continue
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No forecast product is available for model '{model}', "
+            f"variable '{variable}', level '{level}', lead '{lead_time_hours}h'."
+        ),
+    )
 
 
 def _require_model_variable(db: Session, model: str, variable: str) -> None:

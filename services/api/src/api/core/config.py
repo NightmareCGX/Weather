@@ -58,7 +58,14 @@ class Settings(BaseSettings):
     ELEVATION_CACHE_MAX: Any = 4096
     ELEVATION_CACHE_DISABLED: Any = False
 
+    # Minimum member coverage ratio for serving eligibility (Phase 3).
+    # Constrained to (0.0, 1.0]; default 0.85 (85%).
+    ENSEMBLE_MIN_COVERAGE_RATIO: float = 0.85
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
+
+from domain.coverage import set_min_coverage_ratio  # noqa: E402
+set_min_coverage_ratio(settings.ENSEMBLE_MIN_COVERAGE_RATIO)

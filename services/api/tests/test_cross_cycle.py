@@ -118,13 +118,13 @@ def _seed(session: Session) -> None:
             zarr_store_path="/tmp/gfs_06.zarr",
         )
     )
-    # Run C: 12Z PROCESSING (must NOT participate).
+    # Run C: 12Z FAILED (must NOT participate).
     session.add(
         ModelRun(
             id="run_12z",
             model_version_id="version_gfs_v1",
             cycle_time=CYCLE_12,
-            status="processing",
+            status="failed",
             zarr_store_path="/tmp/gfs_12.zarr",
         )
     )
@@ -146,7 +146,7 @@ def _seed(session: Session) -> None:
         _product("run_00z", lead)
     for lead in (0, 6):
         _product("run_06z", lead)
-    # The processing 12Z run has products but must be excluded.
+    # The failed 12Z run has products but must be excluded.
     for lead in (0,):
         _product("run_12z", lead)
     session.commit()
@@ -171,10 +171,10 @@ def test_newest_cycle_wins_because_lower_lead(db: Session) -> None:
     assert winners[datetime(2026, 8, 14, 12, tzinfo=timezone.utc)][0] == (CYCLE_06, 6)
 
 
-def test_processing_run_excluded(db: Session) -> None:
-    """A processing run's products never participate in selection."""
+def test_failed_run_excluded(db: Session) -> None:
+    """A failed run's products never participate in selection."""
     winners = _select_min_lead_winners(db, "gfs")
-    # The 12Z processing run would win 12Z valid_time with lead 0, but it must
+    # The 12Z failed run would win 12Z valid_time with lead 0, but it must
     # NOT be a candidate. The 06Z run wins with lead 6.
     assert winners[datetime(2026, 8, 14, 12, tzinfo=timezone.utc)][0] == (CYCLE_06, 6)
     # No winner is attributed to the 12Z cycle.
@@ -185,9 +185,23 @@ def test_processing_run_excluded(db: Session) -> None:
     )
 
 
-def test_no_ready_run_returns_empty(db: Session) -> None:
-    """No READY runs -> empty selection."""
-    db.query(ModelRun).update({"status": "processing"})
+def test_processing_and_partial_runs_participate(db: Session) -> None:
+    """Processing and partial runs with committed products participate in progressive selection."""
+    db.query(ModelRun).filter(ModelRun.id == "run_12z").update({"status": "processing"})
+    db.commit()
+    winners = _select_min_lead_winners(db, "gfs")
+    # With 12Z in processing state and lead 0 committed, valid_time 12Z selects (12Z, 0)
+    assert winners[datetime(2026, 8, 14, 12, tzinfo=timezone.utc)][0] == (CYCLE_12, 0)
+
+    db.query(ModelRun).filter(ModelRun.id == "run_12z").update({"status": "partial"})
+    db.commit()
+    winners = _select_min_lead_winners(db, "gfs")
+    assert winners[datetime(2026, 8, 14, 12, tzinfo=timezone.utc)][0] == (CYCLE_12, 0)
+
+
+def test_no_eligible_run_returns_empty(db: Session) -> None:
+    """No eligible (ready/processing/partial) runs -> empty selection."""
+    db.query(ModelRun).update({"status": "failed"})
     db.commit()
     winners = _select_min_lead_winners(db, "gfs")
     assert winners == {}

@@ -92,11 +92,10 @@ def test_reader_revalidation_observes_downgrade(catalog_engine, tmp_path) -> Non
         db.commit()
 
     # Simulate the reader's in-flight selection: it holds the store path from a
-    # prior SELECT (the run was READY). Before it acquires SHARED + revalidates,
-    # the writer downgrades the run to partial.
+    # prior SELECT. When the run is failed, revalidation fails.
     with Session(catalog_engine) as db:
         run = db.get(ModelRunRecord, "r")
-        setattr(run, "status", "partial")
+        setattr(run, "status", "failed")
         db.commit()
 
     # The reader now acquires SHARED + revalidates on a fresh Connection.
@@ -109,7 +108,7 @@ def test_reader_revalidation_observes_downgrade(catalog_engine, tmp_path) -> Non
     try:
         session.acquire(timeout_seconds=5.0)
         ok, path = session.revalidate(DB_URL)
-        assert ok is False  # run is partial -> revalidation fails
+        assert ok is False  # run is failed -> revalidation fails
         assert path == store_path
     finally:
         session.release()
