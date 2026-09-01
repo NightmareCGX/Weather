@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 import s3fs  # type: ignore[import-untyped]
 
@@ -556,6 +557,28 @@ def build_object_inventory(store_path: str, array_paths: list[str]) -> set[str]:
     return inventory
 
 
+@dataclass(frozen=True)
+class StoreAuditReport:
+    """Result of an explicit physical-store storage audit.
+
+    Attributes:
+        is_valid: True when all markers are structurally valid and all required
+            physical chunk objects exist on physical storage.
+        total_markers: Total number of COMPLETE region markers checked.
+        valid_markers: Number of markers whose physical write-sets were fully confirmed.
+        invalid_markers: Number of markers with missing objects or structural defects.
+        missing_physical_objects: List of missing physical object error details.
+        errors_by_region: Mapping of region_id to specific error descriptions.
+    """
+
+    is_valid: bool
+    total_markers: int
+    valid_markers: int
+    invalid_markers: int
+    missing_physical_objects: list[str] = field(default_factory=list)
+    errors_by_region: dict[str, str] = field(default_factory=dict)
+
+
 def validate_marker_evidence(
     store_path: str,
     *,
@@ -564,6 +587,7 @@ def validate_marker_evidence(
     actual_expected_keys: list[str],
     marker_expected_fingerprint: str,
     existing_objects: set[str] | None = None,
+    verify_physical_objects: bool = False,
 ) -> None:
     """Validate a COMPLETE marker's completion evidence structurally.
 
@@ -575,11 +599,13 @@ def validate_marker_evidence(
             .zarray chunk metadata + the region).
         marker_expected_fingerprint: The marker's recorded expected-write-set
             fingerprint.
-        existing_objects: An in-memory set of existing physical object keys
-            (built once per finalizer run via ``build_object_inventory``). When
-            provided, existence is checked against this set (one LIST per
-            prefix) instead of a remote exists per object. When omitted, a
-            remote ``object_exists`` is issued per required key.
+        existing_objects: An optional in-memory set of existing physical object keys
+            (built via ``build_object_inventory`` for full-store audit). When
+            provided, existence is checked against this set.
+        verify_physical_objects: When True (and ``existing_objects`` is None),
+            a remote ``object_exists`` is issued per required key. In normal
+            realtime finalization, this is False to avoid recursive physical S3 scans
+            while trusting the verified COMPLETE marker protocol.
 
     Raises:
         InventoryError: If any structural invariant fails or a required
@@ -630,16 +656,114 @@ def validate_marker_evidence(
             "marker expected-write-set fingerprint does not match the materialized "
             "+ omitted sets"
         )
-    # 6. every required materialized object currently exists.
-    for key in sorted(materialized):
-        exists = (
-            key in existing_objects
-            if existing_objects is not None
-            else object_exists(store_path, key)
-        )
-        if not exists:
-            raise InventoryError(
-                f"required materialized object is missing: {key!r} (external "
-                "deletion invalidates committed state)"
+    # 6. physical object existence validation (only during explicit physical audit).
+    if existing_objects is not None or verify_physical_objects:
+        for key in sorted(materialized):
+            exists = (
+                key in existing_objects
+                if existing_objects is not None
+                else object_exists(store_path, key)
             )
+            if not exists:
+                raise InventoryError(
+                    f"required materialized object is missing: {key!r} (external "
+                    "deletion invalidates committed state)"
+                )
     # 7. intentionally omitted fill chunks may be physically absent (no check).
+
+
+def audit_store_integrity(
+    store_path: str,
+    *,
+    array_paths: Sequence[str] | None = None,
+    marker_concurrency: int = 16,
+) -> StoreAuditReport:
+    """Perform an explicit full-store physical object audit and marker verification.
+
+    This function performs an exhaustive physical-object scan and cross-validates
+    all persisted COMPLETE markers against actual storage. It is intended for
+    out-of-band audits, migration checks, and administrative tooling, outside the
+    realtime ingestion critical path.
+
+    Args:
+        store_path: Root of the Zarr store.
+        array_paths: Optional explicit data-variable paths to audit.
+        marker_concurrency: Maximum concurrency for reading marker bodies.
+
+    Returns:
+        StoreAuditReport summarizing full physical integrity.
+    """
+    from ingestion.core.coordinator import (
+        _lead_index_in_store,
+        _parse_region_id,
+        _read_marker_payloads_bounded,
+        _store_data_var_paths,
+    )
+    from ingestion.core.markers import list_region_marker_keys
+
+    vars_to_scan = list(array_paths) if array_paths is not None else _store_data_var_paths(store_path)
+    existing_objects = build_object_inventory(store_path, vars_to_scan) if vars_to_scan else set()
+    marker_keys = list_region_marker_keys(store_path)
+    marker_results = _read_marker_payloads_bounded(
+        store_path, marker_keys, max_concurrency=marker_concurrency
+    )
+
+    valid_count = 0
+    invalid_count = 0
+    missing_objects: list[str] = []
+    errors: dict[str, str] = {}
+    zarray_cache: dict[str, dict[str, object]] = {}
+
+    for key, payload in marker_results:
+        region_id = key.rsplit("/", 1)[-1].removesuffix(".json")
+        state = payload.get("state")
+        if state != "complete":
+            continue
+        try:
+            member, lead = _parse_region_id(region_id)
+            required_raw = payload.get("required_materialized_object_keys")
+            omitted_raw = payload.get("intentionally_omitted_fill_chunks")
+            fingerprint = payload.get("expected_write_set_fingerprint")
+            if not isinstance(required_raw, list) or not isinstance(omitted_raw, list):
+                raise InventoryError("malformed marker payload lists")
+            if not isinstance(fingerprint, str):
+                raise InventoryError("malformed marker fingerprint")
+            required = [str(k) for k in required_raw]
+            omitted = [str(k) for k in omitted_raw]
+            lead_index = _lead_index_in_store(store_path, lead)
+            data_var_paths = sorted({k.split("/")[0] for k in required + omitted})
+            if not data_var_paths:
+                data_var_paths = vars_to_scan
+            expected_keys = region_expected_object_keys(
+                store_path,
+                member=member,
+                lead_index=lead_index,
+                data_var_paths=data_var_paths,
+                zarray_cache=zarray_cache,
+            )
+            validate_marker_evidence(
+                store_path,
+                marker_required_materialized=required,
+                marker_omitted=omitted,
+                actual_expected_keys=expected_keys,
+                marker_expected_fingerprint=fingerprint,
+                existing_objects=existing_objects,
+                verify_physical_objects=True,
+            )
+            valid_count += 1
+        except Exception as exc:
+            invalid_count += 1
+            err_msg = str(exc)
+            errors[region_id] = err_msg
+            if isinstance(exc, InventoryError) and "missing:" in err_msg:
+                missing_objects.append(err_msg)
+
+    is_valid = invalid_count == 0
+    return StoreAuditReport(
+        is_valid=is_valid,
+        total_markers=valid_count + invalid_count,
+        valid_markers=valid_count,
+        invalid_markers=invalid_count,
+        missing_physical_objects=missing_objects,
+        errors_by_region=errors,
+    )
