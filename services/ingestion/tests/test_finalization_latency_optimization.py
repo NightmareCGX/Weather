@@ -555,14 +555,14 @@ def test_invalid_marker_payload_treated_as_uncommitted(
 
 
 # ---------------------------------------------------------------------------
-# Test F: Missing Physical Object
+# Test F: Missing Physical Object (Full Store Audit)
 # ---------------------------------------------------------------------------
 
 
 def test_missing_physical_object_rejected_by_inventory(
     catalog_engine, tmp_path: Path
 ) -> None:
-    """Test F: Missing required physical chunk object rejects finalization (preserves correctness)."""
+    """Test F: Missing required physical chunk object rejects finalization during full inventory audit."""
     leads = (0, 6)
     store_path = _init_mock_store(tmp_path / "test_f.zarr", leads)
     spec = _spec(expected_leads=leads, store=store_path)
@@ -596,6 +596,7 @@ def test_missing_physical_object_rejected_by_inventory(
             spec=spec,
             expected_leads=leads,
             expected_members=(),
+            verify_full_inventory=True,
         )
     finally:
         conn.close()
@@ -606,14 +607,14 @@ def test_missing_physical_object_rejected_by_inventory(
 
 
 # ---------------------------------------------------------------------------
-# Test G: Full Physical Object Inventory Still Runs Exactly Once
+# Test G: No Full Scan in Normal Realtime Finalization (Regression Test)
 # ---------------------------------------------------------------------------
 
 
 def test_full_inventory_still_runs_once(
     catalog_engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Test G: Verify build_object_inventory runs once and is not replaced by per-marker HEADs."""
+    """Test G: Verify normal finalize_run NEVER calls build_object_inventory or scans physical chunk objects."""
     leads = (0, 6, 12, 18, 24)
     store_path = _init_mock_store(tmp_path / "test_g.zarr", leads)
     spec = _spec(expected_leads=leads, store=store_path)
@@ -629,17 +630,12 @@ def test_full_inventory_still_runs_once(
             expected_members=(),
         )
 
-    inventory_call_count = 0
     import ingestion.core.inventory as INV
 
-    orig_build_inventory = INV.build_object_inventory
+    def _forbidden_build_inventory(*args, **kwargs):
+        raise AssertionError("Normal finalize_run must NOT invoke build_object_inventory!")
 
-    def _counting_build_inventory(store: str, var_paths: list[str]) -> set[str]:
-        nonlocal inventory_call_count
-        inventory_call_count += 1
-        return orig_build_inventory(store, var_paths)
-
-    monkeypatch.setattr(INV, "build_object_inventory", _counting_build_inventory)
+    monkeypatch.setattr(INV, "build_object_inventory", _forbidden_build_inventory)
 
     coordinator = RunCoordinator(spec, store_path)
     conn = catalog_engine.connect()
@@ -654,7 +650,6 @@ def test_full_inventory_still_runs_once(
     finally:
         conn.close()
 
-    assert inventory_call_count == 1, f"Expected exactly 1 inventory call, got {inventory_call_count}"
     assert res.status == "ready"
     assert len(res.committed_regions) == len(leads)
 

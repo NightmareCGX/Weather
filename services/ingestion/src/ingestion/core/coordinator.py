@@ -211,8 +211,11 @@ class RunCoordinator:
         self.timeout_seconds = timeout_seconds
         # Cache the lead -> positional-index map (read once per finalizer run).
         self._lead_index_cache: dict[int, int] = {}
-        # Cache the data-variable .zarray geometry per array path.
+        # Cache the data-variable .zarray and .zattrs geometry per array path.
         self._zarray_cache: dict[str, dict[str, object]] = {}
+        self._zattrs_cache: dict[str, dict[str, object]] = {}
+        # Cache member coordinate positional indices.
+        self._member_index_cache: dict[int, int] = {}
         # Immutable metadata snapshot of the store built under the exclusive gate.
         self._snapshot: StoreMetadataSnapshot | None = None
 
@@ -653,8 +656,13 @@ class RunCoordinator:
         expected_members: tuple[int, ...],
         observer: object | None = None,
         marker_concurrency: int | None = None,
+        verify_full_inventory: bool = False,
     ) -> FinalizeResult:
         """Run the single coalesced finalization for the bounded CLI wave.
+
+        In normal realtime ingestion (verify_full_inventory=False), operates in
+        O(regions) complexity on marker evidence without scanning physical Zarr chunk
+        objects.
 
         Returns the authoritative FinalizeResult with status and committed_regions.
         """
@@ -671,28 +679,52 @@ class RunCoordinator:
         co.acquire_exclusive_gate()
         try:
             mode = read_protocol_version(self.store_path)
-            # Load marker states (LIST + GET, all pages).
+
+            # Phase 1: Marker Listing
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("marker_listing_start")
             marker_keys = list_region_marker_keys(self.store_path)
-            # Build the physical object inventory ONCE (one paginated LIST per
-            # data-variable prefix) so per-marker existence checks are in-memory
-            # instead of one remote exists per object.
-            from ingestion.core.inventory import build_object_inventory
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("marker_listing_complete")
+
+            # Phase 2: Marker Read & Validation
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("marker_read_validation_start")
 
             data_var_paths = _store_data_var_paths(self.store_path)
-            existing_objects = (
-                build_object_inventory(self.store_path, data_var_paths)
-                if data_var_paths
-                else set()
-            )
-            # Populate the .zarray geometry cache once (per array path) so
-            # per-marker region-key derivation avoids repeated remote reads.
-            from ingestion.core.inventory import _read_zarray
+            existing_objects: set[str] | None = None
+            if verify_full_inventory:
+                from ingestion.core.inventory import build_object_inventory
+
+                existing_objects = (
+                    build_object_inventory(self.store_path, data_var_paths)
+                    if data_var_paths
+                    else set()
+                )
+
+            # Populate the .zarray, .zattrs, and member coordinate caches once
+            # so per-marker region-key derivation avoids repeated remote reads.
+            from ingestion.core.inventory import _read_zarray, _read_zattrs
 
             for array_path in data_var_paths:
                 if array_path not in self._zarray_cache:
                     za = _read_zarray(self.store_path, array_path)
                     if za is not None:
                         self._zarray_cache[array_path] = za
+                if array_path not in self._zattrs_cache:
+                    zat = _read_zattrs(self.store_path, array_path)
+                    if zat is not None:
+                        self._zattrs_cache[array_path] = zat
+
+            if not self._member_index_cache and spec.is_ensemble:
+                try:
+                    ds = read_dataset(self.store_path)
+                    if "member" in ds.coords:
+                        member_vals = np.atleast_1d(ds.coords["member"].values).reshape(-1)
+                        self._member_index_cache = {int(v): i for i, v in enumerate(member_vals)}
+                except Exception:
+                    pass
+
             committed: dict[str, str] = {}  # region_id -> generation
             updating: list[str] = []
             marker_results = _read_marker_payloads_bounded(
@@ -703,19 +735,25 @@ class RunCoordinator:
                 state = payload.get("state")
                 gen = payload.get("generation")
                 if state == "complete":
-                    # Full object-inventory validation of the COMPLETE marker's
-                    # completion evidence. A structurally-invalid or externally-
-                    # shrunk marker is treated as uncommitted (not cataloged).
                     if self._marker_evidence_valid(
                         region_id,
                         payload,
                         existing_objects=existing_objects,
+                        verify_physical_objects=verify_full_inventory,
                     ):
                         committed[region_id] = str(gen)
                     else:
                         updating.append(region_id)
                 elif state == "updating":
                     updating.append(region_id)
+
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("marker_read_validation_complete")
+
+            # Phase 3: Manifest Generation & Write
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("manifest_write_start")
+
             # Hybrid mode: marker-less regions use the legacy rule.
             legacy_evidence: list[str] = []
             if mode == HYBRID:
@@ -769,7 +807,13 @@ class RunCoordinator:
             }
             write_manifest(self.store_path, payload)
 
-            # Reconcile catalog to the committed state and derive status.
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("manifest_write_complete")
+
+            # Phase 4: Catalog Reconciliation & Status Commit
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("catalog_reconcile_start")
+
             with Session(bind=conn) as db:
                 run = db.get(ModelRunRecord, run_id)
                 if run is None:
@@ -783,6 +827,10 @@ class RunCoordinator:
                 status = _derive_run_status(db, run, spec, committed_state)
                 setattr(run, "status", status)
                 db.commit()
+
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("catalog_reconcile_complete")
+
             if observer is not None and hasattr(observer, "record_milestone"):
                 observer.record_milestone("finalize_complete")
             return FinalizeResult(status=status, committed_regions=committed)
@@ -796,17 +844,19 @@ class RunCoordinator:
         payload: Mapping[str, object],
         *,
         existing_objects: set[str] | None = None,
+        verify_physical_objects: bool = False,
     ) -> bool:
         """Validate a COMPLETE marker's completion evidence structurally.
 
-        Returns True when the marker is internally consistent AND every required
-        materialized object currently exists. A structurally-invalid or
-        externally-shrunk marker is treated as uncommitted (not cataloged),
-        preserving external-shrink detection.
+        Returns True when the marker is internally consistent and matches chunk
+        geometry and write-set fingerprint. When verify_physical_objects is True or
+        existing_objects is provided, physical storage existence is checked as well.
 
         Args:
             region_id: The logical region id (``det_L0006`` / ``mem017_L0006``).
             payload: The marker body.
+            existing_objects: Optional set of existing physical chunk keys.
+            verify_physical_objects: Whether to check physical storage existence.
 
         Returns:
             True when the evidence is valid; False when the region is
@@ -833,12 +883,16 @@ class RunCoordinator:
             # geometry + cached lead index (avoids per-marker store opens).
             lead_index = self._lead_index_for(lead)
             data_var_paths = sorted({k.split("/")[0] for k in required + omitted})
+            if not data_var_paths:
+                data_var_paths = _store_data_var_paths(self.store_path)
             expected_keys = region_expected_object_keys(
                 self.store_path,
                 member=member,
                 lead_index=lead_index,
                 data_var_paths=data_var_paths,
                 zarray_cache=self._zarray_cache,
+                zattrs_cache=self._zattrs_cache,
+                member_index_cache=self._member_index_cache,
             )
             validate_marker_evidence(
                 self.store_path,
@@ -847,6 +901,7 @@ class RunCoordinator:
                 actual_expected_keys=expected_keys,
                 marker_expected_fingerprint=fingerprint,
                 existing_objects=existing_objects,
+                verify_physical_objects=verify_physical_objects,
             )
             return True
         except (InventoryError, ValueError, KeyError):

@@ -120,6 +120,14 @@ class StartupTimeline:
         "decodes_drained",
         "writes_drained",
         "finalize_start",
+        "marker_listing_start",
+        "marker_listing_complete",
+        "marker_read_validation_start",
+        "marker_read_validation_complete",
+        "manifest_write_start",
+        "manifest_write_complete",
+        "catalog_reconcile_start",
+        "catalog_reconcile_complete",
         "finalize_complete",
     )
 
@@ -204,6 +212,12 @@ class StartupTimeline:
             f"{teardown_dur:.3f}s" if teardown_dur is not None else "--"
         )
 
+        marker_list_dur = _fmt_dur("marker_listing_start", "marker_listing_complete")
+        marker_val_dur = _fmt_dur("marker_read_validation_start", "marker_read_validation_complete")
+        manifest_wr_dur = _fmt_dur("manifest_write_start", "manifest_write_complete")
+        cat_rec_dur = _fmt_dur("catalog_reconcile_start", "catalog_reconcile_complete")
+        finalize_dur = _fmt_dur("finalize_start", "finalize_complete")
+
         lines = [
             "=" * 80,
             "                       INGESTION STARTUP TIMELINE REPORT",
@@ -249,6 +263,22 @@ class StartupTimeline:
             "-" * 80,
             f"* Tail Physical Write Drain (decodes_drained -> writes_drained): {tail_write_str}",
             f"* Task Teardown / Gate Transition (writes_drained -> finalize_start): {teardown_str}",
+            "-" * 80,
+            "Finalization Breakdown:",
+            f"   ├─ finalize_start                      {_fmt_ts('finalize_start')}",
+            f"   ├─ Marker Listing                      {_fmt_ts('marker_listing_start'):<20} {marker_list_dur}",
+            f"   │  ├─ marker_listing_start             {_fmt_ts('marker_listing_start')}",
+            f"   │  └─ marker_listing_complete          {_fmt_ts('marker_listing_complete')}",
+            f"   ├─ Marker Read & Validation            {_fmt_ts('marker_read_validation_start'):<20} {marker_val_dur}",
+            f"   │  ├─ marker_read_validation_start     {_fmt_ts('marker_read_validation_start')}",
+            f"   │  └─ marker_read_validation_complete  {_fmt_ts('marker_read_validation_complete')}",
+            f"   ├─ Manifest Write                      {_fmt_ts('manifest_write_start'):<20} {manifest_wr_dur}",
+            f"   │  ├─ manifest_write_start             {_fmt_ts('manifest_write_start')}",
+            f"   │  └─ manifest_write_complete          {_fmt_ts('manifest_write_complete')}",
+            f"   ├─ Catalog Reconciliation              {_fmt_ts('catalog_reconcile_start'):<20} {cat_rec_dur}",
+            f"   │  ├─ catalog_reconcile_start          {_fmt_ts('catalog_reconcile_start')}",
+            f"   │  └─ catalog_reconcile_complete       {_fmt_ts('catalog_reconcile_complete')}",
+            f"   └─ finalize_complete                   {_fmt_ts('finalize_complete'):<20} {finalize_dur}",
             "=" * 80,
         ]
         return "\n".join(lines)
@@ -336,6 +366,41 @@ class PipelineProgressTracker:
             duration_str,
         )
 
+    def _check_drain_milestones_locked(self) -> None:
+        """Evaluate pipeline drain milestones under self._lock."""
+        # 1. downloads_drained
+        if (
+            self.counters.download_active == 0
+            and (self.counters.download_done + self.counters.download_failed >= self.total_items)
+        ):
+            self.timeline.record("downloads_drained")
+
+        # 2. decodes_drained:
+        # All items have either completed/failed decode or failed before reaching decode (download_failed),
+        # and no item is active in decode or queued for decode.
+        if (
+            self.counters.decode_active == 0
+            and self.counters.decode_queued == 0
+            and (self.counters.decode_done + self.counters.decode_failed + self.counters.download_failed >= self.total_items)
+        ):
+            self.timeline.record("decodes_drained")
+
+        # 3. writes_drained:
+        # All items have settled (write_done, write_failed, decode_failed, or download_failed),
+        # and no item is active in write or waiting to enter write.
+        terminal_items = (
+            self.counters.write_done
+            + self.counters.write_failed
+            + self.counters.decode_failed
+            + self.counters.download_failed
+        )
+        if (
+            self.counters.write_active == 0
+            and self.counters.write_waiting == 0
+            and terminal_items >= self.total_items
+        ):
+            self.timeline.record("writes_drained")
+
     # -------------------------------------------------------------------------
     # Stage lifecycle hooks
     # -------------------------------------------------------------------------
@@ -359,11 +424,7 @@ class PipelineProgressTracker:
             self.counters.download_active = max(0, self.counters.download_active - 1)
             self.counters.download_done += 1
             self.counters.decode_queued += 1
-            if (
-                self.counters.download_done + self.counters.download_failed >= self.total_items
-                and self.counters.download_active == 0
-            ):
-                self.timeline.record("downloads_drained")
+            self._check_drain_milestones_locked()
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -378,11 +439,7 @@ class PipelineProgressTracker:
         with self._lock:
             self.counters.download_active = max(0, self.counters.download_active - 1)
             self.counters.download_failed += 1
-            if (
-                self.counters.download_done + self.counters.download_failed >= self.total_items
-                and self.counters.download_active == 0
-            ):
-                self.timeline.record("downloads_drained")
+            self._check_drain_milestones_locked()
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -406,11 +463,7 @@ class PipelineProgressTracker:
             self.counters.decode_active = max(0, self.counters.decode_active - 1)
             self.counters.decode_done += 1
             self.counters.write_waiting += 1
-            if (
-                self.counters.decode_done + self.counters.decode_failed >= self.total_items
-                and self.counters.decode_active == 0
-            ):
-                self.timeline.record("decodes_drained")
+            self._check_drain_milestones_locked()
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -425,11 +478,7 @@ class PipelineProgressTracker:
         with self._lock:
             self.counters.decode_active = max(0, self.counters.decode_active - 1)
             self.counters.decode_failed += 1
-            if (
-                self.counters.decode_done + self.counters.decode_failed >= self.total_items
-                and self.counters.decode_active == 0
-            ):
-                self.timeline.record("decodes_drained")
+            self._check_drain_milestones_locked()
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -453,11 +502,7 @@ class PipelineProgressTracker:
             self.counters.write_active = max(0, self.counters.write_active - 1)
             self.counters.write_done += 1
             self.counters.overall_done += 1
-            if (
-                self.counters.write_done + self.counters.write_failed >= self.total_items
-                and self.counters.write_active == 0
-            ):
-                self.timeline.record("writes_drained")
+            self._check_drain_milestones_locked()
         self.log_stage_transition(
             member=member,
             lead=lead,
@@ -472,11 +517,7 @@ class PipelineProgressTracker:
         with self._lock:
             self.counters.write_active = max(0, self.counters.write_active - 1)
             self.counters.write_failed += 1
-            if (
-                self.counters.write_done + self.counters.write_failed >= self.total_items
-                and self.counters.write_active == 0
-            ):
-                self.timeline.record("writes_drained")
+            self._check_drain_milestones_locked()
         self.log_stage_transition(
             member=member,
             lead=lead,

@@ -85,7 +85,7 @@ def test_required_materialized_object_deleted_invalidates(tmp_path) -> None:
     store = _mk_store(tmp_path)
     keys = _expected(store, 0)
     _write_chunk(store, keys[0])
-    # keys[1] is missing -> external shrink -> region uncommitted.
+    # keys[1] is missing -> external shrink -> region uncommitted during physical audit.
     with pytest.raises(InventoryError, match="missing"):
         validate_marker_evidence(
             store,
@@ -93,6 +93,7 @@ def test_required_materialized_object_deleted_invalidates(tmp_path) -> None:
             marker_omitted=[],
             actual_expected_keys=keys,
             marker_expected_fingerprint=expected_write_set_fingerprint(keys, []),
+            verify_physical_objects=True,
         )
 
 
@@ -420,6 +421,77 @@ def test_derive_region_prefix_structural_isolation() -> None:
     }
     p15_legacy = _derive_region_prefix("s3://fake/store.zarr", "temperature_2m", member=15, lead_index=2, za=za_legacy, zattrs_cache={"temperature_2m": zattrs})
     assert p15_legacy == "temperature_2m/0.2."
+
+
+def test_audit_store_integrity_full_scan(tmp_path) -> None:
+    """audit_store_integrity performs an exhaustive physical-store audit and reports status."""
+    from ingestion.core.inventory import audit_store_integrity
+    from ingestion.core.markers import write_protocol_version, write_region_marker, MARKER_V1
+    from ingestion.core.zarr_writer import prepare_run_store
+    import xarray as xr
+    import numpy as np
+
+    store_dir = tmp_path / "audit_test.zarr"
+    store = str(store_dir)
+    coords = {
+        "lead_time_hours": np.array([0, 6], dtype=np.int32),
+        "time": np.datetime64("2026-07-22T00:00:00", "ns"),
+        "latitude": np.array([-90.0, 0.0, 90.0], dtype=np.float32),
+        "longitude": np.array([0.0, 90.0, 180.0, 270.0], dtype=np.float32),
+    }
+    dims = ("lead_time_hours", "latitude", "longitude")
+    data = np.zeros((1, 3, 4), dtype=np.float32)
+    seed = xr.Dataset(
+        data_vars={"temperature_2m": (dims, data)},
+        coords={k: v[:1] if k == "lead_time_hours" else v for k, v in coords.items()},
+    )
+    prepare_run_store(seed, store, expected_lead_time_hours=(0, 6), expected_members=())
+    write_protocol_version(store, MARKER_V1)
+
+    # Lead 0: complete with chunks
+    exp0 = region_expected_object_keys(store, member=None, lead_index=0, data_var_paths=["temperature_2m"])
+    for k in exp0:
+        _write_chunk(store, k)
+    write_region_marker(
+        store,
+        lead_time_hours=0,
+        member=None,
+        payload={
+            "protocol_version": 1,
+            "state": "complete",
+            "generation": "gen0",
+            "logical_region": {"lead_time_hours": 0},
+            "expected_write_set_fingerprint": expected_write_set_fingerprint(exp0, []),
+            "required_materialized_object_keys": exp0,
+            "intentionally_omitted_fill_chunks": [],
+        },
+    )
+
+    # Lead 6: complete but chunks missing on physical storage
+    exp6 = region_expected_object_keys(store, member=None, lead_index=1, data_var_paths=["temperature_2m"])
+    write_region_marker(
+        store,
+        lead_time_hours=6,
+        member=None,
+        payload={
+            "protocol_version": 1,
+            "state": "complete",
+            "generation": "gen6",
+            "logical_region": {"lead_time_hours": 6},
+            "expected_write_set_fingerprint": expected_write_set_fingerprint(exp6, []),
+            "required_materialized_object_keys": exp6,
+            "intentionally_omitted_fill_chunks": [],
+        },
+    )
+
+    # Audit store
+    report = audit_store_integrity(store, array_paths=["temperature_2m"])
+    assert not report.is_valid
+    assert report.total_markers == 2
+    assert report.valid_markers == 1
+    assert report.invalid_markers == 1
+    assert "det_L0006" in report.errors_by_region
+
 
 
 
