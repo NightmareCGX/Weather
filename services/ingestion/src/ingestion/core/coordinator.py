@@ -870,28 +870,34 @@ class RunCoordinator:
             committed_for_lead: set[int] = set()
             if spec.is_ensemble:
                 members_to_check = expected_members if expected_members else tuple(range(1, 31))
-                for member_num in members_to_check:
-                    try:
-                        marker = read_region_marker(
-                            self.store_path, lead_time_hours=lead_time_hours, member=member_num
-                        )
-                        if marker.get("state") == "complete" and self._marker_evidence_valid(
-                            f"mem{member_num:03d}_L{lead_time_hours:04d}", marker
-                        ):
-                            committed_for_lead.add(member_num)
-                    except Exception:
-                        pass
+                candidate_keys = [
+                    f".markers/regions/mem{m:03d}_L{lead_time_hours:04d}.json"
+                    for m in members_to_check
+                ]
+                marker_results = _read_marker_payloads_bounded(
+                    self.store_path, candidate_keys, max_concurrency=16
+                )
+                for key, payload in marker_results:
+                    region_id = key.rsplit("/", 1)[-1].removesuffix(".json")
+                    if isinstance(payload, Mapping) and payload.get("state") == "complete" and self._marker_evidence_valid(
+                        region_id, payload
+                    ):
+                        logical_reg = payload.get("logical_region")
+                        if isinstance(logical_reg, Mapping):
+                            m_val = logical_reg.get("member")
+                            if m_val is not None:
+                                committed_for_lead.add(int(str(m_val)))
             else:
-                try:
-                    marker = read_region_marker(
-                        self.store_path, lead_time_hours=lead_time_hours, member=None
-                    )
-                    if marker.get("state") == "complete" and self._marker_evidence_valid(
-                        f"det_L{lead_time_hours:04d}", marker
+                candidate_keys = [f".markers/regions/det_L{lead_time_hours:04d}.json"]
+                marker_results = _read_marker_payloads_bounded(
+                    self.store_path, candidate_keys, max_concurrency=1
+                )
+                for key, payload in marker_results:
+                    region_id = key.rsplit("/", 1)[-1].removesuffix(".json")
+                    if isinstance(payload, Mapping) and payload.get("state") == "complete" and self._marker_evidence_valid(
+                        region_id, payload
                     ):
                         committed_for_lead.add(0)
-                except Exception:
-                    pass
 
             with Session(bind=conn) as db:
                 run = db.get(ModelRunRecord, run_id)
@@ -905,47 +911,84 @@ class RunCoordinator:
                     _get_or_create,
                 )
 
-                if spec.is_ensemble:
-                    for member_num in sorted(committed_for_lead):
-                        _get_or_create(
-                            db,
-                            EnsembleMemberRecord,
-                            (EnsembleMemberRecord.run_id == run.id)
-                            & (EnsembleMemberRecord.member_index == member_num),
+                is_postgres = bool(db.bind and db.bind.dialect.name == "postgresql")
+
+                if spec.is_ensemble and committed_for_lead:
+                    if is_postgres:
+                        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                        member_values = [
                             {
                                 "id": f"member_{member_num}_{run.id}",
                                 "run_id": run.id,
                                 "member_index": member_num,
                                 "member_name": f"{spec.model_id}_member_{member_num}",
-                            },
+                            }
+                            for member_num in sorted(committed_for_lead)
+                        ]
+                        stmt_mem = pg_insert(EnsembleMemberRecord).values(member_values)
+                        stmt_mem = stmt_mem.on_conflict_do_nothing(
+                            index_elements=[
+                                EnsembleMemberRecord.run_id,
+                                EnsembleMemberRecord.member_index,
+                            ]
                         )
-                        _get_or_create(
-                            db,
-                            EnsembleMemberProductRecord,
-                            (EnsembleMemberProductRecord.run_id == run.id)
-                            & (EnsembleMemberProductRecord.member_index == member_num)
-                            & (EnsembleMemberProductRecord.lead_time_hours == lead_time_hours),
+                        db.execute(stmt_mem)
+
+                        member_prod_values = [
                             {
                                 "id": f"member_product_{member_num}_{lead_time_hours}_{run.id}",
                                 "run_id": run.id,
                                 "member_index": member_num,
                                 "lead_time_hours": lead_time_hours,
-                            },
+                            }
+                            for member_num in sorted(committed_for_lead)
+                        ]
+                        stmt_mprod = pg_insert(EnsembleMemberProductRecord).values(member_prod_values)
+                        stmt_mprod = stmt_mprod.on_conflict_do_nothing(
+                            index_elements=[
+                                EnsembleMemberProductRecord.run_id,
+                                EnsembleMemberProductRecord.member_index,
+                                EnsembleMemberProductRecord.lead_time_hours,
+                            ]
                         )
+                        db.execute(stmt_mprod)
+                    else:
+                        for member_num in sorted(committed_for_lead):
+                            _get_or_create(
+                                db,
+                                EnsembleMemberRecord,
+                                (EnsembleMemberRecord.run_id == run.id)
+                                & (EnsembleMemberRecord.member_index == member_num),
+                                {
+                                    "id": f"member_{member_num}_{run.id}",
+                                    "run_id": run.id,
+                                    "member_index": member_num,
+                                    "member_name": f"{spec.model_id}_member_{member_num}",
+                                },
+                            )
+                            _get_or_create(
+                                db,
+                                EnsembleMemberProductRecord,
+                                (EnsembleMemberProductRecord.run_id == run.id)
+                                & (EnsembleMemberProductRecord.member_index == member_num)
+                                & (EnsembleMemberProductRecord.lead_time_hours == lead_time_hours),
+                                {
+                                    "id": f"member_product_{member_num}_{lead_time_hours}_{run.id}",
+                                    "run_id": run.id,
+                                    "member_index": member_num,
+                                    "lead_time_hours": lead_time_hours,
+                                },
+                            )
 
                 if committed_for_lead and spec.variables:
                     grid_code = spec.grid_id
                     product_type = spec.product_type
                     zarr_chunk_path = spec.zarr_store_path or run.zarr_store_path
-                    for v in spec.variables:
-                        _get_or_create(
-                            db,
-                            ProductRecord,
-                            (ProductRecord.run_id == run.id)
-                            & (ProductRecord.variable_id == v.code)
-                            & (ProductRecord.grid_id == grid_code)
-                            & (ProductRecord.product_type == product_type)
-                            & (ProductRecord.lead_time_hours == lead_time_hours),
+                    if is_postgres:
+                        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                        prod_values = [
                             {
                                 "id": (
                                     f"product_{run.id}_{v.code}_{grid_code}_"
@@ -957,8 +1000,43 @@ class RunCoordinator:
                                 "product_type": product_type,
                                 "lead_time_hours": lead_time_hours,
                                 "zarr_chunk_path": zarr_chunk_path,
-                            },
+                            }
+                            for v in spec.variables
+                        ]
+                        stmt_prod = pg_insert(ProductRecord).values(prod_values)
+                        stmt_prod = stmt_prod.on_conflict_do_nothing(
+                            index_elements=[
+                                ProductRecord.run_id,
+                                ProductRecord.variable_id,
+                                ProductRecord.grid_id,
+                                ProductRecord.product_type,
+                                ProductRecord.lead_time_hours,
+                            ]
                         )
+                        db.execute(stmt_prod)
+                    else:
+                        for v in spec.variables:
+                            _get_or_create(
+                                db,
+                                ProductRecord,
+                                (ProductRecord.run_id == run.id)
+                                & (ProductRecord.variable_id == v.code)
+                                & (ProductRecord.grid_id == grid_code)
+                                & (ProductRecord.product_type == product_type)
+                                & (ProductRecord.lead_time_hours == lead_time_hours),
+                                {
+                                    "id": (
+                                        f"product_{run.id}_{v.code}_{grid_code}_"
+                                        f"{product_type}_{lead_time_hours}"
+                                    ),
+                                    "run_id": run.id,
+                                    "variable_id": v.code,
+                                    "grid_id": grid_code,
+                                    "product_type": product_type,
+                                    "lead_time_hours": lead_time_hours,
+                                    "zarr_chunk_path": zarr_chunk_path,
+                                },
+                            )
                 db.commit()
 
             # Advance manifest generation with new serving fingerprint

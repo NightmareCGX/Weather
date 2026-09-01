@@ -586,6 +586,51 @@ def select_gfs_records(
     )
 
 
+def merge_adjacent_records(
+    records: tuple[IdxRecord, ...] | list[IdxRecord],
+    *,
+    max_gap: int = 0,
+) -> tuple[tuple[IdxRecord, ...], ...]:
+    """Group sorted IdxRecords into contiguous or near-contiguous spans.
+
+    Two consecutive records r1 and r2 are grouped together if:
+    ``r2.start_offset - (r1.end_offset + 1) <= max_gap`` (where r1.end_offset is not None).
+
+    When ``max_gap == 0`` (default), strictly groups only physically adjacent records
+    (0-byte gap) with zero extra byte overhead.
+
+    Args:
+        records: Sequence of IdxRecord instances, sorted by start_offset.
+        max_gap: Maximum allowed gap in bytes between consecutive records to merge.
+
+    Returns:
+        A tuple of record groups (each group is a tuple of IdxRecord).
+    """
+    if not records:
+        return ()
+
+    groups: list[list[IdxRecord]] = []
+    cur_group: list[IdxRecord] = [records[0]]
+
+    for r in records[1:]:
+        prev = cur_group[-1]
+        gap = (
+            r.start_offset - (prev.end_offset + 1)
+            if prev.end_offset is not None
+            else 999999999999
+        )
+        if gap <= max_gap:
+            cur_group.append(r)
+        else:
+            groups.append(cur_group)
+            cur_group = [r]
+
+    if cur_group:
+        groups.append(cur_group)
+
+    return tuple(tuple(g) for g in groups)
+
+
 def _record_selection(
     var: str,
     matches: list[IdxRecord],

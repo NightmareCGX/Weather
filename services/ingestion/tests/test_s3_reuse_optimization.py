@@ -242,7 +242,8 @@ def test_failure_propagation_leaves_region_uncommitted(tmp_path):
     ds = _make_gefs_region(lead=6, member=1)
     prepare_run_store(ds, store, expected_lead_time_hours=leads, expected_members=members)
 
-    with patch.object(zarr.core.Array, "__setitem__", side_effect=OSError("Simulated S3 PUT failure")):
+    with patch("ingestion.core.zarr_writer.write_encoded_chunks", side_effect=OSError("Simulated S3 PUT failure")), \
+         patch.object(zarr.core.Array, "__setitem__", side_effect=OSError("Simulated S3 PUT failure")):
         with pytest.raises(OSError, match="Simulated S3 PUT failure"):
             commit_region(ds, store, lead_time_hours=6, member=1, lead_index=0, member_index=0)
 
