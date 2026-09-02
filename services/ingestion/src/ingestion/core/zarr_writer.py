@@ -568,12 +568,6 @@ def encode_region_sharded_v1(
     """
     compressor = Zstd(level=5)
     encoded_shards: list[tuple[str, bytes]] = []
-
-    lat_chunk = 100
-    lon_chunk = 100
-    lat_chunks = (721 + lat_chunk - 1) // lat_chunk   # 8
-    lon_chunks = (1440 + lon_chunk - 1) // lon_chunk # 15
-
     target_vars = data_vars if data_vars is not None else tuple(dataset.data_vars.keys())
 
     for name in target_vars:
@@ -585,6 +579,11 @@ def encode_region_sharded_v1(
         if arr_2d.ndim != 2:
             continue
         lat_size, lon_size = arr_2d.shape
+
+        lat_chunk = min(100, lat_size) if lat_size > 0 else 100
+        lon_chunk = min(100, lon_size) if lon_size > 0 else 100
+        lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
+        lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
 
         var_chunks: list[bytes] = []
         for r_i in range(lat_chunks):
@@ -819,26 +818,159 @@ def _coordinate_index(
     )
 
 
+def _parse_shard_filename(fname: str) -> tuple[int | None, int]:
+    """Parse member and lead from shard.mem001_L0006.shard or shard.det_L0006.shard."""
+    base = fname.removesuffix(".shard")
+    if ".mem" in base:
+        parts = base.split(".mem")[-1].split("_L")
+        return int(parts[0]), int(parts[1])
+    if ".det_L" in base:
+        lead_str = base.split(".det_L")[-1]
+        return None, int(lead_str)
+    return None, 0
+
+
+def _populate_sharded_data(
+    dataset: xr.Dataset, store: str | PathLike[str] | Mapping[str, bytes]
+) -> xr.Dataset:
+    """Populate data variables in an opened dataset from sharded_v1 container files if present."""
+    path = os.fspath(store) if isinstance(store, (str, PathLike)) else ""
+    if not path:
+        return dataset
+
+    compressor = Zstd(level=5)
+    is_s3 = path.startswith("s3://")
+    fs = None
+    root = path
+    if is_s3:
+        rest = path[len("s3://") :].strip("/")
+        from ingestion.core.s3 import get_s3_fs
+
+        fs = get_s3_fs()
+        root = rest
+
+    lead_vals = (
+        [int(v) for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)]
+        if "lead_time_hours" in dataset.coords
+        else []
+    )
+    member_vals = (
+        [int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)]
+        if "member" in dataset.coords
+        else []
+    )
+    lead_idx_map = {v: i for i, v in enumerate(lead_vals)}
+    member_idx_map = {v: i for i, v in enumerate(member_vals)}
+
+    lat_size = dataset.sizes.get("latitude", 0)
+    lon_size = dataset.sizes.get("longitude", 0)
+    if lat_size == 0 or lon_size == 0:
+        return dataset
+
+    lat_chunk = min(100, lat_size)
+    lon_chunk = min(100, lon_size)
+    lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
+    lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
+
+    for var_name in list(dataset.data_vars):
+        shard_keys: list[tuple[str, int | None, int]] = []
+        if is_s3 and fs is not None:
+            full_prefix = f"{root}/{var_name}"
+            try:
+                for item in fs.find(full_prefix):
+                    rel = item[len(root) + 1 :]
+                    if rel.endswith(".shard"):
+                        fname = rel.rsplit("/", 1)[-1]
+                        m, l = _parse_shard_filename(fname)
+                        shard_keys.append((rel, m, l))
+            except Exception:
+                pass
+        else:
+            var_dir = os.path.join(root, var_name)
+            if os.path.isdir(var_dir):
+                for fname in os.listdir(var_dir):
+                    if fname.endswith(".shard"):
+                        m, l = _parse_shard_filename(fname)
+                        shard_keys.append((f"{var_name}/{fname}", m, l))
+
+        if not shard_keys:
+            continue
+
+        var_arr = np.copy(dataset[var_name].values)
+        has_member = "member" in dataset[var_name].dims
+        has_lead = "lead_time_hours" in dataset[var_name].dims
+
+        for rel_key, member, lead in shard_keys:
+            if is_s3 and fs is not None:
+                try:
+                    shard_bytes = fs.cat_file(f"{root}/{rel_key}")
+                except Exception:
+                    continue
+            else:
+                full_path = os.path.join(root, *rel_key.split("/"))
+                if not os.path.isfile(full_path):
+                    continue
+                try:
+                    with open(full_path, "rb") as fh:
+                        shard_bytes = fh.read()
+                except OSError:
+                    continue
+
+            if len(shard_bytes) < TRAILER_SIZE:
+                continue
+
+            num_chunks, index_size, magic = struct.unpack("<III", shard_bytes[-TRAILER_SIZE:])
+            if magic != SHARD_MAGIC:
+                continue
+
+            index_bytes = shard_bytes[-(TRAILER_SIZE + index_size) : -TRAILER_SIZE]
+            entries = parse_sharded_v1_index(index_bytes, num_chunks)
+
+            assembled_2d = np.full((lat_size, lon_size), np.nan, dtype=np.float32)
+            c_idx = 0
+            for r_i in range(lat_chunks):
+                lat_start = r_i * lat_chunk
+                lat_end = min((r_i + 1) * lat_chunk, lat_size)
+                sub_lat = lat_end - lat_start
+                for c_i in range(lon_chunks):
+                    lon_start = c_i * lon_chunk
+                    lon_end = min((c_i + 1) * lon_chunk, lon_size)
+                    sub_lon = lon_end - lon_start
+                    if c_idx < len(entries):
+                        off, length = entries[c_idx]
+                        if length > 0:
+                            raw = compressor.decode(shard_bytes[off : off + length])
+                            arr_c = np.frombuffer(raw, dtype=np.float32).reshape(1, 1, lat_chunk, lon_chunk)
+                            assembled_2d[lat_start:lat_end, lon_start:lon_end] = arr_c[0, 0, :sub_lat, :sub_lon]
+                    c_idx += 1
+
+            l_idx = lead_idx_map.get(lead, 0)
+            if has_member and member is not None:
+                m_idx = member_idx_map.get(member, 0)
+                if has_lead:
+                    var_arr[m_idx, l_idx] = assembled_2d
+                else:
+                    var_arr[m_idx] = assembled_2d
+            elif has_lead:
+                var_arr[l_idx] = assembled_2d
+            else:
+                var_arr = assembled_2d
+
+        dataset[var_name].values = var_arr
+
+    return dataset
+
+
 def read_dataset(store: str | PathLike[str] | Mapping[str, bytes]) -> xr.Dataset:
     """Read a Zarr store back into a dataset.
 
     The dataset is returned numpy-backed (no dask required); the chunk
     grid and compressor persisted at write time remain available via
     ``encoding``.
-
-    Args:
-        store: The same local path, ``s3://`` URL, or mapping used to
-            write.
-
-    Returns:
-        The dataset read back from the Zarr store.
     """
     resolved = _resolve_store(store)
-    # ``xr.open_zarr`` is overloaded and infers ``Any`` for the ``Any``-typed
-    # store; the value is always a concrete ``Dataset`` at runtime, so narrow
-    # through a typed intermediate to satisfy the declared return type.
     dataset: xr.Dataset = xr.open_zarr(resolved)
-    return dataset
+    return _populate_sharded_data(dataset, store)
 
 
 def store_exists(store: str | PathLike[str] | Mapping[str, bytes]) -> bool:

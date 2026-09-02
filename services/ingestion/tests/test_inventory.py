@@ -219,9 +219,9 @@ def test_physical_conflict_keys_full_member_layout_serializes(tmp_path) -> None:
     # member full-extent (chunk 0 covers all 4 members), lead chunked at 1.
     import json as _json
 
-    (_json).dump(
-        {"shape": [4, 2, 4, 4], "chunks": [4, 1, 2, 2], "zarr_format": 2},
-        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    (var_dir / ".zarray").write_text(
+        _json.dumps({"shape": [4, 2, 4, 4], "chunks": [4, 1, 2, 2], "zarr_format": 2}),
+        encoding="utf-8",
     )
     from ingestion.core.inventory import physical_conflict_keys
 
@@ -243,9 +243,9 @@ def test_physical_conflict_keys_member_chunked_at_1_distinct(tmp_path) -> None:
     var_dir.mkdir(parents=True)
     import json as _json
 
-    _json.dump(
-        {"shape": [4, 2, 4, 4], "chunks": [1, 1, 2, 2], "zarr_format": 2},
-        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    (var_dir / ".zarray").write_text(
+        _json.dumps({"shape": [4, 2, 4, 4], "chunks": [1, 1, 2, 2], "zarr_format": 2}),
+        encoding="utf-8",
     )
     from ingestion.core.inventory import physical_conflict_keys
 
@@ -264,9 +264,9 @@ def test_physical_conflict_keys_deterministic_disjoint(tmp_path) -> None:
     var_dir.mkdir(parents=True)
     import json as _json
 
-    _json.dump(
-        {"shape": [2, 4, 4], "chunks": [1, 2, 2], "zarr_format": 2},
-        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    (var_dir / ".zarray").write_text(
+        _json.dumps({"shape": [2, 4, 4], "chunks": [1, 2, 2], "zarr_format": 2}),
+        encoding="utf-8",
     )
     from ingestion.core.inventory import physical_conflict_keys
 
@@ -287,13 +287,13 @@ def test_region_expected_matches_conflict_keys_member_chunk_1(tmp_path, member, 
     var_dir.mkdir(parents=True)
     import json as _json
 
-    _json.dump(
-        {"shape": [30, 10, 4, 4], "chunks": [1, 1, 2, 2], "zarr_format": 2},
-        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    (var_dir / ".zarray").write_text(
+        _json.dumps({"shape": [30, 10, 4, 4], "chunks": [1, 1, 2, 2], "zarr_format": 2}),
+        encoding="utf-8",
     )
-    _json.dump(
-        {"_ARRAY_DIMENSIONS": ["member", "lead_time_hours", "latitude", "longitude"]},
-        open(var_dir / ".zattrs", "w", encoding="utf-8"),
+    (var_dir / ".zattrs").write_text(
+        _json.dumps({"_ARRAY_DIMENSIONS": ["member", "lead_time_hours", "latitude", "longitude"]}),
+        encoding="utf-8",
     )
     from ingestion.core.inventory import physical_conflict_keys, region_expected_object_keys
 
@@ -320,13 +320,13 @@ def test_region_expected_matches_conflict_keys_legacy_member_chunk_30(tmp_path, 
     var_dir.mkdir(parents=True)
     import json as _json
 
-    _json.dump(
-        {"shape": [30, 10, 4, 4], "chunks": [30, 1, 2, 2], "zarr_format": 2},
-        open(var_dir / ".zarray", "w", encoding="utf-8"),
+    (var_dir / ".zarray").write_text(
+        _json.dumps({"shape": [30, 10, 4, 4], "chunks": [30, 1, 2, 2], "zarr_format": 2}),
+        encoding="utf-8",
     )
-    _json.dump(
-        {"_ARRAY_DIMENSIONS": ["member", "lead_time_hours", "latitude", "longitude"]},
-        open(var_dir / ".zattrs", "w", encoding="utf-8"),
+    (var_dir / ".zattrs").write_text(
+        _json.dumps({"_ARRAY_DIMENSIONS": ["member", "lead_time_hours", "latitude", "longitude"]}),
+        encoding="utf-8",
     )
     from ingestion.core.inventory import physical_conflict_keys, region_expected_object_keys
 

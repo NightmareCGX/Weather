@@ -597,7 +597,18 @@ def region_expected_object_keys(
     Returns:
         A sorted list of physical object keys (relative to the store).
     """
-    resolved_format = format_version or getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1")
+    if format_version is not None:
+        resolved_format = format_version
+    else:
+        try:
+            from ingestion.core.markers import read_manifest
+            m = read_manifest(store_path)
+            if m is not None and "storage_format_version" in m:
+                resolved_format = str(m["storage_format_version"])
+            else:
+                resolved_format = "v2_unsharded"
+        except Exception:
+            resolved_format = "v2_unsharded"
 
     # Sharded v1 format: 1 shard container per variable per region (14 objects total)
     if resolved_format == "sharded_v1":

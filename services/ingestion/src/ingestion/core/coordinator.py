@@ -566,6 +566,7 @@ class RunCoordinator:
                             member=member,
                             lead_index=lead_index,
                             lead_time_hours=lead,
+                            format_version=getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
                             data_var_paths=snapshot.data_var_paths,
                             zarray_cache=snapshot.zarray_by_var,
                             zattrs_cache=snapshot.zattrs_by_var,

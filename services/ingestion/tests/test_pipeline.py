@@ -456,9 +456,9 @@ def test_ingest_grib_file_multi_typeoflevel_end_to_end(
     assert session.query(ProductRecord).count() == 2
 
     # The Zarr store holds both platform variables in canonical units.
-    import xarray as xr
+    from ingestion.core.zarr_writer import read_dataset
 
-    restored = xr.open_zarr(store_path)
+    restored = read_dataset(store_path)
     assert set(restored.data_vars) == {"temperature_2m", "precipitation_rate"}
 
     # temperature_2m: K -> °C. Fixture t2m = 280.0 K -> 6.85 °C. The values
