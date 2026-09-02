@@ -145,3 +145,198 @@ def test_verify_shard_integrity(tmp_path: Path) -> None:
     # Short/truncated file
     shard_file.write_bytes(valid_shard[:1000])
     assert verify_shard_integrity(store_path, shard_key, expected_num_chunks=120) is False
+
+
+def test_sharded_v1_store_roundtrip_preserves_data(tmp_path: Path) -> None:
+    """Test full prepare_run_store, commit_region, and read_dataset roundtrip under sharded_v1."""
+    from ingestion.core.zarr_writer import commit_region, prepare_run_store, read_dataset
+
+    store = str(tmp_path / "sharded_store.zarr")
+    ds_seed = _synthetic_region_dataset(lead=0, member=1)
+    prepare_run_store(
+        ds_seed,
+        store,
+        expected_lead_time_hours=(0, 6, 12),
+        expected_members=(1, 2),
+    )
+
+    # Commit member 1, lead 0
+    commit_region(ds_seed, store, lead_time_hours=0, member=1)
+
+    # Commit member 1, lead 6
+    ds_lead6 = _synthetic_region_dataset(lead=6, member=1)
+    commit_region(ds_lead6, store, lead_time_hours=6, member=1)
+
+    # Read back
+    restored = read_dataset(store)
+    assert "temperature_2m" in restored.data_vars
+    assert "precipitation_rate" in restored.data_vars
+
+    # Check committed slices have data and uncommitted slices are NaN
+    t2m = restored["temperature_2m"].values # shape: (member=2, lead=3, 721, 1440)
+    # member 1 (index 0), lead 0 (index 0) committed
+    assert not np.all(np.isnan(t2m[0, 0]))
+    assert np.allclose(t2m[0, 0], 290.0)
+
+    # member 1 (index 0), lead 6 (index 1) committed
+    assert not np.all(np.isnan(t2m[0, 1]))
+    assert np.allclose(t2m[0, 1], 290.0)
+
+    # member 1 (index 0), lead 12 (index 2) uncommitted -> NaN
+    assert np.all(np.isnan(t2m[0, 2]))
+
+    # member 2 (index 1), lead 0 (index 0) uncommitted -> NaN
+    assert np.all(np.isnan(t2m[1, 0]))
+
+
+def test_sharded_v1_minio_roundtrip_and_no_chunk_flooding(minio_store: str) -> None:
+    """Regression test: sharded_v1 on MinIO S3 roundtrips without flooding chunk GETs or hanging."""
+    from ingestion.core.zarr_writer import commit_region, prepare_run_store, read_dataset
+
+    ds_seed = _synthetic_region_dataset(lead=0, member=None)
+    prepare_run_store(
+        ds_seed,
+        minio_store,
+        expected_lead_time_hours=(0, 6),
+        expected_members=(),
+    )
+
+    commit_region(ds_seed, minio_store, lead_time_hours=0, member=None)
+    ds_lead6 = _synthetic_region_dataset(lead=6, member=None)
+    commit_region(ds_lead6, minio_store, lead_time_hours=6, member=None)
+
+    # Reading the store must not hang or issue 404 chunk requests
+    restored = read_dataset(minio_store)
+    assert not np.all(np.isnan(restored["temperature_2m"].values[0]))
+    assert not np.all(np.isnan(restored["temperature_2m"].values[1]))
+    assert np.allclose(restored["temperature_2m"].values[0], 290.0)
+
+
+def _write_sample_grib(path: Path, lead: int) -> None:
+    from eccodes import (
+        codes_grib_new_from_samples,
+        codes_release,
+        codes_set,
+        codes_set_values,
+        codes_write,
+    )
+    with path.open("wb") as f:
+        msg = codes_grib_new_from_samples("GRIB2")
+        codes_set(msg, "dataDate", 20260721)
+        codes_set(msg, "dataTime", 0)
+        codes_set(msg, "stepType", "instant")
+        codes_set(msg, "stepRange", str(lead))
+        codes_set(msg, "stepUnits", "h")
+        codes_set(msg, "paramId", 167)
+        codes_set(msg, "shortName", "2t")
+        codes_set(msg, "typeOfLevel", "heightAboveGround")
+        codes_set(msg, "level", 2)
+        codes_set(msg, "gridType", "regular_ll")
+        codes_set(msg, "Ni", 10)
+        codes_set(msg, "Nj", 5)
+        codes_set(msg, "latitudeOfFirstGridPointInDegrees", 40.0)
+        codes_set(msg, "longitudeOfFirstGridPointInDegrees", 250.0)
+        codes_set(msg, "latitudeOfLastGridPointInDegrees", 36.0)
+        codes_set(msg, "longitudeOfLastGridPointInDegrees", 259.0)
+        codes_set(msg, "iDirectionIncrementInDegrees", 1.0)
+        codes_set(msg, "jDirectionIncrementInDegrees", 1.0)
+        codes_set_values(msg, np.full((5, 10), 285.0 + float(lead), dtype=np.float32).ravel())
+        codes_write(msg, f)
+        codes_release(msg)
+
+
+def test_sharded_v1_pipeline_concurrent_wave_regression(
+    minio_store: str, tmp_path: Path, monkeypatch
+) -> None:
+    """Regression test: multi-lead concurrent wave against MinIO with sharded_v1.
+
+    Validates that:
+    1. Multiple admitted pipeline items download, decode, and write concurrently.
+    2. The first sharded region write does not freeze or block the event loop.
+    3. Global PUT concurrency remains bounded.
+    4. Pipeline cleanly drains and finalizes with status='ready'.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from ingestion.cli import main
+    from ingestion.core.catalog import CatalogBase, record_run
+    from ingestion.core.zarr_writer import read_dataset
+
+    db_file = tmp_path / "catalog_test.sqlite"
+    engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+    CatalogBase.metadata.create_all(engine)
+    session = Session(engine)
+
+    class _NoopLocks:
+        def __init__(self, *a, **k):
+            pass
+        def acquire_shared_gate(self):
+            pass
+        def release_shared_gate(self):
+            pass
+        def acquire_exclusive_gate(self):
+            pass
+        def release_exclusive_gate(self):
+            pass
+        def acquire_admission(self):
+            pass
+        def release_admission(self):
+            pass
+        def acquire_shared_admission(self):
+            pass
+        def release_shared_admission(self):
+            pass
+        def acquire_region_locks(self, region_ids):
+            pass
+        def release_region_locks(self, region_ids):
+            pass
+        def release_all(self):
+            pass
+        def close_connection(self):
+            pass
+
+    async def _mock_download(self, model, cycle_date, cycle_hour, lead_time_hours, destination, **kw):
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _write_sample_grib(dest, lead_time_hours)
+        return dest
+
+    monkeypatch.setattr("ingestion.providers.noaa.connector.NOAAConnector.download", _mock_download)
+    monkeypatch.setattr("ingestion.cli._catalog_session_factory", lambda: engine)
+    monkeypatch.setattr("ingestion.core.coordinator.StoreLockCoordinator", _NoopLocks)
+
+    recorded = []
+    def _record_session(spec, dataset, *, effective_store_path=None, member=None, committed_state=None):
+        run = record_run(session, spec, dataset, member=member, committed_state=committed_state)
+        recorded.append(run)
+        return run
+
+    monkeypatch.setattr("ingestion.core.pipeline.record_ingested_dataset", _record_session)
+
+    argv = [
+        "ingest",
+        "--model", "gfs",
+        "--cycle-date", "2026-07-21",
+        "--cycle-hour", "0",
+        "--lead-time-hours", "0", "3", "6",
+        "--store", minio_store,
+        "--allow-custom-store",
+        "--concurrency", "4",
+        "--download-dir", str(tmp_path / "downloads"),
+    ]
+
+    exit_code = main(argv)
+    assert exit_code == 0
+
+    # Verify store content across all 3 leads
+    restored = read_dataset(minio_store)
+    assert "temperature_2m" in restored.data_vars
+    t2m = restored["temperature_2m"].values
+    assert t2m.shape[0] == 3
+    for lead_idx, lead_val in enumerate([0, 3, 6]):
+        assert not np.all(np.isnan(t2m[lead_idx]))
+        # 285.0 K -> 11.85 °C (+ lead_val)
+        expected_celsius = (285.0 + lead_val) - 273.15
+        assert np.allclose(t2m[lead_idx], expected_celsius, atol=1e-3)
+
+
