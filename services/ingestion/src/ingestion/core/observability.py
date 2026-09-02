@@ -119,12 +119,22 @@ class StartupTimeline:
         "downloads_drained",
         "decodes_drained",
         "writes_drained",
+        "post_write_task_gather_start",
+        "post_write_task_gather_complete",
+        "download_client_close_start",
+        "download_client_close_complete",
         "finalize_start",
         "marker_listing_start",
         "marker_listing_complete",
         "marker_read_validation_start",
         "marker_read_validation_complete",
         "manifest_write_start",
+        "manifest_payload_build_start",
+        "manifest_payload_build_complete",
+        "manifest_fingerprint_start",
+        "manifest_fingerprint_complete",
+        "manifest_put_start",
+        "manifest_put_complete",
         "manifest_write_complete",
         "catalog_reconcile_start",
         "catalog_reconcile_complete",
@@ -211,10 +221,15 @@ class StartupTimeline:
         teardown_str = (
             f"{teardown_dur:.3f}s" if teardown_dur is not None else "--"
         )
+        task_gather_dur = _fmt_dur("post_write_task_gather_start", "post_write_task_gather_complete")
+        client_close_dur = _fmt_dur("download_client_close_start", "download_client_close_complete")
 
         marker_list_dur = _fmt_dur("marker_listing_start", "marker_listing_complete")
         marker_val_dur = _fmt_dur("marker_read_validation_start", "marker_read_validation_complete")
         manifest_wr_dur = _fmt_dur("manifest_write_start", "manifest_write_complete")
+        manifest_fp_dur = _fmt_dur("manifest_fingerprint_start", "manifest_fingerprint_complete")
+        manifest_build_dur = _fmt_dur("manifest_payload_build_start", "manifest_payload_build_complete")
+        manifest_put_dur = _fmt_dur("manifest_put_start", "manifest_put_complete")
         cat_rec_dur = _fmt_dur("catalog_reconcile_start", "catalog_reconcile_complete")
         finalize_dur = _fmt_dur("finalize_start", "finalize_complete")
 
@@ -263,6 +278,8 @@ class StartupTimeline:
             "-" * 80,
             f"* Tail Physical Write Drain (decodes_drained -> writes_drained): {tail_write_str}",
             f"* Task Teardown / Gate Transition (writes_drained -> finalize_start): {teardown_str}",
+            f"   ├─ post_write_task_gather              {_fmt_ts('post_write_task_gather_start'):<20} {task_gather_dur}",
+            f"   └─ download_client_close               {_fmt_ts('download_client_close_start'):<20} {client_close_dur}",
             "-" * 80,
             "Finalization Breakdown:",
             f"   ├─ finalize_start                      {_fmt_ts('finalize_start')}",
@@ -273,7 +290,9 @@ class StartupTimeline:
             f"   │  ├─ marker_read_validation_start     {_fmt_ts('marker_read_validation_start')}",
             f"   │  └─ marker_read_validation_complete  {_fmt_ts('marker_read_validation_complete')}",
             f"   ├─ Manifest Write                      {_fmt_ts('manifest_write_start'):<20} {manifest_wr_dur}",
-            f"   │  ├─ manifest_write_start             {_fmt_ts('manifest_write_start')}",
+            f"   │  ├─ manifest_fingerprint             {_fmt_ts('manifest_fingerprint_start'):<20} {manifest_fp_dur}",
+            f"   │  ├─ manifest_payload_build           {_fmt_ts('manifest_payload_build_start'):<20} {manifest_build_dur}",
+            f"   │  ├─ manifest_put                     {_fmt_ts('manifest_put_start'):<20} {manifest_put_dur}",
             f"   │  └─ manifest_write_complete          {_fmt_ts('manifest_write_complete')}",
             f"   ├─ Catalog Reconciliation              {_fmt_ts('catalog_reconcile_start'):<20} {cat_rec_dur}",
             f"   │  ├─ catalog_reconcile_start          {_fmt_ts('catalog_reconcile_start')}",

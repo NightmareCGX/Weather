@@ -40,7 +40,7 @@ class IngestionSettings(BaseSettings):
     #: HTTP connection pool configuration for NOAAConnector (P4)
     HTTP_MAX_CONNECTIONS: Any = 100
     HTTP_MAX_KEEPALIVE_CONNECTIONS: Any = 50
-    HTTP_KEEPALIVE_EXPIRY_SECONDS: Any = 30.0
+    HTTP_KEEPALIVE_EXPIRY_SECONDS: Any = 5.0
 
     #: Feature switch for NOMADS .idx byte-range selective downloading.
     #: When True, selectively fetches only platform-required GRIB records with
