@@ -881,8 +881,8 @@ def _populate_sharded_data(
                     rel = item[len(root) + 1 :]
                     if rel.endswith(".shard"):
                         fname = rel.rsplit("/", 1)[-1]
-                        m, l = _parse_shard_filename(fname)
-                        shard_keys.append((rel, m, l))
+                        member_val, lead_val = _parse_shard_filename(fname)
+                        shard_keys.append((rel, member_val, lead_val))
             except Exception:
                 pass
         else:
@@ -890,8 +890,8 @@ def _populate_sharded_data(
             if os.path.isdir(var_dir):
                 for fname in os.listdir(var_dir):
                     if fname.endswith(".shard"):
-                        m, l = _parse_shard_filename(fname)
-                        shard_keys.append((f"{var_name}/{fname}", m, l))
+                        member_val, lead_val = _parse_shard_filename(fname)
+                        shard_keys.append((f"{var_name}/{fname}", member_val, lead_val))
 
         if not shard_keys:
             continue

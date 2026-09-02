@@ -33,7 +33,6 @@ import numpy as np
 import s3fs  # type: ignore[import-untyped]
 
 from domain.locks import sha256_hex
-from ingestion.core.config import settings
 
 
 class InventoryError(RuntimeError):
