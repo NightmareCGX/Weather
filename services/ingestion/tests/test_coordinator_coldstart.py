@@ -130,7 +130,7 @@ def _spec(
 
     run_spec = RunSpec(
         model=model, cycle_date=date(2026, 8, 22), cycle_hour=0,
-        lead_time_hours=leads, members=members, store=None, allow_custom_store=False,
+        target_lead_time_hours=leads, members=members, store=None, allow_custom_store=False,
     )
     args = type("A", (), {
         "center_id": "noaa", "version_string": "v1.0", "grid_id": "global_025deg",

@@ -98,13 +98,13 @@ async def _fake_download(
 
 
 def _install_mocks(monkeypatch, session: Session):
-    import ingestion.cli as CLI
+    import ingestion.core.wave_runner as wave_runner
 
     monkeypatch.setattr(
         "ingestion.providers.noaa.connector.NOAAConnector.download",
         _fake_download,
     )
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: session.bind)
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: session.bind)
     monkeypatch.setattr(
         "ingestion.core.coordinator.StoreLockCoordinator", _NoopLockCoordinator
     )
@@ -576,8 +576,8 @@ def test_gefs_30_member_startup_timeline_breakdown(session: Session, tmp_path, m
         "ingestion.providers.noaa.connector.NOAAConnector.download",
         _gefs_download,
     )
-    import ingestion.cli as CLI
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: session.bind)
+    import ingestion.core.wave_runner as wave_runner
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: session.bind)
     monkeypatch.setattr(
         "ingestion.core.coordinator.StoreLockCoordinator", _NoopLockCoordinator
     )
@@ -934,8 +934,8 @@ def test_gefs_510_region_startup_delay_measurement(session: Session, tmp_path, m
         "ingestion.providers.noaa.connector.NOAAConnector.download",
         _gefs_download,
     )
-    import ingestion.cli as CLI
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: session.bind)
+    import ingestion.core.wave_runner as wave_runner
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: session.bind)
     monkeypatch.setattr(
         "ingestion.core.coordinator.StoreLockCoordinator", _NoopLockCoordinator
     )

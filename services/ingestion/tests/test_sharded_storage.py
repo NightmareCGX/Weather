@@ -254,7 +254,11 @@ def test_sharded_v1_pipeline_concurrent_wave_regression(
     1. Multiple admitted pipeline items download, decode, and write concurrently.
     2. The first sharded region write does not freeze or block the event loop.
     3. Global PUT concurrency remains bounded.
-    4. Pipeline cleanly drains and finalizes with status='ready'.
+    4. Pipeline cleanly drains and finalizes (status='partial' under the
+       Phase 5B canonical-horizon split: targets [0,3,6] are 3 of the 81
+       canonical leads, so the horizon is incomplete).
+    5. The store's lead axis is the canonical horizon; the committed DATA is
+       exactly the wave targets, with non-target leads still NaN.
     """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
@@ -302,7 +306,7 @@ def test_sharded_v1_pipeline_concurrent_wave_regression(
         return dest
 
     monkeypatch.setattr("ingestion.providers.noaa.connector.NOAAConnector.download", _mock_download)
-    monkeypatch.setattr("ingestion.cli._catalog_session_factory", lambda: engine)
+    monkeypatch.setattr("ingestion.core.wave_runner._catalog_session_factory", lambda: engine)
     monkeypatch.setattr("ingestion.core.coordinator.StoreLockCoordinator", _NoopLocks)
 
     recorded = []
@@ -328,15 +332,29 @@ def test_sharded_v1_pipeline_concurrent_wave_regression(
     exit_code = main(argv)
     assert exit_code == 0
 
-    # Verify store content across all 3 leads
+    # Phase 5B: the store's lead axis is pre-allocated with the CANONICAL
+    # horizon (81 leads, 0..240 @ 3h) — it is NOT the wave's target subset.
+    # Committed-region evidence comes from the target leads' data, never from
+    # the coordinate-axis length.
+    from domain.horizon import canonical_lead_time_hours
+
     restored = read_dataset(minio_store)
     assert "temperature_2m" in restored.data_vars
-    t2m = restored["temperature_2m"].values
-    assert t2m.shape[0] == 3
-    for lead_idx, lead_val in enumerate([0, 3, 6]):
-        assert not np.all(np.isnan(t2m[lead_idx]))
+    assert sorted(int(v) for v in restored.coords["lead_time_hours"].values) == list(
+        canonical_lead_time_hours("gfs")
+    )
+
+    targets = [0, 3, 6]
+    t2m = restored["temperature_2m"]
+    for lead_val in targets:
         # 285.0 K -> 11.85 °C (+ lead_val)
         expected_celsius = (285.0 + lead_val) - 273.15
-        assert np.allclose(t2m[lead_idx], expected_celsius, atol=1e-3)
+        values = t2m.sel(lead_time_hours=lead_val).values
+        assert not np.all(np.isnan(values))
+        assert np.allclose(values, expected_celsius, atol=1e-3)
+
+    # Representative non-target horizon leads remain uncommitted (NaN).
+    for lead_val in (9, 120, 240):
+        assert np.all(np.isnan(t2m.sel(lead_time_hours=lead_val).values))
 
 
