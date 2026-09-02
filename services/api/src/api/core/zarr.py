@@ -47,8 +47,8 @@ class ShardedV1Reader:
         self,
         store: str | PathLike[str] | MutableMapping[str, bytes],
         *,
-        max_cached_indices: int = 1024,
-        max_cached_chunks: int = 128,
+        max_cached_indices: int = 4096,
+        max_cached_chunks: int = 2048,
     ) -> None:
         self.store = store
         self.max_cached_indices = max_cached_indices
@@ -57,19 +57,21 @@ class ShardedV1Reader:
         self._index_cache: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
         self._chunk_cache: OrderedDict[str, np.ndarray[Any, Any]] = OrderedDict()
         self._cache_lock = threading.Lock()
+        self._fs: Any | None = None
 
     def _resolve_fs_and_root(self) -> tuple[Any, str]:
         path = os.fspath(self.store) if isinstance(self.store, (str, PathLike)) else ""
         if path.startswith("s3://"):
             rest = path[len("s3://") :].strip("/")
-            scheme = "https" if settings.MINIO_SECURE else "http"
-            fs = s3fs.S3FileSystem(
-                key=settings.MINIO_ACCESS_KEY,
-                secret=settings.MINIO_SECRET_KEY,
-                client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
-                use_listings_cache=False,
-            )
-            return fs, rest
+            if self._fs is None:
+                scheme = "https" if settings.MINIO_SECURE else "http"
+                self._fs = s3fs.S3FileSystem(
+                    key=settings.MINIO_ACCESS_KEY,
+                    secret=settings.MINIO_SECRET_KEY,
+                    client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+                    use_listings_cache=False,
+                )
+            return self._fs, rest
         return None, path
 
     def _get_shard_key(self, variable: str, member: int | None, lead_time_hours: int) -> str:
@@ -223,18 +225,35 @@ class ShardedV1Reader:
         lat0, lat1 = lat_idx[0], lat_idx[1]
         lon0, lon1 = lon_idx[0], lon_idx[1]
 
-        val_00 = self.read_point_value(
-            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon0, generation=generation
-        )
-        val_01 = self.read_point_value(
-            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon1, generation=generation
-        )
-        val_10 = self.read_point_value(
-            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon0, generation=generation
-        )
-        val_11 = self.read_point_value(
-            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon1, generation=generation
-        )
+        r0, c0 = lat0 // 100, lon0 // 100
+        r1, c1 = lat1 // 100, lon1 // 100
+
+        if r0 == r1 and c0 == c1:
+            arr = self.read_chunk(
+                variable,
+                member=member,
+                lead_time_hours=lead_time_hours,
+                chunk_row=r0,
+                chunk_col=c0,
+                generation=generation,
+            )
+            val_00 = float(arr[lat0 % 100, lon0 % 100])
+            val_01 = float(arr[lat0 % 100, lon1 % 100])
+            val_10 = float(arr[lat1 % 100, lon0 % 100])
+            val_11 = float(arr[lat1 % 100, lon1 % 100])
+        else:
+            val_00 = self.read_point_value(
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon0, generation=generation
+            )
+            val_01 = self.read_point_value(
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon1, generation=generation
+            )
+            val_10 = self.read_point_value(
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon0, generation=generation
+            )
+            val_11 = self.read_point_value(
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon1, generation=generation
+            )
 
         lower = val_00 + (val_01 - val_00) * t_col
         upper = val_10 + (val_11 - val_10) * t_col
