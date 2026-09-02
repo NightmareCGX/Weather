@@ -152,6 +152,24 @@ def test_small_queue_pool_stress_with_high_logical_concurrency(
     # Clean up small pool
     small_pool_engine.dispose()
 
-    # Assertions: 0 QueuePool timeout failures, status ready
+    # Assertions: 0 QueuePool timeout failures, 0 ingestion failures, and the
+    # run stays partial (Phase 5B: the 10 targets are part of the canonical
+    # 81-lead horizon, so the horizon is incomplete).
     assert len(failures) == 0, f"Failures occurred: {failures}"
-    assert status == "ready"
+    assert status == "partial"
+
+    # Every requested target lead was committed; representative non-target
+    # horizon leads remain uncommitted. The synthetic decode fixture carries
+    # no GRIB units attribute, so canonical-unit normalization is a no-op and
+    # the stored value is the raw 290.0 K (documented _normalize_canonical_units
+    # behavior for unit-less datasets).
+    from ingestion.core.zarr_writer import read_dataset
+
+    restored = read_dataset(store_path)
+    t2m = restored["temperature_2m"]
+    for lead_val in leads:
+        values = t2m.sel(lead_time_hours=lead_val).values
+        assert not np.all(np.isnan(values))
+        assert np.allclose(values, 290.0, atol=1e-3)
+    for lead_val in (30, 240):
+        assert np.all(np.isnan(t2m.sel(lead_time_hours=lead_val).values))

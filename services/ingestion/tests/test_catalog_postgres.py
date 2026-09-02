@@ -240,8 +240,10 @@ def test_cli_production_entrypoint_ingests_and_serves(
 
     This exercises the actual deployable call path: ``ingestion.cli:main``
     downloads (mocked at the connector boundary), parses the committed GRIB2
-    fixture, writes Zarr, records the run in PostgreSQL as ``ready``, and the
-    API discovers/serves it through ``/v1/points``.
+    fixture, writes Zarr, records the run in PostgreSQL as ``partial``
+    (Phase 5B: lead 6 is one wave target of the canonical 81-lead horizon;
+    partial runs remain serving-eligible), and the API discovers/serves it
+    through ``/v1/points``.
     """
     engine = catalog_db["engine"]
     client = catalog_db["client"]
@@ -297,7 +299,9 @@ def test_cli_production_entrypoint_ingests_and_serves(
     assert code == 0
     assert captured_variables == [tuple(v.code for v in DEFAULT_VARIABLES)]
 
-    # The run is recorded as ready with the store path.
+    # Phase 5B: a single-lead target of the canonical 81-lead horizon is
+    # committed and served, but the run stays partial until the whole horizon
+    # is committed.
     with Session(engine) as session:
         run = (
             session.query(ModelRun)
@@ -305,7 +309,7 @@ def test_cli_production_entrypoint_ingests_and_serves(
             .where(ModelRun.zarr_store_path == store)
             .one()
         )
-        assert run.status == "ready"
+        assert run.status == "partial"
         # The run id is version-scoped (approved remediation): model gfs,
         # version v1.0, cycle 2026-07-22T00Z. The CLI only ingests gfs/gefs, so
         # this test's run uses model gfs. The other two tests use distinct model
