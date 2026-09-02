@@ -47,6 +47,7 @@ from domain.locks import (
     sha256_hex,
     serving_state_fingerprint,
 )
+from ingestion.core.config import settings
 from ingestion.core.base import (
     StoreSchemaMismatchError,
     is_retryable_storage_error,
@@ -564,6 +565,8 @@ class RunCoordinator:
                             self.store_path,
                             member=member,
                             lead_index=lead_index,
+                            lead_time_hours=lead,
+                            format_version=getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
                             data_var_paths=snapshot.data_var_paths,
                             zarray_cache=snapshot.zarray_by_var,
                             zattrs_cache=snapshot.zattrs_by_var,
@@ -796,6 +799,7 @@ class RunCoordinator:
             payload = {
                 "manifest_schema_version": 1,
                 "store_protocol_mode": mode,
+                "storage_format_version": getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
                 "generation": generation,
                 "run_identity": run_identity,
                 "canonical_store_identity_hash": _store_identity_hash(self.store_path),
@@ -1050,6 +1054,7 @@ class RunCoordinator:
             manifest_payload = {
                 "manifest_schema_version": 1,
                 "store_protocol_mode": mode,
+                "storage_format_version": getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
                 "generation": generation,
                 "run_identity": run_identity,
                 "canonical_store_identity_hash": _store_identity_hash(self.store_path),
@@ -1113,10 +1118,13 @@ class RunCoordinator:
             data_var_paths = sorted({k.split("/")[0] for k in required + omitted})
             if not data_var_paths:
                 data_var_paths = _store_data_var_paths(self.store_path)
+            is_sharded = any(k.endswith(".shard") for k in required + omitted)
             expected_keys = region_expected_object_keys(
                 self.store_path,
                 member=member,
                 lead_index=lead_index,
+                lead_time_hours=lead,
+                format_version="sharded_v1" if is_sharded else "v2_unsharded",
                 data_var_paths=data_var_paths,
                 zarray_cache=self._zarray_cache,
                 zattrs_cache=self._zattrs_cache,

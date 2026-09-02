@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+import numpy as np
 import s3fs  # type: ignore[import-untyped]
 
 from domain.locks import sha256_hex
@@ -212,6 +214,17 @@ def verify_expected_object_keys(
         by_var.setdefault(var, []).append(key)
 
     for var, keys in by_var.items():
+        # If expected keys are sharded containers (ending with .shard), verify existence directly
+        if keys and any(k.endswith(".shard") for k in keys):
+            for k in keys:
+                full = f"{root}/{k}"
+                try:
+                    if fs.exists(full):
+                        out_s3.add(k)
+                except Exception:
+                    pass
+            continue
+
         za: Mapping[str, object] | None = None
         if zarray_cache is not None and var in zarray_cache:
             za = zarray_cache[var]
@@ -485,22 +498,87 @@ def physical_conflict_keys(
     return sorted(set(out))
 
 
+def verify_shard_integrity(
+    store_path: str,
+    shard_key: str,
+    expected_num_chunks: int = 120,
+) -> bool:
+    """Verify structural integrity of a sharded_v1 physical container object.
+
+    Checks:
+    - Object exists
+    - Object size >= TRAILER_SIZE + INDEX_ENTRY_SIZE * expected_num_chunks (1932 bytes)
+    - Shard trailer magic == 0x53484152 ('SHAR')
+    - Trailer num_chunks == expected_num_chunks
+    - Index table offsets and lengths are within object byte bounds
+    """
+    backend, root = _storage_backend(store_path)
+    trailer_and_index_len = expected_num_chunks * 16 + 12
+    if backend == "local":
+        full = os.path.join(root, *shard_key.split("/"))
+        if not os.path.isfile(full):
+            return False
+        try:
+            size = os.path.getsize(full)
+            if size < trailer_and_index_len:
+                return False
+            with open(full, "rb") as fh:
+                fh.seek(-trailer_and_index_len, os.SEEK_END)
+                tail_data = fh.read(trailer_and_index_len)
+        except OSError:
+            return False
+    else:
+        fs = _s3_fs()
+        full = f"{root}/{shard_key}"
+        try:
+            if not fs.exists(full):
+                return False
+            size = fs.size(full)
+            if size < trailer_and_index_len:
+                return False
+            tail_data = fs.cat_file(full, start=-trailer_and_index_len)
+        except Exception:
+            return False
+
+    if len(tail_data) < trailer_and_index_len:
+        return False
+
+    trailer = tail_data[-12:]
+    num_chunks, index_size, magic = struct.unpack("<III", trailer)
+    if magic != 0x53484152:
+        return False
+    if num_chunks != expected_num_chunks:
+        return False
+    if index_size != expected_num_chunks * 16:
+        return False
+
+    index_bytes = tail_data[:expected_num_chunks * 16]
+    payload_bound = size - trailer_and_index_len
+    for i in range(num_chunks):
+        off, length = struct.unpack_from("<QQ", index_bytes, i * 16)
+        if off + length > payload_bound:
+            return False
+
+    return True
+
+
 def region_expected_object_keys(
     store_path: str,
     *,
     member: int | None,
     lead_index: int,
     data_var_paths: list[str] | tuple[str, ...],
+    lead_time_hours: int | None = None,
+    format_version: str | None = None,
     zarray_cache: Mapping[str, Mapping[str, object]] | None = None,
     zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
     member_index_cache: Mapping[int, int] | None = None,
 ) -> list[str]:
-    """Derive the physical chunk object keys a logical region writes.
+    """Derive the physical object keys a logical region writes.
 
-    The actual store's ``.zarray`` chunk metadata determines the physical chunk
-    grid. Uses the exact same chunk-coordinate derivation as
-    :func:`physical_conflict_keys`, ensuring complete consistency between
-    advisory locking and marker completion evidence.
+    Under Weather Platform Sharded v1 (sharded_v1), derives the exact 14 physical
+    shard container keys (1 shard per data variable per region).
+    Under legacy Zarr v2 (v2_unsharded), derives the ~1,680 individual chunk keys.
 
     Args:
         store_path: The store path/URL.
@@ -509,17 +587,54 @@ def region_expected_object_keys(
             ``lead_time_hours`` coordinate.
         data_var_paths: The data-variable array paths (e.g.
             ``["temperature_2m"]``).
-        zarray_cache: An optional in-memory cache of per-array ``.zarray``
-            metadata (built once per finalizer run), avoiding repeated remote
-            reads across markers.
-        zattrs_cache: An optional in-memory cache of per-array ``.zattrs``
-            metadata.
-        member_index_cache: An optional in-memory cache of member coordinate
-            indices.
+        lead_time_hours: Optional explicit forecast lead time in hours.
+        format_version: Storage format version ("sharded_v1" or "v2_unsharded").
+        zarray_cache: An optional in-memory cache of per-array ``.zarray`` metadata.
+        zattrs_cache: An optional in-memory cache of per-array ``.zattrs`` metadata.
+        member_index_cache: An optional in-memory cache of member coordinate indices.
 
     Returns:
-        A sorted list of physical chunk object keys (relative to the store).
+        A sorted list of physical object keys (relative to the store).
     """
+    if format_version is not None:
+        resolved_format = format_version
+    else:
+        try:
+            from ingestion.core.markers import read_manifest
+            m = read_manifest(store_path)
+            if m is not None and "storage_format_version" in m:
+                resolved_format = str(m["storage_format_version"])
+            else:
+                resolved_format = "v2_unsharded"
+        except Exception:
+            resolved_format = "v2_unsharded"
+
+    # Sharded v1 format: 1 shard container per variable per region (14 objects total)
+    if resolved_format == "sharded_v1":
+        # Resolve lead_time_hours if not provided
+        lead_val = lead_time_hours
+        if lead_val is None:
+            try:
+                from ingestion.core.zarr_writer import read_dataset
+                ds = read_dataset(store_path)
+                if "lead_time_hours" in ds.coords:
+                    vals = np.atleast_1d(ds.coords["lead_time_hours"].values).reshape(-1)
+                    if 0 <= lead_index < len(vals):
+                        lead_val = int(vals[lead_index])
+            except Exception:
+                pass
+        if lead_val is None:
+            lead_val = lead_index
+
+        out_shards: list[str] = []
+        for var in sorted(data_var_paths):
+            if member is not None:
+                out_shards.append(f"{var}/shard.mem{member:03d}_L{lead_val:04d}.shard")
+            else:
+                out_shards.append(f"{var}/shard.det_L{lead_val:04d}.shard")
+        return sorted(set(out_shards))
+
+    # Legacy Zarr v2 unsharded: ~1,680 individual chunk objects
     out: list[str] = []
     for array_path in data_var_paths:
         za: dict[str, object] | None

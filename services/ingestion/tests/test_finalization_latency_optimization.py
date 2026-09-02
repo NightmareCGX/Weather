@@ -220,6 +220,8 @@ def _populate_mock_region(
         store_path,
         member=member,
         lead_index=lead_index,
+        lead_time_hours=lead,
+        format_version="sharded_v1",
         data_var_paths=["temperature_2m", "precipitation_rate"],
     )
 
