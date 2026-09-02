@@ -82,3 +82,19 @@ def manifest_generation(store_path: str) -> str | None:
     if not isinstance(generation, str) or not generation:
         raise ManifestReadError("committed manifest has no valid generation")
     return generation
+
+
+def manifest_storage_format(store_path: str) -> str:
+    """Return the storage_format_version declared in the committed manifest.
+
+    Returns:
+        The format version string (e.g. 'sharded_v1'), or 'v2_unsharded' when
+        the manifest is missing or does not declare a format version.
+    """
+    try:
+        payload = _read_manifest(store_path)
+        if payload is None:
+            return "v2_unsharded"
+        return str(payload.get("storage_format_version") or "v2_unsharded")
+    except Exception:  # noqa: BLE001 - unreadable manifest -> default legacy
+        return "v2_unsharded"
