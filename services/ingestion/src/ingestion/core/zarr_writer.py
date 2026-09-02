@@ -872,31 +872,38 @@ def _populate_sharded_data(
     lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
     lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
 
-    for var_name in list(dataset.data_vars):
-        shard_keys: list[tuple[str, int | None, int]] = []
-        if is_s3 and fs is not None:
-            full_prefix = f"{root}/{var_name}"
-            try:
-                for item in fs.find(full_prefix):
-                    rel = item[len(root) + 1 :]
-                    if rel.endswith(".shard"):
-                        fname = rel.rsplit("/", 1)[-1]
-                        member_val, lead_val = _parse_shard_filename(fname)
-                        shard_keys.append((rel, member_val, lead_val))
-            except Exception:
-                pass
-        else:
-            var_dir = os.path.join(root, var_name)
+    shards_by_var: dict[str, list[tuple[str, int | None, int]]] = {}
+    if is_s3 and fs is not None:
+        try:
+            for item in fs.find(root):
+                rel = item[len(root) + 1 :]
+                if rel.endswith(".shard") and "/" in rel:
+                    vname, fname = rel.split("/", 1)
+                    member_val, lead_val = _parse_shard_filename(fname)
+                    shards_by_var.setdefault(vname, []).append((rel, member_val, lead_val))
+        except Exception:
+            pass
+    else:
+        for vname in dataset.data_vars:
+            var_dir = os.path.join(root, str(vname))
             if os.path.isdir(var_dir):
                 for fname in os.listdir(var_dir):
                     if fname.endswith(".shard"):
                         member_val, lead_val = _parse_shard_filename(fname)
-                        shard_keys.append((f"{var_name}/{fname}", member_val, lead_val))
+                        shards_by_var.setdefault(str(vname), []).append(
+                            (f"{vname}/{fname}", member_val, lead_val)
+                        )
 
+    if not shards_by_var:
+        return dataset
+
+    for var_name in list(dataset.data_vars):
+        shard_keys = shards_by_var.get(str(var_name), [])
         if not shard_keys:
             continue
 
-        var_arr = np.copy(dataset[var_name].values)
+        fill_val = np.nan if np.issubdtype(dataset[var_name].dtype, np.floating) else 0
+        var_arr = np.full(dataset[var_name].shape, fill_val, dtype=dataset[var_name].dtype)
         has_member = "member" in dataset[var_name].dims
         has_lead = "lead_time_hours" in dataset[var_name].dims
 
