@@ -93,8 +93,8 @@ def test_small_queue_pool_stress_with_high_logical_concurrency(
     )
     monkeypatch.setattr("ingestion.core.config.settings", custom_settings)
 
-    import ingestion.cli as CLI
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: small_pool_engine)
+    import ingestion.core.wave_runner as wave_runner
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: small_pool_engine)
 
     # Fast download mock
     async def _mock_download(self, model, cycle_date, cycle_hour, lead, destination, **kwargs):
@@ -121,7 +121,7 @@ def test_small_queue_pool_stress_with_high_logical_concurrency(
         model="gfs",
         cycle_date=date(2026, 7, 21),
         cycle_hour=0,
-        lead_time_hours=leads,
+        target_lead_time_hours=leads,
         store=store_path,
         allow_custom_store=True,
     )

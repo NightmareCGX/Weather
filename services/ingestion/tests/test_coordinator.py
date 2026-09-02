@@ -53,9 +53,9 @@ def catalog_engine(tmp_path):
 @pytest.fixture
 def cli_catalog(catalog_engine, monkeypatch):
     """Route the CLI's catalog access to the SQLite catalog engine."""
-    import ingestion.cli as CLI
+    import ingestion.core.wave_runner as wave_runner
 
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: catalog_engine)
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: catalog_engine)
     # Also route the coordinator's worker connections to the SQLite engine so
     # the advisory locks... but SQLite has no advisory locks. The coordinator's
     # locks module requires PG. For the catalog-path tests we mock the lock
@@ -126,7 +126,7 @@ def test_retained_seed_initializes_store_and_catalogs(
 
     run_spec = RunSpec(
         model="gfs", cycle_date=date(2026, 7, 21), cycle_hour=0,
-        lead_time_hours=(6,), members=(), store=store_path, allow_custom_store=True,
+        target_lead_time_hours=(6,), members=(), store=store_path, allow_custom_store=True,
     )
     spec = _build_spec(
         run_spec,

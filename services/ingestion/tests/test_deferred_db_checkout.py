@@ -82,8 +82,8 @@ def test_db_checkout_deferred_past_decode_and_normalization(
     real_engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
     CatalogBase.metadata.create_all(real_engine)
 
-    import ingestion.cli as CLI
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: real_engine)
+    import ingestion.core.wave_runner as wave_runner
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: real_engine)
 
     real_connect = real_engine.connect
 
@@ -132,7 +132,7 @@ def test_db_checkout_deferred_past_decode_and_normalization(
         model="gfs",
         cycle_date=date(2026, 7, 21),
         cycle_hour=0,
-        lead_time_hours=(6, 12),
+        target_lead_time_hours=(6, 12),
         store=store_path,
         allow_custom_store=True,
     )

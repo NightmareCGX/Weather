@@ -116,8 +116,8 @@ def test_write_semaphore_bounds_active_writers(tmp_path: Path, monkeypatch) -> N
     test_engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
     CatalogBase.metadata.create_all(test_engine)
 
-    import ingestion.cli as CLI
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: test_engine)
+    import ingestion.core.wave_runner as wave_runner
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: test_engine)
 
     store_path = str(tmp_path / "test.zarr")
     leads = (0, 3, 6, 9, 12, 15, 18, 21)
@@ -125,7 +125,7 @@ def test_write_semaphore_bounds_active_writers(tmp_path: Path, monkeypatch) -> N
         model="gfs",
         cycle_date=date(2026, 7, 21),
         cycle_hour=0,
-        lead_time_hours=leads,
+        target_lead_time_hours=leads,
         store=store_path,
         allow_custom_store=True,
     )

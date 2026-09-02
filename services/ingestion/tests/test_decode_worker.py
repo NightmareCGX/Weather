@@ -439,7 +439,7 @@ class _NoopLockCoordinator:
 
 def _install_cli_stubs(monkeypatch, engine):
     """Mock download/routing for a CLI run (mirrors test_cli helpers)."""
-    import ingestion.cli as CLI
+    import ingestion.core.wave_runner as wave_runner
 
     def _download_gefs_member(
         self,
@@ -540,7 +540,7 @@ def _install_cli_stubs(monkeypatch, engine):
         "ingestion.providers.noaa.connector.NOAAConnector.download_idx",
         _fake_download_idx,
     )
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: engine)
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: engine)
     monkeypatch.setattr(
         "ingestion.core.coordinator.StoreLockCoordinator", _NoopLockCoordinator
     )
@@ -614,7 +614,7 @@ def test_cli_broken_decode_pool_no_false_ready(tmp_path, monkeypatch) -> None:
         return real(future, catalog_spec)
 
     monkeypatch.setattr(
-        "ingestion.cli._decode_and_normalize", _flaky_decode_and_normalize
+        "ingestion.core.wave_runner._decode_and_normalize", _flaky_decode_and_normalize
     )
 
     from ingestion.cli import main

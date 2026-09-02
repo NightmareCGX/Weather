@@ -377,7 +377,21 @@ def test_mixed_batch_gfs_multi_lead_merges_into_deterministic_store(
 
     restored = read_dataset(store)
     assert "member" not in restored.coords
-    assert sorted(int(v) for v in restored.coords["lead_time_hours"].values) == [0, 12, 24, 36, 48]
+    # Phase 5B: _build_spec pre-allocates the store axis with the CANONICAL
+    # cycle horizon (0..240 @ 3h), not the batch's requested lead subset.
+    from domain.horizon import canonical_lead_time_hours
+
+    assert sorted(int(v) for v in restored.coords["lead_time_hours"].values) == list(
+        canonical_lead_time_hours("gfs")
+    )
+    # The committed DATA is exactly the batch's requested leads; every other
+    # horizon lead stays NaN.
+    field = restored["temperature_2m"]
+    has = field.notnull().any(dim=("latitude", "longitude"))
+    committed = {
+        int(v) for i, v in enumerate(restored.coords["lead_time_hours"].values) if bool(has.values[i])
+    }
+    assert committed == {0, 12, 24, 36, 48}
     for var in restored.data_vars:
         assert restored[var].dims == ("lead_time_hours", "latitude", "longitude")
 

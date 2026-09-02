@@ -22,7 +22,7 @@ def test_concurrency_derivation_standard_values() -> None:
         DB_POOL_SIZE=10,
     )
 
-    with patch("ingestion.cli._detect_effective_cpus", return_value=8):
+    with patch("ingestion.core.wave_runner._detect_effective_cpus", return_value=8):
         # 1. Low concurrency (4)
         p4 = _resolve_concurrency_plan(4, settings)
         assert p4.requested == 4
@@ -72,7 +72,7 @@ def test_concurrency_derivation_cpu_capping() -> None:
         DB_POOL_SIZE=10,
     )
     # When host has only 2 CPUs, decode_concurrency is capped at 2 even if requested=16
-    with patch("ingestion.cli._detect_effective_cpus", return_value=2):
+    with patch("ingestion.core.wave_runner._detect_effective_cpus", return_value=2):
         plan = _resolve_concurrency_plan(16, settings)
         assert plan.decode_concurrency == 2
         assert plan.download_concurrency == 16

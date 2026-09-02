@@ -196,7 +196,7 @@ def _install_download_and_catalog(
     to the SQLite ``session``'s bind, and no-ops the advisory-lock coordinator
     (SQLite has no PostgreSQL advisory locks).
     """
-    import ingestion.cli as CLI
+    import ingestion.core.wave_runner as wave_runner
 
     monkeypatch.setattr(
         "ingestion.providers.noaa.connector.NOAAConnector.download",
@@ -207,7 +207,7 @@ def _install_download_and_catalog(
         _fake_download_idx,
     )
     # Route the CLI's catalog engine to the SQLite session's bind.
-    monkeypatch.setattr(CLI, "_catalog_session_factory", lambda: session.bind)
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: session.bind)
     # No-op the lock coordinator for SQLite.
     monkeypatch.setattr(
         "ingestion.core.coordinator.StoreLockCoordinator", _NoopLockCoordinator
@@ -261,7 +261,7 @@ def _run_cli(argv: list[str], session: Session, monkeypatch) -> None:
     # The coordinator path records the run via the injectable catalog engine.
     runs = session.query(ModelRunRecord).all()
     assert len(runs) == 1
-    assert runs[0].status == "ready"
+    assert runs[0].status == "partial"  # single-lead target: canonical 81-lead horizon incomplete
 
 
 def test_cli_ingest_end_to_end(session: Session, tmp_path, monkeypatch) -> None:
@@ -295,10 +295,10 @@ def test_cli_ingest_end_to_end(session: Session, tmp_path, monkeypatch) -> None:
     assert session.query(CenterRecord).count() == 1
 
     # The run id encodes the model + UTC cycle, so it proves the cycle was
-    # normalized to UTC and the run is ready.
+    # normalized to UTC; status is partial because one lead of the canonical horizon is committed.
     run = session.query(ModelRunRecord).one()
     assert run.id == "run_version_gfs_v1.0_202607210000_gfs"
-    assert run.status == "ready"
+    assert run.status == "partial"
     assert run.cycle_time.year == 2026
     assert run.cycle_time.month == 7
     assert run.cycle_time.day == 21
@@ -336,7 +336,7 @@ def test_cli_ingest_custom_variables(session: Session, tmp_path, monkeypatch) ->
         monkeypatch,
     )
     run = session.query(ModelRunRecord).one()
-    assert run.status == "ready"
+    assert run.status == "partial"
 
 
 def test_cli_rejects_bad_variable_spec(session: Session, tmp_path, monkeypatch) -> None:
@@ -395,7 +395,7 @@ def test_cli_lead_time_matches_file_succeeds(
         monkeypatch,
     )
     run = session.query(ModelRunRecord).one()
-    assert run.status == "ready"
+    assert run.status == "partial"
 
 
 def test_cli_lead_time_mismatch_fails_run(
@@ -1030,9 +1030,9 @@ def test_cli_cleanup_swallows_permission_error(
         session,
         monkeypatch,
     )
-    # The run must still be marked ready and succeed with exit code 0
+    # The run must succeed with exit code 0 and stay partial (canonical horizon incomplete)
     run = session.query(ModelRunRecord).one()
-    assert run.status == "ready"
+    assert run.status == "partial"
 
 
 def test_cli_cleanup_idempotent_on_missing_file(tmp_path: Path) -> None:
@@ -1350,13 +1350,13 @@ def test_destination_for_date_isolation(tmp_path: Path) -> None:
         model="gfs",
         cycle_date=date(2026, 8, 24),
         cycle_hour=0,
-        lead_time_hours=(6,),
+        target_lead_time_hours=(6,),
     )
     spec2 = RunSpec(
         model="gfs",
         cycle_date=date(2026, 8, 25),
         cycle_hour=0,
-        lead_time_hours=(6,),
+        target_lead_time_hours=(6,),
     )
     p1 = _destination_for(spec1, tmp_path, lead=6)
     p2 = _destination_for(spec2, tmp_path, lead=6)
@@ -1511,7 +1511,7 @@ def test_finalize_run_returns_final_authoritative_committed_regions(
         from ingestion.cli import _resolve_run_id
 
         monkeypatch.setattr(
-            "ingestion.cli._catalog_session_factory", lambda: session.bind
+            "ingestion.core.wave_runner._catalog_session_factory", lambda: session.bind
         )
         run_id = _resolve_run_id(spec, store)
 
@@ -1621,7 +1621,7 @@ def test_staging_dir_rmdir_failure_is_non_fatal(
         monkeypatch,
     )
     run = session.query(ModelRunRecord).one()
-    assert run.status == "ready"
+    assert run.status == "partial"
 
 
 def test_keep_downloads_preserves_staging_dir(
@@ -1935,7 +1935,7 @@ def test_finalization_gate_on_cancellation(
     recorded: list[ModelRunRecord] = []
     _install_download_and_catalog(monkeypatch, session, recorded)
     monkeypatch.setattr(
-        "ingestion.cli._validate_requested_lead", lambda ds, lead: None
+        "ingestion.core.wave_runner._validate_requested_lead", lambda ds, lead: None
     )
 
     worker_in_write = threading.Event()

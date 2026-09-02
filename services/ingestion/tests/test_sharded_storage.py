@@ -302,7 +302,7 @@ def test_sharded_v1_pipeline_concurrent_wave_regression(
         return dest
 
     monkeypatch.setattr("ingestion.providers.noaa.connector.NOAAConnector.download", _mock_download)
-    monkeypatch.setattr("ingestion.cli._catalog_session_factory", lambda: engine)
+    monkeypatch.setattr("ingestion.core.wave_runner._catalog_session_factory", lambda: engine)
     monkeypatch.setattr("ingestion.core.coordinator.StoreLockCoordinator", _NoopLocks)
 
     recorded = []
