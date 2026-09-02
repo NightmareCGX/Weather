@@ -1585,9 +1585,11 @@ async def _run_wave(
                 )
 
         # 5. Aggregate drain: wait for all outer pipeline tasks
+        tracker.record_milestone("post_write_task_gather_start")
         results, cancelled = await await_all_workers_non_abandoning(
             pipeline_tasks, cancel_event
         )
+        tracker.record_milestone("post_write_task_gather_complete")
         for res in results:
             if isinstance(res, BaseException) and not isinstance(
                 res, asyncio.CancelledError
@@ -1602,6 +1604,9 @@ async def _run_wave(
                 raise RuntimeError(
                     "Finalization gate invariant violated: active executor worker detected"
                 )
+
+        tracker.record_milestone("download_client_close_start")
+    tracker.record_milestone("download_client_close_complete")
 
     # 7. Coalesced finalization (after all worker Futures drained).
     tracker.on_finalize_start()

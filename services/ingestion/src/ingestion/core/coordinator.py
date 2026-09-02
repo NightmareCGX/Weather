@@ -78,7 +78,6 @@ from ingestion.core.pipeline import (
 )
 from ingestion.core.zarr_writer import (
     prepare_run_store,
-    read_dataset,
     store_exists,
 )
 
@@ -222,8 +221,12 @@ class RunCoordinator:
 
     def _lead_index_for(self, lead: int) -> int:
         """Return the positional lead index, caching per lead value."""
+        if self._snapshot is not None and lead in self._snapshot.lead_index_map:
+            return self._snapshot.lead_index_map[lead]
         if lead not in self._lead_index_cache:
-            self._lead_index_cache[lead] = _lead_index_in_store(self.store_path, lead)
+            self._lead_index_cache.update(_load_lead_indices_in_store(self.store_path))
+        if lead not in self._lead_index_cache:
+            raise ValueError(f"lead {lead} not found in store {self.store_path!r}")
         return self._lead_index_cache[lead]
 
     def _build_snapshot(self) -> StoreMetadataSnapshot:
@@ -231,8 +234,10 @@ class RunCoordinator:
         from ingestion.core.inventory import _read_zarray, _read_zattrs
         from ingestion.core.pipeline import _resolve_cycle_time
         from ingestion.core.markers import read_manifest
+        from ingestion.core.zarr_writer import _resolve_store
 
-        ds = read_dataset(self.store_path)
+        resolved = _resolve_store(self.store_path)
+        ds = xr.open_zarr(resolved, consolidated=False)
         manifest = read_manifest(self.store_path)
         gen = str(manifest.get("generation")) if manifest and manifest.get("generation") else None
 
@@ -267,6 +272,7 @@ class RunCoordinator:
         grid_shape = (int(lat_len), int(lon_len))
         cycle_time = _resolve_cycle_time(ds)
         model_id = str(ds.attrs.get("model_id")) if "model_id" in ds.attrs else None
+        ds.close()
 
         return StoreMetadataSnapshot(
             store_path=self.store_path,
@@ -332,8 +338,12 @@ class RunCoordinator:
                 # Existing store: validate identity only; the region worker's
                 # _commit_region performs schema validation after expanding the
                 # lead/member dims (the raw seed is 2-D (lat, lon) until then).
-                existing = read_dataset(self.store_path)
+                from ingestion.core.zarr_writer import _resolve_store
+
+                resolved = _resolve_store(self.store_path)
+                existing = xr.open_zarr(resolved, consolidated=False)
                 _validate_store_identity(seed_dataset, existing, self.store_path)
+                existing.close()
                 if run_id is not None and is_same_cycle:
                     with Session(bind=conn) as db:
                         set_run_partial(db, run_id)
@@ -694,7 +704,7 @@ class RunCoordinator:
             if observer is not None and hasattr(observer, "record_milestone"):
                 observer.record_milestone("marker_read_validation_start")
 
-            data_var_paths = _store_data_var_paths(self.store_path)
+            data_var_paths = _store_data_var_paths(self.store_path, snapshot=self._snapshot)
             existing_objects: set[str] | None = None
             if verify_full_inventory:
                 from ingestion.core.inventory import build_object_inventory
@@ -720,13 +730,20 @@ class RunCoordinator:
                         self._zattrs_cache[array_path] = zat
 
             if not self._member_index_cache and spec.is_ensemble:
-                try:
-                    ds = read_dataset(self.store_path)
-                    if "member" in ds.coords:
-                        member_vals = np.atleast_1d(ds.coords["member"].values).reshape(-1)
-                        self._member_index_cache = {int(v): i for i, v in enumerate(member_vals)}
-                except Exception:
-                    pass
+                if self._snapshot is not None and self._snapshot.member_index_map:
+                    self._member_index_cache = dict(self._snapshot.member_index_map)
+                else:
+                    try:
+                        from ingestion.core.zarr_writer import _resolve_store
+
+                        resolved = _resolve_store(self.store_path)
+                        ds = xr.open_zarr(resolved, consolidated=False)
+                        if "member" in ds.coords:
+                            member_vals = np.atleast_1d(ds.coords["member"].values).reshape(-1)
+                            self._member_index_cache = {int(v): i for i, v in enumerate(member_vals)}
+                        ds.close()
+                    except Exception:
+                        pass
 
             committed: dict[str, str] = {}  # region_id -> generation
             updating: list[str] = []
@@ -756,6 +773,7 @@ class RunCoordinator:
             # Phase 3: Manifest Generation & Write
             if observer is not None and hasattr(observer, "record_milestone"):
                 observer.record_milestone("manifest_write_start")
+                observer.record_milestone("manifest_payload_build_start")
 
             # Hybrid mode: marker-less regions use the legacy rule.
             legacy_evidence: list[str] = []
@@ -772,7 +790,9 @@ class RunCoordinator:
                 "cycle_time": spec.cycle_time.isoformat(),
                 "is_ensemble": spec.is_ensemble,
             }
-            store_schema_fp = _store_schema_fingerprint(self.store_path)
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("manifest_fingerprint_start")
+            store_schema_fp = _store_schema_fingerprint(self.store_path, snapshot=self._snapshot)
             legacy_fp = (
                 region_evidence_fingerprint(self.store_path, legacy_evidence)
                 if mode in (LEGACY, HYBRID)
@@ -786,6 +806,8 @@ class RunCoordinator:
             )
             committed_fp = sha256_hex("committed", *sorted(committed.keys()))
             markers_fp = sha256_hex("markers", *sorted(marker_keys))
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("manifest_fingerprint_complete")
 
             existing_manifest = read_manifest(self.store_path)
             if (
@@ -809,9 +831,14 @@ class RunCoordinator:
                 "region_marker_set_fingerprint": markers_fp,
                 "legacy_region_evidence_fingerprint": legacy_fp,
             }
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("manifest_payload_build_complete")
+                observer.record_milestone("manifest_put_start")
+
             write_manifest(self.store_path, payload)
 
             if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("manifest_put_complete")
                 observer.record_milestone("manifest_write_complete")
 
             # Phase 4: Catalog Reconciliation & Status Commit
@@ -1049,7 +1076,7 @@ class RunCoordinator:
                 "cycle_time": spec.cycle_time.isoformat(),
                 "is_ensemble": spec.is_ensemble,
             }
-            store_schema_fp = _store_schema_fingerprint(self.store_path)
+            store_schema_fp = _store_schema_fingerprint(self.store_path, snapshot=self._snapshot)
             generation = _new_generation()
             manifest_payload = {
                 "manifest_schema_version": 1,
@@ -1117,8 +1144,23 @@ class RunCoordinator:
             lead_index = self._lead_index_for(lead)
             data_var_paths = sorted({k.split("/")[0] for k in required + omitted})
             if not data_var_paths:
-                data_var_paths = _store_data_var_paths(self.store_path)
+                data_var_paths = _store_data_var_paths(self.store_path, snapshot=self._snapshot)
             is_sharded = any(k.endswith(".shard") for k in required + omitted)
+            zarray_cache = (
+                self._snapshot.zarray_by_var
+                if self._snapshot is not None and self._snapshot.store_path == self.store_path
+                else self._zarray_cache
+            )
+            zattrs_cache = (
+                self._snapshot.zattrs_by_var
+                if self._snapshot is not None and self._snapshot.store_path == self.store_path
+                else self._zattrs_cache
+            )
+            member_index_cache = (
+                self._snapshot.member_index_map
+                if self._snapshot is not None and self._snapshot.store_path == self.store_path
+                else self._member_index_cache
+            )
             expected_keys = region_expected_object_keys(
                 self.store_path,
                 member=member,
@@ -1126,9 +1168,9 @@ class RunCoordinator:
                 lead_time_hours=lead,
                 format_version="sharded_v1" if is_sharded else "v2_unsharded",
                 data_var_paths=data_var_paths,
-                zarray_cache=self._zarray_cache,
-                zattrs_cache=self._zattrs_cache,
-                member_index_cache=self._member_index_cache,
+                zarray_cache=zarray_cache,
+                zattrs_cache=zattrs_cache,
+                member_index_cache=member_index_cache,
             )
             validate_marker_evidence(
                 self.store_path,
@@ -1168,7 +1210,7 @@ class RunCoordinator:
                 pairs.add((member, lead))
         # The store's real variable set (used for catalog ↔ store variable
         # honesty during reconciliation). Read once from the store's schema.
-        store_vars = set(_store_data_var_paths(self.store_path))
+        store_vars = set(_store_data_var_paths(self.store_path, snapshot=self._snapshot))
         if self.spec.is_ensemble:
             members = {m for m, _ in pairs}
             return CommittedState.ensemble(pairs, members, variables=store_vars)
@@ -1265,18 +1307,32 @@ def _read_marker_payloads_bounded(
         return list(zip(marker_keys, payloads, strict=True))
 
 
+def _load_lead_indices_in_store(store_path: str) -> dict[int, int]:
+    """Load all positional lead indices from the store's coordinate axis in one read."""
+    from ingestion.core.zarr_writer import _resolve_store
+    import zarr  # type: ignore[import-untyped]
+
+    resolved = _resolve_store(store_path)
+    try:
+        ds = xr.open_zarr(resolved, consolidated=False)
+        values = ds.coords["lead_time_hours"].values
+        ds.close()
+    except Exception:
+        root = zarr.open_group(resolved, mode="r")
+        values = root["lead_time_hours"][:]
+    flat = np.atleast_1d(values).reshape(-1)
+    return {int(v): i for i, v in enumerate(flat)}
+
+
 def _lead_index_in_store(store_path: str, lead_time_hours: int) -> int:
     """Return the positional index of a lead in the store's coordinate axis."""
-    ds = read_dataset(store_path)
-    values = ds.coords["lead_time_hours"].values
-    flat = np.atleast_1d(values).reshape(-1)
-    for i, value in enumerate(flat):
-        if int(value) == int(lead_time_hours):
-            return i
-    raise ValueError(
-        f"lead {lead_time_hours} not found in store coordinate "
-        f"lead_time_hours: {[int(v) for v in flat]}"
-    )
+    indices = _load_lead_indices_in_store(store_path)
+    if lead_time_hours not in indices:
+        raise ValueError(
+            f"lead {lead_time_hours} not found in store coordinate "
+            f"lead_time_hours: {sorted(indices.keys())}"
+        )
+    return indices[lead_time_hours]
 
 
 def _write_set_fingerprint(dataset: xr.Dataset) -> str:
@@ -1297,22 +1353,51 @@ def _omitted_fill_chunks(dataset: xr.Dataset) -> list[str]:
     return []
 
 
-def _store_data_var_paths(store_path: str) -> list[str]:
+def _store_data_var_paths(
+    store_path: str, snapshot: StoreMetadataSnapshot | None = None
+) -> list[str]:
     """Return the data-variable array paths present in the store."""
+    if snapshot is not None and snapshot.store_path == store_path:
+        return list(snapshot.data_var_paths)
     try:
-        ds = read_dataset(store_path)
-        return sorted(str(v) for v in ds.data_vars)
+        from ingestion.core.zarr_writer import _resolve_store
+        import zarr
+
+        resolved = _resolve_store(store_path)
+        root = zarr.open_group(resolved, mode="r")
+        non_data = {"lead_time_hours", "latitude", "longitude", "member", "time"}
+        return sorted(str(k) for k in root.keys() if str(k) not in non_data)
     except Exception:  # noqa: BLE001 - unreadable store -> empty
         return []
 
 
-def _store_schema_fingerprint(store_path: str) -> str:
-    try:
-        ds = read_dataset(store_path)
+def _store_schema_fingerprint(
+    store_path: str, snapshot: StoreMetadataSnapshot | None = None
+) -> str:
+    if snapshot is not None and snapshot.store_path == store_path:
+        coords = sorted(
+            list(snapshot.coords_values.keys())
+            + (["member"] if snapshot.is_ensemble else [])
+            + ["lead_time_hours"]
+        )
         return sha256_hex(
             "schema",
-            *sorted(str(c) for c in ds.coords),
-            *sorted(str(v) for v in ds.data_vars),
+            *coords,
+            *sorted(snapshot.data_var_paths),
+        )
+    try:
+        from ingestion.core.zarr_writer import _resolve_store
+        import zarr
+
+        resolved = _resolve_store(store_path)
+        root = zarr.open_group(resolved, mode="r")
+        coord_keys = {"lead_time_hours", "latitude", "longitude", "member", "time"}
+        coords = sorted(str(k) for k in root.keys() if str(k) in coord_keys)
+        vars = sorted(str(k) for k in root.keys() if str(k) not in coord_keys)
+        return sha256_hex(
+            "schema",
+            *coords,
+            *vars,
         )
     except Exception:  # noqa: BLE001
         return sha256_hex("schema-unreadable")

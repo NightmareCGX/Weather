@@ -281,15 +281,27 @@ def _member_positional_index(
     if member_index_cache is not None and member in member_index_cache:
         return member_index_cache[member]
     try:
-        from ingestion.core.zarr_writer import read_dataset
+        from ingestion.core.zarr_writer import _resolve_store
+        import xarray as xr
+        import zarr  # type: ignore[import-untyped]
 
-        ds = read_dataset(store_path)
-        if "member" in ds.coords:
-            values = ds.coords["member"].values
-            flat = list(values)
-            for i, value in enumerate(flat):
-                if int(value) == int(member):
-                    return i
+        resolved = _resolve_store(store_path)
+        try:
+            ds = xr.open_zarr(resolved, consolidated=False)
+            if "member" in ds.coords:
+                values = ds.coords["member"].values
+                flat = list(values)
+                for i, value in enumerate(flat):
+                    if int(value) == int(member):
+                        return i
+            ds.close()
+        except Exception:
+            root = zarr.open_group(resolved, mode="r")
+            if "member" in root:
+                values = root["member"][:]
+                for i, value in enumerate(values):
+                    if int(value) == int(member):
+                        return i
     except Exception:  # noqa: BLE001 - fall back to identity-1
         pass
     return max(0, member - 1)

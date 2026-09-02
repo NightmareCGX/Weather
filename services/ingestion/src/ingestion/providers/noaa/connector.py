@@ -87,14 +87,22 @@ class NOAAConnector(BaseConnector):
         self._settings = conn_settings or settings
         max_connections = int(getattr(self._settings, "HTTP_MAX_CONNECTIONS", 100))
         max_keepalive = int(getattr(self._settings, "HTTP_MAX_KEEPALIVE_CONNECTIONS", 50))
-        keepalive_expiry = float(getattr(self._settings, "HTTP_KEEPALIVE_EXPIRY_SECONDS", 30.0))
+        keepalive_expiry = float(getattr(self._settings, "HTTP_KEEPALIVE_EXPIRY_SECONDS", 5.0))
         limits = httpx.Limits(
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive,
             keepalive_expiry=keepalive_expiry,
         )
+        timeout_val = float(getattr(self._settings, "REQUEST_TIMEOUT_SECONDS", 30.0))
+        timeout = httpx.Timeout(
+            timeout=timeout_val,
+            connect=min(10.0, timeout_val),
+            read=min(20.0, timeout_val),
+            write=min(15.0, timeout_val),
+            pool=min(10.0, timeout_val),
+        )
         self._client = httpx.AsyncClient(
-            timeout=self._settings.REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
             headers={"User-Agent": self._settings.NOAA_USER_AGENT},
             limits=limits,
         )
