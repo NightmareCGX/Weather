@@ -636,11 +636,247 @@ def gated_point_interpolations(
     materializes only that tiny window. Returns ``{var_code: value}``, or
     ``None`` if the store is unreadable (caller drops the record).
     """
+    from api.core.manifest_reader import manifest_generation, manifest_storage_format
     from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.core.zarr import get_sharded_reader
 
     def select_and_interpolate(dataset: xr.Dataset) -> dict[str, Any]:
         grid, lat_desc, lon_desc = _derive_grid(dataset)
-        out: dict[str, Any] = {}
+        format_version = manifest_storage_format(store_path)
+        generation = manifest_generation(store_path)
+
+        if format_version == "sharded_v1":
+            reader = get_sharded_reader(store_path)
+            if grid.rows < 2 or grid.cols < 2:
+                raise InvalidGridError(
+                    "Bilinear interpolation requires at least two rows and two columns; "
+                    f"grid is {grid.rows} x {grid.cols}."
+                )
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+            row_0 = math.floor(row_f)
+            col_0 = math.floor(col_f)
+            if row_0 == grid.rows - 1:
+                row_0 = grid.rows - 2
+            if col_0 == grid.cols - 1:
+                col_0 = grid.cols - 2
+            row_1, col_1 = row_0 + 1, col_0 + 1
+            t_row = row_f - row_0
+            t_col = col_f - col_0
+
+            def _stored(value: int, size: int, descending: bool) -> int:
+                return (size - 1 - value) if descending else value
+
+            lat_size = int(dataset.sizes["latitude"])
+            lon_size = int(dataset.sizes["longitude"])
+            lat_idx = [_stored(row_0, lat_size, lat_desc), _stored(row_1, lat_size, lat_desc)]
+            lon_idx = [_stored(col_0, lon_size, lon_desc), _stored(col_1, lon_size, lon_desc)]
+
+            out: dict[str, Any] = {}
+            for var_code in var_codes:
+                if var_code == "wind_10m":
+                    if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Variable 'wind_10m' requires 'wind_u_10m' and 'wind_v_10m' in the forecast dataset.",
+                        )
+                    u_val = float(
+                        reader.interpolate_point(
+                            "wind_u_10m",
+                            member=None,
+                            lead_time_hours=lead,
+                            lat_idx=lat_idx,
+                            lon_idx=lon_idx,
+                            t_row=t_row,
+                            t_col=t_col,
+                            generation=generation,
+                        )
+                    )
+                    v_val = float(
+                        reader.interpolate_point(
+                            "wind_v_10m",
+                            member=None,
+                            lead_time_hours=lead,
+                            lat_idx=lat_idx,
+                            lon_idx=lon_idx,
+                            t_row=t_row,
+                            t_col=t_col,
+                            generation=generation,
+                        )
+                    )
+                    speed_mps = math.hypot(u_val, v_val)
+                    speed_kmh = speed_mps * 3.6
+                    direction_deg = derive_meteorological_direction(
+                        u_val, v_val, calm_threshold=CALM_WIND_THRESHOLD_MPS
+                    )
+                    cardinal_str = get_cardinal_direction(direction_deg) if direction_deg is not None else "CALM"
+                    out["wind_10m"] = speed_kmh
+                    out["_wind_direction_10m"] = direction_deg if direction_deg is not None else float("nan")
+                    out["_wind_cardinal_10m"] = cardinal_str
+                    continue
+
+                if var_code == "precipitation_amount_3h":
+                    if "precipitation_amount_3h" not in dataset.data_vars:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Variable 'precipitation_amount_3h' is not available in the forecast dataset.",
+                        )
+                    amt_val = float(
+                        reader.interpolate_point(
+                            "precipitation_amount_3h",
+                            member=None,
+                            lead_time_hours=lead,
+                            lat_idx=lat_idx,
+                            lon_idx=lon_idx,
+                            t_row=t_row,
+                            t_col=t_col,
+                            generation=generation,
+                        )
+                    )
+                    out["precipitation_amount_3h"] = amt_val
+
+                    flags_curr: dict[str, int] = {}
+                    for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                        if f_code in dataset.data_vars:
+                            f_val = float(
+                                reader.interpolate_point(
+                                    f_code,
+                                    member=None,
+                                    lead_time_hours=lead,
+                                    lat_idx=lat_idx,
+                                    lon_idx=lon_idx,
+                                    t_row=t_row,
+                                    t_col=t_col,
+                                    generation=generation,
+                                )
+                            )
+                            flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+
+                    t2m_val: float | None = None
+                    if "temperature_2m" in dataset.data_vars:
+                        t2m_val = float(
+                            reader.interpolate_point(
+                                "temperature_2m",
+                                member=None,
+                                lead_time_hours=lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
+                        )
+
+                    amt_prev: float | None = None
+                    flags_prev: dict[str, int] | None = None
+                    t2m_start: float | None = None
+
+                    if lead % 6 == 0 and lead > 0:
+                        pred_lead = lead - 3
+                        leads_in_ds = [
+                            int(v)
+                            for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+                        ]
+                        if pred_lead in leads_in_ds:
+                            amt_prev = float(
+                                reader.interpolate_point(
+                                    "precipitation_amount_3h",
+                                    member=None,
+                                    lead_time_hours=pred_lead,
+                                    lat_idx=lat_idx,
+                                    lon_idx=lon_idx,
+                                    t_row=t_row,
+                                    t_col=t_col,
+                                    generation=generation,
+                                )
+                            )
+                            f_prev = {}
+                            for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                                if f_code in dataset.data_vars:
+                                    f_p_val = float(
+                                        reader.interpolate_point(
+                                            f_code,
+                                            member=None,
+                                            lead_time_hours=pred_lead,
+                                            lat_idx=lat_idx,
+                                            lon_idx=lon_idx,
+                                            t_row=t_row,
+                                            t_col=t_col,
+                                            generation=generation,
+                                        )
+                                    )
+                                    f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
+                            if f_prev:
+                                flags_prev = f_prev
+
+                            if "temperature_2m" in dataset.data_vars:
+                                t2m_start = float(
+                                    reader.interpolate_point(
+                                        "temperature_2m",
+                                        member=None,
+                                        lead_time_hours=pred_lead,
+                                        lat_idx=lat_idx,
+                                        lon_idx=lon_idx,
+                                        t_row=t_row,
+                                        t_col=t_col,
+                                        generation=generation,
+                                    )
+                                )
+
+                    phase_state = classify_precipitation_phase(
+                        amt_val,
+                        flags_curr if flags_curr else None,
+                        amount_prev=amt_prev,
+                        flags_prev=flags_prev,
+                        t2m_start=t2m_start,
+                        t2m_end=t2m_val,
+                    )
+                    out["_precipitation_type"] = phase_state.interval_type.value
+                    out["_precipitation_transition"] = phase_state.transition.value
+                    out["_precipitation_start_type"] = phase_state.start_type.value
+                    out["_precipitation_end_type"] = phase_state.end_type.value
+                    out["_precipitation_evidence"] = phase_state.evidence.value
+                    continue
+
+                if var_code not in dataset.data_vars:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Variable '{var_code}' is not available in the forecast dataset.",
+                    )
+
+                if "member" in dataset[var_code].dims:
+                    members_in_ds = [
+                        int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)
+                    ]
+                    member_vals = [
+                        reader.interpolate_point(
+                            var_code,
+                            member=m,
+                            lead_time_hours=lead,
+                            lat_idx=lat_idx,
+                            lon_idx=lon_idx,
+                            t_row=t_row,
+                            t_col=t_col,
+                            generation=generation,
+                        )
+                        for m in members_in_ds
+                    ]
+                    out[var_code] = float(np.nanmean(member_vals))
+                else:
+                    out[var_code] = float(
+                        reader.interpolate_point(
+                            var_code,
+                            member=None,
+                            lead_time_hours=lead,
+                            lat_idx=lat_idx,
+                            lon_idx=lon_idx,
+                            t_row=t_row,
+                            t_col=t_col,
+                            generation=generation,
+                        )
+                    )
+            return out
+
+        out_legacy: dict[str, Any] = {}
         for var_code in var_codes:
             if var_code == "wind_10m":
                 if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
@@ -680,9 +916,9 @@ def gated_point_interpolations(
                     u_val, v_val, calm_threshold=CALM_WIND_THRESHOLD_MPS
                 )
                 cardinal_str = get_cardinal_direction(direction_deg) if direction_deg is not None else "CALM"
-                out["wind_10m"] = speed_kmh
-                out["_wind_direction_10m"] = direction_deg if direction_deg is not None else float("nan")
-                out["_wind_cardinal_10m"] = cardinal_str
+                out_legacy["wind_10m"] = speed_kmh
+                out_legacy["_wind_direction_10m"] = direction_deg if direction_deg is not None else float("nan")
+                out_legacy["_wind_cardinal_10m"] = cardinal_str
                 continue
 
             if var_code == "precipitation_amount_3h":
@@ -699,10 +935,10 @@ def gated_point_interpolations(
                         field_p, grid, lat_desc, lon_desc, latitude, longitude
                     )
                 )
-                out["precipitation_amount_3h"] = amt_val
+                out_legacy["precipitation_amount_3h"] = amt_val
 
                 # Optional categorical flags interpolation
-                flags_curr: dict[str, int] = {}
+                flags_curr_l: dict[str, int] = {}
                 for f_code in ("crain", "csnow", "cfrzr", "cicep"):
                     if f_code in dataset.data_vars:
                         f_field = dataset[f_code]
@@ -713,24 +949,24 @@ def gated_point_interpolations(
                                 f_field, grid, lat_desc, lon_desc, latitude, longitude
                             )
                         )
-                        flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+                        flags_curr_l[f_code] = 1 if f_val >= 0.5 else 0
 
                 # Optional t2m
-                t2m_val: float | None = None
+                t2m_val_l: float | None = None
                 if "temperature_2m" in dataset.data_vars:
                     t_field = dataset["temperature_2m"]
                     if "lead_time_hours" in t_field.dims:
                         t_field = t_field.sel(lead_time_hours=lead)
-                    t2m_val = float(
+                    t2m_val_l = float(
                         _interpolate_neighborhood(
                             t_field, grid, lat_desc, lon_desc, latitude, longitude
                         )
                     )
 
                 # Predecessor contextual evidence for 6-hour reset leads (t=6, 12, 18, 24, ...)
-                amt_prev: float | None = None
-                flags_prev: dict[str, int] | None = None
-                t2m_start: float | None = None
+                amt_prev_l: float | None = None
+                flags_prev_l: dict[str, int] | None = None
+                t2m_start_l: float | None = None
 
                 if lead % 6 == 0 and lead > 0:
                     pred_lead = lead - 3
@@ -742,7 +978,7 @@ def gated_point_interpolations(
                         p_field_prev = dataset["precipitation_amount_3h"].sel(
                             lead_time_hours=pred_lead
                         )
-                        amt_prev = float(
+                        amt_prev_l = float(
                             _interpolate_neighborhood(
                                 p_field_prev, grid, lat_desc, lon_desc, latitude, longitude
                             )
@@ -758,11 +994,11 @@ def gated_point_interpolations(
                                 )
                                 f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
                         if f_prev:
-                            flags_prev = f_prev
+                            flags_prev_l = f_prev
 
                         if "temperature_2m" in dataset.data_vars:
                             t_field_p = dataset["temperature_2m"].sel(lead_time_hours=pred_lead)
-                            t2m_start = float(
+                            t2m_start_l = float(
                                 _interpolate_neighborhood(
                                     t_field_p, grid, lat_desc, lon_desc, latitude, longitude
                                 )
@@ -770,17 +1006,17 @@ def gated_point_interpolations(
 
                 phase_state = classify_precipitation_phase(
                     amt_val,
-                    flags_curr if flags_curr else None,
-                    amount_prev=amt_prev,
-                    flags_prev=flags_prev,
-                    t2m_start=t2m_start,
-                    t2m_end=t2m_val,
+                    flags_curr_l if flags_curr_l else None,
+                    amount_prev=amt_prev_l,
+                    flags_prev=flags_prev_l,
+                    t2m_start=t2m_start_l,
+                    t2m_end=t2m_val_l,
                 )
-                out["_precipitation_type"] = phase_state.interval_type.value
-                out["_precipitation_transition"] = phase_state.transition.value
-                out["_precipitation_start_type"] = phase_state.start_type.value
-                out["_precipitation_end_type"] = phase_state.end_type.value
-                out["_precipitation_evidence"] = phase_state.evidence.value
+                out_legacy["_precipitation_type"] = phase_state.interval_type.value
+                out_legacy["_precipitation_transition"] = phase_state.transition.value
+                out_legacy["_precipitation_start_type"] = phase_state.start_type.value
+                out_legacy["_precipitation_end_type"] = phase_state.end_type.value
+                out_legacy["_precipitation_evidence"] = phase_state.evidence.value
                 continue
 
             if var_code not in dataset.data_vars:
@@ -803,12 +1039,12 @@ def gated_point_interpolations(
                         "vertical-level variables are not supported."
                     ),
                 )
-            out[var_code] = float(
+            out_legacy[var_code] = float(
                 _interpolate_neighborhood(
                     field, grid, lat_desc, lon_desc, latitude, longitude
                 )
             )
-        return out
+        return out_legacy
 
     from api.core.reader_gate import ReaderGateTimeout
 

@@ -366,6 +366,28 @@ jobs:
           print("All required concurrency and S3 lifecycle tests executed and passed (not skipped)")
           PY
 
+      # Prove the Serving Contract E2E executed and PASSED (not skipped)
+      # from the pytest-native JUnit report.
+      - name: Verify Serving Contract E2E ran and passed (not skipped)
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("services/ingestion/ingestion-junit.xml").getroot()
+          required = [
+              "test_serving_contract_e2e_gfs_and_gefs",
+              "test_serving_contract_legacy_v2_unsharded_compatibility",
+              "test_serving_contract_negative_assertions",
+          ]
+          for name in required:
+              test = root.find(f".//testcase[@name='{name}']")
+              assert test is not None, f"Serving contract testcase '{name}' not found in pytest report"
+              assert test.find("failure") is None and test.find("error") is None, \
+                  f"Serving contract testcase '{name}' FAILED: found <failure>/<error> in pytest report"
+              assert test.find("skipped") is None, \
+                  f"Serving contract testcase '{name}' was SKIPPED: <skipped> present in pytest report"
+              print(f"Serving contract testcase '{name}' executed and passed (not skipped)")
+          PY
+
   # ---------------------------------------------------------------------------
   # Frontend unit tests: Jest (jsdom, offline; maplibre mocked).
   # ---------------------------------------------------------------------------

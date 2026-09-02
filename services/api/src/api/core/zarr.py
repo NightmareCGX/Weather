@@ -39,7 +39,8 @@ class ShardedV1Reader:
     """Production reader for Weather Platform Sharded v1 (sharded_v1) stores.
 
     Performs granular byte-range GETs to read inner compressed chunks without
-    downloading entire shard files, backed by process-local bounded LRU index cache.
+    downloading entire shard files, backed by process-local bounded LRU index
+    and chunk caches.
     """
 
     def __init__(
@@ -47,11 +48,14 @@ class ShardedV1Reader:
         store: str | PathLike[str] | MutableMapping[str, bytes],
         *,
         max_cached_indices: int = 1024,
+        max_cached_chunks: int = 128,
     ) -> None:
         self.store = store
         self.max_cached_indices = max_cached_indices
+        self.max_cached_chunks = max_cached_chunks
         self._compressor = Zstd(level=5)
         self._index_cache: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
+        self._chunk_cache: OrderedDict[str, np.ndarray[Any, Any]] = OrderedDict()
         self._cache_lock = threading.Lock()
 
     def _resolve_fs_and_root(self) -> tuple[Any, str]:
@@ -67,6 +71,11 @@ class ShardedV1Reader:
             )
             return fs, rest
         return None, path
+
+    def _get_shard_key(self, variable: str, member: int | None, lead_time_hours: int) -> str:
+        if member is not None:
+            return f"{variable}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
+        return f"{variable}/shard.det_L{lead_time_hours:04d}.shard"
 
     def get_shard_index(
         self,
@@ -88,13 +97,24 @@ class ShardedV1Reader:
         trailer_and_index_len = expected_num_chunks * INDEX_ENTRY_SIZE + TRAILER_SIZE
         if fs is not None:
             full = f"{root}/{shard_key}"
-            tail_bytes = fs.cat_file(full, start=-trailer_and_index_len)
+            try:
+                tail_bytes = fs.cat_file(full, start=-trailer_and_index_len)
+            except Exception:
+                return []
         else:
             full = os.path.join(root, *shard_key.split("/"))
-            with open(full, "rb") as fh:
-                fh.seek(-trailer_and_index_len, os.SEEK_END)
-                tail_data = fh.read(trailer_and_index_len)
-            tail_bytes = tail_data
+            if not os.path.isfile(full):
+                return []
+            try:
+                with open(full, "rb") as fh:
+                    fh.seek(-trailer_and_index_len, os.SEEK_END)
+                    tail_data = fh.read(trailer_and_index_len)
+                tail_bytes = tail_data
+            except Exception:
+                return []
+
+        if len(tail_bytes) < trailer_and_index_len:
+            return []
 
         index_size = expected_num_chunks * INDEX_ENTRY_SIZE
         index_bytes = tail_bytes[:index_size]
@@ -110,6 +130,58 @@ class ShardedV1Reader:
 
         return entries
 
+    def read_chunk(
+        self,
+        variable: str,
+        *,
+        member: int | None,
+        lead_time_hours: int,
+        chunk_row: int,
+        chunk_col: int,
+        generation: str | None = None,
+    ) -> np.ndarray[Any, Any]:
+        """Read and decompress a 100x100 float32 chunk from the target shard container."""
+        if chunk_row < 0 or chunk_row >= 8 or chunk_col < 0 or chunk_col >= 15:
+            return np.full((100, 100), np.nan, dtype=np.float32)
+
+        chunk_idx = chunk_row * 15 + chunk_col
+        shard_key = self._get_shard_key(variable, member, lead_time_hours)
+        store_path = os.fspath(self.store) if isinstance(self.store, (str, PathLike)) else ""
+        chunk_cache_key = f"{store_path}::{generation or 'live'}::{shard_key}::{chunk_idx}"
+
+        with self._cache_lock:
+            if chunk_cache_key in self._chunk_cache:
+                self._chunk_cache.move_to_end(chunk_cache_key)
+                return self._chunk_cache[chunk_cache_key]
+
+        entries = self.get_shard_index(shard_key, generation=generation)
+        if not entries or chunk_idx >= len(entries):
+            return np.full((100, 100), np.nan, dtype=np.float32)
+
+        off, length = entries[chunk_idx]
+        if length == 0:
+            arr = np.full((100, 100), np.nan, dtype=np.float32)
+        else:
+            fs, root = self._resolve_fs_and_root()
+            if fs is not None:
+                full = f"{root}/{shard_key}"
+                chunk_comp = fs.cat_file(full, start=off, end=off + length)
+            else:
+                full = os.path.join(root, *shard_key.split("/"))
+                with open(full, "rb") as fh:
+                    fh.seek(off)
+                    chunk_comp = fh.read(length)
+
+            raw = self._compressor.decode(chunk_comp)
+            arr = np.frombuffer(raw, dtype=np.float32).reshape(100, 100).copy()
+
+        with self._cache_lock:
+            self._chunk_cache[chunk_cache_key] = arr
+            if len(self._chunk_cache) > self.max_cached_chunks:
+                self._chunk_cache.popitem(last=False)
+
+        return arr
+
     def read_point_value(
         self,
         variable: str,
@@ -121,35 +193,163 @@ class ShardedV1Reader:
         generation: str | None = None,
     ) -> float:
         """Read a single cell value via granular byte-range GET."""
-        if member is not None:
-            shard_key = f"{variable}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
-        else:
-            shard_key = f"{variable}/shard.det_L{lead_time_hours:04d}.shard"
-
-        entries = self.get_shard_index(shard_key, generation=generation)
-        row_chunk = lat_idx // 100
-        col_chunk = lon_idx // 100
-        chunk_idx = row_chunk * 15 + col_chunk
+        chunk_row = lat_idx // 100
+        chunk_col = lon_idx // 100
+        arr = self.read_chunk(
+            variable,
+            member=member,
+            lead_time_hours=lead_time_hours,
+            chunk_row=chunk_row,
+            chunk_col=chunk_col,
+            generation=generation,
+        )
         sub_lat = lat_idx % 100
         sub_lon = lon_idx % 100
+        return float(arr[sub_lat, sub_lon])
 
-        off, length = entries[chunk_idx]
-        if length == 0:
-            return float("nan")
+    def interpolate_point(
+        self,
+        variable: str,
+        *,
+        member: int | None,
+        lead_time_hours: int,
+        lat_idx: list[int],
+        lon_idx: list[int],
+        t_row: float,
+        t_col: float,
+        generation: str | None = None,
+    ) -> float:
+        """Bilinearly interpolate a variable at 2x2 neighborhood coordinates."""
+        lat0, lat1 = lat_idx[0], lat_idx[1]
+        lon0, lon1 = lon_idx[0], lon_idx[1]
 
-        fs, root = self._resolve_fs_and_root()
-        if fs is not None:
-            full = f"{root}/{shard_key}"
-            chunk_comp = fs.cat_file(full, start=off, end=off + length)
-        else:
-            full = os.path.join(root, *shard_key.split("/"))
-            with open(full, "rb") as fh:
-                fh.seek(off)
-                chunk_comp = fh.read(length)
+        val_00 = self.read_point_value(
+            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon0, generation=generation
+        )
+        val_01 = self.read_point_value(
+            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon1, generation=generation
+        )
+        val_10 = self.read_point_value(
+            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon0, generation=generation
+        )
+        val_11 = self.read_point_value(
+            variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon1, generation=generation
+        )
 
-        raw = self._compressor.decode(chunk_comp)
-        arr = np.frombuffer(raw, dtype=np.float32).reshape(1, 1, 100, 100)
-        return float(arr[0, 0, sub_lat, sub_lon])
+        lower = val_00 + (val_01 - val_00) * t_col
+        upper = val_10 + (val_11 - val_10) * t_col
+        return float(lower + (upper - lower) * t_row)
+
+    def read_window(
+        self,
+        variable: str,
+        *,
+        member: int | None,
+        lead_time_hours: int,
+        lat_min: int,
+        lat_max: int,
+        lon_min: int,
+        lon_max: int,
+        generation: str | None = None,
+    ) -> np.ndarray[Any, Any]:
+        """Read a bounded rectangular spatial window [lat_min..lat_max, lon_min..lon_max] (inclusive)."""
+        lat_len = lat_max - lat_min + 1
+        lon_len = lon_max - lon_min + 1
+        window = np.full((lat_len, lon_len), np.nan, dtype=np.float32)
+
+        r_start = lat_min // 100
+        r_end = lat_max // 100
+        c_start = lon_min // 100
+        c_end = lon_max // 100
+
+        for r_chunk in range(r_start, r_end + 1):
+            chunk_lat_start = r_chunk * 100
+            chunk_lat_end = min((r_chunk + 1) * 100, 721)
+
+            sub_lat_start = max(0, lat_min - chunk_lat_start)
+            sub_lat_end = min(chunk_lat_end - chunk_lat_start, lat_max - chunk_lat_start + 1)
+            win_lat_start = max(0, chunk_lat_start - lat_min)
+            win_lat_end = win_lat_start + (sub_lat_end - sub_lat_start)
+
+            for c_chunk in range(c_start, c_end + 1):
+                chunk_lon_start = c_chunk * 100
+                chunk_lon_end = min((c_chunk + 1) * 100, 1440)
+
+                sub_lon_start = max(0, lon_min - chunk_lon_start)
+                sub_lon_end = min(chunk_lon_end - chunk_lon_start, lon_max - chunk_lon_start + 1)
+                win_lon_start = max(0, chunk_lon_start - lon_min)
+                win_lon_end = win_lon_start + (sub_lon_end - sub_lon_start)
+
+                if sub_lat_end > sub_lat_start and sub_lon_end > sub_lon_start:
+                    chunk_arr = self.read_chunk(
+                        variable,
+                        member=member,
+                        lead_time_hours=lead_time_hours,
+                        chunk_row=r_chunk,
+                        chunk_col=c_chunk,
+                        generation=generation,
+                    )
+                    window[win_lat_start:win_lat_end, win_lon_start:win_lon_end] = chunk_arr[
+                        sub_lat_start:sub_lat_end, sub_lon_start:sub_lon_end
+                    ]
+
+        return window
+
+    def read_ensemble_mean_window(
+        self,
+        variable: str,
+        *,
+        members: tuple[int, ...],
+        lead_time_hours: int,
+        lat_min: int,
+        lat_max: int,
+        lon_min: int,
+        lon_max: int,
+        expected_members: int = 30,
+        generation: str | None = None,
+    ) -> np.ndarray[Any, Any]:
+        """Read and compute member-mean across ensemble members for a spatial window."""
+        if not members:
+            return np.full((lat_max - lat_min + 1, lon_max - lon_min + 1), np.nan, dtype=np.float32)
+
+        stack: list[np.ndarray[Any, Any]] = []
+        for m in members:
+            w = self.read_window(
+                variable,
+                member=m,
+                lead_time_hours=lead_time_hours,
+                lat_min=lat_min,
+                lat_max=lat_max,
+                lon_min=lon_min,
+                lon_max=lon_max,
+                generation=generation,
+            )
+            stack.append(w)
+
+        from domain.coverage import is_cell_statistically_valid
+
+        arr_stack = np.stack(stack, axis=0)
+        finite_counts = np.sum(np.isfinite(arr_stack), axis=0)
+        valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
+        with np.errstate(all="ignore"):
+            mean_vals = np.nanmean(arr_stack, axis=0)
+            return np.where(valid_cells, mean_vals, np.nan).astype(np.float32)
+
+
+_readers: dict[str, ShardedV1Reader] = {}
+_readers_lock = threading.Lock()
+
+
+def get_sharded_reader(
+    store: str | PathLike[str] | MutableMapping[str, bytes],
+) -> ShardedV1Reader:
+    """Return a process-cached ShardedV1Reader for the store path."""
+    path = os.fspath(store) if isinstance(store, (str, PathLike)) else id(store)
+    path_key = str(path)
+    with _readers_lock:
+        if path_key not in _readers:
+            _readers[path_key] = ShardedV1Reader(store)
+        return _readers[path_key]
 
 
 def _resolve_store(

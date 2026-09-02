@@ -632,7 +632,9 @@ def _gated_member_values(
     available_member_indices: tuple[int, ...] | None = None,
 ) -> list[float]:
     """Interpolate each committed ensemble member's field at a point and lead time."""
+    from api.core.manifest_reader import manifest_generation, manifest_storage_format
     from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.core.zarr import get_sharded_reader
 
     def select_and_interpolate(dataset: xr.Dataset) -> list[float]:
         if var_code not in dataset.data_vars:
@@ -649,9 +651,6 @@ def _gated_member_values(
                     "the forecast dataset."
                 ),
             )
-        if "lead_time_hours" in field.dims:
-            field = field.sel(lead_time_hours=lead)
-
         grid, lat_descending, lon_descending = _derive_grid(dataset)
         member_coords = dataset.coords["member"].values
         member_val_to_pos = {
@@ -663,7 +662,54 @@ def _gated_member_values(
         else:
             target_members = sorted(member_val_to_pos.keys())
 
-        values: list[float] = []
+        format_version = manifest_storage_format(store_path)
+        generation = manifest_generation(store_path)
+
+        if format_version == "sharded_v1":
+            reader = get_sharded_reader(store_path)
+            if grid.rows < 2 or grid.cols < 2:
+                raise InvalidGridError(
+                    "Bilinear interpolation requires at least two rows and two columns; "
+                    f"grid is {grid.rows} x {grid.cols}."
+                )
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+            row_0 = math.floor(row_f)
+            col_0 = math.floor(col_f)
+            if row_0 == grid.rows - 1:
+                row_0 = grid.rows - 2
+            if col_0 == grid.cols - 1:
+                col_0 = grid.cols - 2
+            row_1, col_1 = row_0 + 1, col_0 + 1
+            t_row = row_f - row_0
+            t_col = col_f - col_0
+
+            def _stored(value: int, size: int, descending: bool) -> int:
+                return (size - 1 - value) if descending else value
+
+            lat_size = int(dataset.sizes["latitude"])
+            lon_size = int(dataset.sizes["longitude"])
+            lat_idx = [_stored(row_0, lat_size, lat_descending), _stored(row_1, lat_size, lat_descending)]
+            lon_idx = [_stored(col_0, lon_size, lon_descending), _stored(col_1, lon_size, lon_descending)]
+
+            values: list[float] = []
+            for member_num in target_members:
+                val = reader.interpolate_point(
+                    var_code,
+                    member=member_num,
+                    lead_time_hours=lead,
+                    lat_idx=lat_idx,
+                    lon_idx=lon_idx,
+                    t_row=t_row,
+                    t_col=t_col,
+                    generation=generation,
+                )
+                values.append(val)
+            return values
+
+        if "lead_time_hours" in field.dims:
+            field = field.sel(lead_time_hours=lead)
+
+        values_legacy: list[float] = []
         for member_num in target_members:
             member_pos = member_val_to_pos[member_num]
             member_field = field.isel(member=member_pos)
@@ -676,7 +722,7 @@ def _gated_member_values(
                     ),
                 )
             try:
-                values.append(
+                values_legacy.append(
                     float(
                         _interpolate_neighborhood(
                             member_field,
@@ -698,7 +744,7 @@ def _gated_member_values(
                     status_code=500,
                     detail="The forecast dataset grid is invalid.",
                 ) from exc
-        return values
+        return values_legacy
 
     return gated_read_dataset_with_selector(store_path, select_and_interpolate)
 
@@ -711,7 +757,9 @@ def _gated_wind_member_vectors(
     available_member_indices: tuple[int, ...] | None = None,
 ) -> tuple[list[float], list[float]]:
     """Interpolate committed ensemble member u and v vectors at a point and lead time."""
+    from api.core.manifest_reader import manifest_generation, manifest_storage_format
     from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.core.zarr import get_sharded_reader
 
     def select_and_interpolate(dataset: xr.Dataset) -> tuple[list[float], list[float]]:
         if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
@@ -726,10 +774,6 @@ def _gated_wind_member_vectors(
                 status_code=422,
                 detail="Wind variables have no ensemble member dimension in the forecast dataset.",
             )
-        if "lead_time_hours" in field_u.dims:
-            field_u = field_u.sel(lead_time_hours=lead)
-        if "lead_time_hours" in field_v.dims:
-            field_v = field_v.sel(lead_time_hours=lead)
 
         grid, lat_descending, lon_descending = _derive_grid(dataset)
         member_coords = dataset.coords["member"].values
@@ -741,6 +785,67 @@ def _gated_wind_member_vectors(
             target_members = [m for m in available_member_indices if m in member_val_to_pos]
         else:
             target_members = sorted(member_val_to_pos.keys())
+
+        format_version = manifest_storage_format(store_path)
+        generation = manifest_generation(store_path)
+
+        if format_version == "sharded_v1":
+            reader = get_sharded_reader(store_path)
+            if grid.rows < 2 or grid.cols < 2:
+                raise InvalidGridError(
+                    "Bilinear interpolation requires at least two rows and two columns; "
+                    f"grid is {grid.rows} x {grid.cols}."
+                )
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+            row_0 = math.floor(row_f)
+            col_0 = math.floor(col_f)
+            if row_0 == grid.rows - 1:
+                row_0 = grid.rows - 2
+            if col_0 == grid.cols - 1:
+                col_0 = grid.cols - 2
+            row_1, col_1 = row_0 + 1, col_0 + 1
+            t_row = row_f - row_0
+            t_col = col_f - col_0
+
+            def _stored(value: int, size: int, descending: bool) -> int:
+                return (size - 1 - value) if descending else value
+
+            lat_size = int(dataset.sizes["latitude"])
+            lon_size = int(dataset.sizes["longitude"])
+            lat_idx = [_stored(row_0, lat_size, lat_descending), _stored(row_1, lat_size, lat_descending)]
+            lon_idx = [_stored(col_0, lon_size, lon_descending), _stored(col_1, lon_size, lon_descending)]
+
+            u_vals_s: list[float] = []
+            v_vals_s: list[float] = []
+            for member_num in target_members:
+                u_val = reader.interpolate_point(
+                    "wind_u_10m",
+                    member=member_num,
+                    lead_time_hours=lead,
+                    lat_idx=lat_idx,
+                    lon_idx=lon_idx,
+                    t_row=t_row,
+                    t_col=t_col,
+                    generation=generation,
+                )
+                v_val = reader.interpolate_point(
+                    "wind_v_10m",
+                    member=member_num,
+                    lead_time_hours=lead,
+                    lat_idx=lat_idx,
+                    lon_idx=lon_idx,
+                    t_row=t_row,
+                    t_col=t_col,
+                    generation=generation,
+                )
+                u_vals_s.append(u_val)
+                v_vals_s.append(v_val)
+            return u_vals_s, v_vals_s
+
+        if "lead_time_hours" in field_u.dims:
+            field_u = field_u.sel(lead_time_hours=lead)
+        if "lead_time_hours" in field_v.dims:
+            field_v = field_v.sel(lead_time_hours=lead)
 
         u_vals: list[float] = []
         v_vals: list[float] = []
@@ -801,7 +906,9 @@ def _gated_precipitation_member_states(
     available_member_indices: tuple[int, ...] | None = None,
 ) -> tuple[list[float], list[PrecipitationPhaseState]]:
     """Extract per-member precipitation amounts and classify their phase states under the gate."""
+    from api.core.manifest_reader import manifest_generation, manifest_storage_format
     from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.core.zarr import get_sharded_reader
 
     def select_and_classify(dataset: xr.Dataset) -> tuple[list[float], list[PrecipitationPhaseState]]:
         if "precipitation_amount_3h" not in dataset.data_vars:
@@ -815,8 +922,6 @@ def _gated_precipitation_member_states(
                 status_code=422,
                 detail="Variable 'precipitation_amount_3h' has no ensemble member dimension in the forecast dataset.",
             )
-        if "lead_time_hours" in field_amt.dims:
-            field_amt = field_amt.sel(lead_time_hours=lead)
 
         grid, lat_descending, lon_descending = _derive_grid(dataset)
         member_coords = dataset.coords["member"].values
@@ -828,6 +933,157 @@ def _gated_precipitation_member_states(
             target_members = [m for m in available_member_indices if m in member_val_to_pos]
         else:
             target_members = sorted(member_val_to_pos.keys())
+
+        format_version = manifest_storage_format(store_path)
+        generation = manifest_generation(store_path)
+
+        if format_version == "sharded_v1":
+            reader = get_sharded_reader(store_path)
+            if grid.rows < 2 or grid.cols < 2:
+                raise InvalidGridError(
+                    "Bilinear interpolation requires at least two rows and two columns; "
+                    f"grid is {grid.rows} x {grid.cols}."
+                )
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+            row_0 = math.floor(row_f)
+            col_0 = math.floor(col_f)
+            if row_0 == grid.rows - 1:
+                row_0 = grid.rows - 2
+            if col_0 == grid.cols - 1:
+                col_0 = grid.cols - 2
+            row_1, col_1 = row_0 + 1, col_0 + 1
+            t_row = row_f - row_0
+            t_col = col_f - col_0
+
+            def _stored(value: int, size: int, descending: bool) -> int:
+                return (size - 1 - value) if descending else value
+
+            lat_size = int(dataset.sizes["latitude"])
+            lon_size = int(dataset.sizes["longitude"])
+            lat_idx = [_stored(row_0, lat_size, lat_descending), _stored(row_1, lat_size, lat_descending)]
+            lon_idx = [_stored(col_0, lon_size, lon_descending), _stored(col_1, lon_size, lon_descending)]
+
+            leads_in_ds = (
+                [int(v) for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)]
+                if "lead_time_hours" in dataset.coords
+                else []
+            )
+
+            amounts_s: list[float] = []
+            states_s: list[PrecipitationPhaseState] = []
+
+            for member_num in target_members:
+                amt_val = float(
+                    reader.interpolate_point(
+                        "precipitation_amount_3h",
+                        member=member_num,
+                        lead_time_hours=lead,
+                        lat_idx=lat_idx,
+                        lon_idx=lon_idx,
+                        t_row=t_row,
+                        t_col=t_col,
+                        generation=generation,
+                    )
+                )
+                amounts_s.append(amt_val)
+
+                flags: dict[str, int] = {}
+                for c in ("crain", "csnow", "cfrzr", "cicep"):
+                    if c in dataset.data_vars:
+                        c_val = float(
+                            reader.interpolate_point(
+                                c,
+                                member=member_num,
+                                lead_time_hours=lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
+                        )
+                        flags[c] = 1 if c_val >= 0.5 else 0
+
+                t_val: float | None = None
+                if "temperature_2m" in dataset.data_vars:
+                    t_val = float(
+                        reader.interpolate_point(
+                            "temperature_2m",
+                            member=member_num,
+                            lead_time_hours=lead,
+                            lat_idx=lat_idx,
+                            lon_idx=lon_idx,
+                            t_row=t_row,
+                            t_col=t_col,
+                            generation=generation,
+                        )
+                    )
+
+                amt_prev: float | None = None
+                flags_prev: dict[str, int] | None = None
+                t_start_val: float | None = None
+
+                if lead % 6 == 0 and lead > 0:
+                    pred_lead = lead - 3
+                    if pred_lead in leads_in_ds:
+                        amt_prev = float(
+                            reader.interpolate_point(
+                                "precipitation_amount_3h",
+                                member=member_num,
+                                lead_time_hours=pred_lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
+                        )
+                        f_p = {}
+                        for c in ("crain", "csnow", "cfrzr", "cicep"):
+                            if c in dataset.data_vars:
+                                f_p_val = float(
+                                    reader.interpolate_point(
+                                        c,
+                                        member=member_num,
+                                        lead_time_hours=pred_lead,
+                                        lat_idx=lat_idx,
+                                        lon_idx=lon_idx,
+                                        t_row=t_row,
+                                        t_col=t_col,
+                                        generation=generation,
+                                    )
+                                )
+                                f_p[c] = 1 if f_p_val >= 0.5 else 0
+                        if f_p:
+                            flags_prev = f_p
+                        if "temperature_2m" in dataset.data_vars:
+                            t_start_val = float(
+                                reader.interpolate_point(
+                                    "temperature_2m",
+                                    member=member_num,
+                                    lead_time_hours=pred_lead,
+                                    lat_idx=lat_idx,
+                                    lon_idx=lon_idx,
+                                    t_row=t_row,
+                                    t_col=t_col,
+                                    generation=generation,
+                                )
+                            )
+
+                state = classify_precipitation_phase(
+                    amt_val,
+                    flags if flags else None,
+                    amount_prev=amt_prev,
+                    flags_prev=flags_prev,
+                    t2m_start=t_start_val,
+                    t2m_end=t_val,
+                )
+                states_s.append(state)
+
+            return amounts_s, states_s
+
+        if "lead_time_hours" in field_amt.dims:
+            field_amt = field_amt.sel(lead_time_hours=lead)
 
         cat_fields = {}
         for c in ("crain", "csnow", "cfrzr", "cicep"):
@@ -882,7 +1138,7 @@ def _gated_precipitation_member_states(
             )
             amounts.append(amt_val)
 
-            flags: dict[str, int] = {}
+            flags_l: dict[str, int] = {}
             for c, c_field in cat_fields.items():
                 c_val = float(
                     _interpolate_neighborhood(
@@ -894,11 +1150,11 @@ def _gated_precipitation_member_states(
                         longitude,
                     )
                 )
-                flags[c] = 1 if c_val >= 0.5 else 0
+                flags_l[c] = 1 if c_val >= 0.5 else 0
 
-            t_val: float | None = None
+            t_val_l: float | None = None
             if t2m_field is not None:
-                t_val = float(
+                t_val_l = float(
                     _interpolate_neighborhood(
                         t2m_field.isel(member=member_pos),
                         grid,
@@ -909,12 +1165,12 @@ def _gated_precipitation_member_states(
                     )
                 )
 
-            amt_prev: float | None = None
-            flags_prev: dict[str, int] | None = None
-            t_start_val: float | None = None
+            amt_prev_l: float | None = None
+            flags_prev_l: dict[str, int] | None = None
+            t_start_val_l: float | None = None
 
             if pred_fields_avail and pred_field_amt is not None:
-                amt_prev = float(
+                amt_prev_l = float(
                     _interpolate_neighborhood(
                         pred_field_amt.isel(member=member_pos),
                         grid,
@@ -938,9 +1194,9 @@ def _gated_precipitation_member_states(
                             )
                         )
                         f_p[c] = 1 if c_p_val >= 0.5 else 0
-                    flags_prev = f_p
+                    flags_prev_l = f_p
                 if pred_t2m_field is not None:
-                    t_start_val = float(
+                    t_start_val_l = float(
                         _interpolate_neighborhood(
                             pred_t2m_field.isel(member=member_pos),
                             grid,
@@ -953,11 +1209,11 @@ def _gated_precipitation_member_states(
 
             st = classify_precipitation_phase(
                 amt_val,
-                flags if flags else None,
-                amount_prev=amt_prev,
-                flags_prev=flags_prev,
-                t2m_start=t_start_val,
-                t2m_end=t_val,
+                flags_l if flags_l else None,
+                amount_prev=amt_prev_l,
+                flags_prev=flags_prev_l,
+                t2m_start=t_start_val_l,
+                t2m_end=t_val_l,
             )
             states.append(st)
 

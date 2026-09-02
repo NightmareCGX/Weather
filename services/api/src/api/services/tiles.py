@@ -398,6 +398,7 @@ def render_tile_png(
                     x=x,
                     y=y,
                     expected_members=expected_members,
+                    store_path=store_path,
                 ),
             )
         except Exception:  # noqa: BLE001 - unreadable/no-longer-ready store
@@ -441,6 +442,7 @@ def _select_tile_window(
     x: int,
     y: int,
     expected_members: int = 1,
+    store_path: str | None = None,
 ) -> _TileWindow:
     """Gate-time selector: read only the tile's geographic window from the store.
 
@@ -471,7 +473,14 @@ def _select_tile_window(
     lon_native = _align_longitudes(grid, pixel_lons)
 
     field, lat_axis, lon_axis = _slice_field(
-        dataset, variable, lead, grid, pixel_lats, lon_native, expected_members=expected_members
+        dataset,
+        variable,
+        lead,
+        grid,
+        pixel_lats,
+        lon_native,
+        expected_members=expected_members,
+        store_path=store_path,
     )
     # ``_slice_field`` already materializes the bounded window. Return the
     # window + its axes + the grid so rendering needs no store access.
@@ -657,8 +666,158 @@ def _slice_field(
     pixel_lats: npt.NDArray[np.float64],
     lon_native: npt.NDArray[np.float64],
     expected_members: int = 1,
+    store_path: str | None = None,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Return the 2-D ascending field and its sliced axes for the tile bounds."""
+    from api.core.manifest_reader import manifest_generation, manifest_storage_format
+    from api.core.zarr import get_sharded_reader
+
+    format_version = manifest_storage_format(store_path) if store_path else "v2_unsharded"
+    if format_version == "sharded_v1" and store_path is not None:
+        reader = get_sharded_reader(store_path)
+        generation = manifest_generation(store_path)
+
+        lat_axis_full = dataset.coords["latitude"].values
+        lon_axis_full = dataset.coords["longitude"].values
+        lat_min = float(pixel_lats.min())
+        lat_max = float(pixel_lats.max())
+        lon_native_min = float(lon_native.min())
+        lon_native_max = float(lon_native.max())
+
+        lat_step = abs(float(lat_axis_full[1] - lat_axis_full[0])) if len(lat_axis_full) > 1 else 0.25
+        lon_step = abs(float(lon_axis_full[1] - lon_axis_full[0])) if len(lon_axis_full) > 1 else 0.25
+        lo_lat = float(max(min(lat_axis_full[0], lat_axis_full[-1]), lat_min - lat_step))
+        hi_lat = float(min(max(lat_axis_full[-1], lat_axis_full[0]), lat_max + lat_step))
+        lo_lon = float(max(min(lon_axis_full[0], lon_axis_full[-1]), lon_native_min - lon_step))
+        hi_lon = float(min(max(lon_axis_full[-1], lon_axis_full[0]), lon_native_max + lon_step))
+
+        if lo_lat > hi_lat or lo_lon > hi_lon:
+            return (
+                np.full((1, 1), np.nan),
+                np.asarray([min(lat_axis_full[0], lat_axis_full[-1])]),
+                np.asarray([min(lon_axis_full[0], lon_axis_full[-1])]),
+            )
+
+        if grid.lat_reversed:
+            lat_idx_0 = int(np.clip(round((lat_axis_full[0] - hi_lat) / lat_step), 0, len(lat_axis_full) - 1))
+            lat_idx_1 = int(np.clip(round((lat_axis_full[0] - lo_lat) / lat_step), 0, len(lat_axis_full) - 1))
+        else:
+            lat_idx_0 = int(np.clip(round((lo_lat - lat_axis_full[0]) / lat_step), 0, len(lat_axis_full) - 1))
+            lat_idx_1 = int(np.clip(round((hi_lat - lat_axis_full[0]) / lat_step), 0, len(lat_axis_full) - 1))
+
+        if grid.lon_reversed:
+            lon_idx_0 = int(np.clip(round((lon_axis_full[0] - hi_lon) / lon_step), 0, len(lon_axis_full) - 1))
+            lon_idx_1 = int(np.clip(round((lon_axis_full[0] - lo_lon) / lon_step), 0, len(lon_axis_full) - 1))
+        else:
+            lon_idx_0 = int(np.clip(round((lo_lon - lon_axis_full[0]) / lon_step), 0, len(lon_axis_full) - 1))
+            lon_idx_1 = int(np.clip(round((hi_lon - lon_axis_full[0]) / lon_step), 0, len(lon_axis_full) - 1))
+
+        lat_min_idx = min(lat_idx_0, lat_idx_1)
+        lat_max_idx = max(lat_idx_0, lat_idx_1)
+        lon_min_idx = min(lon_idx_0, lon_idx_1)
+        lon_max_idx = max(lon_idx_0, lon_idx_1)
+
+        is_ensemble = "member" in dataset.coords or expected_members > 1
+        if variable in ("wind_10m", "wind_speed_10m"):
+            if is_ensemble:
+                members_to_read = tuple(range(1, expected_members + 1))
+                u_stack = [
+                    reader.read_window(
+                        "wind_u_10m",
+                        member=m,
+                        lead_time_hours=lead,
+                        lat_min=lat_min_idx,
+                        lat_max=lat_max_idx,
+                        lon_min=lon_min_idx,
+                        lon_max=lon_max_idx,
+                        generation=generation,
+                    )
+                    for m in members_to_read
+                ]
+                v_stack = [
+                    reader.read_window(
+                        "wind_v_10m",
+                        member=m,
+                        lead_time_hours=lead,
+                        lat_min=lat_min_idx,
+                        lat_max=lat_max_idx,
+                        lon_min=lon_min_idx,
+                        lon_max=lon_max_idx,
+                        generation=generation,
+                    )
+                    for m in members_to_read
+                ]
+                from domain.coverage import is_cell_statistically_valid
+
+                u_arr = np.stack(u_stack, axis=0)
+                v_arr = np.stack(v_stack, axis=0)
+                finite_mask = np.isfinite(u_arr) & np.isfinite(v_arr)
+                finite_counts = np.sum(finite_mask, axis=0)
+                valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
+                speed_members = np.hypot(u_arr, v_arr)
+                with np.errstate(all="ignore"):
+                    mean_speed = np.nanmean(speed_members, axis=0) * 3.6
+                    values = np.where(valid_cells, mean_speed, np.nan)
+            else:
+                u_win = reader.read_window(
+                    "wind_u_10m",
+                    member=None,
+                    lead_time_hours=lead,
+                    lat_min=lat_min_idx,
+                    lat_max=lat_max_idx,
+                    lon_min=lon_min_idx,
+                    lon_max=lon_max_idx,
+                    generation=generation,
+                )
+                v_win = reader.read_window(
+                    "wind_v_10m",
+                    member=None,
+                    lead_time_hours=lead,
+                    lat_min=lat_min_idx,
+                    lat_max=lat_max_idx,
+                    lon_min=lon_min_idx,
+                    lon_max=lon_max_idx,
+                    generation=generation,
+                )
+                values = np.hypot(u_win, v_win) * 3.6
+        else:
+            if is_ensemble:
+                members_to_read = tuple(range(1, expected_members + 1))
+                values = reader.read_ensemble_mean_window(
+                    variable,
+                    members=members_to_read,
+                    lead_time_hours=lead,
+                    lat_min=lat_min_idx,
+                    lat_max=lat_max_idx,
+                    lon_min=lon_min_idx,
+                    lon_max=lon_max_idx,
+                    expected_members=expected_members,
+                    generation=generation,
+                )
+            else:
+                values = reader.read_window(
+                    variable,
+                    member=None,
+                    lead_time_hours=lead,
+                    lat_min=lat_min_idx,
+                    lat_max=lat_max_idx,
+                    lon_min=lon_min_idx,
+                    lon_max=lon_max_idx,
+                    generation=generation,
+                )
+
+        lat_sliced = np.asarray(lat_axis_full[lat_min_idx : lat_max_idx + 1], dtype=float)
+        lon_sliced = np.asarray(lon_axis_full[lon_min_idx : lon_max_idx + 1], dtype=float)
+
+        if len(lat_sliced) > 1 and lat_sliced[-1] < lat_sliced[0]:
+            values = values[::-1, :]
+            lat_sliced = lat_sliced[::-1]
+        if len(lon_sliced) > 1 and lon_sliced[-1] < lon_sliced[0]:
+            values = values[:, ::-1]
+            lon_sliced = lon_sliced[::-1]
+
+        return (values, lat_sliced, lon_sliced)
+
     if variable in ("wind_10m", "wind_speed_10m"):
         if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
             raise ValueError("Variables 'wind_u_10m' and 'wind_v_10m' must be in the dataset.")
