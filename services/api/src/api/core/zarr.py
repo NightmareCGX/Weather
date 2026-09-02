@@ -14,14 +14,142 @@ uses so a store produced by the ingestion worker is readable here.
 from __future__ import annotations
 
 import os
+import struct
+import threading
+from collections import OrderedDict
 from collections.abc import Generator, MutableMapping
 from contextlib import contextmanager
 from os import PathLike
+from typing import Any
 
+import numpy as np
 import s3fs  # type: ignore[import-untyped]
 import xarray as xr
+from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from api.core.config import settings
+
+#: Canonical Weather Platform Sharded v1 (sharded_v1) binary layout constants
+SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
+INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
+TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
+
+
+class ShardedV1Reader:
+    """Production reader for Weather Platform Sharded v1 (sharded_v1) stores.
+
+    Performs granular byte-range GETs to read inner compressed chunks without
+    downloading entire shard files, backed by process-local bounded LRU index cache.
+    """
+
+    def __init__(
+        self,
+        store: str | PathLike[str] | MutableMapping[str, bytes],
+        *,
+        max_cached_indices: int = 1024,
+    ) -> None:
+        self.store = store
+        self.max_cached_indices = max_cached_indices
+        self._compressor = Zstd(level=5)
+        self._index_cache: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
+        self._cache_lock = threading.Lock()
+
+    def _resolve_fs_and_root(self) -> tuple[Any, str]:
+        path = os.fspath(self.store) if isinstance(self.store, (str, PathLike)) else ""
+        if path.startswith("s3://"):
+            rest = path[len("s3://") :].strip("/")
+            scheme = "https" if settings.MINIO_SECURE else "http"
+            fs = s3fs.S3FileSystem(
+                key=settings.MINIO_ACCESS_KEY,
+                secret=settings.MINIO_SECRET_KEY,
+                client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+                use_listings_cache=False,
+            )
+            return fs, rest
+        return None, path
+
+    def get_shard_index(
+        self,
+        shard_key: str,
+        expected_num_chunks: int = 120,
+        *,
+        generation: str | None = None,
+    ) -> list[tuple[int, int]]:
+        """Retrieve shard index from LRU cache or fetch via tail Range GET."""
+        store_path = os.fspath(self.store) if isinstance(self.store, (str, PathLike)) else ""
+        cache_key = f"{store_path}::{generation or 'live'}::{shard_key}"
+
+        with self._cache_lock:
+            if cache_key in self._index_cache:
+                self._index_cache.move_to_end(cache_key)
+                return self._index_cache[cache_key]
+
+        fs, root = self._resolve_fs_and_root()
+        trailer_and_index_len = expected_num_chunks * INDEX_ENTRY_SIZE + TRAILER_SIZE
+        if fs is not None:
+            full = f"{root}/{shard_key}"
+            tail_bytes = fs.cat_file(full, start=-trailer_and_index_len)
+        else:
+            full = os.path.join(root, *shard_key.split("/"))
+            with open(full, "rb") as fh:
+                fh.seek(-trailer_and_index_len, os.SEEK_END)
+                tail_data = fh.read(trailer_and_index_len)
+            tail_bytes = tail_data
+
+        index_size = expected_num_chunks * INDEX_ENTRY_SIZE
+        index_bytes = tail_bytes[:index_size]
+        entries: list[tuple[int, int]] = []
+        for i in range(expected_num_chunks):
+            off, length = struct.unpack_from("<QQ", index_bytes, i * INDEX_ENTRY_SIZE)
+            entries.append((off, length))
+
+        with self._cache_lock:
+            self._index_cache[cache_key] = entries
+            if len(self._index_cache) > self.max_cached_indices:
+                self._index_cache.popitem(last=False)
+
+        return entries
+
+    def read_point_value(
+        self,
+        variable: str,
+        *,
+        member: int | None,
+        lead_time_hours: int,
+        lat_idx: int,
+        lon_idx: int,
+        generation: str | None = None,
+    ) -> float:
+        """Read a single cell value via granular byte-range GET."""
+        if member is not None:
+            shard_key = f"{variable}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
+        else:
+            shard_key = f"{variable}/shard.det_L{lead_time_hours:04d}.shard"
+
+        entries = self.get_shard_index(shard_key, generation=generation)
+        row_chunk = lat_idx // 100
+        col_chunk = lon_idx // 100
+        chunk_idx = row_chunk * 15 + col_chunk
+        sub_lat = lat_idx % 100
+        sub_lon = lon_idx % 100
+
+        off, length = entries[chunk_idx]
+        if length == 0:
+            return float("nan")
+
+        fs, root = self._resolve_fs_and_root()
+        if fs is not None:
+            full = f"{root}/{shard_key}"
+            chunk_comp = fs.cat_file(full, start=off, end=off + length)
+        else:
+            full = os.path.join(root, *shard_key.split("/"))
+            with open(full, "rb") as fh:
+                fh.seek(off)
+                chunk_comp = fh.read(length)
+
+        raw = self._compressor.decode(chunk_comp)
+        arr = np.frombuffer(raw, dtype=np.float32).reshape(1, 1, 100, 100)
+        return float(arr[0, 0, sub_lat, sub_lon])
 
 
 def _resolve_store(

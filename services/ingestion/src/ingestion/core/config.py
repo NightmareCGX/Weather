@@ -83,9 +83,16 @@ class IngestionSettings(BaseSettings):
     # Advisory-lock acquisition timeout for the ingestion coordinator.
     ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
 
+    #: Primary storage format version for newly initialized forecast cycles ("sharded_v1" or "v2_unsharded").
+    #: Defaults to "sharded_v1" (14 physical shard objects per region, 120 inner 100x100 chunks).
+    STORAGE_FORMAT_VERSION: Any = "sharded_v1"
+
+    #: Global physical object PUT concurrency for shard writes.
+    GLOBAL_PUT_CONCURRENCY: Any = 64
+
     #: Maximum concurrent connections per S3 client connection pool for data-plane chunk writes (P2 Phase 1).
     #: Sized to allow high concurrent chunk PUT throughput within region writes.
-    S3_MAX_POOL_CONNECTIONS: Any = 50
+    S3_MAX_POOL_CONNECTIONS: Any = 128
 
     #: Maximum concurrent connections per S3 client connection pool for control-plane operations (markers, inventory).
     #: Matched to MARKER_GET_CONCURRENCY / MARKER_PUT_CONCURRENCY without excess socket allocation.
