@@ -401,6 +401,31 @@ def test_serving_contract_e2e_gfs_and_gefs(clean_db) -> None:
         assert len(res_tile_gefs.content) > 500
         assert res_tile_gefs.content.startswith(b"\x89PNG\r\n\x1a\n")
 
+        # G. GEFS Point Forecast Endpoint (Ensemble Member-Mean)
+        res_gefs_point = client.get(
+            f"/v1/points?lat={LAT}&lon={LON}&models=gefs&start_lead_time_hours=0&end_lead_time_hours=0"
+        )
+        assert res_gefs_point.status_code == 200
+        gefs_point_data = res_gefs_point.json()["data"]
+        assert gefs_point_data["model"] == "gefs"
+        gefs_forecasts = gefs_point_data.get("forecasts", [])
+        assert len(gefs_forecasts) >= 1
+        gefs_f0 = gefs_forecasts[0]
+        assert gefs_f0.get("temperature_2m") is not None
+        assert not np.isnan(gefs_f0["temperature_2m"])
+        # Members 1..30 had temperature: 290.15 + m*0.2 K -> Celsius = 17.0 + m*0.2 -> mean = 17.0 + 3.1 = 20.1 deg C
+        assert np.isclose(gefs_f0["temperature_2m"], 20.1, atol=0.2)
+        assert gefs_f0.get("wind_10m") is not None
+        assert not np.isnan(gefs_f0["wind_10m"])
+        assert gefs_f0["wind_10m"] > 0.0
+        assert gefs_f0.get("precipitation_amount_3h") is not None
+        assert not np.isnan(gefs_f0["precipitation_amount_3h"])
+
+        # H. GEFS Vector Field (Consensus Mean Vector)
+        res_vf = client.get(f"/v1/maps/gefs/wind_10m/vector-field?lead_time_hours=0&initial_time={cycle_str_gefs}")
+        assert res_vf.status_code == 200
+        assert len(res_vf.content) > 100
+
 
 def test_serving_contract_legacy_v2_unsharded_compatibility(tmp_path, clean_db) -> None:
     """Test that legacy v2_unsharded stores (without sharded_v1 manifest) serve correctly via legacy xarray path."""

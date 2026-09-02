@@ -672,6 +672,16 @@ def gated_point_interpolations(
             lon_idx = [_stored(col_0, lon_size, lon_desc), _stored(col_1, lon_size, lon_desc)]
 
             out: dict[str, Any] = {}
+            is_ensemble = "member" in dataset.coords or any("member" in dataset[v].dims for v in dataset.data_vars)
+            members_in_ds: list[int] = []
+            if is_ensemble:
+                if "member" in dataset.coords:
+                    members_in_ds = [
+                        int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)
+                    ]
+                else:
+                    members_in_ds = list(range(1, 31))
+
             for var_code in var_codes:
                 if var_code == "wind_10m":
                     if "wind_u_10m" not in dataset.data_vars or "wind_v_10m" not in dataset.data_vars:
@@ -679,30 +689,61 @@ def gated_point_interpolations(
                             status_code=404,
                             detail="Variable 'wind_10m' requires 'wind_u_10m' and 'wind_v_10m' in the forecast dataset.",
                         )
-                    u_val = float(
-                        reader.interpolate_point(
-                            "wind_u_10m",
-                            member=None,
-                            lead_time_hours=lead,
-                            lat_idx=lat_idx,
-                            lon_idx=lon_idx,
-                            t_row=t_row,
-                            t_col=t_col,
-                            generation=generation,
+                    has_members = "member" in dataset["wind_u_10m"].dims or is_ensemble
+                    if has_members and members_in_ds:
+                        u_vals = [
+                            reader.interpolate_point(
+                                "wind_u_10m",
+                                member=m,
+                                lead_time_hours=lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
+                            for m in members_in_ds
+                        ]
+                        v_vals = [
+                            reader.interpolate_point(
+                                "wind_v_10m",
+                                member=m,
+                                lead_time_hours=lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
+                            for m in members_in_ds
+                        ]
+                        u_val = float(np.nanmean(u_vals))
+                        v_val = float(np.nanmean(v_vals))
+                    else:
+                        u_val = float(
+                            reader.interpolate_point(
+                                "wind_u_10m",
+                                member=None,
+                                lead_time_hours=lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
                         )
-                    )
-                    v_val = float(
-                        reader.interpolate_point(
-                            "wind_v_10m",
-                            member=None,
-                            lead_time_hours=lead,
-                            lat_idx=lat_idx,
-                            lon_idx=lon_idx,
-                            t_row=t_row,
-                            t_col=t_col,
-                            generation=generation,
+                        v_val = float(
+                            reader.interpolate_point(
+                                "wind_v_10m",
+                                member=None,
+                                lead_time_hours=lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
                         )
-                    )
                     speed_mps = math.hypot(u_val, v_val)
                     speed_kmh = speed_mps * 3.6
                     direction_deg = derive_meteorological_direction(
@@ -720,27 +761,49 @@ def gated_point_interpolations(
                             status_code=404,
                             detail="Variable 'precipitation_amount_3h' is not available in the forecast dataset.",
                         )
-                    amt_val = float(
-                        reader.interpolate_point(
-                            "precipitation_amount_3h",
-                            member=None,
-                            lead_time_hours=lead,
-                            lat_idx=lat_idx,
-                            lon_idx=lon_idx,
-                            t_row=t_row,
-                            t_col=t_col,
-                            generation=generation,
-                        )
-                    )
-                    out["precipitation_amount_3h"] = amt_val
+                    has_members = "member" in dataset["precipitation_amount_3h"].dims or is_ensemble
+                    if has_members and members_in_ds:
+                        amt_vals = [
+                            reader.interpolate_point(
+                                "precipitation_amount_3h",
+                                member=m,
+                                lead_time_hours=lead,
+                                lat_idx=lat_idx,
+                                lon_idx=lon_idx,
+                                t_row=t_row,
+                                t_col=t_col,
+                                generation=generation,
+                            )
+                            for m in members_in_ds
+                        ]
+                        amt_val = float(np.nanmean(amt_vals))
+                        out["precipitation_amount_3h"] = amt_val
 
-                    flags_curr: dict[str, int] = {}
-                    for f_code in ("crain", "csnow", "cfrzr", "cicep"):
-                        if f_code in dataset.data_vars:
-                            f_val = float(
+                        flags_curr: dict[str, int] = {}
+                        for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                            if f_code in dataset.data_vars:
+                                f_vals = [
+                                    reader.interpolate_point(
+                                        f_code,
+                                        member=m,
+                                        lead_time_hours=lead,
+                                        lat_idx=lat_idx,
+                                        lon_idx=lon_idx,
+                                        t_row=t_row,
+                                        t_col=t_col,
+                                        generation=generation,
+                                    )
+                                    for m in members_in_ds
+                                ]
+                                f_val = float(np.nanmean(f_vals))
+                                flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+
+                        t2m_val: float | None = None
+                        if "temperature_2m" in dataset.data_vars:
+                            t2m_vals = [
                                 reader.interpolate_point(
-                                    f_code,
-                                    member=None,
+                                    "temperature_2m",
+                                    member=m,
                                     lead_time_hours=lead,
                                     lat_idx=lat_idx,
                                     lon_idx=lon_idx,
@@ -748,14 +811,95 @@ def gated_point_interpolations(
                                     t_col=t_col,
                                     generation=generation,
                                 )
-                            )
-                            flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+                                for m in members_in_ds
+                            ]
+                            t2m_val = float(np.nanmean(t2m_vals))
 
-                    t2m_val: float | None = None
-                    if "temperature_2m" in dataset.data_vars:
-                        t2m_val = float(
+                        amt_prev: float | None = None
+                        flags_prev: dict[str, int] | None = None
+                        t2m_start: float | None = None
+
+                        if lead % 6 == 0 and lead > 0:
+                            pred_lead = lead - 3
+                            leads_in_ds = (
+                                [
+                                    int(v)
+                                    for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+                                ]
+                                if "lead_time_hours" in dataset.coords
+                                else []
+                            )
+                            if pred_lead in leads_in_ds:
+                                amt_prev_vals = [
+                                    reader.interpolate_point(
+                                        "precipitation_amount_3h",
+                                        member=m,
+                                        lead_time_hours=pred_lead,
+                                        lat_idx=lat_idx,
+                                        lon_idx=lon_idx,
+                                        t_row=t_row,
+                                        t_col=t_col,
+                                        generation=generation,
+                                    )
+                                    for m in members_in_ds
+                                ]
+                                amt_prev = float(np.nanmean(amt_prev_vals))
+
+                                f_prev: dict[str, int] = {}
+                                for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                                    if f_code in dataset.data_vars:
+                                        f_p_vals = [
+                                            reader.interpolate_point(
+                                                f_code,
+                                                member=m,
+                                                lead_time_hours=pred_lead,
+                                                lat_idx=lat_idx,
+                                                lon_idx=lon_idx,
+                                                t_row=t_row,
+                                                t_col=t_col,
+                                                generation=generation,
+                                            )
+                                            for m in members_in_ds
+                                        ]
+                                        f_p_val = float(np.nanmean(f_p_vals))
+                                        f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
+                                if f_prev:
+                                    flags_prev = f_prev
+
+                                if "temperature_2m" in dataset.data_vars:
+                                    t2m_start_vals = [
+                                        reader.interpolate_point(
+                                            "temperature_2m",
+                                            member=m,
+                                            lead_time_hours=pred_lead,
+                                            lat_idx=lat_idx,
+                                            lon_idx=lon_idx,
+                                            t_row=t_row,
+                                            t_col=t_col,
+                                            generation=generation,
+                                        )
+                                        for m in members_in_ds
+                                    ]
+                                    t2m_start = float(np.nanmean(t2m_start_vals))
+
+                        phase_state = classify_precipitation_phase(
+                            amt_val,
+                            flags_curr if flags_curr else None,
+                            amount_prev=amt_prev,
+                            flags_prev=flags_prev,
+                            t2m_start=t2m_start,
+                            t2m_end=t2m_val,
+                        )
+                        out["_precipitation_type"] = phase_state.interval_type.value
+                        out["_precipitation_transition"] = phase_state.transition.value
+                        out["_precipitation_start_type"] = phase_state.start_type.value
+                        out["_precipitation_end_type"] = phase_state.end_type.value
+                        out["_precipitation_evidence"] = phase_state.evidence.value
+                        continue
+                    else:
+                        amt_val = float(
                             reader.interpolate_point(
-                                "temperature_2m",
+                                "precipitation_amount_3h",
                                 member=None,
                                 lead_time_hours=lead,
                                 lat_idx=lat_idx,
@@ -765,23 +909,32 @@ def gated_point_interpolations(
                                 generation=generation,
                             )
                         )
+                        out["precipitation_amount_3h"] = amt_val
 
-                    amt_prev: float | None = None
-                    flags_prev: dict[str, int] | None = None
-                    t2m_start: float | None = None
+                        flags_curr = {}
+                        for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                            if f_code in dataset.data_vars:
+                                f_val = float(
+                                    reader.interpolate_point(
+                                        f_code,
+                                        member=None,
+                                        lead_time_hours=lead,
+                                        lat_idx=lat_idx,
+                                        lon_idx=lon_idx,
+                                        t_row=t_row,
+                                        t_col=t_col,
+                                        generation=generation,
+                                    )
+                                )
+                                flags_curr[f_code] = 1 if f_val >= 0.5 else 0
 
-                    if lead % 6 == 0 and lead > 0:
-                        pred_lead = lead - 3
-                        leads_in_ds = [
-                            int(v)
-                            for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
-                        ]
-                        if pred_lead in leads_in_ds:
-                            amt_prev = float(
+                        t2m_val = None
+                        if "temperature_2m" in dataset.data_vars:
+                            t2m_val = float(
                                 reader.interpolate_point(
-                                    "precipitation_amount_3h",
+                                    "temperature_2m",
                                     member=None,
-                                    lead_time_hours=pred_lead,
+                                    lead_time_hours=lead,
                                     lat_idx=lat_idx,
                                     lon_idx=lon_idx,
                                     t_row=t_row,
@@ -789,29 +942,25 @@ def gated_point_interpolations(
                                     generation=generation,
                                 )
                             )
-                            f_prev = {}
-                            for f_code in ("crain", "csnow", "cfrzr", "cicep"):
-                                if f_code in dataset.data_vars:
-                                    f_p_val = float(
-                                        reader.interpolate_point(
-                                            f_code,
-                                            member=None,
-                                            lead_time_hours=pred_lead,
-                                            lat_idx=lat_idx,
-                                            lon_idx=lon_idx,
-                                            t_row=t_row,
-                                            t_col=t_col,
-                                            generation=generation,
-                                        )
-                                    )
-                                    f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
-                            if f_prev:
-                                flags_prev = f_prev
 
-                            if "temperature_2m" in dataset.data_vars:
-                                t2m_start = float(
+                        amt_prev = None
+                        flags_prev = None
+                        t2m_start = None
+
+                        if lead % 6 == 0 and lead > 0:
+                            pred_lead = lead - 3
+                            leads_in_ds = (
+                                [
+                                    int(v)
+                                    for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+                                ]
+                                if "lead_time_hours" in dataset.coords
+                                else []
+                            )
+                            if pred_lead in leads_in_ds:
+                                amt_prev = float(
                                     reader.interpolate_point(
-                                        "temperature_2m",
+                                        "precipitation_amount_3h",
                                         member=None,
                                         lead_time_hours=pred_lead,
                                         lat_idx=lat_idx,
@@ -821,21 +970,53 @@ def gated_point_interpolations(
                                         generation=generation,
                                     )
                                 )
+                                f_prev = {}
+                                for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                                    if f_code in dataset.data_vars:
+                                        f_p_val = float(
+                                            reader.interpolate_point(
+                                                f_code,
+                                                member=None,
+                                                lead_time_hours=pred_lead,
+                                                lat_idx=lat_idx,
+                                                lon_idx=lon_idx,
+                                                t_row=t_row,
+                                                t_col=t_col,
+                                                generation=generation,
+                                            )
+                                        )
+                                        f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
+                                if f_prev:
+                                    flags_prev = f_prev
 
-                    phase_state = classify_precipitation_phase(
-                        amt_val,
-                        flags_curr if flags_curr else None,
-                        amount_prev=amt_prev,
-                        flags_prev=flags_prev,
-                        t2m_start=t2m_start,
-                        t2m_end=t2m_val,
-                    )
-                    out["_precipitation_type"] = phase_state.interval_type.value
-                    out["_precipitation_transition"] = phase_state.transition.value
-                    out["_precipitation_start_type"] = phase_state.start_type.value
-                    out["_precipitation_end_type"] = phase_state.end_type.value
-                    out["_precipitation_evidence"] = phase_state.evidence.value
-                    continue
+                                if "temperature_2m" in dataset.data_vars:
+                                    t2m_start = float(
+                                        reader.interpolate_point(
+                                            "temperature_2m",
+                                            member=None,
+                                            lead_time_hours=pred_lead,
+                                            lat_idx=lat_idx,
+                                            lon_idx=lon_idx,
+                                            t_row=t_row,
+                                            t_col=t_col,
+                                            generation=generation,
+                                        )
+                                    )
+
+                        phase_state = classify_precipitation_phase(
+                            amt_val,
+                            flags_curr if flags_curr else None,
+                            amount_prev=amt_prev,
+                            flags_prev=flags_prev,
+                            t2m_start=t2m_start,
+                            t2m_end=t2m_val,
+                        )
+                        out["_precipitation_type"] = phase_state.interval_type.value
+                        out["_precipitation_transition"] = phase_state.transition.value
+                        out["_precipitation_start_type"] = phase_state.start_type.value
+                        out["_precipitation_end_type"] = phase_state.end_type.value
+                        out["_precipitation_evidence"] = phase_state.evidence.value
+                        continue
 
                 if var_code not in dataset.data_vars:
                     raise HTTPException(
@@ -843,10 +1024,16 @@ def gated_point_interpolations(
                         detail=f"Variable '{var_code}' is not available in the forecast dataset.",
                     )
 
-                if "member" in dataset[var_code].dims:
-                    members_in_ds = [
-                        int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)
-                    ]
+                if "member" in dataset[var_code].dims or (is_ensemble and members_in_ds):
+                    target_m = (
+                        members_in_ds
+                        if members_in_ds
+                        else (
+                            [int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)]
+                            if "member" in dataset.coords
+                            else list(range(1, 31))
+                        )
+                    )
                     member_vals = [
                         reader.interpolate_point(
                             var_code,
@@ -858,7 +1045,7 @@ def gated_point_interpolations(
                             t_col=t_col,
                             generation=generation,
                         )
-                        for m in members_in_ds
+                        for m in target_m
                     ]
                     out[var_code] = float(np.nanmean(member_vals))
                 else:

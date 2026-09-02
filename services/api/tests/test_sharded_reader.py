@@ -7,6 +7,7 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pytest
 from numcodecs import Zstd
 
 from api.core.zarr import (
@@ -14,6 +15,21 @@ from api.core.zarr import (
     SHARD_MAGIC,
     ShardedV1Reader,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_reader_pool(monkeypatch):
+    """Force the direct bounded read path for standalone store tests without DB fixtures."""
+    try:
+        import api.main as main
+
+        if hasattr(main, "reader_pool"):
+            monkeypatch.setattr(main, "reader_pool", None)
+        if hasattr(main, "reader_lifecycle"):
+            monkeypatch.setattr(main, "reader_lifecycle", None)
+    except ImportError:
+        pass
+    yield
 
 
 def _build_test_shard(val_offset: float = 0.0) -> bytes:
@@ -151,3 +167,86 @@ def test_manifest_storage_format_dispatch(tmp_path: Path) -> None:
         json.dumps({"manifest_schema_version": 1, "generation": "abc", "storage_format_version": "sharded_v1"})
     )
     assert manifest_storage_format(store_path) == "sharded_v1"
+
+
+def test_gated_point_interpolations_gefs_sharded_v1(tmp_path: Path) -> None:
+    """Test that gated_point_interpolations correctly serves GEFS ensemble means on sharded_v1."""
+    import json
+    import xarray as xr
+    from api.services.point_forecast import gated_point_interpolations
+
+    # Set up sharded_v1 store structure for GEFS with 3 members
+    store_dir = tmp_path / "gefs_test.zarr"
+    store_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_dir = store_dir / "__commit__" / "v1"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "manifest.json").write_text(
+        json.dumps({
+            "manifest_schema_version": 1,
+            "generation": "gen_gefs_test",
+            "storage_format_version": "sharded_v1",
+        })
+    )
+
+    # Write members 1, 2, 3 for temperature_2m, wind_u_10m, wind_v_10m, precipitation_amount_3h
+    for m, val_offset in [(1, 10.0), (2, 20.0), (3, 30.0)]:
+        # temperature_2m
+        t_shard = _build_test_shard(val_offset=val_offset)
+        p = store_dir / "temperature_2m" / f"shard.mem{m:03d}_L0006.shard"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(t_shard)
+
+        # wind_u_10m (m=1 -> 3.0, m=2 -> 4.0, m=3 -> 5.0 in m/s -> mean = 4.0 m/s)
+        u_shard = _build_test_shard(val_offset=val_offset / 10.0 + 2.0)
+        p = store_dir / "wind_u_10m" / f"shard.mem{m:03d}_L0006.shard"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(u_shard)
+
+        # wind_v_10m (m=1 -> 3.0, m=2 -> 4.0, m=3 -> 5.0 in m/s -> mean = 4.0 m/s)
+        v_shard = _build_test_shard(val_offset=val_offset / 10.0 + 2.0)
+        p = store_dir / "wind_v_10m" / f"shard.mem{m:03d}_L0006.shard"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(v_shard)
+
+        # precipitation_amount_3h
+        pr_shard = _build_test_shard(val_offset=val_offset / 10.0)
+        p = store_dir / "precipitation_amount_3h" / f"shard.mem{m:03d}_L0006.shard"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(pr_shard)
+
+    # Write .zmetadata / coords for xarray metadata open
+    latitudes = [90.0 - i * 0.25 for i in range(721)]
+    longitudes = [0.0 + j * 0.25 for j in range(1440)]
+    ds_meta = xr.Dataset(
+        data_vars={
+            "temperature_2m": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((3, 1, 721, 1440), dtype=np.float32)),
+            "wind_u_10m": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((3, 1, 721, 1440), dtype=np.float32)),
+            "wind_v_10m": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((3, 1, 721, 1440), dtype=np.float32)),
+            "precipitation_amount_3h": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((3, 1, 721, 1440), dtype=np.float32)),
+        },
+        coords={
+            "member": [1, 2, 3],
+            "lead_time_hours": [6],
+            "latitude": latitudes,
+            "longitude": longitudes,
+        },
+    )
+    ds_meta.to_zarr(str(store_dir), mode="a", consolidated=True)
+
+    # Interpolate at lat=45.0, lon=90.0 (inside chunk 0: lat idx 180, lon idx 360 -> chunk row 1, col 3 -> chunk_idx = 18)
+    # Chunk 18 base value = 18.0
+    # Expected temperature mean: mean([18+10, 18+20, 18+30]) = 38.0
+    res = gated_point_interpolations(
+        str(store_dir),
+        var_codes=("temperature_2m", "wind_10m", "precipitation_amount_3h"),
+        lead=6,
+        latitude=45.0,
+        longitude=90.0,
+    )
+    assert res is not None
+    assert np.isclose(res["temperature_2m"], 38.0)
+    assert not np.isnan(res["wind_10m"])
+    assert res["wind_10m"] > 0.0
+    assert not np.isnan(res["precipitation_amount_3h"])
+

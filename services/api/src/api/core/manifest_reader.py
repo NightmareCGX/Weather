@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any
 
 import s3fs  # type: ignore[import-untyped]
@@ -18,6 +19,23 @@ from api.core.config import settings
 
 #: Committed manifest path under a store's commit namespace.
 _MANIFEST_PATH = "__commit__/v1/manifest.json"
+
+_s3_fs_instance: s3fs.S3FileSystem | None = None
+_s3_fs_lock = threading.Lock()
+
+
+def _get_s3_fs() -> s3fs.S3FileSystem:
+    global _s3_fs_instance
+    with _s3_fs_lock:
+        if _s3_fs_instance is None:
+            scheme = "https" if settings.MINIO_SECURE else "http"
+            _s3_fs_instance = s3fs.S3FileSystem(
+                key=settings.MINIO_ACCESS_KEY,
+                secret=settings.MINIO_SECRET_KEY,
+                client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+                use_listings_cache=False,
+            )
+        return _s3_fs_instance
 
 
 class ManifestReadError(RuntimeError):
@@ -36,13 +54,7 @@ def _resolve_store_root(store_path: str) -> str:
 def _read_manifest(store_path: str) -> dict[str, Any] | None:
     root = _resolve_store_root(store_path)
     if store_path.startswith("s3://"):
-        scheme = "https" if settings.MINIO_SECURE else "http"
-        fs = s3fs.S3FileSystem(
-            key=settings.MINIO_ACCESS_KEY,
-            secret=settings.MINIO_SECRET_KEY,
-            client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
-            use_listings_cache=False,
-        )
+        fs = _get_s3_fs()
         try:
             raw = fs.cat_file(f"{root}/{_MANIFEST_PATH}")
         except FileNotFoundError:
