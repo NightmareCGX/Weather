@@ -34,6 +34,7 @@ from api.models.entities import (
     VerificationObservation,
 )
 from api.schemas import VerificationPeriod, VerificationReportData
+from api.services.lifecycle import filter_visible_runs
 from api.services.point_forecast import (
     _derive_grid,
     _interpolate_neighborhood,
@@ -221,8 +222,8 @@ def _ready_runs(db: Session, model: str) -> list[ModelRun]:
         .where(Model.model_id == model)
         .where(ModelRun.status == "ready")
         .where(ModelRun.zarr_store_path.isnot(None))
-        .order_by(ModelRun.cycle_time.desc())
     )
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
     return list(db.execute(stmt).scalars().all())
 
 

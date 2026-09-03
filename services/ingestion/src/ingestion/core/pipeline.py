@@ -827,15 +827,25 @@ def ingest_grib_file(
     # the coordinator (which acquires the advisory-lock store gate); library
     # callers of ingest_grib_file that target a live store are refused rather
     # than silently bypassing the concurrency protocol.
-    from ingestion.core.catalog import is_live_run_store
+    from ingestion.core.base import CycleTombstonedError
+    from ingestion.core.catalog import (
+        is_cycle_fenced_or_deleted,
+        is_live_run_store,
+    )
 
-    if is_live_run_store(_session_local(), store_path):
-        raise LiveStoreOverwriteError(
-            f"Refusing to ingest via the unlocked library path into {store_path!r}: "
-            "the store belongs to a live model_runs row. Use the coordinated "
-            "ingestion path (the weather-ingest CLI coordinator) so the "
-            "region-write concurrency protocol is enforced."
-        )
+    with _session_local() as db:
+        if is_cycle_fenced_or_deleted(db, spec.cycle_time):
+            raise CycleTombstonedError(
+                f"Refusing ingestion for cycle {spec.cycle_time.isoformat()}: "
+                "cycle is claimed for deletion or already tombstoned."
+            )
+        if is_live_run_store(db, store_path):
+            raise LiveStoreOverwriteError(
+                f"Refusing to ingest via the unlocked library path into {store_path!r}: "
+                "the store belongs to a live model_runs row. Use the coordinated "
+                "ingestion path (the weather-ingest CLI coordinator) so the "
+                "region-write concurrency protocol is enforced."
+            )
 
     dataset = parse_grib2(grib_path)
     dataset = _normalize_precipitation_increments(

@@ -48,6 +48,7 @@ from api.models.entities import (
     ModelRun,
     ModelVersion,
 )
+from api.services.lifecycle import filter_visible_runs, require_cycle_visible
 from api.services.point_forecast import _axis_values
 
 #: ModelRun lifecycle statuses eligible for serving.
@@ -338,6 +339,9 @@ def render_tile_png(
         ValueError: For invalid tile/grid/field input.
     """
     _validate_tile(zoom, x, y)
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
+
     # Resolve the committed-manifest generation for cache identity before the
     # lookup (the tile cache key includes the generation so a same-set data
     # replacement makes old tiles unreachable). This is a cheap catalog query.
@@ -1016,6 +1020,9 @@ def _resolve_ready_run(
     """
     from fastapi import HTTPException
 
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
+
     stmt = (
         select(ModelRun)
         .join(ModelRun.model_version)
@@ -1027,7 +1034,7 @@ def _resolve_ready_run(
     if initial_time is not None:
         cycle = _parse_cycle_time(initial_time)
         stmt = stmt.where(ModelRun.cycle_time == cycle)
-    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
     runs = list(db.execute(stmt).scalars().all())
     if not runs:
         raise HTTPException(
@@ -1074,6 +1081,9 @@ def _resolve_run_store_path(
         raise HTTPException(status_code=422, detail=f"Unsupported level '{level}'.")
     _require_model_variable(db, model, variable)
 
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
+
     expected_members = get_expected_members(model, default_if_unknown=1)
 
     stmt = (
@@ -1087,7 +1097,7 @@ def _resolve_run_store_path(
     if initial_time is not None:
         cycle = _parse_cycle_time(initial_time)
         stmt = stmt.where(ModelRun.cycle_time == cycle)
-    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
     runs = list(db.execute(stmt).scalars().all())
 
     candidates = [

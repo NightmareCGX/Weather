@@ -51,6 +51,7 @@ from api.models.entities import (
 )
 from api.schemas import ForecastLocationOut, ForecastSeries, PointForecastData
 from api.services.elevation import get_elevation_provider
+from api.services.lifecycle import filter_visible_runs
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +500,7 @@ def _select_min_lead_winners(
         .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
+    stmt = filter_visible_runs(stmt)
     candidates_by_valid: dict[datetime, set[tuple[datetime, int]]] = {}
     # Cycle times that supplied at least one candidate via forecast_products.
     product_cycles: set[datetime] = set()
@@ -532,6 +534,7 @@ def _select_min_lead_winners(
         .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
+    runs_stmt = filter_visible_runs(runs_stmt)
     for run in db.execute(runs_stmt).scalars().all():
         cycle_time = run.cycle_time
         if cycle_time.tzinfo is None:
@@ -568,19 +571,16 @@ def _resolve_cycle_store_path(
 
     Catalog-only; no store I/O.
     """
-    run = (
-        db.execute(
-            select(ModelRun.zarr_store_path)
-            .join(ModelRun.model_version)
-            .join(ModelVersion.model)
-            .where(Model.model_id == model)
-            .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
-            .where(ModelRun.zarr_store_path.isnot(None))
-            .where(ModelRun.cycle_time == cycle_time)
-        )
-        .scalars()
-        .one_or_none()
+    stmt = (
+        select(ModelRun.zarr_store_path)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model)
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
+        .where(ModelRun.zarr_store_path.isnot(None))
+        .where(ModelRun.cycle_time == cycle_time)
     )
+    run = db.execute(filter_visible_runs(stmt)).scalars().one_or_none()
     return str(run) if run is not None else None
 
 
@@ -1292,15 +1292,29 @@ def resolve_latest_run_serving_generation(
     )
     if initial_time is not None:
         stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
-    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
     path = db.execute(stmt).scalars().first()
     if path is None:
         return None
     try:
-        return manifest_generation(path)
+        gen = manifest_generation(path)
     except ManifestReadError:
         # A malformed manifest fails closed: do not serve a stale cache key.
         return None
+
+    if initial_time is None:
+        from api.models.entities import ForecastCycleLifecycle
+
+        latest_retired = db.execute(
+            select(func.max(ForecastCycleLifecycle.retired_at))
+        ).scalar_one_or_none()
+        if latest_retired is not None:
+            if latest_retired.tzinfo is None:
+                latest_retired = latest_retired.replace(tzinfo=timezone.utc)
+            ret_str = latest_retired.astimezone(timezone.utc).isoformat()
+            return f"{gen}:{ret_str}" if gen else f"ret_{ret_str}"
+
+    return gen
 
 
 def resolve_latest_run_cycle_time(
@@ -1335,7 +1349,7 @@ def resolve_latest_run_cycle_time(
     )
     if initial_time is not None:
         stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
-    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
     value = db.execute(stmt).scalars().first()
     if value is None:
         return None

@@ -24,6 +24,7 @@ from api.models.entities import (
     ModelRun,
     ModelVersion,
 )
+from api.services.lifecycle import filter_visible_runs
 from api.schemas import (
     CenterOut,
     GridOut,
@@ -131,6 +132,7 @@ def list_runs(
         .join(ModelVersion.model)
         .options(selectinload(ModelRun.model_version).selectinload(ModelVersion.model))
     )
+    stmt = filter_visible_runs(stmt)
     if model_id is not None:
         stmt = stmt.where(Model.model_id == model_id)
     if status is not None:

@@ -70,6 +70,11 @@ class LiveStoreOverwriteError(IngestionError):
     """
 
 
+class CycleTombstonedError(IngestionError):
+    """Raised when an ingestion write is attempted for a deleted/tombstoned cycle."""
+
+
+
 class DeaccumulationError(IngestionError):
     """Raised when precipitation de-accumulation subtraction fails an invariant."""
 

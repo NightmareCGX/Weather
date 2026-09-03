@@ -7,18 +7,29 @@ Skipped when PostgreSQL is unreachable.
 
 from __future__ import annotations
 
-import os
-import sys
+from datetime import datetime, timezone
 
+import numpy as np
 import pytest
+import xarray as xr
 from sqlalchemy import create_engine, text
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../packages/domain/src")))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../ingestion/src")))
+from sqlalchemy.orm import Session
 
 from api.core.config import settings
-from api.core.reader_gate import _ReaderGateSession
+from api.core.reader_gate import (
+    ReaderGateLifecycle,
+    ReaderLockPool,
+    _ReaderGateSession,
+    gated_read,
+)
+from api.models.entities import (
+    ForecastCenter,
+    Model,
+    ModelRun,
+    ModelVersion,
+)
+from domain.locks import store_gate_key
+from tests._zarr_writer import write_dataset
 
 DB_URL = settings.DATABASE_URL
 
@@ -39,71 +50,47 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture
-def catalog_engine():
-    """A PostgreSQL engine with a clean ingestion catalog schema per test."""
-    from ingestion.core.catalog import CatalogBase
+def _ensure_reader_race_version(session: Session) -> str:
+    """Ensure base center/model/version exist and return version_id."""
+    v_id = "version_gfs_v1"
+    if not session.get(ModelVersion, v_id):
+        if not session.get(ForecastCenter, "center_noaa"):
+            session.add(ForecastCenter(id="center_noaa", center_id="noaa", name="NOAA", country="USA"))
+            session.flush()
+        if not session.get(Model, "model_gfs"):
+            session.add(Model(id="model_gfs", model_id="gfs", name="GFS", center_id="noaa", is_ensemble=False, resolution_km=25.0))
+            session.flush()
+        session.add(ModelVersion(id=v_id, model_id="gfs", version_string="v1.0"))
+        session.flush()
+    return v_id
 
-    eng = create_engine(DB_URL, pool_pre_ping=True)
-    # Drop + recreate so each test starts from an empty catalog (isolated).
-    CatalogBase.metadata.drop_all(eng)
-    CatalogBase.metadata.create_all(eng)
-    yield eng
-    CatalogBase.metadata.drop_all(eng)
-    eng.dispose()
 
-
-def test_reader_revalidation_observes_downgrade(catalog_engine, tmp_path) -> None:
+def test_reader_revalidation_observes_downgrade(migrated_db, tmp_path) -> None:
     """A reader that selected READY before a downgrade revalidates and sees
     ``partial`` -> it refuses to read the store (FileNotFoundError)."""
-    from datetime import datetime, timezone
-
-    from ingestion.core.catalog import (
-        CenterRecord,
-        GridRecord,
-        ModelRecord,
-        ModelRunRecord,
-        ModelVersionRecord,
-    )
-    from sqlalchemy.orm import Session
-
-    # Insert a READY run row pointing at a local store path.
     store_path = str(tmp_path / "cycle.zarr")
-    with Session(catalog_engine) as db:
-        db.add(CenterRecord(id="c", center_id="noaa", name="NOAA", country="USA"))
-        db.flush()
-        db.add(
-            ModelRecord(
-                id="m", model_id="gfs", name="GFS", center_id="noaa",
-                is_ensemble=False, resolution_km=25.0,
-            )
+    cycle_time = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+
+    with Session(migrated_db) as db:
+        v_id = _ensure_reader_race_version(db)
+        run = ModelRun(
+            id="run_race_downgrade",
+            model_version_id=v_id,
+            cycle_time=cycle_time,
+            status="ready",
+            zarr_store_path=store_path,
         )
-        db.flush()
-        db.add(ModelVersionRecord(id="v", model_id="gfs", version_string="v1.0"))
-        db.flush()
-        db.add(
-            ModelRunRecord(
-                id="r", model_version_id="v",
-                cycle_time=datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc),
-                status="ready", zarr_store_path=store_path,
-            )
-        )
-        db.add(GridRecord(id="g", grid_code="global_025deg", name="g", resolution_km=25.0))
+        db.add(run)
         db.commit()
 
-    # Simulate the reader's in-flight selection: it holds the store path from a
-    # prior SELECT. When the run is failed, revalidation fails.
-    with Session(catalog_engine) as db:
-        run = db.get(ModelRunRecord, "r")
-        setattr(run, "status", "failed")
+    # Simulate downgrade to failed
+    with Session(migrated_db) as db:
+        r = db.get(ModelRun, "run_race_downgrade")
+        assert r is not None
+        setattr(r, "status", "failed")
         db.commit()
 
-    # The reader now acquires SHARED + revalidates on a fresh Connection.
-    from api.core.reader_gate import ReaderLockPool
-
-    pool = ReaderLockPool(
-        DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0
-    )
+    pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
     session = _ReaderGateSession(pool, store_path)
     try:
         session.acquire(timeout_seconds=5.0)
@@ -115,43 +102,22 @@ def test_reader_revalidation_observes_downgrade(catalog_engine, tmp_path) -> Non
         pool.dispose()
 
 
-def test_reader_revalidation_ready_succeeds(catalog_engine, tmp_path) -> None:
+def test_reader_revalidation_ready_succeeds(migrated_db, tmp_path) -> None:
     """A READY run whose store is stable passes fresh Core revalidation."""
-    from datetime import datetime, timezone
-
-    from ingestion.core.catalog import (
-        CenterRecord,
-        GridRecord,
-        ModelRecord,
-        ModelRunRecord,
-        ModelVersionRecord,
-    )
-    from sqlalchemy.orm import Session
-
     store_path = str(tmp_path / "ready.zarr")
-    with Session(catalog_engine) as db:
-        db.add(CenterRecord(id="c2", center_id="noaa", name="NOAA", country="USA"))
-        db.flush()
-        db.add(
-            ModelRecord(
-                id="m2", model_id="gfs", name="GFS", center_id="noaa",
-                is_ensemble=False, resolution_km=25.0,
-            )
-        )
-        db.flush()
-        db.add(ModelVersionRecord(id="v2", model_id="gfs", version_string="v1.0"))
-        db.flush()
-        db.add(
-            ModelRunRecord(
-                id="r2", model_version_id="v2",
-                cycle_time=datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc),
-                status="ready", zarr_store_path=store_path,
-            )
-        )
-        db.add(GridRecord(id="g2", grid_code="global_025deg", name="g", resolution_km=25.0))
-        db.commit()
+    cycle_time = datetime(2026, 7, 22, 6, 0, tzinfo=timezone.utc)
 
-    from api.core.reader_gate import ReaderLockPool
+    with Session(migrated_db) as db:
+        v_id = _ensure_reader_race_version(db)
+        run = ModelRun(
+            id="run_race_ready",
+            model_version_id=v_id,
+            cycle_time=cycle_time,
+            status="ready",
+            zarr_store_path=store_path,
+        )
+        db.add(run)
+        db.commit()
 
     pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
     session = _ReaderGateSession(pool, store_path)
@@ -165,7 +131,7 @@ def test_reader_revalidation_ready_succeeds(catalog_engine, tmp_path) -> None:
         pool.dispose()
 
 
-def test_gated_read_materializes_bounded_selection_under_lock(catalog_engine, tmp_path) -> None:
+def test_gated_read_materializes_bounded_selection_under_lock(migrated_db, tmp_path) -> None:
     """A gated read's selector runs while the SHARED advisory lock is held.
 
     The materialize callback opens a second DB connection and attempts a
@@ -174,19 +140,8 @@ def test_gated_read_materializes_bounded_selection_under_lock(catalog_engine, tm
     fail. This proves the selector/read does its Zarr S3/local I/O while the
     gate is held (Phase 1 contract).
     """
-
-    import numpy as np
-    import xarray as xr
-
-    from api.core.reader_gate import (
-        ReaderGateLifecycle,
-        ReaderLockPool,
-        gated_read,
-    )
-
-    # Build a tiny READY-store row.
     store_path = str(tmp_path / "gated.zarr")
-    from tests._zarr_writer import write_dataset
+    cycle_time = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
     lat = np.arange(40.0, 40.0 + 0.25 * 8, 0.25)
     lon = np.arange(-107.0, -107.0 + 0.25 * 8, 0.25)
@@ -199,49 +154,40 @@ def test_gated_read_materializes_bounded_selection_under_lock(catalog_engine, tm
     )
     write_dataset(ds, store_path)
 
-    # Seed a READY run row pointing at our store so revalidation succeeds.
-    from datetime import datetime, timezone as _tz
-    from ingestion.core.catalog import (
-        CenterRecord, GridRecord, ModelRecord, ModelRunRecord, ModelVersionRecord,
-    )
-    from sqlalchemy.orm import Session as _Session
-
-    with _Session(catalog_engine) as db:
-        db.add(CenterRecord(id='c3', center_id='noaa', name='NOAA', country='USA'))
-        db.flush()
-        db.add(ModelRecord(id='m3', model_id='gfs', name='GFS', center_id='noaa', is_ensemble=False, resolution_km=25.0))
-        db.flush()
-        db.add(ModelVersionRecord(id='v3', model_id='gfs', version_string='v1.0'))
-        db.flush()
-        db.add(ModelRunRecord(id='r3', model_version_id='v3', cycle_time=datetime(2026,7,22,0,0,tzinfo=_tz.utc), status='ready', zarr_store_path=store_path))
-        db.add(GridRecord(id='g3', grid_code='global_025deg', name='g', resolution_km=25.0))
+    with Session(migrated_db) as db:
+        v_id = _ensure_reader_race_version(db)
+        run = ModelRun(
+            id="run_race_gated",
+            model_version_id=v_id,
+            cycle_time=cycle_time,
+            status="ready",
+            zarr_store_path=store_path,
+        )
+        db.add(run)
         db.commit()
 
     pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
     lifecycle = ReaderGateLifecycle()
     lock_held_during_selector: list[bool] = []
+    key = store_gate_key(store_path)
 
     def materialize():
-        # Prove the SHARED gate is held by attempting an EXCLUSIVE advisory
-        # lock on the SAME store-gate key from a second, non-blocking connection.
-        # If the SHARED gate were not held, pg_try_advisory_lock would return
-        # True immediately; because the gate's SHARED lock is held, it returns
-        # False. This proves the selector/read executes while the gate is live.
-        from domain.locks import store_gate_key as _sgk
-
-        key = _sgk(store_path)
         eng2 = create_engine(DB_URL, pool_pre_ping=True)
         with eng2.connect() as c2:
             acquired = c2.execute(
                 text("SELECT pg_try_advisory_lock(:key)"),
                 {"key": key},
             ).scalar()
+            if acquired:
+                c2.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": key},
+                )
         eng2.dispose()
         lock_held_during_selector.append(not acquired)
-        import xarray as _xr
 
-        ds = _xr.open_zarr(store_path, consolidated=False)
-        sel = ds["temperature_2m"].sel(lead_time_hours=6, latitude=slice(40, 41), longitude=slice(-107, -106))
+        ds_open = xr.open_zarr(store_path, consolidated=False)
+        sel = ds_open["temperature_2m"].sel(lead_time_hours=6, latitude=slice(40, 41), longitude=slice(-107, -106))
         return sel.values
 
     try:
@@ -255,6 +201,7 @@ def test_gated_read_materializes_bounded_selection_under_lock(catalog_engine, tm
         )
     finally:
         pool.dispose()
+
     assert lock_held_during_selector == [True], (
         "SHARED advisory lock was not held during gated materialization: "
         f"{lock_held_during_selector}"
