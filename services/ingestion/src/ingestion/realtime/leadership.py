@@ -50,7 +50,47 @@ class SchedulerLeadership:
     @property
     def is_leader(self) -> bool:
         """Whether this instance currently holds leadership."""
-        return self._held
+        return self._held and self.check_leadership()
+
+    def check_leadership(self) -> bool:
+        """Verify that this instance still actively holds leadership on PostgreSQL.
+
+        Executes a fast query on the dedicated connection against ``pg_locks``.
+        If the connection died, was closed, or the lock is no longer held
+        server-side, marks leadership as lost and returns False.
+        """
+        if not self._held or self._conn is None:
+            return False
+        if self._conn.closed or self._conn.invalidated:
+            self._held = False
+            return False
+        try:
+            held = self._conn.execute(
+                text(
+                    "SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+                    "AND pid = pg_backend_pid() "
+                    "AND ((classid::bigint << 32) | (objid::bigint & 4294967295)) = :key"
+                ),
+                {"key": self._key},
+            ).scalar()
+            if not held:
+                logger.warning(
+                    "realtime leadership advisory lock is no longer held in session"
+                )
+                self._held = False
+                return False
+            return True
+        except Exception as exc:
+            logger.warning(
+                "realtime leadership connection health check failed: %s", exc
+            )
+            self._held = False
+            try:
+                self._conn.invalidate()
+            except Exception:
+                pass
+            self._conn = None
+            return False
 
     def acquire(self) -> bool:
         """Try to become the leader (non-blocking).
@@ -118,3 +158,6 @@ class NoopLeadership:
 
     def release(self) -> None:
         self.is_leader = False
+
+    def check_leadership(self) -> bool:
+        return self.is_leader

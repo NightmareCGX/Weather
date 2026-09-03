@@ -364,6 +364,15 @@ class RealtimeScheduler:
         gefs_empty = gefs is None or len(gefs.regions) == 0
         return gfs_empty and gefs_empty
 
+    def _is_leader_active(self) -> bool:
+        """Whether leadership is currently held and active."""
+        if self.leadership is None:
+            return True
+        check_fn = getattr(self.leadership, "check_leadership", None)
+        if callable(check_fn):
+            return bool(check_fn())
+        return bool(getattr(self.leadership, "is_leader", False))
+
     # ------------------------------------------------------------------
     # One poll iteration
     # ------------------------------------------------------------------
@@ -377,6 +386,18 @@ class RealtimeScheduler:
         Returns:
             The structured :class:`PollOutcome`.
         """
+        if self.leadership is not None and not self._is_leader_active():
+            logger.warning(
+                "realtime leadership is no longer held (connection lost or "
+                "released); skipping planning and wave dispatch"
+            )
+            return self._log_outcome(
+                PollOutcome(
+                    kind="leadership-lost",
+                    error="scheduler does not hold leadership",
+                ),
+                next_interval=None,
+            )
         try:
             cycle, snaps, switched = self._resolve_cycle()
         except Exception as exc:  # noqa: BLE001 - discovery failure != idle
@@ -464,6 +485,12 @@ class RealtimeScheduler:
                 ):
                     if not targets:
                         continue
+                    if self._stop_event.is_set() or cancel_event.is_set():
+                        logger.info(
+                            "realtime shutdown requested; skipping wave dispatch for model=%s",
+                            model,
+                        )
+                        break
                     dispatches.append(
                         self.dispatch_wave(model, targets, cycle, cancel_event)
                     )
@@ -525,10 +552,24 @@ class RealtimeScheduler:
                 return 1
         try:
             while not self._stop_event.is_set():
+                if self.leadership is not None and not self._is_leader_active():
+                    logger.warning(
+                        "realtime leadership lost; attempting to reacquire"
+                    )
+                    try:
+                        if not self.leadership.acquire():
+                            logger.warning(
+                                "could not reacquire realtime leadership (held "
+                                "by another instance); exiting"
+                            )
+                            return 0
+                    except Exception:
+                        logger.exception("exception while attempting to reacquire leadership")
+                        return 1
                 outcome = self.poll_once(dry_run=dry_run)
                 if once:
                     return 0
-                if outcome.kind in ("discovery-failed", "state-read-failed"):
+                if outcome.kind in ("discovery-failed", "state-read-failed", "leadership-lost"):
                     interval = self._machine.config.discovery_failure_retry
                 else:
                     interval = self._machine.next_interval(self._rng)
