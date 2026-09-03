@@ -21,17 +21,15 @@ from sqlalchemy.orm import Session
 
 from api.core.reader_gate import _ReaderGateSession, ReaderLockPool
 from api.models.entities import (
+    EnsembleMember,
+    EnsembleMemberProduct,
     ForecastCycleLifecycle,
+    ForecastProduct,
+    ModelRun,
 )
 from api.services.tiles import _tile_cache
 from api.services.vector_field import _vector_cache
-from ingestion.core.catalog import (
-    CommittedState,
-    RunCatalogSpec,
-    VariableSpec,
-    record_run,
-)
-from ingestion.core.zarr_writer import write_dataset
+from tests._zarr_writer import write_dataset
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -85,7 +83,7 @@ def _make_ensemble_dataset(cycle_time: datetime, leads: list[int], members: list
 
 @pytest.fixture(autouse=True)
 def _flush_caches(migrated_db):
-    """Clear Redis, in-memory caches, and cycle lifecycle rows before each test in this module."""
+    """Clear Redis, in-memory caches, and test catalog rows before each test in this module."""
     import redis as redis_lib
     from api.core.config import settings
 
@@ -99,8 +97,139 @@ def _flush_caches(migrated_db):
         pass
 
     with Session(migrated_db) as session:
+        session.execute(text("DELETE FROM forecast_products WHERE run_id LIKE 'run_gfs_%' OR run_id LIKE 'run_gefs_%'"))
+        session.execute(text("DELETE FROM ensemble_member_products WHERE run_id LIKE 'run_gfs_%' OR run_id LIKE 'run_gefs_%'"))
+        session.execute(text("DELETE FROM ensemble_members WHERE run_id LIKE 'run_gfs_%' OR run_id LIKE 'run_gefs_%'"))
+        session.execute(text("DELETE FROM model_runs WHERE id LIKE 'run_gfs_%' OR id LIKE 'run_gefs_%'"))
         session.execute(text("DELETE FROM forecast_cycle_lifecycle"))
         session.commit()
+
+
+def _ensure_version(session: Session, model_id: str) -> str:
+    from sqlalchemy import select
+    from api.models.entities import (
+        ForecastCenter,
+        ForecastGrid,
+        ForecastVariable,
+        Model,
+        ModelVersion,
+    )
+    if not session.execute(select(ForecastCenter).where(ForecastCenter.center_id == "noaa")).scalar_one_or_none():
+        session.add(ForecastCenter(id="center_noaa", center_id="noaa", name="NOAA", country="USA"))
+        session.flush()
+    if not session.execute(select(Model).where(Model.model_id == model_id)).scalar_one_or_none():
+        session.add(Model(id=f"model_{model_id}", model_id=model_id, name=model_id.upper(), center_id="noaa", is_ensemble=(model_id == "gefs"), resolution_km=25.0))
+        session.flush()
+    existing_ver = session.execute(select(ModelVersion).where((ModelVersion.model_id == model_id) & (ModelVersion.version_string == "v1.0"))).scalar_one_or_none()
+    if not existing_ver:
+        v_id = f"version_{model_id}_v1"
+        session.add(ModelVersion(id=v_id, model_id=model_id, version_string="v1.0"))
+        session.flush()
+    else:
+        v_id = str(existing_ver.id)
+    if not session.execute(select(ForecastGrid).where(ForecastGrid.grid_code == "global_025deg")).scalar_one_or_none():
+        session.add(ForecastGrid(id="grid_global_025deg", grid_code="global_025deg", name="Global 0.25", resolution_km=25.0))
+        session.flush()
+    for v_code, v_name, v_unit in [
+        ("temperature_2m", "2m Temp", "°C"),
+        ("precipitation_rate", "Precip Rate", "mm/h"),
+        ("wind_10m", "10m Wind", "km/h"),
+        ("wind_u_10m", "Wind U", "m/s"),
+        ("wind_v_10m", "Wind V", "m/s"),
+    ]:
+        if not session.execute(select(ForecastVariable).where(ForecastVariable.variable_code == v_code)).scalar_one_or_none():
+            session.add(ForecastVariable(id=f"var_{v_code}", variable_code=v_code, name=v_name, unit=v_unit))
+            session.flush()
+    return v_id
+
+
+def _seed_gfs_run(
+    session: Session,
+    cycle_time: datetime,
+    store_path: str,
+    leads: list[int],
+    status: str = "ready",
+) -> ModelRun:
+    v_id = _ensure_version(session, "gfs")
+    c_tag = cycle_time.strftime("%Y%m%d%H%M")
+    run = ModelRun(
+        id=f"run_gfs_{c_tag}",
+        model_version_id=v_id,
+        cycle_time=cycle_time,
+        status=status,
+        zarr_store_path=store_path,
+        created_at=cycle_time,
+    )
+    session.add(run)
+    for lead in leads:
+        for var in ("temperature_2m", "precipitation_rate", "wind_u_10m", "wind_v_10m"):
+            session.add(
+                ForecastProduct(
+                    id=f"product_gfs_{var}_{c_tag}_{lead}",
+                    run_id=run.id,
+                    variable_id=var,
+                    grid_id="global_025deg",
+                    product_type="surface",
+                    lead_time_hours=lead,
+                    zarr_chunk_path=store_path,
+                )
+            )
+    session.commit()
+    return run
+
+
+def _seed_gefs_run(
+    session: Session,
+    cycle_time: datetime,
+    store_path: str,
+    leads: list[int],
+    members: list[int],
+    status: str = "ready",
+) -> ModelRun:
+    v_id = _ensure_version(session, "gefs")
+    c_tag = cycle_time.strftime("%Y%m%d%H%M")
+    run = ModelRun(
+        id=f"run_gefs_{c_tag}",
+        model_version_id=v_id,
+        cycle_time=cycle_time,
+        status=status,
+        zarr_store_path=store_path,
+        created_at=cycle_time,
+    )
+    session.add(run)
+    for m in members:
+        session.add(
+            EnsembleMember(
+                id=f"member_gefs_{m}_{c_tag}",
+                run_id=run.id,
+                member_index=m,
+                member_name=f"gefs_member_{m}",
+            )
+        )
+    for lead in leads:
+        for var in ("temperature_2m", "wind_u_10m", "wind_v_10m"):
+            session.add(
+                ForecastProduct(
+                    id=f"product_gefs_{var}_{c_tag}_{lead}",
+                    run_id=run.id,
+                    variable_id=var,
+                    grid_id="global_025deg",
+                    product_type="surface",
+                    lead_time_hours=lead,
+                    zarr_chunk_path=store_path,
+                )
+            )
+        for m in members:
+            session.add(
+                EnsembleMemberProduct(
+                    id=f"emp_gefs_{m}_{lead}_{c_tag}",
+                    run_id=run.id,
+                    member_index=m,
+                    lead_time_hours=lead,
+                )
+            )
+    session.commit()
+    return run
 
 
 # ---------------------------------------------------------------------------
@@ -122,59 +251,9 @@ def test_adversarial_cache_bypass_immunity(client, migrated_db, tmp_path):
     write_dataset(ds_gfs, gfs_path)
     write_dataset(ds_gefs, gefs_path)
 
-    spec_gfs = RunCatalogSpec(
-        center_id="noaa",
-        center_name="NOAA",
-        center_country="US",
-        model_id="gfs",
-        model_name="GFS",
-        is_ensemble=False,
-        resolution_km=25.0,
-        version_string="v1.0",
-        cycle_time=c_ret,
-        grid_id="global_025deg",
-        grid_name="Global 0.25",
-        grid_resolution_km=25.0,
-        zarr_store_path=gfs_path,
-        variables=(
-            VariableSpec("temperature_2m", "2-Meter Temperature", "°C"),
-            VariableSpec("precipitation_rate", "Precipitation Rate", "mm/h"),
-            VariableSpec("wind_u_10m", "Wind U", "m/s"),
-            VariableSpec("wind_v_10m", "Wind V", "m/s"),
-        ),
-        expected_lead_time_hours=(0,),
-    )
-    spec_gefs = RunCatalogSpec(
-        center_id="noaa",
-        center_name="NOAA",
-        center_country="US",
-        model_id="gefs",
-        model_name="GEFS",
-        is_ensemble=True,
-        resolution_km=25.0,
-        version_string="v1.0",
-        cycle_time=c_ret,
-        grid_id="global_025deg",
-        grid_name="Global 0.25",
-        grid_resolution_km=25.0,
-        zarr_store_path=gefs_path,
-        variables=(
-            VariableSpec("temperature_2m", "2-Meter Temperature", "°C"),
-            VariableSpec("wind_u_10m", "Wind U", "m/s"),
-            VariableSpec("wind_v_10m", "Wind V", "m/s"),
-        ),
-        expected_lead_time_hours=(0,),
-        expected_members=tuple(range(1, 31)),
-    )
-
     with Session(migrated_db) as session:
-        record_run(session, spec_gfs, ds_gfs, committed_state=CommittedState.deterministic({0}))
-        record_run(
-            session,
-            spec_gefs,
-            ds_gefs,
-            committed_state=CommittedState.ensemble({(m, 0) for m in range(1, 31)}, set(range(1, 31))),
-        )
+        _seed_gfs_run(session, c_ret, gfs_path, [0], "ready")
+        _seed_gefs_run(session, c_ret, gefs_path, [0], list(range(1, 31)), "ready")
 
     c_ret_iso = c_ret.isoformat().replace("+00:00", "Z")
 
@@ -256,25 +335,8 @@ def test_in_flight_reader_safe_during_concurrent_retirement(client, migrated_db,
     ds = _make_dataset(c0, [0])
     write_dataset(ds, gfs_path)
 
-    spec = RunCatalogSpec(
-        center_id="noaa",
-        center_name="NOAA",
-        center_country="US",
-        model_id="gfs",
-        model_name="GFS",
-        is_ensemble=False,
-        resolution_km=25.0,
-        version_string="v1.0",
-        cycle_time=c0,
-        grid_id="global_025deg",
-        grid_name="Global 0.25",
-        grid_resolution_km=25.0,
-        zarr_store_path=gfs_path,
-        variables=(VariableSpec("temperature_2m", "2-Meter Temperature", "°C"),),
-        expected_lead_time_hours=(0,),
-    )
     with Session(migrated_db) as session:
-        record_run(session, spec, ds, committed_state=CommittedState.deterministic({0}))
+        _seed_gfs_run(session, c0, gfs_path, [0], "ready")
 
     # T0: Start a reader session holding SHARED reader gate
     reader_pool = ReaderLockPool(db_url, pool_size=2, max_overflow=0, pool_timeout=5.0)
@@ -331,30 +393,10 @@ def test_progressive_serving_blends_visible_runs_and_excludes_retired(client, mi
     write_dataset(ds_ready, p_ready)
     write_dataset(ds_part, p_part)
 
-    def _spec(cycle, path, leads):
-        return RunCatalogSpec(
-            center_id="noaa",
-            center_name="NOAA",
-            center_country="US",
-            model_id="gfs",
-            model_name="GFS",
-            is_ensemble=False,
-            resolution_km=25.0,
-            version_string="v1.0",
-            cycle_time=cycle,
-            grid_id="global_025deg",
-            grid_name="Global 0.25",
-            grid_resolution_km=25.0,
-            zarr_store_path=path,
-            variables=(VariableSpec("temperature_2m", "2-Meter Temperature", "°C"),),
-            expected_lead_time_hours=tuple(leads),
-        )
-
     with Session(migrated_db) as session:
-        record_run(session, _spec(c_ret, p_ret, [0, 6]), ds_ret, committed_state=CommittedState.deterministic({0, 6}))
-        record_run(session, _spec(c_ready, p_ready, [0, 6, 12, 18]), ds_ready, committed_state=CommittedState.deterministic({0, 6, 12, 18}))
-        r_part = record_run(session, _spec(c_part, p_part, [0, 6, 12, 18]), ds_part, committed_state=None)
-        setattr(r_part, "status", "partial")
+        _seed_gfs_run(session, c_ret, p_ret, [0, 6], "ready")
+        _seed_gfs_run(session, c_ready, p_ready, [0, 6, 12, 18], "ready")
+        _seed_gfs_run(session, c_part, p_part, [0], "partial")
 
         # Mark c_ret retired
         session.add(

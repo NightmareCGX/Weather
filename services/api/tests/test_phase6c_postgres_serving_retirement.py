@@ -18,14 +18,12 @@ import pytest
 import xarray as xr
 from sqlalchemy.orm import Session
 
-from api.models.entities import ForecastCycleLifecycle
-from ingestion.core.catalog import (
-    CommittedState,
-    RunCatalogSpec,
-    VariableSpec,
-    record_run,
+from api.models.entities import (
+    ForecastCycleLifecycle,
+    ForecastProduct,
+    ModelRun,
 )
-from ingestion.core.zarr_writer import write_dataset
+from tests._zarr_writer import write_dataset
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -71,6 +69,54 @@ def _flush_redis():
         client.close()
 
 
+def _ensure_version(session: Session, model_id: str) -> str:
+    v_id = f"version_{model_id}_v1"
+    from api.models.entities import ForecastCenter, Model, ModelVersion
+    if not session.get(ModelVersion, v_id):
+        if not session.get(ForecastCenter, "center_noaa"):
+            session.add(ForecastCenter(id="center_noaa", center_id="noaa", name="NOAA", country="USA"))
+            session.flush()
+        if not session.get(Model, f"model_{model_id}"):
+            session.add(Model(id=f"model_{model_id}", model_id=model_id, name=model_id.upper(), center_id="noaa", is_ensemble=(model_id == "gefs"), resolution_km=25.0))
+            session.flush()
+        session.add(ModelVersion(id=v_id, model_id=model_id, version_string="v1.0"))
+        session.flush()
+    return v_id
+
+
+def _seed_gfs_run(
+    session: Session,
+    cycle_time: datetime,
+    store_path: str,
+    status: str = "ready",
+) -> ModelRun:
+    v_id = _ensure_version(session, "gfs")
+    c_tag = cycle_time.strftime("%Y%m%d%H%M")
+    run = ModelRun(
+        id=f"run_gfs_{c_tag}",
+        model_version_id=v_id,
+        cycle_time=cycle_time,
+        status=status,
+        zarr_store_path=store_path,
+        created_at=cycle_time,
+    )
+    session.add(run)
+    for var in ("temperature_2m", "precipitation_rate"):
+        session.add(
+            ForecastProduct(
+                id=f"product_gfs_{var}_{c_tag}_0",
+                run_id=run.id,
+                variable_id=var,
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=0,
+                zarr_chunk_path=store_path,
+            )
+        )
+    session.commit()
+    return run
+
+
 def test_postgres_serving_retirement_lifecycle_transition(
     client, migrated_db, tmp_path
 ):
@@ -86,60 +132,9 @@ def test_postgres_serving_retirement_lifecycle_transition(
     write_dataset(ds1, store1_path)
     write_dataset(ds2, store2_path)
 
-    spec1 = RunCatalogSpec(
-        center_id="noaa",
-        center_name="NOAA",
-        center_country="US",
-        model_id="gfs",
-        model_name="GFS",
-        is_ensemble=False,
-        resolution_km=25.0,
-        version_string="v1.0",
-        cycle_time=c1,
-        grid_id="global_025deg",
-        grid_name="Global 0.25",
-        grid_resolution_km=25.0,
-        zarr_store_path=store1_path,
-        variables=(
-            VariableSpec("temperature_2m", "2-Meter Temperature", "°C"),
-            VariableSpec("precipitation_rate", "Precipitation Rate", "mm/h"),
-        ),
-        expected_lead_time_hours=(0,),
-    )
-    spec2 = RunCatalogSpec(
-        center_id="noaa",
-        center_name="NOAA",
-        center_country="US",
-        model_id="gfs",
-        model_name="GFS",
-        is_ensemble=False,
-        resolution_km=25.0,
-        version_string="v1.0",
-        cycle_time=c2,
-        grid_id="global_025deg",
-        grid_name="Global 0.25",
-        grid_resolution_km=25.0,
-        zarr_store_path=store2_path,
-        variables=(
-            VariableSpec("temperature_2m", "2-Meter Temperature", "°C"),
-            VariableSpec("precipitation_rate", "Precipitation Rate", "mm/h"),
-        ),
-        expected_lead_time_hours=(0,),
-    )
-
     with Session(migrated_db) as session:
-        record_run(
-            session,
-            spec1,
-            ds1,
-            committed_state=CommittedState.deterministic({0}),
-        )
-        record_run(
-            session,
-            spec2,
-            ds2,
-            committed_state=CommittedState.deterministic({0}),
-        )
+        _seed_gfs_run(session, c1, store1_path, "ready")
+        _seed_gfs_run(session, c2, store2_path, "ready")
 
     # 1. Before retirement: point forecast succeeds
     res_point = client.get(
