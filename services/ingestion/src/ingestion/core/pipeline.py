@@ -60,6 +60,7 @@ from ingestion.core.zarr_writer import (
     commit_region,
     prepare_run_store,
     read_dataset,
+    read_slice,
     store_exists,
 )
 from ingestion.providers.noaa.parser import parse_grib2
@@ -390,38 +391,17 @@ def read_predecessor_precipitation(
         raise MissingPredecessorLeadError(
             f"Cannot read predecessor precipitation: store {store_path!r} does not exist."
         )
-    ds = read_dataset(store_path)
-    if "precipitation_amount_3h" not in ds.data_vars:
+    vals = read_slice(
+        store_path,
+        "precipitation_amount_3h",
+        lead_time_hours=lead_time_hours,
+        member=member,
+    )
+    if vals is None:
         raise MissingPredecessorLeadError(
             f"Cannot read predecessor precipitation: variable 'precipitation_amount_3h' "
-            f"is missing from store {store_path!r}."
+            f"at lead {lead_time_hours} (member={member}) is missing from store {store_path!r}."
         )
-    if "lead_time_hours" not in ds.coords:
-        raise MissingPredecessorLeadError(
-            f"Cannot read predecessor precipitation: no 'lead_time_hours' coordinate in {store_path!r}."
-        )
-    lead_vals = [int(v) for v in np.atleast_1d(ds.coords["lead_time_hours"].values).reshape(-1)]
-    if int(lead_time_hours) not in lead_vals:
-        raise MissingPredecessorLeadError(
-            f"Predecessor lead {lead_time_hours} is not in store's lead coordinates {lead_vals}."
-        )
-
-    var = ds["precipitation_amount_3h"]
-    if member is not None:
-        if "member" not in ds.coords:
-            raise MissingPredecessorLeadError(
-                f"Expected ensemble store with 'member' coordinate in {store_path!r}."
-            )
-        member_vals = [int(v) for v in np.atleast_1d(ds.coords["member"].values).reshape(-1)]
-        if int(member) not in member_vals:
-            raise MissingPredecessorLeadError(
-                f"Predecessor member {member} is not in store's member coordinates {member_vals}."
-            )
-        slice_da = var.sel(member=member, lead_time_hours=lead_time_hours)
-    else:
-        slice_da = var.sel(lead_time_hours=lead_time_hours)
-
-    vals = np.asarray(slice_da.values, dtype=np.float32)
     if np.all(np.isnan(vals)):
         raise MissingPredecessorLeadError(
             f"Predecessor lead {lead_time_hours} (member={member}) in {store_path!r} "
@@ -570,38 +550,17 @@ def read_predecessor_cloud_cover(
         raise MissingPredecessorLeadError(
             f"Cannot read predecessor cloud cover: store {store_path!r} does not exist."
         )
-    ds = read_dataset(store_path)
-    if "cloud_cover_3h" not in ds.data_vars:
+    vals = read_slice(
+        store_path,
+        "cloud_cover_3h",
+        lead_time_hours=lead_time_hours,
+        member=member,
+    )
+    if vals is None:
         raise MissingPredecessorLeadError(
             f"Cannot read predecessor cloud cover: variable 'cloud_cover_3h' "
-            f"is missing from store {store_path!r}."
+            f"at lead {lead_time_hours} (member={member}) is missing from store {store_path!r}."
         )
-    if "lead_time_hours" not in ds.coords:
-        raise MissingPredecessorLeadError(
-            f"Cannot read predecessor cloud cover: no 'lead_time_hours' coordinate in {store_path!r}."
-        )
-    lead_vals = [int(v) for v in np.atleast_1d(ds.coords["lead_time_hours"].values).reshape(-1)]
-    if int(lead_time_hours) not in lead_vals:
-        raise MissingPredecessorLeadError(
-            f"Predecessor lead {lead_time_hours} is not in store's lead coordinates {lead_vals}."
-        )
-
-    var = ds["cloud_cover_3h"]
-    if member is not None:
-        if "member" not in ds.coords:
-            raise MissingPredecessorLeadError(
-                f"Expected ensemble store with 'member' coordinate in {store_path!r}."
-            )
-        member_vals = [int(v) for v in np.atleast_1d(ds.coords["member"].values).reshape(-1)]
-        if int(member) not in member_vals:
-            raise MissingPredecessorLeadError(
-                f"Predecessor member {member} is not in store's member coordinates {member_vals}."
-            )
-        slice_da = var.sel(member=member, lead_time_hours=lead_time_hours)
-    else:
-        slice_da = var.sel(lead_time_hours=lead_time_hours)
-
-    vals = np.asarray(slice_da.values, dtype=np.float32)
     if np.all(np.isnan(vals)):
         raise MissingPredecessorLeadError(
             f"Predecessor lead {lead_time_hours} (member={member}) in {store_path!r} "

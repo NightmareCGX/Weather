@@ -189,6 +189,45 @@ def test_sharded_v1_store_roundtrip_preserves_data(tmp_path: Path) -> None:
     assert np.all(np.isnan(t2m[1, 0]))
 
 
+def test_sharded_v1_read_slice(tmp_path: Path) -> None:
+    """Test read_slice loads individual 2D region shards without full 4D store allocation."""
+    from ingestion.core.zarr_writer import commit_region, prepare_run_store, read_slice
+
+    store = str(tmp_path / "slice_store.zarr")
+    ds_seed = _synthetic_region_dataset(lead=0, member=1)
+    prepare_run_store(
+        ds_seed,
+        store,
+        expected_lead_time_hours=(0, 6, 12),
+        expected_members=(1, 2),
+    )
+
+    commit_region(ds_seed, store, lead_time_hours=0, member=1)
+    ds_lead6 = _synthetic_region_dataset(lead=6, member=1)
+    commit_region(ds_lead6, store, lead_time_hours=6, member=1)
+
+    # Committed slice (member 1, lead 0) -> valid 2D array (721, 1440)
+    slice_0 = read_slice(store, "temperature_2m", lead_time_hours=0, member=1)
+    assert slice_0 is not None
+    assert slice_0.shape == (721, 1440)
+    assert not np.all(np.isnan(slice_0))
+    assert np.allclose(slice_0, 290.0)
+
+    # Committed slice (member 1, lead 6) -> valid 2D array
+    slice_6 = read_slice(store, "temperature_2m", lead_time_hours=6, member=1)
+    assert slice_6 is not None
+    assert slice_6.shape == (721, 1440)
+    assert np.allclose(slice_6, 290.0)
+
+    # Uncommitted lead (member 1, lead 12) -> shard does not exist -> fallback / None or NaN
+    slice_12 = read_slice(store, "temperature_2m", lead_time_hours=12, member=1)
+    assert slice_12 is None or np.all(np.isnan(slice_12))
+
+    # Uncommitted member (member 2, lead 0) -> shard does not exist -> fallback / None or NaN
+    slice_m2 = read_slice(store, "temperature_2m", lead_time_hours=0, member=2)
+    assert slice_m2 is None or np.all(np.isnan(slice_m2))
+
+
 def test_sharded_v1_minio_roundtrip_and_no_chunk_flooding(minio_store: str) -> None:
     """Regression test: sharded_v1 on MinIO S3 roundtrips without flooding chunk GETs or hanging."""
     from ingestion.core.zarr_writer import commit_region, prepare_run_store, read_dataset
