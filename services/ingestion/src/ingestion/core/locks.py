@@ -198,11 +198,12 @@ class StoreLockCoordinator:
         while True:
             acquired_keys: list[int] = []
             try:
-                stmt = text(
-                    "SELECT k, pg_try_advisory_lock(k) AS acquired "
-                    "FROM unnest(CAST(:keys AS bigint[])) AS k"
-                )
-                results = self._connection.execute(stmt, {"keys": sorted_keys}).fetchall()
+                with self._connection.begin():
+                    stmt = text(
+                        "SELECT k, pg_try_advisory_lock(k) AS acquired "
+                        "FROM unnest(CAST(:keys AS bigint[])) AS k"
+                    )
+                    results = self._connection.execute(stmt, {"keys": sorted_keys}).fetchall()
                 all_acquired = True
                 for row in results:
                     k_val = int(row[0])
@@ -244,6 +245,23 @@ class StoreLockCoordinator:
                 )
             time.sleep(0.02)
 
+    def _is_lock_timeout_error(self, exc: BaseException) -> bool:
+        """Return whether exc was caused by a PostgreSQL lock_timeout cancellation (SQLSTATE 55P03)."""
+        orig = getattr(exc, "orig", None)
+        if orig is not None:
+            pgcode = getattr(orig, "pgcode", None)
+            if pgcode == "55P03":
+                return True
+            sqlstate = getattr(orig, "sqlstate", None)
+            if sqlstate == "55P03":
+                return True
+        exc_str = str(exc).lower()
+        return (
+            "55p03" in exc_str
+            or "canceling statement due to lock timeout" in exc_str
+            or "lock_not_available" in exc_str
+        )
+
     def _release_batch_exclusive(self, keys: list[int]) -> None:
         """Release a batch of exclusive advisory locks in a single SQL round-trip.
 
@@ -255,15 +273,21 @@ class StoreLockCoordinator:
         sorted_keys = sorted(keys, reverse=True)
         ok = True
         try:
-            stmt = text(
-                "SELECT k, pg_advisory_unlock(k) AS released "
-                "FROM unnest(CAST(:keys AS bigint[])) AS k"
+            with self._connection.begin():
+                stmt = text(
+                    "SELECT k, pg_advisory_unlock(k) AS released "
+                    "FROM unnest(CAST(:keys AS bigint[])) AS k"
+                )
+                results = self._connection.execute(stmt, {"keys": sorted_keys}).fetchall()
+                for row in results:
+                    if not bool(row[1]):
+                        ok = False
+        except Exception as exc:
+            logger.warning(
+                "Error during batched advisory unlock on %s: %s",
+                self._store_path,
+                exc,
             )
-            results = self._connection.execute(stmt, {"keys": sorted_keys}).fetchall()
-            for row in results:
-                if not bool(row[1]):
-                    ok = False
-        except Exception:
             ok = False
 
         if not ok:
@@ -299,38 +323,39 @@ class StoreLockCoordinator:
             # each key once. Refuse rather than double-acquire (which would
             # require a second unlock).
             raise RuntimeError(f"advisory lock {key} already held by this worker")
-        deadline = time.monotonic() + self._timeout_seconds
-        while True:
-            try:
-                self._connection.execute(text("BEGIN"))
+
+        timeout_ms = int(max(1, self._timeout_seconds * 1000))
+        try:
+            with self._connection.begin():
                 self._connection.execute(
                     text("SET LOCAL lock_timeout = :ms"),
-                    {"ms": int(max(1, self._timeout_seconds * 1000))},
+                    {"ms": timeout_ms},
                 )
-                # Try non-blocking first so a cancelled request can bail out
-                # between attempts without a long blocking wait.
-                acquired = self._connection.execute(
-                    text(f"SELECT {try_fn}(:key)"), {"key": key}
-                ).scalar()
-                if acquired:
-                    self._connection.execute(text("COMMIT"))
-                    with self._lock:
-                        if exclusive:
-                            self._locks.record_exclusive(key)
-                        else:
-                            self._locks.record_shared(key)
-                    return
-                self._connection.execute(text("ROLLBACK"))
-            except Exception:
-                self._connection.execute(text("ROLLBACK"))
-                raise
-            if time.monotonic() >= deadline:
+                self._connection.execute(
+                    text(f"SELECT {blocking}(:key)"),
+                    {"key": key},
+                )
+            # Transaction commits; session-level advisory lock remains held on Connection.
+            with self._lock:
+                if exclusive:
+                    self._locks.record_exclusive(key)
+                else:
+                    self._locks.record_shared(key)
+        except Exception as exc:
+            if self._is_lock_timeout_error(exc):
                 raise LockTimeoutError(
-                    f"timed out acquiring advisory lock {key} after "
-                    f"{self._timeout_seconds}s"
-                )
-            # Poll briefly. This is a bounded non-abandoning wait.
-            time.sleep(0.02)
+                    f"timed out acquiring advisory lock {key} on {self._store_path} "
+                    f"after {self._timeout_seconds}s"
+                ) from exc
+            logger.error(
+                "Error during advisory lock acquisition on %s (key=%s); invalidating "
+                "physical Connection to guarantee no lock leaks: %s",
+                self._store_path,
+                key,
+                exc,
+            )
+            self._invalidate_connection()
+            raise
 
     def _release_exclusive(self, key: int) -> None:
         self._release(key, "pg_advisory_unlock")
@@ -344,14 +369,24 @@ class StoreLockCoordinator:
             in_shared = key in self._locks.shared_held
         if not in_exclusive and not in_shared:
             return  # not held by this worker; nothing to unlock
+
+        ok = True
         try:
-            self._connection.execute(text("BEGIN"))
-            ok = self._connection.execute(
-                text(f"SELECT {unlock_fn}(:key)"), {"key": key}
-            ).scalar()
-            self._connection.execute(text("COMMIT"))
-        except Exception:
+            with self._connection.begin():
+                result = self._connection.execute(
+                    text(f"SELECT {unlock_fn}(:key)"), {"key": key}
+                ).scalar()
+                if not bool(result):
+                    ok = False
+        except Exception as exc:
+            logger.warning(
+                "Error during advisory unlock of %s on %s: %s",
+                key,
+                self._store_path,
+                exc,
+            )
             ok = False
+
         if not ok:
             # Unlock could not be confirmed; the physical session must be
             # dropped so its remaining locks die with it. Never return this
@@ -363,6 +398,7 @@ class StoreLockCoordinator:
                 self._store_path,
             )
             self._invalidate_connection()
+
         with self._lock:
             self._locks.held.discard(key)
             self._locks.shared_held.discard(key)

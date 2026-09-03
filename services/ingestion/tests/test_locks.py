@@ -278,3 +278,134 @@ def test_batched_region_locks_partial_contention_timeout(engine) -> None:
         c1.close()
         c2.close()
 
+
+def test_writer_cannot_be_starved_by_continuous_readers(engine) -> None:
+    """A waiting exclusive writer makes bounded progress and is not starved by newly arriving readers."""
+    import threading
+
+    store = "s3://weather-data/gfs/2026-07-21/00/cycle.zarr"
+    c_r1 = engine.connect()
+    co_r1 = _co(engine, c_r1, store)
+
+    # 1. R1 acquires SHARED store gate
+    co_r1.acquire_shared_gate()
+
+    writer_acquired = threading.Event()
+    writer_failed = threading.Event()
+    stop_stream = threading.Event()
+
+    def writer_worker():
+        c_w = engine.connect()
+        co_w = StoreLockCoordinator(c_w, store_path=store, timeout_seconds=5.0)
+        try:
+            co_w.acquire_exclusive_gate()
+            writer_acquired.set()
+            # Hold briefly to verify exclusive ownership
+            time.sleep(0.05)
+            co_w.release_exclusive_gate()
+        except Exception:
+            writer_failed.set()
+        finally:
+            c_w.close()
+
+    def continuous_reader_worker(worker_id: int):
+        c_r = engine.connect()
+        co_r = StoreLockCoordinator(c_r, store_path=store, timeout_seconds=5.0)
+        try:
+            while not stop_stream.is_set():
+                try:
+                    co_r.acquire_shared_gate()
+                    time.sleep(0.02)
+                    co_r.release_shared_gate()
+                    time.sleep(0.01)
+                except Exception:
+                    pass
+        finally:
+            co_r.release_all()
+            c_r.close()
+
+    writer_thread = threading.Thread(target=writer_worker)
+    # Start continuous reader threads that bombard the lock
+    reader_threads = [
+        threading.Thread(target=continuous_reader_worker, args=(i,))
+        for i in range(4)
+    ]
+    for rt in reader_threads:
+        rt.start()
+
+    time.sleep(0.05)
+    # Start writer: it must queue behind R1 and block subsequent readers
+    writer_thread.start()
+    time.sleep(0.1)
+
+    # R1 releases its lock. PostgreSQL's lock manager must grant the lock to Writer!
+    co_r1.release_shared_gate()
+    c_r1.close()
+
+    # Writer must acquire within 2.0 seconds despite continuous readers running
+    writer_thread.join(timeout=3.0)
+    stop_stream.set()
+    for rt in reader_threads:
+        rt.join(timeout=2.0)
+
+    assert not writer_failed.is_set(), "Writer failed to acquire exclusive lock"
+    assert writer_acquired.is_set(), "Writer was starved by continuous arriving readers"
+
+
+def test_db_disconnect_during_acquire_preserves_error_and_invalidates(engine) -> None:
+    """A DBAPI/OperationalError during acquire preserves the original exception and invalidates the Connection."""
+    from unittest.mock import MagicMock
+    from sqlalchemy.exc import OperationalError
+
+    c1 = engine.connect()
+    store = "s3://weather-data/gfs/2026-07-21/00/cycle.zarr"
+    co = _co(engine, c1, store)
+
+    # Mock execute to simulate a severed connection on BEGIN
+    orig_execute = c1.execute
+    def mock_broken_execute(*args, **kwargs):
+        raise OperationalError("server closed the connection unexpectedly", params=None, orig=Exception("socket closed"))
+
+    c1.execute = MagicMock(side_effect=mock_broken_execute)
+
+    try:
+        with pytest.raises(OperationalError) as exc_info:
+            co.acquire_exclusive_gate()
+
+        # Assert original error message is preserved (not masked by PendingRollbackError)
+        assert "server closed the connection unexpectedly" in str(exc_info.value)
+        # Assert connection was invalidated
+        assert c1.invalidated or c1.closed
+    finally:
+        c1.execute = orig_execute
+        c1.close()
+
+
+def test_unlock_failure_invalidates_connection(engine) -> None:
+    """An unlock failure (query returns False or raises) marks the connection invalidated."""
+    from unittest.mock import MagicMock
+
+    c1 = engine.connect()
+    store = "s3://weather-data/gfs/2026-07-21/00/cycle.zarr"
+    co = _co(engine, c1, store)
+    key = co.store_gate()
+
+    co.acquire_shared_gate()
+    assert key in co.held_keys
+
+    # Mock execute on unlock to simulate unlock returning false
+    mock_result = MagicMock()
+    mock_result.scalar.return_value = False
+    orig_execute = c1.execute
+    c1.execute = MagicMock(return_value=mock_result)
+
+    try:
+        co.release_shared_gate()
+        # Connection should have been invalidated
+        assert c1.invalidated or c1.closed
+        assert key not in co.held_keys
+    finally:
+        c1.execute = orig_execute
+        c1.close()
+
+

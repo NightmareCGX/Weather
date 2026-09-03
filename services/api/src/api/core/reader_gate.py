@@ -131,48 +131,90 @@ class _ReaderGateSession:
         self._gate_key = store_gate_key(store_path)
         self._admission_key = admission_key(store_path)
 
+    def _is_lock_timeout_error(self, exc: BaseException) -> bool:
+        """Check if an exception is a PostgreSQL lock_timeout cancellation (55P03)."""
+        orig = getattr(exc, "orig", None)
+        if orig is not None:
+            pgcode = getattr(orig, "pgcode", None)
+            if pgcode == "55P03":
+                return True
+            sqlstate = getattr(orig, "sqlstate", None)
+            if sqlstate == "55P03":
+                return True
+        exc_str = str(exc).lower()
+        return (
+            "55p03" in exc_str
+            or "canceling statement due to lock timeout" in exc_str
+            or "lock_not_available" in exc_str
+        )
+
     def acquire(self, timeout_seconds: float) -> None:
         deadline = time.monotonic() + timeout_seconds
         if time.monotonic() >= deadline:
             raise ReaderGateTimeout("reader gate timed out before checkout")
         self._conn = self._pool.connect()
         try:
-            self._acquire_shared(self._admission_key, deadline)
+            rem_admission = max(0.001, deadline - time.monotonic())
+            self._acquire_shared(self._admission_key, rem_admission)
             try:
-                self._acquire_shared(self._gate_key, deadline)
+                rem_gate = max(0.001, deadline - time.monotonic())
+                self._acquire_shared(self._gate_key, rem_gate)
                 self._gate_held = True
             finally:
                 self._release_shared(self._admission_key)
         except BaseException:
-            self._release_shared(self._gate_key)
+            if self._gate_held:
+                self._release_shared(self._gate_key)
+                self._gate_held = False
             self._close_conn()
             raise
 
-    def _acquire_shared(self, key: int, deadline: float) -> None:
+    def _acquire_shared(self, key: int, timeout_seconds: float) -> None:
         assert self._conn is not None
-        while True:
-            if time.monotonic() >= deadline:
-                raise ReaderGateTimeout("reader gate timed out acquiring SHARED lock")
-            self._conn.execute(text("BEGIN"))
-            self._conn.execute(text("SET LOCAL lock_timeout = 1000"))
-            acquired = self._conn.execute(
-                text("SELECT pg_try_advisory_lock_shared(:key)"), {"key": key}
-            ).scalar()
-            self._conn.execute(text("COMMIT"))
-            if acquired:
-                return
-            time.sleep(0.02)
+        timeout_ms = int(max(1, timeout_seconds * 1000))
+        try:
+            with self._conn.begin():
+                self._conn.execute(
+                    text("SET LOCAL lock_timeout = :ms"),
+                    {"ms": timeout_ms},
+                )
+                self._conn.execute(
+                    text("SELECT pg_advisory_lock_shared(:key)"),
+                    {"key": key},
+                )
+        except Exception as exc:
+            if self._is_lock_timeout_error(exc):
+                raise ReaderGateTimeout(
+                    f"reader gate timed out acquiring SHARED lock on {self._store_path} "
+                    f"after {timeout_seconds}s"
+                ) from exc
+            logger.error(
+                "reader SHARED lock acquisition error on %s (key=%s); invalidating: %s",
+                self._store_path,
+                key,
+                exc,
+            )
+            self._invalidate_conn()
+            raise
 
     def _release_shared(self, key: int) -> None:
         if self._conn is None:
             return
+        ok = True
         try:
-            self._conn.execute(text("BEGIN"))
-            ok = self._conn.execute(
-                text("SELECT pg_advisory_unlock_shared(:key)"), {"key": key}
-            ).scalar()
-            self._conn.execute(text("COMMIT"))
-        except Exception:  # noqa: BLE001
+            with self._conn.begin():
+                result = self._conn.execute(
+                    text("SELECT pg_advisory_unlock_shared(:key)"), {"key": key}
+                ).scalar()
+                if not bool(result):
+                    ok = False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Error releasing reader SHARED lock on %s (key=%s): %s",
+                self._store_path,
+                key,
+                exc,
+            )
             ok = False
         if not ok:
             logger.error(

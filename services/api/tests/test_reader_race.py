@@ -208,3 +208,56 @@ def test_gated_read_materializes_bounded_selection_under_lock(migrated_db, tmp_p
     )
     assert isinstance(out, np.ndarray)
     assert out.shape == (5, 5), f"bounded read shape wrong: {out.shape}"
+
+
+def test_reader_gate_timeout_when_exclusive_held(migrated_db, tmp_path) -> None:
+    """ReaderGateTimeout is raised near the configured bound when an EXCLUSIVE lock is held."""
+    from api.core.reader_gate import ReaderGateTimeout
+
+    store_path = str(tmp_path / "contested.zarr")
+    key = store_gate_key(store_path)
+
+    # Acquire EXCLUSIVE lock on an independent connection
+    eng = create_engine(DB_URL, pool_pre_ping=True)
+    c_ex = eng.connect()
+    c_ex.execute(text("SELECT pg_advisory_lock(:key)"), {"key": key})
+
+    pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
+    session = _ReaderGateSession(pool, store_path)
+    try:
+        with pytest.raises(ReaderGateTimeout):
+            session.acquire(timeout_seconds=1.0)
+    finally:
+        session.release()
+        c_ex.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+        c_ex.close()
+        eng.dispose()
+        pool.dispose()
+
+
+def test_reader_disconnect_during_acquire_invalidates(migrated_db, tmp_path) -> None:
+    """A DBAPI/OperationalError during reader acquire invalidates the connection and raises."""
+    from unittest.mock import MagicMock
+    from sqlalchemy.exc import OperationalError
+
+    store_path = str(tmp_path / "broken_reader.zarr")
+    pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
+    session = _ReaderGateSession(pool, store_path)
+
+    # Patch pool.connect to return a connection with a broken execute
+    mock_conn = pool.connect()
+    mock_conn.execute = MagicMock(
+        side_effect=OperationalError("server closed the connection unexpectedly", params=None, orig=Exception("socket closed"))
+    )
+    pool.connect = MagicMock(return_value=mock_conn)
+
+    try:
+        with pytest.raises(OperationalError) as exc_info:
+            session.acquire(timeout_seconds=2.0)
+
+        assert "server closed the connection unexpectedly" in str(exc_info.value)
+        assert mock_conn.invalidated or mock_conn.closed
+    finally:
+        session.release()
+        pool.dispose()
+
