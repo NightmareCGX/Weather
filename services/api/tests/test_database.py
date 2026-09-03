@@ -20,13 +20,14 @@ from api.models import (
 
 
 def test_orm_metadata_tables_registered():
-    """Verify all 14 expected tables are correctly registered in SQLAlchemy metadata."""
+    """Verify all expected tables are correctly registered in SQLAlchemy metadata."""
     expected_tables = [
         "forecast_centers",
         "models",
         "model_versions",
         "model_runs",
         "ensemble_members",
+        "ensemble_member_products",
         "forecast_variables",
         "forecast_grids",
         "forecast_products",
@@ -35,6 +36,7 @@ def test_orm_metadata_tables_registered():
         "ski_resorts",
         "verification_observations",
         "point_query_fallback_audit",
+        "forecast_cycle_lifecycle",
     ]
 
     registered_tables = list(Base.metadata.tables.keys())
@@ -48,6 +50,14 @@ def test_model_attributes_and_relationships():
     assert hasattr(Model, "center")
     assert hasattr(Model, "versions")
     assert hasattr(Station, "observations")
+
+    from api.models.entities import ForecastCycleLifecycle
+    assert hasattr(ForecastCycleLifecycle, "cycle_time")
+    assert hasattr(ForecastCycleLifecycle, "retired_at")
+    assert hasattr(ForecastCycleLifecycle, "retired_by_cycle_time")
+    assert hasattr(ForecastCycleLifecycle, "deleted_at")
+    assert hasattr(ForecastCycleLifecycle, "created_at")
+    assert hasattr(ForecastCycleLifecycle, "updated_at")
     assert hasattr(Station, "geom")
     assert hasattr(City, "geom")
     assert hasattr(SkiResort, "geom")

@@ -55,6 +55,7 @@ _NS_STORE_GATE = 0x0000000000000000
 _NS_REGION_CONFLICT = 0x1000000000000000
 _NS_ADMISSION = 0x2000000000000000
 _NS_SCHEDULER_LEADER = 0x3000000000000000
+_NS_GC_LEADER = 0x4000000000000000
 
 #: Mask that keeps the low 60 bits (the effective hash payload).
 _HASH_MASK = 0x0FFFFFFFFFFFFFFF
@@ -65,6 +66,12 @@ _HASH_MASK = 0x0FFFFFFFFFFFFFFF
 #: duplicated scheduler work and is released naturally when the holder's
 #: connection dies) and never replaces the per-store correctness gates.
 REALTIME_SCHEDULER_LEADER_IDENTITY = "ingestion-realtime-scheduler-leader"
+
+#: Default identity of the GC orchestrator leadership lock.
+#: One deployment-wide GC worker may run at a time; the session-level advisory
+#: lock on this key is optimization-only leadership (it prevents duplicate GC
+#: runs and is released naturally when the holder's connection closes/dies).
+GC_LEADER_IDENTITY = "ingestion-gc-leader"
 
 
 def scheduler_leader_key(
@@ -80,6 +87,21 @@ def scheduler_leader_key(
         The 64-bit advisory key in the scheduler-leader namespace.
     """
     return _namespaced_key(_NS_SCHEDULER_LEADER, identity)
+
+
+def gc_leader_key(
+    identity: str = GC_LEADER_IDENTITY,
+) -> int:
+    """Derive the advisory-lock key for GC orchestrator leadership.
+
+    Args:
+        identity: Deployment-wide leader-lock identity. One lock key per
+            deployment so independent deployments do not exclude each other.
+
+    Returns:
+        The 64-bit advisory key in the GC-leader namespace.
+    """
+    return _namespaced_key(_NS_GC_LEADER, identity)
 
 
 def _namespaced_key(namespace: int, identity: str) -> int:

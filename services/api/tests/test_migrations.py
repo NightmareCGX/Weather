@@ -49,6 +49,7 @@ def test_postgres_alembic_migration_smoke(postgres_engine):
         "model_versions",
         "model_runs",
         "ensemble_members",
+        "ensemble_member_products",
         "forecast_variables",
         "forecast_grids",
         "forecast_products",
@@ -57,6 +58,7 @@ def test_postgres_alembic_migration_smoke(postgres_engine):
         "ski_resorts",
         "verification_observations",
         "point_query_fallback_audit",
+        "forecast_cycle_lifecycle",
     ]
 
     for table in expected_tables:
