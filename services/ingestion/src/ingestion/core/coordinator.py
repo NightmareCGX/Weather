@@ -290,6 +290,87 @@ class RunCoordinator:
             model_id=model_id,
         )
 
+    def try_validate_existing_store(
+        self,
+        seed_dataset: xr.Dataset,
+        *,
+        expected_leads: tuple[int, ...],
+        expected_members: tuple[int, ...],
+    ) -> StoreMetadataSnapshot | None:
+        """Attempt to authoritatively validate an existing store without acquiring exclusive lock.
+
+        Verifies:
+        1. Store existence (.zgroup, .zattrs, .protocol_version)
+        2. Protocol version marker is present and recognized
+        3. Model identity and cycle time match the spec and seed dataset
+        4. Canonical coordinate horizon:
+           - lead_time_hours coordinate covers all expected_leads
+           - member coordinate covers all expected_members (if ensemble)
+        5. Grid geometry: latitude and longitude coordinates and shapes match seed dataset
+        6. Variable schemas: all variables in catalog_spec exist in store
+        7. Snapshot construction succeeds completely in memory
+
+        Returns the validated StoreMetadataSnapshot if all checks pass, else None.
+        """
+        from ingestion.core.markers import HYBRID, MARKER_V1, read_protocol_version
+        from ingestion.core.zarr_writer import _resolve_store, store_exists
+
+        if not store_exists(self.store_path):
+            return None
+
+        mode = read_protocol_version(self.store_path)
+        if mode not in (MARKER_V1, HYBRID):
+            return None
+
+        resolved = _resolve_store(self.store_path)
+        existing = xr.open_zarr(resolved, consolidated=False)
+        try:
+            # 1. Model & Cycle identity validation
+            _validate_store_identity(seed_dataset, existing, self.store_path)
+            if "model_id" in existing.attrs and self.spec.model_id:
+                if str(existing.attrs.get("model_id")) != self.spec.model_id:
+                    return None
+
+            # 2. Canonical Coordinate Horizon check
+            if "lead_time_hours" not in existing.coords:
+                return None
+            stored_leads = set(int(v) for v in np.atleast_1d(existing.coords["lead_time_hours"].values).reshape(-1))
+            if not set(expected_leads).issubset(stored_leads):
+                return None
+
+            if self.spec.is_ensemble or expected_members:
+                if "member" not in existing.coords:
+                    return None
+                stored_members = set(int(v) for v in np.atleast_1d(existing.coords["member"].values).reshape(-1))
+                if not set(expected_members).issubset(stored_members):
+                    return None
+
+            # 3. Grid geometry check
+            for axis in ("latitude", "longitude"):
+                if axis in existing.coords and axis in seed_dataset.coords:
+                    stored_vals = existing.coords[axis].values
+                    seed_vals = seed_dataset.coords[axis].values
+                    if len(stored_vals) != len(seed_vals) or not np.allclose(
+                        np.asarray(stored_vals, dtype=np.float32),
+                        np.asarray(seed_vals, dtype=np.float32),
+                    ):
+                        return None
+
+            # 4. Data variable schemas check
+            if not existing.data_vars:
+                return None
+            for var in seed_dataset.data_vars:
+                if str(var) not in existing.data_vars:
+                    return None
+
+            # 5. Build full metadata snapshot in memory
+            return self._build_snapshot()
+        except Exception as exc:
+            logger.debug("Existing store validation error on %s: %s", self.store_path, exc)
+            return None
+        finally:
+            existing.close()
+
     # ------------------------------------------------------------------
     # Retained-seed initialization (Step 5)
     # ------------------------------------------------------------------
@@ -306,6 +387,11 @@ class RunCoordinator:
     ) -> None:
         """Initialize the store under the EXCLUSIVE gate (retained-seed flow).
 
+        For already-initialized and fully compatible stores (incremental waves),
+        attempts an authoritative fast-path validation that skips the EXCLUSIVE gate.
+        Falls back to full EXCLUSIVE initialization on missing, incomplete, or
+        corrupted stores.
+
         Args:
             conn: The worker's physical Connection (holds the EXCLUSIVE gate).
             seed_dataset: The retained parsed/normalized seed dataset.
@@ -321,6 +407,32 @@ class RunCoordinator:
         Raises:
             LiveStoreOverwriteError: If a live run owns the absent store path.
         """
+        # Fast path for validated existing stores:
+        snapshot: StoreMetadataSnapshot | None = None
+        try:
+            snapshot = self.try_validate_existing_store(
+                seed_dataset,
+                expected_leads=expected_leads,
+                expected_members=expected_members,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Fast-path store validation failed on %s; falling back to EXCLUSIVE init: %s",
+                self.store_path,
+                exc,
+            )
+            snapshot = None
+
+        if snapshot is not None:
+            self._snapshot = snapshot
+            if run_id is not None and is_same_cycle:
+                with Session(bind=conn) as db:
+                    set_run_partial(db, run_id)
+                    db.commit()
+            if observer is not None and hasattr(observer, "record_milestone"):
+                observer.record_milestone("store_gate_acquired")
+            return
+
         co = StoreLockCoordinator(
             conn,
             store_path=self.store_path,
