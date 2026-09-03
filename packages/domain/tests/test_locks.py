@@ -227,3 +227,24 @@ def test_serving_state_fingerprint_run_identity_order_insensitive() -> None:
         region_serving_states=[],
     )
     assert a == b
+
+
+def test_scheduler_leader_key_namespaced_and_stable() -> None:
+    from domain.locks import (
+        REALTIME_SCHEDULER_LEADER_IDENTITY,
+        scheduler_leader_key,
+        store_gate_key,
+    )
+
+    key = scheduler_leader_key()
+    assert key == scheduler_leader_key(REALTIME_SCHEDULER_LEADER_IDENTITY)
+    # Stable across calls, 64-bit, and disjoint from the store-gate namespace.
+    assert 0 <= key < 2**64
+    assert key & 0xF000000000000000 == 0x3000000000000000
+    assert key != store_gate_key("s3://weather-data/gfs/2026-07-21/00/cycle.zarr")
+
+
+def test_scheduler_leader_key_identity_sensitive() -> None:
+    from domain.locks import scheduler_leader_key
+
+    assert scheduler_leader_key("deployment-a") != scheduler_leader_key("deployment-b")

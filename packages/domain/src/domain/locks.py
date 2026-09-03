@@ -54,9 +54,32 @@ def sha256_hex(*parts: object) -> str:
 _NS_STORE_GATE = 0x0000000000000000
 _NS_REGION_CONFLICT = 0x1000000000000000
 _NS_ADMISSION = 0x2000000000000000
+_NS_SCHEDULER_LEADER = 0x3000000000000000
 
 #: Mask that keeps the low 60 bits (the effective hash payload).
 _HASH_MASK = 0x0FFFFFFFFFFFFFFF
+
+#: Default identity of the realtime lead-wave scheduler leadership lock.
+#: One deployment-wide realtime scheduler may run at a time; the session-level
+#: advisory lock on this key is optimization-only leadership (it prevents
+#: duplicated scheduler work and is released naturally when the holder's
+#: connection dies) and never replaces the per-store correctness gates.
+REALTIME_SCHEDULER_LEADER_IDENTITY = "ingestion-realtime-scheduler-leader"
+
+
+def scheduler_leader_key(
+    identity: str = REALTIME_SCHEDULER_LEADER_IDENTITY,
+) -> int:
+    """Derive the advisory-lock key for realtime scheduler leadership.
+
+    Args:
+        identity: Deployment-wide leader-lock identity. One lock key per
+            deployment so independent deployments do not exclude each other.
+
+    Returns:
+        The 64-bit advisory key in the scheduler-leader namespace.
+    """
+    return _namespaced_key(_NS_SCHEDULER_LEADER, identity)
 
 
 def _namespaced_key(namespace: int, identity: str) -> int:
