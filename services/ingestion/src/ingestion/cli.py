@@ -73,6 +73,7 @@ from ingestion.core.base import (
     LeadTimeMismatchError,
 )
 from ingestion.core.catalog import VariableSpec
+from ingestion.core.config import settings
 from ingestion.core.wave_runner import (  # noqa: F401 - re-exported runner API
     DEFAULT_VARIABLES,
     ConcurrencyPlan,
@@ -517,6 +518,54 @@ def _build_parser() -> argparse.ArgumentParser:
         "documented platform surface vocabulary (temperature_2m, "
         "precipitation_rate).",
     )
+
+    realtime = subparsers.add_parser(
+        "realtime",
+        help="run the realtime lead-wave scheduler (Phase 5C)",
+        description="Poll upstream GFS/GEFS publication, plan bounded shared "
+        "lead waves against the canonical horizon, and dispatch the existing "
+        "ingestion wave runner. Requires PostgreSQL and REALTIME_ENABLED=true.",
+    )
+    realtime.add_argument(
+        "--cycle-date",
+        type=date.fromisoformat,
+        default=None,
+        help="Explicit cycle mode: the UTC cycle date to track (with "
+        "--cycle-hour). Omit both for automatic upstream-driven selection.",
+    )
+    realtime.add_argument(
+        "--cycle-hour",
+        type=int,
+        choices=(0, 6, 12, 18),
+        default=None,
+        help="Explicit cycle mode: the UTC cycle hour to track (with "
+        "--cycle-date). Omit both for automatic upstream-driven selection.",
+    )
+    realtime.add_argument(
+        "--once",
+        action="store_true",
+        help="Run exactly ONE poll iteration — discovery, planning, and wave "
+        "dispatch (unless --dry-run) — then exit. Without --once the "
+        "scheduler polls until shutdown.",
+    )
+    realtime.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan and log the frontier/wave diagnostics WITHOUT dispatching "
+        "any wave. Diagnostic mode; typically combined with --once.",
+    )
+    realtime.add_argument(
+        "--download-dir",
+        default="downloads",
+        help="Local staging directory for wave downloads (default 'downloads').",
+    )
+    realtime.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="Per-wave requested concurrency passed to the wave runner "
+        "(default 4).",
+    )
     return parser
 
 
@@ -652,11 +701,74 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
     )
 
 
+def _run_realtime(args: argparse.Namespace) -> int:
+    """Run the realtime lead-wave scheduler (Phase 5C).
+
+    Semantics: ``--once`` performs exactly one poll iteration (discovery,
+    planning, and wave dispatch unless ``--dry-run``) and exits;
+    ``--dry-run`` plans and logs diagnostics without dispatching. Without
+    ``--once`` the scheduler polls until shutdown (SIGINT/SIGTERM stop
+    promptly; an active wave drains non-abandoningly via the wave runner).
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+    if (args.cycle_date is None) != (args.cycle_hour is None):
+        print(
+            "--cycle-date and --cycle-hour must be given together (explicit "
+            "cycle mode) or both omitted (automatic upstream-driven selection)."
+        )
+        return 2
+    if not settings.REALTIME_ENABLED:
+        print(
+            "Realtime ingestion is disabled: set REALTIME_ENABLED=true "
+            "(see .env.example). Big-batch `ingest` is unaffected."
+        )
+        return 2
+
+    import signal
+
+    from ingestion.core.db import engine as catalog_engine
+    from ingestion.realtime.leadership import SchedulerLeadership
+    from ingestion.realtime.scheduler import CycleIdentity, RealtimeScheduler
+
+    cycle_override = None
+    if args.cycle_date is not None and args.cycle_hour is not None:
+        cycle_override = CycleIdentity(
+            cycle_date=args.cycle_date, cycle_hour=args.cycle_hour
+        )
+    scheduler = RealtimeScheduler(
+        conn_settings=settings,
+        leadership=SchedulerLeadership(catalog_engine),
+        cycle_override=cycle_override,
+        download_dir=args.download_dir,
+        concurrency=max(1, int(args.concurrency)),
+    )
+
+    def _handle_signal(signum: int, frame: object) -> None:
+        del signum, frame
+        scheduler.request_stop()
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handle_signal)
+            except (ValueError, OSError):  # not the main thread / unsupported
+                pass
+    return scheduler.run(once=args.once, dry_run=args.dry_run)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return the process exit code."""
     args = _build_parser().parse_args(argv)
     if args.command == "ingest":
         return _run_ingest(args)
+    if args.command == "realtime":
+        return _run_realtime(args)
     return 2
 
 

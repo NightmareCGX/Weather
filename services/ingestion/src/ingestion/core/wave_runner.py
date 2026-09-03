@@ -428,6 +428,7 @@ async def _run_wave(
     store_path: str,
     concurrency: int,
     failures: list[str],
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Download and ingest every lead/member target of a single forecast run.
 
@@ -463,6 +464,11 @@ async def _run_wave(
         store_path: The cycle's Zarr store path.
         concurrency: Requested concurrency (resolved into stage capacities).
         failures: Mutable list collecting per-file failure descriptions.
+        cancel_event: Optional external cancellation event (Phase 5C). When
+            provided, the wave uses it instead of creating its own, so a
+            caller (e.g. the realtime scheduler on shutdown) can trigger the
+            existing non-abandoning drain. Defaults to ``None`` (the CLI
+            behavior is unchanged: the wave owns its event).
 
     Returns:
         The finalizer's derived run status ('ready', 'partial', or 'processing').
@@ -591,7 +597,9 @@ async def _run_wave(
         store_path,
         timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
     )
-    cancel_event = threading.Event()
+    wave_cancel_event: threading.Event = (
+        cancel_event if cancel_event is not None else threading.Event()
+    )
     write_completed_events: dict[tuple[int | None, int], asyncio.Event] = {
         item: asyncio.Event() for item in items
     }
@@ -748,7 +756,7 @@ async def _run_wave(
                 run_id=run_id,
                 is_same_cycle=is_same_cycle,
                 executor=executor,
-                cancel_event=cancel_event,
+                cancel_event=wave_cancel_event,
                 observer=tracker,
             )
             tracker.set_init_phase("store_ready")
@@ -840,10 +848,10 @@ async def _run_wave(
 
         # Seed task: starts immediately after pre-update under write_sem admission
         async def _run_seed_task() -> None:
-            if cancel_event.is_set():
+            if wave_cancel_event.is_set():
                 return
             async with write_sem:
-                if cancel_event.is_set():
+                if wave_cancel_event.is_set():
                     return
                 tracker.record_milestone("seed_write_start")
                 tracker.on_write_start(seed_member, seed_lead, is_seed=True)
@@ -858,7 +866,7 @@ async def _run_wave(
                         await asyncio.shield(fut)
                     except asyncio.CancelledError:
                         cancel_requested = True
-                        cancel_event.set()
+                        wave_cancel_event.set()
                         continue
                     except Exception:
                         break
@@ -891,18 +899,18 @@ async def _run_wave(
         # Non-seed pipeline tasks:
         # bounded download -> bounded decode & parent normalize -> bounded write admission -> write
         async def _pipeline_item(member: int | None, lead: int) -> None:
-            if cancel_event.is_set():
+            if wave_cancel_event.is_set():
                 return
             dest = _destination_for(spec, staging_dir, lead=lead, member=member)
 
             # Stage 1: Pipeline admission (bounds total in-flight active/queued work)
             async with staging_sem:
-                if cancel_event.is_set():
+                if wave_cancel_event.is_set():
                     return
 
                 # Stage 2: Bounded download
                 async with download_sem:
-                    if cancel_event.is_set():
+                    if wave_cancel_event.is_set():
                         return
                     tracker.on_download_start(member, lead)
                     t_dl_start = time.monotonic()
@@ -946,16 +954,16 @@ async def _run_wave(
                     pred_item = (member, lead - 3)
                     if pred_item in decode_completed_events:
                         await decode_completed_events[pred_item].wait()
-                        if cancel_event.is_set():
+                        if wave_cancel_event.is_set():
                             return
 
                 # Stage 3: Bounded decode (ProcessPool execution + parent normalization)
                 # ZERO DB connections checked out during this compute-intensive phase.
-                if cancel_event.is_set():
+                if wave_cancel_event.is_set():
                     return
                 ds: xr.Dataset | None = None
                 async with decode_sem:
-                    if cancel_event.is_set():
+                    if wave_cancel_event.is_set():
                         return
                     tracker.on_decode_start(member, lead)
                     t_dec_start = time.monotonic()
@@ -1022,7 +1030,7 @@ async def _run_wave(
                         return
 
                 # Stage 4: Bounded write admission (application-level backpressure BEFORE thread submission)
-                if cancel_event.is_set():
+                if wave_cancel_event.is_set():
                     return
                 region_id = _region_id_for(lead, member)
                 generation = generation_by_region.get(region_id)
@@ -1033,7 +1041,7 @@ async def _run_wave(
                     return
 
                 async with write_sem:
-                    if cancel_event.is_set():
+                    if wave_cancel_event.is_set():
                         return
                     tracker.on_write_start(member, lead)
                     t_wr_start = time.monotonic()
@@ -1051,7 +1059,7 @@ async def _run_wave(
                             await asyncio.shield(worker_fut)
                         except asyncio.CancelledError:
                             cancel_requested = True
-                            cancel_event.set()
+                            wave_cancel_event.set()
                             continue
                         except Exception:
                             break
@@ -1091,7 +1099,7 @@ async def _run_wave(
         # 5. Aggregate drain: wait for all outer pipeline tasks
         tracker.record_milestone("post_write_task_gather_start")
         results, cancelled = await await_all_workers_non_abandoning(
-            pipeline_tasks, cancel_event
+            pipeline_tasks, wave_cancel_event
         )
         tracker.record_milestone("post_write_task_gather_complete")
         for res in results:

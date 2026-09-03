@@ -101,6 +101,34 @@ class IngestionSettings(BaseSettings):
     #: Minimum member coverage ratio for serving eligibility (Phase 3).
     ENSEMBLE_MIN_COVERAGE_RATIO: float = 0.85
 
+    # --- Realtime lead-wave scheduler (Phase 5C) ---
+    #: Master switch for `weather-ingest realtime`. Big-batch ingestion never
+    #: reads these settings.
+    REALTIME_ENABLED: bool = False
+    #: Normal active poll cadence (seconds) when tracking a cycle.
+    REALTIME_ACTIVE_POLL_SECONDS: float = 600.0
+    #: Fast poll cadence (seconds) while upstream publication activity is observed.
+    REALTIME_PUBLICATION_POLL_SECONDS: float = 120.0
+    #: Initial idle-backoff interval (seconds) after polls with no publication
+    #: activity; doubles on each further idle poll up to the maximum.
+    REALTIME_IDLE_BACKOFF_INITIAL_SECONDS: float = 1800.0
+    #: Upper bound for the idle-backoff interval (seconds).
+    REALTIME_IDLE_BACKOFF_MAX_SECONDS: float = 3600.0
+    #: Relative jitter applied to every poll interval (± fraction). 0 disables.
+    REALTIME_POLL_JITTER_FRACTION: float = 0.10
+    #: Bounded-batching: emit a wave when this many complete pending leads have
+    #: accumulated OR the oldest pending lead has waited wave_max_wait seconds.
+    REALTIME_WAVE_MAX_LEADS: int = 8
+    #: Bounded-batching maximum wait (seconds) for the oldest pending lead.
+    REALTIME_WAVE_MAX_WAIT_SECONDS: float = 1200.0
+    #: Retry delay (seconds) after a discovery failure. Discovery failures are
+    #: never treated as "upstream idle" and never advance the poll state machine.
+    REALTIME_DISCOVERY_FAILURE_RETRY_SECONDS: float = 60.0
+    #: Auto cycle selection: delay (seconds) after a cycle's nominal time before
+    #: the scheduler considers it eligible for upstream probing (publication
+    #: begins roughly 3-3.5h after cycle time, probed in Phase 5A).
+    REALTIME_FIRST_PUBLICATION_DELAY_SECONDS: float = 10800.0
+
     @model_validator(mode="after")
     def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
         pool_size = int(self.DB_POOL_SIZE)
@@ -112,6 +140,17 @@ class IngestionSettings(BaseSettings):
         max_marker_get = int(self.MARKER_GET_CONCURRENCY)
         s3_max_pool = int(self.S3_MAX_POOL_CONNECTIONS)
         s3_ctrl_pool = int(self.S3_CONTROL_MAX_POOL_CONNECTIONS)
+        active_poll = float(self.REALTIME_ACTIVE_POLL_SECONDS)
+        publication_poll = float(self.REALTIME_PUBLICATION_POLL_SECONDS)
+        backoff_initial = float(self.REALTIME_IDLE_BACKOFF_INITIAL_SECONDS)
+        backoff_max = float(self.REALTIME_IDLE_BACKOFF_MAX_SECONDS)
+        jitter = float(self.REALTIME_POLL_JITTER_FRACTION)
+        wave_max_leads = int(self.REALTIME_WAVE_MAX_LEADS)
+        wave_max_wait = float(self.REALTIME_WAVE_MAX_WAIT_SECONDS)
+        failure_retry = float(self.REALTIME_DISCOVERY_FAILURE_RETRY_SECONDS)
+        first_publication_delay = float(
+            self.REALTIME_FIRST_PUBLICATION_DELAY_SECONDS
+        )
 
         if pool_size < 1:
             raise ValueError(f"DB_POOL_SIZE must be >= 1, got {pool_size}")
@@ -149,6 +188,44 @@ class IngestionSettings(BaseSettings):
         if s3_ctrl_pool < 1:
             raise ValueError(
                 f"S3_CONTROL_MAX_POOL_CONNECTIONS must be >= 1, got {s3_ctrl_pool}"
+            )
+        if active_poll <= 0.0:
+            raise ValueError(
+                f"REALTIME_ACTIVE_POLL_SECONDS must be > 0.0, got {active_poll}"
+            )
+        if publication_poll <= 0.0:
+            raise ValueError(
+                f"REALTIME_PUBLICATION_POLL_SECONDS must be > 0.0, got {publication_poll}"
+            )
+        if backoff_initial <= 0.0:
+            raise ValueError(
+                f"REALTIME_IDLE_BACKOFF_INITIAL_SECONDS must be > 0.0, got {backoff_initial}"
+            )
+        if backoff_max < backoff_initial:
+            raise ValueError(
+                f"REALTIME_IDLE_BACKOFF_MAX_SECONDS ({backoff_max}) must be >= "
+                f"REALTIME_IDLE_BACKOFF_INITIAL_SECONDS ({backoff_initial})"
+            )
+        if not 0.0 <= jitter < 1.0:
+            raise ValueError(
+                f"REALTIME_POLL_JITTER_FRACTION must be in [0.0, 1.0), got {jitter}"
+            )
+        if wave_max_leads < 1:
+            raise ValueError(
+                f"REALTIME_WAVE_MAX_LEADS must be >= 1, got {wave_max_leads}"
+            )
+        if wave_max_wait <= 0.0:
+            raise ValueError(
+                f"REALTIME_WAVE_MAX_WAIT_SECONDS must be > 0.0, got {wave_max_wait}"
+            )
+        if failure_retry <= 0.0:
+            raise ValueError(
+                f"REALTIME_DISCOVERY_FAILURE_RETRY_SECONDS must be > 0.0, got {failure_retry}"
+            )
+        if first_publication_delay < 0.0:
+            raise ValueError(
+                f"REALTIME_FIRST_PUBLICATION_DELAY_SECONDS must be >= 0.0, got "
+                f"{first_publication_delay}"
             )
         return self
 
