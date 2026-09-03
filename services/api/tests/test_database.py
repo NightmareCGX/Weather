@@ -55,6 +55,7 @@ def test_model_attributes_and_relationships():
     assert hasattr(ForecastCycleLifecycle, "cycle_time")
     assert hasattr(ForecastCycleLifecycle, "retired_at")
     assert hasattr(ForecastCycleLifecycle, "retired_by_cycle_time")
+    assert hasattr(ForecastCycleLifecycle, "deletion_started_at")
     assert hasattr(ForecastCycleLifecycle, "deleted_at")
     assert hasattr(ForecastCycleLifecycle, "created_at")
     assert hasattr(ForecastCycleLifecycle, "updated_at")

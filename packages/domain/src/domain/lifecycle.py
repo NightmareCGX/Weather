@@ -122,6 +122,7 @@ class CycleLifecycleSnapshot:
     cycle_time: datetime
     retired_at: datetime | None = None
     retired_by_cycle_time: datetime | None = None
+    deletion_started_at: datetime | None = None
     deleted_at: datetime | None = None
     gfs_status: str | None = None
     gefs_status: str | None = None
@@ -136,6 +137,12 @@ class CycleLifecycleSnapshot:
                 "retired_by_cycle_time",
                 _ensure_utc(self.retired_by_cycle_time),
             )
+        if self.deletion_started_at is not None:
+            object.__setattr__(
+                self,
+                "deletion_started_at",
+                _ensure_utc(self.deletion_started_at),
+            )
         if self.deleted_at is not None:
             object.__setattr__(self, "deleted_at", _ensure_utc(self.deleted_at))
 
@@ -148,6 +155,11 @@ class CycleLifecycleSnapshot:
     def is_retired(self) -> bool:
         """Whether this cycle is durably retired."""
         return self.retired_at is not None
+
+    @property
+    def is_deletion_started(self) -> bool:
+        """Whether physical deletion has been claimed/started."""
+        return self.deletion_started_at is not None
 
     @property
     def is_deleted(self) -> bool:
@@ -191,6 +203,28 @@ class GcEligibilityDecision:
     reason: str
 
 
+def canonical_cycle_store_path(
+    model: str,
+    cycle_time: datetime,
+    *,
+    base_bucket: str = "weather-data",
+) -> str:
+    """Derive the canonical sharded_v1 Zarr store URL for a model and cycle.
+
+    Args:
+        model: Model identifier ('gfs' or 'gefs').
+        cycle_time: UTC cycle datetime.
+        base_bucket: S3/MinIO bucket name (defaults to 'weather-data').
+
+    Returns:
+        Canonical S3 URL, e.g. 's3://weather-data/gfs/2026-09-02/18/cycle.zarr'.
+    """
+    dt = _ensure_utc(cycle_time)
+    date_str = dt.strftime("%Y-%m-%d")
+    hour_str = f"{dt.hour:02d}"
+    return f"s3://{base_bucket}/{model}/{date_str}/{hour_str}/cycle.zarr"
+
+
 @dataclass(frozen=True)
 class LifecyclePlan:
     """Deterministic, batch-evaluated lifecycle transitions and active sets.
@@ -208,6 +242,27 @@ class LifecyclePlan:
     active_visible_cycles: tuple[datetime, ...]
     retired_cycles: tuple[datetime, ...]
     deleted_cycles: tuple[datetime, ...]
+
+    @property
+    def would_retire(self) -> tuple[RetirementDecision, ...]:
+        """Subset of retirement decisions where should_retire is True."""
+        return tuple(r for r in self.retirements if r.should_retire)
+
+    @property
+    def would_gc(self) -> tuple[GcEligibilityDecision, ...]:
+        """Subset of GC eligibility decisions where is_gc_eligible is True (oldest-first)."""
+        return tuple(g for g in self.gc_eligibilities if g.is_gc_eligible)
+
+    @property
+    def blocked(self) -> tuple[RetirementDecision | GcEligibilityDecision, ...]:
+        """Decisions where a cycle is not yet ready to advance (missing R1 or R2)."""
+        blocked_ret: list[RetirementDecision | GcEligibilityDecision] = [
+            r for r in self.retirements if not r.should_retire
+        ]
+        blocked_gc: list[RetirementDecision | GcEligibilityDecision] = [
+            g for g in self.gc_eligibilities if not g.is_gc_eligible
+        ]
+        return tuple(blocked_ret + blocked_gc)
 
 
 def evaluate_retirement(

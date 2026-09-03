@@ -9,6 +9,7 @@ from domain.lifecycle import (
     GC_SAFETY_DELTA,
     RETIREMENT_DELTA,
     CycleLifecycleSnapshot,
+    canonical_cycle_store_path,
     evaluate_gc_eligibility,
     evaluate_retirement,
     find_r1,
@@ -330,6 +331,11 @@ def test_plan_lifecycle_mixed_timeline() -> None:
     assert plan.active_visible_cycles == (c3, c4, c5, c6)
     assert plan.retired_cycles == (c0, c1, c2)
 
+    # 4. Check helper properties
+    assert len(plan.would_retire) == 2
+    assert len(plan.would_gc) == 2
+    assert len(plan.blocked) == 1
+
 
 def test_snapshot_properties() -> None:
     dt = _dt(2026, 9, 1, 0)
@@ -340,7 +346,17 @@ def test_snapshot_properties() -> None:
     )
     assert snap.is_paired_ready is True
     assert snap.is_retired is False
+    assert snap.is_deletion_started is False
     assert snap.is_deleted is False
+
+    claimed_snap = CycleLifecycleSnapshot(
+        cycle_time=dt,
+        retired_at=_dt(2026, 9, 2, 0),
+        retired_by_cycle_time=_dt(2026, 9, 2, 0),
+        deletion_started_at=_dt(2026, 9, 2, 6),
+    )
+    assert claimed_snap.is_deletion_started is True
+    assert claimed_snap.is_retired is True
 
     partial_snap = CycleLifecycleSnapshot(
         cycle_time=dt,
@@ -348,3 +364,13 @@ def test_snapshot_properties() -> None:
         gefs_status="partial",
     )
     assert partial_snap.is_paired_ready is False
+
+
+def test_canonical_cycle_store_path() -> None:
+    dt = _dt(2026, 9, 2, 18)
+    gfs_path = canonical_cycle_store_path("gfs", dt)
+    assert gfs_path == "s3://weather-data/gfs/2026-09-02/18/cycle.zarr"
+
+    gefs_path = canonical_cycle_store_path("gefs", dt, base_bucket="custom-bucket")
+    assert gefs_path == "s3://custom-bucket/gefs/2026-09-02/18/cycle.zarr"
+

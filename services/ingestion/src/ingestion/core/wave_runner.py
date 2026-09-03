@@ -525,6 +525,17 @@ async def _run_wave(
             f"member contract {horizon_members} for model={spec.model!r}."
         )
 
+    # Phase 6D: Early ingestion admission guard against claimed/deleted cycles.
+    from ingestion.core.base import CycleTombstonedError
+    from ingestion.core.catalog import is_cycle_fenced_or_deleted
+
+    with _catalog_session() as session:
+        if is_cycle_fenced_or_deleted(session, spec.cycle_time):
+            raise CycleTombstonedError(
+                f"Refusing ingestion for cycle {spec.cycle_time.isoformat()}: "
+                "cycle is claimed for deletion or already tombstoned."
+            )
+
     run_tag = (
         f"staging_{spec.model}_{spec.cycle_date:%Y%m%d}_"
         f"{spec.cycle_hour:02d}z_{uuid.uuid4().hex}"

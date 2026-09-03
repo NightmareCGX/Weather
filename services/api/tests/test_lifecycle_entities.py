@@ -38,6 +38,7 @@ def test_forecast_cycle_lifecycle_entity_crud() -> None:
         assert _utc(row.cycle_time) == cycle_time
         assert _utc(row.retired_at) == retired_at
         assert _utc(row.retired_by_cycle_time) == retired_by
+        assert row.deletion_started_at is None
         assert row.deleted_at is None
         assert row.created_at is not None
         assert row.updated_at is not None

@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,8 @@ from ingestion.core.wave_runner import (  # noqa: F401 - re-exported runner API
     _synthetic_spec_dataset,
 )
 from ingestion.providers.noaa.connector import NOAAConnector  # noqa: F401 - re-export
+
+logger = logging.getLogger(__name__)
 
 #: Supported NOAA model identifiers (NOMADS GFS/GEFS).
 SUPPORTED_MODELS = ("gfs", "gefs")
@@ -566,6 +569,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-wave requested concurrency passed to the wave runner "
         "(default 4).",
     )
+
+    gc = subparsers.add_parser(
+        "gc",
+        help="run the garbage collection and storage reclamation engine (Phase 6D)",
+        description="Reconcile retired cycles, derive R2 eligibility, and delete "
+        "retired forecast stores safely and sequentially.",
+    )
+    gc.add_argument(
+        "--once",
+        action="store_true",
+        help="Execute exactly ONE reconciliation and deletion pass, then exit.",
+    )
+    gc.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan and log GC diagnostics WITHOUT taking exclusive locks, "
+        "deleting S3 stores, or mutating catalog/lifecycle metadata.",
+    )
+    gc.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=1800.0,
+        help="Sleep interval in seconds between reconciliation passes in daemon mode "
+        "(default 1800.0).",
+    )
+    gc.add_argument(
+        "--lock-timeout-seconds",
+        type=float,
+        default=5.0,
+        help="Maximum timeout in seconds to wait for exclusive store gate before skipping "
+        "a busy cycle (default 5.0).",
+    )
+    gc.add_argument(
+        "--bucket",
+        default="weather-data",
+        help="S3/MinIO bucket name holding forecast cycle stores (default 'weather-data').",
+    )
     return parser
 
 
@@ -762,6 +802,91 @@ def _run_realtime(args: argparse.Namespace) -> int:
     return scheduler.run(once=args.once, dry_run=args.dry_run)
 
 
+def _run_gc(args: argparse.Namespace) -> int:
+    """Run the garbage collection (GC) and storage reclamation engine (Phase 6D).
+
+    Supported modes:
+    * ``--once --dry-run``: Plan and log diagnostics without acquiring exclusive
+      locks or mutating S3/PostgreSQL.
+    * ``--once``: Acquire GC leadership, execute one reconciliation/deletion pass,
+      and exit.
+    * Daemon (default): Acquire GC leadership and loop: reconcile -> sleep -> reconcile.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code (0 on success, non-zero on fatal leadership/runtime error).
+    """
+    import signal
+    import time
+    from ingestion.core.db import engine as catalog_engine
+    from ingestion.gc.leadership import GcLeadership
+    from ingestion.gc.reconciler import run_gc_pass
+
+    dry_run = bool(args.dry_run)
+    interval = max(1.0, float(args.interval_seconds))
+    bucket = str(args.bucket)
+    timeout_seconds = float(args.lock_timeout_seconds)
+
+    if dry_run:
+        # Dry-run performs zero mutations and does not acquire destructive leadership
+        run_gc_pass(
+            catalog_engine,
+            dry_run=True,
+            base_bucket=bucket,
+            timeout_seconds=timeout_seconds,
+        )
+        return 0
+
+    leadership = GcLeadership(catalog_engine)
+    if not leadership.acquire():
+        logger.warning("Another GC leader is currently active; exiting.")
+        print("Another GC leader process is currently running. Exiting.")
+        return 0 if args.once else 1
+
+    stop_requested = False
+
+    def _handle_signal(signum: int, frame: object) -> None:
+        nonlocal stop_requested
+        del signum, frame
+        stop_requested = True
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handle_signal)
+            except (ValueError, OSError):
+                pass
+
+    try:
+        while not stop_requested:
+            if not leadership.check_leadership():
+                logger.error("GC leadership lost; attempting reacquisition...")
+                if not leadership.acquire():
+                    logger.error("Failed to reacquire GC leadership; exiting.")
+                    return 1
+
+            run_gc_pass(
+                catalog_engine,
+                dry_run=False,
+                base_bucket=bucket,
+                timeout_seconds=timeout_seconds,
+            )
+
+            if args.once or stop_requested:
+                break
+
+            # Bounded sleep with signal responsiveness
+            sleep_end = time.monotonic() + interval
+            while time.monotonic() < sleep_end and not stop_requested:
+                time.sleep(min(1.0, sleep_end - time.monotonic()))
+        return 0
+    finally:
+        leadership.release()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return the process exit code."""
     args = _build_parser().parse_args(argv)
@@ -769,6 +894,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_ingest(args)
     if args.command == "realtime":
         return _run_realtime(args)
+    if args.command == "gc":
+        return _run_gc(args)
     return 2
 
 

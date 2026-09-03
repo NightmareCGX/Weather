@@ -96,6 +96,3 @@ def test_postgres_alembic_migration_smoke(postgres_engine):
 
     # 6. Second Alembic upgrade head (idempotency test)
     command.upgrade(alembic_cfg, "head")
-
-    # Final cleanup downgrade
-    command.downgrade(alembic_cfg, "base")

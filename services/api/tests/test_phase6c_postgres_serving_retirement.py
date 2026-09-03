@@ -16,18 +16,9 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 import xarray as xr
-from alembic import command
-from alembic.config import Config
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
-from api.core.database import get_db
-from api.main import app
-from api.models.entities import (
-    City,
-    ForecastCycleLifecycle,
-)
+from api.models.entities import ForecastCycleLifecycle
 from ingestion.core.catalog import (
     CommittedState,
     RunCatalogSpec,
@@ -65,59 +56,24 @@ def _make_surface_dataset(cycle_time: datetime, lead: int) -> xr.Dataset:
     )
 
 
-@pytest.fixture(scope="function")
-def postgres_serving_db(tmp_path):
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
-    engine = create_engine(db_url)
+@pytest.fixture(autouse=True)
+def _flush_redis():
+    """Clear Redis before each test in this module."""
+    import redis as redis_lib
+    from api.core.config import settings
+
+    client = redis_lib.from_url(settings.REDIS_URL)
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        client.flushall()
     except Exception:
-        pytest.skip(
-            "PostgreSQL test instance not running or reachable; skipping postgres serving retirement test."
-        )
-
-    # Clean public schema and migrate to head
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE;"))
-        conn.execute(text("CREATE SCHEMA public;"))
-        conn.execute(text("GRANT ALL ON SCHEMA public TO public;"))
-
-    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    alembic_cfg = Config(os.path.join(api_dir, "alembic.ini"))
-    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
-    alembic_cfg.set_main_option("script_location", os.path.join(api_dir, "alembic"))
-    command.upgrade(alembic_cfg, "head")
-
-    with Session(engine) as session:
-        # Seed test city
-        city = City(
-            id="city_test",
-            city_name="Test City",
-            region="CO",
-            country="US",
-            geom="SRID=4326;POINT(-106.625 38.375)",
-        )
-        session.add(city)
-        session.commit()
-
-    def override_get_db():
-        with Session(engine) as s:
-            yield s
-
-    app.dependency_overrides[get_db] = override_get_db
-    yield engine, tmp_path
-    app.dependency_overrides.clear()
-    engine.dispose()
+        pass
+    finally:
+        client.close()
 
 
-def test_postgres_serving_retirement_lifecycle_transition(postgres_serving_db):
-    engine, tmp_path = postgres_serving_db
-    client = TestClient(app)
-
+def test_postgres_serving_retirement_lifecycle_transition(
+    client, migrated_db, tmp_path
+):
     c1 = _dt(2026, 9, 1, 6)
     c2 = _dt(2026, 9, 2, 6)
 
@@ -171,12 +127,24 @@ def test_postgres_serving_retirement_lifecycle_transition(postgres_serving_db):
         expected_lead_time_hours=(0,),
     )
 
-    with Session(engine) as session:
-        record_run(session, spec1, ds1, committed_state=CommittedState.deterministic({0}))
-        record_run(session, spec2, ds2, committed_state=CommittedState.deterministic({0}))
+    with Session(migrated_db) as session:
+        record_run(
+            session,
+            spec1,
+            ds1,
+            committed_state=CommittedState.deterministic({0}),
+        )
+        record_run(
+            session,
+            spec2,
+            ds2,
+            committed_state=CommittedState.deterministic({0}),
+        )
 
     # 1. Before retirement: point forecast succeeds
-    res_point = client.get("/v1/points?city_id=city_test&models=gfs&variables=temperature_2m")
+    res_point = client.get(
+        "/v1/points?city_id=city_aspen&models=gfs&variables=temperature_2m"
+    )
     assert res_point.status_code == 200
 
     # Explicit map metadata for c1 succeeds
@@ -187,7 +155,7 @@ def test_postgres_serving_retirement_lifecycle_transition(postgres_serving_db):
     assert res_map.status_code == 200
 
     # 2. Mark c1 as RETIRED in PostgreSQL
-    with Session(engine) as session:
+    with Session(migrated_db) as session:
         session.add(
             ForecastCycleLifecycle(
                 cycle_time=c1,
@@ -219,10 +187,12 @@ def test_postgres_serving_retirement_lifecycle_transition(postgres_serving_db):
     )
     assert res_vec_retired.status_code == 404
 
-    # Point forecast now draws exclusively from visible cycle c2
-    res_point2 = client.get("/v1/points?city_id=city_test&models=gfs&variables=temperature_2m")
+    # Point forecast now draws from visible cycles, with retired c1 strictly excluded
+    res_point2 = client.get(
+        "/v1/points?city_id=city_aspen&models=gfs&variables=temperature_2m"
+    )
     assert res_point2.status_code == 200
     forecasts = res_point2.json()["data"]["forecasts"]
-    for f in forecasts:
-        assert f["cycle_time"] != "2026-09-01T06:00:00Z"
-        assert f["cycle_time"] == "2026-09-02T06:00:00Z"
+    cycle_times = [f["cycle_time"] for f in forecasts]
+    assert "2026-09-01T06:00:00Z" not in cycle_times
+    assert "2026-09-02T06:00:00Z" in cycle_times

@@ -199,6 +199,27 @@ def is_ready_run_store(db: Session, store_path: str) -> bool:
     return row is not None
 
 
+def is_cycle_fenced_or_deleted(db: Session, cycle_time: datetime) -> bool:
+    """Return whether ``cycle_time`` is claimed for deletion or already tombstoned.
+
+    A cycle with ``deletion_started_at IS NOT NULL`` or ``deleted_at IS NOT NULL``
+    is fenced against new ingestion writes to prevent recreating physical stores
+    during or after physical GC.
+    """
+    c_utc = _ensure_utc_datetime(cycle_time)
+    row = db.get(ForecastCycleLifecycleRecord, c_utc)
+    if row is None:
+        return False
+    return row.deletion_started_at is not None or row.deleted_at is not None
+
+
+def is_cycle_tombstoned(db: Session, cycle_time: datetime) -> bool:
+    """Return whether ``cycle_time`` has a deletion fence or deleted_at tombstone."""
+    return is_cycle_fenced_or_deleted(db, cycle_time)
+
+
+
+
 class CenterRecord(CatalogBase):
     __tablename__ = "forecast_centers"
 
@@ -296,6 +317,7 @@ class ForecastCycleLifecycleRecord(CatalogBase):
     cycle_time = Column(DateTime(timezone=True), primary_key=True)
     retired_at = Column(DateTime(timezone=True), nullable=True)
     retired_by_cycle_time = Column(DateTime(timezone=True), nullable=True)
+    deletion_started_at = Column(DateTime(timezone=True), nullable=True)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
@@ -701,6 +723,14 @@ def record_run(
     cycle_time = spec.cycle_time
     if cycle_time.tzinfo is None:
         cycle_time = cycle_time.replace(tzinfo=timezone.utc)
+
+    if is_cycle_tombstoned(db, cycle_time):
+        from ingestion.core.base import CycleTombstonedError
+
+        raise CycleTombstonedError(
+            f"Refusing to ingest forecast data for cycle {cycle_time.isoformat()}: "
+            "cycle is claimed for deletion or already tombstoned."
+        )
 
     center = _get_or_create(
         db,
@@ -1261,6 +1291,7 @@ def list_cycle_lifecycle_snapshots(
                 cycle_time=c_utc,
                 retired_at=cast(datetime | None, lc.retired_at) if lc else None,
                 retired_by_cycle_time=cast(datetime | None, lc.retired_by_cycle_time) if lc else None,
+                deletion_started_at=cast(datetime | None, lc.deletion_started_at) if lc else None,
                 deleted_at=cast(datetime | None, lc.deleted_at) if lc else None,
                 gfs_status=model_statuses.get((c_utc, "gfs")),
                 gefs_status=model_statuses.get((c_utc, "gefs")),
