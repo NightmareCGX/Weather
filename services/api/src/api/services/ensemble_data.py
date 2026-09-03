@@ -70,6 +70,7 @@ from api.models.entities import (
     ModelRun,
     ModelVersion,
 )
+from api.services.lifecycle import filter_visible_runs, require_cycle_visible
 from api.schemas import (
     ConsensusVectorOut,
     EnsemblePDF,
@@ -129,6 +130,9 @@ def _resolve_eligible_ensemble_run_and_members(
     Raises:
         HTTPException: 404 if no eligible run is found.
     """
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
+
     expected_members = get_expected_members(model, default_if_unknown=30)
     stmt = (
         select(ModelRun)
@@ -140,7 +144,7 @@ def _resolve_eligible_ensemble_run_and_members(
     )
     if initial_time is not None:
         stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
-    stmt = stmt.order_by(ModelRun.cycle_time.desc())
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
     runs = list(db.execute(stmt).scalars().all())
     if not runs:
         raise HTTPException(

@@ -16,6 +16,7 @@ from api.core.database import get_db
 from api.schemas import EnsembleStatisticsEnvelope
 from api.services.cache import PointCache, build_ensemble_cache_key
 from api.services.ensemble_data import build_ensemble_statistics
+from api.services.lifecycle import require_cycle_visible
 from api.services.point_forecast import (
     resolve_latest_run_cycle_time,
     resolve_latest_run_serving_generation,
@@ -84,6 +85,9 @@ def get_ensemble_statistics(
     ``include_members=true`` the genuine raw member values are attached. An
     optional ``initial_time`` pins the forecast run.
     """
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
+
     cache_key = build_ensemble_cache_key(
         model=model,
         latitude=lat,

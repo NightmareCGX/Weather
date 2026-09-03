@@ -232,6 +232,11 @@ def render_vector_field_binary(
         HTTPException: 404 if model/product/lead is not found or unreadable.
         ValueError: If dataset is malformed.
     """
+    if initial_time is not None:
+        from api.services.lifecycle import require_cycle_visible
+
+        require_cycle_visible(db, initial_time)
+
     check_available(
         db,
         model=model,

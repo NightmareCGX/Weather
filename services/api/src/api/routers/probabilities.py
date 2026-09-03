@@ -27,6 +27,7 @@ from api.services.cache import (
     build_probability_cache_key,
 )
 from api.services.ensemble_data import build_probability_forecast
+from api.services.lifecycle import require_cycle_visible
 from api.services.point_forecast import (
     resolve_latest_run_cycle_time,
     resolve_latest_run_serving_generation,
@@ -116,6 +117,8 @@ def get_probability(
     optional ``initial_time`` pins the forecast run.
     """
     _validate_threshold_bounds(operator, threshold, threshold_max)
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
 
     cache_key = build_probability_cache_key(
         model=model,

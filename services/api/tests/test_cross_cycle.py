@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from api.models.entities import (
     Base,
     ForecastCenter,
+    ForecastCycleLifecycle,
     ForecastGrid,
     ForecastProduct,
     ForecastVariable,
@@ -50,6 +51,7 @@ def db() -> Session:
         ForecastVariable.__table__,
         ForecastGrid.__table__,
         ForecastProduct.__table__,
+        ForecastCycleLifecycle.__table__,
     ]
     Base.metadata.create_all(engine, tables=_CATALOG_TABLES)
     session = Session(engine)

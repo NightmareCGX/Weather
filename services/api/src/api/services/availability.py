@@ -32,6 +32,7 @@ from api.models.entities import (
     ModelRun,
     ModelVersion,
 )
+from api.services.lifecycle import filter_visible_runs
 from api.schemas import (
     ForecastAvailabilityData,
     InitialTimeAvailability,
@@ -106,7 +107,7 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
         The availability payload, with models ordered by model id, variables
         by variable code, initial times newest-first, and lead times ascending.
     """
-    rows = db.execute(
+    stmt = (
         select(
             Model.model_id,
             Model.name,
@@ -128,7 +129,8 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             ForecastVariable.variable_code == ForecastProduct.variable_id,
         )
         .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
-    ).all()
+    )
+    rows = db.execute(filter_visible_runs(stmt)).all()
 
     # Pre-query committed ensemble member counts per (run_id, lead_time_hours)
     emp_rows = db.execute(

@@ -37,6 +37,7 @@ from api.models.entities import (
     EnsembleMember,
     EnsembleMemberProduct,
     ForecastCenter,
+    ForecastCycleLifecycle,
     ForecastGrid,
     ForecastProduct,
     ForecastVariable,
@@ -61,6 +62,7 @@ def memory_db() -> Session:
         ForecastVariable.__table__,
         ForecastGrid.__table__,
         ForecastProduct.__table__,
+        ForecastCycleLifecycle.__table__,
     ]
     Base.metadata.create_all(engine, tables=_TABLES)
     session = Session(engine)
