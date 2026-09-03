@@ -200,6 +200,12 @@ class _ReaderGateSession:
     def _release_shared(self, key: int) -> None:
         if self._conn is None:
             return
+        # Defensive rollback if an unhandled exception left a stray open transaction
+        if self._conn.in_transaction():
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
         ok = True
         try:
             with self._conn.begin():
@@ -243,13 +249,15 @@ class _ReaderGateSession:
         and 'partial'. Runs in 'failed' status are rejected.
         """
         assert self._conn is not None
-        row = self._conn.execute(
-            text(
-                "SELECT status, zarr_store_path FROM model_runs "
-                "WHERE zarr_store_path = :path LIMIT 1"
-            ),
-            {"path": self._store_path},
-        ).first()
+        row = None
+        with self._conn.begin():
+            row = self._conn.execute(
+                text(
+                    "SELECT status, zarr_store_path FROM model_runs "
+                    "WHERE zarr_store_path = :path LIMIT 1"
+                ),
+                {"path": self._store_path},
+            ).first()
         if row is None:
             return False, None
         status, path = row

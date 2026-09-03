@@ -235,29 +235,156 @@ def test_reader_gate_timeout_when_exclusive_held(migrated_db, tmp_path) -> None:
         pool.dispose()
 
 
-def test_reader_disconnect_during_acquire_invalidates(migrated_db, tmp_path) -> None:
-    """A DBAPI/OperationalError during reader acquire invalidates the connection and raises."""
-    from unittest.mock import MagicMock
-    from sqlalchemy.exc import OperationalError
+def test_reader_normal_lifecycle_no_autobegin_leak(migrated_db, tmp_path) -> None:
+    """Reader revalidate does not leak an autobegin transaction into S3 read or release."""
+    store_path = str(tmp_path / "lifecycle_clean.zarr")
+    cycle_time = datetime(2026, 7, 22, 18, 0, tzinfo=timezone.utc)
 
-    store_path = str(tmp_path / "broken_reader.zarr")
+    with Session(migrated_db) as db:
+        v_id = _ensure_reader_race_version(db)
+        run = ModelRun(
+            id="run_race_clean_lifecycle",
+            model_version_id=v_id,
+            cycle_time=cycle_time,
+            status="ready",
+            zarr_store_path=store_path,
+        )
+        db.add(run)
+        db.commit()
+
     pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
     session = _ReaderGateSession(pool, store_path)
-
-    # Patch pool.connect to return a connection with a broken execute
-    mock_conn = pool.connect()
-    mock_conn.execute = MagicMock(
-        side_effect=OperationalError("server closed the connection unexpectedly", params=None, orig=Exception("socket closed"))
-    )
-    pool.connect = MagicMock(return_value=mock_conn)
-
     try:
-        with pytest.raises(OperationalError) as exc_info:
-            session.acquire(timeout_seconds=2.0)
+        session.acquire(timeout_seconds=5.0)
+        conn = session.connection
+        assert conn is not None
+        assert not conn.in_transaction(), "Transaction open after acquire!"
 
-        assert "server closed the connection unexpectedly" in str(exc_info.value)
-        assert mock_conn.invalidated or mock_conn.closed
+        ok, path = session.revalidate(DB_URL)
+        assert ok is True
+        assert path == store_path
+        # Crucial invariant: after revalidate(), connection must NOT have an open transaction!
+        assert not conn.in_transaction(), "revalidate() leaked an autobegin transaction!"
+
+        # Release must complete cleanly without InvalidRequestError or invalidation
+        session.release()
+        assert not conn.invalidated, "Connection was unexpectedly invalidated on normal release!"
+        assert not conn.in_transaction(), "Connection in transaction after release!"
     finally:
         session.release()
         pool.dispose()
+
+
+def test_reader_repeated_reuse_without_invalidation_or_pool_churn(migrated_db, tmp_path) -> None:
+    """50 sequential gated reads through a single connection pool reuse the connection cleanly without invalidations."""
+    store_path = str(tmp_path / "pool_reuse.zarr")
+    cycle_time = datetime(2026, 7, 23, 0, 0, tzinfo=timezone.utc)
+
+    with Session(migrated_db) as db:
+        v_id = _ensure_reader_race_version(db)
+        run = ModelRun(
+            id="run_race_pool_reuse",
+            model_version_id=v_id,
+            cycle_time=cycle_time,
+            status="ready",
+            zarr_store_path=store_path,
+        )
+        db.add(run)
+        db.commit()
+
+    # Pool size = 1, max_overflow = 0: any leaked connection or invalidation churn would fail or reconnect
+    pool = ReaderLockPool(DB_URL, pool_size=1, max_overflow=0, pool_timeout=2.0)
+    lifecycle = ReaderGateLifecycle()
+
+    for i in range(50):
+        result = gated_read(
+            pool,
+            lifecycle,
+            store_path=store_path,
+            revalidate_db_url=DB_URL,
+            materialize=lambda: f"item_{i}",
+            timeout_seconds=2.0,
+        )
+        assert result == f"item_{i}"
+
+    # Check for any leaked advisory locks on PostgreSQL
+    eng = create_engine(DB_URL, pool_pre_ping=True)
+    key = store_gate_key(store_path)
+    classid = (key >> 32) & 0xFFFFFFFF
+    objid = key & 0xFFFFFFFF
+    with eng.connect() as c:
+        count = c.execute(
+            text(
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                "AND classid=:classid AND objid=:objid"
+            ),
+            {"classid": classid, "objid": objid},
+        ).scalar()
+        assert int(count or 0) == 0, f"Leaked advisory locks detected: {count}"
+    eng.dispose()
+    pool.dispose()
+
+
+def test_concurrent_readers_no_autobegin_or_invalidations(migrated_db, tmp_path) -> None:
+    """Concurrent readers acquire, revalidate, and release without transaction collision or invalidation."""
+    import concurrent.futures
+
+    store_path = str(tmp_path / "concurrent_readers.zarr")
+    cycle_time = datetime(2026, 7, 23, 6, 0, tzinfo=timezone.utc)
+
+    with Session(migrated_db) as db:
+        v_id = _ensure_reader_race_version(db)
+        run = ModelRun(
+            id="run_race_concurrent_clean",
+            model_version_id=v_id,
+            cycle_time=cycle_time,
+            status="ready",
+            zarr_store_path=store_path,
+        )
+        db.add(run)
+        db.commit()
+
+    pool = ReaderLockPool(DB_URL, pool_size=8, max_overflow=4, pool_timeout=5.0)
+    lifecycle = ReaderGateLifecycle()
+
+    def reader_task(idx: int):
+        return gated_read(
+            pool,
+            lifecycle,
+            store_path=store_path,
+            revalidate_db_url=DB_URL,
+            materialize=lambda: idx,
+            timeout_seconds=5.0,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(reader_task, i) for i in range(32)]
+        results = [f.result() for f in futures]
+
+    assert sorted(results) == list(range(32))
+    pool.dispose()
+
+
+def test_reader_unlock_failure_invalidates(migrated_db, tmp_path) -> None:
+    """If pg_advisory_unlock_shared returns False or raises, connection is invalidated."""
+    from unittest.mock import MagicMock
+
+    store_path = str(tmp_path / "unlock_fail.zarr")
+    pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
+    session = _ReaderGateSession(pool, store_path)
+    try:
+        session.acquire(timeout_seconds=2.0)
+        conn = session.connection
+        assert conn is not None
+
+        # Mock execute on unlock to simulate unlock failure
+        mock_result = MagicMock()
+        mock_result.scalar.return_value = False
+        conn.execute = MagicMock(return_value=mock_result)
+
+        session.release()
+        assert conn.invalidated or conn.closed
+    finally:
+        pool.dispose()
+
 
