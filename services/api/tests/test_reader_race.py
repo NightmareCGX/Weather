@@ -7,8 +7,6 @@ Skipped when PostgreSQL is unreachable.
 
 from __future__ import annotations
 
-import os
-import sys
 from datetime import datetime, timezone
 
 import numpy as np
@@ -18,14 +16,19 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from api.core.config import settings
-from api.core.reader_gate import _ReaderGateSession, ReaderLockPool
+from api.core.reader_gate import (
+    ReaderGateLifecycle,
+    ReaderLockPool,
+    _ReaderGateSession,
+    gated_read,
+)
 from api.models.entities import (
     ForecastCenter,
-    ForecastGrid,
     Model,
     ModelRun,
     ModelVersion,
 )
+from domain.locks import store_gate_key
 from tests._zarr_writer import write_dataset
 
 DB_URL = settings.DATABASE_URL
@@ -129,22 +132,25 @@ def test_reader_revalidation_ready_succeeds(migrated_db, tmp_path) -> None:
 
 
 def test_gated_read_materializes_bounded_selection_under_lock(migrated_db, tmp_path) -> None:
-    """A gated read's selector runs while the SHARED advisory lock is held."""
+    """A gated read's selector runs while the SHARED advisory lock is held.
+
+    The materialize callback opens a second DB connection and attempts a
+    non-blocking EXCLUSIVE advisory lock on the store-gate key. Because the
+    gate's SHARED lock is still held at that moment, the EXCLUSIVE attempt must
+    fail. This proves the selector/read does its Zarr S3/local I/O while the
+    gate is held (Phase 1 contract).
+    """
     store_path = str(tmp_path / "gated.zarr")
     cycle_time = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
+    lat = np.arange(40.0, 40.0 + 0.25 * 8, 0.25)
+    lon = np.arange(-107.0, -107.0 + 0.25 * 8, 0.25)
+    lead = np.array([0, 6, 12, 18])
+    lead_g, lat_g, lon_g = np.meshgrid(lead, lat, lon, indexing="ij")
+    temperature = 10.0 + 0.1 * lat_g + 0.2 * lon_g + 0.5 * lead_g
     ds = xr.Dataset(
-        data_vars={
-            "temperature_2m": (
-                ("lead_time_hours", "latitude", "longitude"),
-                np.ones((1, 4, 4), dtype=np.float32),
-            )
-        },
-        coords={
-            "lead_time_hours": [0],
-            "latitude": [38.0, 38.25, 38.5, 38.75],
-            "longitude": [-107.0, -106.75, -106.5, -106.25],
-        },
+        {"temperature_2m": (("lead_time_hours", "latitude", "longitude"), temperature)},
+        coords={"lead_time_hours": lead, "latitude": lat, "longitude": lon},
     )
     write_dataset(ds, store_path)
 
@@ -160,34 +166,45 @@ def test_gated_read_materializes_bounded_selection_under_lock(migrated_db, tmp_p
         db.add(run)
         db.commit()
 
-    from domain.locks import store_gate_key
-    from api.core.reader_gate import gated_read_dataset_with_selector
-    from api.main import reader_lifecycle
-    reader_lifecycle._closing = False
+    pool = ReaderLockPool(DB_URL, pool_size=2, max_overflow=2, pool_timeout=2.0)
+    lifecycle = ReaderGateLifecycle()
+    lock_held_during_selector: list[bool] = []
+    key = store_gate_key(store_path)
 
-    gate_key = store_gate_key(store_path)
-
-    def select_with_lock_probe(dataset: xr.Dataset) -> float:
-        # Probe from a second connection: attempt EXCLUSIVE lock on the SAME gate key
-        eng = create_engine(DB_URL, pool_pre_ping=True)
-        with eng.connect() as conn:
-            acquired = conn.execute(
-                text("SELECT pg_try_advisory_lock(:key)"), {"key": gate_key}
+    def materialize():
+        eng2 = create_engine(DB_URL, pool_pre_ping=True)
+        with eng2.connect() as c2:
+            acquired = c2.execute(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": key},
             ).scalar()
             if acquired:
-                conn.execute(
-                    text("SELECT pg_advisory_unlock(:key)"), {"key": gate_key}
+                c2.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": key},
                 )
-                exclusive_acquired = True
-            else:
-                exclusive_acquired = False
-        eng.dispose()
+        eng2.dispose()
+        lock_held_during_selector.append(not acquired)
 
-        assert exclusive_acquired is False, (
-            "EXCLUSIVE store gate lock was acquired while the selector was running! "
-            "The SHARED reader gate was not held during materialization."
+        ds_open = xr.open_zarr(store_path, consolidated=False)
+        sel = ds_open["temperature_2m"].sel(lead_time_hours=6, latitude=slice(40, 41), longitude=slice(-107, -106))
+        return sel.values
+
+    try:
+        out = gated_read(
+            pool,
+            lifecycle,
+            store_path=store_path,
+            revalidate_db_url=DB_URL,
+            materialize=materialize,
+            timeout_seconds=10.0,
         )
-        return float(dataset["temperature_2m"].values.sum())
+    finally:
+        pool.dispose()
 
-    val = gated_read_dataset_with_selector(store_path, select_with_lock_probe)
-    assert val == 16.0
+    assert lock_held_during_selector == [True], (
+        "SHARED advisory lock was not held during gated materialization: "
+        f"{lock_held_during_selector}"
+    )
+    assert isinstance(out, np.ndarray)
+    assert out.shape == (5, 5), f"bounded read shape wrong: {out.shape}"
