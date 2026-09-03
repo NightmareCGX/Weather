@@ -968,6 +968,111 @@ def _populate_sharded_data(
     return dataset
 
 
+def read_slice(
+    store: str | PathLike[str] | Mapping[str, bytes],
+    var_name: str,
+    *,
+    lead_time_hours: int,
+    member: int | None = None,
+) -> np.ndarray[Any, Any] | None:
+    """Read a single 2D (latitude, longitude) float32 slice from a Zarr store.
+
+    For sharded_v1 stores, directly loads and decodes the single required
+    .shard container without materializing the full 4D/3D store in memory.
+    For legacy / unsharded stores, lazily loads the requested slice.
+
+    Returns:
+        2D numpy array of shape (latitude, longitude), or None if not found.
+    """
+    path = os.fspath(store) if isinstance(store, (str, PathLike)) else ""
+    is_s3 = path.startswith("s3://")
+    fs = None
+    root = path
+    if is_s3:
+        rest = path[len("s3://") :].strip("/")
+        from ingestion.core.s3 import get_s3_fs
+
+        fs = get_s3_fs()
+        root = rest
+
+    # Construct candidate shard filename
+    if member is not None:
+        shard_filename = f"shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
+    else:
+        shard_filename = f"shard.det_L{lead_time_hours:04d}.shard"
+
+    rel_key = f"{var_name}/{shard_filename}"
+    shard_bytes: bytes | None = None
+
+    if is_s3 and fs is not None:
+        full_key = f"{root}/{rel_key}"
+        try:
+            if fs.exists(full_key):
+                shard_bytes = fs.cat_file(full_key)
+        except Exception:
+            shard_bytes = None
+    elif path:
+        full_path = os.path.join(root, *rel_key.split("/"))
+        if os.path.isfile(full_path):
+            try:
+                with open(full_path, "rb") as fh:
+                    shard_bytes = fh.read()
+            except OSError:
+                shard_bytes = None
+    elif isinstance(store, Mapping):
+        shard_bytes = store.get(rel_key)
+
+    if shard_bytes is not None and len(shard_bytes) >= TRAILER_SIZE:
+        num_chunks, index_size, magic = struct.unpack("<III", shard_bytes[-TRAILER_SIZE:])
+        if magic == SHARD_MAGIC:
+            index_bytes = shard_bytes[-(TRAILER_SIZE + index_size) : -TRAILER_SIZE]
+            entries = parse_sharded_v1_index(index_bytes, num_chunks)
+            compressor = Zstd(level=5)
+            # Default to global 0.25 deg grid dimensions (721 x 1440)
+            lat_size = 721
+            lon_size = 1440
+            lat_chunk = min(100, lat_size)
+            lon_chunk = min(100, lon_size)
+            lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
+            lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
+
+            assembled_2d = np.full((lat_size, lon_size), np.nan, dtype=np.float32)
+            c_idx = 0
+            for r_i in range(lat_chunks):
+                lat_start = r_i * lat_chunk
+                lat_end = min((r_i + 1) * lat_chunk, lat_size)
+                sub_lat = lat_end - lat_start
+                for c_i in range(lon_chunks):
+                    lon_start = c_i * lon_chunk
+                    lon_end = min((c_i + 1) * lon_chunk, lon_size)
+                    sub_lon = lon_end - lon_start
+                    if c_idx < len(entries):
+                        off, length = entries[c_idx]
+                        if length > 0:
+                            raw = compressor.decode(shard_bytes[off : off + length])
+                            arr_c = np.frombuffer(raw, dtype=np.float32).reshape(1, 1, lat_chunk, lon_chunk)
+                            assembled_2d[lat_start:lat_end, lon_start:lon_end] = arr_c[0, 0, :sub_lat, :sub_lon]
+                    c_idx += 1
+            return assembled_2d
+
+    # Fallback to standard xarray / Zarr slice access
+    try:
+        resolved = _resolve_store(store)
+        ds = xr.open_zarr(resolved)
+        if var_name not in ds.data_vars:
+            return None
+        var = ds[var_name]
+        if member is not None and "member" in var.coords:
+            slice_da = var.sel(member=member, lead_time_hours=lead_time_hours)
+        elif "lead_time_hours" in var.coords:
+            slice_da = var.sel(lead_time_hours=lead_time_hours)
+        else:
+            slice_da = var
+        return np.asarray(slice_da.values, dtype=np.float32)
+    except Exception:
+        return None
+
+
 def read_dataset(store: str | PathLike[str] | Mapping[str, bytes]) -> xr.Dataset:
     """Read a Zarr store back into a dataset.
 
