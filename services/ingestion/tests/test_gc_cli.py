@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from alembic import command
+from alembic.config import Config
 from ingestion.cli import _build_parser, main
 
 
@@ -36,6 +39,16 @@ def test_gc_subcommand_parser_flags():
 
 def test_gc_dry_run_main_dispatch(monkeypatch):
     """Verify that main(["gc", "--once", "--dry-run"]) executes cleanly without error."""
+    db_url = os.getenv("DATABASE_URL", "postgresql://weather_user:weather_password@localhost:5432/weather_db")
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../api"))
+    alembic_cfg = Config(os.path.join(api_dir, "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    alembic_cfg.set_main_option("script_location", os.path.join(api_dir, "alembic"))
+    try:
+        command.upgrade(alembic_cfg, "head")
+    except Exception:
+        pass
+
     # Run against dry-run pass
     code = main(["gc", "--once", "--dry-run"])
     assert code == 0

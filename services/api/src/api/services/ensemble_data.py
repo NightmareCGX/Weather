@@ -234,10 +234,13 @@ def build_probability_forecast(
     )
     _resolve_variables(db, metadata, [variable])
     assert run.zarr_store_path is not None
+    store_path_str = str(run.zarr_store_path)
+    # Release ORM DB connection before storage reads.
+    db.close()
 
     if variable == "wind_10m":
         u_members, v_members = _gated_wind_member_vectors(
-            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
+            store_path_str, lead_time_hours, latitude, longitude, avail_members
         )
         finite_pairs = [
             (u, v)
@@ -269,7 +272,7 @@ def build_probability_forecast(
             lower, upper = probability_confidence_interval(probability, len(members_kmh))
     elif variable == "precipitation_amount_3h" and phase is not None:
         amounts, precip_states = _gated_precipitation_member_states(
-            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
+            store_path_str, lead_time_hours, latitude, longitude, avail_members
         )
         finite_states = [st for amt, st in zip(amounts, precip_states, strict=True) if math.isfinite(amt)]
         if not is_cell_statistically_valid(len(finite_states), expected_members):
@@ -293,7 +296,7 @@ def build_probability_forecast(
         lower, upper = probability_confidence_interval(probability, len(finite_states))
     elif variable == "cloud_ceiling" and operator in ("lt", "lte"):
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
+            store_path_str, variable, lead_time_hours, latitude, longitude, avail_members
         )
         finite_members = [m for m in members if math.isfinite(m)]
         if not is_cell_statistically_valid(len(finite_members), expected_members):
@@ -312,7 +315,7 @@ def build_probability_forecast(
         probability = prob
     elif variable == "cloud_cover_3h":
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
+            store_path_str, variable, lead_time_hours, latitude, longitude, avail_members
         )
         valid_members = [float(m) for m in members if math.isfinite(m) and 0.0 <= float(m) <= 100.0]
         if not is_cell_statistically_valid(len(valid_members), expected_members):
@@ -324,7 +327,7 @@ def build_probability_forecast(
         lower, upper = probability_confidence_interval(probability, len(valid_members))
     else:
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
+            store_path_str, variable, lead_time_hours, latitude, longitude, avail_members
         )
         finite_members = [m for m in members if math.isfinite(m)]
         if not is_cell_statistically_valid(len(finite_members), expected_members):
@@ -373,6 +376,9 @@ def build_ensemble_statistics(
     )
     _resolve_variables(db, metadata, [variable])
     assert run.zarr_store_path is not None
+    store_path_str = str(run.zarr_store_path)
+    # Release ORM DB connection before storage reads.
+    db.close()
 
     consensus_payload: ConsensusVectorOut | None = None
     wind_rose_payload: WindRoseOut | None = None
@@ -387,7 +393,7 @@ def build_ensemble_statistics(
 
     if variable == "wind_10m":
         u_members, v_members = _gated_wind_member_vectors(
-            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
+            store_path_str, lead_time_hours, latitude, longitude, avail_members
         )
         finite_pairs = [
             (u, v)
@@ -423,7 +429,7 @@ def build_ensemble_statistics(
             )
     elif variable == "precipitation_amount_3h":
         amounts, precip_states = _gated_precipitation_member_states(
-            str(run.zarr_store_path), lead_time_hours, latitude, longitude, avail_members
+            store_path_str, lead_time_hours, latitude, longitude, avail_members
         )
         if all(math.isnan(m) for m in amounts):
             participating_members = [0.0] * len(amounts)
@@ -445,7 +451,7 @@ def build_ensemble_statistics(
             }
     elif variable == "cloud_cover_3h":
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
+            store_path_str, variable, lead_time_hours, latitude, longitude, avail_members
         )
         participating_members = [float(m) for m in members if math.isfinite(m) and 0.0 <= float(m) <= 100.0]
         valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
@@ -478,7 +484,7 @@ def build_ensemble_statistics(
             valid_member_count_payload = len(participating_members)
     elif variable == "cloud_ceiling":
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
+            store_path_str, variable, lead_time_hours, latitude, longitude, avail_members
         )
         participating_members = [float(m) for m in members if math.isfinite(m) and float(m) >= 0.0]
         valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
@@ -522,7 +528,7 @@ def build_ensemble_statistics(
             )
     else:
         members = _gated_member_values(
-            str(run.zarr_store_path), variable, lead_time_hours, latitude, longitude, avail_members
+            store_path_str, variable, lead_time_hours, latitude, longitude, avail_members
         )
         participating_members = [m for m in members if math.isfinite(m)]
         valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)

@@ -19,7 +19,8 @@ from api.services.ensemble_data import build_ensemble_statistics
 from api.services.lifecycle import require_cycle_visible
 from api.services.point_forecast import (
     resolve_latest_run_cycle_time,
-    resolve_latest_run_serving_generation,
+    resolve_latest_run_store_path_and_retirement,
+    resolve_serving_generation_for_store,
 )
 
 router = APIRouter()
@@ -88,6 +89,16 @@ def get_ensemble_statistics(
     if initial_time is not None:
         require_cycle_visible(db, initial_time)
 
+    cycle_time = resolve_latest_run_cycle_time(db, model, initial_time)
+    store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+        db, model, initial_time
+    )
+    # Release DB connection immediately before S3 manifest read, Redis query, and stats compute.
+    db.close()
+
+    serving_generation = resolve_serving_generation_for_store(
+        store_path, latest_retired_iso
+    )
     cache_key = build_ensemble_cache_key(
         model=model,
         latitude=lat,
@@ -95,10 +106,8 @@ def get_ensemble_statistics(
         variable=variable,
         lead_time_hours=lead_time_hours,
         include_members=include_members,
-        cycle_time=resolve_latest_run_cycle_time(db, model, initial_time),
-        serving_generation=resolve_latest_run_serving_generation(
-            db, model, initial_time
-        ),
+        cycle_time=cycle_time,
+        serving_generation=serving_generation,
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&model={model}"
@@ -107,11 +116,10 @@ def get_ensemble_statistics(
     )
 
     envelope = _cache.compute_or_retrieve(
-        db,
+        None,
         cache_key,
         query_params,
         lambda: _compute(
-            db,
             lat,
             lon,
             variable,
@@ -127,7 +135,6 @@ def get_ensemble_statistics(
 
 
 def _compute(
-    db: Session,
     lat: float,
     lon: float,
     variable: str,
@@ -136,14 +143,18 @@ def _compute(
     include_members: bool,
     initial_time: str | None,
 ) -> EnsembleStatisticsEnvelope:
-    data = build_ensemble_statistics(
-        db,
-        latitude=lat,
-        longitude=lon,
-        variable=variable,
-        model=model,
-        lead_time_hours=lead_time_hours,
-        include_members=include_members,
-        initial_time=initial_time,
-    )
+    from api.core.database import SessionLocal
+
+    with SessionLocal() as db:
+        data = build_ensemble_statistics(
+            db,
+            latitude=lat,
+            longitude=lon,
+            variable=variable,
+            model=model,
+            lead_time_hours=lead_time_hours,
+            include_members=include_members,
+            initial_time=initial_time,
+        )
+    return EnsembleStatisticsEnvelope(data=data)
     return EnsembleStatisticsEnvelope(data=data)

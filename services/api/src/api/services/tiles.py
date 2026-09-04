@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.core.png import encode_rgba_png
@@ -278,6 +278,86 @@ def _nearest_indices(
     return indices
 
 
+@dataclass(frozen=True)
+class TileReadContext:
+    """Immutable database-resolved metadata context for tile rendering."""
+
+    model: str
+    variable: str
+    level: str
+    zoom: int
+    x: int
+    y: int
+    lead_time_hours: int
+    initial_time: str | None
+    store_path: str
+    expected_members: int
+    latest_retired_iso: str | None
+
+
+def resolve_tile_read_context(
+    db: Session,
+    *,
+    model: str,
+    variable: str,
+    level: str,
+    zoom: int,
+    x: int,
+    y: int,
+    lead_time_hours: int,
+    initial_time: str | None = None,
+    excluded: set[str] | None = None,
+) -> TileReadContext:
+    """Resolve all catalog, lifecycle, and store metadata in a short-lived DB scope.
+
+    This function isolates all database operations into a compact scope so the
+    request's ORM database connection can be released before manifest reading,
+    cache checks, and Zarr storage reads.
+    """
+    _validate_tile(zoom, x, y)
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
+
+    store_path = _resolve_run_store_path(
+        db,
+        model=model,
+        variable=variable,
+        level=level,
+        lead_time_hours=lead_time_hours,
+        initial_time=initial_time,
+        excluded=excluded or set(),
+    )
+    from domain.coverage import get_expected_members
+
+    expected_members = get_expected_members(model, default_if_unknown=1)
+
+    latest_retired_iso: str | None = None
+    if initial_time is None:
+        from api.models.entities import ForecastCycleLifecycle
+
+        latest_retired = db.execute(
+            select(func.max(ForecastCycleLifecycle.retired_at))
+        ).scalar_one_or_none()
+        if latest_retired is not None:
+            if latest_retired.tzinfo is None:
+                latest_retired = latest_retired.replace(tzinfo=timezone.utc)
+            latest_retired_iso = latest_retired.astimezone(timezone.utc).isoformat()
+
+    return TileReadContext(
+        model=model,
+        variable=variable,
+        level=level,
+        zoom=zoom,
+        x=x,
+        y=y,
+        lead_time_hours=lead_time_hours,
+        initial_time=initial_time,
+        store_path=store_path,
+        expected_members=expected_members,
+        latest_retired_iso=latest_retired_iso,
+    )
+
+
 def render_tile_png(
     db: Session,
     *,
@@ -338,62 +418,57 @@ def render_tile_png(
             is missing from the dataset.
         ValueError: For invalid tile/grid/field input.
     """
-    _validate_tile(zoom, x, y)
-    if initial_time is not None:
-        require_cycle_visible(db, initial_time)
-
-    # Resolve the committed-manifest generation for cache identity before the
-    # lookup (the tile cache key includes the generation so a same-set data
-    # replacement makes old tiles unreachable). This is a cheap catalog query.
-    from api.services.point_forecast import resolve_latest_run_serving_generation
-
-    serving_generation = resolve_latest_run_serving_generation(
-        db, model, initial_time
-    )
-    cache_key = _tile_cache_key(
-        model, variable, level, zoom, x, y, lead_time_hours, initial_time, serving_generation
-    )
-    cached = _tile_cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    from domain.coverage import get_expected_members
-    expected_members = get_expected_members(model, default_if_unknown=1)
-
-    from api.core import reader_gate
-    from api.core.database import SessionLocal
+    from api.services.point_forecast import resolve_serving_generation_for_store
 
     session = db
     excluded: set[str] = set()
     while True:
         try:
-            store_path = _resolve_run_store_path(
+            context = resolve_tile_read_context(
                 session,
                 model=model,
                 variable=variable,
                 level=level,
+                zoom=zoom,
+                x=x,
+                y=y,
                 lead_time_hours=lead_time_hours,
                 initial_time=initial_time,
                 excluded=excluded,
             )
-        except BaseException:
-            # No usable candidate (404) or a query error: the session's
-            # connection must still be returned to the pool before propagating.
+        finally:
+            # Release this session's DB connection immediately upon context resolution.
+            # Even on cache hits, no connection remains checked out during response send.
             session.close()
-            raise
-        # Release this session's DB connection BEFORE the expensive Zarr read.
-        # The reader gate revalidates the run is READY on its own dedicated
-        # lock-pool connection, so no ORM session is needed during the read. On
-        # a broken store the catalog is re-queried on a fresh short-lived
-        # session (rare recovery path) to fall through to the next candidate.
-        session.close()  # return the connection to the QueuePool
+
+        serving_generation = resolve_serving_generation_for_store(
+            context.store_path, context.latest_retired_iso
+        )
+        cache_key = _tile_cache_key(
+            model,
+            variable,
+            level,
+            zoom,
+            x,
+            y,
+            lead_time_hours,
+            initial_time,
+            serving_generation,
+        )
+        cached = _tile_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        from api.core import reader_gate
+        from api.core.database import SessionLocal
+
         try:
             # Phase 1 remediation: only the tile's geographic window is read
             # from the store. The selector receives the lazy dataset, selects
             # the variable/lead (and member-reduces GEFS), crops the spatial
             # window, then materializes that bounded window *inside* the gate.
             windowed = reader_gate.gated_read_dataset_with_selector(
-                store_path,
+                context.store_path,
                 selector=lambda dataset: _select_tile_window(
                     dataset,
                     variable=variable,
@@ -401,12 +476,12 @@ def render_tile_png(
                     zoom=zoom,
                     x=x,
                     y=y,
-                    expected_members=expected_members,
-                    store_path=store_path,
+                    expected_members=context.expected_members,
+                    store_path=context.store_path,
                 ),
             )
         except Exception:  # noqa: BLE001 - unreadable/no-longer-ready store
-            excluded.add(store_path)
+            excluded.add(context.store_path)
             session = SessionLocal()
             continue
         break

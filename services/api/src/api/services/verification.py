@@ -92,44 +92,62 @@ def build_verification_report(
 
     runs = _ready_runs(db, model)
     products = _products_for_runs(db, runs)
-    # ORM attributes are typed as ``Column``; cast to their Python types when
-    # used as plain values (see the ``cast`` convention in point_forecast.py).
-    runs_by_id = {cast(str, run.id): run for run in runs}
 
-    station_coords: dict[str, tuple[float, float] | None] = {}
+    station_codes = {cast(str, obs.station_id) for obs in observations}
+    station_coords = _station_coordinates_bulk(db, station_codes)
+
+    # Materialize plain values before releasing the database connection.
+    obs_data = [
+        (
+            cast(str, obs.station_id),
+            cast(str, obs.variable_code),
+            cast(float, obs.observed_value),
+            cast(datetime, obs.valid_time),
+        )
+        for obs in observations
+    ]
+    runs_by_id = {
+        cast(str, run.id): (
+            cast(datetime, run.cycle_time),
+            cast(str, run.zarr_store_path),
+        )
+        for run in runs
+        if run.zarr_store_path is not None
+    }
+    prod_data = [
+        (
+            cast(str, p.run_id),
+            cast(str, p.variable_id),
+            cast(int, p.lead_time_hours),
+        )
+        for p in products
+    ]
+
+    # Explicitly release the ORM database connection before storage reads.
+    db.close()
+
     pairs_by_variable: dict[str, list[tuple[float, float]]] = defaultdict(list)
 
-    for observation in observations:
-        station_code = cast(str, observation.station_id)
-        variable_code = cast(str, observation.variable_code)
-        observed_value = cast(float, observation.observed_value)
-        valid_time = cast(datetime, observation.valid_time)
-
-        if station_code not in station_coords:
-            station_coords[station_code] = _station_coordinates(db, station_code)
-        coords = station_coords[station_code]
+    for station_code, variable_code, observed_value, valid_time in obs_data:
+        coords = station_coords.get(station_code)
         if coords is None:
             continue
         latitude, longitude = coords
 
-        for product in products:
-            product_variable = cast(str, product.variable_id)
-            product_lead = cast(int, product.lead_time_hours)
-            product_run_id = cast(str, product.run_id)
+        for product_run_id, product_variable, product_lead in prod_data:
             if product_variable != variable_code:
                 continue
-            run = runs_by_id.get(product_run_id)
-            if run is None:
+            run_info = runs_by_id.get(product_run_id)
+            if run_info is None:
                 continue
-            run_cycle_time = cast(datetime, run.cycle_time)
+            run_cycle_time, zarr_store_path = run_info
             if run_cycle_time + timedelta(hours=product_lead) != valid_time:
                 continue
-            assert run.zarr_store_path is not None
             # Phase 1 remediation: interpolate the single observation point via
             # a bounded gated read (only the 2x2 neighborhood is materialized,
             # never the full grid), under the SHARED reader gate.
             forecast_value = _gated_interpolate_candidate(
-                str(run.zarr_store_path),
+                zarr_store_path,
                 product_variable,
                 product_lead,
                 latitude,
@@ -248,6 +266,25 @@ def _products_for_runs(
         .order_by(ForecastProduct.lead_time_hours.asc())
     )
     return list(db.execute(stmt).scalars().all())
+
+
+def _station_coordinates_bulk(
+    db: Session, station_codes: set[str]
+) -> dict[str, tuple[float, float]]:
+    """Return a mapping of station_code to (latitude, longitude) for all requested stations."""
+    if not station_codes:
+        return {}
+    rows = db.execute(
+        select(
+            Station.station_code,
+            func.ST_X(Station.geom),
+            func.ST_Y(Station.geom),
+        ).where(Station.station_code.in_(station_codes))
+    ).all()
+    return {
+        str(row[0]): (float(row[2]), float(row[1]))
+        for row in rows
+    }
 
 
 def _station_coordinates(

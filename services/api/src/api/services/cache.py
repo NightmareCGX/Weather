@@ -159,7 +159,7 @@ class PointCache:
 
     def compute_or_retrieve(
         self,
-        db: Session,
+        db: Session | None,
         cache_key: str,
         query_params: str,
         compute: Callable[[], TEnvelope],
@@ -176,7 +176,8 @@ class PointCache:
         with a reason. No forecast is ever lost because of a Redis outage.
 
         Args:
-            db: Database session used to record fallback audit rows.
+            db: Optional database session used to record fallback audit rows.
+                If None, a short-lived session is created only on fallback write.
             cache_key: Deterministic cache key for this request.
             query_params: The normalized query parameter string recorded on
                 fallback.
@@ -201,24 +202,22 @@ class PointCache:
             # is still returned.
             write_fallback = True
 
+        reason: str | None = None
         if write_fallback and read.fallback_reason is not None:
-            # Redis was unavailable on both the read and write paths for this
-            # request. The audit row's cache_key is the primary key (one row
-            # per request), so both failures are combined into one reason.
-            self._record_fallback(
-                db,
-                cache_key,
-                query_params,
-                FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE,
-            )
+            reason = FALLBACK_REASON_REDIS_READ_AND_WRITE_UNAVAILABLE
         elif write_fallback:
-            self._record_fallback(
-                db, cache_key, query_params, FALLBACK_REASON_REDIS_WRITE_UNAVAILABLE
-            )
+            reason = FALLBACK_REASON_REDIS_WRITE_UNAVAILABLE
         elif read.fallback_reason is not None:
-            # The read fell back (Redis unavailable or corrupt entry); record
-            # it so the audit ledger reflects the outage.
-            self._record_fallback(db, cache_key, query_params, read.fallback_reason)
+            reason = read.fallback_reason
+
+        if reason is not None:
+            if db is not None:
+                self._record_fallback(db, cache_key, query_params, reason)
+            else:
+                from api.core.database import SessionLocal
+
+                with SessionLocal() as fallback_db:
+                    self._record_fallback(fallback_db, cache_key, query_params, reason)
 
         return response
 
