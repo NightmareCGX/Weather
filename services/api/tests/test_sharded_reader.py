@@ -232,7 +232,7 @@ def test_gated_point_interpolations_gefs_sharded_v1(tmp_path: Path) -> None:
             "longitude": longitudes,
         },
     )
-    ds_meta.to_zarr(str(store_dir), mode="a", consolidated=True)
+    ds_meta.to_zarr(str(store_dir), mode="a", consolidated=True, zarr_format=2)
 
     # Interpolate at lat=45.0, lon=90.0 (inside chunk 0: lat idx 180, lon idx 360 -> chunk row 1, col 3 -> chunk_idx = 18)
     # Chunk 18 base value = 18.0

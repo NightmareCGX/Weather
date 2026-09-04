@@ -7,8 +7,8 @@ packages = [{ include = "domain", from = "src" }]
 
 [tool.poetry.dependencies]
 python = "^3.12"
-numpy = "^1.26.4"
-xarray = "^2024.3.0"
+numpy = "^2.0.0"
+xarray = "^2026.7.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"

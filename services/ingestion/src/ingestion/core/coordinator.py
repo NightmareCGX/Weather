@@ -1422,7 +1422,7 @@ def _read_marker_payloads_bounded(
 def _load_lead_indices_in_store(store_path: str) -> dict[int, int]:
     """Load all positional lead indices from the store's coordinate axis in one read."""
     from ingestion.core.zarr_writer import _resolve_store
-    import zarr  # type: ignore[import-untyped]
+    import zarr
 
     resolved = _resolve_store(store_path)
     try:
@@ -1431,7 +1431,8 @@ def _load_lead_indices_in_store(store_path: str) -> dict[int, int]:
         ds.close()
     except Exception:
         root = zarr.open_group(resolved, mode="r")
-        values = root["lead_time_hours"][:]
+        lead_arr = root["lead_time_hours"]
+        values = lead_arr[:] if isinstance(lead_arr, zarr.Array) else []
     flat = np.atleast_1d(values).reshape(-1)
     return {int(v): i for i, v in enumerate(flat)}
 

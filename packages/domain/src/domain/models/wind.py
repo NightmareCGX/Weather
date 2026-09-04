@@ -276,7 +276,7 @@ def derive_ensemble_member_speeds(
     Returns:
         Array of scalar speeds matching the input shape.
     """
-    return np.hypot(u_members, v_members)
+    return np.hypot(u_members, v_members)  # type: ignore[no-any-return]
 
 
 def derive_ensemble_mean_vector(
@@ -325,7 +325,7 @@ def derive_ensemble_mean_scalar_speed(
     mean_speed = np.mean(member_speeds, axis=axis)
     if np.ndim(mean_speed) == 0:
         return float(mean_speed)
-    return mean_speed  # type: ignore[no-any-return]
+    return mean_speed
 
 
 def compute_consensus_vector(

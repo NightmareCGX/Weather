@@ -613,6 +613,9 @@ jobs:
           poetry check -C services/api
           poetry check -C services/ingestion
 
+      - name: Validate shared runtime dependency alignment
+        run: python scripts/check_dependency_alignment.py
+
       - name: Sanity check placeholder packages
         run: |
           python -c "import sys; sys.path.insert(0, 'packages/contracts/src'); import contracts; assert contracts.__version__ == '0.1.0'"

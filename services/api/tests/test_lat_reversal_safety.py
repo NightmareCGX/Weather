@@ -74,17 +74,17 @@ class _BackendKeySpy:
         self.keys: list[tuple[object, ...]] = []
 
     def __enter__(self) -> "_BackendKeySpy":
-        self._orig = zarr.core.Array.__getitem__
+        self._orig = zarr.Array.__getitem__
 
-        def spy(array: zarr.core.Array, item: object) -> np.ndarray:
+        def spy(array: zarr.Array, item: object) -> np.ndarray:  # type: ignore[type-arg]
             self.keys.append(item if isinstance(item, tuple) else (item,))
             return self._orig(array, item)  # type: ignore[arg-type]
 
-        zarr.core.Array.__getitem__ = spy  # type: ignore[method-assign]
+        zarr.Array.__getitem__ = spy  # type: ignore[method-assign]
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        zarr.core.Array.__getitem__ = self._orig  # type: ignore[method-assign]
+        zarr.Array.__getitem__ = self._orig  # type: ignore[method-assign]
 
     def assert_no_negative_step(self) -> None:
         for key in self.keys:
@@ -181,7 +181,7 @@ def test_direct_bounded_negative_step_isel_fails_on_chunked_store(
         coords={"latitude": lats, "longitude": lons},
         dims=("latitude", "longitude"),
         name="t",
-    ).to_dataset().to_zarr(store, consolidated=True, encoding={"t": {"chunks": [16, 16]}})
+    ).to_dataset().to_zarr(store, consolidated=True, encoding={"t": {"chunks": [16, 16]}}, zarr_format=2)
     lazy = xr.open_zarr(store)["t"]
     with pytest.raises(IndexError, match="range object index out of range"):
         # Any bounded start>stop... i.e. an EMPTY negative-step slice. This is

@@ -22,7 +22,7 @@ from typing import Any, Hashable, Mapping, MutableMapping
 
 import numpy as np
 import xarray as xr
-import zarr  # type: ignore[import-untyped]
+import zarr
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.config import IngestionSettings, settings
@@ -125,7 +125,7 @@ def write_dataset(
         name: {"chunks": _chunk_sizes(dataset, defaults)[name], "compressor": Zstd(level=5)}
         for name in dataset.data_vars
     }
-    dataset.to_zarr(resolved, mode="w", encoding=encoding)
+    dataset.to_zarr(resolved, mode="w", encoding=encoding, zarr_format=2)
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
 
 
@@ -334,11 +334,11 @@ def prepare_run_store(
         )
 
     resolved = _resolve_store(store)
-    ds_coords.to_zarr(resolved, mode="w", consolidated=False)
+    ds_coords.to_zarr(resolved, mode="w", consolidated=False, zarr_format=2)
 
     # Initialize data variables directly via Zarr schema metadata without
     # allocating full logical forecast cubes or creating empty data chunks.
-    root = zarr.open_group(resolved, mode="a")
+    root = zarr.open_group(resolved, mode="a", zarr_format=2)
     for name, da in dataset.data_vars.items():
         # Only the spatial axes come from the source file; the lead (and for
         # GEFS, member) axes are the run's expected dimensions.
@@ -358,7 +358,7 @@ def prepare_run_store(
             for d, s in zip(dims, shape)
         )
         fill_val = "NaN" if np.issubdtype(da.dtype, np.floating) else None
-        arr = root.create_dataset(
+        arr = root.create_array(
             str(name),
             shape=shape,
             chunks=chunks,
@@ -369,7 +369,7 @@ def prepare_run_store(
         )
         var_attrs: dict[str, object] = {"_ARRAY_DIMENSIONS": list(dims)}
         var_attrs.update(da.attrs)
-        arr.attrs.update(var_attrs)
+        arr.attrs.update(var_attrs)  # type: ignore[arg-type]
 
     zarr.consolidate_metadata(resolved)
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
@@ -510,7 +510,7 @@ def commit_region(
         write_encoded_chunks(store, encoded_chunks, concurrency=16)
         return os.fspath(store) if isinstance(store, PathLike) else str(store)
 
-    target.to_zarr(resolved, mode="r+", region=region)
+    target.to_zarr(resolved, mode="r+", region=region, zarr_format=2)
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
 
 
@@ -641,6 +641,8 @@ def encode_region_chunks(
         if var_name not in root:
             continue
         zarr_arr = root[var_name]
+        if not isinstance(zarr_arr, zarr.Array):
+            continue
         chunks = zarr_arr.chunks
         if len(chunks) == 4:
             if chunks[0] != 1 or chunks[1] != 1:
@@ -655,7 +657,7 @@ def encode_region_chunks(
         else:
             raise ValueError(f"Unsupported chunk dimensionality: {len(chunks)}")
 
-        compressor = zarr_arr.compressor
+        compressor = getattr(zarr_arr, "compressor", None)
         fill_val = zarr_arr.fill_value
         dtype = zarr_arr.dtype
 
@@ -700,7 +702,8 @@ def encode_region_chunks(
                     ]
                     key = f"{var_name}/{lead_index}.{r_i}.{c_i}"
 
-                raw_bytes = chunk_buf.tobytes(order=zarr_arr.order or "C")
+                arr_order = getattr(zarr_arr, "order", "C") or "C"
+                raw_bytes = chunk_buf.tobytes(order="F" if str(arr_order).upper() == "F" else "C")
                 comp_bytes = (
                     compressor.encode(raw_bytes)
                     if compressor is not None

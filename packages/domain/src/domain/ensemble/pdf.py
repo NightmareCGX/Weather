@@ -8,7 +8,6 @@ linearly spaced points to preserve continuous tail behavior without truncation.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast
 
 import numpy as np
 import numpy.typing as npt
@@ -82,7 +81,7 @@ def _evaluate_gaussian_kde(
     """
     diff = (grid[:, np.newaxis] - array[np.newaxis, :]) / h
     kernels = np.exp(-0.5 * (diff**2)) / _SQRT_2PI
-    return cast(npt.NDArray[np.float64], np.mean(kernels, axis=1) / h)
+    return np.mean(kernels, axis=1) / h
 
 
 def estimate_ensemble_pdf(

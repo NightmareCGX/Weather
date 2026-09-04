@@ -88,7 +88,7 @@ def fallback_client(tmp_path_factory):
             "longitude": lon,
         },
     )
-    ds.to_zarr(valid_store, mode="w")
+    ds.to_zarr(valid_store, mode="w", zarr_format=2)
 
     with Session(engine) as session:
         session.add(
