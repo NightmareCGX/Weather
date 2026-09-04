@@ -35,7 +35,8 @@ from api.services.point_forecast import (
     ResolvedLocation,
     build_point_forecast,
     resolve_latest_run_cycle_time,
-    resolve_latest_run_serving_generation,
+    resolve_latest_run_store_path_and_retirement,
+    resolve_serving_generation_for_store,
     resolve_location,
 )
 
@@ -85,6 +86,17 @@ def get_point_forecast(
     )
     var_codes = _parse_variables(variables)
 
+    cycle_time = resolve_latest_run_cycle_time(db, model_ids[0])
+    store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+        db, model_ids[0]
+    )
+    # Explicitly release the request-scoped database connection before manifest
+    # reading, Redis querying, and point compute.
+    db.close()
+
+    serving_generation = resolve_serving_generation_for_store(
+        store_path, latest_retired_iso
+    )
     cache_key = build_point_cache_key(
         model=model_ids[0],
         latitude=location.latitude,
@@ -95,8 +107,8 @@ def get_point_forecast(
         # becomes READY it may change the minimum-lead selection, so the cached
         # cross-cycle series must be invalidated. The series itself is built
         # from all READY cycles.
-        cycle_time=resolve_latest_run_cycle_time(db, model_ids[0]),
-        serving_generation=resolve_latest_run_serving_generation(db, model_ids[0]),
+        cycle_time=cycle_time,
+        serving_generation=serving_generation,
         variables=tuple(var_codes) if var_codes else None,
         units=units,
         start_lead_time_hours=start_lead_time_hours,
@@ -111,11 +123,10 @@ def get_point_forecast(
     )
 
     envelope = _cache.compute_or_retrieve(
-        db,
+        None,
         cache_key,
         query_params,
         lambda: _compute(
-            db,
             location,
             model_ids[0],
             var_codes,
@@ -161,7 +172,6 @@ def _parse_variables(variables: str | None) -> list[str] | None:
 
 
 def _compute(
-    db: Session,
     location: ResolvedLocation,
     model: str,
     var_codes: list[str] | None,
@@ -169,13 +179,16 @@ def _compute(
     start_lead_time_hours: int | None,
     end_lead_time_hours: int | None,
 ) -> PointForecastEnvelope:
-    data = build_point_forecast(
-        db,
-        location=location,
-        model=model,
-        variables=var_codes,
-        units=units,
-        start_lead_time_hours=start_lead_time_hours,
-        end_lead_time_hours=end_lead_time_hours,
-    )
+    from api.core.database import SessionLocal
+
+    with SessionLocal() as db:
+        data = build_point_forecast(
+            db,
+            location=location,
+            model=model,
+            variables=var_codes,
+            units=units,
+            start_lead_time_hours=start_lead_time_hours,
+            end_lead_time_hours=end_lead_time_hours,
+        )
     return PointForecastEnvelope(data=data)

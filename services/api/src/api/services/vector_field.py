@@ -20,7 +20,10 @@ import numpy as np
 import xarray as xr
 from sqlalchemy.orm import Session
 
-from api.services.point_forecast import resolve_latest_run_serving_generation
+from api.services.point_forecast import (
+    resolve_latest_run_store_path_and_retirement,
+    resolve_serving_generation_for_store,
+)
 from api.services.tiles import (
     _resolve_run_store_path,
     check_available,
@@ -246,8 +249,14 @@ def render_vector_field_binary(
         initial_time=initial_time,
     )
 
-    serving_generation = resolve_latest_run_serving_generation(
+    store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
         db, model, initial_time
+    )
+    # Release DB connection immediately before S3 manifest read and cache check.
+    db.close()
+
+    serving_generation = resolve_serving_generation_for_store(
+        store_path, latest_retired_iso
     )
     cache_key = _vector_cache_key(
         model, "wind_10m", lead_time_hours, initial_time, serving_generation, stride
@@ -259,39 +268,41 @@ def render_vector_field_binary(
     from api.core import reader_gate
     from api.core.database import SessionLocal
 
-    session = db
+    session: Session | None = None
     excluded: set[str] = set()
+    current_store_path = store_path or ""
     while True:
-        try:
-            store_path = _resolve_run_store_path(
-                session,
-                model=model,
-                variable="wind_10m",
-                level="surface",
-                lead_time_hours=lead_time_hours,
-                initial_time=initial_time,
-                excluded=excluded,
-            )
-        except BaseException:
-            session.close()
-            raise
+        if not current_store_path or current_store_path in excluded:
+            session = SessionLocal()
+            try:
+                current_store_path = _resolve_run_store_path(
+                    session,
+                    model=model,
+                    variable="wind_10m",
+                    level="surface",
+                    lead_time_hours=lead_time_hours,
+                    initial_time=initial_time,
+                    excluded=excluded,
+                )
+            finally:
+                session.close()
 
-        session.close()
         try:
             payload = reader_gate.gated_read_dataset_with_selector(
-                store_path,
+                current_store_path,
                 selector=lambda dataset: _select_and_encode_vector_field(
                     dataset,
                     lead=lead_time_hours,
                     stride=stride,
-                    store_path=store_path,
+                    store_path=current_store_path,
                 ),
             )
         except Exception:  # noqa: BLE001
-            excluded.add(store_path)
-            session = SessionLocal()
+            excluded.add(current_store_path)
             continue
         break
+    _vector_cache_set(cache_key, payload)
+    return payload
 
     _vector_cache_set(cache_key, payload)
     return payload

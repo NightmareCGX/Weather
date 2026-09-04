@@ -345,9 +345,18 @@ def build_point_forecast(
     )
     units_by_code = _variable_units(db, var_codes)
 
+    # Pre-cache resolved store paths so the DB connection can be released before
+    # the heavy point interpolations loop.
+    cycle_store_paths: dict[datetime, str | None] = {
+        ct: _resolve_cycle_store_path(db, model, ct)
+        for ct, _ in resolved.values()
+    }
+    # Explicitly release the ORM database connection before storage reads.
+    db.close()
+
     forecasts: list[ForecastSeries] = []
     for valid_time, (cycle_time, lead) in sorted(resolved.items()):
-        store_path = _resolve_cycle_store_path(db, model, cycle_time)
+        store_path = cycle_store_paths.get(cycle_time)
         if store_path is None:
             continue
         # One bounded gate session interpolates every requested variable at the
@@ -1266,6 +1275,74 @@ def _merge_var_names(by_cycle: dict[datetime, _CycleMetadata]) -> Iterable[str]:
     return sorted(names)
 
 
+def resolve_latest_run_store_path_and_retirement(
+    db: Session, model: str, initial_time: str | None = None
+) -> tuple[str | None, str | None]:
+    """Resolve the latest run's store path and retirement timestamp in a single DB query.
+
+    All database queries for serving generation resolution are executed here,
+    allowing the ORM session to be closed before the S3 manifest read.
+
+    Returns:
+        A tuple of ``(store_path, latest_retired_iso)``.
+    """
+    stmt = (
+        select(ModelRun.zarr_store_path)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model)
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
+        .where(ModelRun.zarr_store_path.isnot(None))
+    )
+    if initial_time is not None:
+        stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
+    path = db.execute(stmt).scalars().first()
+    if path is None:
+        return None, None
+
+    latest_retired_iso: str | None = None
+    if initial_time is None:
+        from api.models.entities import ForecastCycleLifecycle
+
+        latest_retired = db.execute(
+            select(func.max(ForecastCycleLifecycle.retired_at))
+        ).scalar_one_or_none()
+        if latest_retired is not None:
+            if latest_retired.tzinfo is None:
+                latest_retired = latest_retired.replace(tzinfo=timezone.utc)
+            latest_retired_iso = latest_retired.astimezone(timezone.utc).isoformat()
+
+    return str(path), latest_retired_iso
+
+
+def resolve_serving_generation_for_store(
+    store_path: str | None, latest_retired_iso: str | None = None
+) -> str | None:
+    """Derive the serving generation from a store path outside the DB scope.
+
+    Performs the storage-backed committed manifest read with ZERO database
+    connections held.
+
+    Returns:
+        The serving generation discriminator string, or ``None``.
+    """
+    if store_path is None:
+        return None
+    from api.core.manifest_reader import ManifestReadError, manifest_generation
+
+    try:
+        gen = manifest_generation(store_path)
+    except ManifestReadError:
+        # A malformed manifest fails closed: do not serve a stale cache key.
+        return None
+
+    if latest_retired_iso is not None:
+        return f"{gen}:{latest_retired_iso}" if gen else f"ret_{latest_retired_iso}"
+
+    return gen
+
+
 def resolve_latest_run_serving_generation(
     db: Session, model: str, initial_time: str | None = None
 ) -> str | None:
@@ -1280,41 +1357,10 @@ def resolve_latest_run_serving_generation(
         The serving generation string, or ``None`` when no ready run exists, no
         manifest exists, or the store path cannot be resolved.
     """
-    from api.core.manifest_reader import ManifestReadError, manifest_generation
-
-    stmt = (
-        select(ModelRun.zarr_store_path)
-        .join(ModelRun.model_version)
-        .join(ModelVersion.model)
-        .where(Model.model_id == model)
-        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
-        .where(ModelRun.zarr_store_path.isnot(None))
+    path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+        db, model, initial_time
     )
-    if initial_time is not None:
-        stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
-    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
-    path = db.execute(stmt).scalars().first()
-    if path is None:
-        return None
-    try:
-        gen = manifest_generation(path)
-    except ManifestReadError:
-        # A malformed manifest fails closed: do not serve a stale cache key.
-        return None
-
-    if initial_time is None:
-        from api.models.entities import ForecastCycleLifecycle
-
-        latest_retired = db.execute(
-            select(func.max(ForecastCycleLifecycle.retired_at))
-        ).scalar_one_or_none()
-        if latest_retired is not None:
-            if latest_retired.tzinfo is None:
-                latest_retired = latest_retired.replace(tzinfo=timezone.utc)
-            ret_str = latest_retired.astimezone(timezone.utc).isoformat()
-            return f"{gen}:{ret_str}" if gen else f"ret_{ret_str}"
-
-    return gen
+    return resolve_serving_generation_for_store(path, latest_retired_iso)
 
 
 def resolve_latest_run_cycle_time(
