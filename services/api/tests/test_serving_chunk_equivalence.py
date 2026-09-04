@@ -61,14 +61,14 @@ def test_serving_equivalence_between_member_chunk_1_and_30(tmp_path: Path) -> No
         name: {"chunks": (1, 1, 4, 4), "compressor": Zstd(level=5)}
         for name in ds.data_vars
     }
-    ds.to_zarr(store_mc1, mode="w", encoding=encoding_mc1)
+    ds.to_zarr(store_mc1, mode="w", encoding=encoding_mc1, zarr_format=2)
 
     # Write store with member_chunk=30 (or full extent 5)
     encoding_mc30 = {
         name: {"chunks": (5, 1, 4, 4), "compressor": Zstd(level=5)}
         for name in ds.data_vars
     }
-    ds.to_zarr(store_mc30, mode="w", encoding=encoding_mc30)
+    ds.to_zarr(store_mc30, mode="w", encoding=encoding_mc30, zarr_format=2)
 
     # Read back and compare direct array selections
     ds_mc1 = xr.open_zarr(store_mc1)

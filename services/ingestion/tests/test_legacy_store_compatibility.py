@@ -101,7 +101,7 @@ def test_legacy_store_preserves_member_chunk_30_on_reingest(tmp_path: Path) -> N
             "write_empty_chunks": False,
         }
     }
-    store_ds.to_zarr(_resolve_store(store_path), mode="w", encoding=legacy_encoding)
+    store_ds.to_zarr(_resolve_store(store_path), mode="w", encoding=legacy_encoding, zarr_format=2)
 
     za_path = os.path.join(store_path, "t2m", ".zarray")
     with open(za_path, "r", encoding="utf-8") as f:

@@ -7,14 +7,14 @@ packages = [{ include = "domain", from = "src" }]
 
 [tool.poetry.dependencies]
 python = "^3.12"
-numpy = "^1.26.4"
-xarray = "^2024.3.0"
+numpy = "^2.0.0"
+xarray = "^2026.7.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
 pytest-cov = "^5.0.0"
 ruff = "^0.3.4"
-mypy = "^1.9.0"
+mypy = "^1.20.0"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

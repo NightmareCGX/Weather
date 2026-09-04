@@ -437,7 +437,7 @@ def test_serving_contract_legacy_v2_unsharded_compatibility(tmp_path, clean_db) 
 
     # Create global legacy v2 dataset written directly with to_zarr
     ds_legacy = _build_synthetic_dataset(leads=(0,), t2m_val=291.65, cycle_time=cycle_time)  # 18.5 deg C
-    ds_legacy.to_zarr(store_path, mode="w", consolidated=True)
+    ds_legacy.to_zarr(store_path, mode="w", consolidated=True, zarr_format=2)
 
     # Assert legacy manifest format
     assert manifest_storage_format(store_path) == "v2_unsharded"

@@ -283,7 +283,7 @@ def _member_positional_index(
     try:
         from ingestion.core.zarr_writer import _resolve_store
         import xarray as xr
-        import zarr  # type: ignore[import-untyped]
+        import zarr
 
         resolved = _resolve_store(store_path)
         try:
@@ -298,10 +298,12 @@ def _member_positional_index(
         except Exception:
             root = zarr.open_group(resolved, mode="r")
             if "member" in root:
-                values = root["member"][:]
-                for i, value in enumerate(values):
-                    if int(value) == int(member):
-                        return i
+                member_arr = root["member"]
+                if isinstance(member_arr, zarr.Array):
+                    values = list(np.atleast_1d(member_arr[:]).reshape(-1))
+                    for i, value in enumerate(values):
+                        if int(value) == int(member):
+                            return i
     except Exception:  # noqa: BLE001 - fall back to identity-1
         pass
     return max(0, member - 1)

@@ -179,8 +179,12 @@ def test_storage_schema_identity_preservation(tmp_path):
     assert t2m.chunks == (1, 1, 100, 100)
     assert t2m.dtype == np.float32
     assert t2m.fill_value is not None and np.isnan(t2m.fill_value)
-    assert t2m.compressor.codec_id == "zstd"
-    assert t2m.compressor.level == 5
+    comp = getattr(t2m, "compressor", None)
+    if comp is None and hasattr(t2m, "compressors") and t2m.compressors:
+        comp = t2m.compressors[0]
+    assert comp is not None
+    assert comp.codec_id == "zstd"
+    assert comp.level == 5
     assert t2m.attrs["_ARRAY_DIMENSIONS"] == ["member", "lead_time_hours", "latitude", "longitude"]
 
 
@@ -243,7 +247,7 @@ def test_failure_propagation_leaves_region_uncommitted(tmp_path):
     prepare_run_store(ds, store, expected_lead_time_hours=leads, expected_members=members)
 
     with patch("ingestion.core.zarr_writer.write_encoded_chunks", side_effect=OSError("Simulated S3 PUT failure")), \
-         patch.object(zarr.core.Array, "__setitem__", side_effect=OSError("Simulated S3 PUT failure")):
+         patch.object(zarr.Array, "__setitem__", side_effect=OSError("Simulated S3 PUT failure")):
         with pytest.raises(OSError, match="Simulated S3 PUT failure"):
             commit_region(ds, store, lead_time_hours=6, member=1, lead_index=0, member_index=0)
 

@@ -233,7 +233,7 @@ def parse_grib2(path: str | Path) -> xr.Dataset:
 
     if len(selected) == 1:
         return selected[0]
-    return xr.merge(selected)
+    return xr.merge(selected, compat="override")
 
 
 def normalize(dataset: xr.Dataset) -> xr.Dataset:

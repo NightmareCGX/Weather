@@ -70,5 +70,5 @@ def write_dataset(
         name: {"chunks": _chunk_sizes(name), "compressor": Zstd(level=5)}
         for name in dataset.data_vars
     }
-    dataset.to_zarr(path, mode="w", encoding=encoding)
+    dataset.to_zarr(path, mode="w", encoding=encoding, zarr_format=2)
     return path

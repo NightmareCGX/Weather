@@ -98,7 +98,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Poetry, Ruff, MyPy
-        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.9.0
+        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.20.2
 
       - name: Cache Poetry
         uses: actions/cache@v4
@@ -170,7 +170,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Poetry, Ruff, MyPy
-        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.9.0
+        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.20.2
 
       - name: Cache Poetry
         uses: actions/cache@v4
@@ -241,7 +241,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       minio:
-        image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+        image: minio/minio:RELEASE.2025-09-07T16-13-09Z
         command: server /data --console-address ":9001"
         env:
           MINIO_ROOT_USER: minio_admin
@@ -273,7 +273,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Poetry, Ruff, MyPy
-        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.9.0
+        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.20.2
 
       - name: Cache Poetry
         uses: actions/cache@v4
@@ -612,6 +612,9 @@ jobs:
           poetry check -C packages/config
           poetry check -C services/api
           poetry check -C services/ingestion
+
+      - name: Validate shared runtime dependency alignment
+        run: python scripts/check_dependency_alignment.py
 
       - name: Sanity check placeholder packages
         run: |

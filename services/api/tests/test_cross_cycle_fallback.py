@@ -71,7 +71,7 @@ def _write_store(path: str, *, broken: bool = False) -> str:
         },
         coords={"lead_time_hours": lead, "latitude": lat, "longitude": lon},
     )
-    ds.to_zarr(path, mode="w")
+    ds.to_zarr(path, mode="w", zarr_format=2)
     return path
 
 

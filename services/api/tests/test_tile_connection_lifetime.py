@@ -114,7 +114,7 @@ def tile_client(tmp_path_factory):
     command.upgrade(alembic_cfg, "head")
 
     store = str(tmp_path_factory.mktemp("tile_lifetime") / "cycle.zarr")
-    _build_tiny_dataset().to_zarr(store, mode="w")
+    _build_tiny_dataset().to_zarr(store, mode="w", zarr_format=2)
 
     with Session(engine) as session:
         session.add(ForecastCenter(id="center_noaa", center_id="noaa", name="NOAA", country="USA"))

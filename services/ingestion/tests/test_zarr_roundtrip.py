@@ -36,6 +36,9 @@ def test_local_store_roundtrip_preserves_data(
 
     # Compression is preserved.
     compressor = restored.t2m.encoding.get("compressor")
+    if compressor is None:
+        compressors = restored.t2m.encoding.get("compressors", ())
+        compressor = compressors[0] if compressors else None
     assert compressor is not None
     assert compressor.codec_id == "zstd"
 
@@ -49,6 +52,9 @@ def test_s3_store_roundtrip_preserves_data(grib_fixture, minio_store: str) -> No
     xrt.assert_identical(ds, restored)
     assert restored.t2m.encoding.get("chunks") == (5, 10)
     compressor = restored.t2m.encoding.get("compressor")
+    if compressor is None:
+        compressors = restored.t2m.encoding.get("compressors", ())
+        compressor = compressors[0] if compressors else None
     assert compressor is not None
     assert compressor.codec_id == "zstd"
 
@@ -83,6 +89,9 @@ def test_api_reads_ingestion_written_store(grib_fixture: Path, tmp_path: Path) -
         float(ds.t2m.values[0, 0]), abs=1e-6
     )
     compressor = restored.t2m.encoding.get("compressor")
+    if compressor is None:
+        compressors = restored.t2m.encoding.get("compressors", ())
+        compressor = compressors[0] if compressors else None
     assert compressor is not None
     assert compressor.codec_id == "zstd"
 

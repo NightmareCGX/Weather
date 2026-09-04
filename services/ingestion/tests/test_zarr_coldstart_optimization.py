@@ -14,7 +14,6 @@ Validates:
 from __future__ import annotations
 
 import json
-from collections.abc import MutableMapping
 from pathlib import Path
 from unittest.mock import patch
 
@@ -80,34 +79,21 @@ def _make_gefs_seed() -> xr.Dataset:
     )
 
 
-class TrackingStore(MutableMapping):
+class TrackingStore(dict[str, bytes]):
     """A dictionary-backed Zarr store that records deletions and operations."""
 
-    def __init__(self) -> None:
-        self._store: dict[str, bytes] = {}
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
         self.deletions: list[str] = []
         self.writes: list[str] = []
 
-    def __getitem__(self, key: str) -> bytes:
-        return self._store[key]
-
     def __setitem__(self, key: str, value: bytes) -> None:
         self.writes.append(key)
-        self._store[key] = value
+        super().__setitem__(key, value)
 
     def __delitem__(self, key: str) -> None:
         self.deletions.append(key)
-        if key in self._store:
-            del self._store[key]
-
-    def __iter__(self):
-        return iter(self._store)
-
-    def __len__(self) -> int:
-        return len(self._store)
-
-    def keys(self):
-        return self._store.keys()
+        super().__delitem__(key)
 
 
 # ==============================================================================
