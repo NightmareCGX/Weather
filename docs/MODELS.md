@@ -1,40 +1,48 @@
 # Operational Weather Models
 
-The platform integrates deterministic and ensemble numerical weather prediction (NWP) models from major meteorological centers.
+The Weather Platform ingests, processes, and serves global numerical weather prediction (NWP) model forecasts.
 
 ---
 
-## 1. Phase 1 Models: NOAA (USA)
+## 1. Supported Operational Models
 
-### 1.1 GFS (Global Forecast System)
-- **Resolution**: ~25 km (0.25 degree) horizontal grid, 127 vertical levels.
-- **Cycle Frequency**: 4 times daily (00Z, 06Z, 12Z, 18Z).
-- **Forecast Horizon**: Up to 384 hours (16 days).
-- **Format**: GRIB2 files via NOAA NOMADS / AWS S3 buckets.
-- **Key Variables**: Temperature, wind speed/direction, geopotential height, relative humidity, precipitation rate, mean sea level pressure.
+### 1.1 NOAA GFS (Global Forecast System)
+* **Status:** Operational
+* **Grid Resolution:** 0.25° (~25 km) global regular rectilinear grid ($721 \times 1440$).
+* **Cycle Cadence:** 4 times daily (00Z, 06Z, 12Z, 18Z).
+* **Canonical Horizon:** 0 to 240 hours at 3-hour cadence (`domain.horizon`). Upstream extends to 384 hours.
+* **Storage Layout:** `sharded_v1` single-lead binary shard containers (120 chunks of $100 \times 100$ per variable).
+* **Upstream Sources:** AWS Open Data S3 (`noaa-gfs-bdp-pds`) with automated fallback to NOAA NOMADS HTTP.
+* **Supported Variables:**
+  * `temperature_2m` (2-Meter Temperature, °C)
+  * `precipitation_rate` (Surface Precipitation Rate, mm/h)
+  * `precipitation_amount_3h` (3-Hour De-accumulated Precipitation, mm)
+  * `crain` (Categorical Rain Flag, 0/1)
+  * `csnow` (Categorical Snow Flag, 0/1)
+  * `wind_10m` (10-Meter Wind Speed & Direction, derived from $u/v$ components)
 
-### 1.2 GEFS (Global Ensemble Forecast System)
-- **Resolution**: ~25 km to 50 km horizontal grid.
-- **Cycle Frequency**: 4 times daily (00Z, 06Z, 12Z, 18Z).
-- **Ensemble Size**: 1 control member + 30 perturbation members.
-- **Forecast Horizon**: Up to 384 hours.
-- **Purpose**: Powers initial ensemble spread, probability calculations, and confidence intervals.
+### 1.2 NOAA GEFS (Global Ensemble Forecast System)
+* **Status:** Operational
+* **Grid Resolution:** 0.50° (~50 km) global regular rectilinear grid ($361 \times 720$).
+* **Cycle Cadence:** 4 times daily (00Z, 06Z, 12Z, 18Z).
+* **Canonical Horizon:** 0 to 240 hours at 3-hour cadence (`domain.horizon`).
+* **Ensemble Size:** 30 perturbation members (`gep01`–`gep30`).
+* **Storage Layout:** `sharded_v1` per-member/per-lead binary shard containers (`{variable}/shard.mem{member:03d}_L{lead:04d}.shard`).
+* **Upstream Sources:** AWS Open Data S3 (`noaa-gefs-pds`) with automated fallback to NOAA NOMADS HTTP (`pgrb2sp25`).
+* **Ensemble Calculations:** Real-time calculation of ensemble mean, median, standard deviation, spread, interquartile range, percentiles (P10..P90), and empirical probability density functions (PDFs).
 
 ---
 
-## 2. Phase 2 Models: ECMWF & Canada
+## 2. Future / Prospective Models (Unimplemented)
 
-### 2.1 ECMWF IFS & AIFS (Europe)
-- **Resolution**: ~9 km (IFS deterministic) / AI-driven global models (AIFS).
-- **Cycle Frequency**: 2 times daily (00Z, 12Z).
-- **Access**: ECMWF Meteorological Archival and Retrieval System (MARS) / Copernicus Climate Data Store (CDS).
+The following models are prospective roadmap targets and are **not currently implemented** in the repository:
 
-### 2.2 Canadian Meteorological Centre (ECCC)
-- **GDPS (Global Deterministic Prediction System)**: ~15 km resolution, 2x daily.
-- **GEPS (Global Ensemble Prediction System)**: Ensemble forecasts, ~35 km resolution, 20+ members.
-- **Access**: ECCC Datamart (HTTPS / AWS Open Data).
+* **ECMWF IFS & AIFS (European Centre for Medium-Range Weather Forecasts):** High-resolution deterministic (9 km) and machine-learning global forecasts.
+* **ECCC GDPS & GEPS (Environment and Climate Change Canada):** Deterministic (15 km) and ensemble (35 km, 20 members) global forecasts.
+* **NOAA HRRR (High-Resolution Rapid Refresh):** 3 km convection-allowing regional model over North America.
 
 ---
 
 ## 3. Data Ingestion & Normalization Standard
-Regardless of the upstream source (NOAA, ECMWF, ECCC), all raw GRIB2 datasets are parsed via `cfgrib` and `xarray`, mapped to standardized CF-conventions variable names, and written to our unified Zarr storage format.
+
+All incoming GRIB2 datasets are decoded via `cfgrib` and `ecCodes`, normalized into platform canonical units (temperature in °C, precipitation rate in mm/h, wind speed in km/h), and written into `sharded_v1` Zarr stores. Variable mappings are defined in `ingestion.core.wave_runner.DEFAULT_VARIABLES`.

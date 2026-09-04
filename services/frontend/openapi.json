@@ -1,0 +1,2558 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Global Probabilistic Weather Forecasting Platform API",
+    "version": "1.1.0"
+  },
+  "paths": {
+    "/v1/centers": {
+      "get": {
+        "summary": "List forecast centers",
+        "description": "Retrieve all supported meteorological forecast centers.",
+        "operationId": "list_centers_v1_centers_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "starting_after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Starting After"
+            }
+          },
+          {
+            "name": "ending_before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ending Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListEnvelope_CenterOut_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "summary": "List models",
+        "description": "Retrieve supported operational and AI weather models.",
+        "operationId": "list_models_v1_models_get",
+        "parameters": [
+          {
+            "name": "center_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Center Id"
+            }
+          },
+          {
+            "name": "is_ensemble",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Is Ensemble"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "starting_after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Starting After"
+            }
+          },
+          {
+            "name": "ending_before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ending Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListEnvelope_ModelOut_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs": {
+      "get": {
+        "summary": "List model runs",
+        "description": "Retrieve ingested model execution cycles and their statuses.\n\nA run's ``model_id`` is resolved through the schema's existing\n``model_versions`` relationship (a run is keyed by model version, not by\nmodel directly).",
+        "operationId": "list_runs_v1_runs_get",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model Id"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "starting_after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Starting After"
+            }
+          },
+          {
+            "name": "ending_before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ending Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListEnvelope_RunOut_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/variables": {
+      "get": {
+        "summary": "List forecast variables",
+        "description": "Retrieve standardized physical meteorological variables.",
+        "operationId": "list_variables_v1_variables_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "starting_after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Starting After"
+            }
+          },
+          {
+            "name": "ending_before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ending Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListEnvelope_VariableOut_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/grids": {
+      "get": {
+        "summary": "List forecast grids",
+        "description": "Retrieve supported spatial grid definitions.",
+        "operationId": "list_grids_v1_grids_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "starting_after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Starting After"
+            }
+          },
+          {
+            "name": "ending_before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ending Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListEnvelope_GridOut_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/forecast/availability": {
+      "get": {
+        "summary": "Get available forecast combinations",
+        "description": "Return the available model/variable/initial-time/lead-time structure.\n\nThe response is generated from the database on every request, so newly\ningested runs (new models, variables, initial times, or lead times)\nbecome visible automatically without any code or configuration change.",
+        "operationId": "get_forecast_availability_v1_forecast_availability_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForecastAvailabilityEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/search": {
+      "get": {
+        "summary": "Search locations",
+        "description": "Search cities, ski resorts, stations, or places.\n\nThe ``q`` parameter is required. ``type`` restricts the search to one\nplatform location table (``city``, ``resort``, or ``station``), searches\nall of them (``all``, the default), or delegates to the place-autocomplete\nprovider (``place``). Results are returned in the universal list envelope.",
+        "operationId": "search_v1_search_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Search query string.",
+              "title": "Q"
+            },
+            "description": "Search query string."
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": ["city", "resort", "station", "all", "place"],
+              "type": "string",
+              "description": "Location type to search.",
+              "default": "all",
+              "title": "Type"
+            },
+            "description": "Location type to search."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "session_token",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Places search-session token (Google billing semantics): one token spans an autocomplete session so the provider bills one Autocomplete request instead of one per keystroke.",
+              "title": "Session Token"
+            },
+            "description": "Places search-session token (Google billing semantics): one token spans an autocomplete session so the provider bills one Autocomplete request instead of one per keystroke."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListEnvelope_SearchResultOut_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/search/places/{place_id}": {
+      "get": {
+        "summary": "Resolve a place suggestion",
+        "description": "Resolve a selected place suggestion to its canonical location.\n\nThe user selects an autocomplete suggestion (which carries a ``place_id``\nbut no coordinates yet); this endpoint resolves the canonical display\nname, latitude/longitude, country, and region so the map recenters and the\npoint forecast updates.",
+        "operationId": "get_place_v1_search_places__place_id__get",
+        "parameters": [
+          {
+            "name": "place_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Place Id"
+            }
+          },
+          {
+            "name": "session_token",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Places search-session token; reuse the same token that was used for the autocomplete call so the session is billed once.",
+              "title": "Session Token"
+            },
+            "description": "Places search-session token; reuse the same token that was used for the autocomplete call so the session is billed once."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResultOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/points": {
+      "get": {
+        "summary": "Get point forecast",
+        "description": "Return hourly forecasts for a resolved geographic location.\n\nExactly one spatial specifier is required: a ``lat``/``lon`` pair, a\n``city_id``, or a ``resort_id``. ``models`` accepts exactly one model\nidentifier; multi-model requests are rejected with 422 (see the module\ndocstring).",
+        "operationId": "get_point_forecast_v1_points_get",
+        "parameters": [
+          {
+            "name": "lat",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Lat"
+            }
+          },
+          {
+            "name": "lon",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Lon"
+            }
+          },
+          {
+            "name": "city_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "City Id"
+            }
+          },
+          {
+            "name": "resort_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Resort Id"
+            }
+          },
+          {
+            "name": "models",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "A single model identifier.",
+              "default": "gfs",
+              "title": "Models"
+            },
+            "description": "A single model identifier."
+          },
+          {
+            "name": "variables",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Variables"
+            }
+          },
+          {
+            "name": "units",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": ["metric", "imperial"],
+              "type": "string",
+              "default": "metric",
+              "title": "Units"
+            }
+          },
+          {
+            "name": "start_lead_time_hours",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start Lead Time Hours"
+            }
+          },
+          {
+            "name": "end_lead_time_hours",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End Lead Time Hours"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PointForecastEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/probabilities": {
+      "get": {
+        "summary": "Get exceedance probability",
+        "description": "Return the exceedance probability for a forecast variable.\n\nThe ensemble model (default ``gefs``) must exist and be an ensemble model;\nmember values are interpolated at the requested point and lead time. An\noptional ``initial_time`` pins the forecast run.",
+        "operationId": "get_probability_v1_probabilities_get",
+        "parameters": [
+          {
+            "name": "lat",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "description": "Latitude in decimal degrees.",
+              "title": "Lat"
+            },
+            "description": "Latitude in decimal degrees."
+          },
+          {
+            "name": "lon",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "description": "Longitude in decimal degrees.",
+              "title": "Lon"
+            },
+            "description": "Longitude in decimal degrees."
+          },
+          {
+            "name": "variable",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A forecast variable code.",
+              "title": "Variable"
+            },
+            "description": "A forecast variable code."
+          },
+          {
+            "name": "threshold",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "description": "The probability threshold.",
+              "title": "Threshold"
+            },
+            "description": "The probability threshold."
+          },
+          {
+            "name": "operator",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "enum": ["gt", "gte", "lt", "lte", "between"],
+              "type": "string",
+              "description": "Threshold comparison operator.",
+              "title": "Operator"
+            },
+            "description": "Threshold comparison operator."
+          },
+          {
+            "name": "lead_time_hours",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Forecast offset hours from cycle time.",
+              "title": "Lead Time Hours"
+            },
+            "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "model",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "A single ensemble model identifier.",
+              "default": "gefs",
+              "title": "Model"
+            },
+            "description": "A single ensemble model identifier."
+          },
+          {
+            "name": "threshold_max",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Upper bound of the 'between' operator (required only when operator=between).",
+              "title": "Threshold Max"
+            },
+            "description": "Upper bound of the 'between' operator (required only when operator=between)."
+          },
+          {
+            "name": "direction_sector",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional 8-point cardinal sector for directional wind probabilities (e.g. 'SW', 'N').",
+              "title": "Direction Sector"
+            },
+            "description": "Optional 8-point cardinal sector for directional wind probabilities (e.g. 'SW', 'N')."
+          },
+          {
+            "name": "phase",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional physical precipitation phase (e.g. 'snow', 'rain', 'freezing_rain', 'ice_pellets') for joint exceedance probability.",
+              "title": "Phase"
+            },
+            "description": "Optional physical precipitation phase (e.g. 'snow', 'rain', 'freezing_rain', 'ice_pellets') for joint exceedance probability."
+          },
+          {
+            "name": "initial_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC cycle time pinning the model run (e.g. 2026-08-13T00:00:00Z). Defaults to the newest ready run.",
+              "title": "Initial Time"
+            },
+            "description": "Optional ISO 8601 UTC cycle time pinning the model run (e.g. 2026-08-13T00:00:00Z). Defaults to the newest ready run."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbabilityForecastEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/maps": {
+      "get": {
+        "summary": "Get map tile metadata",
+        "description": "Return the tile template and legend for a weather map layer.\n\nThe model and variable must exist in the catalog, and a ready run with a\nmatching forecast product must be available for the requested\nmodel/variable/level/lead/initial-time combination; otherwise 404 is\nraised so the client never builds a template for data that does not exist.",
+        "operationId": "get_spatial_layer_v1_maps_get",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A model identifier.",
+              "title": "Model"
+            },
+            "description": "A model identifier."
+          },
+          {
+            "name": "variable",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A forecast variable code.",
+              "title": "Variable"
+            },
+            "description": "A forecast variable code."
+          },
+          {
+            "name": "level",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "const": "surface",
+              "type": "string",
+              "description": "The vertical level; only 'surface' is supported.",
+              "title": "Level"
+            },
+            "description": "The vertical level; only 'surface' is supported."
+          },
+          {
+            "name": "lead_time_hours",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Forecast offset hours from cycle time.",
+              "title": "Lead Time Hours"
+            },
+            "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "initial_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC cycle time pinning the model run (e.g. 2026-08-13T00:00:00Z).",
+              "title": "Initial Time"
+            },
+            "description": "Optional ISO 8601 UTC cycle time pinning the model run (e.g. 2026-08-13T00:00:00Z)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpatialLayerEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/maps/{model}/wind_10m/vector-field": {
+      "get": {
+        "summary": "Get 10-meter wind vector field for flow animation",
+        "description": "Return the quantized Int16 binary wind vector field for particle flow animation.\n\nFor GFS: returns canonical zonal (u) and meridional (v) velocity components.\nFor GEFS: returns the consensus mean vector field (mean(u_i), mean(v_i)).",
+        "operationId": "get_wind_vector_field_v1_maps__model__wind_10m_vector_field_get",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Model"
+            }
+          },
+          {
+            "name": "lead_time_hours",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Forecast offset hours from cycle time.",
+              "title": "Lead Time Hours"
+            },
+            "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "initial_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC cycle time pinning the model run.",
+              "title": "Initial Time"
+            },
+            "description": "Optional ISO 8601 UTC cycle time pinning the model run."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/maps/{model}/{variable}/{level}/{z}/{x}/{y}.png": {
+      "get": {
+        "summary": "Render a forecast raster tile",
+        "description": "Render a 256x256 PNG tile of the forecast field for the selection.\n\nThe tile reads genuine values from the run's Zarr store for the requested\nmodel/variable/initial time/lead time and colors them by the variable's\nramp. Tiles are served with a short cache policy so newly ingested runs\nbecome visible promptly.",
+        "operationId": "get_map_tile_v1_maps__model___variable___level___z___x___y__png_get",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Model"
+            }
+          },
+          {
+            "name": "variable",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Variable"
+            }
+          },
+          {
+            "name": "level",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Level"
+            }
+          },
+          {
+            "name": "z",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Z"
+            }
+          },
+          {
+            "name": "x",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "X"
+            }
+          },
+          {
+            "name": "y",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Y"
+            }
+          },
+          {
+            "name": "lead_time_hours",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Forecast offset hours from cycle time.",
+              "title": "Lead Time Hours"
+            },
+            "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "initial_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC cycle time pinning the model run.",
+              "title": "Initial Time"
+            },
+            "description": "Optional ISO 8601 UTC cycle time pinning the model run."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/ensembles": {
+      "get": {
+        "summary": "Get ensemble statistics and spread",
+        "description": "Return ensemble dispersion statistics for a forecast variable.\n\nThe ensemble model (default ``gefs``) must exist and be an ensemble model;\nmember values are interpolated at the requested point and lead time. When\n``include_members=true`` the genuine raw member values are attached. An\noptional ``initial_time`` pins the forecast run.",
+        "operationId": "get_ensemble_statistics_v1_ensembles_get",
+        "parameters": [
+          {
+            "name": "lat",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "description": "Latitude in decimal degrees.",
+              "title": "Lat"
+            },
+            "description": "Latitude in decimal degrees."
+          },
+          {
+            "name": "lon",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "description": "Longitude in decimal degrees.",
+              "title": "Lon"
+            },
+            "description": "Longitude in decimal degrees."
+          },
+          {
+            "name": "variable",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A forecast variable code.",
+              "title": "Variable"
+            },
+            "description": "A forecast variable code."
+          },
+          {
+            "name": "model",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "A single ensemble model identifier.",
+              "default": "gefs",
+              "title": "Model"
+            },
+            "description": "A single ensemble model identifier."
+          },
+          {
+            "name": "lead_time_hours",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Forecast offset hours from cycle time.",
+              "default": 0,
+              "title": "Lead Time Hours"
+            },
+            "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "include_members",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Return raw ensemble-member forecast values.",
+              "default": false,
+              "title": "Include Members"
+            },
+            "description": "Return raw ensemble-member forecast values."
+          },
+          {
+            "name": "initial_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC cycle time pinning the model run (e.g. 2026-08-13T00:00:00Z). Defaults to the newest ready run.",
+              "title": "Initial Time"
+            },
+            "description": "Optional ISO 8601 UTC cycle time pinning the model run (e.g. 2026-08-13T00:00:00Z). Defaults to the newest ready run."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnsembleStatisticsEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/verifications": {
+      "get": {
+        "summary": "Get verification metrics",
+        "description": "Return RMSE/bias/MAE verification metrics for a model and date window.\n\nMetrics are computed over the pooled sample of every forecast/observation\npair whose valid time falls in the window (see the verification service).",
+        "operationId": "get_verification_metrics_v1_verifications_get",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A model identifier.",
+              "title": "Model"
+            },
+            "description": "A model identifier."
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "description": "Inclusive start date (YYYY-MM-DD, UTC).",
+              "title": "Start Date"
+            },
+            "description": "Inclusive start date (YYYY-MM-DD, UTC)."
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "description": "Inclusive end date (YYYY-MM-DD, UTC).",
+              "title": "End Date"
+            },
+            "description": "Inclusive end date (YYYY-MM-DD, UTC)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerificationReportEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "summary": "Get system health",
+        "description": "Return connectivity status for database, Redis, and object storage.\n\nThe probe result is deterministic per request: each dependency is probed\nlive and reported as ``connected`` or ``disconnected``. The overall\n``status`` is ``healthy`` when every dependency is connected and\n``degraded`` otherwise (with an HTTP ``503`` status).",
+        "operationId": "get_system_health_v1_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthCheckEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CenterOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "const": "center",
+            "title": "Object",
+            "default": "center"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "country": {
+            "type": "string",
+            "title": "Country"
+          }
+        },
+        "type": "object",
+        "required": ["id", "name", "country"],
+        "title": "CenterOut",
+        "description": "A forecast center resource (API.md section 1.1)."
+      },
+      "EnsembleStatisticsData": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "EnsembleStatisticsEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "ensemble_statistics",
+            "title": "Object",
+            "default": "ensemble_statistics"
+          },
+          "data": {
+            "$ref": "#/components/schemas/EnsembleStatisticsData"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "EnsembleStatisticsEnvelope",
+        "description": "The ensemble statistics response envelope (API.md sections 5.1 and 2.3)."
+      },
+      "ForecastAvailabilityData": {
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelAvailability"
+            },
+            "type": "array",
+            "title": "Models"
+          }
+        },
+        "type": "object",
+        "required": ["models"],
+        "title": "ForecastAvailabilityData",
+        "description": "The payload of the forecast availability endpoint.\n\nModels are ordered by model id; only models that have at least one\n``ready`` run with forecast product rows are included, so the list\nreflects exactly what the platform can serve."
+      },
+      "ForecastAvailabilityEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "forecast_availability",
+            "title": "Object",
+            "default": "forecast_availability"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ForecastAvailabilityData"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ForecastAvailabilityEnvelope",
+        "description": "The forecast availability response envelope.\n\n``object`` is ``forecast_availability`` (a new resource shape that is a\nnon-breaking addition to the v1 surface per API.md section 1.3)."
+      },
+      "ForecastLocationOut": {
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "title": "Latitude"
+          },
+          "longitude": {
+            "type": "number",
+            "title": "Longitude"
+          },
+          "elevation_m": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elevation M"
+          },
+          "resolved_via": {
+            "type": "string",
+            "title": "Resolved Via"
+          }
+        },
+        "type": "object",
+        "required": ["latitude", "longitude", "resolved_via"],
+        "title": "ForecastLocationOut",
+        "description": "The resolved location of a point forecast (API.md section 2.1)."
+      },
+      "ForecastSeries": {
+        "properties": {
+          "lead_time_hours": {
+            "type": "integer",
+            "title": "Lead Time Hours"
+          },
+          "valid_time": {
+            "type": "string",
+            "title": "Valid Time"
+          },
+          "cycle_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cycle Time"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": ["lead_time_hours", "valid_time"],
+        "title": "ForecastSeries",
+        "description": "A single forecast entry indexed by lead time (API.md section 2.1).\n\nRequested forecast variables are attached as additional top-level keys\n(e.g. ``temperature_2m``), matching the dynamic keyed shape shown in\nAPI.md. Variable keys are captured through ``extra=\"allow\"``.\n\n``cycle_time`` is the source forecast run's cycle/reference time. The point\nforecast is a **cross-cycle** deterministic time series: entries may come\nfrom different cycles (the minimum-lead record for each valid_time), so the\nsource cycle is exposed to make the provenance unambiguous. It is additive\nand non-breaking."
+      },
+      "GridOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "const": "grid",
+            "title": "Object",
+            "default": "grid"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "resolution_km": {
+            "type": "number",
+            "title": "Resolution Km"
+          }
+        },
+        "type": "object",
+        "required": ["id", "name", "resolution_km"],
+        "title": "GridOut",
+        "description": "A forecast grid resource (API.md section 1.5)."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthCheckData": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "database": {
+            "type": "string",
+            "title": "Database"
+          },
+          "redis": {
+            "type": "string",
+            "title": "Redis"
+          },
+          "object_storage": {
+            "type": "string",
+            "title": "Object Storage"
+          }
+        },
+        "type": "object",
+        "required": ["status", "version", "database", "redis", "object_storage"],
+        "title": "HealthCheckData",
+        "description": "The payload of a system health check (API.md section 8.1).\n\n``status`` is ``healthy`` when every dependency is connected and\n``degraded`` otherwise. ``version`` is the API contract version."
+      },
+      "HealthCheckEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "health_check",
+            "title": "Object",
+            "default": "health_check"
+          },
+          "data": {
+            "$ref": "#/components/schemas/HealthCheckData"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "HealthCheckEnvelope",
+        "description": "The health check response envelope (API.md sections 8.1 and 2.3)."
+      },
+      "InitialTimeAvailability": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "lead_time_hours": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Lead Time Hours"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "leads": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LeadAvailabilityOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leads"
+          }
+        },
+        "type": "object",
+        "required": ["value", "lead_time_hours"],
+        "title": "InitialTimeAvailability",
+        "description": "One available forecast initialization (cycle time) of a variable.\n\nAttributes:\n    value: The run's ``cycle_time`` in ISO 8601 UTC. ``valid_time`` for a\n        given lead is derived as ``value + lead_time_hours``\n        (DATABASE.md section 1).\n    lead_time_hours: The publicly servable forecast offset hours available\n        for this model/variable/initial time (coverage >= 85%), ascending.\n    status: The run lifecycle status (e.g. 'ready', 'processing', 'partial').\n    leads: Rich lead-level coverage descriptors including below-threshold leads."
+      },
+      "LayerDescriptor": {
+        "properties": {
+          "tile_url_template": {
+            "type": "string",
+            "title": "Tile Url Template"
+          },
+          "min_zoom": {
+            "type": "integer",
+            "title": "Min Zoom"
+          },
+          "max_zoom": {
+            "type": "integer",
+            "title": "Max Zoom"
+          },
+          "legend": {
+            "$ref": "#/components/schemas/SpatialLayerLegend"
+          },
+          "vector_field_url_template": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vector Field Url Template"
+          }
+        },
+        "type": "object",
+        "required": ["tile_url_template", "min_zoom", "max_zoom", "legend"],
+        "title": "LayerDescriptor",
+        "description": "The spatial layer descriptor for rendering map tiles and legends."
+      },
+      "LeadAvailabilityOut": {
+        "properties": {
+          "lead_time_hours": {
+            "type": "integer",
+            "title": "Lead Time Hours"
+          },
+          "available_members": {
+            "type": "integer",
+            "title": "Available Members"
+          },
+          "expected_members": {
+            "type": "integer",
+            "title": "Expected Members"
+          },
+          "coverage_ratio": {
+            "type": "number",
+            "title": "Coverage Ratio"
+          },
+          "servable": {
+            "type": "boolean",
+            "title": "Servable"
+          }
+        },
+        "type": "object",
+        "required": [
+          "lead_time_hours",
+          "available_members",
+          "expected_members",
+          "coverage_ratio",
+          "servable"
+        ],
+        "title": "LeadAvailabilityOut",
+        "description": "Rich lead-level availability and member-coverage metadata."
+      },
+      "ListEnvelope_CenterOut_": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list",
+            "title": "Object",
+            "default": "list"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/CenterOut"
+            },
+            "type": "array",
+            "title": "Data"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ListEnvelope[CenterOut]"
+      },
+      "ListEnvelope_GridOut_": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list",
+            "title": "Object",
+            "default": "list"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/GridOut"
+            },
+            "type": "array",
+            "title": "Data"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ListEnvelope[GridOut]"
+      },
+      "ListEnvelope_ModelOut_": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list",
+            "title": "Object",
+            "default": "list"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ModelOut"
+            },
+            "type": "array",
+            "title": "Data"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ListEnvelope[ModelOut]"
+      },
+      "ListEnvelope_RunOut_": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list",
+            "title": "Object",
+            "default": "list"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/RunOut"
+            },
+            "type": "array",
+            "title": "Data"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ListEnvelope[RunOut]"
+      },
+      "ListEnvelope_SearchResultOut_": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list",
+            "title": "Object",
+            "default": "list"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SearchResultOut"
+            },
+            "type": "array",
+            "title": "Data"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ListEnvelope[SearchResultOut]"
+      },
+      "ListEnvelope_VariableOut_": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list",
+            "title": "Object",
+            "default": "list"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/VariableOut"
+            },
+            "type": "array",
+            "title": "Data"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ListEnvelope[VariableOut]"
+      },
+      "ModelAvailability": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "is_ensemble": {
+            "type": "boolean",
+            "title": "Is Ensemble"
+          },
+          "variables": {
+            "items": {
+              "$ref": "#/components/schemas/VariableAvailability"
+            },
+            "type": "array",
+            "title": "Variables"
+          }
+        },
+        "type": "object",
+        "required": ["id", "name", "is_ensemble", "variables"],
+        "title": "ModelAvailability",
+        "description": "A forecast model and the variables available for it.\n\nAttributes:\n    id: The ``models.model_id`` (e.g. ``gfs``).\n    name: Human-readable model name.\n    is_ensemble: Whether the model is an ensemble product.\n    variables: The variables with ready forecast data for this model,\n        ordered by variable code."
+      },
+      "ModelOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "const": "model",
+            "title": "Object",
+            "default": "model"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "center_id": {
+            "type": "string",
+            "title": "Center Id"
+          },
+          "is_ensemble": {
+            "type": "boolean",
+            "title": "Is Ensemble"
+          },
+          "resolution_km": {
+            "type": "number",
+            "title": "Resolution Km"
+          }
+        },
+        "type": "object",
+        "required": ["id", "name", "center_id", "is_ensemble", "resolution_km"],
+        "title": "ModelOut",
+        "description": "A weather model resource (API.md section 1.2)."
+      },
+      "PointForecastData": {
+        "properties": {
+          "location": {
+            "$ref": "#/components/schemas/ForecastLocationOut"
+          },
+          "generated_at": {
+            "type": "string",
+            "title": "Generated At"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "forecasts": {
+            "items": {
+              "$ref": "#/components/schemas/ForecastSeries"
+            },
+            "type": "array",
+            "title": "Forecasts"
+          }
+        },
+        "type": "object",
+        "required": ["location", "generated_at", "model", "forecasts"],
+        "title": "PointForecastData",
+        "description": "The payload of a point forecast (API.md section 2.1).\n\n``generated_at`` is the forecast dataset generation time -- the selected\nmodel run's ``cycle_time`` -- so that identical forecast data produces\nidentical payloads and deterministic cache behavior."
+      },
+      "PointForecastEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "point_forecast",
+            "title": "Object",
+            "default": "point_forecast"
+          },
+          "data": {
+            "$ref": "#/components/schemas/PointForecastData"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "PointForecastEnvelope",
+        "description": "The point forecast response envelope (API.md sections 2.1 and 2.3).\n\nOnly the documented single-model ``point_forecast`` envelope is\nimplemented in Milestone 9. The multi-model response format is not\ndefined by the approved design documents and is therefore a recorded\nspecification gap; multi-model requests are rejected (see the\n``/v1/points`` router)."
+      },
+      "ProbabilityForecastData": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "ProbabilityForecastEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "probability_forecast",
+            "title": "Object",
+            "default": "probability_forecast"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ProbabilityForecastData"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ProbabilityForecastEnvelope",
+        "description": "The probability forecast response envelope (API.md sections 3.1 and 2.3)."
+      },
+      "RunOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "const": "run",
+            "title": "Object",
+            "default": "run"
+          },
+          "model_id": {
+            "type": "string",
+            "title": "Model Id"
+          },
+          "cycle_time": {
+            "type": "string",
+            "title": "Cycle Time"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": ["id", "model_id", "cycle_time", "status"],
+        "title": "RunOut",
+        "description": "A model run resource (API.md section 1.3)."
+      },
+      "SearchResultOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "title": "Object"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Country"
+          },
+          "elevation_m": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elevation M"
+          },
+          "latitude": {
+            "type": "number",
+            "title": "Latitude"
+          },
+          "longitude": {
+            "type": "number",
+            "title": "Longitude"
+          },
+          "place_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Place Id"
+          }
+        },
+        "type": "object",
+        "required": ["id", "object", "name", "latitude", "longitude"],
+        "title": "SearchResultOut",
+        "description": "A location search result (API.md section 6.1).\n\nThe ``object`` field distinguishes the source table: ``city``,\n``ski_resort``, or ``station``. Type-specific fields (``region``,\n``country``, ``elevation_m``) are optional because not every source\ntable defines them."
+      },
+      "SpatialLayerData": {
+        "properties": {
+          "tile_url_template": {
+            "type": "string",
+            "title": "Tile Url Template"
+          },
+          "min_zoom": {
+            "type": "integer",
+            "title": "Min Zoom"
+          },
+          "max_zoom": {
+            "type": "integer",
+            "title": "Max Zoom"
+          },
+          "lead_time_hours": {
+            "type": "integer",
+            "title": "Lead Time Hours"
+          },
+          "legend": {
+            "$ref": "#/components/schemas/SpatialLayerLegend"
+          },
+          "vector_field_url_template": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vector Field Url Template"
+          }
+        },
+        "type": "object",
+        "required": ["tile_url_template", "min_zoom", "max_zoom", "lead_time_hours", "legend"],
+        "title": "SpatialLayerData",
+        "description": "The payload of a spatial layer (API.md section 4.1).\n\n``tile_url_template`` is a self-referential template for a future tile\nendpoint; map tile generation is out of scope for Milestone 10."
+      },
+      "SpatialLayerEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "spatial_layer",
+            "title": "Object",
+            "default": "spatial_layer"
+          },
+          "data": {
+            "$ref": "#/components/schemas/SpatialLayerData"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "SpatialLayerEnvelope",
+        "description": "The spatial layer response envelope (API.md sections 4.1 and 2.3)."
+      },
+      "SpatialLayerLegend": {
+        "properties": {
+          "unit": {
+            "type": "string",
+            "title": "Unit"
+          },
+          "stops": {
+            "items": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "type": "array",
+            "title": "Stops"
+          }
+        },
+        "type": "object",
+        "required": ["unit", "stops"],
+        "title": "SpatialLayerLegend",
+        "description": "The legend of a spatial layer (API.md section 4.1)."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": ["loc", "msg", "type"],
+        "title": "ValidationError"
+      },
+      "VariableAvailability": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "unit": {
+            "type": "string",
+            "title": "Unit"
+          },
+          "initial_times": {
+            "items": {
+              "$ref": "#/components/schemas/InitialTimeAvailability"
+            },
+            "type": "array",
+            "title": "Initial Times"
+          },
+          "layer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LayerDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": ["id", "name", "unit", "initial_times"],
+        "title": "VariableAvailability",
+        "description": "A forecast variable and the initial times available for it.\n\nAttributes:\n    id: The ``forecast_variables.variable_code`` (e.g.\n        ``temperature_2m``).\n    name: Human-readable variable name.\n    unit: The registered SI unit string (e.g. ``\u00b0C``).\n    initial_times: The initial times with data for this\n        model/variable, newest first.\n    layer: Authoritative map layer descriptor for rendering tiles and\n        legends without an extra metadata roundtrip."
+      },
+      "VariableOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "const": "variable",
+            "title": "Object",
+            "default": "variable"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "unit": {
+            "type": "string",
+            "title": "Unit"
+          }
+        },
+        "type": "object",
+        "required": ["id", "name", "unit"],
+        "title": "VariableOut",
+        "description": "A forecast variable resource (API.md section 1.4)."
+      },
+      "VerificationPeriod": {
+        "properties": {
+          "start": {
+            "type": "string",
+            "format": "date",
+            "title": "Start"
+          },
+          "end": {
+            "type": "string",
+            "format": "date",
+            "title": "End"
+          }
+        },
+        "type": "object",
+        "required": ["start", "end"],
+        "title": "VerificationPeriod",
+        "description": "The verification date window (API.md section 7.1).\n\n``start`` and ``end`` are inclusive calendar dates (the window spans\n``[start 00:00:00Z, end + 1 day)``)."
+      },
+      "VerificationReportData": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "period": {
+            "$ref": "#/components/schemas/VerificationPeriod"
+          },
+          "metrics": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Metrics"
+          }
+        },
+        "type": "object",
+        "required": ["model", "period", "metrics"],
+        "title": "VerificationReportData",
+        "description": "The payload of a verification report (API.md section 7.1).\n\n``metrics`` maps a flat per-variable key (``{variable}_rmse``,\n``{variable}_bias``, ``{variable}_mae``) to its value. A variable with no\nvalid forecast/observation pairs in the window contributes no keys, so\n``metrics`` may be empty."
+      },
+      "VerificationReportEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "verification_report",
+            "title": "Object",
+            "default": "verification_report"
+          },
+          "data": {
+            "$ref": "#/components/schemas/VerificationReportData"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "VerificationReportEnvelope",
+        "description": "The verification report response envelope (API.md sections 7.1 and 2.3)."
+      }
+    }
+  }
+}

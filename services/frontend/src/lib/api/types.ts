@@ -82,7 +82,7 @@ export interface ForecastEntry {
    */
   cycle_time?: string;
   /** Requested forecast variables are attached as dynamic top-level keys. */
-  [variableCode: string]: number | string | undefined;
+  [variableCode: string]: number | string | boolean | undefined;
 }
 
 /**
@@ -111,6 +111,7 @@ export const FORECAST_ENTRY_METADATA_FIELDS: ReadonlySet<string> = new Set([
   "precipitation_start_type",
   "precipitation_end_type",
   "precipitation_evidence",
+  "cloud_ceiling_unlimited",
 ]);
 
 /**
