@@ -607,16 +607,16 @@ jobs:
 
       - name: Validate workspace packages metadata
         run: |
-          cd packages/domain && poetry check && cd ../..
-          cd packages/contracts && poetry check && cd ../..
-          cd packages/config && poetry check && cd ../..
-          cd services/api && poetry check && cd ../..
-          cd services/ingestion && poetry check && cd ../..
+          poetry check -C packages/domain
+          poetry check -C packages/contracts
+          poetry check -C packages/config
+          poetry check -C services/api
+          poetry check -C services/ingestion
 
       - name: Sanity check placeholder packages
         run: |
-          cd packages/contracts && poetry run python -c "import contracts; assert contracts.__version__ == '0.1.0'" && cd ../..
-          cd packages/config && poetry run python -c "import config; assert config.__version__ == '0.1.0'" && cd ../..
+          python -c "import sys; sys.path.insert(0, 'packages/contracts/src'); import contracts; assert contracts.__version__ == '0.1.0'"
+          python -c "import sys; sys.path.insert(0, 'packages/config/src'); import config; assert config.__version__ == '0.1.0'"
 
   # ===========================================================================
   # 8. CROSS-PACKAGE CONTRACT COVERAGE (Stage 7D Gate)
@@ -659,9 +659,9 @@ jobs:
 
       - name: Install Python workspace dependencies
         run: |
-          cd packages/domain && poetry install --no-interaction && cd ../..
-          cd services/api && poetry install --no-interaction && cd ../..
-          cd services/ingestion && poetry install --no-interaction && cd ../..
+          poetry install --no-interaction -C packages/domain
+          poetry install --no-interaction -C services/api
+          poetry install --no-interaction -C services/ingestion
 
       - name: Install Frontend dependencies
         working-directory: services/frontend
