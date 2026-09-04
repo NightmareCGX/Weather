@@ -5,7 +5,6 @@ contract tests can verify producer/consumer compatibility without contaminating
 individual package dependency definitions.
 """
 
-import os
 import sys
 from pathlib import Path
 
