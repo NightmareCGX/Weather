@@ -672,7 +672,7 @@ jobs:
         run: poetry run pytest tests/test_openapi_export.py
 
       - name: Run Python cross-package contract tests
-        run: poetry run pytest tests/contracts
+        run: poetry run --directory services/ingestion pytest ../../tests/contracts
 
       - name: Run Frontend OpenAPI contract suite
         working-directory: services/frontend
