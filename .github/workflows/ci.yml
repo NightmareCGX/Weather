@@ -1,27 +1,19 @@
-# Milestone 14 — End-to-End Integration & CI/CD Pipelines
+# Global Probabilistic Weather Platform — Continuous Integration
 #
-# GitHub Actions CI for the Global Probabilistic Weather Forecasting Platform.
+# GitHub Actions CI pipeline protecting domain correctness, serving contracts,
+# ingestion invariants, frontend quality, and container runtime readiness.
 #
-# Job graph (8 jobs):
-#   Leaf jobs (no `needs`, run in parallel):
-#     python-quality       — Ruff + MyPy (domain/api/ingestion) + contracts/config install/import validation
-#     domain-tests         — pytest (offline, 100% coverage gate)
-#     api-tests            — pytest with isolated PostgreSQL + Redis service containers
-#     ingestion-tests      — pytest with isolated PostgreSQL + Redis + MinIO, WEATHER_TEST_MINIO=1, -W error::ResourceWarning
-#     frontend-unit        — npm ci + Jest
-#     frontend-lint-build  — lint + typecheck + format:check + next build
-#   Dependent jobs:
-#     frontend-e2e         — needs: [frontend-lint-build]; Playwright chromium, npm run e2e
-#     container-builds     — needs: [python-quality, domain-tests, api-tests, ingestion-tests,
-#                                   frontend-unit, frontend-lint-build, frontend-e2e]
-#
-# The API and ingestion suites both run `DROP SCHEMA public CASCADE` and
-# `FLUSHALL` on the same DATABASE_URL/REDIS_URL in their tests. Each job owns
-# its own per-job service containers, so they never share a physical
-# PostgreSQL/Redis instance — the suites are safe to run in parallel.
-#
-# No registry publication, no deployment, no Kubernetes. Images are built and
-# smoke-tested only.
+# Architecture (Stage 7C / 7D):
+#   1. change-detection         — dorny/paths-filter evaluates touched paths
+#   2. domain-pipeline          — Ruff + MyPy + Pytest (offline, 100% coverage gate)
+#   3. api-pipeline             — Ruff + MyPy + Pytest (PostgreSQL + Redis containers)
+#   4. ingestion-pipeline       — Ruff + MyPy + Pytest (PostgreSQL + Redis + MinIO containers)
+#   5. frontend-unit-build      — ESLint + Typecheck + Format + Jest + Next.js build
+#   6. frontend-e2e             — Playwright Chromium E2E (needs: frontend-unit-build)
+#   7. container-builds         — Multi-stage Docker image builds + runtime smoke tests
+#   8. docs-metadata            — Poetry package manifest & metadata validation
+#   9. cross-package-contracts  — Stage 7D cross-package & OpenAPI contract suite
+#  10. ci-required              — Stable branch-protection aggregation gate (if: always())
 
 name: CI
 
@@ -31,22 +23,73 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Python quality: Ruff + MyPy per package, plus contracts/config validation.
-  # ruff/mypy must run from each package cwd so each package's own config is
-  # read (root has none; domain uses line-length=100 + explicit selects).
-  # ---------------------------------------------------------------------------
-  python-quality:
-    name: Python quality (ruff + mypy)
+  # ===========================================================================
+  # 1. CHANGE DETECTION
+  # ===========================================================================
+  change-detection:
+    name: Change detection
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    outputs:
+      domain: ${{ steps.filter.outputs.domain }}
+      api: ${{ steps.filter.outputs.api }}
+      ingestion: ${{ steps.filter.outputs.ingestion }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      docker: ${{ steps.filter.outputs.docker }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ci: ${{ steps.filter.outputs.ci }}
+      root_python: ${{ steps.filter.outputs.root_python }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            domain:
+              - 'packages/domain/**'
+            api:
+              - 'services/api/**'
+              - 'packages/domain/**'
+            ingestion:
+              - 'services/ingestion/**'
+              - 'packages/domain/**'
+            frontend:
+              - 'services/frontend/**'
+            docker:
+              - 'docker/**'
+              - 'docker-compose.yml'
+              - '.dockerignore'
+            docs:
+              - 'README.md'
+              - 'docs/**'
+              - 'services/frontend/README.md'
+            ci:
+              - '.github/workflows/**'
+            root_python:
+              - 'pyproject.toml'
+              - 'packages/contracts/**'
+              - 'packages/config/**'
+
+  # ===========================================================================
+  # 2. DOMAIN PIPELINE (Pure Logic & Invariants)
+  # ===========================================================================
+  domain-pipeline:
+    name: Domain pipeline (quality + 100% coverage)
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.root_python == 'true' ||
+      needs.change-detection.outputs.domain == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -61,85 +104,36 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
-          restore-keys: poetry-${{ runner.os }}-
+          key: poetry-${{ runner.os }}-domain-${{ hashFiles('packages/domain/pyproject.toml') }}
+          restore-keys: poetry-${{ runner.os }}-domain-
 
       - name: Install domain dependencies
         working-directory: packages/domain
         run: poetry install --no-interaction
-      - name: Install contracts dependencies
-        working-directory: packages/contracts
-        run: poetry install --no-interaction
-      - name: Install config dependencies
-        working-directory: packages/config
-        run: poetry install --no-interaction
-      - name: Install api dependencies
-        working-directory: services/api
-        run: poetry install --no-interaction
-      - name: Install ingestion dependencies
-        working-directory: services/ingestion
-        run: poetry install --no-interaction
 
       - name: Ruff check (domain)
-        run: cd packages/domain && ruff check .
-      - name: Ruff check (api)
-        run: cd services/api && ruff check .
-      - name: Ruff check (ingestion)
-        run: cd services/ingestion && ruff check .
+        working-directory: packages/domain
+        run: ruff check .
 
       - name: MyPy (domain)
-        run: cd packages/domain && mypy --python-executable "$(poetry env info --path)/bin/python"
-      - name: MyPy (api)
-        run: cd services/api && mypy --python-executable "$(poetry env info --path)/bin/python"
-      - name: MyPy (ingestion)
-        run: cd services/ingestion && mypy --python-executable "$(poetry env info --path)/bin/python"
+        working-directory: packages/domain
+        run: mypy --python-executable "$(poetry env info --path)/bin/python"
 
-      # Placeholder shared packages have no lintable logic, no tests, and no
-      # ruff/mypy config. They receive lightweight install/import validation so
-      # M14's "across all packages and services" is not left ambiguous.
-      - name: Validate contracts package
-        working-directory: packages/contracts
-        run: poetry run python -c "import contracts; assert contracts.__version__"
-      - name: Validate config package
-        working-directory: packages/config
-        run: poetry run python -c "import config; assert config.__version__"
+      - name: Run domain tests (100% coverage gate)
+        working-directory: packages/domain
+        run: poetry run pytest
 
-  # ---------------------------------------------------------------------------
-  # Domain unit tests: offline, no services, 100% coverage gate.
-  # ---------------------------------------------------------------------------
-  domain-tests:
-    name: Domain tests (pytest, 100% coverage)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Poetry
-        run: python -m pip install poetry==2.4.1
-
-      - name: Cache Poetry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
-          restore-keys: poetry-${{ runner.os }}-
-
-      - name: Install domain dependencies
-        run: cd packages/domain && poetry install --no-interaction
-
-      - name: Run domain tests
-        run: cd packages/domain && poetry run pytest
-
-  # ---------------------------------------------------------------------------
-  # API integration tests: isolated PostgreSQL + Redis service containers.
-  # The api package also needs its runtime deps (installed via poetry).
-  # ---------------------------------------------------------------------------
-  api-tests:
-    name: API tests (PostgreSQL + Redis)
+  # ===========================================================================
+  # 3. API PIPELINE (Serving Tier Integration)
+  # ===========================================================================
+  api-pipeline:
+    name: API pipeline (PostgreSQL + Redis)
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.root_python == 'true' ||
+      needs.change-detection.outputs.api == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -175,31 +169,52 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Poetry
-        run: python -m pip install poetry==2.4.1
+      - name: Install Poetry, Ruff, MyPy
+        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.9.0
 
       - name: Cache Poetry
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
-          restore-keys: poetry-${{ runner.os }}-
+          key: poetry-${{ runner.os }}-api-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-api-
 
       - name: Install API dependencies
-        run: cd services/api && poetry install --no-interaction
+        working-directory: services/api
+        run: poetry install --no-interaction
+
+      - name: Ruff check (api)
+        working-directory: services/api
+        run: ruff check .
+
+      - name: MyPy (api)
+        working-directory: services/api
+        run: mypy --python-executable "$(poetry env info --path)/bin/python"
 
       - name: Run API tests
-        run: cd services/api && poetry run pytest
+        working-directory: services/api
+        run: poetry run pytest --junitxml=api-junit.xml
 
-  # ---------------------------------------------------------------------------
-  # Ingestion integration tests: isolated PostgreSQL + Redis + MinIO.
-  # test_catalog_postgres.py imports the api package (api.main TestClient), so
-  # both api and ingestion main deps must be installed into the same venv.
-  # The real MinIO S3 Zarr round-trip (test_s3_store_roundtrip) is opt-in and
-  # requires the weather-data bucket to pre-exist.
-  # ---------------------------------------------------------------------------
-  ingestion-tests:
-    name: Ingestion tests (PostgreSQL + Redis + MinIO)
+      - name: Upload API test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-results
+          path: services/api/api-junit.xml
+          retention-days: 7
+
+  # ===========================================================================
+  # 4. INGESTION PIPELINE (Ingestion, Sharding, Realtime & GC)
+  # ===========================================================================
+  ingestion-pipeline:
+    name: Ingestion pipeline (PostgreSQL + Redis + MinIO)
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.root_python == 'true' ||
+      needs.change-detection.outputs.ingestion == 'true' ||
+      needs.change-detection.outputs.api == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -226,9 +241,6 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       minio:
-        # Pinned release (not :latest) for deterministic CI. The image's
-        # default CMD is `minio` with no args, which prints help and exits;
-        # the explicit `server /data` command keeps the container running.
         image: minio/minio:RELEASE.2024-12-18T13-15-44Z
         command: server /data --console-address ":9001"
         env:
@@ -253,42 +265,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ecCodes native C-library system dependency (Linux). The `eccodes`
-      # Python wheel bundles the native library only on Windows; on Linux it
-      # requires the ecCodes C-library from a system package (`eccodeslib` is
-      # not actually published to PyPI). cfgrib's documented Linux install is
-      # `apt-get install libeccodes-dev` (which pulls the runtime libeccodes0).
-      - name: Install ecCodes system dependency
+      - name: Install ecCodes native system dependency
         run: sudo apt-get update && sudo apt-get install -y libeccodes-dev
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install Poetry
-        run: python -m pip install poetry==2.4.1
+      - name: Install Poetry, Ruff, MyPy
+        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.9.0
 
       - name: Cache Poetry
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
-          restore-keys: poetry-${{ runner.os }}-
+          key: poetry-${{ runner.os }}-ingestion-${{ hashFiles('packages/domain/pyproject.toml', 'services/ingestion/poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-ingestion-
 
-      # Install ingestion deps (with dev group, incl. minio + the API-owned
-      # test deps that test_catalog_postgres.py needs to import api.main).
-      # API source is reached via the ingestion pyproject's pythonpath
-      # (``pythonpath = ["src", "../api/src"]``); the ingestion Poetry venv is
-      # self-contained, so no separate API install is required here.
-      - name: Install ingestion dependencies
+      - name: Install Ingestion dependencies
         working-directory: services/ingestion
         run: poetry install --no-interaction
+
+      - name: Ruff check (ingestion)
+        working-directory: services/ingestion
+        run: ruff check .
+
+      - name: MyPy (ingestion)
+        working-directory: services/ingestion
+        run: mypy --python-executable "$(poetry env info --path)/bin/python"
 
       - name: Create MinIO bucket
         run: |
           cd services/ingestion && poetry run python - <<'PY'
-          import time
-          import boto3
+          import time, boto3
           for _ in range(30):
               try:
                   s3 = boto3.client(
@@ -298,24 +307,18 @@ jobs:
                       aws_secret_access_key="minio_password",
                   )
                   s3.create_bucket(Bucket="weather-data")
-                  print("bucket ready")
+                  print("MinIO bucket 'weather-data' ready")
                   break
-              except Exception as exc:  # noqa: BLE001 - retry loop
-                  print("waiting for minio:", exc)
+              except Exception as exc:
                   time.sleep(2)
           else:
-              raise SystemExit("MinIO not ready")
+              raise SystemExit("MinIO bucket initialization timed out")
           PY
 
-      # Run the full suite ONCE (includes the real MinIO S3 Zarr round-trip,
-      # test_catalog_postgres.py, and the S3 lifecycle regression tests).
-      # Strict ResourceWarning promotion ensures unclosed ClientSessions or
-      # connectors fail the build immediately. JUnit report provides pytest-native evidence.
-      - name: Run ingestion tests (with JUnit report)
-        run: cd services/ingestion && poetry run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml
+      - name: Run Ingestion tests (with JUnit report)
+        working-directory: services/ingestion
+        run: poetry run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml
 
-      # Prove the approved MinIO round-trip executed and PASSED (not skipped)
-      # from the pytest-native JUnit report — no stdout parsing.
       - name: Verify MinIO round-trip ran and passed (not skipped)
         run: |
           python - <<'PY'
@@ -323,17 +326,12 @@ jobs:
           root = ET.parse("services/ingestion/ingestion-junit.xml").getroot()
           test = root.find(".//testcase[@name='test_s3_store_roundtrip_preserves_data']")
           assert test is not None, "MinIO round-trip testcase not found in pytest report"
-          assert test.find("failure") is None and test.find("error") is None, \
-              "MinIO round-trip FAILED: found <failure>/<error> in pytest report"
-          assert test.find("skipped") is None, \
-              "MinIO round-trip was SKIPPED: <skipped> present in pytest report"
-          print("MinIO round-trip executed and passed (not skipped)")
+          assert test.find("failure") is None and test.find("error") is None, "MinIO round-trip FAILED"
+          assert test.find("skipped") is None, "MinIO round-trip was SKIPPED"
+          print("MinIO round-trip verified passed")
           PY
 
-      # The Zarr region-write concurrency correctness suite and S3 lifecycle
-      # regression suite are required Linux CI gates. The PG-backed advisory-lock
-      # tests, MinIO marker tests, and S3 lifecycle tests must run and PASS (not skip).
-      - name: Verify concurrency correctness and S3 lifecycle tests ran and passed (not skipped)
+      - name: Verify concurrency correctness and S3 lifecycle tests passed
         run: |
           python - <<'PY'
           import xml.etree.ElementTree as ET
@@ -358,17 +356,13 @@ jobs:
           ]
           for name in required:
               test = root.find(f".//testcase[@name='{name}']")
-              assert test is not None, f"required test {name!r} not found"
-              assert test.find("failure") is None and test.find("error") is None, \
-                  f"test {name!r} FAILED"
-              assert test.find("skipped") is None, \
-                  f"test {name!r} was SKIPPED"
-          print("All required concurrency and S3 lifecycle tests executed and passed (not skipped)")
+              assert test is not None, f"Required test {name!r} not found"
+              assert test.find("failure") is None and test.find("error") is None, f"Test {name!r} FAILED"
+              assert test.find("skipped") is None, f"Test {name!r} was SKIPPED"
+          print("All required concurrency and lifecycle tests verified passed")
           PY
 
-      # Prove the Serving Contract E2E executed and PASSED (not skipped)
-      # from the pytest-native JUnit report.
-      - name: Verify Serving Contract E2E ran and passed (not skipped)
+      - name: Verify Serving Contract E2E tests passed
         run: |
           python - <<'PY'
           import xml.etree.ElementTree as ET
@@ -380,46 +374,30 @@ jobs:
           ]
           for name in required:
               test = root.find(f".//testcase[@name='{name}']")
-              assert test is not None, f"Serving contract testcase '{name}' not found in pytest report"
-              assert test.find("failure") is None and test.find("error") is None, \
-                  f"Serving contract testcase '{name}' FAILED: found <failure>/<error> in pytest report"
-              assert test.find("skipped") is None, \
-                  f"Serving contract testcase '{name}' was SKIPPED: <skipped> present in pytest report"
-              print(f"Serving contract testcase '{name}' executed and passed (not skipped)")
+              assert test is not None, f"Serving contract testcase '{name}' not found"
+              assert test.find("failure") is None and test.find("error") is None, f"Test '{name}' FAILED"
+              assert test.find("skipped") is None, f"Test '{name}' was SKIPPED"
+          print("Serving contract E2E tests verified passed")
           PY
 
-  # ---------------------------------------------------------------------------
-  # Frontend unit tests: Jest (jsdom, offline; maplibre mocked).
-  # ---------------------------------------------------------------------------
-  frontend-unit:
-    name: Frontend unit (Jest)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: services/frontend
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: Upload Ingestion test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: services/frontend/package-lock.json
+          name: ingestion-test-results
+          path: services/ingestion/ingestion-junit.xml
+          retention-days: 7
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run Jest
-        run: npm run test -- --ci
-
-  # ---------------------------------------------------------------------------
-  # Frontend lint + typecheck + format + production build.
-  # The explicit `next build` validates `output: "standalone"` early (in
-  # parallel with the e2e job's implicit build).
-  # ---------------------------------------------------------------------------
-  frontend-lint-build:
-    name: Frontend lint/typecheck/format/build
+  # ===========================================================================
+  # 5. FRONTEND PIPELINE (Unit, Lint, Typecheck, Build & Playwright E2E)
+  # ===========================================================================
+  frontend-unit-build:
+    name: Frontend quality & unit build
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     defaults:
@@ -446,18 +424,26 @@ jobs:
       - name: Format check
         run: npm run format:check
 
-      - name: Production build
+      - name: Run Jest unit tests
+        run: npm run test -- --ci
+
+      - name: Next.js standalone build
         run: npm run build
 
-  # ---------------------------------------------------------------------------
-  # Frontend E2E: Playwright (offline-mocked API; no backend needed).
-  # Depends on frontend-lint-build to fail fast before paying for Chromium/build.
-  # ---------------------------------------------------------------------------
   frontend-e2e:
     name: Frontend E2E (Playwright)
-    needs: [frontend-lint-build]
+    needs: [change-detection, frontend-unit-build]
+    if: |
+      always() &&
+      (needs.frontend-unit-build.result == 'success' || needs.frontend-unit-build.result == 'skipped') &&
+      (
+        github.event_name == 'push' ||
+        needs.change-detection.outputs.ci == 'true' ||
+        needs.change-detection.outputs.frontend == 'true' ||
+        needs.change-detection.outputs.api == 'true'
+      )
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: services/frontend
@@ -470,6 +456,9 @@ jobs:
           cache: npm
           cache-dependency-path: services/frontend/package-lock.json
 
+      - name: Install dependencies
+        run: npm ci
+
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -477,36 +466,42 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('services/frontend/package-lock.json') }}
           restore-keys: playwright-${{ runner.os }}-
 
-      - name: Install dependencies
-        run: npm ci
-
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
       - name: Run Playwright E2E
         run: npm run e2e
 
-  # ---------------------------------------------------------------------------
-  # Container builds: build + runtime smoke-test all three images.
-  # Only runs after every quality/test gate has passed.
-  # ---------------------------------------------------------------------------
+      - name: Upload Playwright artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: services/frontend/playwright-report/
+          retention-days: 7
+
+  # ===========================================================================
+  # 6. CONTAINER BUILDS & RUNTIME SMOKE TESTS
+  # ===========================================================================
   container-builds:
-    name: Container builds + smoke tests
-    needs:
-      - python-quality
-      - domain-tests
-      - api-tests
-      - ingestion-tests
-      - frontend-unit
-      - frontend-lint-build
-      - frontend-e2e
+    name: Container builds & runtime smoke
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.docker == 'true' ||
+      needs.change-detection.outputs.domain == 'true' ||
+      needs.change-detection.outputs.api == 'true' ||
+      needs.change-detection.outputs.ingestion == 'true' ||
+      needs.change-detection.outputs.frontend == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
+      # --- Build Images in Parallel via Buildx ---
       - name: Build API image
         uses: docker/build-push-action@v6
         with:
@@ -518,7 +513,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build ingestion image
+      - name: Build Ingestion image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -529,7 +524,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build frontend image
+      - name: Build Frontend image
         uses: docker/build-push-action@v6
         with:
           context: services/frontend
@@ -542,8 +537,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # --- Runtime smoke tests (no external services required) ---
-      - name: Smoke test API (/docs)
+      # --- Runtime Smoke Tests ---
+      - name: Smoke test API (/docs & health)
         run: |
           docker run -d --name api-smoke -p 8000:8000 weather-api:ci
           for i in $(seq 1 30); do
@@ -555,18 +550,6 @@ jobs:
           curl -sf http://127.0.0.1:8000/docs >/dev/null || { echo "API /docs FAILED"; docker logs api-smoke; exit 1; }
           docker rm -f api-smoke
 
-      # The API serving tier calls ``xr.open_zarr`` (api/core/zarr.py) in
-      # production, which lazily imports the ``zarr``/``numcodecs`` runtime
-      # stack. Prove the image actually ships that stack by opening a real Zarr
-      # store through the API's production reader path — an import-only smoke
-      # would not catch a missing runtime dependency.
-      #
-      # The fixture store is created and read entirely inside the container's own
-      # filesystem under a `tempfile` directory, which is writable by the image's
-      # non-root `appuser`. A host bind-mount of a root-owned path (e.g.
-      # `-v /tmp/...:/store`) is NOT writable by `appuser`, which made
-      # `to_zarr('/store/store.zarr')` fail with PermissionError before the read
-      # path could be exercised. No host mount is used here.
       - name: Smoke test API Zarr-serving (xr.open_zarr)
         run: |
           docker run --rm \
@@ -577,33 +560,242 @@ jobs:
             -e MINIO_SECURE=false \
             weather-api:ci -c "import sys, tempfile, numpy as np, xarray as xr; store = tempfile.mkdtemp() + '/store.zarr'; ds = xr.Dataset({'temperature_2m': (('lead_time_hours','latitude','longitude'), np.zeros((1,2,2)))}, coords={'lead_time_hours':[6],'latitude':[38.0,39.0],'longitude':[-107.0,-106.0]}); ds.to_zarr(store, mode='w'); sys.path.insert(0, '/app/services/api/src'); from api.core.zarr import read_dataset; back = read_dataset(store); assert 'temperature_2m' in back.data_vars; print('API Zarr-serving OK; vars', list(back.data_vars))" || { echo "API Zarr-serving smoke FAILED"; exit 1; }
 
-      - name: Smoke test frontend (/)
+      - name: Smoke test Frontend (/)
         run: |
           docker run -d --name fe-smoke -p 3000:3000 weather-frontend:ci
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:3000/ >/dev/null 2>&1; then
-              echo "frontend / OK"; break
+              echo "Frontend / OK"; break
             fi
             sleep 1
           done
-          curl -sf http://127.0.0.1:3000/ >/dev/null || { echo "frontend / FAILED"; docker logs fe-smoke; exit 1; }
+          curl -sf http://127.0.0.1:3000/ >/dev/null || { echo "Frontend / FAILED"; docker logs fe-smoke; exit 1; }
           docker rm -f fe-smoke
 
-      # The ingestion image's core purpose is GRIB2 decoding, so the smoke test
-      # must actually decode a real GRIB file inside the container. ``--help``
-      # never loads cfgrib/ecCodes, so it cannot prove the native libeccodes
-      # dependency is present. Decode the committed fixture via the image's venv
-      # and fail if ecCodes cannot load or the decode does not yield the expected
-      # variable. The fixture is a GFS 2 m temperature field; cfgrib emits it as
-      # ``t2m`` (GRIB shortName ``2t`` / paramId 167), which is exactly the name
-      # the parser's SURFACE_FIELD_FILTERS selects (parser.py), so the smoke
-      # asserts ``t2m`` — the previous ``t`` only matched the old synthetic
-      # single-message fixture. (The fixture path is inside the build context;
-      # the runtime stage's working directory is /app/services/ingestion.)
-      - name: Smoke test ingestion (real GRIB2 decode)
+      - name: Smoke test Ingestion (GRIB2 decode)
         run: |
           docker run --rm \
             --entrypoint python \
             -v "$PWD/services/ingestion/tests/fixtures/gfs.t00z.pgrb2.0p25.f006.grib2":/fixture.grib2 \
-            weather-ingestion:ci -c "import sys; sys.path.insert(0, '/app/services/ingestion/src'); import xarray as xr; ds = xr.open_dataset('/fixture.grib2', engine='cfgrib'); assert 't2m' in ds.data_vars, 'cfgrib decode produced no t2m variable'; print('GRIB decode OK; t2m range', float(ds.t2m.min()), float(ds.t2m.max()))" || { echo "ingestion GRIB decode FAILED"; exit 1; }
-          echo "ingestion GRIB decode OK"
+            weather-ingestion:ci -c "import sys; sys.path.insert(0, '/app/services/ingestion/src'); import xarray as xr; ds = xr.open_dataset('/fixture.grib2', engine='cfgrib'); assert 't2m' in ds.data_vars, 'cfgrib decode produced no t2m variable'; print('GRIB decode OK; t2m range', float(ds.t2m.min()), float(ds.t2m.max()))" || { echo "Ingestion GRIB decode FAILED"; exit 1; }
+
+  # ===========================================================================
+  # 7. DOCS & PACKAGE METADATA VALIDATION
+  # ===========================================================================
+  docs-metadata:
+    name: Docs & package metadata
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.docs == 'true' ||
+      needs.change-detection.outputs.root_python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: python -m pip install poetry==2.4.1
+
+      - name: Validate root package metadata & README
+        run: poetry check
+
+      - name: Validate workspace packages metadata
+        run: |
+          poetry check -C packages/domain
+          poetry check -C packages/contracts
+          poetry check -C packages/config
+          poetry check -C services/api
+          poetry check -C services/ingestion
+
+      - name: Sanity check placeholder packages
+        run: |
+          python -c "import sys; sys.path.insert(0, 'packages/contracts/src'); import contracts; assert contracts.__version__ == '0.1.0'"
+          python -c "import sys; sys.path.insert(0, 'packages/config/src'); import config; assert config.__version__ == '0.1.0'"
+
+  # ===========================================================================
+  # 8. CROSS-PACKAGE CONTRACT COVERAGE (Stage 7D Gate)
+  # ===========================================================================
+  cross-package-contracts:
+    name: Cross-package contract gates
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.root_python == 'true' ||
+      needs.change-detection.outputs.domain == 'true' ||
+      needs.change-detection.outputs.api == 'true' ||
+      needs.change-detection.outputs.ingestion == 'true' ||
+      needs.change-detection.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: services/frontend/package-lock.json
+
+      - name: Install Poetry
+        run: python -m pip install poetry==2.4.1
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-contracts-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-contracts-
+
+      - name: Install Python workspace dependencies
+        run: |
+          poetry install --no-interaction -C packages/domain
+          poetry install --no-interaction -C services/api
+          poetry install --no-interaction -C services/ingestion
+
+      - name: Install Frontend dependencies
+        working-directory: services/frontend
+        run: npm ci
+
+      - name: Verify OpenAPI schema export
+        working-directory: services/api
+        run: poetry run pytest tests/test_openapi_export.py
+
+      - name: Run Python cross-package contract tests
+        run: poetry run --directory services/ingestion pytest ../../tests/contracts
+
+      - name: Run Frontend OpenAPI contract suite
+        working-directory: services/frontend
+        run: npm test -- openapi_contract.test.ts
+
+  # ===========================================================================
+  # 9. STABLE MERGE GATE (ci-required)
+  # ===========================================================================
+  ci-required:
+    name: ci-required
+    needs:
+      - change-detection
+      - domain-pipeline
+      - api-pipeline
+      - ingestion-pipeline
+      - frontend-unit-build
+      - frontend-e2e
+      - container-builds
+      - docs-metadata
+      - cross-package-contracts
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate required CI gates
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGE_DETECTION_RESULT: ${{ needs.change-detection.result }}
+          DOMAIN_RESULT: ${{ needs.domain-pipeline.result }}
+          API_RESULT: ${{ needs.api-pipeline.result }}
+          INGESTION_RESULT: ${{ needs.ingestion-pipeline.result }}
+          FE_UNIT_RESULT: ${{ needs.frontend-unit-build.result }}
+          FE_E2E_RESULT: ${{ needs.frontend-e2e.result }}
+          CONTAINER_RESULT: ${{ needs.container-builds.result }}
+          DOCS_RESULT: ${{ needs.docs-metadata.result }}
+          CONTRACTS_RESULT: ${{ needs.cross-package-contracts.result }}
+          OUT_DOMAIN: ${{ needs.change-detection.outputs.domain }}
+          OUT_API: ${{ needs.change-detection.outputs.api }}
+          OUT_INGESTION: ${{ needs.change-detection.outputs.ingestion }}
+          OUT_FRONTEND: ${{ needs.change-detection.outputs.frontend }}
+          OUT_DOCKER: ${{ needs.change-detection.outputs.docker }}
+          OUT_DOCS: ${{ needs.change-detection.outputs.docs }}
+          OUT_CI: ${{ needs.change-detection.outputs.ci }}
+          OUT_ROOT_PY: ${{ needs.change-detection.outputs.root_python }}
+        run: |
+          python - <<'PY'
+          import os, sys
+
+          event = os.environ.get("EVENT_NAME", "")
+          cd_result = os.environ.get("CHANGE_DETECTION_RESULT", "")
+
+          if cd_result != "success":
+              print(f"FATAL: change-detection job status was '{cd_result}' (expected 'success').")
+              sys.exit(1)
+
+          is_push = (event == "push")
+          out_ci = (os.environ.get("OUT_CI") == "true")
+          out_root_py = (os.environ.get("OUT_ROOT_PY") == "true")
+          out_domain = (os.environ.get("OUT_DOMAIN") == "true")
+          out_api = (os.environ.get("OUT_API") == "true")
+          out_ing = (os.environ.get("OUT_INGESTION") == "true")
+          out_fe = (os.environ.get("OUT_FRONTEND") == "true")
+          out_docker = (os.environ.get("OUT_DOCKER") == "true")
+          out_docs = (os.environ.get("OUT_DOCS") == "true")
+
+          out_contracts = (
+              is_push or out_ci or out_root_py or out_domain or out_api or out_ing or out_fe
+          )
+
+          # Determine whether each job was EXPECTED to run
+          expected = {
+              "domain-pipeline": is_push or out_ci or out_root_py or out_domain,
+              "api-pipeline": is_push or out_ci or out_root_py or out_api,
+              "ingestion-pipeline": is_push or out_ci or out_root_py or out_ing or out_api,
+              "frontend-unit-build": is_push or out_ci or out_fe,
+              "frontend-e2e": is_push or out_ci or out_fe or out_api,
+              "container-builds": is_push or out_ci or out_docker or out_domain or out_api or out_ing or out_fe,
+              "docs-metadata": is_push or out_ci or out_docs or out_root_py,
+              "cross-package-contracts": out_contracts,
+          }
+
+          results = {
+              "domain-pipeline": os.environ.get("DOMAIN_RESULT", ""),
+              "api-pipeline": os.environ.get("API_RESULT", ""),
+              "ingestion-pipeline": os.environ.get("INGESTION_RESULT", ""),
+              "frontend-unit-build": os.environ.get("FE_UNIT_RESULT", ""),
+              "frontend-e2e": os.environ.get("FE_E2E_RESULT", ""),
+              "container-builds": os.environ.get("CONTAINER_RESULT", ""),
+              "docs-metadata": os.environ.get("DOCS_RESULT", ""),
+              "cross-package-contracts": os.environ.get("CONTRACTS_RESULT", ""),
+          }
+
+          print("=== CI Gate Evaluation ===")
+          print(f"Event: {event}")
+          print("Change flags:", {
+              "ci": out_ci, "root_python": out_root_py, "domain": out_domain,
+              "api": out_api, "ingestion": out_ing, "frontend": out_fe,
+              "docker": out_docker, "docs": out_docs,
+          })
+          print("-" * 50)
+
+          failures = []
+          for job, res in results.items():
+              exp = expected[job]
+              status_label = f"result={res:<10} (expected_to_run={exp})"
+              if exp:
+                  if res == "success":
+                      print(f"[PASS] {job:<24} {status_label}")
+                  else:
+                      print(f"[FAIL] {job:<24} {status_label} - REQUIRED JOB DID NOT SUCCEED")
+                      failures.append(f"{job} (status: {res}, expected: success)")
+              else:
+                  if res in ("skipped", "success"):
+                      print(f"[PASS] {job:<24} {status_label} - legitimately skipped/succeeded")
+                  else:
+                      print(f"[FAIL] {job:<24} {status_label} - UNEXPECTED FAILURE IN OPTIONAL JOB")
+                      failures.append(f"{job} (status: {res})")
+
+          print("-" * 50)
+          if failures:
+              print(f"CI Gate FAILED with {len(failures)} failed/incomplete job(s):")
+              for f in failures:
+                  print(f"  - {f}")
+              sys.exit(1)
+
+          print("All required CI gates verified successfully. Merge gate GREEN.")
+          PY

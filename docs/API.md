@@ -218,7 +218,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 #### 1.5 List Forecast Grids
 - **HTTP Method**: `GET`
 - **Endpoint**: `/v1/grids`
-- **Purpose**: Retrieve supported spatial grid definitions (coarse global vs. high-res AI downscaled).
+- **Purpose**: Retrieve supported spatial grid definitions (e.g. 0.25° GFS vs. 0.50° GEFS).
 - **Required Parameters**: None.
 - **Optional Parameters**: `limit`.
 - **Example Request**: `GET /v1/grids`
@@ -234,10 +234,10 @@ Errors return standard HTTP status codes along with a structured machine-readabl
         "resolution_km": 25.0
       },
       {
-        "id": "downscaled_3km",
+        "id": "global_050deg",
         "object": "grid",
-        "name": "AI Downscaled Local Grid",
-        "resolution_km": 3.0
+        "name": "Global 0.50 Degree Grid",
+        "resolution_km": 50.0
       }
     ],
     "has_more": false,
@@ -528,7 +528,24 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 
 ---
 
-## 5. Future Expansion Strategy
+## 5. OpenAPI Schema Export & Contract Verification
+
+The FastAPI serving service dynamically generates the OpenAPI 3.1 schema from Python route models (`app.openapi()`). This schema is committed to `services/frontend/openapi.json` to enable automated frontend TypeScript contract verification.
+
+### Export / Update Command:
+When backend endpoint models or parameters are modified, update the committed OpenAPI schema artifact:
+```bash
+cd services/api
+poetry run python -c "import json, sys; sys.path.insert(0, 'src'); from api.main import app; open('../../services/frontend/openapi.json', 'w', encoding='utf-8').write(json.dumps(app.openapi(), indent=2) + '\n')"
+```
+
+### Contract Verification:
+1. **Backend Verification:** `services/api/tests/test_openapi_export.py` asserts that `app.openapi()` matches `services/frontend/openapi.json`.
+2. **Frontend Verification:** `services/frontend/src/lib/api/__tests__/openapi_contract.test.ts` asserts that frontend TypeScript types and client methods conform to the exported schema.
+
+---
+
+## 6. Future Expansion Strategy
 
 The API is architected to absorb future platform expansions without breaking existing clients:
 1. **ECMWF & Canada**: Seamlessly integrated by adding new model identifiers to `GET /v1/models` and accepting `?models=ecmwf,gdps` in point queries.

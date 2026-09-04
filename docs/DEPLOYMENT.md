@@ -1,76 +1,142 @@
-# Deployment Architecture & Operations
+# Deployment & Operations Guide
 
-The platform is designed for cloud-native containerized deployment across multi-region cloud environments (AWS / GCP / Azure).
+This document describes the currently implemented deployment architecture, container images, configuration requirements, and operational execution modes for the Weather Platform.
 
----
-
-## 1. Local Development (`Docker Compose`)
-For local development, all auxiliary services are spun up via Docker Compose:
-- **PostgreSQL 16 + PostGIS**: Spatial relational database.
-- **Redis**: Caching and Celery message broker.
-- **MinIO**: S3-compatible object storage for local Zarr and GRIB2 testing.
+> **Operational Runbooks:** For step-by-step procedures covering fresh deployment bootstrapping, database migrations, failure recovery, leadership failover, and operational diagnostic queries, see [`docs/RUNBOOKS.md`](RUNBOOKS.md).
 
 ---
 
-## 2. Production Cloud Architecture
-- **Container Orchestration**: Kubernetes (EKS / GKE) running stateless microservices (`services/ingestion`, `services/processing`, `services/api`).
-- **GPU Inference Node Pools**: Dedicated GPU node groups (NVIDIA T4 / A10G) running PyTorch inference workers for AI downscaling.
-- **Object Storage**: AWS S3 with lifecycle policies for hot/cold Zarr raster storage.
-- **Database**: Managed PostgreSQL (AWS RDS / GCP Cloud SQL) with PostGIS extension enabled and read replicas for serving.
-- **CDN & Edge**: Cloudflare / AWS CloudFront caching API responses and map tiles at the edge.
+## 1. Local Development Infrastructure (`docker-compose.yml`)
+
+For local development and integration testing, backing services run via Docker Compose:
+
+* **PostgreSQL 16 + PostGIS 3.4 (`postgis/postgis:16-3.4`):**
+  * Port: `5432`
+  * Database: `weather_db`
+  * Credentials: `weather_user` / `weather_password`
+  * Stores relational catalog, forecast product availability, lifecycle fences, and coordinates PostgreSQL advisory locks.
+* **Redis 7 (`redis:7-alpine`):**
+  * Port: `6379`
+  * In-memory cache for API point forecast JSON envelopes and vector field grids.
+* **MinIO (`minio/minio:latest`):**
+  * S3 API: `http://localhost:9000`
+  * Console: `http://localhost:9001`
+  * Credentials: `minio_admin` / `minio_password`
+  * S3-compatible object storage bucket: `weather-data`
+
+To launch:
+```bash
+docker-compose up -d
+```
 
 ---
 
-## 3. CI/CD Pipelines (`GitHub Actions`)
-- **Linting & Type Checking**: Ruff, Black, MyPy, ESLint.
-- **Automated Testing**: Pytest for Python services, Jest/Playwright for Next.js frontend.
-- **Container Builds**: Automated multi-architecture Docker image builds pushed to container registries on semantic release tags.
-- **Infrastructure as Code**: Terraform for provisioning cloud networking, S3 buckets, RDS instances, and Kubernetes clusters.
+## 2. Container Images (`docker/`)
+
+The repository provides multi-stage production Dockerfiles:
+
+### 2.1 API Image (`docker/Dockerfile.api`)
+* **Base:** `python:3.12-slim` (non-root `appuser`, UID 1001).
+* **Builder Stage:** Installs Poetry 2.4.1, resolves path dependencies (`packages/domain`), and builds a self-contained in-project virtual environment (`--only main`).
+* **Runtime:** Copies venv, API source, Alembic migrations, and configuration. Runs `uvicorn api.main:app --host 0.0.0.0 --port 8000`.
+* **Healthcheck:** Probes `http://127.0.0.1:8000/docs` (or `/v1/health`).
+* **Build Command:**
+  ```bash
+  docker build -f docker/Dockerfile.api -t weather-api:latest .
+  ```
+
+### 2.2 Ingestion Image (`docker/Dockerfile.ingestion`)
+* **Base:** `python:3.12-slim` (non-root `appuser`, UID 1001).
+* **System Packages:** Installs `libeccodes-dev` (required for GRIB2 decoding on Linux).
+* **Runtime:** Self-contained Poetry venv + `packages/domain` source + `services/ingestion` source.
+* **Entrypoint:** `weather-ingest` CLI.
+* **Build Command:**
+  ```bash
+  docker build -f docker/Dockerfile.ingestion -t weather-ingestion:latest .
+  ```
+
+### 2.3 Frontend Image (`docker/Dockerfile.frontend`)
+* **Base:** `node:20-alpine` (non-root `nextjs`, GID/UID 1001).
+* **Build Output:** Next.js `output: "standalone"` (`.next/standalone`, `.next/static`, `public`).
+* **Build Argument:** `API_PROXY_TARGET` (defaults to `http://127.0.0.1:8000`). Note: Next.js bakes rewrite destinations into routes-manifest at build time.
+* **Entrypoint:** `node server.js`.
+* **Build Command:**
+  ```bash
+  docker build -f docker/Dockerfile.frontend --build-arg API_PROXY_TARGET=http://api:8000 -t weather-frontend:latest services/frontend
+  ```
 
 ---
 
-## 4. Operational prerequisites (post-M14 remediation)
+## 3. Production Configuration & Environment Variables
 
-### Google Places API (New) — location autocomplete
-- Enable the **Places API (New)** in the Google Cloud project.
-- Create a **server API key** restricted by IP address and restricted to the
-  Places API service. The key is read by the FastAPI service from
-  `GOOGLE_PLACES_API_KEY` and **never reaches the browser** (the frontend
-  proxies `/v1/*` to FastAPI via Next.js rewrites).
-- `SEARCH_PROVIDER` selects the backend (`google` default, or `mapbox` with
-  `MAPBOX_TOKEN`).
+### 3.1 Common Infrastructure Settings
+* `DATABASE_URL`: PostgreSQL connection string (e.g. `postgresql://user:pass@db-host:5432/weather_db`).
+* `REDIS_URL`: Redis connection string (e.g. `redis://redis-host:6379/0`).
+* `MINIO_ENDPOINT`: S3/MinIO host and port (e.g. `s3.us-east-1.amazonaws.com` or `minio:9000`).
+* `MINIO_ACCESS_KEY`: S3 access key ID.
+* `MINIO_SECRET_KEY`: S3 secret access key.
+* `MINIO_SECURE`: `true` for HTTPS (production AWS S3 / CloudFlare R2), `false` for plain HTTP (local MinIO).
+* `MINIO_BUCKET_NAME`: Target object storage bucket (default `weather-data`).
 
-### DEM (terrain elevation)
-- The API reads elevation from `DEM_DATA_PATH` — a global xarray-readable DEM
-  store (Zarr or NetCDF) with `latitude`/`longitude` coordinates and an
-  `elevation` data variable in meters. The supported source is **local
-  Copernicus 30m DEM data**: the operator downloads the Copernicus DEM
-  (GLO-30 / Copernicus 30m) and prepares it into a Zarr/NetCDF store on the
-  API's object storage or a mounted volume, then points `DEM_DATA_PATH` at it.
-  No Sentinel Hub credentials or online DEM retrieval are used.
-- Expected layout: a global grid with `latitude` (descending or ascending) and
-  `longitude` coordinates and an `elevation` data variable in meters. The
-  provider interpolates bilinearly; no-data (NaN/ocean) cells yield `null`
-  (rendered `unavailable`), never a fabricated value.
-- `ELEVATION_PROVIDER` selects the backend (`dem` default, `google`, or
-  `none`). The elevation provider and its rounded-coordinate cache are created
-  **once per process** and reused across requests (the DEM store is not
-  re-opened per request). No DEM configured → elevation renders `unavailable`.
+### 3.2 Ingestion-Specific Settings
+* `NOAA_DOWNLOAD_SOURCE`: `aws_s3` (recommended for production) or `nomads`.
+* `ENABLE_NOMADS_FALLBACK`: `true` (automatically fall back to NOMADS on AWS S3 404 publication lag).
+* `ENABLE_SELECTIVE_DOWNLOAD`: `true` (enables `.idx` byte-range partial file download).
+* `DB_POOL_SIZE`: Ingestion PostgreSQL connection pool size (default `10`).
+* `MAX_WRITE_CONCURRENCY`: Parallel region write worker ceiling (must be $\le \text{DB\_POOL\_SIZE}$, default `6`).
+* `GLOBAL_PUT_CONCURRENCY`: Shard object upload concurrency (default `64`).
+* `REALTIME_ENABLED`: `true` to enable realtime polling daemon.
+* `REALTIME_ACTIVE_POLL_SECONDS`: Cadence for active cycle tracking (default `600.0` seconds).
+* `REALTIME_WAVE_MAX_LEADS`: Number of accumulated leads before dispatching a wave (default `8`).
 
-### Environment variables
-New optional env vars (defaults in `services/api/src/api/core/config.py`):
-`SEARCH_PROVIDER`, `GOOGLE_PLACES_API_KEY`, `GOOGLE_PLACES_API_BASE`,
-`GOOGLE_PLACES_REGION`, `GOOGLE_PLACES_TIMEOUT`, `MAPBOX_TOKEN`,
-`ELEVATION_PROVIDER`, `DEM_DATA_PATH`, `ELEVATION_CACHE_MAX`,
-`ELEVATION_CACHE_DISABLED`, `ENSEMBLE_MIN_COVERAGE_RATIO`. See `.env.example`.
-
-The ingestion worker reads `NOMADS_BASE_URL`, `NOAA_USER_AGENT`,
-`REQUEST_TIMEOUT_SECONDS`, `DOWNLOAD_RETRIES`, `RETRY_BACKOFF_SECONDS` (see
-`services/ingestion/src/ingestion/core/config.py`). GEFS ingestion fetches the
-30 perturbation members (`gep01`..`gep30`) from the NOMADS `pgrb2sp25` layout,
-preserving each member's real identity; the run becomes `READY` only when every
-requested lead and member is committed. Source `.grib2`/`.idx` files are deleted
-after durable per-file commit.
+### 3.3 API-Specific Settings
+* `API_READER_LOCK_POOL_SIZE`: Dedicated connection pool size for PostgreSQL reader advisory locks (default `16`).
+* `API_READER_LOCK_MAX_OVERFLOW`: Overflow connections for reader locks (default `8`).
+* `API_READER_GATE_TIMEOUT_SECONDS`: Maximum wait time to acquire `SHARED` store gate (default `30.0` seconds).
+* `SEARCH_PROVIDER`: `google` (Google Places API) or `mapbox` (Mapbox Geocoding).
+* `GOOGLE_PLACES_API_KEY`: Server-side API key for Google Places (New).
+* `ELEVATION_PROVIDER`: `dem` (local DEM raster) or `none`.
+* `DEM_DATA_PATH`: Local or S3 path to global DEM Zarr/NetCDF dataset.
 
 ---
 
+## 4. Operational Execution & Runbooks
+
+### 4.1 Database Migration
+Run database migrations before starting application services:
+```bash
+cd services/api
+poetry run alembic upgrade head
+```
+
+### 4.2 Starting the Serving Tier
+```bash
+cd services/api
+poetry run uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+### 4.3 Starting the Realtime Ingestion Daemon
+The realtime scheduler automatically probes upstream NOAA publication, coordinates leadership via PostgreSQL advisory locks, and dispatches lead waves:
+```bash
+cd services/ingestion
+poetry run weather-ingest realtime
+```
+
+### 4.4 Running Retention Garbage Collection (GC)
+Execute the GC reconciler to reclaim expired S3 stores and set deletion tombstones:
+```bash
+cd services/ingestion
+# Single-pass execution (e.g. from cron):
+poetry run weather-ingest gc --once
+
+# Continuous daemon mode:
+poetry run weather-ingest gc --interval-seconds 1800
+```
+
+---
+
+## 5. Production Orchestration Status
+
+* **Currently Implemented:** Docker multi-stage container builds, local Docker Compose stack, database migrations via Alembic, CLI daemon entrypoints for API, Ingestion, and GC, and the complete operational runbook framework in [`docs/RUNBOOKS.md`](RUNBOOKS.md).
+* **Stage 8 Server Deployment Handoff:**
+  * Specific physical server sizing (CPU/RAM), PostgreSQL `max_connections`, API worker counts, and production supervisor definitions (systemd unit files, Docker Compose production profiles, or Kubernetes manifests) will be finalized during Stage 8 server deployment based on the parameter placeholders in `docs/RUNBOOKS.md`.

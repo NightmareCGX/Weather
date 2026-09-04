@@ -45,3 +45,26 @@ The ingestion suite includes tests that prove the catalog↔actual-Zarr-committe
   transport, and the elevation provider (`api/services/elevation.py`) takes an
   injectable DEM loader — so unit tests supply fakes and never make network
   calls. See `test_places.py` and `test_elevation.py`.
+
+---
+
+## 3. Test Execution Commands
+
+```bash
+# Domain tests (offline, 100% coverage gate required)
+cd packages/domain && poetry run pytest
+
+# API tests (PostgreSQL + Redis integration tests)
+cd services/api && poetry run pytest
+
+# Ingestion tests (PostgreSQL + Redis + MinIO integration tests)
+# Set WEATHER_TEST_MINIO=1 to execute live S3/MinIO Zarr round-trip tests
+cd services/ingestion && WEATHER_TEST_MINIO=1 poetry run pytest
+
+# Frontend unit tests (Jest)
+cd services/frontend && npm test
+
+# Frontend E2E tests (Playwright)
+cd services/frontend && npm run e2e
+```
+
