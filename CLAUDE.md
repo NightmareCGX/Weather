@@ -65,7 +65,7 @@ Where practical, Claude MUST reproduce Linux behavior using the environment that
 1. which CI jobs can be affected;
 2. which commands those jobs execute;
 3. which operating system they run on (all CI jobs here are `ubuntu-latest`);
-4. which runtime/tool versions they use (Python `3.12`, Poetry `2.4.1`, `ruff 0.3.4`, `mypy 1.9.0`, Node `20`, `npm ci`);
+4. which runtime/tool versions they use (Python `3.12`, Poetry `2.4.1`, `ruff 0.3.4`, `mypy 1.20.2`, Node `20`, `npm ci`);
 5. which services/dependencies they require (PostgreSQL `postgis/postgis:16-3.4`, Redis `redis:7-alpine`, MinIO, Linux `libeccodes-dev`);
 6. which checks can be reproduced locally;
 7. which checks require Linux/container validation.

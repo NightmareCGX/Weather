@@ -568,7 +568,7 @@ def encode_region_sharded_v1(
     """
     compressor = Zstd(level=5)
     encoded_shards: list[tuple[str, bytes]] = []
-    target_vars = data_vars if data_vars is not None else tuple(dataset.data_vars.keys())
+    target_vars = data_vars if data_vars is not None else tuple(str(k) for k in dataset.data_vars)
 
     for name in target_vars:
         if name not in dataset.data_vars:
