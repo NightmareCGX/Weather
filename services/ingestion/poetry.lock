@@ -2648,7 +2648,7 @@ optional = false
 python-versions = "^3.12"
 groups = ["main"]
 files = []
-develop = false
+develop = true
 
 [package.dependencies]
 numpy = "^2.0.0"
@@ -2936,4 +2936,4 @@ remote = ["fsspec (>=2023.10.0)", "obstore (>=0.5.1)"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.12"
-content-hash = "ae4b150eb75c63628af6f8756175776258233cb7d8ec8f95628cd4f49f870760"
+content-hash = "77098e7c43b8159a6d4d52d7529ded496d77af4d16c30388078281350e71ac27"

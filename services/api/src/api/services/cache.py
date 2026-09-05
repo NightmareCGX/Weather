@@ -333,6 +333,7 @@ def build_probability_cache_key(
     phase: str | None = None,
     cycle_time: str | None = None,
     serving_generation: str | None = None,
+    valid_time: str | None = None,
 ) -> str:
     """Build a deterministic cache key for a probability forecast request.
 
@@ -356,6 +357,7 @@ def build_probability_cache_key(
         "threshold_max": threshold_max,
         "direction_sector": direction_sector,
         "phase": phase,
+        "valid_time": valid_time,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "probability:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -371,6 +373,7 @@ def build_ensemble_cache_key(
     include_members: bool = False,
     cycle_time: str | None = None,
     serving_generation: str | None = None,
+    valid_time: str | None = None,
 ) -> str:
     """Build a deterministic cache key for an ensemble statistics request.
 
@@ -391,6 +394,7 @@ def build_ensemble_cache_key(
         "variable": variable,
         "lead_time_hours": lead_time_hours,
         "include_members": include_members,
+        "valid_time": valid_time,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "ensemble:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

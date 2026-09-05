@@ -153,6 +153,7 @@ def test_postgres_serving_retirement_lifecycle_transition(
     with Session(migrated_db) as session:
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c1,
                 retired_at=_dt(2026, 9, 2, 6, 30),
                 retired_by_cycle_time=c2,

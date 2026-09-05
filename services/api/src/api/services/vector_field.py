@@ -47,6 +47,7 @@ def _vector_cache_key(
     initial_time: str | None,
     serving_generation: str | None,
     stride: int,
+    valid_time: str | None = None,
 ) -> tuple[object, ...]:
     """Build the vector field cache key with full forecast and generation identity."""
     return (
@@ -56,6 +57,7 @@ def _vector_cache_key(
         initial_time,
         serving_generation,
         stride,
+        valid_time,
         "v1_i16",
     )
 
@@ -215,51 +217,78 @@ def render_vector_field_binary(
     db: Session,
     *,
     model: str,
-    lead_time_hours: int,
+    lead_time_hours: int | None = None,
+    valid_time: str | None = None,
     initial_time: str | None = None,
     stride: int = 2,
 ) -> bytes:
     """Render the quantized Int16 binary vector field for the given forecast selection.
 
-    Args:
-        db: Database session.
-        model: Model identifier (e.g. 'gfs', 'gefs').
-        lead_time_hours: Forecast offset hours from cycle time.
-        initial_time: Optional ISO 8601 UTC cycle time.
-        stride: Grid subsampling stride (default 2 -> 0.50° from 0.25° native).
-
-    Returns:
-        Encoded binary bytes.
-
-    Raises:
-        HTTPException: 404 if model/product/lead is not found or unreadable.
-        ValueError: If dataset is malformed.
+    Under Lifecycle V2, supports either ``valid_time`` or ``lead_time_hours`` (with optional ``initial_time``).
     """
-    if initial_time is not None:
-        from api.services.lifecycle import require_cycle_visible
+    from fastapi import HTTPException
+    from api.services.resolver import resolve_valid_time_source
 
-        require_cycle_visible(db, initial_time)
+    resolved_valid_iso: str | None = None
+    resolved_initial: str | None = None
+    resolved_lead: int = 0
+    store_path: str | None = None
+    serving_generation: str | None = None
 
-    check_available(
-        db,
-        model=model,
-        variable="wind_10m",
-        level="surface",
-        lead_time_hours=lead_time_hours,
-        initial_time=initial_time,
-    )
+    if valid_time is not None:
+        if initial_time is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Provide either valid_time or initial_time, not both.",
+            )
+        source = resolve_valid_time_source(db, model, valid_time, variable="wind_10m")
+        store_path = source.store_path
+        resolved_lead = source.lead_time_hours
+        resolved_initial = source.cycle_time.isoformat().replace("+00:00", "Z")
+        resolved_valid_iso = source.valid_time.isoformat().replace("+00:00", "Z")
+        serving_generation = source.serving_generation
+        db.close()
+    else:
+        if lead_time_hours is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Either valid_time or lead_time_hours is required.",
+            )
+        resolved_lead = lead_time_hours
+        resolved_initial = initial_time
 
-    store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
-        db, model, initial_time
-    )
-    # Release DB connection immediately before S3 manifest read and cache check.
-    db.close()
+        if initial_time is not None:
+            from api.services.lifecycle import require_cycle_visible
 
-    serving_generation = resolve_serving_generation_for_store(
-        store_path, latest_retired_iso
-    )
+            require_cycle_visible(db, initial_time, model_id=model)
+
+        check_available(
+            db,
+            model=model,
+            variable="wind_10m",
+            level="surface",
+            lead_time_hours=resolved_lead,
+            initial_time=resolved_initial,
+        )
+
+        store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+            db, model, resolved_initial
+        )
+        # Release DB connection immediately before S3 manifest read and cache check.
+        db.close()
+
+        serving_generation = resolve_serving_generation_for_store(
+            store_path, latest_retired_iso
+        )
+
     cache_key = _vector_cache_key(
-        model, "wind_10m", lead_time_hours, initial_time, serving_generation, stride
+        model,
+        "wind_10m",
+        resolved_lead,
+        resolved_initial,
+        serving_generation,
+        stride,
+        valid_time=resolved_valid_iso,
     )
     cached = _vector_cache_get(cache_key)
     if cached is not None:
@@ -280,8 +309,8 @@ def render_vector_field_binary(
                     model=model,
                     variable="wind_10m",
                     level="surface",
-                    lead_time_hours=lead_time_hours,
-                    initial_time=initial_time,
+                    lead_time_hours=resolved_lead,
+                    initial_time=resolved_initial,
                     excluded=excluded,
                 )
             finally:
@@ -292,7 +321,7 @@ def render_vector_field_binary(
                 current_store_path,
                 selector=lambda dataset: _select_and_encode_vector_field(
                     dataset,
-                    lead=lead_time_hours,
+                    lead=resolved_lead,
                     stride=stride,
                     store_path=current_store_path,
                 ),
@@ -301,8 +330,5 @@ def render_vector_field_binary(
             excluded.add(current_store_path)
             continue
         break
-    _vector_cache_set(cache_key, payload)
-    return payload
-
     _vector_cache_set(cache_key, payload)
     return payload

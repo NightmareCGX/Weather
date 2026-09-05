@@ -62,7 +62,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **Sorting**: Controlled via `sort` parameter (e.g., `sort=-valid_time` for descending order).
 
 ### 2.6 Datetime, Units, & Coordinates
-- **Datetimes & Forecast Concepts**: Absolute timestamps use ISO 8601 UTC strings (`2026-07-21T12:00:00Z`). However, the core numerical weather prediction (NWP) concept for forecast products is **`lead_time_hours`** (offset hours from cycle time), ensuring ingestion idempotency and multi-model alignment. `valid_time` may be returned as a convenience property derived from `cycle_time + lead_time_hours`.
+- **Datetimes & Forecast Serving Concepts (Lifecycle V2)**: Absolute timestamps use ISO 8601 UTC strings (`2026-07-21T12:00:00Z`). Under Data Lifecycle V2, forecast serving endpoints (`/v1/points`, `/v1/ensembles`, `/v1/probabilities`, `/v1/maps`) support direct querying by **`valid_time`**. When `valid_time` is supplied, the platform dynamically resolves the newest committed source cycle capable of serving that valid time, providing seamless realtime promotion as new leads commit. Legacy querying via `lead_time_hours` and `initial_time` remains supported additively for backward compatibility. Source cycle provenance (`source_cycle` / `cycle_time`, `lead_time_hours`) is preserved in response payloads and metadata.
 - **Units**: International System of Units (SI) by default (`°C`, `mm`, `km/h`, `hPa`), with query param support for imperial overrides (`?units=imperial` for `°F`, `in`, `mph`).
 - **Coordinate System**: WGS 84 (`EPSG:4326`) for latitude (-90 to 90) and longitude (-180 to 180).
 

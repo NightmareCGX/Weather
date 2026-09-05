@@ -82,6 +82,7 @@ function mockSelectionContext(overrides: Partial<ReturnType<typeof useForecastSe
     selection: {
       model: "gfs",
       variable: "temperature_2m",
+      validTime: "2026-08-13T06:00:00Z",
       initialTime: "2026-08-13T00:00:00Z",
       leadTimeHours: 6,
     },
@@ -90,6 +91,7 @@ function mockSelectionContext(overrides: Partial<ReturnType<typeof useForecastSe
       models: [{ id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] }],
       model: { id: "gfs", name: "Global Forecast System", is_ensemble: false, variables: [] },
       variables: [],
+      validTimes: ["2026-08-13T06:00:00Z"],
       initialTimes: [],
       variable: null,
       initialTime: null,
@@ -97,6 +99,7 @@ function mockSelectionContext(overrides: Partial<ReturnType<typeof useForecastSe
     },
     setModel: jest.fn(),
     setVariable: jest.fn(),
+    setValidTime: jest.fn(),
     setInitialTime: jest.fn(),
     setLeadTimeHours: jest.fn(),
     retry: jest.fn(),

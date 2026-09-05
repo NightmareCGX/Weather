@@ -15,9 +15,11 @@ Specification notes:
   rejected when ``operator`` is ``gt`` or ``lt``.
 """
 
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
@@ -67,8 +69,18 @@ def get_probability(
         Query(description="Threshold comparison operator."),
     ],
     lead_time_hours: Annotated[
-        int, Query(ge=0, description="Forecast offset hours from cycle time.")
-    ],
+        int | None,
+        Query(ge=0, description="Forecast offset hours from cycle time."),
+    ] = None,
+    valid_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest "
+                "serveable cycle capable of providing this valid time."
+            )
+        ),
+    ] = None,
     model: Annotated[
         str, Query(description="A single ensemble model identifier.")
     ] = "gefs",
@@ -113,24 +125,61 @@ def get_probability(
 ) -> ProbabilityForecastEnvelope:
     """Return the exceedance probability for a forecast variable.
 
-    The ensemble model (default ``gefs``) must exist and be an ensemble model;
-    member values are interpolated at the requested point and lead time. An
-    optional ``initial_time`` pins the forecast run.
+    Under Lifecycle V2:
+    - If ``valid_time`` is supplied, the newest committed source cycle and lead
+      are dynamically resolved via the shared ValidTimeResolver.
+    - If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead
+      serving is preserved for backward compatibility.
     """
+    from api.services.resolver import resolve_valid_time_source
+
     _validate_threshold_bounds(operator, threshold, threshold_max)
-    if initial_time is not None:
-        require_cycle_visible(db, initial_time)
 
-    cycle_time = resolve_latest_run_cycle_time(db, model, initial_time)
-    store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
-        db, model, initial_time
-    )
-    # Release DB connection immediately before S3 manifest read, Redis query, and stats compute.
-    db.close()
+    if valid_time is not None and initial_time is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either valid_time or initial_time, not both.",
+        )
+    if valid_time is None and lead_time_hours is None:
+        raise RequestValidationError(
+            [{"loc": ("query", "lead_time_hours"), "msg": "Field required", "type": "missing"}]
+        )
 
-    serving_generation = resolve_serving_generation_for_store(
-        store_path, latest_retired_iso
-    )
+    resolved_valid_time: datetime | None = None
+    resolved_source_cycle: datetime | None = None
+    target_initial: str | None = None
+    cycle_time: str | None = None
+    store_path: str | None = None
+    serving_generation: str | None = None
+    resolved_lead: int = 0
+
+    if valid_time is not None:
+        source = resolve_valid_time_source(db, model, valid_time, variable=variable)
+        resolved_lead = source.lead_time_hours
+        cycle_time = source.cycle_time.isoformat().replace("+00:00", "Z")
+        store_path = source.store_path
+        serving_generation = source.serving_generation
+        target_initial = cycle_time
+        resolved_valid_time = source.valid_time
+        resolved_source_cycle = source.cycle_time
+        db.close()
+    else:
+        assert lead_time_hours is not None
+        resolved_lead = lead_time_hours
+        target_initial = initial_time
+        if target_initial is not None:
+            require_cycle_visible(db, target_initial, model_id=model)
+
+        cycle_time = resolve_latest_run_cycle_time(db, model, target_initial)
+        store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+            db, model, target_initial
+        )
+        db.close()
+
+        serving_generation = resolve_serving_generation_for_store(
+            store_path, latest_retired_iso
+        )
+
     cache_key = build_probability_cache_key(
         model=model,
         latitude=lat,
@@ -138,18 +187,19 @@ def get_probability(
         variable=variable,
         threshold=threshold,
         operator=operator,
-        lead_time_hours=lead_time_hours,
+        lead_time_hours=resolved_lead,
         threshold_max=threshold_max,
         direction_sector=direction_sector,
         phase=phase,
         cycle_time=cycle_time,
         serving_generation=serving_generation,
+        valid_time=valid_time,
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&threshold={threshold}"
-        f"&operator={operator}&lead_time_hours={lead_time_hours}"
+        f"&operator={operator}&lead_time_hours={resolved_lead}"
         f"&model={model}&threshold_max={threshold_max}&direction_sector={direction_sector}"
-        f"&phase={phase}&initial_time={initial_time}"
+        f"&phase={phase}&initial_time={target_initial}&valid_time={valid_time}"
     )
 
     envelope = _cache.compute_or_retrieve(
@@ -162,12 +212,14 @@ def get_probability(
             variable,
             threshold,
             operator,
-            lead_time_hours,
+            resolved_lead,
             model,
             threshold_max,
             direction_sector,
             phase,
-            initial_time,
+            target_initial,
+            resolved_valid_time,
+            resolved_source_cycle,
         ),
         model_type=ProbabilityForecastEnvelope,
     )
@@ -210,6 +262,8 @@ def _compute(
     direction_sector: str | None,
     phase: str | None,
     initial_time: str | None,
+    valid_time_dt: datetime | None = None,
+    source_cycle_dt: datetime | None = None,
 ) -> ProbabilityForecastEnvelope:
     from api.core.database import SessionLocal
 
@@ -228,4 +282,8 @@ def _compute(
             phase=phase,
             initial_time=initial_time,
         )
+        if valid_time_dt is not None:
+            data.valid_time = valid_time_dt
+        if source_cycle_dt is not None:
+            data.source_cycle = source_cycle_dt
     return ProbabilityForecastEnvelope(data=data)

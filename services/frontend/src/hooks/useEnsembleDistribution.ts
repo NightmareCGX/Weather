@@ -14,21 +14,14 @@ export interface UseEnsembleDistributionResult {
 }
 
 /**
- * Fetch the raw ensemble-member distribution for a single selected lead.
+ * Fetch the raw ensemble-member distribution for a single selected valid time or lead.
  *
- * This is the focused request behind the Ensemble Distribution View: it
- * requests `/v1/ensembles` with `include_members=true` for exactly one
- * location / variable / model / lead time and receives the genuine raw member
- * values. ``model`` must be an ensemble model (the dashboard only calls this
- * for an ensemble model); when it is null the hook stays idle. It is
- * deliberately separate from {@link useEnsemble}, which fans out
- * statistics-only requests (no `include_members`) across leads for the
- * percentile timeline. A stale selection is cancelled and ignored so a slow
- * response for a previous lead can never render over a newer one.
+ * Under Lifecycle V2: accepts either a string ISO 8601 `validTime` or a number `leadTimeHours`.
+ * When a `validTime` is passed, the backend dynamically resolves the newest committed source cycle.
  */
 export function useEnsembleDistribution(
   location: SelectedLocation | null,
-  leadTimeHours: number,
+  timeSpecifier: number | string | null,
   variable: string,
   options: { model: string | null }
 ): UseEnsembleDistributionResult {
@@ -37,8 +30,12 @@ export function useEnsembleDistribution(
   const [status, setStatus] = useState<DistributionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
 
+  const isString = typeof timeSpecifier === "string";
+  const validTime = isString ? timeSpecifier : undefined;
+  const leadTimeHours = typeof timeSpecifier === "number" ? timeSpecifier : undefined;
+
   useEffect(() => {
-    if (location === null || model === null) {
+    if (location === null || model === null || timeSpecifier === null) {
       setData(null);
       setStatus("idle");
       setError(null);
@@ -56,6 +53,7 @@ export function useEnsembleDistribution(
       longitude: location.longitude,
       variable,
       model,
+      validTime,
       leadTimeHours,
       includeMembers: true,
       signal: controller.signal,
@@ -76,7 +74,7 @@ export function useEnsembleDistribution(
       active = false;
       controller.abort();
     };
-  }, [location, leadTimeHours, variable, model]);
+  }, [location, timeSpecifier, variable, model, validTime, leadTimeHours]);
 
   return { data, status, error };
 }

@@ -161,33 +161,36 @@ def test_lifecycle_service_predicates(test_db):
         # c2: row with retired_at NULL -> visible
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c2,
                 retired_at=None,
                 retired_by_cycle_time=None,
             )
         )
         session.commit()
-        assert is_cycle_visible(session, c2) is True
-        assert require_cycle_visible(session, c2) == c2
+        assert is_cycle_visible(session, c2, model_id="gfs") is True
+        assert require_cycle_visible(session, c2, model_id="gfs") == c2
 
         # c3: row with retired_at set -> NOT visible (404)
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c3,
                 retired_at=_dt(2026, 9, 2, 12),
                 retired_by_cycle_time=_dt(2026, 9, 2, 12),
             )
         )
         session.commit()
-        assert is_cycle_visible(session, c3) is False
+        assert is_cycle_visible(session, c3, model_id="gfs") is False
         with pytest.raises(HTTPException) as exc_info:
-            require_cycle_visible(session, c3)
+            require_cycle_visible(session, c3, model_id="gfs")
         assert exc_info.value.status_code == 404
         assert "not available" in exc_info.value.detail
 
         # c4: row with deleted_at set (tombstone) -> NOT visible (404)
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c4,
                 retired_at=_dt(2026, 9, 2, 18),
                 retired_by_cycle_time=_dt(2026, 9, 2, 18),
@@ -195,9 +198,9 @@ def test_lifecycle_service_predicates(test_db):
             )
         )
         session.commit()
-        assert is_cycle_visible(session, c4) is False
+        assert is_cycle_visible(session, c4, model_id="gfs") is False
         with pytest.raises(HTTPException) as exc_info4:
-            require_cycle_visible(session, c4)
+            require_cycle_visible(session, c4, model_id="gfs")
         assert exc_info4.value.status_code == 404
 
 
@@ -279,6 +282,7 @@ def test_availability_excludes_retired_cycles(test_db):
     with Session(test_db) as session:
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c1,
                 retired_at=_dt(2026, 9, 2, 6),
                 retired_by_cycle_time=c2,
@@ -345,6 +349,7 @@ def test_ensemble_and_probability_explicit_retired_returns_404(test_db):
     with Session(test_db) as session:
         session.add(
             ForecastCycleLifecycle(
+                model_id="gefs",
                 cycle_time=c_retired,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_visible,
@@ -380,6 +385,7 @@ def test_maps_metadata_explicit_retired_returns_404(test_db):
     with Session(test_db) as session:
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c_retired,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_visible,
@@ -402,6 +408,7 @@ def test_raster_tile_and_vector_field_explicit_retired_returns_404(test_db):
     with Session(test_db) as session:
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c_retired,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_visible,
@@ -439,12 +446,13 @@ def test_cached_tile_cannot_bypass_retirement(test_db):
 
     # Before retirement: is_cycle_visible is True (no lifecycle row)
     with Session(test_db) as session:
-        assert is_cycle_visible(session, c) is True
+        assert is_cycle_visible(session, c, model_id="gfs") is True
 
     # Now mark cycle as RETIRED
     with Session(test_db) as session:
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=_dt(2026, 9, 2, 0),
@@ -487,6 +495,7 @@ def test_runs_catalog_excludes_retired_runs(test_db):
         session.add_all([r_vis, r_ret])
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c_ret,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_vis,

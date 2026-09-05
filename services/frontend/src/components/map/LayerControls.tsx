@@ -1,18 +1,14 @@
 "use client";
 
 import { useForecastSelection } from "@/context/forecast-selection";
-import { formatInitialTimeLabel } from "@/lib/forecast/labels";
-import { formatLeadTimeHours } from "@/lib/forecast/time";
+import { formatDayHourUtc } from "@/lib/forecast/time";
 
 /**
- * Presentation-only forecast selection controls for the map layer.
+ * Presentation-only forecast selection controls for the map layer (Lifecycle V2).
  *
- * All options are derived from the shared forecast-selection context (which is
- * database-driven via `/v1/forecast/availability`): the Model dropdown lists
- * exactly the models in the database, Variable lists the selected model's
- * variables, Initial Time lists the selected variable's initial times, and
- * Lead Time lists the selected initial time's lead times. Nothing here is
- * hard-coded.
+ * All options are derived from the shared forecast-selection context:
+ * Model, Variable, and Valid Time dropdowns. Initial Time and Lead Time controls
+ * are removed as primary selectors.
  */
 export function LayerControls() {
   const {
@@ -24,8 +20,7 @@ export function LayerControls() {
     validTime,
     setModel,
     setVariable,
-    setInitialTime,
-    setLeadTimeHours,
+    setValidTime,
     retry,
   } = useForecastSelection();
 
@@ -101,32 +96,16 @@ export function LayerControls() {
       </label>
 
       <label className="flex items-center gap-2 text-sm text-slate-700">
-        Initial Time
+        Valid Time
         <select
           className="rounded border border-slate-300 px-2 py-1"
-          value={selection.initialTime}
-          onChange={(event) => setInitialTime(event.target.value)}
-          aria-label="Initial time"
+          value={selection.validTime ?? ""}
+          onChange={(event) => setValidTime?.(event.target.value)}
+          aria-label="Valid time"
         >
-          {options.initialTimes.map((entry) => (
-            <option key={entry.value} value={entry.value}>
-              {formatInitialTimeLabel(entry.value)}
-            </option>
-          ))}
-        </select>
-      </label>
-
-      <label className="flex items-center gap-2 text-sm text-slate-700">
-        Lead time
-        <select
-          className="rounded border border-slate-300 px-2 py-1"
-          value={selection.leadTimeHours}
-          onChange={(event) => setLeadTimeHours(Number(event.target.value))}
-          aria-label="Lead time"
-        >
-          {options.leadTimes.map((lead) => (
-            <option key={lead} value={lead}>
-              {formatLeadTimeHours(lead)}
+          {(options.validTimes ?? []).map((vt) => (
+            <option key={vt} value={vt}>
+              {formatDayHourUtc(vt)} UTC
             </option>
           ))}
         </select>
@@ -134,7 +113,7 @@ export function LayerControls() {
 
       {validTime !== null && (
         <span className="text-sm text-slate-500" data-testid="valid-time">
-          Valid {formatInitialTimeLabel(validTime)}
+          Valid {formatDayHourUtc(validTime)} UTC
         </span>
       )}
     </div>

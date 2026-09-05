@@ -293,6 +293,7 @@ class TileReadContext:
     store_path: str
     expected_members: int
     latest_retired_iso: str | None
+    valid_time: str | None = None
 
 
 def resolve_tile_read_context(
@@ -304,7 +305,8 @@ def resolve_tile_read_context(
     zoom: int,
     x: int,
     y: int,
-    lead_time_hours: int,
+    lead_time_hours: int | None = None,
+    valid_time: str | None = None,
     initial_time: str | None = None,
     excluded: set[str] | None = None,
 ) -> TileReadContext:
@@ -315,28 +317,57 @@ def resolve_tile_read_context(
     cache checks, and Zarr storage reads.
     """
     _validate_tile(zoom, x, y)
-    if initial_time is not None:
-        require_cycle_visible(db, initial_time)
+    from fastapi import HTTPException
+    from api.services.resolver import resolve_valid_time_source
 
-    store_path = _resolve_run_store_path(
-        db,
-        model=model,
-        variable=variable,
-        level=level,
-        lead_time_hours=lead_time_hours,
-        initial_time=initial_time,
-        excluded=excluded or set(),
-    )
+    resolved_valid_iso: str | None = None
+    resolved_initial: str | None = None
+    resolved_lead: int = 0
+
+    if valid_time is not None:
+        if initial_time is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Provide either valid_time or initial_time, not both.",
+            )
+        source = resolve_valid_time_source(db, model, valid_time, variable=variable)
+        store_path = source.store_path
+        resolved_lead = source.lead_time_hours
+        resolved_initial = source.cycle_time.isoformat().replace("+00:00", "Z")
+        resolved_valid_iso = source.valid_time.isoformat().replace("+00:00", "Z")
+    else:
+        if lead_time_hours is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Either valid_time or lead_time_hours is required.",
+            )
+        resolved_lead = lead_time_hours
+        resolved_initial = initial_time
+        if initial_time is not None:
+            require_cycle_visible(db, initial_time, model_id=model)
+
+        store_path = _resolve_run_store_path(
+            db,
+            model=model,
+            variable=variable,
+            level=level,
+            lead_time_hours=resolved_lead,
+            initial_time=resolved_initial,
+            excluded=excluded or set(),
+        )
+
     from domain.coverage import get_expected_members
 
     expected_members = get_expected_members(model, default_if_unknown=1)
 
     latest_retired_iso: str | None = None
-    if initial_time is None:
+    if resolved_initial is None and valid_time is None:
         from api.models.entities import ForecastCycleLifecycle
 
         latest_retired = db.execute(
-            select(func.max(ForecastCycleLifecycle.retired_at))
+            select(func.max(ForecastCycleLifecycle.retired_at)).where(
+                ForecastCycleLifecycle.model_id == model.lower().strip()
+            )
         ).scalar_one_or_none()
         if latest_retired is not None:
             if latest_retired.tzinfo is None:
@@ -350,11 +381,12 @@ def resolve_tile_read_context(
         zoom=zoom,
         x=x,
         y=y,
-        lead_time_hours=lead_time_hours,
-        initial_time=initial_time,
+        lead_time_hours=resolved_lead,
+        initial_time=resolved_initial,
         store_path=store_path,
         expected_members=expected_members,
         latest_retired_iso=latest_retired_iso,
+        valid_time=resolved_valid_iso,
     )
 
 
@@ -367,56 +399,13 @@ def render_tile_png(
     zoom: int,
     x: int,
     y: int,
-    lead_time_hours: int,
+    lead_time_hours: int | None = None,
+    valid_time: str | None = None,
     initial_time: str | None = None,
 ) -> bytes:
     """Render one PNG tile for a forecast variable and selection.
 
-    The newest ``status='ready'`` run of the model (optionally pinned to a
-    specific ``cycle_time`` via ``initial_time``) whose store opens is
-    selected, the requested lead is sliced from the variable's field, and the
-    tile's pixels are sampled nearest-neighbor and colored by the variable's
-    ramp.
-
-    The output is cached server-side keyed by the full forecast identity
-    (model, variable, level, lead, cycle, tile coordinates) so identical tile
-    requests are served from memory instead of recomputing the PNG
-    (ACCEPTANCE_REMEDIATION_PLAN §12). The color mapping is fully vectorized
-    (no per-pixel Python loop) and the longitude alignment is vectorized
-    (no ``np.vectorize``), removing the dominant rendering costs.
-
-    **Connection lifetime (row liveness).** All database metadata — the
-    committed-manifest serving generation, the ready run, and the forecast
-    product — is resolved into plain values *first*, while the request's DB
-    session is live. The session is then closed, returning its QueuePool
-    connection, **before** the expensive Zarr materialize + PNG encode runs.
-    The store read itself goes through ``api.core.reader_gate`` which uses its
-    own dedicated lock pool and revalidates the run is READY on a fresh core
-    query (per ``docs/ARCHITECTURE.md``), so no ORM session is needed after the
-    metadata phase. This keeps a single tile request's database connection
-    checkout to a few milliseconds of catalog queries instead of the full
-    render duration, so a browser viewport's concurrent tile requests cannot
-    exhaust the QueuePool (``pool_size=5``/``max_overflow=10``) even when many
-    tiles need cold reads of a large store.
-
-    Args:
-        db: Database session.
-        model: A model identifier.
-        variable: A ``forecast_variables.variable_code``.
-        level: The vertical level; only ``surface`` is supported.
-        zoom: Web-Mercator zoom level.
-        x: Web-Mercator tile X.
-        y: Web-Mercator tile Y.
-        lead_time_hours: Forecast offset hours from the run's cycle time.
-        initial_time: Optional ISO 8601 UTC cycle time to pin the run.
-
-    Returns:
-        The PNG bytes.
-
-    Raises:
-        HTTPException: 404 when no ready run / product / lead, or the variable
-            is missing from the dataset.
-        ValueError: For invalid tile/grid/field input.
+    Under Lifecycle V2, supports either ``valid_time`` or ``lead_time_hours`` (with optional ``initial_time``).
     """
     from api.services.point_forecast import resolve_serving_generation_for_store
 
@@ -433,6 +422,7 @@ def render_tile_png(
                 x=x,
                 y=y,
                 lead_time_hours=lead_time_hours,
+                valid_time=valid_time,
                 initial_time=initial_time,
                 excluded=excluded,
             )
@@ -451,9 +441,10 @@ def render_tile_png(
             zoom,
             x,
             y,
-            lead_time_hours,
-            initial_time,
+            context.lead_time_hours,
+            context.initial_time,
             serving_generation,
+            context.valid_time,
         )
         cached = _tile_cache_get(cache_key)
         if cached is not None:
@@ -472,7 +463,7 @@ def render_tile_png(
                 selector=lambda dataset: _select_tile_window(
                     dataset,
                     variable=variable,
-                    lead=lead_time_hours,
+                    lead=context.lead_time_hours,
                     zoom=zoom,
                     x=x,
                     y=y,
@@ -698,6 +689,7 @@ def _tile_cache_key(
     lead_time_hours: int,
     initial_time: str | None,
     serving_generation: str | None,
+    valid_time: str | None = None,
 ) -> tuple[object, ...]:
     """Build the tile cache key: the full forecast + spatial + generation."""
     return (
@@ -710,6 +702,7 @@ def _tile_cache_key(
         lead_time_hours,
         initial_time,
         serving_generation,
+        valid_time,
     )
 
 

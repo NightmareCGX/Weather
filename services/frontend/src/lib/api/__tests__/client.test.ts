@@ -370,6 +370,42 @@ describe("getEnsembleStatistics", () => {
     expect(data.members).toEqual([15.5, 17.5, 19.5, 21.5, 23.5]);
     expect(data.members?.length).toBe(5);
   });
+
+  it("requests with valid_time when validTime parameter is provided", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        object: "ensemble_statistics",
+        data: {
+          model: "gefs",
+          member_count: 5,
+          statistics: {
+            mean: 17.5,
+            median: 17.5,
+            spread: 3.16,
+            p10: 13.9,
+            p25: 15.5,
+            p50: 17.5,
+            p75: 19.5,
+            p90: 21.1,
+          },
+        },
+        has_more: false,
+        next_cursor: null,
+      })
+    );
+
+    await getEnsembleStatistics({
+      latitude: 38.19,
+      longitude: -106.82,
+      variable: "temperature_2m",
+      validTime: "2026-09-04T06:00:00Z",
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&valid_time=2026-09-04T06%3A00%3A00Z",
+      expect.any(Object)
+    );
+  });
 });
 
 describe("decodeVectorFieldBinary & getVectorField", () => {

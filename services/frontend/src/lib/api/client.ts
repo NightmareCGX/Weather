@@ -257,6 +257,7 @@ export interface GetEnsembleStatisticsParams {
   variable: string;
   model?: string;
   leadTimeHours?: number;
+  validTime?: string;
   /** Opt into the raw ensemble-member values (Ensemble Distribution View). */
   includeMembers?: boolean;
   signal?: AbortSignal;
@@ -267,7 +268,8 @@ export async function getEnsembleStatistics({
   longitude,
   variable,
   model = "gefs",
-  leadTimeHours = 0,
+  leadTimeHours,
+  validTime,
   includeMembers = false,
   signal,
 }: GetEnsembleStatisticsParams): Promise<EnsembleStatisticsData> {
@@ -276,8 +278,12 @@ export async function getEnsembleStatistics({
     lon: String(longitude),
     variable,
     model,
-    lead_time_hours: String(leadTimeHours),
   });
+  if (validTime !== undefined) {
+    params.set("valid_time", validTime);
+  } else {
+    params.set("lead_time_hours", String(leadTimeHours ?? 0));
+  }
   if (includeMembers) {
     params.set("include_members", "true");
   }
