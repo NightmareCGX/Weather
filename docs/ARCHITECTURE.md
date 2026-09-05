@@ -287,7 +287,7 @@ The PostgreSQL database tracks platform metadata and progressive publication sta
                                            ▼ (1:N)
                              [ensemble_member_products]
 
-[forecast_cycle_lifecycle] (cycle_time PK, retired_at, deletion_started_at, deleted_at)
+[forecast_cycle_lifecycle] ((model_id, cycle_time) PK, retired_at, deletion_started_at, deleted_at)
 [forecast_variables]       (variable_code PK, name, unit)
 [forecast_grids]           (grid_code PK, name, resolution_km)
 [stations], [cities], [ski_resorts] (PostGIS spatial reference tables)

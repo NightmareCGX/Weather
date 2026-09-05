@@ -304,3 +304,31 @@ def test_probability_unknown_phase_422(client):
     )
     assert resp.status_code == 422
     assert "Unknown physical phase" in resp.json()["error"]["message"]
+
+
+def test_probability_valid_time_resolution(client):
+    """Under Lifecycle V2, /v1/probabilities serves by valid_time."""
+    resp = client.get(
+        f"/v1/probabilities?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m&threshold=15.0&operator=gt"
+        "&valid_time=2026-07-21T06:00:00Z"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    data = body["data"]
+    assert data["valid_time"] == "2026-07-21T06:00:00Z"
+    assert data["source_cycle"] == "2026-07-21T00:00:00Z"
+    assert data["lead_time_hours"] == 6
+
+
+def test_probability_conflicting_valid_time_and_initial_time_rejected(client):
+    """Passing both valid_time and initial_time returns 422."""
+    resp = client.get(
+        f"/v1/probabilities?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m&threshold=15.0&operator=gt"
+        "&valid_time=2026-07-21T06:00:00Z"
+        "&initial_time=2026-07-21T00:00:00Z"
+    )
+    assert resp.status_code == 422
+    assert "Provide either valid_time or initial_time" in resp.json()["error"]["message"]

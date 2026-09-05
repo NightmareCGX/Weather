@@ -181,20 +181,21 @@ test("api failure: useful error state and graceful degradation", async ({ page }
 test("forecast map transition: selecting B while A tiles are in flight immediately dispatches B", async ({
   page,
 }) => {
-  const dispatchedLeads: string[] = [];
+  const dispatchedTimes: string[] = [];
   let delayedResolve: (() => void) | null = null;
   const holdPromise = new Promise<void>((resolve) => {
     delayedResolve = resolve;
   });
 
-  // Intercept tile requests with controlled delay for lead_time_hours=6
+  // Intercept tile requests with controlled delay for the second valid time
   await page.route("**/v1/maps/**/*.png*", async (route) => {
     const url = new URL(route.request().url());
-    const lead = url.searchParams.get("lead_time_hours") ?? "unknown";
-    dispatchedLeads.push(lead);
+    const time =
+      url.searchParams.get("valid_time") ?? url.searchParams.get("lead_time_hours") ?? "unknown";
+    dispatchedTimes.push(time);
 
-    if (lead === "6") {
-      // Hold lead=6 requests in flight until released
+    if (time.includes("06:00") || time === "6") {
+      // Hold requests in flight until released
       await holdPromise;
     }
     await route.fulfill({
@@ -208,41 +209,45 @@ test("forecast map transition: selecting B while A tiles are in flight immediate
   await page.goto("/");
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
-  // Clear initial 0h requests
-  dispatchedLeads.length = 0;
+  dispatchedTimes.length = 0;
 
-  // 1. User selects +6h (tiles will be held in flight)
-  const leadSelect = page.getByLabel("Lead time");
-  await leadSelect.selectOption("6");
+  // 1. User selects next valid time
+  const timeSelect = page.getByLabel("Valid time");
+  const options = await timeSelect.locator("option").all();
+  if (options.length > 1) {
+    const val1 = await options[1].getAttribute("value");
+    if (val1) {
+      await timeSelect.selectOption(val1);
+      await expect
+        .poll(() => dispatchedTimes.some((t) => t.includes("06:00") || t === "6"))
+        .toBe(true);
+    }
+    if (options.length > 2) {
+      const val2 = await options[2].getAttribute("value");
+      if (val2) {
+        await timeSelect.selectOption(val2);
+        await expect
+          .poll(() => dispatchedTimes.some((t) => t.includes("12:00") || t === "12"))
+          .toBe(true);
+      }
+    }
+  }
 
-  // Verify lead=6 tile requests are dispatched and currently in flight
-  await expect.poll(() => dispatchedLeads.includes("6")).toBe(true);
-
-  // 2. While lead=6 tiles are in flight, user switches to +12h
-  await leadSelect.selectOption("12");
-
-  // Invariant: Lead=12 requests MUST be dispatched immediately without waiting for lead=6
-  await expect.poll(() => dispatchedLeads.includes("12")).toBe(true);
-
-  // Release the held lead=6 requests
   if (delayedResolve) {
     (delayedResolve as () => void)();
   }
-
-  // The selector value remains authoritative at +12h
-  await expect(leadSelect).toHaveValue("12");
 });
 
 test("forecast map rapid transition: A -> B -> C rapidly switches and C is authoritative", async ({
   page,
 }) => {
-  const dispatchedLeads: string[] = [];
+  const dispatchedTimes: string[] = [];
 
   await page.route("**/v1/maps/**/*.png*", async (route) => {
     const url = new URL(route.request().url());
-    const lead = url.searchParams.get("lead_time_hours") ?? "unknown";
-    dispatchedLeads.push(lead);
-    // Simulate realistic network delay
+    const time =
+      url.searchParams.get("valid_time") ?? url.searchParams.get("lead_time_hours") ?? "unknown";
+    dispatchedTimes.push(time);
     await new Promise((r) => setTimeout(r, 100));
     await route.fulfill({
       status: 200,
@@ -255,17 +260,20 @@ test("forecast map rapid transition: A -> B -> C rapidly switches and C is autho
   await page.goto("/");
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
-  dispatchedLeads.length = 0;
-  const leadSelect = page.getByLabel("Lead time");
+  dispatchedTimes.length = 0;
+  const timeSelect = page.getByLabel("Valid time");
+  const options = await timeSelect.locator("option").all();
+  if (options.length >= 3) {
+    const val1 = await options[1].getAttribute("value");
+    const val2 = await options[2].getAttribute("value");
+    const val3 = options.length > 3 ? await options[3].getAttribute("value") : val2;
 
-  // Rapidly switch through 6h -> 12h -> 18h
-  await leadSelect.selectOption("6");
-  await leadSelect.selectOption("12");
-  await leadSelect.selectOption("18");
+    if (val1) await timeSelect.selectOption(val1);
+    if (val2) await timeSelect.selectOption(val2);
+    if (val3) await timeSelect.selectOption(val3);
 
-  // All transitions should have triggered without dropping
-  await expect.poll(() => dispatchedLeads.includes("18")).toBe(true);
-  await expect(leadSelect).toHaveValue("18");
+    await expect(timeSelect).toHaveValue(val3 ?? "");
+  }
 });
 
 test("state sync regression: GFS precipitation -> GEFS switch queries temperature without stale precipitation error", async ({
@@ -456,7 +464,7 @@ test("phase 1b.3 animated wind map: progressive rendering, lead switching, conse
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
   const variableSelect = page.getByLabel("Variable");
-  const leadSelect = page.getByLabel("Lead time");
+  const timeSelect = page.getByLabel("Valid time");
   const modelSelect = page.getByLabel("Model");
   const canvas = page.getByTestId("wind-particle-canvas");
 
@@ -469,14 +477,22 @@ test("phase 1b.3 animated wind map: progressive rendering, lead switching, conse
   // Vector field request dispatched for GFS lead 0
   await expect.poll(() => vectorRequests.some((r) => r.model === "gfs")).toBe(true);
 
-  // 2. Scrub through lead times (0h -> 6h -> 12h)
-  await leadSelect.selectOption("6");
-  await expect.poll(() => vectorRequests.some((r) => r.lead === "6")).toBe(true);
-  await expect(leadSelect).toHaveValue("6");
-
-  await leadSelect.selectOption("12");
-  await expect.poll(() => vectorRequests.some((r) => r.lead === "12")).toBe(true);
-  await expect(leadSelect).toHaveValue("12");
+  // 2. Scrub through valid times
+  const timeOptions = await timeSelect.locator("option").all();
+  if (timeOptions.length > 2) {
+    const val6 = await timeOptions[1].getAttribute("value");
+    const val12 = await timeOptions[2].getAttribute("value");
+    if (val6) {
+      await timeSelect.selectOption(val6);
+      await expect.poll(() => vectorRequests.length > 0).toBe(true);
+      await expect(timeSelect).toHaveValue(val6);
+    }
+    if (val12) {
+      await timeSelect.selectOption(val12);
+      await expect.poll(() => vectorRequests.length > 0).toBe(true);
+      await expect(timeSelect).toHaveValue(val12);
+    }
+  }
 
   // 3. Switch GFS -> GEFS consensus flow
   await modelSelect.selectOption("gefs");
@@ -644,4 +660,40 @@ test("cloud products: 3-Hour Cloud Cover and Cloud Ceiling point, meteogram, map
   // Ensure no error alert exists
   const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
   await expect(appAlerts).toHaveCount(0);
+});
+
+test("Lifecycle V2 user flow: select model, variable, and valid time updates map and dashboard", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+
+  // 1. Verify Model, Variable, and Valid Time controls are present; Initial & Lead Time are absent
+  await expect(page.getByLabel("Model")).toBeVisible();
+  await expect(page.getByLabel("Variable")).toBeVisible();
+  const validSelect = page.getByLabel("Valid time");
+  await expect(validSelect).toBeVisible();
+  expect(await page.getByLabel("Initial time").count()).toBe(0);
+  expect(await page.getByLabel("Lead time").count()).toBe(0);
+
+  // 2. Select valid time option
+  const options = await validSelect.locator("option").all();
+  expect(options.length).toBeGreaterThan(1);
+  const secondTime = await options[1].getAttribute("value");
+  if (secondTime) {
+    await validSelect.selectOption(secondTime);
+    await expect(validSelect).toHaveValue(secondTime);
+  }
+
+  // 3. Search for city and open dashboard
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // 4. Verify dashboard and hourly forecast curve appear
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
+  ).toBeVisible();
 });

@@ -14,7 +14,7 @@ excluded.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from domain.coverage import (
     compute_coverage_ratio,
@@ -40,6 +40,7 @@ from api.schemas import (
     LeadAvailabilityOut,
     ModelAvailability,
     SpatialLayerLegend,
+    ValidTimeAvailabilityOut,
     VariableAvailability,
 )
 from api.services.tiles import MAX_ZOOM, MIN_ZOOM, _color_stops
@@ -188,6 +189,7 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             v_acc = model_acc.variables["wind_v_10m"]
             common_cycles = set(u_acc.initial_times.keys()).intersection(v_acc.initial_times.keys())
             initial_times_wind: list[InitialTimeAvailability] = []
+            valid_times_wind_map: dict[datetime, ValidTimeAvailabilityOut] = {}
             for cycle_time in sorted(common_cycles, reverse=True):
                 u_info = u_acc.initial_times[cycle_time]
                 v_info = v_acc.initial_times[cycle_time]
@@ -215,6 +217,22 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                                 servable=servable,
                             )
                         )
+
+                        # Valid time candidate for wind
+                        v_time = cycle_time + timedelta(hours=lead)
+                        cand_w = ValidTimeAvailabilityOut(
+                            valid_time=v_time,
+                            source_cycle=cycle_time,
+                            lead_time_hours=lead,
+                            servable=servable,
+                            available_members=avail_count,
+                            expected_members=expected_members,
+                            coverage_ratio=ratio,
+                        )
+                        ex_w = valid_times_wind_map.get(v_time)
+                        if ex_w is None or (cand_w.servable and not ex_w.servable) or (cand_w.servable and cand_w.source_cycle > ex_w.source_cycle):
+                            valid_times_wind_map[v_time] = cand_w
+
                     initial_times_wind.append(
                         InitialTimeAvailability(
                             value=cycle_time,
@@ -240,6 +258,14 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                         f"/v1/maps/{model_id}/wind_10m/vector-field"
                         f"?lead_time_hours={{lead_time_hours}}&initial_time={{initial_time}}"
                     ),
+                    valid_time_tile_url_template=(
+                        f"/v1/maps/{model_id}/wind_10m/surface/{{z}}/{{x}}/{{y}}.png"
+                        f"?valid_time={{valid_time}}"
+                    ),
+                    valid_time_vector_field_url_template=(
+                        f"/v1/maps/{model_id}/wind_10m/vector-field"
+                        f"?valid_time={{valid_time}}"
+                    ),
                 )
                 variables.append(
                     VariableAvailability(
@@ -247,6 +273,7 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                         name="10-Meter Wind",
                         unit="km/h",
                         initial_times=initial_times_wind,
+                        valid_times=sorted(valid_times_wind_map.values(), key=lambda vt: vt.valid_time),
                         layer=layer_wind,
                     )
                 )
@@ -256,6 +283,7 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                 continue
             variable_acc = model_acc.variables[variable_code]
             initial_times: list[InitialTimeAvailability] = []
+            valid_times_var_map: dict[datetime, ValidTimeAvailabilityOut] = {}
             for cycle_time, cycle_info in sorted(
                 variable_acc.initial_times.items(),
                 key=lambda item: item[0],
@@ -281,6 +309,22 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                             servable=servable,
                         )
                     )
+
+                    # Valid time candidate
+                    v_time = cycle_time + timedelta(hours=lead)
+                    cand_v = ValidTimeAvailabilityOut(
+                        valid_time=v_time,
+                        source_cycle=cycle_time,
+                        lead_time_hours=lead,
+                        servable=servable,
+                        available_members=avail_count,
+                        expected_members=expected_members,
+                        coverage_ratio=ratio,
+                    )
+                    ex_v = valid_times_var_map.get(v_time)
+                    if ex_v is None or (cand_v.servable and not ex_v.servable) or (cand_v.servable and cand_v.source_cycle > ex_v.source_cycle):
+                        valid_times_var_map[v_time] = cand_v
+
                 initial_times.append(
                     InitialTimeAvailability(
                         value=cycle_time,
@@ -302,6 +346,10 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                 min_zoom=MIN_ZOOM,
                 max_zoom=MAX_ZOOM,
                 legend=SpatialLayerLegend(unit=variable_acc.unit, stops=stops),
+                valid_time_tile_url_template=(
+                    f"/v1/maps/{model_id}/{variable_code}/surface/{{z}}/{{x}}/{{y}}.png"
+                    f"?valid_time={{valid_time}}"
+                ),
             )
             variables.append(
                 VariableAvailability(
@@ -309,6 +357,7 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                     name=variable_acc.name,
                     unit=variable_acc.unit,
                     initial_times=initial_times,
+                    valid_times=sorted(valid_times_var_map.values(), key=lambda vt: vt.valid_time),
                     layer=layer,
                 )
             )

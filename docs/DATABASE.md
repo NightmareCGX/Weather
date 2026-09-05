@@ -38,6 +38,9 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 ### Migration 004: Deletion Fencing (`004_deletion_fence.py`)
 * `forecast_cycle_lifecycle.deletion_started_at`: Crash-safe deletion fence column and index (`idx_cycle_lifecycle_claimed`). Fences off retired cycles so ingestion writers cannot resurrect a cycle during or after GC deletion.
 
+### Migration 005: Model-Scoped Lifecycle (`005_model_scoped_lifecycle.py`)
+* `forecast_cycle_lifecycle`: Primary key updated to `(model_id, cycle_time)` with foreign key to `models.model_id` (CASCADE delete) and model-scoped indexes. Decouples model retention so GFS and GEFS advance retention independently under Lifecycle V2.
+
 ---
 
 ## 3. Table Ownership & Mutability Matrix
@@ -51,7 +54,7 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 | `ensemble_members` | Ingestion catalog init | API ensemble router | `id` PK, `UNIQUE (run_id, member_index)` | Static per run |
 | `forecast_products` | Ingestion wave runner | API availability service | `id` PK, `UNIQUE (run_id, variable_id, grid_id, product_type, lead_time_hours)` | Append-only per wave |
 | `ensemble_member_products`| Ingestion wave runner | Ingestion wave runner | `id` PK, `UNIQUE (run_id, member_index, lead_time_hours)` | Append-only per wave |
-| `forecast_cycle_lifecycle`| Ingestion GC reconciler | Ingestion GC, API lifecycle | `cycle_time` PK | Mutable timestamps |
+| `forecast_cycle_lifecycle`| Ingestion GC reconciler | Ingestion GC, API lifecycle | `PRIMARY KEY (model_id, cycle_time)` | Mutable timestamps |
 | `forecast_variables` | Ingestion catalog init | API catalog router | `id` PK, `UNIQUE (variable_code)` | Static |
 | `forecast_grids` | Ingestion catalog init | API catalog router | `id` PK, `UNIQUE (grid_code)` | Static |
 | `stations`, `cities`, `ski_resorts` | Seed scripts | API search & places | `id` PK, PostGIS `GIST` on `geom` | Static reference |

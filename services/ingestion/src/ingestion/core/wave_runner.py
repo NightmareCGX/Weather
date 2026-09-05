@@ -561,7 +561,7 @@ async def _run_wave_impl(
     from ingestion.core.catalog import is_cycle_fenced_or_deleted
 
     with _catalog_session() as session:
-        if is_cycle_fenced_or_deleted(session, spec.cycle_time):
+        if is_cycle_fenced_or_deleted(session, spec.cycle_time, model_id=spec.model):
             raise CycleTombstonedError(
                 f"Refusing ingestion for cycle {spec.cycle_time.isoformat()}: "
                 "cycle is claimed for deletion or already tombstoned."
