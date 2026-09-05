@@ -10,6 +10,8 @@ Validates:
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -17,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 import xarray as xr
+import zarr
 import numpy as np
 from sqlalchemy import create_engine
 
@@ -411,5 +414,86 @@ def test_realtime_preflight_runs_strictly_once_at_startup_not_per_poll(monkeypat
     assert preflight_call_count == 1, (
         f"Preflight was called {preflight_call_count} times; expected strictly 1 at startup (not per poll)!"
     )
+
+
+def test_zarr_fsspec_async_clones_are_tracked_and_closed_at_wave_end(monkeypatch):
+    """Verify that Zarr 3's anonymous async S3FileSystem clones are tracked and closed without warnings."""
+    import warnings
+    captured = []
+    monkeypatch.setattr(
+        warnings,
+        "showwarning",
+        lambda msg, cat, fn, ln, *a, **k: captured.append(f"[{cat.__name__}] {msg}"),
+    )
+
+    from ingestion.core.s3 import (
+        _active_data_filesystems,
+        close_wave_data_s3_fs,
+    )
+
+    fs = get_s3_fs()
+    assert id(fs) in _active_data_filesystems
+    mapper = fs.get_mapper("weather-data/test_clone_audit/store.zarr")
+
+    ds = xr.Dataset(
+        {"temp": (("lead", "lat", "lon"), np.full((1, 2, 2), 20.0, dtype=np.float32))},
+        coords={"lead": [0], "lat": [38.0, 38.25], "lon": [-107.0, -106.75]},
+        attrs={"cycle_time": "2026-09-04T00:00:00Z"},
+    )
+    # 1. ds.to_zarr invokes _make_async and creates an anonymous async clone
+    ds.to_zarr(mapper, mode="w", zarr_format=2)
+
+    # 2. zarr.open_group creates another anonymous async clone
+    root = zarr.open_group(mapper, mode="a", zarr_format=2)
+    assert root is not None
+
+    # Assert that all async clones registered in _active_data_filesystems
+    assert len(_active_data_filesystems) >= 2
+
+    # 3. Wave completion calls close_wave_data_s3_fs()
+    all_closed = close_wave_data_s3_fs()
+    assert all_closed is True
+    assert len(_active_data_filesystems) == 0
+
+    # 4. Force GC to prove zero unclosed session / connector warnings
+    import gc
+    gc.collect()
+
+    unclosed_warnings = [w for w in captured if "Unclosed" in w]
+    assert len(unclosed_warnings) == 0, f"Unclosed session warnings captured: {unclosed_warnings}"
+
+
+def test_async_fs_close_across_threads_and_loops(monkeypatch):
+    """Test thread/event-loop safety for async S3FileSystem closure."""
+    from ingestion.core.s3 import (
+        IngestionS3FileSystem,
+        settings,
+        _endpoint_url,
+    )
+
+    fs = IngestionS3FileSystem(
+        key=settings.MINIO_ACCESS_KEY,
+        secret=settings.MINIO_SECRET_KEY,
+        client_kwargs={"endpoint_url": _endpoint_url(settings)},
+        is_data_plane=True,
+        asynchronous=True,
+    )
+
+    bg_loop = asyncio.new_event_loop()
+    bg_thread = threading.Thread(target=bg_loop.run_forever, daemon=True)
+    bg_thread.start()
+
+    fut = asyncio.run_coroutine_threadsafe(fs._lsdir("weather-data", delimiter=""), bg_loop)
+    fut.result()
+    assert fs._session_loop is bg_loop
+
+    # Close from synchronous main thread (foreign thread) while background loop is running
+    success = fs.close()
+    assert success is True
+    assert fs._is_closed is True
+
+    bg_loop.call_soon_threadsafe(bg_loop.stop)
+    bg_thread.join(timeout=1.0)
+
 
 
