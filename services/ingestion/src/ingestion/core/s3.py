@@ -28,6 +28,7 @@ asyncio event loop is active:
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import enum
 import logging
@@ -93,7 +94,7 @@ def _perform_safe_creator_close(loop: Any, s3creator: Any, timeout: float = 5.0)
 
     Guarantees:
     - Atomically transitions OPEN/CLOSE_FAILED -> CLOSING -> CLOSED (or CLOSE_FAILED on error).
-    - Teardown executes strictly on ``loop`` (the owning fsspecIO loop) via :func:`fsspec.asyn.sync`.
+    - Teardown executes strictly on ``loop`` (fsspecIO or zarr_io loop) via coroutine execution.
     - If already in CLOSED or CLOSING, returns immediately without re-entering teardown.
     - If teardown raises or times out, state transitions to CLOSE_FAILED so it remains retryable.
 
@@ -139,18 +140,32 @@ class IngestionS3FileSystem(s3fs.S3FileSystem):
 
     Eliminates upstream s3fs cross-event-loop cleanup defects by:
     1. Overriding :meth:`close_session` to perform teardown on ``self.loop`` (fsspecIO)
-       instead of scheduling un-awaited tasks onto caller loops via ``asyncio.get_running_loop()``.
-    2. Providing an explicit, idempotent :meth:`close` method for deterministic shutdown.
-    3. Sharing :class:`CloseState` tokens between explicit close and deferred weakref finalizers.
+       or ``self._session_loop`` (zarr_io) instead of scheduling un-awaited tasks.
+    2. Tracking wave data-plane instances and anonymous Zarr clones in :data:`_active_data_filesystems`.
+    3. Providing an explicit, idempotent :meth:`close` method for deterministic shutdown.
+    4. Sharing :class:`CloseState` tokens between explicit close and deferred weakref finalizers.
     """
 
     # Ingestion manages its own caching (control-plane singleton and data-plane strong registry).
     # Disable fsspec global instance cache to prevent closed instances from being revived.
     cachable = False
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, is_data_plane: bool = True, **kwargs: Any) -> None:
+        self.is_data_plane = is_data_plane
         super().__init__(*args, **kwargs)
         self._is_closed: bool = False
+        self._session_loop: asyncio.AbstractEventLoop | None = None
+        if self.is_data_plane:
+            with _data_registry_lock:
+                _active_data_filesystems[id(self)] = self
+
+    async def set_session(self, refresh: bool = False, kwargs: dict[str, Any] = {}) -> Any:
+        res = await super().set_session(refresh=refresh, kwargs=kwargs)
+        try:
+            self._session_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        return res
 
     @staticmethod
     def close_session(loop: Any, s3: Any) -> None:
@@ -158,17 +173,14 @@ class IngestionS3FileSystem(s3fs.S3FileSystem):
 
         Consults the shared :class:`CloseState` token:
         - If already CLOSED via explicit :meth:`close`, exits immediately as a no-op.
-        - If OPEN or CLOSE_FAILED, executes safe synchronous teardown on ``loop`` (fsspecIO).
+        - If OPEN or CLOSE_FAILED, executes safe synchronous teardown on ``loop``.
         """
         if s3 is None or loop is None or loop.is_closed():
             return
         _perform_safe_creator_close(loop, s3, timeout=5.0)
 
     def close(self, timeout: float = 5.0) -> bool:
-        """Explicitly and synchronously close the S3 client session on its owning fsspec loop.
-
-        Note: Accesses ``self._s3creator`` because s3fs does not expose a public synchronous
-        client teardown method. ``self.loop`` is the public fsspec event-loop property.
+        """Explicitly and synchronously close the S3 client session on its owning event loop.
 
         Returns:
             True if session closed successfully (or was already closed), False on failure/timeout.
@@ -179,8 +191,10 @@ class IngestionS3FileSystem(s3fs.S3FileSystem):
         # ``_s3creator`` holds the aiobotocore.session.ClientCreatorContext created during set_session()
         s3creator = getattr(self, "_s3creator", None)
         loop = getattr(self, "loop", None)
+        if loop is None:
+            loop = getattr(self, "_session_loop", None)
 
-        if s3creator is not None:
+        if s3creator is not None and loop is not None and not loop.is_closed():
             success = _perform_safe_creator_close(loop, s3creator, timeout=timeout)
             if not success:
                 # Do NOT clear references on failure; keep creator intact for retry
@@ -284,17 +298,15 @@ def get_control_s3_fs(
 def _build_data_s3_fs(cfg: IngestionSettings) -> IngestionS3FileSystem:
     """Construct a new data-plane IngestionS3FileSystem instance and register strong ownership."""
     max_pool = int(cfg.S3_MAX_POOL_CONNECTIONS)
-    fs = IngestionS3FileSystem(
+    return IngestionS3FileSystem(
         key=cfg.MINIO_ACCESS_KEY,
         secret=cfg.MINIO_SECRET_KEY,
         client_kwargs={"endpoint_url": _endpoint_url(cfg)},
         config_kwargs={"max_pool_connections": max_pool},
         use_listings_cache=False,
         skip_instance_cache=True,
+        is_data_plane=True,
     )
-    with _data_registry_lock:
-        _active_data_filesystems[id(fs)] = fs
-    return fs
 
 
 def _build_control_s3_fs(cfg: IngestionSettings) -> IngestionS3FileSystem:
@@ -307,28 +319,26 @@ def _build_control_s3_fs(cfg: IngestionSettings) -> IngestionS3FileSystem:
         config_kwargs={"max_pool_connections": max_pool},
         use_listings_cache=False,
         skip_instance_cache=True,
+        is_data_plane=False,
     )
 
 
 def close_wave_data_s3_fs() -> bool:
-    """Explicitly close all worker data-plane S3 filesystems at wave completion.
+    """Explicitly close all worker data-plane S3 filesystems and Zarr clones at wave completion.
 
     Drains :data:`_active_data_filesystems` and closes each instance on its owning
-    ``fsspecIO`` loop before the wave terminates.
+    ``fsspecIO`` or ``zarr_io`` loop before the wave terminates.
 
     Returns:
         True if all filesystems closed successfully, False if any close failed.
     """
     with _data_registry_lock:
         filesystems = list(_active_data_filesystems.values())
+        _active_data_filesystems.clear()
 
     all_success = True
     for fs in filesystems:
-        success = fs.close()
-        if success:
-            with _data_registry_lock:
-                _active_data_filesystems.pop(id(fs), None)
-        else:
+        if not fs.close():
             all_success = False
 
     # Clear current thread's thread-local reference if present
@@ -366,6 +376,40 @@ def shutdown_s3_fs() -> bool:
         all_success = False
 
     return all_success
+
+
+class MissingBucketError(RuntimeError):
+    """Raised when the configured object-store bucket does not exist."""
+
+
+def verify_object_store_preflight(
+    conn_settings: IngestionSettings | None = None,
+) -> None:
+    """Validate S3 endpoint reachability, credentials, and configured bucket existence.
+
+    Preflight validation executed once at service startup before any wave dispatch.
+    Fails fast with actionable diagnosis if the bucket is unprovisioned. Does NOT
+    auto-create buckets.
+
+    Raises:
+        MissingBucketError: When the configured bucket does not exist.
+        RuntimeError: When the S3 endpoint is unreachable or credentials are rejected.
+    """
+    cfg = conn_settings if conn_settings is not None else settings
+    bucket = str(cfg.MINIO_BUCKET_NAME)
+    fs = get_control_s3_fs(cfg)
+    try:
+        exists = fs.exists(bucket)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to connect to S3 endpoint at {_endpoint_url(cfg)}: {exc}"
+        ) from exc
+
+    if not exists:
+        raise MissingBucketError(
+            f"Configured object-store bucket '{bucket}' does not exist on "
+            f"{_endpoint_url(cfg)}. Provision the bucket before starting ingestion."
+        )
 
 
 def reset_s3_fs() -> None:
