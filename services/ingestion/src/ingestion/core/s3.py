@@ -368,6 +368,40 @@ def shutdown_s3_fs() -> bool:
     return all_success
 
 
+class MissingBucketError(RuntimeError):
+    """Raised when the configured object-store bucket does not exist."""
+
+
+def verify_object_store_preflight(
+    conn_settings: IngestionSettings | None = None,
+) -> None:
+    """Validate S3 endpoint reachability, credentials, and configured bucket existence.
+
+    Preflight validation executed once at service startup before any wave dispatch.
+    Fails fast with actionable diagnosis if the bucket is unprovisioned. Does NOT
+    auto-create buckets.
+
+    Raises:
+        MissingBucketError: When the configured bucket does not exist.
+        RuntimeError: When the S3 endpoint is unreachable or credentials are rejected.
+    """
+    cfg = conn_settings if conn_settings is not None else settings
+    bucket = str(cfg.MINIO_BUCKET_NAME)
+    fs = get_control_s3_fs(cfg)
+    try:
+        exists = fs.exists(bucket)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to connect to S3 endpoint at {_endpoint_url(cfg)}: {exc}"
+        ) from exc
+
+    if not exists:
+        raise MissingBucketError(
+            f"Configured object-store bucket '{bucket}' does not exist on "
+            f"{_endpoint_url(cfg)}. Provision the bucket before starting ingestion."
+        )
+
+
 def reset_s3_fs() -> None:
     """Clear both data-plane and control-plane S3FileSystem caches (testing/teardown)."""
     shutdown_s3_fs()

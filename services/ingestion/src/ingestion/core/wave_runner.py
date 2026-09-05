@@ -432,6 +432,37 @@ async def _run_wave(
 ) -> str:
     """Download and ingest every lead/member target of a single forecast run.
 
+    Outer resource-guarded entrypoint ensuring that all active S3 data-plane
+    filesystems are deterministically drained on wave completion or any early
+    failure (e.g. initialization, download, or decode exceptions).
+    """
+    from ingestion.core.s3 import close_wave_data_s3_fs
+
+    try:
+        return await _run_wave_impl(
+            spec=spec,
+            args=args,
+            catalog_spec=catalog_spec,
+            store_path=store_path,
+            concurrency=concurrency,
+            failures=failures,
+            cancel_event=cancel_event,
+        )
+    finally:
+        close_wave_data_s3_fs()
+
+
+async def _run_wave_impl(
+    spec: RunSpec,
+    args: Any,
+    catalog_spec: RunCatalogSpec,
+    store_path: str,
+    concurrency: int,
+    failures: list[str],
+    cancel_event: threading.Event | None = None,
+) -> str:
+    """Internal wave execution pipeline.
+
     Implements the approved decoupled pipeline architecture (Phase 1):
     - retained-seed fresh-store initialization;
     - one wave-level EXCLUSIVE pre-update (run -> partial + UPDATING markers);
@@ -629,445 +660,253 @@ async def _run_wave(
 
     var_codes = tuple(v.code for v in catalog_spec.variables)
 
-    async with NOAAConnector() as connector:
-        # 1. Retained seed. Download the seed first, then decode it in a
-        #    worker process (the native ecCodes boundary).
-        seed_dest = _destination_for(
-            spec, staging_dir, lead=seed_lead, member=seed_member
-        )
-        Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
-        tracker.set_init_phase("seed_download")
-        tracker.record_milestone("seed_download_start")
-        tracker.on_download_start(seed_member, seed_lead, is_seed=True)
-        t_dl_start = time.monotonic()
-        try:
-            await connector.download(
-                spec.model,
-                spec.cycle_date,
-                spec.cycle_hour,
-                seed_lead,
-                seed_dest,
-                member=seed_member,
-                variables=var_codes,
+    try:
+        async with NOAAConnector() as connector:
+            # 1. Retained seed. Download the seed first, then decode it in a
+            #    worker process (the native ecCodes boundary).
+            seed_dest = _destination_for(
+                spec, staging_dir, lead=seed_lead, member=seed_member
             )
-            tracker.record_milestone("seed_download_complete")
-            tracker.on_download_complete(
-                seed_member,
-                seed_lead,
-                duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
-            )
-        except Exception:
-            tracker.on_download_failed(
-                seed_member,
-                seed_lead,
-                duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
-            )
-            tracker.set_init_phase("failed")
-            raise
-
-        tracker.set_init_phase("seed_decode")
-        tracker.record_milestone("seed_decode_start")
-        tracker.on_decode_start(seed_member, seed_lead)
-        t_dec_start = time.monotonic()
-        try:
-            seed_future = decode_pool.submit(seed_dest)
-            seed_dataset = _decode_and_normalize(
-                seed_future, catalog_spec, store_path=store_path, member=seed_member
-            )
-
-            raw_precip_for_future = None
-            if "tp" in seed_dataset.data_vars:
-                raw_precip_for_future = np.copy(seed_dataset["tp"].values)
-            elif "precipitation_amount_3h" in seed_dataset.data_vars:
-                raw_precip_for_future = np.copy(seed_dataset["precipitation_amount_3h"].values)
-
-            raw_cloud_for_future = None
-            if "tcc" in seed_dataset.data_vars:
-                raw_cloud_for_future = np.copy(seed_dataset["tcc"].values)
-            elif "cloud_cover_3h" in seed_dataset.data_vars:
-                raw_cloud_for_future = np.copy(seed_dataset["cloud_cover_3h"].values)
-
-            _validate_requested_lead(seed_dataset, seed_lead)
-            _validate_requested_member(seed_dataset, seed_member)
-
-            if raw_precip_for_future is not None or raw_cloud_for_future is not None:
-                with predecessor_lock:
-                    predecessor_states[seed_item] = PredecessorState(
-                        precip_raw=raw_precip_for_future,
-                        cloud_raw=raw_cloud_for_future,
-                    )
-            decode_completed_events[seed_item].set()
-
-            tracker.record_milestone("seed_decode_complete")
-            tracker.on_decode_complete(
-                seed_member,
-                seed_lead,
-                duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
-            )
-        except Exception:
-            decode_completed_events[seed_item].set()
-            tracker.on_decode_failed(
-                seed_member,
-                seed_lead,
-                duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
-            )
-            tracker.set_init_phase("failed")
-            raise
-
-        # 2. Determine run id + same-cycle.
-        run_id: str | None = None
-        is_same_cycle = False
-        tracker.set_init_phase("catalog_init")
-        tracker.record_milestone("catalog_init_start")
-        with _catalog_session() as db:
-            from ingestion.core.catalog import ModelRunRecord
-            from sqlalchemy import select
-
-            row = (
-                db.execute(
-                    select(ModelRunRecord).where(
-                        ModelRunRecord.zarr_store_path == store_path
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if row is not None:
-                run_id = str(row.id)
-                is_same_cycle = True
-        tracker.record_milestone("catalog_init_complete")
-
-        # 3. Wave-level EXCLUSIVE pre-update (init + UPDATING markers).
-        #    The store is pre-allocated with the canonical cycle horizon (not
-        #    this wave's targets) so repeated disjoint-target waves always
-        #    find their leads inside the pre-allocated coordinate axis.
-        pre_conn = engine.connect()
-        try:
-            tracker.set_init_phase("initialize_run_store")
-            coordinator.initialize_run_store(
-                pre_conn,
-                seed_dataset=seed_dataset,
-                expected_leads=horizon_leads,
-                expected_members=horizon_members,
-                run_id=run_id,
-                is_same_cycle=is_same_cycle,
-                observer=tracker,
-            )
-            regions = [
-                WaveRegion(
-                    lead_time_hours=lead,
-                    member=member,
-                    generation=_new_generation(),
-                )
-                for member, lead in items
-            ]
-            coordinator.pre_update_wave(
-                pre_conn,
-                regions=regions,
-                run_id=run_id,
-                is_same_cycle=is_same_cycle,
-                executor=executor,
-                cancel_event=wave_cancel_event,
-                observer=tracker,
-            )
-            tracker.set_init_phase("store_ready")
-            tracker.record_milestone("store_ready")
-        except Exception:
-            tracker.set_init_phase("failed")
-            raise
-        finally:
-            pre_conn.close()
-
-        # 4. Decoupled stage semaphores (Phase 1):
-        # - download_sem: at most `plan.download_concurrency` active HTTP downloads;
-        # - decode_sem: at most `plan.decode_concurrency` active decode jobs;
-        # - write_sem: at most `plan.write_concurrency` active DB/Zarr writes;
-        # - staging_sem: at most `plan.staging_concurrency` in-flight pipeline admissions
-        #   (bounding peak resident decoded datasets in memory).
-        download_sem = asyncio.Semaphore(plan.download_concurrency)
-        decode_sem = asyncio.Semaphore(plan.decode_concurrency)
-        write_sem = asyncio.Semaphore(plan.write_concurrency)
-        staging_sem = asyncio.Semaphore(plan.staging_concurrency)
-        futures_lock = threading.Lock()
-        registered_worker_futures: list[asyncio.Future[Any]] = []
-        pipeline_tasks: list[asyncio.Task[Any]] = []
-
-        generation_by_region = {r.region_id: r.generation for r in regions}
-
-        # Synchronous write execution: checks out DB connection only for the
-        # coordinated critical section (advisory locks + Zarr write + COMPLETE marker).
-        def _run_region_write(
-            dataset: xr.Dataset, member: int | None, lead: int, generation: str
-        ) -> None:
-            worker_conn = engine.connect()
+            Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
+            tracker.set_init_phase("seed_download")
+            tracker.record_milestone("seed_download_start")
+            tracker.on_download_start(seed_member, seed_lead, is_seed=True)
+            t_dl_start = time.monotonic()
             try:
-                coordinator.write_region_worker(
-                    worker_conn,
-                    dataset=dataset,
-                    member=member,
-                    generation=generation,
+                await connector.download(
+                    spec.model,
+                    spec.cycle_date,
+                    spec.cycle_hour,
+                    seed_lead,
+                    seed_dest,
+                    member=seed_member,
+                    variables=var_codes,
+                )
+                tracker.record_milestone("seed_download_complete")
+                tracker.on_download_complete(
+                    seed_member,
+                    seed_lead,
+                    duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
+                )
+            except Exception:
+                tracker.on_download_failed(
+                    seed_member,
+                    seed_lead,
+                    duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
+                )
+                tracker.set_init_phase("failed")
+                raise
+
+            tracker.set_init_phase("seed_decode")
+            tracker.record_milestone("seed_decode_start")
+            tracker.on_decode_start(seed_member, seed_lead)
+            t_dec_start = time.monotonic()
+            try:
+                seed_future = decode_pool.submit(seed_dest)
+                seed_dataset = _decode_and_normalize(
+                    seed_future, catalog_spec, store_path=store_path, member=seed_member
+                )
+
+                raw_precip_for_future = None
+                if "tp" in seed_dataset.data_vars:
+                    raw_precip_for_future = np.copy(seed_dataset["tp"].values)
+                elif "precipitation_amount_3h" in seed_dataset.data_vars:
+                    raw_precip_for_future = np.copy(seed_dataset["precipitation_amount_3h"].values)
+
+                raw_cloud_for_future = None
+                if "tcc" in seed_dataset.data_vars:
+                    raw_cloud_for_future = np.copy(seed_dataset["tcc"].values)
+                elif "cloud_cover_3h" in seed_dataset.data_vars:
+                    raw_cloud_for_future = np.copy(seed_dataset["cloud_cover_3h"].values)
+
+                _validate_requested_lead(seed_dataset, seed_lead)
+                _validate_requested_member(seed_dataset, seed_member)
+
+                if raw_precip_for_future is not None or raw_cloud_for_future is not None:
+                    with predecessor_lock:
+                        predecessor_states[seed_item] = PredecessorState(
+                            precip_raw=raw_precip_for_future,
+                            cloud_raw=raw_cloud_for_future,
+                        )
+                decode_completed_events[seed_item].set()
+
+                tracker.record_milestone("seed_decode_complete")
+                tracker.on_decode_complete(
+                    seed_member,
+                    seed_lead,
+                    duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
+                )
+            except Exception:
+                decode_completed_events[seed_item].set()
+                tracker.on_decode_failed(
+                    seed_member,
+                    seed_lead,
+                    duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
+                )
+                tracker.set_init_phase("failed")
+                raise
+
+            # 2. Determine run id + same-cycle.
+            run_id: str | None = None
+            is_same_cycle = False
+            tracker.set_init_phase("catalog_init")
+            tracker.record_milestone("catalog_init_start")
+            with _catalog_session() as db:
+                from ingestion.core.catalog import ModelRunRecord
+                from sqlalchemy import select
+
+                row = (
+                    db.execute(
+                        select(ModelRunRecord).where(
+                            ModelRunRecord.zarr_store_path == store_path
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if row is not None:
+                    run_id = str(row.id)
+                    is_same_cycle = True
+            tracker.record_milestone("catalog_init_complete")
+
+            # 3. Wave-level EXCLUSIVE pre-update (init + UPDATING markers).
+            #    The store is pre-allocated with the canonical cycle horizon (not
+            #    this wave's targets) so repeated disjoint-target waves always
+            #    find their leads inside the pre-allocated coordinate axis.
+            pre_conn = engine.connect()
+            try:
+                tracker.set_init_phase("initialize_run_store")
+                coordinator.initialize_run_store(
+                    pre_conn,
+                    seed_dataset=seed_dataset,
                     expected_leads=horizon_leads,
                     expected_members=horizon_members,
+                    run_id=run_id,
+                    is_same_cycle=is_same_cycle,
+                    observer=tracker,
                 )
-            finally:
-                worker_conn.close()
-
-        # Retained-seed writer uses the retained dataset (no re-parse).
-        def _run_seed_region() -> None:
-            region_id = _region_id_for(seed_lead, seed_member)
-            generation = generation_by_region.get(region_id)
-            if generation is None:
-                raise RuntimeError(f"no generation for region {region_id}")
-            _run_region_write(seed_dataset, seed_member, seed_lead, generation)
-
-        loop = asyncio.get_event_loop()
-
-        # Track pending tasks per lead for intermediate settled-lead publication
-        expected_members_for_lead = spec.members if spec.members else (None,)
-        lead_pending: dict[int, set[int | None]] = {
-            lead_val: set(expected_members_for_lead)
-            for lead_val in spec.target_lead_time_hours
-        }
-        lead_settle_lock = threading.Lock()
-        published_leads: set[int] = set()
-        run_id_for_pub = _resolve_run_id(catalog_spec, store_path)
-
-        def _check_and_publish_lead(lead_val: int) -> None:
-            if lead_val in published_leads:
-                return
-            published_leads.add(lead_val)
-            pub_conn = engine.connect()
-            try:
-                coordinator.publish_settled_lead(
-                    pub_conn,
-                    run_id=run_id_for_pub,
-                    spec=catalog_spec,
-                    lead_time_hours=lead_val,
-                    expected_members=spec.members,
+                regions = [
+                    WaveRegion(
+                        lead_time_hours=lead,
+                        member=member,
+                        generation=_new_generation(),
+                    )
+                    for member, lead in items
+                ]
+                coordinator.pre_update_wave(
+                    pre_conn,
+                    regions=regions,
+                    run_id=run_id,
+                    is_same_cycle=is_same_cycle,
+                    executor=executor,
+                    cancel_event=wave_cancel_event,
+                    observer=tracker,
                 )
-            except Exception as exc:
-                logger.warning("Settled-lead publication failed for lead %d: %s", lead_val, exc)
+                tracker.set_init_phase("store_ready")
+                tracker.record_milestone("store_ready")
+            except Exception:
+                tracker.set_init_phase("failed")
+                raise
             finally:
-                pub_conn.close()
+                pre_conn.close()
 
-        def _on_item_settled(member_val: int | None, lead_val: int) -> None:
-            with lead_settle_lock:
-                if lead_val in lead_pending:
-                    lead_pending[lead_val].discard(member_val)
-                    if not lead_pending[lead_val]:
-                        _check_and_publish_lead(lead_val)
+            # 4. Decoupled stage semaphores (Phase 1):
+            # - download_sem: at most `plan.download_concurrency` active HTTP downloads;
+            # - decode_sem: at most `plan.decode_concurrency` active decode jobs;
+            # - write_sem: at most `plan.write_concurrency` active DB/Zarr writes;
+            # - staging_sem: at most `plan.staging_concurrency` in-flight pipeline admissions
+            #   (bounding peak resident decoded datasets in memory).
+            download_sem = asyncio.Semaphore(plan.download_concurrency)
+            decode_sem = asyncio.Semaphore(plan.decode_concurrency)
+            write_sem = asyncio.Semaphore(plan.write_concurrency)
+            staging_sem = asyncio.Semaphore(plan.staging_concurrency)
+            futures_lock = threading.Lock()
+            registered_worker_futures: list[asyncio.Future[Any]] = []
+            pipeline_tasks: list[asyncio.Task[Any]] = []
 
-        # Seed task: starts immediately after pre-update under write_sem admission
-        async def _run_seed_task() -> None:
-            if wave_cancel_event.is_set():
-                return
-            async with write_sem:
-                if wave_cancel_event.is_set():
-                    return
-                tracker.record_milestone("seed_write_start")
-                tracker.on_write_start(seed_member, seed_lead, is_seed=True)
-                t_wr_start = time.monotonic()
-                fut = loop.run_in_executor(executor, _run_seed_region)
-                with futures_lock:
-                    registered_worker_futures.append(fut)
+            generation_by_region = {r.region_id: r.generation for r in regions}
 
-                cancel_requested = False
-                while not fut.done():
-                    try:
-                        await asyncio.shield(fut)
-                    except asyncio.CancelledError:
-                        cancel_requested = True
-                        wave_cancel_event.set()
-                        continue
-                    except Exception:
-                        break
-
+            # Synchronous write execution: checks out DB connection only for the
+            # coordinated critical section (advisory locks + Zarr write + COMPLETE marker).
+            def _run_region_write(
+                dataset: xr.Dataset, member: int | None, lead: int, generation: str
+            ) -> None:
+                worker_conn = engine.connect()
                 try:
-                    fut.result()
-                    wr_dur = (time.monotonic() - t_wr_start) * 1000.0
-                    tracker.record_milestone("seed_write_complete")
-                    tracker.on_write_complete(
-                        seed_member, seed_lead, duration_ms=wr_dur
+                    coordinator.write_region_worker(
+                        worker_conn,
+                        dataset=dataset,
+                        member=member,
+                        generation=generation,
+                        expected_leads=horizon_leads,
+                        expected_members=horizon_members,
                     )
-                    write_completed_events[seed_item].set()
-                    _on_item_settled(seed_member, seed_lead)
-                except Exception as exc:  # noqa: BLE001 - report failure
-                    wr_dur = (time.monotonic() - t_wr_start) * 1000.0
-                    tracker.on_write_failed(
-                        seed_member, seed_lead, duration_ms=wr_dur
-                    )
-                    failures.append(
-                        f"{spec.model} member={seed_member} lead={seed_lead}: {exc}"
-                    )
-                    write_completed_events[seed_item].set()
-                    _on_item_settled(seed_member, seed_lead)
+                finally:
+                    worker_conn.close()
 
-                if cancel_requested:
-                    raise asyncio.CancelledError
-
-        pipeline_tasks.append(asyncio.create_task(_run_seed_task()))
-
-        # Non-seed pipeline tasks:
-        # bounded download -> bounded decode & parent normalize -> bounded write admission -> write
-        async def _pipeline_item(member: int | None, lead: int) -> None:
-            if wave_cancel_event.is_set():
-                return
-            dest = _destination_for(spec, staging_dir, lead=lead, member=member)
-
-            # Stage 1: Pipeline admission (bounds total in-flight active/queued work)
-            async with staging_sem:
-                if wave_cancel_event.is_set():
-                    return
-
-                # Stage 2: Bounded download
-                async with download_sem:
-                    if wave_cancel_event.is_set():
-                        return
-                    tracker.on_download_start(member, lead)
-                    t_dl_start = time.monotonic()
-                    try:
-                        await connector.download(
-                            spec.model,
-                            spec.cycle_date,
-                            spec.cycle_hour,
-                            lead,
-                            dest,
-                            member=member,
-                            variables=var_codes,
-                        )
-                        dl_dur = (time.monotonic() - t_dl_start) * 1000.0
-                        tracker.on_download_complete(
-                            member, lead, duration_ms=dl_dur
-                        )
-                    except Exception as exc:  # noqa: BLE001 - report download failure
-                        dl_dur = (time.monotonic() - t_dl_start) * 1000.0
-                        tracker.on_download_failed(
-                            member, lead, duration_ms=dl_dur
-                        )
-                        failures.append(
-                            f"{spec.model} member={member} lead={lead} download: {exc}"
-                        )
-                        decode_completed_events[(member, lead)].set()
-                        write_completed_events[(member, lead)].set()
-                        _on_item_settled(member, lead)
-                        return
-
-                # Predecessor coordination for 6h-reset leads requiring de-accumulation / reconstruction.
-                # Waiting occurs OUTSIDE and BEFORE acquiring decode_sem to prevent semaphore inversion.
-                if (
-                    lead % 6 == 0
-                    and lead > 0
-                    and any(
-                        v.code in ("precipitation_amount_3h", "cloud_cover_3h")
-                        for v in catalog_spec.variables
-                    )
-                ):
-                    pred_item = (member, lead - 3)
-                    if pred_item in decode_completed_events:
-                        await decode_completed_events[pred_item].wait()
-                        if wave_cancel_event.is_set():
-                            return
-
-                # Stage 3: Bounded decode (ProcessPool execution + parent normalization)
-                # ZERO DB connections checked out during this compute-intensive phase.
-                if wave_cancel_event.is_set():
-                    return
-                ds: xr.Dataset | None = None
-                async with decode_sem:
-                    if wave_cancel_event.is_set():
-                        return
-                    tracker.on_decode_start(member, lead)
-                    t_dec_start = time.monotonic()
-                    decode_fut = decode_pool.submit(dest)
-                    try:
-                        # Retrieve and consume predecessor raw state if this is a 6h reset lead
-                        pred_precip = None
-                        pred_cloud = None
-                        if lead % 6 == 0 and lead > 0:
-                            pred_item = (member, lead - 3)
-                            with predecessor_lock:
-                                pred_state = predecessor_states.pop(pred_item, None)
-                            if pred_state is not None:
-                                pred_precip = pred_state.precip_raw
-                                pred_cloud = pred_state.cloud_raw
-
-                        ds = _decode_and_normalize(
-                            decode_fut,
-                            catalog_spec,
-                            store_path=store_path,
-                            predecessor_array=pred_precip,
-                            predecessor_cloud_array=pred_cloud,
-                            member=member,
-                        )
-                        _validate_requested_lead(ds, lead)
-                        _validate_requested_member(ds, member)
-
-                        # Store raw arrays for future dependent leads
-                        raw_precip_for_future = None
-                        if "tp" in ds.data_vars:
-                            raw_precip_for_future = np.copy(ds["tp"].values)
-                        elif "precipitation_amount_3h" in ds.data_vars:
-                            raw_precip_for_future = np.copy(ds["precipitation_amount_3h"].values)
-
-                        raw_cloud_for_future = None
-                        if "tcc" in ds.data_vars:
-                            raw_cloud_for_future = np.copy(ds["tcc"].values)
-                        elif "cloud_cover_3h" in ds.data_vars:
-                            raw_cloud_for_future = np.copy(ds["cloud_cover_3h"].values)
-
-                        if raw_precip_for_future is not None or raw_cloud_for_future is not None:
-                            with predecessor_lock:
-                                predecessor_states[(member, lead)] = PredecessorState(
-                                    precip_raw=raw_precip_for_future,
-                                    cloud_raw=raw_cloud_for_future,
-                                )
-
-                        dec_dur = (time.monotonic() - t_dec_start) * 1000.0
-                        tracker.on_decode_complete(
-                            member, lead, duration_ms=dec_dur
-                        )
-                        decode_completed_events[(member, lead)].set()
-                    except Exception as exc:  # noqa: BLE001 - report decode failure
-                        dec_dur = (time.monotonic() - t_dec_start) * 1000.0
-                        tracker.on_decode_failed(
-                            member, lead, duration_ms=dec_dur
-                        )
-                        failures.append(
-                            f"{spec.model} member={member} lead={lead} decode: {exc}"
-                        )
-                        decode_completed_events[(member, lead)].set()
-                        write_completed_events[(member, lead)].set()
-                        _on_item_settled(member, lead)
-                        return
-
-                # Stage 4: Bounded write admission (application-level backpressure BEFORE thread submission)
-                if wave_cancel_event.is_set():
-                    return
-                region_id = _region_id_for(lead, member)
+            # Retained-seed writer uses the retained dataset (no re-parse).
+            def _run_seed_region() -> None:
+                region_id = _region_id_for(seed_lead, seed_member)
                 generation = generation_by_region.get(region_id)
                 if generation is None:
-                    failures.append(
-                        f"{spec.model} member={member} lead={lead}: no generation for region {region_id}"
-                    )
-                    return
+                    raise RuntimeError(f"no generation for region {region_id}")
+                _run_region_write(seed_dataset, seed_member, seed_lead, generation)
 
+            loop = asyncio.get_event_loop()
+
+            # Track pending tasks per lead for intermediate settled-lead publication
+            expected_members_for_lead = spec.members if spec.members else (None,)
+            lead_pending: dict[int, set[int | None]] = {
+                lead_val: set(expected_members_for_lead)
+                for lead_val in spec.target_lead_time_hours
+            }
+            lead_settle_lock = threading.Lock()
+            published_leads: set[int] = set()
+            run_id_for_pub = _resolve_run_id(catalog_spec, store_path)
+
+            def _check_and_publish_lead(lead_val: int) -> None:
+                if lead_val in published_leads:
+                    return
+                published_leads.add(lead_val)
+                pub_conn = engine.connect()
+                try:
+                    coordinator.publish_settled_lead(
+                        pub_conn,
+                        run_id=run_id_for_pub,
+                        spec=catalog_spec,
+                        lead_time_hours=lead_val,
+                        expected_members=spec.members,
+                    )
+                except Exception as exc:
+                    logger.warning("Settled-lead publication failed for lead %d: %s", lead_val, exc)
+                finally:
+                    pub_conn.close()
+
+            def _on_item_settled(member_val: int | None, lead_val: int) -> None:
+                with lead_settle_lock:
+                    if lead_val in lead_pending:
+                        lead_pending[lead_val].discard(member_val)
+                        if not lead_pending[lead_val]:
+                            _check_and_publish_lead(lead_val)
+
+            # Seed task: starts immediately after pre-update under write_sem admission
+            async def _run_seed_task() -> None:
+                if wave_cancel_event.is_set():
+                    return
                 async with write_sem:
                     if wave_cancel_event.is_set():
                         return
-                    tracker.on_write_start(member, lead)
+                    tracker.record_milestone("seed_write_start")
+                    tracker.on_write_start(seed_member, seed_lead, is_seed=True)
                     t_wr_start = time.monotonic()
-                    assert ds is not None
-                    worker_fut = loop.run_in_executor(
-                        executor, _run_region_write, ds, member, lead, generation
-                    )
+                    fut = loop.run_in_executor(executor, _run_seed_region)
                     with futures_lock:
-                        registered_worker_futures.append(worker_fut)
+                        registered_worker_futures.append(fut)
 
-                    # Stage 5: Non-abandoning worker wait
                     cancel_requested = False
-                    while not worker_fut.done():
+                    while not fut.done():
                         try:
-                            await asyncio.shield(worker_fut)
+                            await asyncio.shield(fut)
                         except asyncio.CancelledError:
                             cancel_requested = True
                             wave_cancel_event.set()
@@ -1076,115 +915,306 @@ async def _run_wave(
                             break
 
                     try:
-                        worker_fut.result()
+                        fut.result()
                         wr_dur = (time.monotonic() - t_wr_start) * 1000.0
+                        tracker.record_milestone("seed_write_complete")
                         tracker.on_write_complete(
-                            member, lead, duration_ms=wr_dur
+                            seed_member, seed_lead, duration_ms=wr_dur
                         )
-                        write_completed_events[(member, lead)].set()
-                        _on_item_settled(member, lead)
-                    except Exception as exc:  # noqa: BLE001 - report write failure
+                        write_completed_events[seed_item].set()
+                        _on_item_settled(seed_member, seed_lead)
+                    except Exception as exc:  # noqa: BLE001 - report failure
                         wr_dur = (time.monotonic() - t_wr_start) * 1000.0
                         tracker.on_write_failed(
-                            member, lead, duration_ms=wr_dur
+                            seed_member, seed_lead, duration_ms=wr_dur
                         )
                         failures.append(
-                            f"{spec.model} member={member} lead={lead} write: {exc}"
+                            f"{spec.model} member={seed_member} lead={seed_lead}: {exc}"
                         )
-                        write_completed_events[(member, lead)].set()
-                        _on_item_settled(member, lead)
-                    finally:
-                        # Drop local dataset reference so memory is freed promptly
-                        ds = None
+                        write_completed_events[seed_item].set()
+                        _on_item_settled(seed_member, seed_lead)
 
                     if cancel_requested:
                         raise asyncio.CancelledError
 
-        tracker.record_milestone("wave_tasks_created")
-        for member, lead in items:
-            if (member, lead) != seed_item:
-                pipeline_tasks.append(
-                    asyncio.create_task(_pipeline_item(member, lead))
-                )
+            pipeline_tasks.append(asyncio.create_task(_run_seed_task()))
 
-        # 5. Aggregate drain: wait for all outer pipeline tasks
-        tracker.record_milestone("post_write_task_gather_start")
-        results, cancelled = await await_all_workers_non_abandoning(
-            pipeline_tasks, wave_cancel_event
-        )
-        tracker.record_milestone("post_write_task_gather_complete")
-        for res in results:
-            if isinstance(res, BaseException) and not isinstance(
-                res, asyncio.CancelledError
-            ):
-                msg = str(res)
-                if not any(msg in f for f in failures):
-                    failures.append(msg)
+            # Non-seed pipeline tasks:
+            # bounded download -> bounded decode & parent normalize -> bounded write admission -> write
+            async def _pipeline_item(member: int | None, lead: int) -> None:
+                if wave_cancel_event.is_set():
+                    return
+                dest = _destination_for(spec, staging_dir, lead=lead, member=member)
 
-        # 6. Finalization gate: Verify that 100% of underlying worker futures are genuinely settled
-        for fut in registered_worker_futures:
-            if not fut.done():
-                raise RuntimeError(
-                    "Finalization gate invariant violated: active executor worker detected"
-                )
+                # Stage 1: Pipeline admission (bounds total in-flight active/queued work)
+                async with staging_sem:
+                    if wave_cancel_event.is_set():
+                        return
 
-        tracker.record_milestone("download_client_close_start")
-    tracker.record_milestone("download_client_close_complete")
+                    # Stage 2: Bounded download
+                    async with download_sem:
+                        if wave_cancel_event.is_set():
+                            return
+                        tracker.on_download_start(member, lead)
+                        t_dl_start = time.monotonic()
+                        try:
+                            await connector.download(
+                                spec.model,
+                                spec.cycle_date,
+                                spec.cycle_hour,
+                                lead,
+                                dest,
+                                member=member,
+                                variables=var_codes,
+                            )
+                            dl_dur = (time.monotonic() - t_dl_start) * 1000.0
+                            tracker.on_download_complete(
+                                member, lead, duration_ms=dl_dur
+                            )
+                        except Exception as exc:  # noqa: BLE001 - report download failure
+                            dl_dur = (time.monotonic() - t_dl_start) * 1000.0
+                            tracker.on_download_failed(
+                                member, lead, duration_ms=dl_dur
+                            )
+                            failures.append(
+                                f"{spec.model} member={member} lead={lead} download: {exc}"
+                            )
+                            decode_completed_events[(member, lead)].set()
+                            write_completed_events[(member, lead)].set()
+                            _on_item_settled(member, lead)
+                            return
 
-    # 7. Coalesced finalization (after all worker Futures drained).
-    #    Readiness is evaluated against the canonical cycle horizon, not this
-    #    wave's targets, so the run converges to 'ready' only when the whole
-    #    horizon is committed.
-    tracker.on_finalize_start()
-    t_fin_start = time.monotonic()
-    fin_conn = engine.connect()
-    try:
-        run_id = _resolve_run_id(catalog_spec, store_path)
-        finalize_result = coordinator.finalize_run(
-            fin_conn,
-            run_id=run_id,
-            spec=catalog_spec,
-            expected_leads=horizon_leads,
-            expected_members=horizon_members,
-            observer=tracker,
-        )
-        status = finalize_result.status
-        fin_dur = (time.monotonic() - t_fin_start) * 1000.0
-        tracker.on_finalize_complete(duration_ms=fin_dur)
+                    # Predecessor coordination for 6h-reset leads requiring de-accumulation / reconstruction.
+                    # Waiting occurs OUTSIDE and BEFORE acquiring decode_sem to prevent semaphore inversion.
+                    if (
+                        lead % 6 == 0
+                        and lead > 0
+                        and any(
+                            v.code in ("precipitation_amount_3h", "cloud_cover_3h")
+                            for v in catalog_spec.variables
+                        )
+                    ):
+                        pred_item = (member, lead - 3)
+                        if pred_item in decode_completed_events:
+                            await decode_completed_events[pred_item].wait()
+                            if wave_cancel_event.is_set():
+                                return
 
-        # Post-finalization cleanup: clean up only regions proven committed
-        # by THIS wave's generation, unless --keep-downloads is set.
-        if not getattr(args, "keep_downloads", False):
-            committed_dests: list[Path] = []
-            for r in regions:
-                committed_gen = finalize_result.committed_regions.get(r.region_id)
-                if committed_gen is not None and committed_gen == r.generation:
-                    dest = _destination_for(
-                        spec, staging_dir, lead=r.lead_time_hours, member=r.member
+                    # Stage 3: Bounded decode (ProcessPool execution + parent normalization)
+                    # ZERO DB connections checked out during this compute-intensive phase.
+                    if wave_cancel_event.is_set():
+                        return
+                    ds: xr.Dataset | None = None
+                    async with decode_sem:
+                        if wave_cancel_event.is_set():
+                            return
+                        tracker.on_decode_start(member, lead)
+                        t_dec_start = time.monotonic()
+                        decode_fut = decode_pool.submit(dest)
+                        try:
+                            # Retrieve and consume predecessor raw state if this is a 6h reset lead
+                            pred_precip = None
+                            pred_cloud = None
+                            if lead % 6 == 0 and lead > 0:
+                                pred_item = (member, lead - 3)
+                                with predecessor_lock:
+                                    pred_state = predecessor_states.pop(pred_item, None)
+                                if pred_state is not None:
+                                    pred_precip = pred_state.precip_raw
+                                    pred_cloud = pred_state.cloud_raw
+
+                            ds = _decode_and_normalize(
+                                decode_fut,
+                                catalog_spec,
+                                store_path=store_path,
+                                predecessor_array=pred_precip,
+                                predecessor_cloud_array=pred_cloud,
+                                member=member,
+                            )
+                            _validate_requested_lead(ds, lead)
+                            _validate_requested_member(ds, member)
+
+                            # Store raw arrays for future dependent leads
+                            raw_precip_for_future = None
+                            if "tp" in ds.data_vars:
+                                raw_precip_for_future = np.copy(ds["tp"].values)
+                            elif "precipitation_amount_3h" in ds.data_vars:
+                                raw_precip_for_future = np.copy(ds["precipitation_amount_3h"].values)
+
+                            raw_cloud_for_future = None
+                            if "tcc" in ds.data_vars:
+                                raw_cloud_for_future = np.copy(ds["tcc"].values)
+                            elif "cloud_cover_3h" in ds.data_vars:
+                                raw_cloud_for_future = np.copy(ds["cloud_cover_3h"].values)
+
+                            if raw_precip_for_future is not None or raw_cloud_for_future is not None:
+                                with predecessor_lock:
+                                    predecessor_states[(member, lead)] = PredecessorState(
+                                        precip_raw=raw_precip_for_future,
+                                        cloud_raw=raw_cloud_for_future,
+                                    )
+
+                            dec_dur = (time.monotonic() - t_dec_start) * 1000.0
+                            tracker.on_decode_complete(
+                                member, lead, duration_ms=dec_dur
+                            )
+                            decode_completed_events[(member, lead)].set()
+                        except Exception as exc:  # noqa: BLE001 - report decode failure
+                            dec_dur = (time.monotonic() - t_dec_start) * 1000.0
+                            tracker.on_decode_failed(
+                                member, lead, duration_ms=dec_dur
+                            )
+                            failures.append(
+                                f"{spec.model} member={member} lead={lead} decode: {exc}"
+                            )
+                            decode_completed_events[(member, lead)].set()
+                            write_completed_events[(member, lead)].set()
+                            _on_item_settled(member, lead)
+                            return
+
+                    # Stage 4: Bounded write admission (application-level backpressure BEFORE thread submission)
+                    if wave_cancel_event.is_set():
+                        return
+                    region_id = _region_id_for(lead, member)
+                    generation = generation_by_region.get(region_id)
+                    if generation is None:
+                        failures.append(
+                            f"{spec.model} member={member} lead={lead}: no generation for region {region_id}"
+                        )
+                        return
+
+                    async with write_sem:
+                        if wave_cancel_event.is_set():
+                            return
+                        tracker.on_write_start(member, lead)
+                        t_wr_start = time.monotonic()
+                        assert ds is not None
+                        worker_fut = loop.run_in_executor(
+                            executor, _run_region_write, ds, member, lead, generation
+                        )
+                        with futures_lock:
+                            registered_worker_futures.append(worker_fut)
+
+                        # Stage 5: Non-abandoning worker wait
+                        cancel_requested = False
+                        while not worker_fut.done():
+                            try:
+                                await asyncio.shield(worker_fut)
+                            except asyncio.CancelledError:
+                                cancel_requested = True
+                                wave_cancel_event.set()
+                                continue
+                            except Exception:
+                                break
+
+                        try:
+                            worker_fut.result()
+                            wr_dur = (time.monotonic() - t_wr_start) * 1000.0
+                            tracker.on_write_complete(
+                                member, lead, duration_ms=wr_dur
+                            )
+                            write_completed_events[(member, lead)].set()
+                            _on_item_settled(member, lead)
+                        except Exception as exc:  # noqa: BLE001 - report write failure
+                            wr_dur = (time.monotonic() - t_wr_start) * 1000.0
+                            tracker.on_write_failed(
+                                member, lead, duration_ms=wr_dur
+                            )
+                            failures.append(
+                                f"{spec.model} member={member} lead={lead} write: {exc}"
+                            )
+                            write_completed_events[(member, lead)].set()
+                            _on_item_settled(member, lead)
+                        finally:
+                            # Drop local dataset reference so memory is freed promptly
+                            ds = None
+
+                        if cancel_requested:
+                            raise asyncio.CancelledError
+
+            tracker.record_milestone("wave_tasks_created")
+            for member, lead in items:
+                if (member, lead) != seed_item:
+                    pipeline_tasks.append(
+                        asyncio.create_task(_pipeline_item(member, lead))
                     )
-                    committed_dests.append(dest)
-            if committed_dests:
-                _cleanup_sources(staging_dir, committed_dests)
-            # Best-effort removal of the owned staging directory.
-            try:
-                staging_dir.rmdir()
-            except OSError as exc:
-                logger.warning(
-                    "Failed to remove staging directory %s: %s; data is safe.",
-                    staging_dir,
-                    exc,
-                )
-    except Exception:
-        fin_dur = (time.monotonic() - t_fin_start) * 1000.0
-        tracker.on_finalize_failed(duration_ms=fin_dur)
-        raise
+
+            # 5. Aggregate drain: wait for all outer pipeline tasks
+            tracker.record_milestone("post_write_task_gather_start")
+            results, cancelled = await await_all_workers_non_abandoning(
+                pipeline_tasks, wave_cancel_event
+            )
+            tracker.record_milestone("post_write_task_gather_complete")
+            for res in results:
+                if isinstance(res, BaseException) and not isinstance(
+                    res, asyncio.CancelledError
+                ):
+                    msg = str(res)
+                    if not any(msg in f for f in failures):
+                        failures.append(msg)
+
+            # 6. Finalization gate: Verify that 100% of underlying worker futures are genuinely settled
+            for fut in registered_worker_futures:
+                if not fut.done():
+                    raise RuntimeError(
+                        "Finalization gate invariant violated: active executor worker detected"
+                    )
+
+                tracker.record_milestone("download_client_close_start")
+        tracker.record_milestone("download_client_close_complete")
+
+        # 7. Coalesced finalization (after all worker Futures drained).
+        #    Readiness is evaluated against the canonical cycle horizon, not this
+        #    wave's targets, so the run converges to 'ready' only when the whole
+        #    horizon is committed.
+        tracker.on_finalize_start()
+        t_fin_start = time.monotonic()
+        fin_conn = engine.connect()
+        try:
+            run_id = _resolve_run_id(catalog_spec, store_path)
+            finalize_result = coordinator.finalize_run(
+                fin_conn,
+                run_id=run_id,
+                spec=catalog_spec,
+                expected_leads=horizon_leads,
+                expected_members=horizon_members,
+                observer=tracker,
+            )
+            status = finalize_result.status
+            fin_dur = (time.monotonic() - t_fin_start) * 1000.0
+            tracker.on_finalize_complete(duration_ms=fin_dur)
+
+            # Post-finalization cleanup: clean up only regions proven committed
+            # by THIS wave's generation, unless --keep-downloads is set.
+            if not getattr(args, "keep_downloads", False):
+                committed_dests: list[Path] = []
+                for r in regions:
+                    committed_gen = finalize_result.committed_regions.get(r.region_id)
+                    if committed_gen is not None and committed_gen == r.generation:
+                        dest = _destination_for(
+                            spec, staging_dir, lead=r.lead_time_hours, member=r.member
+                        )
+                        committed_dests.append(dest)
+                if committed_dests:
+                    _cleanup_sources(staging_dir, committed_dests)
+                # Best-effort removal of the owned staging directory.
+                try:
+                    staging_dir.rmdir()
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove staging directory %s: %s; data is safe.",
+                        staging_dir,
+                        exc,
+                    )
+        except Exception:
+            fin_dur = (time.monotonic() - t_fin_start) * 1000.0
+            tracker.on_finalize_failed(duration_ms=fin_dur)
+            raise
+        finally:
+            fin_conn.close()
     finally:
-        fin_conn.close()
         engine.dispose()
         executor.shutdown(wait=True)
-        from ingestion.core.s3 import close_wave_data_s3_fs
-
-        close_wave_data_s3_fs()
         decode_pool.shutdown()
         ui_stop_event.set()
         ui_task.cancel()

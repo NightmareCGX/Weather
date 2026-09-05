@@ -51,6 +51,25 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      default:
+        aliases:
+          - minio
+          - weather-minio
+
+  weather_minio_init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: weather_minio_init
+    depends_on:
+      weather_minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minio_admin} $${MINIO_ROOT_PASSWORD:-minio_password};
+      /usr/bin/mc mb --ignore-existing local/$${MINIO_BUCKET_NAME:-weather-data};
+      exit 0;
+      "
+    restart: "no"
 
 volumes:
   postgres_data:

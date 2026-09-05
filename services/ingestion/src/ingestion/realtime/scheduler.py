@@ -550,6 +550,12 @@ class RealtimeScheduler:
             except Exception:
                 logger.exception("failed to acquire realtime leadership")
                 return 1
+
+        if not dry_run:
+            from ingestion.core.s3 import verify_object_store_preflight
+
+            verify_object_store_preflight(self.settings)
+
         try:
             while not self._stop_event.is_set():
                 if self.leadership is not None and not self._is_leader_active():

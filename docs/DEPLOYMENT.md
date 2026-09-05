@@ -78,6 +78,11 @@ The repository provides multi-stage production Dockerfiles:
 * `MINIO_SECURE`: `true` for HTTPS (production AWS S3 / CloudFlare R2), `false` for plain HTTP (local MinIO).
 * `MINIO_BUCKET_NAME`: Target object storage bucket (default `weather-data`).
 
+#### Object-Store Bucket Provisioning Ownership
+* **Local Docker Compose**: `docker compose up -d` executes a one-shot `weather_minio_init` container (`minio/mc`) that idempotently provisions `weather-data` as soon as `weather_minio` healthcheck passes.
+* **CI Environment**: The GitHub Actions workflow (`.github/workflows/ci.yml`) explicitly creates `weather-data` during MinIO setup.
+* **Production Environment**: The target object storage bucket (`<OBJECT_STORAGE_BUCKET>`) is infrastructure-managed (e.g., via Terraform / AWS IAM / Cloudflare R2 Console) and must exist with appropriate read/write permissions before starting application services. Ingestion and serving tiers run preflight validation to verify bucket existence and fail fast if unprovisioned.
+
 ### 3.2 Ingestion-Specific Settings
 * `NOAA_DOWNLOAD_SOURCE`: `aws_s3` (recommended for production) or `nomads`.
 * `ENABLE_NOMADS_FALLBACK`: `true` (automatically fall back to NOMADS on AWS S3 404 publication lag).

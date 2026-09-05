@@ -647,6 +647,10 @@ def _run_ingest(args: argparse.Namespace) -> int:
             )
         return 0
 
+    from ingestion.core.s3 import verify_object_store_preflight
+
+    verify_object_store_preflight(settings)
+
     failed = 0
     try:
         for spec in run_specs:
