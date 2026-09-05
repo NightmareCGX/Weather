@@ -72,6 +72,7 @@ testpaths = ["tests"]
 python_version = "3.12"
 strict = true
 files = ["src/ingestion"]
+mypy_path = ["../../packages/domain/src", "../api/src"]
 # The SQLAlchemy declarative base (``declarative_base()``) is a runtime-factory
 # function whose return type is ``Any``; every ORM class subclasses it. mypy
 # reports each subclass as an error ("Class cannot subclass Base (has type
