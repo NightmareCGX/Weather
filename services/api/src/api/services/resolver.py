@@ -181,7 +181,7 @@ def resolve_valid_time_candidates(
     from api.services.point_forecast import gated_cycle_metadata
 
     runs_stmt = (
-        select(ModelRun)
+        select(ModelRun.id, ModelRun.cycle_time, ModelRun.zarr_store_path)
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
         .where(Model.model_id == m_id)
@@ -189,13 +189,14 @@ def resolve_valid_time_candidates(
         .where(ModelRun.zarr_store_path.isnot(None))
     )
     runs_stmt = filter_visible_runs(runs_stmt, model_id=m_id)
-    for run in db.execute(runs_stmt).scalars().all():
-        c_utc = _ensure_utc(run.cycle_time)
+    for run_id, cycle_time, store_path in db.execute(runs_stmt).all():
+        if store_path is None:
+            continue
+        c_utc = _ensure_utc(cycle_time)
         if c_utc in product_cycles:
             continue
-        assert run.zarr_store_path is not None
         try:
-            metadata = gated_cycle_metadata(str(run.zarr_store_path))
+            metadata = gated_cycle_metadata(str(store_path))
         except Exception:
             continue
         leads = sorted(metadata.lead_times)
@@ -208,7 +209,7 @@ def resolve_valid_time_candidates(
             if target_valid_time is not None and v_time != _ensure_utc(target_valid_time):
                 continue
             candidates_by_valid.setdefault(v_time, set()).add(
-                (c_utc, lead_num, str(run.id), str(run.zarr_store_path))
+                (c_utc, lead_num, str(run_id), str(store_path))
             )
 
     # Sort each valid_time's candidates by ascending lead (newest cycle first)

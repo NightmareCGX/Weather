@@ -13,7 +13,7 @@ python = "^3.12"
 # ensemble_data, verification). Declare the workspace package as a runtime
 # dependency so a clean install of ``weather-platform-api`` can import it
 # without relying on the developer's environment (ENGINEERING_CONTRACT §6).
-weather-platform-domain = { path = "../../packages/domain" }
+weather-platform-domain = { path = "../../packages/domain", develop = true }
 fastapi = "^0.110.0"
 uvicorn = "^0.28.0"
 sqlalchemy = "^2.0.28"

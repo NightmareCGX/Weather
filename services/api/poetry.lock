@@ -2149,7 +2149,7 @@ optional = false
 python-versions = "^3.12"
 groups = ["main"]
 files = []
-develop = false
+develop = true
 
 [package.dependencies]
 numpy = "^2.0.0"
