@@ -105,7 +105,19 @@ def resolver_test_db(tmp_path):
             name="10m Wind",
             unit="km/h",
         )
-        session.add_all([center, gfs, gefs, v_gfs, v_gefs, grid, var_t2m, var_wind])
+        var_tp = ForecastVariable(
+            id="var_tp",
+            variable_code="precipitation_amount_3h",
+            name="3h Precipitation",
+            unit="mm",
+        )
+        var_tcc = ForecastVariable(
+            id="var_tcc",
+            variable_code="cloud_cover_3h",
+            name="3h Cloud Cover",
+            unit="%",
+        )
+        session.add_all([center, gfs, gefs, v_gfs, v_gefs, grid, var_t2m, var_wind, var_tp, var_tcc])
         session.commit()
 
     yield engine
@@ -360,3 +372,387 @@ def test_resolver_excludes_retired_and_deleted_cycles(resolver_test_db):
         with pytest.raises(HTTPException) as exc:
             resolve_valid_time_source(session, "gfs", target_v, variable="temperature_2m")
         assert exc.value.status_code == 404
+
+
+def test_resolver_instantaneous_variable_at_lead0_wins(resolver_test_db):
+    """Instantaneous variables (temperature_2m) at lead 0 use the newest cycle."""
+    c_prev = _dt(2026, 9, 4, 18)
+    c_curr = _dt(2026, 9, 5, 0)
+    target_v = _dt(2026, 9, 5, 0)
+
+    with Session(resolver_test_db) as session:
+        r_prev = ModelRun(
+            id="run_gfs_prev_inst",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_prev,
+            status="ready",
+            zarr_store_path="/stores/gfs/18z",
+            created_at=c_prev,
+        )
+        r_curr = ModelRun(
+            id="run_gfs_curr_inst",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_curr,
+            status="ready",
+            zarr_store_path="/stores/gfs/00z",
+            created_at=c_curr,
+        )
+        session.add_all([r_prev, r_curr])
+
+        p_prev = ForecastProduct(
+            id="prod_gfs_prev_t2m_06",
+            run_id="run_gfs_prev_inst",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=6,
+        )
+        p_curr = ForecastProduct(
+            id="prod_gfs_curr_t2m_00",
+            run_id="run_gfs_curr_inst",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=0,
+        )
+        session.add_all([p_prev, p_curr])
+        session.commit()
+
+        source = resolve_valid_time_source(session, "gfs", target_v, variable="temperature_2m")
+        assert source.valid_time == target_v
+        assert source.cycle_time == c_curr
+        assert source.lead_time_hours == 0
+        assert source.run_id == "run_gfs_curr_inst"
+
+
+def test_resolver_precipitation_amount_3h_at_lead0_falls_back_to_previous_positive_lead(
+    resolver_test_db,
+):
+    """precipitation_amount_3h at lead 0 falls back to the previous cycle's positive lead."""
+    c_prev = _dt(2026, 9, 4, 18)
+    c_curr = _dt(2026, 9, 5, 0)
+    target_v = _dt(2026, 9, 5, 0)
+
+    with Session(resolver_test_db) as session:
+        r_prev = ModelRun(
+            id="run_gfs_prev_tp",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_prev,
+            status="ready",
+            zarr_store_path="/stores/gfs/18z",
+            created_at=c_prev,
+        )
+        r_curr = ModelRun(
+            id="run_gfs_curr_tp",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_curr,
+            status="ready",
+            zarr_store_path="/stores/gfs/00z",
+            created_at=c_curr,
+        )
+        session.add_all([r_prev, r_curr])
+
+        p_prev = ForecastProduct(
+            id="prod_gfs_prev_tp_06",
+            run_id="run_gfs_prev_tp",
+            variable_id="precipitation_amount_3h",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=6,
+        )
+        p_curr = ForecastProduct(
+            id="prod_gfs_curr_tp_00",
+            run_id="run_gfs_curr_tp",
+            variable_id="precipitation_amount_3h",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=0,
+        )
+        session.add_all([p_prev, p_curr])
+        session.commit()
+
+        source = resolve_valid_time_source(
+            session, "gfs", target_v, variable="precipitation_amount_3h"
+        )
+        assert source.valid_time == target_v
+        assert source.cycle_time == c_prev
+        assert source.lead_time_hours == 6
+        assert source.run_id == "run_gfs_prev_tp"
+
+
+def test_resolver_cloud_cover_3h_at_lead0_falls_back_to_previous_positive_lead(
+    resolver_test_db,
+):
+    """cloud_cover_3h at lead 0 falls back to the previous cycle's positive lead."""
+    c_prev = _dt(2026, 9, 4, 18)
+    c_curr = _dt(2026, 9, 5, 0)
+    target_v = _dt(2026, 9, 5, 0)
+
+    with Session(resolver_test_db) as session:
+        r_prev = ModelRun(
+            id="run_gfs_prev_tcc",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_prev,
+            status="ready",
+            zarr_store_path="/stores/gfs/18z",
+            created_at=c_prev,
+        )
+        r_curr = ModelRun(
+            id="run_gfs_curr_tcc",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_curr,
+            status="ready",
+            zarr_store_path="/stores/gfs/00z",
+            created_at=c_curr,
+        )
+        session.add_all([r_prev, r_curr])
+
+        p_prev = ForecastProduct(
+            id="prod_gfs_prev_tcc_06",
+            run_id="run_gfs_prev_tcc",
+            variable_id="cloud_cover_3h",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=6,
+        )
+        p_curr = ForecastProduct(
+            id="prod_gfs_curr_tcc_00",
+            run_id="run_gfs_curr_tcc",
+            variable_id="cloud_cover_3h",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=0,
+        )
+        session.add_all([p_prev, p_curr])
+        session.commit()
+
+        source = resolve_valid_time_source(
+            session, "gfs", target_v, variable="cloud_cover_3h"
+        )
+        assert source.valid_time == target_v
+        assert source.cycle_time == c_prev
+        assert source.lead_time_hours == 6
+        assert source.run_id == "run_gfs_prev_tcc"
+
+
+def test_resolver_interval_variable_at_positive_lead_stays_on_newest_cycle(
+    resolver_test_db,
+):
+    """Interval variables at positive lead (e.g. +3) stay on the newest cycle without fallback."""
+    c_prev = _dt(2026, 9, 4, 18)
+    c_curr = _dt(2026, 9, 5, 0)
+    target_v = _dt(2026, 9, 5, 3)
+
+    with Session(resolver_test_db) as session:
+        r_prev = ModelRun(
+            id="run_gfs_prev_pos",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_prev,
+            status="ready",
+            zarr_store_path="/stores/gfs/18z",
+            created_at=c_prev,
+        )
+        r_curr = ModelRun(
+            id="run_gfs_curr_pos",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_curr,
+            status="ready",
+            zarr_store_path="/stores/gfs/00z",
+            created_at=c_curr,
+        )
+        session.add_all([r_prev, r_curr])
+
+        # 00Z + 3h = 03Z (newest cycle, positive lead)
+        # 18Z + 9h = 03Z (older cycle)
+        p_curr = ForecastProduct(
+            id="prod_gfs_curr_tp_03",
+            run_id="run_gfs_curr_pos",
+            variable_id="precipitation_amount_3h",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=3,
+        )
+        p_prev = ForecastProduct(
+            id="prod_gfs_prev_tp_09",
+            run_id="run_gfs_prev_pos",
+            variable_id="precipitation_amount_3h",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=9,
+        )
+        session.add_all([p_curr, p_prev])
+        session.commit()
+
+        source = resolve_valid_time_source(
+            session, "gfs", target_v, variable="precipitation_amount_3h"
+        )
+        assert source.valid_time == target_v
+        assert source.cycle_time == c_curr
+        assert source.lead_time_hours == 3
+        assert source.run_id == "run_gfs_curr_pos"
+
+
+def test_resolver_interval_variable_at_lead0_missing_fallback_raises_404(
+    resolver_test_db,
+):
+    """When lead 0 is the only candidate for an interval variable, raise 404 rather than returning lead 0."""
+    c_curr = _dt(2026, 9, 5, 0)
+    target_v = _dt(2026, 9, 5, 0)
+
+    with Session(resolver_test_db) as session:
+        r_curr = ModelRun(
+            id="run_gfs_solo_00z",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_curr,
+            status="ready",
+            zarr_store_path="/stores/gfs/00z",
+            created_at=c_curr,
+        )
+        session.add(r_curr)
+
+        p_t2m = ForecastProduct(
+            id="prod_gfs_solo_t2m_00",
+            run_id="run_gfs_solo_00z",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=0,
+        )
+        p_tp = ForecastProduct(
+            id="prod_gfs_solo_tp_00",
+            run_id="run_gfs_solo_00z",
+            variable_id="precipitation_amount_3h",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=0,
+        )
+        session.add_all([p_t2m, p_tp])
+        session.commit()
+
+        # Instantaneous succeeds
+        source_inst = resolve_valid_time_source(
+            session, "gfs", target_v, variable="temperature_2m"
+        )
+        assert source_inst.cycle_time == c_curr
+        assert source_inst.lead_time_hours == 0
+
+        # Interval variable has no positive-lead fallback -> must raise 404
+        with pytest.raises(HTTPException) as exc:
+            resolve_valid_time_source(
+                session, "gfs", target_v, variable="precipitation_amount_3h"
+            )
+        assert exc.value.status_code == 404
+
+
+def test_resolver_gefs_interval_fallback_respects_member_coverage(
+    resolver_test_db,
+):
+    """Under-covered GEFS fallback (<85% members) is rejected, selecting older covered candidate."""
+    from domain.coverage import get_expected_members, register_expected_members
+
+    old_expected = get_expected_members("gefs", default_if_unknown=30)
+    register_expected_members("gefs", 30)
+
+    try:
+        c_12z = _dt(2026, 9, 4, 12)
+        c_18z = _dt(2026, 9, 4, 18)
+        c_00z = _dt(2026, 9, 5, 0)
+        target_v = _dt(2026, 9, 5, 0)
+
+        with Session(resolver_test_db) as session:
+            r_12z = ModelRun(
+                id="run_gefs_12z_cov",
+                model_version_id="version_gefs_v1.0",
+                cycle_time=c_12z,
+                status="ready",
+                zarr_store_path="/stores/gefs/12z",
+                created_at=c_12z,
+            )
+            r_18z = ModelRun(
+                id="run_gefs_18z_cov",
+                model_version_id="version_gefs_v1.0",
+                cycle_time=c_18z,
+                status="ready",
+                zarr_store_path="/stores/gefs/18z",
+                created_at=c_18z,
+            )
+            r_00z = ModelRun(
+                id="run_gefs_00z_cov",
+                model_version_id="version_gefs_v1.0",
+                cycle_time=c_00z,
+                status="ready",
+                zarr_store_path="/stores/gefs/00z",
+                created_at=c_00z,
+            )
+            session.add_all([r_12z, r_18z, r_00z])
+
+            # 00Z has lead 0h with 30 members
+            p_00z = ForecastProduct(
+                id="prod_gefs_00z_tp_00",
+                run_id="run_gefs_00z_cov",
+                variable_id="precipitation_amount_3h",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=0,
+            )
+            session.add(p_00z)
+            for m in range(1, 31):
+                session.add(
+                    EnsembleMemberProduct(
+                        id=f"emp_cov_00z_{m}",
+                        run_id="run_gefs_00z_cov",
+                        member_index=m,
+                        lead_time_hours=0,
+                    )
+                )
+
+            # 18Z has lead 6h with ONLY 10 members (<85% of 30)
+            p_18z = ForecastProduct(
+                id="prod_gefs_18z_tp_06",
+                run_id="run_gefs_18z_cov",
+                variable_id="precipitation_amount_3h",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=6,
+            )
+            session.add(p_18z)
+            for m in range(1, 11):
+                session.add(
+                    EnsembleMemberProduct(
+                        id=f"emp_cov_18z_{m}",
+                        run_id="run_gefs_18z_cov",
+                        member_index=m,
+                        lead_time_hours=6,
+                    )
+                )
+
+            # 12Z has lead 12h with 30 members (>=85%)
+            p_12z = ForecastProduct(
+                id="prod_gefs_12z_tp_12",
+                run_id="run_gefs_12z_cov",
+                variable_id="precipitation_amount_3h",
+                grid_id="global_025deg",
+                product_type="surface",
+                lead_time_hours=12,
+            )
+            session.add(p_12z)
+            for m in range(1, 31):
+                session.add(
+                    EnsembleMemberProduct(
+                        id=f"emp_cov_12z_{m}",
+                        run_id="run_gefs_12z_cov",
+                        member_index=m,
+                        lead_time_hours=12,
+                    )
+                )
+            session.commit()
+
+            # 18Z + 6h is under-covered -> must skip and select 12Z + 12h!
+            source = resolve_valid_time_source(
+                session, "gefs", target_v, variable="precipitation_amount_3h"
+            )
+            assert source.cycle_time == c_12z
+            assert source.lead_time_hours == 12
+            assert source.run_id == "run_gefs_12z_cov"
+    finally:
+        register_expected_members("gefs", old_expected)

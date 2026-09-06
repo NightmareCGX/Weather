@@ -14,13 +14,14 @@ excluded.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from domain.coverage import (
     compute_coverage_ratio,
     get_expected_members,
     is_lead_servable,
 )
+from domain.temporal import requires_lead0_display_fallback
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -161,6 +162,11 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
         run_status,
         lead,
     ) in rows:
+        c_utc = (
+            cycle_time.replace(tzinfo=timezone.utc)
+            if cycle_time.tzinfo is None
+            else cycle_time.astimezone(timezone.utc)
+        )
         model_acc = by_model.setdefault(
             model_id,
             _ModelAccumulator(name=model_name, is_ensemble=is_ensemble),
@@ -170,7 +176,7 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             _VariableAccumulator(name=variable_name, unit=variable_unit),
         )
         cycle_info = variable_acc.initial_times.setdefault(
-            cycle_time,
+            c_utc,
             _CycleInfo(run_id=run_id, status=run_status),
         )
         cycle_info.leads.add(int(lead))
@@ -310,20 +316,21 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                         )
                     )
 
-                    # Valid time candidate
-                    v_time = cycle_time + timedelta(hours=lead)
-                    cand_v = ValidTimeAvailabilityOut(
-                        valid_time=v_time,
-                        source_cycle=cycle_time,
-                        lead_time_hours=lead,
-                        servable=servable,
-                        available_members=avail_count,
-                        expected_members=expected_members,
-                        coverage_ratio=ratio,
-                    )
-                    ex_v = valid_times_var_map.get(v_time)
-                    if ex_v is None or (cand_v.servable and not ex_v.servable) or (cand_v.servable and cand_v.source_cycle > ex_v.source_cycle):
-                        valid_times_var_map[v_time] = cand_v
+                    # Valid time candidate (interval variables at lead 0 contain NaN and are not servable valid times)
+                    if not (lead == 0 and requires_lead0_display_fallback(variable_code)):
+                        v_time = cycle_time + timedelta(hours=lead)
+                        cand_v = ValidTimeAvailabilityOut(
+                            valid_time=v_time,
+                            source_cycle=cycle_time,
+                            lead_time_hours=lead,
+                            servable=servable,
+                            available_members=avail_count,
+                            expected_members=expected_members,
+                            coverage_ratio=ratio,
+                        )
+                        ex_v = valid_times_var_map.get(v_time)
+                        if ex_v is None or (cand_v.servable and not ex_v.servable) or (cand_v.servable and cand_v.source_cycle > ex_v.source_cycle):
+                            valid_times_var_map[v_time] = cand_v
 
                 initial_times.append(
                     InitialTimeAvailability(
