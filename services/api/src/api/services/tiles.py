@@ -91,6 +91,11 @@ class _TileGrid:
         """The maximum native longitude coordinate of the axis."""
         return self.lon_start + self.lon_step * (self.lon_count - 1)
 
+    @property
+    def is_periodic_lon(self) -> bool:
+        """Whether the longitude axis covers a full periodic 360° domain."""
+        return math.isclose(self.lon_count * self.lon_step, 360.0, rel_tol=1e-5, abs_tol=1e-4)
+
 
 def _pixel_lonlat(zoom: int, x: int, y: int, px: int, py: int) -> tuple[float, float]:
     """Return the (lon, lat) of a tile's pixel at (px, py)."""
@@ -790,93 +795,103 @@ def _slice_field(
         lon_max_idx = max(lon_idx_0, lon_idx_1)
 
         is_ensemble = "member" in dataset.coords or expected_members > 1
-        if variable in ("wind_10m", "wind_speed_10m"):
-            if is_ensemble:
-                members_to_read = tuple(range(1, expected_members + 1))
-                u_stack = [
-                    reader.read_window(
-                        "wind_u_10m",
-                        member=m,
-                        lead_time_hours=lead,
-                        lat_min=lat_min_idx,
-                        lat_max=lat_max_idx,
-                        lon_min=lon_min_idx,
-                        lon_max=lon_max_idx,
-                        generation=generation,
-                    )
-                    for m in members_to_read
-                ]
-                v_stack = [
-                    reader.read_window(
-                        "wind_v_10m",
-                        member=m,
-                        lead_time_hours=lead,
-                        lat_min=lat_min_idx,
-                        lat_max=lat_max_idx,
-                        lon_min=lon_min_idx,
-                        lon_max=lon_max_idx,
-                        generation=generation,
-                    )
-                    for m in members_to_read
-                ]
-                from domain.coverage import is_cell_statistically_valid
 
-                u_arr = np.stack(u_stack, axis=0)
-                v_arr = np.stack(v_stack, axis=0)
-                finite_mask = np.isfinite(u_arr) & np.isfinite(v_arr)
-                finite_counts = np.sum(finite_mask, axis=0)
-                valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
-                speed_members = np.hypot(u_arr, v_arr)
-                with np.errstate(all="ignore"):
-                    mean_speed = np.nanmean(speed_members, axis=0) * 3.6
-                    values = np.where(valid_cells, mean_speed, np.nan)
+        def _read_sharded_window(c_min: int, c_max: int) -> npt.NDArray[np.float64]:
+            if variable in ("wind_10m", "wind_speed_10m"):
+                if is_ensemble:
+                    members_to_read = tuple(range(1, expected_members + 1))
+                    u_stack = [
+                        reader.read_window(
+                            "wind_u_10m",
+                            member=m,
+                            lead_time_hours=lead,
+                            lat_min=lat_min_idx,
+                            lat_max=lat_max_idx,
+                            lon_min=c_min,
+                            lon_max=c_max,
+                            generation=generation,
+                        )
+                        for m in members_to_read
+                    ]
+                    v_stack = [
+                        reader.read_window(
+                            "wind_v_10m",
+                            member=m,
+                            lead_time_hours=lead,
+                            lat_min=lat_min_idx,
+                            lat_max=lat_max_idx,
+                            lon_min=c_min,
+                            lon_max=c_max,
+                            generation=generation,
+                        )
+                        for m in members_to_read
+                    ]
+                    from domain.coverage import is_cell_statistically_valid
+
+                    u_arr = np.stack(u_stack, axis=0)
+                    v_arr = np.stack(v_stack, axis=0)
+                    finite_mask = np.isfinite(u_arr) & np.isfinite(v_arr)
+                    finite_counts = np.sum(finite_mask, axis=0)
+                    valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
+                    speed_members = np.hypot(u_arr, v_arr)
+                    with np.errstate(all="ignore"):
+                        mean_speed = np.nanmean(speed_members, axis=0) * 3.6
+                        return np.asarray(np.where(valid_cells, mean_speed, np.nan), dtype=np.float64)
+                else:
+                    u_win = reader.read_window(
+                        "wind_u_10m",
+                        member=None,
+                        lead_time_hours=lead,
+                        lat_min=lat_min_idx,
+                        lat_max=lat_max_idx,
+                        lon_min=c_min,
+                        lon_max=c_max,
+                        generation=generation,
+                    )
+                    v_win = reader.read_window(
+                        "wind_v_10m",
+                        member=None,
+                        lead_time_hours=lead,
+                        lat_min=lat_min_idx,
+                        lat_max=lat_max_idx,
+                        lon_min=c_min,
+                        lon_max=c_max,
+                        generation=generation,
+                    )
+                    return np.asarray(np.hypot(u_win, v_win) * 3.6, dtype=np.float64)
             else:
-                u_win = reader.read_window(
-                    "wind_u_10m",
-                    member=None,
-                    lead_time_hours=lead,
-                    lat_min=lat_min_idx,
-                    lat_max=lat_max_idx,
-                    lon_min=lon_min_idx,
-                    lon_max=lon_max_idx,
-                    generation=generation,
-                )
-                v_win = reader.read_window(
-                    "wind_v_10m",
-                    member=None,
-                    lead_time_hours=lead,
-                    lat_min=lat_min_idx,
-                    lat_max=lat_max_idx,
-                    lon_min=lon_min_idx,
-                    lon_max=lon_max_idx,
-                    generation=generation,
-                )
-                values = np.hypot(u_win, v_win) * 3.6
-        else:
-            if is_ensemble:
-                members_to_read = tuple(range(1, expected_members + 1))
-                values = reader.read_ensemble_mean_window(
-                    variable,
-                    members=members_to_read,
-                    lead_time_hours=lead,
-                    lat_min=lat_min_idx,
-                    lat_max=lat_max_idx,
-                    lon_min=lon_min_idx,
-                    lon_max=lon_max_idx,
-                    expected_members=expected_members,
-                    generation=generation,
-                )
-            else:
-                values = reader.read_window(
-                    variable,
-                    member=None,
-                    lead_time_hours=lead,
-                    lat_min=lat_min_idx,
-                    lat_max=lat_max_idx,
-                    lon_min=lon_min_idx,
-                    lon_max=lon_max_idx,
-                    generation=generation,
-                )
+                if is_ensemble:
+                    members_to_read = tuple(range(1, expected_members + 1))
+                    return np.asarray(
+                        reader.read_ensemble_mean_window(
+                            variable,
+                            members=members_to_read,
+                            lead_time_hours=lead,
+                            lat_min=lat_min_idx,
+                            lat_max=lat_max_idx,
+                            lon_min=c_min,
+                            lon_max=c_max,
+                            expected_members=expected_members,
+                            generation=generation,
+                        ),
+                        dtype=np.float64,
+                    )
+                else:
+                    return np.asarray(
+                        reader.read_window(
+                            variable,
+                            member=None,
+                            lead_time_hours=lead,
+                            lat_min=lat_min_idx,
+                            lat_max=lat_max_idx,
+                            lon_min=c_min,
+                            lon_max=c_max,
+                            generation=generation,
+                        ),
+                        dtype=np.float64,
+                    )
+
+        values = _read_sharded_window(lon_min_idx, lon_max_idx)
 
         lat_sliced = np.asarray(lat_axis_full[lat_min_idx : lat_max_idx + 1], dtype=float)
         lon_sliced = np.asarray(lon_axis_full[lon_min_idx : lon_max_idx + 1], dtype=float)
@@ -887,6 +902,14 @@ def _slice_field(
         if len(lon_sliced) > 1 and lon_sliced[-1] < lon_sliced[0]:
             values = values[:, ::-1]
             lon_sliced = lon_sliced[::-1]
+
+        if grid.is_periodic_lon and lon_native_max > grid.lon_end:
+            wrap_lon_idx = len(lon_axis_full) - 1 if grid.lon_reversed else 0
+            wrap_values = _read_sharded_window(wrap_lon_idx, wrap_lon_idx)
+            if len(lat_axis_full[lat_min_idx : lat_max_idx + 1]) > 1 and lat_axis_full[lat_max_idx] < lat_axis_full[lat_min_idx]:
+                wrap_values = wrap_values[::-1, :]
+            values = np.concatenate([values, wrap_values], axis=1)
+            lon_sliced = np.append(lon_sliced, grid.lon_start + 360.0)
 
         return (values, lat_sliced, lon_sliced)
 
@@ -957,6 +980,36 @@ def _slice_field(
         if len(lon_sliced) > 1 and lon_sliced[-1] < lon_sliced[0]:
             values = values[:, ::-1]
             lon_sliced = lon_sliced[::-1]
+
+        if grid.is_periodic_lon and lon_native_max > grid.lon_end:
+            wrap_lon_coord = [float(lon_axis_full[-1 if grid.lon_reversed else 0])]
+            wrap_u = field_u.sel(
+                latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
+                longitude=wrap_lon_coord,
+            )
+            wrap_v = field_v.sel(
+                latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
+                longitude=wrap_lon_coord,
+            )
+            if "member" in wrap_u.dims:
+                from domain.coverage import is_cell_statistically_valid
+
+                wrap_u_vals = np.asarray(wrap_u.values, dtype=float)
+                wrap_v_vals = np.asarray(wrap_v.values, dtype=float)
+                f_mask = np.isfinite(wrap_u_vals) & np.isfinite(wrap_v_vals)
+                f_counts = np.sum(f_mask, axis=0)
+                v_cells = is_cell_statistically_valid(f_counts, expected_members)
+                sp_members = np.hypot(wrap_u_vals, wrap_v_vals)
+                with np.errstate(all="ignore"):
+                    m_speed = np.nanmean(sp_members, axis=0) * 3.6
+                    wrap_vals = np.where(v_cells, m_speed, np.nan)
+            else:
+                wrap_vals = np.hypot(wrap_u.values, wrap_v.values) * 3.6
+            if len(lat_sliced) > 1 and wrap_u.latitude.values[-1] < wrap_u.latitude.values[0]:
+                wrap_vals = wrap_vals[::-1, :]
+            values = np.concatenate([values, wrap_vals], axis=1)
+            lon_sliced = np.append(lon_sliced, grid.lon_start + 360.0)
+
         return (values, lat_sliced, lon_sliced)
 
     if variable not in dataset.data_vars:
@@ -1026,6 +1079,40 @@ def _slice_field(
     if len(lon_sliced) > 1 and lon_sliced[-1] < lon_sliced[0]:
         values = values[:, ::-1]
         lon_sliced = lon_sliced[::-1]
+
+    if grid.is_periodic_lon and lon_native_max > grid.lon_end:
+        wrap_lon_coord = [float(lon_axis_full[-1 if grid.lon_reversed else 0])]
+        wrap_sliced = field.sel(
+            latitude=slice(hi_lat, lo_lat) if grid.lat_reversed else slice(lo_lat, hi_lat),
+            longitude=wrap_lon_coord,
+        )
+        if "member" in wrap_sliced.dims:
+            from domain.coverage import is_cell_statistically_valid
+
+            raw_members = np.asarray(wrap_sliced.values, dtype=float)
+            if variable == "cloud_ceiling":
+                valid_mask = np.isfinite(raw_members) & (raw_members >= 0.0)
+                valid_counts = np.sum(valid_mask, axis=0)
+                valid_cells = is_cell_statistically_valid(valid_counts, expected_members)
+                unlimited_mask = raw_members >= 19990.0
+                finite_members = np.where(unlimited_mask, np.nan, raw_members)
+                with np.errstate(all="ignore"):
+                    mean_vals = np.nanmean(finite_members, axis=0)
+                    wrap_vals = np.where(valid_cells, mean_vals, np.nan)
+            else:
+                finite_mask = np.isfinite(raw_members)
+                finite_counts = np.sum(finite_mask, axis=0)
+                valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
+                with np.errstate(all="ignore"):
+                    mean_vals = np.nanmean(raw_members, axis=0)
+                    wrap_vals = np.where(valid_cells, mean_vals, np.nan)
+        else:
+            wrap_vals = np.asarray(wrap_sliced.values, dtype=float)
+        if len(lat_sliced) > 1 and wrap_sliced.latitude.values[-1] < wrap_sliced.latitude.values[0]:
+            wrap_vals = wrap_vals[::-1, :]
+        values = np.concatenate([values, wrap_vals], axis=1)
+        lon_sliced = np.append(lon_sliced, grid.lon_start + 360.0)
+
     return (values, lat_sliced, lon_sliced)
 
 
@@ -1037,7 +1124,10 @@ def _inside_grid(
     """Return a boolean mask of pixels inside the grid's lat/native-lon box."""
     lat_min = grid.lat_start
     lat_max = grid.lat_start + grid.lat_step * (grid.lat_count - 1)
-    return (pixel_lats >= lat_min) & (pixel_lats <= lat_max) & (
+    lat_valid = (pixel_lats >= lat_min) & (pixel_lats <= lat_max)
+    if grid.is_periodic_lon:
+        return lat_valid
+    return lat_valid & (
         lon_native >= grid.lon_start
     ) & (lon_native <= grid.lon_end)
 

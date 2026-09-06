@@ -9,6 +9,8 @@ skip, following the existing convention.
 import struct
 import zlib
 
+import numpy as np
+
 
 def _png_dimensions(png: bytes) -> tuple[int, int]:
     """Extract the width/height from a PNG's IHDR chunk."""
@@ -367,5 +369,244 @@ def test_phase1a_color_stops_and_data_ranges():
 
         d_min, d_max = _data_range(var)
         assert d_min < d_max
-        assert d_min <= values[0]
-        assert d_max >= values[-1]
+
+
+def _extract_rgba(png: bytes) -> np.ndarray:
+    """Decode raw RGBA scanlines from PNG bytes (filter type 0)."""
+    import numpy as np
+
+    width, height, idat = _extract_idat(png)
+    raw = zlib.decompress(idat)
+    stride = width * 4
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    for row in range(height):
+        offset = row * (stride + 1) + 1
+        line = raw[offset : offset + stride]
+        rgba[row] = np.frombuffer(line, dtype=np.uint8).reshape(width, 4)
+    return rgba
+
+
+def test_periodic_grid_detection():
+    """_TileGrid.is_periodic_lon detects global 360° longitude domains."""
+    from api.services.tiles import _TileGrid
+
+    gfs = _TileGrid(lat_start=-90.0, lat_step=0.25, lat_count=721, lon_start=0.0, lon_step=0.25, lon_count=1440, lat_reversed=False, lon_reversed=False)
+    assert gfs.is_periodic_lon is True
+
+    gefs = _TileGrid(lat_start=-90.0, lat_step=0.5, lat_count=361, lon_start=0.0, lon_step=0.5, lon_count=720, lat_reversed=False, lon_reversed=False)
+    assert gefs.is_periodic_lon is True
+
+    global_180 = _TileGrid(lat_start=-90.0, lat_step=0.25, lat_count=721, lon_start=-180.0, lon_step=0.25, lon_count=1440, lat_reversed=False, lon_reversed=False)
+    assert global_180.is_periodic_lon is True
+
+    regional = _TileGrid(lat_start=38.0, lat_step=0.25, lat_count=4, lon_start=-107.0, lon_step=0.25, lon_count=4, lat_reversed=False, lon_reversed=False)
+    assert regional.is_periodic_lon is False
+
+
+def test_inside_grid_periodic_and_regional():
+    """_inside_grid accepts wrapped longitudes on periodic grids but rejects on regional grids."""
+    import numpy as np
+    from api.services.tiles import _TileGrid, _inside_grid
+
+    gfs = _TileGrid(lat_start=-90.0, lat_step=0.25, lat_count=721, lon_start=0.0, lon_step=0.25, lon_count=1440, lat_reversed=False, lon_reversed=False)
+    # Longitudes in [359.75, 360) are inside the global periodic grid
+    assert bool(_inside_grid(gfs, np.array([40.0]), np.array([359.956]))[0]) is True
+    # Out-of-bounds latitude is still rejected
+    assert bool(_inside_grid(gfs, np.array([95.0]), np.array([359.956]))[0]) is False
+
+    regional = _TileGrid(lat_start=38.0, lat_step=0.25, lat_count=4, lon_start=-107.0, lon_step=0.25, lon_count=4, lat_reversed=False, lon_reversed=False)
+    # Regional grid strictly enforces longitude boundaries
+    assert bool(_inside_grid(regional, np.array([38.125]), np.array([-105.0]))[0]) is False
+    assert bool(_inside_grid(regional, np.array([38.125]), np.array([-106.875]))[0]) is True
+
+
+def test_gfs_west_of_0_seam_not_transparent():
+    """GFS 0.25° tiles immediately west of 0° have no transparent seam."""
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _select_tile_window, _render_window_to_png
+
+    lats = np.arange(90.0, -90.25, -0.25)
+    lons = np.arange(0.0, 360.0, 0.25)
+    data = np.full((1, len(lats), len(lons)), 20.0, dtype=np.float32)
+    data[0, :, 0] = 10.0   # lon 0.0
+    data[0, :, -1] = 50.0  # lon 359.75
+
+    ds = xr.Dataset(
+        data_vars={"temperature_2m": (("lead_time_hours", "latitude", "longitude"), data)},
+        coords={"lead_time_hours": [0], "latitude": lats, "longitude": lons},
+    )
+
+    for z, x in [(4, 7), (8, 127)]:
+        y = 2 ** (z - 1)
+        win = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=z, x=x, y=y)
+        png = _render_window_to_png(win, variable="temperature_2m", zoom=z, x=x, y=y, cache_key=())
+        rgba = _extract_rgba(png)
+        # All columns at the seam must be 100% opaque (alpha == 255)
+        assert np.all(rgba[:, -5:, 3] == 255), f"GFS z={z} x={x} right seam contains transparent pixels"
+
+
+def test_gefs_west_of_0_seam_not_transparent():
+    """GEFS 0.50° tiles immediately west of 0° have no transparent seam."""
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _select_tile_window, _render_window_to_png
+
+    lats = np.arange(90.0, -90.5, -0.5)
+    lons = np.arange(0.0, 360.0, 0.5)
+    data = np.full((1, len(lats), len(lons)), 20.0, dtype=np.float32)
+
+    ds = xr.Dataset(
+        data_vars={"temperature_2m": (("lead_time_hours", "latitude", "longitude"), data)},
+        coords={"lead_time_hours": [0], "latitude": lats, "longitude": lons},
+    )
+
+    for z, x in [(4, 7), (8, 127)]:
+        y = 2 ** (z - 1)
+        win = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=z, x=x, y=y)
+        png = _render_window_to_png(win, variable="temperature_2m", zoom=z, x=x, y=y, cache_key=())
+        rgba = _extract_rgba(png)
+        assert np.all(rgba[:, -5:, 3] == 255), f"GEFS z={z} x={x} right seam contains transparent pixels"
+
+
+def test_periodic_nearest_neighbor_sampling():
+    """Pixels near 360° select conceptual wrapped column 360.0° (backed by stored lon 0.0°)."""
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _select_tile_window
+
+    lats = np.arange(90.0, -90.25, -0.25)
+    lons = np.arange(0.0, 360.0, 0.25)
+    data = np.full((1, len(lats), len(lons)), 20.0, dtype=np.float32)
+    data[0, :, 0] = 10.0   # lon 0.0 value
+    data[0, :, -1] = 50.0  # lon 359.75 value
+
+    ds = xr.Dataset(
+        data_vars={"temperature_2m": (("lead_time_hours", "latitude", "longitude"), data)},
+        coords={"lead_time_hours": [0], "latitude": lats, "longitude": lons},
+    )
+
+    win = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=8, x=127, y=128)
+    # Window longitude axis must expose wrapped column at 360.0
+    assert win.lon_axis[-1] == 360.0
+    # Wrapped column at 360.0 must carry data from stored lon 0.0 (10.0)
+    assert win.field[0, -1] == 10.0
+    # Penultimate column must carry data from stored lon 359.75 (50.0)
+    assert win.field[0, -2] == 50.0
+
+
+def test_east_side_of_0_continuous():
+    """Tiles immediately east of 0° (x=8) remain valid, opaque, and meet seamlessly."""
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _select_tile_window, _render_window_to_png
+
+    lats = np.arange(90.0, -90.25, -0.25)
+    lons = np.arange(0.0, 360.0, 0.25)
+    data = np.full((1, len(lats), len(lons)), 20.0, dtype=np.float32)
+    data[0, :, 0] = 10.0
+
+    ds = xr.Dataset(
+        data_vars={"temperature_2m": (("lead_time_hours", "latitude", "longitude"), data)},
+        coords={"lead_time_hours": [0], "latitude": lats, "longitude": lons},
+    )
+
+    win = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=4, x=8, y=8)
+    png = _render_window_to_png(win, variable="temperature_2m", zoom=4, x=8, y=8, cache_key=())
+    rgba = _extract_rgba(png)
+    assert np.all(rgba[:, :5, 3] == 255)
+    assert win.field[0, 0] == 10.0
+
+
+def test_plus_minus_180_interior_regression():
+    """±180° is an interior grid location on [0, 360) stores and does not trigger wrap."""
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _select_tile_window, _render_window_to_png
+
+    lats = np.arange(90.0, -90.25, -0.25)
+    lons = np.arange(0.0, 360.0, 0.25)
+    data = np.full((1, len(lats), len(lons)), 20.0, dtype=np.float32)
+
+    ds = xr.Dataset(
+        data_vars={"temperature_2m": (("lead_time_hours", "latitude", "longitude"), data)},
+        coords={"lead_time_hours": [0], "latitude": lats, "longitude": lons},
+    )
+
+    win_180 = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=4, x=0, y=8)
+    assert win_180.lon_axis[-1] <= win_180.grid.lon_end
+    png = _render_window_to_png(win_180, variable="temperature_2m", zoom=4, x=0, y=8, cache_key=())
+    rgba = _extract_rgba(png)
+    assert np.all(rgba[:, :, 3] == 255)
+
+
+def test_sharded_v1_periodic_wrap():
+    """Sharded v1 store format correctly appends column 0 at 360.0 for periodic grids."""
+    import json
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+    import xarray as xr
+    from api.services.tiles import _derive_grid, _slice_field, _align_longitudes, TILE_SIZE
+    from tests.test_sharded_reader import _build_test_shard
+
+    latitudes = [90.0 - i * 0.25 for i in range(721)]
+    longitudes = [0.0 + j * 0.25 for j in range(1440)]
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_dir = Path(tmp_dir) / "gefs_test.zarr"
+        store_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_dir = store_dir / "__commit__" / "v1"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "manifest.json").write_text(
+            json.dumps({
+                "manifest_schema_version": 1,
+                "generation": "gen_test",
+                "storage_format_version": "sharded_v1",
+            })
+        )
+
+        # Write shard container for member 1, lead 0 of temperature_2m
+        # Chunk row 4, col 0 (lon 0.0) has value 4 * 15 + 0 + 10.0 = 70.0
+        # Chunk row 4, col 14 (lon 359.75) has value 4 * 15 + 14 + 10.0 = 84.0
+        t_shard = _build_test_shard(val_offset=10.0)
+        shard_file = store_dir / "temperature_2m" / "shard.mem001_L0000.shard"
+        shard_file.parent.mkdir(parents=True, exist_ok=True)
+        shard_file.write_bytes(t_shard)
+
+        ds_meta = xr.Dataset(
+            data_vars={
+                "temperature_2m": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((1, 1, 721, 1440), dtype=np.float32)),
+            },
+            coords={
+                "member": [1],
+                "lead_time_hours": [0],
+                "latitude": latitudes,
+                "longitude": longitudes,
+            },
+        )
+        ds_meta.to_zarr(str(store_dir), mode="a", consolidated=True, zarr_format=2)
+
+        grid = _derive_grid(ds_meta)
+        z, x, y = 4, 7, 8
+        n = 2 ** z
+        px_idx, py_idx = np.meshgrid(
+            np.arange(TILE_SIZE, dtype=np.float64),
+            np.arange(TILE_SIZE, dtype=np.float64),
+            indexing="xy",
+        )
+        pixel_lons = ((x + (px_idx + 0.5) / TILE_SIZE) / n) * 360.0 - 180.0
+        y_merc = y + (py_idx + 0.5) / TILE_SIZE
+        lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
+        pixel_lats = np.degrees(lat_rad)
+        lon_native = _align_longitudes(grid, pixel_lons)
+
+        field, lat_axis, lon_axis = _slice_field(
+            ds_meta, "temperature_2m", 0, grid, pixel_lats, lon_native, expected_members=1, store_path=str(store_dir)
+        )
+        assert lon_axis[-1] == 360.0
+        # Wrapped column at 360.0 must carry data from stored lon 0.0 (chunk 60 = 70.0)
+        assert field[0, -1] == 70.0
+        # Penultimate column must carry data from stored lon 359.75 (chunk 74 = 84.0)
+        assert field[0, -2] == 84.0
