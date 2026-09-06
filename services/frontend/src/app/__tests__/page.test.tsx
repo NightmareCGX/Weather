@@ -297,31 +297,31 @@ describe("HomePage", () => {
     expect(mapsCalls.length).toBe(0);
   });
 
-  it("shows the Initial Time and Lead Time controls derived from availability", async () => {
+  it("shows the Valid Time control derived from availability", async () => {
     renderPage();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Initial time")).toBeInTheDocument();
+      expect(screen.getByLabelText("Valid time")).toBeInTheDocument();
     });
-    expect(screen.getByText("2026-08-13 00Z")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(screen.getByLabelText("Lead time")).toBeInTheDocument();
-    });
-    expect(screen.getByText("+0h")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Initial time")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Lead time")).not.toBeInTheDocument();
   });
 
-  it("synchronously updates the map layer when lead time changes (+0h -> +6h)", async () => {
+  it("synchronously updates the map layer when valid time changes", async () => {
     renderPage();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Lead time")).toBeInTheDocument();
+      expect(screen.getByLabelText("Valid time")).toBeInTheDocument();
     });
 
-    // Change lead time to 6
-    fireEvent.change(screen.getByLabelText("Lead time"), { target: { value: "6" } });
-
-    expect(lastRenderedLayer?.lead_time_hours).toBe(6);
-    expect(lastRenderedLayer?.tile_url_template).toContain("lead_time_hours=6");
+    // Change valid time
+    const validSelect = (await screen.findByLabelText("Valid time")) as HTMLSelectElement;
+    const optionEls = validSelect.querySelectorAll("option");
+    if (optionEls.length > 1) {
+      const nextVal = optionEls[1].value;
+      fireEvent.change(validSelect, { target: { value: nextVal } });
+      expect(lastRenderedLayer?.valid_time).toBe(nextVal);
+    }
   });
 
   it("synchronously updates the map layer when variable changes", async () => {

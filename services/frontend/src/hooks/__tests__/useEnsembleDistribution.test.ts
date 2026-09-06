@@ -203,4 +203,19 @@ describe("useEnsembleDistribution", () => {
     await waitFor(() => expect(result.current.status).toBe("success"));
     expect(result.current.data?.lead_time_hours).toBe(12);
   });
+
+  it("requests with valid_time parameter when a string timestamp is passed", async () => {
+    mockFetch.mockResolvedValueOnce(distResponse(6, [15, 16, 17]));
+
+    const { result } = renderHook(() =>
+      useEnsembleDistribution(location, "2026-09-04T06:00:00Z", "temperature_2m", { model: "gefs" })
+    );
+
+    expect(result.current.status).toBe("loading");
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining("valid_time=2026-09-04T06%3A00%3A00Z"),
+      expect.any(Object)
+    );
+  });
 });

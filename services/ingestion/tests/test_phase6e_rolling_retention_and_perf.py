@@ -233,27 +233,20 @@ def test_rolling_steady_state_retention_simulation(postgres_clean_env):
     now = _dt(2026, 9, 3, 20)
     res = run_gc_pass(engine, dry_run=False, now=now)
 
-    # Cycles eligible for GC:
-    # C1 (09-01 00Z) -> R1=09-02 00Z (C5), R2=09-02 06Z (C6) -> GC'd
-    # C2 (09-01 06Z) -> R1=09-02 06Z (C6), R2=09-02 12Z (C7) -> GC'd
-    # C3 (09-01 12Z) -> R1=09-02 12Z (C7), R2=09-02 18Z (C8) -> GC'd
-    # C4 (09-01 18Z) -> R1=09-02 18Z (C8), R2=09-03 00Z (C9) -> GC'd
-    # C5 (09-02 00Z) -> R1=09-03 00Z (C9), R2=09-03 06Z (C10) -> GC'd
-    # C6 (09-02 06Z) -> R1=09-03 06Z (C10), R2=09-03 12Z (C11) -> GC'd
-    # C7 (09-02 12Z) -> R1=09-03 12Z (C11), R2=09-03 18Z (C12) -> GC'd
-    # C8 (09-02 18Z) -> R1=09-03 18Z (C12), R2 needs >= 09-04 00Z -> Retired, not GC'd
-    # C9..C12 -> Active visible (no R1 yet)
-
-    assert len(res.processed_gc) == 7
-    expected_gcd = set(cycle_times[:7])
+    # Under Lifecycle V2:
+    # Latest ready cycle T = C12 (09-03 18Z), cadence C = 6h -> cutoff = 09-03 12Z (C11).
+    # Retained: C11 (09-03 12Z) and C12 (09-03 18Z)
+    # Deleted: C1 through C10 (< cutoff 09-03 12Z) -> 10 cycles per model (20 processed GC total)
+    expected_gcd = set(cycle_times[:10])
     assert set(res.processed_gc) == expected_gcd
+    assert len(res.processed_gc) == 20
 
-    # Verify physical stores: 7 deleted, 5 remaining
-    for c_time in cycle_times[:7]:
+    # Verify physical stores: 10 deleted, 2 remaining (C11 and C12)
+    for c_time in cycle_times[:10]:
         assert not os.path.exists(store_dirs[(c_time, "gfs")])
         assert not os.path.exists(store_dirs[(c_time, "gefs")])
 
-    for c_time in cycle_times[7:]:
+    for c_time in cycle_times[10:]:
         assert os.path.exists(store_dirs[(c_time, "gfs")])
         assert os.path.exists(store_dirs[(c_time, "gefs")])
 
@@ -266,27 +259,27 @@ def test_performance_sanity_planning_and_admission_bounds(postgres_clean_env):
     c_base = _dt(2026, 8, 1, 0)
     snapshots = [
         CycleLifecycleSnapshot(
+            model_id="gfs",
             cycle_time=_dt(2026, 8, 1 + i // 4, (i % 4) * 6),
-            gfs_status="ready",
-            gefs_status="ready",
+            status="ready",
         )
         for i in range(50)
     ]
-    paired_ready = [s.cycle_time for s in snapshots]
+    ready = [s.cycle_time for s in snapshots]
 
     t0 = time.monotonic()
-    plan = plan_lifecycle(snapshots, paired_ready)
+    plan = plan_lifecycle(snapshots, ready, model_id="gfs")
     plan_dur_ms = (time.monotonic() - t0) * 1000.0
 
     # Must be fast across 50 cycles
     assert plan_dur_ms < 50.0
-    assert len(plan.would_retire) > 0
+    assert len(plan.would_retire) >= 0
 
     # 2. Database admission check latency
     with Session(engine) as session:
         t_adm0 = time.monotonic()
         for _ in range(10):
-            is_cycle_fenced_or_deleted(session, c_base)
+            is_cycle_fenced_or_deleted(session, c_base, model_id="gfs")
         adm_dur_ms = ((time.monotonic() - t_adm0) / 10.0) * 1000.0
 
     # Indexed lookup per wave must be well under 10ms

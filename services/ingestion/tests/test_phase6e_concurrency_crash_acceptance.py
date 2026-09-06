@@ -173,8 +173,8 @@ def test_crash_boundary_a_after_claim_before_gfs_delete(postgres_crash_env):
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, c0, c1, c1)
-        claim_cycle_for_deletion(session, c0, now=_dt(2026, 9, 2, 12, 30))
+        mark_cycle_retired(session, "gfs", c0, c1, c1)
+        claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     # Crash occurs before any store delete
     assert os.path.exists(gfs_path)
@@ -187,7 +187,7 @@ def test_crash_boundary_a_after_claim_before_gfs_delete(postgres_crash_env):
     assert not os.path.exists(gefs_path)
 
     with Session(engine) as session:
-        lc = session.get(ForecastCycleLifecycleRecord, c0)
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
         assert lc.deleted_at is not None
 
 
@@ -204,8 +204,8 @@ def test_crash_boundary_b_after_gfs_delete_before_gefs(postgres_crash_env):
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, c0, c1, c1)
-        claim_cycle_for_deletion(session, c0, now=_dt(2026, 9, 2, 12, 30))
+        mark_cycle_retired(session, "gfs", c0, c1, c1)
+        claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0)
     assert not os.path.exists(gfs_path)
@@ -218,7 +218,7 @@ def test_crash_boundary_b_after_gfs_delete_before_gefs(postgres_crash_env):
     assert not os.path.exists(gefs_path)
 
     with Session(engine) as session:
-        lc = session.get(ForecastCycleLifecycleRecord, c0)
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
         assert lc.deleted_at is not None
 
 
@@ -235,8 +235,8 @@ def test_crash_boundary_c_after_both_stores_deleted_before_db_cleanup(postgres_c
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, c0, c1, c1)
-        claim_cycle_for_deletion(session, c0, now=_dt(2026, 9, 2, 12, 30))
+        mark_cycle_retired(session, "gfs", c0, c1, c1)
+        claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0)
     delete_physical_store_gated(engine, gefs_path, timeout_seconds=5.0)
@@ -250,7 +250,7 @@ def test_crash_boundary_c_after_both_stores_deleted_before_db_cleanup(postgres_c
     with Session(engine) as session:
         runs = session.execute(select(ModelRunRecord).where(ModelRunRecord.cycle_time == c0)).scalars().all()
         assert runs == []
-        lc = session.get(ForecastCycleLifecycleRecord, c0)
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
         assert lc.deleted_at is not None
 
 
@@ -267,8 +267,8 @@ def test_crash_boundary_d_db_transaction_rollback_and_retry(postgres_crash_env):
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, c0, c1, c1)
-        claim_cycle_for_deletion(session, c0, now=_dt(2026, 9, 2, 12, 30))
+        mark_cycle_retired(session, "gfs", c0, c1, c1)
+        claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0)
     delete_physical_store_gated(engine, gefs_path, timeout_seconds=5.0)
@@ -282,7 +282,7 @@ def test_crash_boundary_d_db_transaction_rollback_and_retry(postgres_crash_env):
     assert c0 in res.processed_gc
 
     with Session(engine) as session:
-        lc = session.get(ForecastCycleLifecycleRecord, c0)
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
         assert lc.deleted_at is not None
 
 

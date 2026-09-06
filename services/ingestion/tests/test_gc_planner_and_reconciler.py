@@ -1,4 +1,4 @@
-"""Unit tests for Phase 6D GC planner, dry-run, store deleter, and catalog cleanup."""
+"""Unit tests for Phase 6D GC planner, dry-run, store deleter, and catalog cleanup (Lifecycle V2)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ from sqlalchemy.orm import Session
 from ingestion.core.base import CycleTombstonedError
 from ingestion.core.catalog import (
     CenterRecord,
-    EnsembleMemberProductRecord,
-    EnsembleMemberRecord,
     ForecastCycleLifecycleRecord,
     ModelRecord,
     ModelRunRecord,
@@ -103,6 +101,7 @@ def _seed_run(
             cycle_time=cycle_time,
             status=status,
             created_at=cycle_time,
+            zarr_store_path=f"s3://weather-data/{model_id}/{cycle_time.strftime('%Y-%m-%d/%H')}/cycle.zarr",
         )
         session.add(run)
         session.commit()
@@ -111,32 +110,28 @@ def _seed_run(
 
 
 # ---------------------------------------------------------------------------
-# Planner & Re-check Unit Tests
+# Planner & Re-check Unit Tests (Lifecycle V2)
 # ---------------------------------------------------------------------------
 
 
 def test_gc_planner_identifies_eligible_candidates(catalog_engine):
-    c0 = _dt(2026, 9, 1, 0)   # Retired by 09-02 00Z, R2 = 09-02 06Z (GC eligible)
-    c1 = _dt(2026, 9, 1, 6)   # Retired by 09-02 06Z, R2 = 09-02 12Z (GC eligible)
-    c2 = _dt(2026, 9, 1, 12)  # Retired by 09-02 12Z, R2 needs >= 09-02 18Z (not present)
-    c3 = _dt(2026, 9, 1, 18)  # Active visible
+    """Under Lifecycle V2:
+    Latest ready GFS cycle T = 09-02 06Z. Cadence C = 6h. Cutoff = 09-02 00Z.
+    Cycles < 09-02 00Z (09-01 12Z, 09-01 18Z) are eligible for GC.
+    Cycles >= 09-02 00Z (09-02 00Z, 09-02 06Z) are retained.
+    """
+    c0 = _dt(2026, 9, 1, 12)  # < cutoff -> GC eligible
+    c1 = _dt(2026, 9, 1, 18)  # < cutoff -> GC eligible
+    c2 = _dt(2026, 9, 2, 0)   # >= cutoff -> retained
+    c3 = _dt(2026, 9, 2, 6)   # latest ready T -> retained
 
-    r1_0 = _dt(2026, 9, 2, 0)
-    r1_1 = _dt(2026, 9, 2, 6)
-    r1_2 = _dt(2026, 9, 2, 12)
+    # Seed GFS runs
+    _seed_run(catalog_engine, "gfs", c0, "ready")
+    _seed_run(catalog_engine, "gfs", c1, "ready")
+    _seed_run(catalog_engine, "gfs", c2, "ready")
+    _seed_run(catalog_engine, "gfs", c3, "ready")
 
-    with Session(catalog_engine) as session:
-        mark_cycle_retired(session, c0, r1_0, r1_0)
-        mark_cycle_retired(session, c1, r1_1, r1_1)
-        mark_cycle_retired(session, c2, r1_2, r1_2)
-        session.commit()
-
-        # Seed paired-ready runs for R1_0, R1_1, R1_2
-        for t in [r1_0, r1_1, r1_2]:
-            _seed_run(catalog_engine, "gfs", t, "ready")
-            _seed_run(catalog_engine, "gefs", t, "ready")
-
-    res = run_gc_pass(catalog_engine, dry_run=True, now=_dt(2026, 9, 2, 12, 30))
+    res = run_gc_pass(catalog_engine, dry_run=True, models=("gfs",), now=_dt(2026, 9, 2, 12, 30))
     assert res.dry_run is True
     gc_times = [c.cycle_time for c in res.would_gc]
     assert gc_times == [c0, c1]
@@ -150,38 +145,37 @@ def test_recheck_gc_eligibility_safely_rejects_unready_state(catalog_engine):
 
     with Session(catalog_engine) as session:
         # 1. Not in lifecycle table
-        is_el, reason, _ = recheck_gc_eligibility(session, c)
+        is_el, reason, _ = recheck_gc_eligibility(session, "gfs", c)
         assert is_el is False
         assert reason == "no_lifecycle_record"
 
         # 2. Not retired
-        ensure_lifecycle_row(session, c)
+        ensure_lifecycle_row(session, "gfs", c)
         session.commit()
-        is_el2, reason2, _ = recheck_gc_eligibility(session, c)
+        is_el2, reason2, _ = recheck_gc_eligibility(session, "gfs", c)
         assert is_el2 is False
         assert reason2 == "cycle_not_retired"
 
-        # 3. Retired but no R2 paired-ready
-        mark_cycle_retired(session, c, r1, r1)
+        # 3. Retired but no qualifying ready cycle advances cutoff past c
+        mark_cycle_retired(session, "gfs", c, r1, r1)
         session.commit()
-        is_el3, reason3, _ = recheck_gc_eligibility(session, c)
+        is_el3, reason3, _ = recheck_gc_eligibility(session, "gfs", c)
         assert is_el3 is False
-        assert reason3 == "no_qualifying_r2_paired_ready"
+        assert reason3 == "retained_at_or_above_cutoff"
 
-        # 4. R2 appears
-        r2 = _dt(2026, 9, 2, 12)
-        _seed_run(catalog_engine, "gfs", r2, "ready")
-        _seed_run(catalog_engine, "gefs", r2, "ready")
+        # 4. Ready cycle advances cutoff past c (e.g. 09-01 18Z is ready -> cutoff 09-01 12Z > c)
+        t_ready = _dt(2026, 9, 1, 18)
+        _seed_run(catalog_engine, "gfs", t_ready, "ready")
 
-        is_el4, reason4, r2_out = recheck_gc_eligibility(session, c)
+        is_el4, reason4, t_out = recheck_gc_eligibility(session, "gfs", c)
         assert is_el4 is True
-        assert r2_out == r2
+        assert t_out == t_ready
 
         # 5. Already deleted (tombstone)
-        lc = session.get(ForecastCycleLifecycleRecord, c)
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c))
         setattr(lc, "deleted_at", _dt(2026, 9, 2, 13))
         session.commit()
-        is_el5, reason5, _ = recheck_gc_eligibility(session, c)
+        is_el5, reason5, _ = recheck_gc_eligibility(session, "gfs", c)
         assert is_el5 is False
         assert reason5 == "cycle_already_deleted"
 
@@ -212,13 +206,12 @@ def test_delete_store_prefix_local(tmp_path: Path):
 def test_cleanup_cycle_catalog_and_tombstone(catalog_engine):
     c = _dt(2026, 9, 1, 6)
     with Session(catalog_engine) as session:
-        mark_cycle_retired(session, c, _dt(2026, 9, 2, 6), _dt(2026, 9, 2, 6))
+        mark_cycle_retired(session, "gfs", c, _dt(2026, 9, 2, 6), _dt(2026, 9, 2, 6))
         session.commit()
 
         gfs_run = _seed_run(catalog_engine, "gfs", c, "ready")
-        gefs_run = _seed_run(catalog_engine, "gefs", c, "ready")
 
-        # Seed products and members
+        # Seed products
         p1 = ProductRecord(
             id=f"p1_{gfs_run.id}",
             run_id=gfs_run.id,
@@ -227,35 +220,31 @@ def test_cleanup_cycle_catalog_and_tombstone(catalog_engine):
             product_type="surface",
             lead_time_hours=0,
         )
-        m1 = EnsembleMemberRecord(
-            id=f"m1_{gefs_run.id}",
-            run_id=gefs_run.id,
-            member_index=1,
-            member_name="gefs_member_1",
-        )
-        emp1 = EnsembleMemberProductRecord(
-            id=f"emp1_{gefs_run.id}",
-            run_id=gefs_run.id,
-            member_index=1,
-            lead_time_hours=0,
-        )
-        session.add_all([p1, m1, emp1])
+        session.add(p1)
         session.commit()
 
-    # Execute catalog cleanup
+    # Execute catalog cleanup for gfs
     del_time = _dt(2026, 9, 2, 13, 0)
     with Session(catalog_engine) as session:
-        cleanup_cycle_catalog_and_tombstone(session, c, now=del_time)
+        cleanup_cycle_catalog_and_tombstone(session, "gfs", c, now=del_time)
 
-    # Verify cycle rows are removed
+    # Verify cycle rows are removed for gfs
     with Session(catalog_engine) as session:
-        assert session.execute(select(ModelRunRecord).where(ModelRunRecord.cycle_time == c)).scalars().all() == []
+        assert (
+            session.execute(
+                select(ModelRunRecord)
+                .join(ModelVersionRecord, ModelRunRecord.model_version_id == ModelVersionRecord.id)
+                .where(
+                    (ModelVersionRecord.model_id == "gfs")
+                    & (ModelRunRecord.cycle_time == c)
+                )
+            ).scalars().all()
+            == []
+        )
         assert session.execute(select(ProductRecord).where(ProductRecord.run_id == gfs_run.id)).scalars().all() == []
-        assert session.execute(select(EnsembleMemberRecord).where(EnsembleMemberRecord.run_id == gefs_run.id)).scalars().all() == []
-        assert session.execute(select(EnsembleMemberProductRecord).where(EnsembleMemberProductRecord.run_id == gefs_run.id)).scalars().all() == []
 
         # Lifecycle row is retained as tombstone
-        lc = session.get(ForecastCycleLifecycleRecord, c)
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c))
         assert lc is not None
         assert _ensure_utc_datetime(lc.deleted_at) == del_time
         assert _ensure_utc_datetime(lc.retired_by_cycle_time) == _dt(2026, 9, 2, 6)
@@ -269,9 +258,9 @@ def test_cleanup_cycle_catalog_and_tombstone(catalog_engine):
 def test_stale_ingestion_resurrection_rejected(catalog_engine):
     c = _dt(2026, 9, 1, 6)
     with Session(catalog_engine) as session:
-        mark_cycle_retired(session, c, _dt(2026, 9, 2, 6), _dt(2026, 9, 2, 6))
-        cleanup_cycle_catalog_and_tombstone(session, c, now=_dt(2026, 9, 2, 13, 0))
-        assert is_cycle_tombstoned(session, c) is True
+        mark_cycle_retired(session, "gfs", c, _dt(2026, 9, 2, 6), _dt(2026, 9, 2, 6))
+        cleanup_cycle_catalog_and_tombstone(session, "gfs", c, now=_dt(2026, 9, 2, 13, 0))
+        assert is_cycle_tombstoned(session, c, model_id="gfs") is True
 
     # Attempting to record a run for the tombstoned cycle must raise CycleTombstonedError
     spec = RunCatalogSpec(
@@ -284,12 +273,22 @@ def test_stale_ingestion_resurrection_rejected(catalog_engine):
         resolution_km=25.0,
         version_string="v1.0",
         cycle_time=c,
-        grid_id="grid_global",
-        grid_name="Global",
+        grid_id="global_025deg",
+        grid_name="Global 0.25 Degree",
         grid_resolution_km=25.0,
+        product_type="surface",
+        variables=(),
     )
-    dummy_ds = xr.Dataset({"temperature_2m": (("lead_time_hours",), [20.0])}, coords={"lead_time_hours": [0]})
-
+    dataset = xr.Dataset(
+        data_vars={
+            "temperature_2m": (("lead_time_hours", "latitude", "longitude"), [[[20.0]]]),
+        },
+        coords={
+            "lead_time_hours": [0],
+            "latitude": [0.0],
+            "longitude": [0.0],
+        },
+    )
     with Session(catalog_engine) as session:
-        with pytest.raises(CycleTombstonedError, match="claimed for deletion or already tombstoned"):
-            record_run(session, spec, dummy_ds)
+        with pytest.raises(CycleTombstonedError, match="Refusing to ingest"):
+            record_run(session, spec, dataset)

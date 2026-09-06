@@ -176,12 +176,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-api-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock') }}
+          key: poetry-${{ runner.os }}-api-${{ hashFiles('packages/domain/**', 'services/api/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-api-
 
       - name: Install API dependencies
         working-directory: services/api
-        run: poetry install --no-interaction
+        run: |
+          poetry install --no-interaction
+          poetry run pip install --no-deps --force-reinstall -e ../../packages/domain
 
       - name: Ruff check (api)
         working-directory: services/api
@@ -279,12 +281,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-ingestion-${{ hashFiles('packages/domain/pyproject.toml', 'services/ingestion/poetry.lock') }}
+          key: poetry-${{ runner.os }}-ingestion-${{ hashFiles('packages/domain/**', 'services/ingestion/poetry.lock') }}
           restore-keys: poetry-${{ runner.os }}-ingestion-
 
       - name: Install Ingestion dependencies
         working-directory: services/ingestion
-        run: poetry install --no-interaction
+        run: |
+          poetry install --no-interaction
+          poetry run pip install --no-deps --force-reinstall -e ../../packages/domain
 
       - name: Ruff check (ingestion)
         working-directory: services/ingestion

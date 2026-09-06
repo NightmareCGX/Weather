@@ -227,7 +227,9 @@ export type EvidenceState = "exact" | "strongly_inferred" | "ambiguous";
  */
 export interface EnsembleStatisticsData {
   model: string;
-  lead_time_hours: number;
+  lead_time_hours?: number;
+  valid_time?: string;
+  source_cycle?: string;
   member_count: number;
   statistics: EnsembleStatistics;
   members?: number[];
@@ -260,20 +262,33 @@ export interface SpatialLayerLegend {
   stops: LegendStop[];
 }
 
+export interface ValidTimeAvailability {
+  valid_time: string;
+  source_cycle: string;
+  lead_time_hours: number;
+  servable: boolean;
+  available_members: number;
+  expected_members: number;
+  coverage_ratio: number;
+}
+
 export interface LayerDescriptor {
   tile_url_template: string;
   min_zoom: number;
   max_zoom: number;
   legend: SpatialLayerLegend;
   vector_field_url_template?: string | null;
+  valid_time_tile_url_template?: string | null;
+  valid_time_vector_field_url_template?: string | null;
 }
 
-/** A forecast variable and the initial times available for it. */
+/** A forecast variable and the initial times / valid times available for it. */
 export interface VariableAvailability {
   id: string;
   name: string;
   unit: string;
   initial_times: InitialTimeAvailability[];
+  valid_times?: ValidTimeAvailability[];
   layer?: LayerDescriptor | null;
 }
 
@@ -294,7 +309,8 @@ export interface SpatialLayer {
   tile_url_template: string;
   min_zoom: number;
   max_zoom: number;
-  lead_time_hours: number;
+  lead_time_hours?: number | null;
+  valid_time?: string | null;
   legend: SpatialLayerLegend;
   vector_field_url_template?: string | null;
 }

@@ -76,6 +76,7 @@ describe("availability helpers", () => {
     expect(options.variable?.id).toBe("temperature_2m");
     expect(options.initialTimes.length).toBe(2);
     expect(options.leadTimes).toEqual([0, 6, 12, 18]);
+    expect(options.validTimes?.length).toBeGreaterThan(0);
   });
 
   it("computes valid time correctly", () => {
@@ -86,10 +87,28 @@ describe("availability helpers", () => {
 });
 
 describe("resolveSpatialLayer", () => {
-  it("synchronously constructs authoritative SpatialLayer from availability descriptor", () => {
+  it("synchronously constructs authoritative SpatialLayer from availability descriptor with valid_time", () => {
     const layer = resolveSpatialLayer(mockAvailability, {
       model: "gfs",
       variable: "temperature_2m",
+      validTime: "2026-08-13T12:00:00Z",
+    });
+
+    expect(layer).not.toBeNull();
+    expect(layer?.tile_url_template).toBe(
+      "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?valid_time=2026-08-13T12%3A00%3A00Z"
+    );
+    expect(layer?.min_zoom).toBe(0);
+    expect(layer?.max_zoom).toBe(9);
+    expect(layer?.valid_time).toBe("2026-08-13T12:00:00Z");
+    expect(layer?.legend.unit).toBe("°C");
+  });
+
+  it("synchronously constructs authoritative SpatialLayer from availability descriptor with legacy initialTime", () => {
+    const layer = resolveSpatialLayer(mockAvailability, {
+      model: "gfs",
+      variable: "temperature_2m",
+      validTime: "",
       initialTime: "2026-08-13T00:00:00Z",
       leadTimeHours: 12,
     });

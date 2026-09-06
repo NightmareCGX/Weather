@@ -60,7 +60,7 @@ export function WeatherMap({
   const { field } = useVectorField({
     vectorFieldUrl: layer?.vector_field_url_template ?? null,
     availableLeads,
-    currentLead: layer?.lead_time_hours,
+    currentLead: layer?.lead_time_hours ?? undefined,
     enabled: layer !== null && Boolean(layer.vector_field_url_template),
   });
 

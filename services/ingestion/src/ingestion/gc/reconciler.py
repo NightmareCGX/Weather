@@ -1,29 +1,29 @@
-"""Physical GC engine, sequential store deleter, and atomic catalog cleaner.
+"""Physical GC engine, sequential store deleter, and atomic catalog cleaner (Lifecycle V2).
 
 This module owns physical storage reclamation for retired, GC-eligible forecast
-cycles (Phase 6D).
+cycles under Data Lifecycle V2.
 
-Execution Pipeline (per candidate cycle C):
-------------------------------------------
-1. Re-check GC eligibility against durable PostgreSQL catalog state.
-2. Acquire EXCLUSIVE store gate on GFS store -> recursive delete GFS -> release gate.
-3. Acquire EXCLUSIVE store gate on GEFS store -> recursive delete GEFS -> release gate.
-4. Execute atomic PostgreSQL transaction:
-   - Delete cycle's ensemble_member_products rows
-   - Delete cycle's ensemble_members rows
-   - Delete cycle's forecast_products rows
-   - Delete cycle's model_runs rows
-   - Update forecast_cycle_lifecycle.deleted_at = NOW() (tombstone)
+Execution Pipeline (per candidate model cycle M, C):
+----------------------------------------------------
+1. Re-check GC eligibility against durable PostgreSQL catalog state:
+   Cycle C must be older than model M's cutoff (T - C_M).
+2. Acquire EXCLUSIVE store gate on model M's store -> recursive delete S3 prefix -> release gate.
+3. Execute atomic PostgreSQL transaction:
+   - Delete cycle's ensemble_member_products rows for model M
+   - Delete cycle's ensemble_members rows for model M
+   - Delete cycle's forecast_products rows for model M
+   - Delete cycle's model_runs rows for model M
+   - Update forecast_cycle_lifecycle.deleted_at = NOW() for (model_id, cycle_time) (tombstone)
    - Commit transaction
 
 Invariants:
 -----------
-- GFS and GEFS store gates are NEVER held concurrently (deadlock-free).
+- Models are completely independent: GFS cleanup never locks, touches, or deletes GEFS data.
 - If store gate cannot be acquired due to active readers/writers, GC skips the
   cycle for the current pass and retries on the next pass.
 - Missing S3/MinIO prefixes are treated as idempotent success (crash-safe).
 - Dry-run mode makes ZERO mutations (no locks, no deletes, no DB writes).
-- Lifecycle row survives indefinitely as a tombstone.
+- Lifecycle row survives indefinitely as a tombstone for (model_id, cycle_time).
 """
 
 from __future__ import annotations
@@ -39,23 +39,25 @@ from sqlalchemy import delete, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from domain.cadence import canonical_cycle_cadence
 from domain.lifecycle import (
-    RetirementDecision,
+    LifecycleDecision,
     canonical_cycle_store_path,
-    find_r2,
-    plan_lifecycle,
+    compute_lifecycle_cutoff,
+    plan_model_lifecycle,
 )
 from ingestion.core.catalog import (
     EnsembleMemberProductRecord,
     EnsembleMemberRecord,
     ForecastCycleLifecycleRecord,
     ModelRunRecord,
+    ModelVersionRecord,
     ProductRecord,
     _ensure_utc_datetime,
     _utcnow,
     ensure_lifecycle_row,
     list_cycle_lifecycle_snapshots,
-    list_paired_ready_cycle_times,
+    list_model_ready_cycle_times,
     reconcile_cycle_lifecycle,
 )
 from ingestion.core.config import settings
@@ -69,11 +71,15 @@ logger = logging.getLogger(__name__)
 class GcCandidateInfo:
     """Diagnostic info for a GC candidate."""
 
+    model_id: str
     cycle_time: datetime
     retired_by_cycle_time: datetime | None
-    gc_eligible_by_cycle_time: datetime | None
-    gfs_store_path: str
-    gefs_store_path: str
+    cutoff: datetime | None
+    store_path: str
+    # Optional legacy compatibility fields
+    gc_eligible_by_cycle_time: datetime | None = None
+    gfs_store_path: str | None = None
+    gefs_store_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +88,7 @@ class GcPassResult:
 
     dry_run: bool
     evaluated_at: datetime
-    would_retire: tuple[RetirementDecision, ...]
+    would_retire: tuple[LifecycleDecision, ...]
     would_gc: tuple[GcCandidateInfo, ...]
     processed_gc: tuple[datetime, ...]
     blocked_gc: tuple[datetime, ...]
@@ -172,61 +178,66 @@ def delete_physical_store_gated(
 
 def recheck_gc_eligibility(
     session: Session,
+    model_id: str,
     cycle_time: datetime,
     *,
     version_string: str = "v1.0",
 ) -> tuple[bool, str, datetime | None]:
-    """Re-read PostgreSQL state and re-verify that cycle_time is currently GC eligible.
+    """Re-read PostgreSQL state and re-verify that (model_id, cycle_time) is GC eligible.
 
     Monotonic Recovery Rule:
     - If deletion_started_at IS NOT NULL and deleted_at IS NULL:
       The cycle was ALREADY authorized and claimed by a prior GC pass.
       It is valid for deletion resume even if historical successor runs were later cleaned up.
     - If deletion_started_at IS NULL:
-      Requires retired_at IS NOT NULL, retired_by_cycle_time IS NOT NULL, and
-      earliest R2 >= R1 + 6h in current paired-ready catalog state.
+      Requires retired_at IS NOT NULL and cycle_time < cutoff (T - C).
 
     Returns:
-        (is_eligible, reason, r2_time)
+        (is_eligible, reason, latest_ready_T)
     """
     c_utc = _ensure_utc_datetime(cycle_time)
-    lc = session.get(ForecastCycleLifecycleRecord, c_utc)
+    m_id = model_id.lower().strip()
+    lc = session.get(ForecastCycleLifecycleRecord, (m_id, c_utc))
     if lc is None:
         return False, "no_lifecycle_record", None
     if lc.deleted_at is not None:
         return False, "cycle_already_deleted", None
-    if lc.retired_at is None or lc.retired_by_cycle_time is None:
-        return False, "cycle_not_retired", None
-
-    r1 = _ensure_utc_datetime(lc.retired_by_cycle_time)
 
     # Monotonic recovery: if deletion fence was already committed, deletion is authorized to resume
     if lc.deletion_started_at is not None:
-        return True, "gc_claimed_resumable", r1
+        return True, "gc_claimed_resumable", lc.retired_by_cycle_time
 
-    paired_ready = list_paired_ready_cycle_times(session, version_string=version_string)
-    r2 = find_r2(r1, paired_ready)
-    if r2 is None:
-        return False, "no_qualifying_r2_paired_ready", None
-    return True, "gc_eligible", r2
+    if lc.retired_at is None:
+        return False, "cycle_not_retired", None
+
+    ready_cycles = list_model_ready_cycle_times(session, m_id, version_string=version_string)
+    cadence = canonical_cycle_cadence(m_id)
+    t_ready, cutoff = compute_lifecycle_cutoff(ready_cycles, cadence)
+
+    if cutoff is None or c_utc >= cutoff:
+        return False, "retained_at_or_above_cutoff", None
+
+    return True, "gc_eligible", t_ready
 
 
 def claim_cycle_for_deletion(
     session: Session,
+    model_id: str,
     cycle_time: datetime,
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Atomically stamp deletion_started_at on forecast_cycle_lifecycle.
+    """Atomically stamp deletion_started_at on forecast_cycle_lifecycle for (model_id, cycle_time).
 
     Establishes the durable cycle deletion fence before physical store deletion.
     If already claimed (deletion_started_at is not None), returns True (idempotent resume).
     If already deleted (deleted_at is not None), returns False.
     """
     c_utc = _ensure_utc_datetime(cycle_time)
+    m_id = model_id.lower().strip()
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
 
-    lc = ensure_lifecycle_row(session, c_utc)
+    lc = ensure_lifecycle_row(session, m_id, c_utc)
     if lc.deleted_at is not None:
         return False
     if lc.deletion_started_at is not None:
@@ -236,11 +247,13 @@ def claim_cycle_for_deletion(
     setattr(lc, "updated_at", now_utc)
     session.commit()
     logger.info(
-        "gc_cycle_claimed: cycle_time=%s deletion_started_at=%s",
+        "gc_cycle_claimed: model=%s cycle_time=%s deletion_started_at=%s",
+        m_id,
         c_utc.isoformat(),
         now_utc.isoformat(),
         extra={
             "event": "gc_cycle_claimed",
+            "model": m_id,
             "cycle_time": c_utc.isoformat(),
             "deletion_started_at": now_utc.isoformat(),
         },
@@ -250,56 +263,67 @@ def claim_cycle_for_deletion(
 
 def cleanup_cycle_catalog_and_tombstone(
     session: Session,
+    model_id: str,
     cycle_time: datetime,
     *,
     now: datetime | None = None,
 ) -> None:
-    """Atomically delete cycle-scoped catalog rows and stamp deleted_at tombstone."""
+    """Atomically delete model cycle-scoped catalog rows and stamp deleted_at tombstone."""
     c_utc = _ensure_utc_datetime(cycle_time)
+    m_id = model_id.lower().strip()
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
 
-    # 1. Delete child ensemble_member_products rows
-    session.execute(
-        delete(EnsembleMemberProductRecord).where(
-            EnsembleMemberProductRecord.run_id.in_(
-                select(ModelRunRecord.id).where(ModelRunRecord.cycle_time == c_utc)
+    # Discover run IDs for this model and cycle_time
+    run_ids = list(
+        session.execute(
+            select(ModelRunRecord.id)
+            .join(ModelVersionRecord, ModelRunRecord.model_version_id == ModelVersionRecord.id)
+            .where(
+                (ModelVersionRecord.model_id == m_id)
+                & (ModelRunRecord.cycle_time == c_utc)
             )
-        )
+        ).scalars().all()
     )
 
-    # 2. Delete child ensemble_members rows
-    session.execute(
-        delete(EnsembleMemberRecord).where(
-            EnsembleMemberRecord.run_id.in_(
-                select(ModelRunRecord.id).where(ModelRunRecord.cycle_time == c_utc)
+    if run_ids:
+        # 1. Delete child ensemble_member_products rows
+        session.execute(
+            delete(EnsembleMemberProductRecord).where(
+                EnsembleMemberProductRecord.run_id.in_(run_ids)
             )
         )
-    )
 
-    # 3. Delete child forecast_products rows
-    session.execute(
-        delete(ProductRecord).where(
-            ProductRecord.run_id.in_(
-                select(ModelRunRecord.id).where(ModelRunRecord.cycle_time == c_utc)
+        # 2. Delete child ensemble_members rows
+        session.execute(
+            delete(EnsembleMemberRecord).where(
+                EnsembleMemberRecord.run_id.in_(run_ids)
             )
         )
-    )
 
-    # 4. Delete model_runs rows for cycle_time
-    session.execute(
-        delete(ModelRunRecord).where(ModelRunRecord.cycle_time == c_utc)
-    )
+        # 3. Delete child forecast_products rows
+        session.execute(
+            delete(ProductRecord).where(
+                ProductRecord.run_id.in_(run_ids)
+            )
+        )
+
+        # 4. Delete model_runs rows for this model and cycle_time
+        session.execute(
+            delete(ModelRunRecord).where(ModelRunRecord.id.in_(run_ids))
+        )
 
     # 5. Update tombstone on forecast_cycle_lifecycle
-    lc = ensure_lifecycle_row(session, c_utc)
+    lc = ensure_lifecycle_row(session, m_id, c_utc)
     setattr(lc, "deleted_at", now_utc)
     setattr(lc, "updated_at", now_utc)
     session.commit()
     logger.info(
-        "gc_catalog_cleanup_completed: cycle_time=%s",
+        "gc_catalog_cleanup_completed: model=%s cycle_time=%s",
+        m_id,
         c_utc.isoformat(),
         extra={
             "event": "gc_catalog_cleanup_completed",
+            "model": m_id,
             "cycle_time": c_utc.isoformat(),
         },
     )
@@ -319,18 +343,22 @@ def process_gc_candidate(
     Returns True if deletion and catalog cleanup succeeded, False if skipped/blocked.
     """
     c_utc = candidate.cycle_time
+    m_id = candidate.model_id.lower().strip() if candidate.model_id else "gfs"
+
     # 1. Re-check eligibility against fresh catalog state
     with Session(engine) as session:
-        is_eligible, reason, r2 = recheck_gc_eligibility(
-            session, c_utc, version_string=version_string
+        is_eligible, reason, t_ready = recheck_gc_eligibility(
+            session, m_id, c_utc, version_string=version_string
         )
     if not is_eligible:
         logger.warning(
-            "gc_candidate_skipped: cycle_time=%s reason=%s",
+            "gc_candidate_skipped: model=%s cycle_time=%s reason=%s",
+            m_id,
             c_utc.isoformat(),
             reason,
             extra={
                 "event": "gc_candidate_skipped",
+                "model": m_id,
                 "cycle_time": c_utc.isoformat(),
                 "reason": reason,
             },
@@ -339,36 +367,35 @@ def process_gc_candidate(
 
     # 2. Atomically establish durable deletion fence before touching storage
     with Session(engine) as session:
-        claimed = claim_cycle_for_deletion(session, c_utc, now=now)
+        claimed = claim_cycle_for_deletion(session, m_id, c_utc, now=now)
     if not claimed:
         return False
 
-    # 3. Sequential gated physical store deletion (GFS first)
-    gfs_deleted = delete_physical_store_gated(
-        engine,
-        candidate.gfs_store_path,
-        timeout_seconds=timeout_seconds,
-    )
-    if not gfs_deleted:
-        return False
+    # 3. Gated physical store deletion
+    stores_to_delete: list[str] = []
+    if candidate.store_path:
+        stores_to_delete.append(candidate.store_path)
+    elif candidate.gfs_store_path and candidate.gefs_store_path:
+        stores_to_delete.extend([candidate.gfs_store_path, candidate.gefs_store_path])
 
-    # 4. Sequential gated physical store deletion (GEFS second)
-    gefs_deleted = delete_physical_store_gated(
-        engine,
-        candidate.gefs_store_path,
-        timeout_seconds=timeout_seconds,
-    )
-    if not gefs_deleted:
-        return False
+    for s_path in stores_to_delete:
+        deleted = delete_physical_store_gated(
+            engine,
+            s_path,
+            timeout_seconds=timeout_seconds,
+        )
+        if not deleted:
+            return False
 
-    # 5. Atomic catalog cleanup and tombstone commit
+    # 4. Atomic catalog cleanup and tombstone commit
     with Session(engine) as session:
-        cleanup_cycle_catalog_and_tombstone(session, c_utc, now=now)
+        cleanup_cycle_catalog_and_tombstone(session, m_id, c_utc, now=now)
 
     logger.info(
-        "gc_completed: cycle_time=%s",
+        "gc_completed: model=%s cycle_time=%s",
+        m_id,
         c_utc.isoformat(),
-        extra={"event": "gc_completed", "cycle_time": c_utc.isoformat()},
+        extra={"event": "gc_completed", "model": m_id, "cycle_time": c_utc.isoformat()},
     )
     return True
 
@@ -377,19 +404,21 @@ def run_gc_pass(
     engine: Engine,
     *,
     dry_run: bool = False,
+    models: tuple[str, ...] = ("gfs", "gefs"),
     version_string: str = "v1.0",
     base_bucket: str = "weather-data",
     timeout_seconds: float = 5.0,
     now: datetime | None = None,
 ) -> GcPassResult:
-    """Execute one complete GC pass (discovery, planning, retirement, deletion).
+    """Execute one complete GC pass across managed models under Lifecycle V2.
 
     In dry_run mode: plans without taking exclusive locks or mutating S3/PostgreSQL.
-    In real mode: persists retirements and deletes GC-eligible stores sequentially.
+    In real mode: persists retirements and deletes GC-eligible stores sequentially per model.
 
     Args:
         engine: SQLAlchemy Engine for catalog and advisory lock coordination.
         dry_run: If True, execute observational planning only.
+        models: Tuple of model identifiers to reconcile and GC.
         version_string: Target model version string.
         base_bucket: S3/MinIO bucket name.
         timeout_seconds: Timeout for exclusive store gate acquisition.
@@ -399,20 +428,14 @@ def run_gc_pass(
         GcPassResult with structured diagnostics.
     """
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
-    logger.info("gc_pass_started: dry_run=%s now=%s", dry_run, now_utc.isoformat())
+    logger.info("gc_pass_started: dry_run=%s now=%s models=%s", dry_run, now_utc.isoformat(), models)
 
     with Session(engine) as session:
         if not dry_run:
-            # 1. Reconcile newly eligible retirements
-            reconcile_cycle_lifecycle(session, now=now_utc, version_string=version_string)
+            # 1. Reconcile newly eligible retirements per model
+            reconcile_cycle_lifecycle(session, models=models, now=now_utc, version_string=version_string)
 
-        # 2. Query snapshots and paired-ready state
-        snapshots = list_cycle_lifecycle_snapshots(session, version_string=version_string)
-        paired_ready = list_paired_ready_cycle_times(session, version_string=version_string)
-
-        # 3. Discover recorded store paths from model_runs for accurate deletion
-        from ingestion.core.catalog import ModelVersionRecord
-
+        # 2. Discover recorded store paths from model_runs for accurate deletion
         runs = session.execute(
             select(
                 ModelVersionRecord.model_id,
@@ -422,53 +445,59 @@ def run_gc_pass(
             .join(ModelVersionRecord, ModelRunRecord.model_version_id == ModelVersionRecord.id)
             .where(
                 (ModelVersionRecord.version_string == version_string)
-                & (ModelVersionRecord.model_id.in_(["gfs", "gefs"]))
+                & (ModelVersionRecord.model_id.in_(models))
             )
         ).all()
-        store_paths_by_cycle: dict[tuple[datetime, str], str] = {}
+        store_paths_by_cycle: dict[tuple[str, datetime], str] = {}
         for m_id, c_time, z_path in runs:
             if z_path:
-                store_paths_by_cycle[(_ensure_utc_datetime(c_time), str(m_id))] = str(z_path)
+                store_paths_by_cycle[(str(m_id), _ensure_utc_datetime(c_time))] = str(z_path)
 
-    # 4. Plan lifecycle transitions deterministically
-    plan = plan_lifecycle(snapshots, paired_ready)
+        all_would_retire: list[LifecycleDecision] = []
+        all_would_gc_candidates: list[GcCandidateInfo] = []
+        all_blocked: list[datetime] = []
 
-    would_gc_candidates = tuple(
-        GcCandidateInfo(
-            cycle_time=g.cycle_time,
-            retired_by_cycle_time=g.retired_by_cycle_time,
-            gc_eligible_by_cycle_time=g.gc_eligible_by_cycle_time,
-            gfs_store_path=store_paths_by_cycle.get(
-                (g.cycle_time, "gfs"),
-                canonical_cycle_store_path("gfs", g.cycle_time, base_bucket=base_bucket),
-            ),
-            gefs_store_path=store_paths_by_cycle.get(
-                (g.cycle_time, "gefs"),
-                canonical_cycle_store_path("gefs", g.cycle_time, base_bucket=base_bucket),
-            ),
-        )
-        for g in plan.would_gc
-    )
+        for m_id in models:
+            ready = list_model_ready_cycle_times(session, m_id, version_string=version_string)
+            snapshots = list_cycle_lifecycle_snapshots(session, model_id=m_id, version_string=version_string)
+            plan = plan_model_lifecycle(m_id, snapshots, ready)
+
+            all_would_retire.extend(plan.would_retire)
+            for g in plan.would_gc:
+                store_path = store_paths_by_cycle.get(
+                    (m_id, g.cycle_time),
+                    canonical_cycle_store_path(m_id, g.cycle_time, base_bucket=base_bucket),
+                )
+                all_would_gc_candidates.append(
+                    GcCandidateInfo(
+                        model_id=m_id,
+                        cycle_time=g.cycle_time,
+                        retired_by_cycle_time=g.retired_by_cycle_time,
+                        cutoff=g.cutoff,
+                        store_path=store_path,
+                        gc_eligible_by_cycle_time=g.retired_by_cycle_time,
+                        gfs_store_path=store_path if m_id == "gfs" else None,
+                        gefs_store_path=store_path if m_id == "gefs" else None,
+                    )
+                )
+            all_blocked.extend(b.cycle_time for b in plan.blocked)
 
     if dry_run:
         logger.info(
-            "gc_dry_run_plan: would_retire=%d would_gc=%d active_visible=%d",
-            len(plan.would_retire),
-            len(would_gc_candidates),
-            len(plan.active_visible_cycles),
+            "gc_dry_run_plan: would_retire=%d would_gc=%d",
+            len(all_would_retire),
+            len(all_would_gc_candidates),
             extra={
                 "event": "gc_dry_run_plan",
-                "would_retire": [r.cycle_time.isoformat() for r in plan.would_retire],
-                "would_gc": [g.cycle_time.isoformat() for g in would_gc_candidates],
-                "active_visible": [c.isoformat() for c in plan.active_visible_cycles],
-                "already_deleted": [d.isoformat() for d in plan.deleted_cycles],
+                "would_retire": [f"{r.model_id}:{r.cycle_time.isoformat()}" for r in all_would_retire],
+                "would_gc": [f"{g.model_id}:{g.cycle_time.isoformat()}" for g in all_would_gc_candidates],
             },
         )
         return GcPassResult(
             dry_run=True,
             evaluated_at=now_utc,
-            would_retire=plan.would_retire,
-            would_gc=would_gc_candidates,
+            would_retire=tuple(all_would_retire),
+            would_gc=tuple(all_would_gc_candidates),
             processed_gc=(),
             blocked_gc=(),
             locked_gc=(),
@@ -480,7 +509,9 @@ def run_gc_pass(
     locked: list[datetime] = []
     failed: list[datetime] = []
 
-    for candidate in would_gc_candidates:
+    all_would_gc_candidates.sort(key=lambda c: c.cycle_time)
+
+    for candidate in all_would_gc_candidates:
         try:
             success = process_gc_candidate(
                 engine,
@@ -496,11 +527,13 @@ def run_gc_pass(
                 locked.append(candidate.cycle_time)
         except Exception as exc:
             logger.error(
-                "gc_candidate_failed: cycle_time=%s error=%s",
+                "gc_candidate_failed: model=%s cycle_time=%s error=%s",
+                candidate.model_id,
                 candidate.cycle_time.isoformat(),
                 exc,
                 extra={
                     "event": "gc_candidate_failed",
+                    "model": candidate.model_id,
                     "cycle_time": candidate.cycle_time.isoformat(),
                     "error": str(exc),
                 },
@@ -516,10 +549,10 @@ def run_gc_pass(
     return GcPassResult(
         dry_run=False,
         evaluated_at=now_utc,
-        would_retire=plan.would_retire,
-        would_gc=would_gc_candidates,
+        would_retire=tuple(all_would_retire),
+        would_gc=tuple(all_would_gc_candidates),
         processed_gc=tuple(processed),
-        blocked_gc=tuple(g.cycle_time for g in plan.gc_eligibilities if not g.is_gc_eligible),
+        blocked_gc=tuple(all_blocked),
         locked_gc=tuple(locked),
         failed_gc=tuple(failed),
     )

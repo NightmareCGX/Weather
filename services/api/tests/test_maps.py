@@ -145,3 +145,32 @@ def test_maps_negative_lead_time_422(client):
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["type"] == "validation_error"
+
+
+def test_maps_valid_time(client):
+    """Under Lifecycle V2, /v1/maps serves metadata by valid_time."""
+    resp = client.get(
+        "/v1/maps?model=gfs&variable=temperature_2m"
+        "&level=surface&valid_time=2026-07-21T06:00:00Z"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    data = body["data"]
+    assert data["tile_url_template"] == (
+        "/v1/maps/gfs/temperature_2m/surface/"
+        "{z}/{x}/{y}.png?valid_time=2026-07-21T06:00:00Z"
+    )
+    assert data["valid_time"] == "2026-07-21T06:00:00Z"
+    assert data["lead_time_hours"] == 6
+
+
+def test_maps_conflicting_valid_and_initial_time_rejected(client):
+    """Passing both valid_time and initial_time returns 422."""
+    resp = client.get(
+        "/v1/maps?model=gfs&variable=temperature_2m"
+        "&level=surface&valid_time=2026-07-21T06:00:00Z"
+        "&initial_time=2026-07-21T00:00:00Z"
+    )
+    assert resp.status_code == 422
+    assert "Provide either valid_time or initial_time" in resp.json()["error"]["message"]

@@ -22,7 +22,7 @@ import {
   toPdfPoints,
 } from "@/lib/forecast/transform";
 import { formatPercent, formatValue } from "@/lib/forecast/labels";
-import { formatLeadTimeHours } from "@/lib/forecast/time";
+import { formatDayHourUtc, formatLeadTimeHours } from "@/lib/forecast/time";
 import type { DistributionStatus } from "@/hooks/useEnsembleDistribution";
 import type { EnsembleStatisticsData } from "@/lib/api/types";
 
@@ -31,8 +31,8 @@ interface EnsembleDistributionProps {
   data: EnsembleStatisticsData | null;
   status: DistributionStatus;
   error: string | null;
-  /** The lead time whose distribution to show. */
-  selectedLead: number;
+  /** The lead time or valid time whose distribution to show. */
+  selectedLead: number | string;
   variableLabel: string;
 }
 
@@ -80,11 +80,16 @@ export function EnsembleDistribution({
     );
   }
 
+  const timeLabel =
+    typeof selectedLead === "string"
+      ? `${formatDayHourUtc(selectedLead)} UTC`
+      : formatLeadTimeHours(selectedLead);
+
   if (data === null) {
     return (
       <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
         <p className="text-xs text-slate-600">
-          No ensemble distribution available for {formatLeadTimeHours(selectedLead)}.
+          No ensemble distribution available for {timeLabel}.
         </p>
       </div>
     );
@@ -98,8 +103,8 @@ export function EnsembleDistribution({
     return (
       <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
         <p className="text-xs text-slate-600">
-          Ensemble distribution for {variableLabel} at {formatLeadTimeHours(selectedLead)} is not
-          yet available: the API returned no raw member values. The summary above is shown instead.
+          Ensemble distribution for {variableLabel} at {timeLabel} is not yet available: the API
+          returned no raw member values. The summary above is shown instead.
         </p>
       </div>
     );
@@ -169,8 +174,8 @@ export function EnsembleDistribution({
         <div className="mb-1 flex items-baseline justify-between">
           <h4 className="text-sm font-medium text-slate-800">
             {isCeiling
-              ? `Conditional finite distribution · ${formatLeadTimeHours(selectedLead)}`
-              : `Member distribution · ${formatLeadTimeHours(selectedLead)}`}
+              ? `Conditional finite distribution · ${timeLabel}`
+              : `Member distribution · ${timeLabel}`}
           </h4>
           <span className="text-xs text-slate-500">
             {isCeiling ? `${finiteCount} finite members` : `${memberCount} members`}
@@ -260,7 +265,7 @@ export function EnsembleDistribution({
 
         <div
           role="img"
-          aria-label={`Member values for ${variableLabel} at ${formatLeadTimeHours(selectedLead)}`}
+          aria-label={`Member values for ${variableLabel} at ${timeLabel}`}
           className="mt-2 h-12 w-full"
         >
           <ResponsiveContainer width="100%" height="100%">

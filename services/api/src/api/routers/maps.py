@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response as StarletteResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -99,8 +100,17 @@ def get_spatial_layer(
         Query(description="The vertical level; only 'surface' is supported."),
     ],
     lead_time_hours: Annotated[
-        int, Query(ge=0, description="Forecast offset hours from cycle time.")
-    ],
+        int | None, Query(ge=0, description="Forecast offset hours from cycle time.")
+    ] = None,
+    valid_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest "
+                "serveable cycle capable of providing this valid time."
+            )
+        ),
+    ] = None,
     initial_time: Annotated[
         str | None,
         Query(
@@ -114,37 +124,64 @@ def get_spatial_layer(
 ) -> SpatialLayerEnvelope:
     """Return the tile template and legend for a weather map layer.
 
-    The model and variable must exist in the catalog, and a ready run with a
-    matching forecast product must be available for the requested
-    model/variable/level/lead/initial-time combination; otherwise 404 is
-    raised so the client never builds a template for data that does not exist.
+    Under Lifecycle V2, supports either ``valid_time`` or ``lead_time_hours`` (with optional ``initial_time``).
     """
     _require_model(db, model)
     unit = _legend_unit(db, variable)
-    _require_available(db, model, variable, level, lead_time_hours, initial_time)
 
+    if valid_time is not None and initial_time is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either valid_time or initial_time, not both.",
+        )
+    if valid_time is None and lead_time_hours is None:
+        raise RequestValidationError(
+            [{"loc": ("query", "lead_time_hours"), "msg": "Field required", "type": "missing"}]
+        )
 
-    template_path = (
-        f"/v1/maps/{model}/{variable}/{level}/{{z}}/{{x}}/{{y}}.png"
-        f"?lead_time_hours={lead_time_hours}"
-    )
-    if initial_time is not None:
-        template_path += f"&initial_time={initial_time}"
+    resolved_valid = None
+    if valid_time is not None:
+        from api.services.resolver import resolve_valid_time_source
 
-    vector_field_template: str | None = None
-    if variable in ("wind_10m", "wind_speed_10m"):
+        source = resolve_valid_time_source(db, model, valid_time, variable=variable)
+        resolved_lead = source.lead_time_hours
+        resolved_valid = source.valid_time
+        template_path = (
+            f"/v1/maps/{model}/{variable}/{level}/{{z}}/{{x}}/{{y}}.png"
+            f"?valid_time={valid_time}"
+        )
         vector_field_template = (
-            f"/v1/maps/{model}/wind_10m/vector-field"
-            f"?lead_time_hours={lead_time_hours}"
+            f"/v1/maps/{model}/wind_10m/vector-field?valid_time={valid_time}"
+            if variable in ("wind_10m", "wind_speed_10m")
+            else None
+        )
+    else:
+        assert lead_time_hours is not None
+        resolved_lead = lead_time_hours
+        _require_available(db, model, variable, level, resolved_lead, initial_time)
+
+        template_path = (
+            f"/v1/maps/{model}/{variable}/{level}/{{z}}/{{x}}/{{y}}.png"
+            f"?lead_time_hours={resolved_lead}"
         )
         if initial_time is not None:
-            vector_field_template += f"&initial_time={initial_time}"
+            template_path += f"&initial_time={initial_time}"
+
+        vector_field_template = None
+        if variable in ("wind_10m", "wind_speed_10m"):
+            vector_field_template = (
+                f"/v1/maps/{model}/wind_10m/vector-field"
+                f"?lead_time_hours={resolved_lead}"
+            )
+            if initial_time is not None:
+                vector_field_template += f"&initial_time={initial_time}"
 
     data = SpatialLayerData(
         tile_url_template=template_path,
         min_zoom=MIN_ZOOM,
         max_zoom=MAX_ZOOM,
-        lead_time_hours=lead_time_hours,
+        lead_time_hours=resolved_lead,
+        valid_time=resolved_valid,
         legend=SpatialLayerLegend(unit=unit, stops=_legend_stops(variable)),
         vector_field_url_template=vector_field_template,
     )
@@ -160,8 +197,16 @@ def get_spatial_layer(
 def get_wind_vector_field(
     model: str,
     lead_time_hours: Annotated[
-        int, Query(ge=0, description="Forecast offset hours from cycle time.")
-    ],
+        int | None, Query(ge=0, description="Forecast offset hours from cycle time.")
+    ] = None,
+    valid_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC valid time (Lifecycle V2)."
+            )
+        ),
+    ] = None,
     initial_time: Annotated[
         str | None,
         Query(
@@ -172,11 +217,7 @@ def get_wind_vector_field(
     ] = None,
     db: Session = DB,
 ) -> StarletteResponse:
-    """Return the quantized Int16 binary wind vector field for particle flow animation.
-
-    For GFS: returns canonical zonal (u) and meridional (v) velocity components.
-    For GEFS: returns the consensus mean vector field (mean(u_i), mean(v_i)).
-    """
+    """Return the quantized Int16 binary wind vector field for particle flow animation."""
     from api.services.vector_field import render_vector_field_binary
 
     try:
@@ -184,6 +225,7 @@ def get_wind_vector_field(
             db,
             model=model,
             lead_time_hours=lead_time_hours,
+            valid_time=valid_time,
             initial_time=initial_time,
         )
     except ValueError as exc:
@@ -209,8 +251,16 @@ def get_map_tile(
     x: int,
     y: int,
     lead_time_hours: Annotated[
-        int, Query(ge=0, description="Forecast offset hours from cycle time.")
-    ],
+        int | None, Query(ge=0, description="Forecast offset hours from cycle time.")
+    ] = None,
+    valid_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC valid time (Lifecycle V2)."
+            )
+        ),
+    ] = None,
     initial_time: Annotated[
         str | None,
         Query(
@@ -221,13 +271,7 @@ def get_map_tile(
     ] = None,
     db: Session = DB,
 ) -> StarletteResponse:
-    """Render a 256x256 PNG tile of the forecast field for the selection.
-
-    The tile reads genuine values from the run's Zarr store for the requested
-    model/variable/initial time/lead time and colors them by the variable's
-    ramp. Tiles are served with a short cache policy so newly ingested runs
-    become visible promptly.
-    """
+    """Render a 256x256 PNG tile of the forecast field for the selection."""
     try:
         png = render_tile_png(
             db,
@@ -238,6 +282,7 @@ def get_map_tile(
             x=x,
             y=y,
             lead_time_hours=lead_time_hours,
+            valid_time=valid_time,
             initial_time=initial_time,
         )
     except ValueError as exc:

@@ -189,6 +189,7 @@ def test_retired_cycle_filtered_by_api_lifecycle(db_session: Session) -> None:
 
     # Mark c_old as retired in forecast_cycle_lifecycle
     lifecycle_old = ForecastCycleLifecycle(
+        model_id="gfs",
         cycle_time=c_old,
         retired_at=datetime.now(timezone.utc),
         retired_by_cycle_time=c_new,
@@ -218,6 +219,7 @@ def test_deletion_fenced_cycle_rejected_and_safely_skipped(db_session: Session) 
 
     # Set deletion_started_at fence on cycle (GC deletion claim)
     fence = ForecastCycleLifecycle(
+        model_id="gfs",
         cycle_time=cycle,
         deletion_started_at=datetime.now(timezone.utc),
     )

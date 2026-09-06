@@ -125,13 +125,16 @@ beforeEach(() => {
 });
 
 describe("LayerControls (data-driven)", () => {
-  it("renders model, variable, initial time, and lead time controls derived from availability", async () => {
+  it("renders model, variable, and valid time controls derived from availability", async () => {
     renderControls();
 
     expect(await screen.findByLabelText("Model")).toBeInTheDocument();
     expect(screen.getByLabelText("Variable")).toBeInTheDocument();
-    expect(screen.getByLabelText("Initial time")).toBeInTheDocument();
-    expect(screen.getByLabelText("Lead time")).toBeInTheDocument();
+    expect(screen.getByLabelText("Valid time")).toBeInTheDocument();
+
+    // Initial time and Lead time are removed
+    expect(screen.queryByLabelText("Initial time")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Lead time")).not.toBeInTheDocument();
 
     // Only the database-driven options appear.
     expect(screen.getByText("Global Forecast System")).toBeInTheDocument();
@@ -141,20 +144,15 @@ describe("LayerControls (data-driven)", () => {
     expect(screen.getByText("Wind Gust")).toBeInTheDocument();
     expect(screen.getByText("Visibility")).toBeInTheDocument();
     expect(screen.getByText("Snow Depth")).toBeInTheDocument();
-    expect(screen.getByText("2026-08-13 00Z")).toBeInTheDocument();
-    expect(screen.getByText("+6h")).toBeInTheDocument();
+    expect(screen.getByText("Aug 13, 06:00 UTC")).toBeInTheDocument();
   });
 
-  it("does not render hard-coded lead times that are not available", async () => {
+  it("does not render removed lead time or initial time dropdowns", async () => {
     renderControls();
 
-    await screen.findByLabelText("Lead time");
-    // The database has only +6h; none of the previously hard-coded +0h/+12h/... appear.
-    expect(screen.queryByText("+0h")).not.toBeInTheDocument();
-    expect(screen.queryByText("+12h")).not.toBeInTheDocument();
-    expect(screen.queryByText("+24h")).not.toBeInTheDocument();
-    expect(screen.queryByText("+48h")).not.toBeInTheDocument();
-    expect(screen.queryByText("+72h")).not.toBeInTheDocument();
+    await screen.findByLabelText("Valid time");
+    expect(screen.queryByLabelText("Lead time")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Initial time")).not.toBeInTheDocument();
   });
 
   it("shows a loading state while availability is being fetched", () => {

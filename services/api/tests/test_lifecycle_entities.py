@@ -17,6 +17,7 @@ def test_forecast_cycle_lifecycle_entity_crud() -> None:
 
     with Session(engine) as session:
         record = ForecastCycleLifecycle(
+            model_id="gfs",
             cycle_time=cycle_time,
             retired_at=retired_at,
             retired_by_cycle_time=retired_by,
@@ -25,7 +26,7 @@ def test_forecast_cycle_lifecycle_entity_crud() -> None:
         session.commit()
 
         # Retrieve and verify
-        row = session.get(ForecastCycleLifecycle, cycle_time)
+        row = session.get(ForecastCycleLifecycle, ("gfs", cycle_time))
         assert row is not None
 
         def _utc(dt: datetime | None) -> datetime | None:
@@ -35,6 +36,7 @@ def test_forecast_cycle_lifecycle_entity_crud() -> None:
                 return dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
 
+        assert row.model_id == "gfs"
         assert _utc(row.cycle_time) == cycle_time
         assert _utc(row.retired_at) == retired_at
         assert _utc(row.retired_by_cycle_time) == retired_by

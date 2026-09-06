@@ -279,7 +279,8 @@ poetry run weather-ingest realtime
    ```
 
 ### Operational Invariants:
-* **Deletion Fencing:** GC sets `deletion_started_at = NOW()` on `forecast_cycle_lifecycle` **before** deleting physical S3 keys.
+* **Lifecycle V2 Cadence Retention:** For each model M with cadence C_M (e.g. 6h for GFS/GEFS), let T be the latest run with status == 'ready'. Cycles >= T - C_M are retained (T and T - C_M); cycles < T - C_M are deletion eligible. Models advance retention and GC independently.
+* **Deletion Fencing:** GC sets `deletion_started_at = NOW()` on `forecast_cycle_lifecycle` for `(model_id, cycle_time)` **before** deleting physical S3 keys.
 * **Crash Safety:** If GC crashes mid-deletion, the durable fence prevents new ingestion writers from resurrecting the cycle; the next GC run detects the incomplete deletion and purges remaining objects.
 
 ---

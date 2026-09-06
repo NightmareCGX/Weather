@@ -109,6 +109,8 @@ class LayerDescriptor(BaseModel):
     max_zoom: int
     legend: SpatialLayerLegend
     vector_field_url_template: str | None = None
+    valid_time_tile_url_template: str | None = None
+    valid_time_vector_field_url_template: str | None = None
 
 
 class LeadAvailabilityOut(BaseModel):
@@ -144,8 +146,38 @@ class InitialTimeAvailability(BaseModel):
         return format_datetime_utc(value)
 
 
+class ValidTimeAvailabilityOut(BaseModel):
+    """A valid time available for a model variable under Lifecycle V2.
+
+    Attributes:
+        valid_time: The UTC valid datetime.
+        source_cycle: The newest committed cycle providing this valid time.
+        lead_time_hours: The lead offset from source cycle.
+        servable: Whether the lead is servable.
+        available_members: Number of available ensemble members.
+        expected_members: Expected ensemble members for the model.
+        coverage_ratio: Member coverage ratio in [0.0, 1.0].
+    """
+
+    valid_time: datetime
+    source_cycle: datetime
+    lead_time_hours: int
+    servable: bool
+    available_members: int
+    expected_members: int
+    coverage_ratio: float
+
+    @field_serializer("valid_time")
+    def _serialize_valid_time(self, value: datetime) -> str:
+        return format_datetime_utc(value)
+
+    @field_serializer("source_cycle")
+    def _serialize_source_cycle(self, value: datetime) -> str:
+        return format_datetime_utc(value)
+
+
 class VariableAvailability(BaseModel):
-    """A forecast variable and the initial times available for it.
+    """A forecast variable and the initial times / valid times available for it.
 
     Attributes:
         id: The ``forecast_variables.variable_code`` (e.g.
@@ -153,7 +185,9 @@ class VariableAvailability(BaseModel):
         name: Human-readable variable name.
         unit: The registered SI unit string (e.g. ``°C``).
         initial_times: The initial times with data for this
-            model/variable, newest first.
+            model/variable, newest first (legacy compatibility).
+        valid_times: The unified, cross-cycle valid times available for this
+            model/variable under Lifecycle V2, ascending.
         layer: Authoritative map layer descriptor for rendering tiles and
             legends without an extra metadata roundtrip.
     """
@@ -162,6 +196,7 @@ class VariableAvailability(BaseModel):
     name: str
     unit: str
     initial_times: list[InitialTimeAvailability]
+    valid_times: list[ValidTimeAvailabilityOut] = []
     layer: LayerDescriptor | None = None
 
 
@@ -336,7 +371,9 @@ class ProbabilityForecastData(BaseModel):
     variable: str
     threshold: float
     operator: str
-    lead_time_hours: int
+    lead_time_hours: int | None = None
+    valid_time: datetime | None = None
+    source_cycle: datetime | None = None
     probability: float
     confidence_interval_95: list[float]
     threshold_max: float | None = None
@@ -351,10 +388,15 @@ class ProbabilityForecastData(BaseModel):
             "variable": self.variable,
             "threshold": self.threshold,
             "operator": self.operator,
-            "lead_time_hours": self.lead_time_hours,
             "probability": self.probability,
             "confidence_interval_95": self.confidence_interval_95,
         }
+        if self.lead_time_hours is not None:
+            payload["lead_time_hours"] = self.lead_time_hours
+        if self.valid_time is not None:
+            payload["valid_time"] = format_datetime_utc(self.valid_time)
+        if self.source_cycle is not None:
+            payload["source_cycle"] = format_datetime_utc(self.source_cycle)
         if self.operator == "between" and self.threshold_max is not None:
             payload["threshold_max"] = self.threshold_max
         if self.direction_sector is not None:
@@ -374,18 +416,21 @@ class ProbabilityForecastEnvelope(BaseModel):
 
 
 class SpatialLayerData(BaseModel):
-    """The payload of a spatial layer (API.md section 4.1).
-
-    ``tile_url_template`` is a self-referential template for a future tile
-    endpoint; map tile generation is out of scope for Milestone 10.
-    """
+    """The payload of a spatial layer (API.md section 4.1)."""
 
     tile_url_template: str
     min_zoom: int
     max_zoom: int
-    lead_time_hours: int
+    lead_time_hours: int | None = None
+    valid_time: datetime | None = None
     legend: SpatialLayerLegend
     vector_field_url_template: str | None = None
+
+    @field_serializer("valid_time")
+    def _serialize_valid_time(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return format_datetime_utc(value)
 
 
 class SpatialLayerEnvelope(BaseModel):
@@ -456,7 +501,9 @@ class EnsembleStatisticsData(BaseModel):
     """
 
     model: str
-    lead_time_hours: int
+    lead_time_hours: int | None = None
+    valid_time: datetime | None = None
+    source_cycle: datetime | None = None
     member_count: int
     statistics: EnsembleStatistics
     members: list[float] | None = None
@@ -475,10 +522,15 @@ class EnsembleStatisticsData(BaseModel):
         """Omit ``members`` and ``pdf`` unless include_members=true."""
         payload: dict[str, object] = {
             "model": self.model,
-            "lead_time_hours": self.lead_time_hours,
             "member_count": self.member_count,
             "statistics": self.statistics,
         }
+        if self.lead_time_hours is not None:
+            payload["lead_time_hours"] = self.lead_time_hours
+        if self.valid_time is not None:
+            payload["valid_time"] = format_datetime_utc(self.valid_time)
+        if self.source_cycle is not None:
+            payload["source_cycle"] = format_datetime_utc(self.source_cycle)
         if self.members is not None:
             payload["members"] = self.members
             payload["pdf"] = self.pdf

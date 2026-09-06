@@ -213,6 +213,18 @@ def test_ensemble_tile_reduces_member_dimension_to_mean():
             assert abs(field[i, j] - expected[i, j]) < 1e-6
 
 
+def test_tile_renders_with_valid_time(client):
+    """Under Lifecycle V2, raster tiles can be requested via valid_time."""
+    resp = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png?valid_time=2026-07-21T06:00:00Z"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"] == "image/png"
+    width, height = _png_dimensions(resp.content)
+    assert (width, height) == (256, 256)
+    assert _png_has_opaque_pixels(resp.content)
+
+
 def _derive_grid_fixture(dataset):
     """Small helper: derive the grid for the fixture ensemble dataset."""
     from api.services.tiles import _derive_grid

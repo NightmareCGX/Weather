@@ -7,9 +7,10 @@ calls the ensemble-data and cache services, and serializes the documented
 ``ensemble_statistics`` envelope.
 """
 
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
@@ -57,8 +58,17 @@ def get_ensemble_statistics(
     # API.md section 5.1 which documents the parameter as optional with
     # ``Default: 0``.
     lead_time_hours: Annotated[
-        int, Query(ge=0, description="Forecast offset hours from cycle time.")
-    ] = 0,
+        int | None, Query(ge=0, description="Forecast offset hours from cycle time.")
+    ] = None,
+    valid_time: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest "
+                "serveable cycle capable of providing this valid time."
+            )
+        ),
+    ] = None,
     # ``include_members`` is an opt-in additive extension (API.md section 5.1):
     # when true, the response additionally carries the raw ensemble-member
     # forecast values for the Ensemble Distribution View. Statistics-only
@@ -81,38 +91,69 @@ def get_ensemble_statistics(
 ) -> EnsembleStatisticsEnvelope:
     """Return ensemble dispersion statistics for a forecast variable.
 
-    The ensemble model (default ``gefs``) must exist and be an ensemble model;
-    member values are interpolated at the requested point and lead time. When
-    ``include_members=true`` the genuine raw member values are attached. An
-    optional ``initial_time`` pins the forecast run.
+    Under Lifecycle V2:
+    - If ``valid_time`` is supplied, the newest committed source cycle and lead
+      are dynamically resolved via the shared ValidTimeResolver.
+    - If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead
+      serving is preserved for backward compatibility.
     """
-    if initial_time is not None:
-        require_cycle_visible(db, initial_time)
+    from api.services.resolver import resolve_valid_time_source
 
-    cycle_time = resolve_latest_run_cycle_time(db, model, initial_time)
-    store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
-        db, model, initial_time
-    )
-    # Release DB connection immediately before S3 manifest read, Redis query, and stats compute.
-    db.close()
+    if valid_time is not None and initial_time is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either valid_time or initial_time, not both.",
+        )
 
-    serving_generation = resolve_serving_generation_for_store(
-        store_path, latest_retired_iso
-    )
+    resolved_valid_time: datetime | None = None
+    resolved_source_cycle: datetime | None = None
+    target_initial: str | None = None
+    cycle_time: str | None = None
+    store_path: str | None = None
+    serving_generation: str | None = None
+    resolved_lead: int = 0
+
+    if valid_time is not None:
+        source = resolve_valid_time_source(db, model, valid_time, variable=variable)
+        resolved_lead = source.lead_time_hours
+        cycle_time = source.cycle_time.isoformat().replace("+00:00", "Z")
+        store_path = source.store_path
+        serving_generation = source.serving_generation
+        target_initial = cycle_time
+        resolved_valid_time = source.valid_time
+        resolved_source_cycle = source.cycle_time
+        db.close()
+    else:
+        resolved_lead = lead_time_hours if lead_time_hours is not None else 0
+        target_initial = initial_time
+        if target_initial is not None:
+            require_cycle_visible(db, target_initial, model_id=model)
+
+        cycle_time = resolve_latest_run_cycle_time(db, model, target_initial)
+        store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+            db, model, target_initial
+        )
+        db.close()
+
+        serving_generation = resolve_serving_generation_for_store(
+            store_path, latest_retired_iso
+        )
+
     cache_key = build_ensemble_cache_key(
         model=model,
         latitude=lat,
         longitude=lon,
         variable=variable,
-        lead_time_hours=lead_time_hours,
+        lead_time_hours=resolved_lead,
         include_members=include_members,
         cycle_time=cycle_time,
         serving_generation=serving_generation,
+        valid_time=valid_time,
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&model={model}"
-        f"&lead_time_hours={lead_time_hours}&include_members={include_members}"
-        f"&initial_time={initial_time}"
+        f"&lead_time_hours={resolved_lead}&include_members={include_members}"
+        f"&initial_time={target_initial}&valid_time={valid_time}"
     )
 
     envelope = _cache.compute_or_retrieve(
@@ -124,9 +165,11 @@ def get_ensemble_statistics(
             lon,
             variable,
             model,
-            lead_time_hours,
+            resolved_lead,
             include_members,
-            initial_time,
+            target_initial,
+            resolved_valid_time,
+            resolved_source_cycle,
         ),
         model_type=EnsembleStatisticsEnvelope,
     )
@@ -142,6 +185,8 @@ def _compute(
     lead_time_hours: int,
     include_members: bool,
     initial_time: str | None,
+    valid_time_dt: datetime | None = None,
+    source_cycle_dt: datetime | None = None,
 ) -> EnsembleStatisticsEnvelope:
     from api.core.database import SessionLocal
 
@@ -156,5 +201,8 @@ def _compute(
             include_members=include_members,
             initial_time=initial_time,
         )
-    return EnsembleStatisticsEnvelope(data=data)
+        if valid_time_dt is not None:
+            data.valid_time = valid_time_dt
+        if source_cycle_dt is not None:
+            data.source_cycle = source_cycle_dt
     return EnsembleStatisticsEnvelope(data=data)

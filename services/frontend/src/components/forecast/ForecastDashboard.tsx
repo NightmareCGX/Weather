@@ -93,7 +93,12 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
     model: ensembleModel,
   });
 
-  const distributionLead = selection?.leadTimeHours ?? options.leadTimes[0] ?? 0;
+  const distributionLead =
+    selection?.validTime ??
+    options.validTimes?.[0] ??
+    selection?.leadTimeHours ??
+    options.leadTimes[0] ??
+    0;
   const distribution = useEnsembleDistribution(location, distributionLead, ensembleVariable, {
     model: ensembleModel,
   });

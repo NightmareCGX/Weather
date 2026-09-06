@@ -7,38 +7,66 @@ import type {
 } from "@/lib/api/types";
 
 /**
- * Pure, deterministic helpers for the data-driven forecast selection workflow.
+ * Pure, deterministic helpers for the data-driven forecast selection workflow (Lifecycle V2).
  *
- * Every option in the Model / Variable / Initial Time / Lead Time selectors
- * is derived from the backend's forecast availability response (which is in
- * turn generated from the database), so the UI never hard-codes what forecast
- * data exists. Changing an upstream selection narrows the downstream options
- * to exactly what the availability data allows.
+ * The selection model is:
+ *   Model -> Variable -> Valid Time
+ *
+ * User-facing Initial Time and Lead Time controls are removed. Valid times are
+ * derived from the backend availability response and filtered by the 3-hour UI
+ * grace window:
+ *   visible if: valid_time >= now - 3h
+ *   hidden if:  valid_time < now - 3h (strictly <)
  */
 
-/** A full forecast selection (mirrors the map configuration). */
+/** A full forecast selection under Lifecycle V2. */
 export interface ForecastSelection {
   model: string;
   variable: string;
-  initialTime: string;
-  leadTimeHours: number;
+  validTime?: string;
+  // Legacy optional fields for backward compatibility during transition
+  initialTime?: string;
+  leadTimeHours?: number;
 }
 
-/** The options currently available at each level of the selection cascade. */
+/** The options currently available at each level of the selection. */
 export interface ForecastOptions {
   models: ModelAvailability[];
-  /** The selected model's availability, or null when none selected. */
   model: ModelAvailability | null;
-  /** The selected model's variables, or empty. */
   variables: VariableAvailability[];
-  /** The selected variable's initial times, or empty. */
-  initialTimes: InitialTimeAvailability[];
-  /** The selected variable's availability, or null when none selected. */
   variable: VariableAvailability | null;
-  /** The selected initial time's availability, or null when none selected. */
+  /** Selectable valid times within the 3-hour grace window, ascending. */
+  validTimes?: string[];
+  /** Legacy initial times (for backward compatibility with existing tests). */
+  initialTimes: InitialTimeAvailability[];
   initialTime: InitialTimeAvailability | null;
-  /** The available lead times for the current selection, ascending. */
+  /** Legacy lead times (for backward compatibility with existing tests). */
   leadTimes: number[];
+}
+
+export const GRACE_WINDOW_HOURS = 3;
+
+/**
+ * Check whether a valid time falls within the 3-hour UI grace window:
+ *   visible if: valid_time >= now - 3h
+ *   hidden if:  valid_time < now - 3h (strictly <)
+ */
+export function isWithinGraceWindow(validTime: string | null, nowMs: number = Date.now()): boolean {
+  if (validTime === null) return false;
+  const t = new Date(validTime).getTime();
+  if (Number.isNaN(t)) return false;
+  const threshold = nowMs - GRACE_WINDOW_HOURS * 3600 * 1000;
+  return t >= threshold;
+}
+
+/**
+ * Filter an array of valid times by the 3-hour UI grace window.
+ */
+export function filterGraceWindowValidTimes(
+  validTimes: string[],
+  nowMs: number = Date.now()
+): string[] {
+  return validTimes.filter((vt) => isWithinGraceWindow(vt, nowMs));
 }
 
 /** Pick the first model in availability (or null when empty). */
@@ -58,10 +86,7 @@ export function findModel(
   return availability.models.find((model) => model.id === modelId) ?? null;
 }
 
-/**
- * Pick the first variable of a model that has at least one initial time.
- * Returns null when the model has no available variables.
- */
+/** Pick the first variable of a model that has available data. */
 export function defaultVariable(model: ModelAvailability | null): string | null {
   if (model === null || model.variables.length === 0) {
     return null;
@@ -81,9 +106,39 @@ export function findVariable(
 }
 
 /**
- * Pick the first initial time of a variable (newest first), or null when the
- * variable has no initial times.
+ * Extract all unique valid times for a variable (from valid_times or synthesized
+ * from legacy initial_times), sorted chronologically ascending.
  */
+export function extractVariableValidTimes(variable: VariableAvailability | null): string[] {
+  if (variable === null) {
+    return [];
+  }
+  if (variable.valid_times && variable.valid_times.length > 0) {
+    const times = new Set(variable.valid_times.map((vt) => vt.valid_time));
+    return Array.from(times).sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+  }
+
+  // Fallback synthesis from legacy initial_times: cycle_time + lead_time_hours
+  const times = new Set<string>();
+  for (const it of variable.initial_times) {
+    const base = new Date(it.value);
+    if (Number.isNaN(base.getTime())) continue;
+    for (const lead of it.lead_time_hours) {
+      const vt = new Date(base);
+      vt.setUTCHours(vt.getUTCHours() + lead);
+      times.add(vt.toISOString());
+    }
+  }
+  return Array.from(times).sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+}
+
+/** Pick the default valid time (first available valid time within grace window). */
+export function defaultValidTime(validTimes: string[], nowMs: number = Date.now()): string | null {
+  const filtered = filterGraceWindowValidTimes(validTimes, nowMs);
+  return filtered.length > 0 ? filtered[0] : validTimes.length > 0 ? validTimes[0] : null;
+}
+
+/** Legacy helper: default initial time */
 export function defaultInitialTime(variable: VariableAvailability | null): string | null {
   if (variable === null || variable.initial_times.length === 0) {
     return null;
@@ -91,7 +146,7 @@ export function defaultInitialTime(variable: VariableAvailability | null): strin
   return variable.initial_times[0].value;
 }
 
-/** Resolve an initial time within a variable to its availability entry (or null). */
+/** Legacy helper: find initial time */
 export function findInitialTime(
   variable: VariableAvailability | null,
   initialTime: string | null
@@ -102,25 +157,19 @@ export function findInitialTime(
   return variable.initial_times.find((entry) => entry.value === initialTime) ?? null;
 }
 
-/**
- * Pick the first lead time of an initial time, or null when none exists.
- */
+/** Legacy helper: default lead time */
 export function defaultLeadTime(initialTime: InitialTimeAvailability | null): number | null {
   const leads = initialTime?.lead_time_hours ?? [];
   return leads.length > 0 ? leads[0] : null;
 }
 
 /**
- * Build the cascading options for a selection from availability.
- *
- * The returned structure contains exactly the options the current selection
- * makes available at each downstream level, plus the resolved availability
- * entries. Callers use this to render the selectors and to reset stale
- * downstream selections when an upstream selection changes.
+ * Build the options for a selection from availability, filtered by grace window.
  */
 export function buildForecastOptions(
   availability: ForecastAvailability | null,
-  selection: ForecastSelection | null
+  selection: ForecastSelection | null,
+  nowMs: number = Date.now()
 ): ForecastOptions {
   if (availability === null) {
     return emptyOptions();
@@ -129,17 +178,22 @@ export function buildForecastOptions(
   const model = selection !== null ? findModel(availability, selection.model) : null;
   const variable =
     model !== null && selection !== null ? findVariable(model, selection.variable) : null;
+
+  const allValidTimes = extractVariableValidTimes(variable);
+  const selectableValidTimes = filterGraceWindowValidTimes(allValidTimes, nowMs);
+
   const initialTime =
-    variable !== null && selection !== null
+    variable !== null && selection !== null && selection.initialTime
       ? findInitialTime(variable, selection.initialTime)
-      : null;
+      : (variable?.initial_times[0] ?? null);
 
   return {
     models: availability.models,
     model,
     variables: model?.variables ?? [],
-    initialTimes: variable?.initial_times ?? [],
     variable,
+    validTimes: selectableValidTimes.length > 0 ? selectableValidTimes : allValidTimes,
+    initialTimes: variable?.initial_times ?? [],
     initialTime,
     leadTimes: initialTime?.lead_time_hours ?? [],
   };
@@ -150,16 +204,16 @@ function emptyOptions(): ForecastOptions {
     models: [],
     model: null,
     variables: [],
-    initialTimes: [],
     variable: null,
+    validTimes: [],
+    initialTimes: [],
     initialTime: null,
     leadTimes: [],
   };
 }
 
 /**
- * Compute the valid time for a selection: `initial_time + lead_time_hours`
- * (DATABASE.md section 1). Returns null when either part is missing.
+ * Compute valid time string from (initialTime, leadTimeHours) if provided.
  */
 export function resolveValidTime(
   initialTime: string | null,
@@ -178,14 +232,7 @@ export function resolveValidTime(
 
 /**
  * Synchronously construct the authoritative SpatialLayer for a valid selection
- * using the backend-provided layer descriptor on the variable in availability.
- *
- * Interpolates `{lead_time_hours}` and `{initial_time}` into the backend's
- * authoritative tile URL template pattern, preserving backend URL authority
- * while eliminating the redundant `/v1/maps` metadata network roundtrip.
- *
- * Returns null if the selection is incomplete, not present in availability,
- * or lacks a layer descriptor.
+ * under Lifecycle V2 using the backend-provided layer descriptor.
  */
 export function resolveSpatialLayer(
   availability: ForecastAvailability | null,
@@ -199,35 +246,75 @@ export function resolveSpatialLayer(
   if (variable === null || !variable.layer) {
     return null;
   }
-  const initial = findInitialTime(variable, selection.initialTime);
-  if (initial === null || !initial.lead_time_hours.includes(selection.leadTimeHours)) {
+
+  // Validate availability before constructing layer
+  if (selection.validTime) {
+    const selMs = new Date(selection.validTime).getTime();
+    const validTimes = extractVariableValidTimes(variable);
+    const hasValid = validTimes.some((vt) => new Date(vt).getTime() === selMs);
+    if (!hasValid) {
+      return null;
+    }
+  } else if (selection.initialTime && selection.leadTimeHours !== undefined) {
+    const initial = findInitialTime(variable, selection.initialTime);
+    if (initial === null || !initial.lead_time_hours.includes(selection.leadTimeHours)) {
+      return null;
+    }
+  } else {
     return null;
   }
 
-  const { tile_url_template, min_zoom, max_zoom, legend, vector_field_url_template } =
-    variable.layer;
-  // Substitute selection parameters into the backend-supplied URL template pattern
-  const tileUrl = tile_url_template
-    .replace("{lead_time_hours}", String(selection.leadTimeHours))
-    .replace("{initial_time}", encodeURIComponent(selection.initialTime));
+  const {
+    tile_url_template,
+    valid_time_tile_url_template,
+    valid_time_vector_field_url_template,
+    min_zoom,
+    max_zoom,
+    legend,
+    vector_field_url_template,
+  } = variable.layer;
 
+  let tileUrl: string;
   let vectorFieldUrl: string | null = null;
-  if (vector_field_url_template) {
-    vectorFieldUrl = vector_field_url_template
-      .replace("{lead_time_hours}", String(selection.leadTimeHours))
-      .replace("{initial_time}", encodeURIComponent(selection.initialTime));
+
+  if (selection.validTime) {
+    const encodedVt = encodeURIComponent(selection.validTime);
+    if (valid_time_tile_url_template) {
+      tileUrl = valid_time_tile_url_template.replace("{valid_time}", encodedVt);
+    } else if (tile_url_template.includes("{valid_time}")) {
+      tileUrl = tile_url_template.replace("{valid_time}", encodedVt);
+    } else {
+      tileUrl = `/v1/maps/${selection.model}/${selection.variable}/surface/{z}/{x}/{y}.png?valid_time=${encodedVt}`;
+    }
+    if (valid_time_vector_field_url_template) {
+      vectorFieldUrl = valid_time_vector_field_url_template.replace("{valid_time}", encodedVt);
+    } else if (vector_field_url_template) {
+      vectorFieldUrl = `/v1/maps/${selection.model}/wind_10m/vector-field?valid_time=${encodedVt}`;
+    }
+  } else {
+    // Legacy fallback
+    tileUrl = tile_url_template
+      .replace("{lead_time_hours}", String(selection.leadTimeHours ?? 0))
+      .replace("{initial_time}", encodeURIComponent(selection.initialTime ?? ""));
+    if (vector_field_url_template) {
+      vectorFieldUrl = vector_field_url_template
+        .replace("{lead_time_hours}", String(selection.leadTimeHours ?? 0))
+        .replace("{initial_time}", encodeURIComponent(selection.initialTime ?? ""));
+    }
   }
 
   const layerResult: SpatialLayer = {
     tile_url_template: tileUrl,
     min_zoom,
     max_zoom,
-    lead_time_hours: selection.leadTimeHours,
+    lead_time_hours: selection.leadTimeHours ?? 0,
     legend,
   };
+  if (selection.validTime) {
+    layerResult.valid_time = selection.validTime;
+  }
   if (vectorFieldUrl !== null) {
     layerResult.vector_field_url_template = vectorFieldUrl;
   }
-
   return layerResult;
 }

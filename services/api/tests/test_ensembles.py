@@ -344,3 +344,32 @@ def test_ensembles_precipitation_amount_3h_and_phase_support(client):
 
     # Transition frequency is present
     assert "transition_frequency" in data
+
+
+def test_ensembles_valid_time_resolution(client):
+    """Under Lifecycle V2, /v1/ensembles serves by valid_time."""
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m"
+        "&valid_time=2026-07-21T06:00:00Z"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    data = body["data"]
+    assert data["model"] == "gefs"
+    assert data["valid_time"] == "2026-07-21T06:00:00Z"
+    assert data["source_cycle"] == "2026-07-21T00:00:00Z"
+    assert data["lead_time_hours"] == 6
+
+
+def test_ensembles_conflicting_valid_time_and_initial_time_rejected(client):
+    """Passing both valid_time and initial_time returns 422."""
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m"
+        "&valid_time=2026-07-21T06:00:00Z"
+        "&initial_time=2026-07-21T00:00:00Z"
+    )
+    assert resp.status_code == 422
+    assert "Provide either valid_time or initial_time" in resp.json()["error"]["message"]

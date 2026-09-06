@@ -34,7 +34,6 @@ from ingestion.core.catalog import (
     ModelRunRecord,
     RunCatalogSpec,
     VariableSpec,
-    _ensure_utc_datetime,
     list_paired_ready_cycle_times,
     record_run,
 )
@@ -213,27 +212,26 @@ def test_phase6e_staggered_3day_multicycle_acceptance(postgres_acceptance_env):
     assert paired_ready == [c01, c03, c05, c07, c09, c10]
 
     # 2. Run Dry Run at 2026-09-03 08:00Z
+    # Under Lifecycle V2:
+    # Latest ready cycle T = C10 (09-03 06Z), cadence C = 6h -> cutoff = C09 (09-03 00Z).
+    # Retained: C09 and C10 (cycles >= 09-03 00Z)
+    # Eligible for GC: C01 through C08 (< 09-03 00Z)
     now_sim = _dt(2026, 9, 3, 8)
     res_dry = run_gc_pass(engine, dry_run=True, now=now_sim)
     assert res_dry.dry_run is True
 
     # Assert expected retirements
-    would_retire_times = [r.cycle_time for r in res_dry.would_retire]
-    assert c01 in would_retire_times
-    assert c02 in would_retire_times
-    assert c03 in would_retire_times
-    assert c04 in would_retire_times
-    assert c05 in would_retire_times
-    assert c06 in would_retire_times
-    assert c07 not in would_retire_times
-    assert c08 not in would_retire_times
+    would_retire_times = {r.cycle_time for r in res_dry.would_retire}
+    for c_exp in [c01, c02, c03, c04, c05, c06, c07, c08]:
+        assert c_exp in would_retire_times
     assert c09 not in would_retire_times
     assert c10 not in would_retire_times
 
-    # Assert expected GC candidates (oldest first: C01, C02, C03, C04, C05)
-    would_gc_times = [g.cycle_time for g in res_dry.would_gc]
-    assert would_gc_times == [c01, c02, c03, c04, c05]
-    assert c06 not in would_gc_times  # C06 is retired by C10, but needs R2 >= 09-03 12Z
+    # Assert expected GC candidates (C01 through C08)
+    would_gc_times = {g.cycle_time for g in res_dry.would_gc}
+    assert would_gc_times == {c01, c02, c03, c04, c05, c06, c07, c08}
+    assert c09 not in would_gc_times
+    assert c10 not in would_gc_times
 
     # Verify dry run did not delete any files
     for c_time, (gfs_p, gefs_p) in store_paths.items():
@@ -243,46 +241,38 @@ def test_phase6e_staggered_3day_multicycle_acceptance(postgres_acceptance_env):
     # 3. Execute REAL GC pass
     res_real = run_gc_pass(engine, dry_run=False, now=now_sim)
     assert res_real.dry_run is False
-    assert set(res_real.processed_gc) == {c01, c02, c03, c04, c05}
+    assert set(res_real.processed_gc) == {c01, c02, c03, c04, c05, c06, c07, c08}
 
     # 4. Verify physical stores for deleted cycles are GONE
-    for c_del in [c01, c02, c03, c04, c05]:
+    for c_del in [c01, c02, c03, c04, c05, c06, c07, c08]:
         gfs_p, gefs_p = store_paths[c_del]
         assert not os.path.exists(gfs_p)
         assert not os.path.exists(gefs_p)
 
-    # 5. Verify physical stores for remaining cycles STILL EXIST
-    for c_rem in [c06, c07, c08, c09, c10]:
+    # 5. Verify physical stores for remaining cycles STILL EXIST (C09 and C10)
+    for c_rem in [c09, c10]:
         gfs_p, gefs_p = store_paths[c_rem]
         assert os.path.exists(gfs_p)
         assert os.path.exists(gefs_p)
 
     # 6. Verify catalog records:
-    # - C01..C05: model_runs rows deleted, tombstones present with deleted_at
-    # - C06: model_runs present, retired_at set, deleted_at NULL
-    # - C07..C10: model_runs present, retired_at NULL
+    # - C01..C08: model_runs rows deleted, tombstones present with deleted_at
+    # - C09..C10: model_runs present, retired_at NULL
     with Session(engine) as session:
-        for c_del in [c01, c02, c03, c04, c05]:
+        for c_del in [c01, c02, c03, c04, c05, c06, c07, c08]:
             assert session.execute(select(ModelRunRecord).where(ModelRunRecord.cycle_time == c_del)).scalars().all() == []
-            lc = session.get(ForecastCycleLifecycleRecord, c_del)
+            lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_del))
             assert lc is not None
             assert lc.deleted_at is not None
             assert lc.deletion_started_at is not None
             assert lc.retired_at is not None
             assert lc.retired_by_cycle_time is not None
 
-        # C06: retired but not deleted
-        lc6 = session.get(ForecastCycleLifecycleRecord, c06)
-        assert lc6 is not None
-        assert lc6.retired_at is not None
-        assert _ensure_utc_datetime(lc6.retired_by_cycle_time) == c10
-        assert lc6.deleted_at is None
-
-        # C07, C08, C09, C10: active visible
-        for c_act in [c07, c08, c09, c10]:
+        # C09, C10: active visible
+        for c_act in [c09, c10]:
             runs = session.execute(select(ModelRunRecord).where(ModelRunRecord.cycle_time == c_act)).scalars().all()
             assert len(runs) == 2
-            lc_act = session.get(ForecastCycleLifecycleRecord, c_act)
+            lc_act = session.get(ForecastCycleLifecycleRecord, ("gfs", c_act))
             if lc_act is not None:
                 assert lc_act.retired_at is None
                 assert lc_act.deleted_at is None

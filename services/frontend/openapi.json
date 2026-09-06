@@ -778,7 +778,7 @@
     "/v1/probabilities": {
       "get": {
         "summary": "Get exceedance probability",
-        "description": "Return the exceedance probability for a forecast variable.\n\nThe ensemble model (default ``gefs``) must exist and be an ensemble model;\nmember values are interpolated at the requested point and lead time. An\noptional ``initial_time`` pins the forecast run.",
+        "description": "Return the exceedance probability for a forecast variable.\n\nUnder Lifecycle V2:\n- If ``valid_time`` is supplied, the newest committed source cycle and lead\n  are dynamically resolved via the shared ValidTimeResolver.\n- If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead\n  serving is preserved for backward compatibility.",
         "operationId": "get_probability_v1_probabilities_get",
         "parameters": [
           {
@@ -840,14 +840,39 @@
           {
             "name": "lead_time_hours",
             "in": "query",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 0,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "description": "Forecast offset hours from cycle time.",
               "title": "Lead Time Hours"
             },
             "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "valid_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest serveable cycle capable of providing this valid time.",
+              "title": "Valid Time"
+            },
+            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest serveable cycle capable of providing this valid time."
           },
           {
             "name": "model",
@@ -961,7 +986,7 @@
     "/v1/maps": {
       "get": {
         "summary": "Get map tile metadata",
-        "description": "Return the tile template and legend for a weather map layer.\n\nThe model and variable must exist in the catalog, and a ready run with a\nmatching forecast product must be available for the requested\nmodel/variable/level/lead/initial-time combination; otherwise 404 is\nraised so the client never builds a template for data that does not exist.",
+        "description": "Return the tile template and legend for a weather map layer.\n\nUnder Lifecycle V2, supports either ``valid_time`` or ``lead_time_hours`` (with optional ``initial_time``).",
         "operationId": "get_spatial_layer_v1_maps_get",
         "parameters": [
           {
@@ -1001,14 +1026,39 @@
           {
             "name": "lead_time_hours",
             "in": "query",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 0,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "description": "Forecast offset hours from cycle time.",
               "title": "Lead Time Hours"
             },
             "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "valid_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest serveable cycle capable of providing this valid time.",
+              "title": "Valid Time"
+            },
+            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest serveable cycle capable of providing this valid time."
           },
           {
             "name": "initial_time",
@@ -1056,7 +1106,7 @@
     "/v1/maps/{model}/wind_10m/vector-field": {
       "get": {
         "summary": "Get 10-meter wind vector field for flow animation",
-        "description": "Return the quantized Int16 binary wind vector field for particle flow animation.\n\nFor GFS: returns canonical zonal (u) and meridional (v) velocity components.\nFor GEFS: returns the consensus mean vector field (mean(u_i), mean(v_i)).",
+        "description": "Return the quantized Int16 binary wind vector field for particle flow animation.",
         "operationId": "get_wind_vector_field_v1_maps__model__wind_10m_vector_field_get",
         "parameters": [
           {
@@ -1071,14 +1121,39 @@
           {
             "name": "lead_time_hours",
             "in": "query",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 0,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "description": "Forecast offset hours from cycle time.",
               "title": "Lead Time Hours"
             },
             "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "valid_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2).",
+              "title": "Valid Time"
+            },
+            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2)."
           },
           {
             "name": "initial_time",
@@ -1119,7 +1194,7 @@
     "/v1/maps/{model}/{variable}/{level}/{z}/{x}/{y}.png": {
       "get": {
         "summary": "Render a forecast raster tile",
-        "description": "Render a 256x256 PNG tile of the forecast field for the selection.\n\nThe tile reads genuine values from the run's Zarr store for the requested\nmodel/variable/initial time/lead time and colors them by the variable's\nramp. Tiles are served with a short cache policy so newly ingested runs\nbecome visible promptly.",
+        "description": "Render a 256x256 PNG tile of the forecast field for the selection.",
         "operationId": "get_map_tile_v1_maps__model___variable___level___z___x___y__png_get",
         "parameters": [
           {
@@ -1179,14 +1254,39 @@
           {
             "name": "lead_time_hours",
             "in": "query",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 0,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "description": "Forecast offset hours from cycle time.",
               "title": "Lead Time Hours"
             },
             "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "valid_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2).",
+              "title": "Valid Time"
+            },
+            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2)."
           },
           {
             "name": "initial_time",
@@ -1227,7 +1327,7 @@
     "/v1/ensembles": {
       "get": {
         "summary": "Get ensemble statistics and spread",
-        "description": "Return ensemble dispersion statistics for a forecast variable.\n\nThe ensemble model (default ``gefs``) must exist and be an ensemble model;\nmember values are interpolated at the requested point and lead time. When\n``include_members=true`` the genuine raw member values are attached. An\noptional ``initial_time`` pins the forecast run.",
+        "description": "Return ensemble dispersion statistics for a forecast variable.\n\nUnder Lifecycle V2:\n- If ``valid_time`` is supplied, the newest committed source cycle and lead\n  are dynamically resolved via the shared ValidTimeResolver.\n- If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead\n  serving is preserved for backward compatibility.",
         "operationId": "get_ensemble_statistics_v1_ensembles_get",
         "parameters": [
           {
@@ -1280,13 +1380,37 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 0,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "description": "Forecast offset hours from cycle time.",
-              "default": 0,
               "title": "Lead Time Hours"
             },
             "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "valid_time",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest serveable cycle capable of providing this valid time.",
+              "title": "Valid Time"
+            },
+            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). Resolves to the newest serveable cycle capable of providing this valid time."
           },
           {
             "name": "include_members",
@@ -1772,6 +1896,28 @@
               }
             ],
             "title": "Vector Field Url Template"
+          },
+          "valid_time_tile_url_template": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Time Tile Url Template"
+          },
+          "valid_time_vector_field_url_template": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Time Vector Field Url Template"
           }
         },
         "type": "object",
@@ -2303,8 +2449,26 @@
             "title": "Max Zoom"
           },
           "lead_time_hours": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Lead Time Hours"
+          },
+          "valid_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Time"
           },
           "legend": {
             "$ref": "#/components/schemas/SpatialLayerLegend"
@@ -2322,9 +2486,9 @@
           }
         },
         "type": "object",
-        "required": ["tile_url_template", "min_zoom", "max_zoom", "lead_time_hours", "legend"],
+        "required": ["tile_url_template", "min_zoom", "max_zoom", "legend"],
         "title": "SpatialLayerData",
-        "description": "The payload of a spatial layer (API.md section 4.1).\n\n``tile_url_template`` is a self-referential template for a future tile\nendpoint; map tile generation is out of scope for Milestone 10."
+        "description": "The payload of a spatial layer (API.md section 4.1)."
       },
       "SpatialLayerEnvelope": {
         "properties": {
@@ -2388,6 +2552,50 @@
         "title": "SpatialLayerLegend",
         "description": "The legend of a spatial layer (API.md section 4.1)."
       },
+      "ValidTimeAvailabilityOut": {
+        "properties": {
+          "valid_time": {
+            "type": "string",
+            "title": "Valid Time"
+          },
+          "source_cycle": {
+            "type": "string",
+            "title": "Source Cycle"
+          },
+          "lead_time_hours": {
+            "type": "integer",
+            "title": "Lead Time Hours"
+          },
+          "servable": {
+            "type": "boolean",
+            "title": "Servable"
+          },
+          "available_members": {
+            "type": "integer",
+            "title": "Available Members"
+          },
+          "expected_members": {
+            "type": "integer",
+            "title": "Expected Members"
+          },
+          "coverage_ratio": {
+            "type": "number",
+            "title": "Coverage Ratio"
+          }
+        },
+        "type": "object",
+        "required": [
+          "valid_time",
+          "source_cycle",
+          "lead_time_hours",
+          "servable",
+          "available_members",
+          "expected_members",
+          "coverage_ratio"
+        ],
+        "title": "ValidTimeAvailabilityOut",
+        "description": "A valid time available for a model variable under Lifecycle V2.\n\nAttributes:\n    valid_time: The UTC valid datetime.\n    source_cycle: The newest committed cycle providing this valid time.\n    lead_time_hours: The lead offset from source cycle.\n    servable: Whether the lead is servable.\n    available_members: Number of available ensemble members.\n    expected_members: Expected ensemble members for the model.\n    coverage_ratio: Member coverage ratio in [0.0, 1.0]."
+      },
       "ValidationError": {
         "properties": {
           "loc": {
@@ -2438,6 +2646,14 @@
             "type": "array",
             "title": "Initial Times"
           },
+          "valid_times": {
+            "items": {
+              "$ref": "#/components/schemas/ValidTimeAvailabilityOut"
+            },
+            "type": "array",
+            "title": "Valid Times",
+            "default": []
+          },
           "layer": {
             "anyOf": [
               {
@@ -2452,7 +2668,7 @@
         "type": "object",
         "required": ["id", "name", "unit", "initial_times"],
         "title": "VariableAvailability",
-        "description": "A forecast variable and the initial times available for it.\n\nAttributes:\n    id: The ``forecast_variables.variable_code`` (e.g.\n        ``temperature_2m``).\n    name: Human-readable variable name.\n    unit: The registered SI unit string (e.g. ``\u00b0C``).\n    initial_times: The initial times with data for this\n        model/variable, newest first.\n    layer: Authoritative map layer descriptor for rendering tiles and\n        legends without an extra metadata roundtrip."
+        "description": "A forecast variable and the initial times / valid times available for it.\n\nAttributes:\n    id: The ``forecast_variables.variable_code`` (e.g.\n        ``temperature_2m``).\n    name: Human-readable variable name.\n    unit: The registered SI unit string (e.g. ``\u00b0C``).\n    initial_times: The initial times with data for this\n        model/variable, newest first (legacy compatibility).\n    valid_times: The unified, cross-cycle valid times available for this\n        model/variable under Lifecycle V2, ascending.\n    layer: Authoritative map layer descriptor for rendering tiles and\n        legends without an extra metadata roundtrip."
       },
       "VariableOut": {
         "properties": {

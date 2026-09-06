@@ -280,6 +280,9 @@ class PointQueryFallbackAudit(Base):
 class ForecastCycleLifecycle(Base):
     __tablename__ = "forecast_cycle_lifecycle"
 
+    model_id = Column(
+        String, ForeignKey("models.model_id", ondelete="CASCADE"), primary_key=True
+    )
     cycle_time = Column(DateTime(timezone=True), primary_key=True)
     retired_at = Column(DateTime(timezone=True), nullable=True)
     retired_by_cycle_time = Column(DateTime(timezone=True), nullable=True)
@@ -298,8 +301,8 @@ class ForecastCycleLifecycle(Base):
     )
 
     __table_args__ = (
-        Index("idx_cycle_lifecycle_retired", "retired_at"),
-        Index("idx_cycle_lifecycle_claimed", "deletion_started_at"),
-        Index("idx_cycle_lifecycle_deleted", "deleted_at"),
+        Index("idx_cycle_lifecycle_retired", "model_id", "retired_at"),
+        Index("idx_cycle_lifecycle_claimed", "model_id", "deletion_started_at"),
+        Index("idx_cycle_lifecycle_deleted", "model_id", "deleted_at"),
     )
 

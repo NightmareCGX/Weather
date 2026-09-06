@@ -287,6 +287,15 @@ def test_adversarial_cache_bypass_immunity(client, migrated_db, tmp_path):
     with Session(migrated_db) as session:
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
+                cycle_time=c_ret,
+                retired_at=_dt(2026, 9, 2, 6, 30),
+                retired_by_cycle_time=c_vis,
+            )
+        )
+        session.add(
+            ForecastCycleLifecycle(
+                model_id="gefs",
                 cycle_time=c_ret,
                 retired_at=_dt(2026, 9, 2, 6, 30),
                 retired_by_cycle_time=c_vis,
@@ -348,6 +357,7 @@ def test_in_flight_reader_safe_during_concurrent_retirement(client, migrated_db,
         with Session(migrated_db) as session:
             session.add(
                 ForecastCycleLifecycle(
+                    model_id="gfs",
                     cycle_time=c0,
                     retired_at=_dt(2026, 9, 2, 6, 30),
                     retired_by_cycle_time=c1,
@@ -401,6 +411,7 @@ def test_progressive_serving_blends_visible_runs_and_excludes_retired(client, mi
         # Mark c_ret retired
         session.add(
             ForecastCycleLifecycle(
+                model_id="gfs",
                 cycle_time=c_ret,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_part,

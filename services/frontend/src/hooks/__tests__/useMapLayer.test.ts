@@ -208,6 +208,23 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
     expect(result.current.error).toBe("Unable to load forecast data.");
   });
 
+  it("synchronously resolves authoritative SpatialLayer for valid-time selection", () => {
+    const validTimeSelection: ForecastSelection = {
+      model: "gfs",
+      variable: "temperature_2m",
+      validTime: "2026-08-13T06:00:00Z",
+    };
+    mockUseForecastSelection.mockReturnValue(mockContextValue(validTimeSelection));
+    const { result } = renderHook(() => useMapLayer());
+
+    expect(result.current.loading).toBe(false);
+    expect(result.current.error).toBeNull();
+    expect(result.current.layer?.valid_time).toBe("2026-08-13T06:00:00Z");
+    expect(result.current.layer?.tile_url_template).toContain(
+      "valid_time=2026-08-13T06%3A00%3A00Z"
+    );
+  });
+
   it("synchronously resolves authoritative SpatialLayer for initial selection", () => {
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
     const { result } = renderHook(() => useMapLayer());

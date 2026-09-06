@@ -8,13 +8,13 @@ import {
   formatTransitionName,
 } from "@/lib/forecast/precipitation";
 import { formatPercent } from "@/lib/forecast/labels";
-import { formatLeadTimeHours } from "@/lib/forecast/time";
+import { formatDayHourUtc, formatLeadTimeHours } from "@/lib/forecast/time";
 import type { PhysicalPhase } from "@/lib/api/types";
 
 interface EnsemblePhaseSupportProps {
   phaseSupport: Record<string, number>;
   transitionFrequency?: Record<string, number> | null;
-  selectedLead: number;
+  selectedLead: number | string;
   memberCount?: number;
 }
 
@@ -66,11 +66,17 @@ export function EnsemblePhaseSupport({
     .filter(([_, freq]) => freq > 0)
     .sort((a, b) => b[1] - a[1]);
 
+  const leadLabel =
+    typeof selectedLead === "string"
+      ? `${formatDayHourUtc(selectedLead)} UTC`
+      : formatLeadTimeHours(selectedLead);
+  const ariaLead = typeof selectedLead === "number" ? `lead ${selectedLead}h` : leadLabel;
+
   return (
     <div className="mt-4 rounded border border-slate-200 bg-slate-50/50 p-4">
       <div className="mb-2 flex items-baseline justify-between">
         <h4 className="text-xs font-semibold text-slate-800">
-          Ensemble Phase Support ({formatLeadTimeHours(selectedLead)})
+          Ensemble Phase Support ({leadLabel})
         </h4>
         <span className="text-[11px] text-slate-500">{memberCount} members · 100% total</span>
       </div>
@@ -83,7 +89,7 @@ export function EnsemblePhaseSupport({
       <div
         className="relative flex h-7 w-full overflow-hidden rounded-md border border-slate-200 bg-slate-100 shadow-inner"
         role="img"
-        aria-label={`Ensemble phase support composition at lead ${selectedLead}h`}
+        aria-label={`Ensemble phase support composition at ${ariaLead}`}
       >
         {phaseEntries.map(({ phase, label, raw, percentage, color }) => {
           if (percentage <= 0) return null;

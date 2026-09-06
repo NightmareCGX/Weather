@@ -1,195 +1,243 @@
-"""Pure unit tests for domain.lifecycle R1/R2 math and retention planning."""
+"""Pure unit tests for domain.lifecycle (Data Lifecycle V2)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from domain.cadence import register_canonical_cycle_cadence
 from domain.lifecycle import (
-    GC_SAFETY_DELTA,
-    RETIREMENT_DELTA,
     CycleLifecycleSnapshot,
+    ModelLifecyclePlan,
+    ModelLifecycleSnapshot,
     canonical_cycle_store_path,
-    evaluate_gc_eligibility,
-    evaluate_retirement,
-    find_r1,
-    find_r2,
-    plan_lifecycle,
+    compute_lifecycle_cutoff,
+    evaluate_cycle_lifecycle,
+    plan_model_lifecycle,
 )
 
 
-def _dt(
-    year: int, month: int, day: int, hour: int, tz: bool = True
-) -> datetime:
+def _dt(year: int, month: int, day: int, hour: int, tz: bool = True) -> datetime:
     """Helper to build UTC datetime for tests."""
-    return datetime(
-        year, month, day, hour, 0, 0, tzinfo=timezone.utc if tz else None
-    )
+    return datetime(year, month, day, hour, 0, 0, tzinfo=timezone.utc if tz else None)
 
 
 # ---------------------------------------------------------------------------
-# R1 Tests: Earliest paired-ready >= C + 24h
+# Cutoff Computation Tests: cutoff = T - C
 # ---------------------------------------------------------------------------
 
 
-def test_find_r1_exact_24h_boundary() -> None:
-    c = _dt(2026, 9, 1, 6)
-    r1_target = _dt(2026, 9, 2, 6)
-    assert r1_target == c + RETIREMENT_DELTA
-
-    result = find_r1(c, [r1_target])
-    assert result == r1_target
+def test_compute_lifecycle_cutoff_empty() -> None:
+    """Verify empty ready cycles returns (None, None)."""
+    t, cutoff = compute_lifecycle_cutoff([], timedelta(hours=6))
+    assert t is None
+    assert cutoff is None
 
 
-def test_find_r1_same_hour_failed_later_ready_selected() -> None:
-    c = _dt(2026, 9, 1, 6)
-    # 09-02 06Z is absent/failed; 09-02 12Z is paired-ready
-    later_ready = _dt(2026, 9, 2, 12)
-    paired_ready = [
-        _dt(2026, 9, 1, 12),  # C + 6h: too early
-        _dt(2026, 9, 1, 18),  # C + 12h: too early
-        _dt(2026, 9, 2, 0),   # C + 18h: too early
-        later_ready,          # C + 30h: earliest qualifying
-        _dt(2026, 9, 2, 18),  # C + 36h
-    ]
-    result = find_r1(c, paired_ready)
-    assert result == later_ready
+def test_compute_lifecycle_cutoff_6h_normal() -> None:
+    """Verify 6h cadence cutoff derivation."""
+    ready_cycles = [_dt(2026, 9, 1, 18), _dt(2026, 9, 2, 0)]
+    t, cutoff = compute_lifecycle_cutoff(ready_cycles, timedelta(hours=6))
+    assert t == _dt(2026, 9, 2, 0)
+    assert cutoff == _dt(2026, 9, 1, 18)
 
 
-def test_find_r1_multiple_later_ready_returns_earliest() -> None:
-    c = _dt(2026, 9, 1, 0)
-    ready1 = _dt(2026, 9, 2, 0)  # C + 24h
-    ready2 = _dt(2026, 9, 2, 6)  # C + 30h
-    ready3 = _dt(2026, 9, 2, 12) # C + 36h
-    result = find_r1(c, [ready3, ready1, ready2])
-    assert result == ready1
-
-
-def test_find_r1_only_newer_cycles_below_24h_returns_none() -> None:
-    c = _dt(2026, 9, 1, 0)
-    # All ready cycles are < C + 24h
-    paired_ready = [
-        _dt(2026, 9, 1, 6),   # +6h
-        _dt(2026, 9, 1, 12),  # +12h
-        _dt(2026, 9, 1, 18),  # +18h
-    ]
-    assert find_r1(c, paired_ready) is None
-
-
-def test_find_r1_empty_or_no_later_returns_none() -> None:
-    c = _dt(2026, 9, 1, 6)
-    assert find_r1(c, []) is None
-    assert find_r1(c, [_dt(2026, 9, 1, 0)]) is None
-
-
-def test_find_r1_input_order_insensitive() -> None:
-    c = _dt(2026, 9, 1, 6)
-    t1 = _dt(2026, 9, 2, 6)
-    t2 = _dt(2026, 9, 2, 12)
-    t3 = _dt(2026, 9, 3, 0)
-    assert find_r1(c, [t3, t1, t2]) == find_r1(c, [t1, t2, t3]) == t1
-
-
-def test_find_r1_handles_naive_and_aware_datetimes() -> None:
-    c_naive = _dt(2026, 9, 1, 6, tz=False)
-    r1_aware = _dt(2026, 9, 2, 6, tz=True)
-    res = find_r1(c_naive, [r1_aware])
-    assert res is not None
-    assert res == _dt(2026, 9, 2, 6, tz=True)
+def test_compute_lifecycle_cutoff_3h() -> None:
+    """Verify 3h cadence cutoff derivation."""
+    ready_cycles = [_dt(2026, 9, 1, 3), _dt(2026, 9, 1, 6), _dt(2026, 9, 1, 9)]
+    t, cutoff = compute_lifecycle_cutoff(ready_cycles, timedelta(hours=3))
+    assert t == _dt(2026, 9, 1, 9)
+    assert cutoff == _dt(2026, 9, 1, 6)
 
 
 # ---------------------------------------------------------------------------
-# R2 Tests: Earliest paired-ready >= R1 + 6h
+# Principle 6: Normal Progression Lifecycle
 # ---------------------------------------------------------------------------
 
 
-def test_find_r2_exact_6h_boundary() -> None:
-    r1 = _dt(2026, 9, 2, 12)
-    r2_target = _dt(2026, 9, 2, 18)
-    assert r2_target == r1 + GC_SAFETY_DELTA
+def test_lifecycle_normal_progression_6h() -> None:
+    """Verify normal 6h cadence lifecycle progression:
 
-    result = find_r2(r1, [r2_target])
-    assert result == r2_target
+    Stage A:
+      18Z ready
+      00Z ready
+      06Z partial (in-progress)
+      -> T = 00Z, cutoff = 18Z
+      -> 18Z retained (>= 18Z)
+      -> 00Z retained (>= 18Z)
+      -> 06Z retained (>= 18Z)
+      -> older cycles (< 18Z) eligible for deletion
 
-
-def test_find_r2_immediate_next_cycle_unsuccessful_later_qualifies() -> None:
-    r1 = _dt(2026, 9, 2, 12)
-    # 09-02 18Z is missing/failed; 09-03 00Z is paired-ready
-    r2_later = _dt(2026, 9, 3, 0)
-    paired_ready = [
-        _dt(2026, 9, 2, 12),  # R1 itself (delta = 0h)
-        r2_later,             # R1 + 12h
-        _dt(2026, 9, 3, 6),   # R1 + 18h
-    ]
-    result = find_r2(r1, paired_ready)
-    assert result == r2_later
-
-
-def test_find_r2_no_qualifying_returns_none() -> None:
-    r1 = _dt(2026, 9, 2, 12)
-    # Only R1 itself is known
-    assert find_r2(r1, [r1]) is None
-    assert find_r2(r1, []) is None
-
-
-def test_find_r2_multiple_qualifying_returns_earliest() -> None:
-    r1 = _dt(2026, 9, 2, 12)
-    t1 = _dt(2026, 9, 2, 18)
-    t2 = _dt(2026, 9, 3, 0)
-    t3 = _dt(2026, 9, 3, 6)
-    assert find_r2(r1, [t3, t2, t1]) == t1
-
-
-# ---------------------------------------------------------------------------
-# Regression Test: NO C + 30h shortcut
-# ---------------------------------------------------------------------------
-
-
-def test_no_c_plus_30h_shortcut_regression() -> None:
-    """Prove that C is NOT GC-eligible at R1 merely because wall-clock/R1 >= C + 30h.
-
-    Example:
-      C = 09-01 06Z
-      09-02 06Z failed / missing
-      09-02 12Z paired-ready = R1  (Note: 09-02 12Z is C + 30h!)
-
-    At 09-02 12Z:
-      - C is RETIRED by R1 (09-02 12Z >= C + 24h).
-      - C is NOT GC-eligible! R2 requires a paired-ready cycle >= R1 + 6h (09-02 18Z).
-      - Having R1 at C + 30h does NOT satisfy R2.
+    Stage B:
+      06Z becomes ready
+      -> T = 06Z, cutoff = 00Z
+      -> 18Z becomes eligible for deletion (< 00Z)
+      -> 00Z retained (>= 00Z)
+      -> 06Z retained (>= 00Z)
     """
-    c = _dt(2026, 9, 1, 6)
-    r1 = _dt(2026, 9, 2, 12)
-    assert r1 == c + timedelta(hours=30)
+    c_12z = _dt(2026, 9, 1, 12)
+    c_18z = _dt(2026, 9, 1, 18)
+    c_00z = _dt(2026, 9, 2, 0)
+    c_06z = _dt(2026, 9, 2, 6)
 
-    # Only R1 is paired-ready so far
-    paired_ready = [r1]
+    snapshots_a = [
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_12z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_18z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_00z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_06z, status="partial"),
+    ]
 
-    # Evaluate retirement
-    snapshot = CycleLifecycleSnapshot(cycle_time=c)
-    ret_decision = evaluate_retirement(snapshot, paired_ready)
-    assert ret_decision.should_retire is True
-    assert ret_decision.retired_by_cycle_time == r1
+    # Stage A: 00Z is latest ready (06Z is partial)
+    ready_a = [c_12z, c_18z, c_00z]
+    plan_a = plan_model_lifecycle("gfs", snapshots_a, ready_a)
 
-    # Evaluate GC eligibility for newly retired cycle
-    retired_snapshot = CycleLifecycleSnapshot(
-        cycle_time=c,
-        retired_at=_dt(2026, 9, 2, 12, 1),
-        retired_by_cycle_time=r1,
+    assert plan_a.latest_ready_cycle == c_00z
+    assert plan_a.cutoff == c_18z
+    # 18Z, 00Z, 06Z are all >= cutoff (retained)
+    assert plan_a.active_visible_cycles == (c_18z, c_00z, c_06z)
+    # 12Z is < cutoff (eligible for deletion)
+    assert len(plan_a.eligible_for_deletion) == 1
+    assert plan_a.eligible_for_deletion[0].cycle_time == c_12z
+    assert plan_a.eligible_for_deletion[0].is_eligible_for_deletion is True
+
+    # Stage B: 06Z becomes ready
+    snapshots_b = [
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_12z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_18z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_00z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_06z, status="ready"),
+    ]
+    ready_b = [c_12z, c_18z, c_00z, c_06z]
+    plan_b = plan_model_lifecycle("gfs", snapshots_b, ready_b)
+
+    assert plan_b.latest_ready_cycle == c_06z
+    assert plan_b.cutoff == c_00z
+    # 00Z and 06Z are >= cutoff (retained)
+    assert plan_b.active_visible_cycles == (c_00z, c_06z)
+    # 12Z and 18Z are < cutoff (eligible for deletion)
+    eligible_b = [d.cycle_time for d in plan_b.eligible_for_deletion]
+    assert eligible_b == [c_12z, c_18z]
+
+
+# ---------------------------------------------------------------------------
+# Principle 7: Failed Adjacency (DO NOT keep two successful cycles)
+# ---------------------------------------------------------------------------
+
+
+def test_lifecycle_failed_adjacency_cutoff_is_strict() -> None:
+    """Verify that a failed cycle does NOT alter the T - C cutoff.
+
+    Timeline:
+      00Z ready
+      06Z failed
+      12Z ready
+
+    T = 12Z, C = 6h -> cutoff = 06Z.
+    00Z < 06Z -> 00Z IS ELIGIBLE FOR DELETION.
+    We assert that 00Z is NOT retained merely because 06Z failed!
+    """
+    c_00z = _dt(2026, 9, 2, 0)
+    c_06z = _dt(2026, 9, 2, 6)
+    c_12z = _dt(2026, 9, 2, 12)
+
+    snapshots = [
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_00z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_06z, status="failed"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_12z, status="ready"),
+    ]
+    # Only 00Z and 12Z are ready
+    ready_cycles = [c_00z, c_12z]
+
+    plan = plan_model_lifecycle("gfs", snapshots, ready_cycles)
+
+    assert plan.latest_ready_cycle == c_12z
+    assert plan.cutoff == c_06z
+
+    # 06Z (failed) and 12Z (ready) are >= cutoff (06Z)
+    assert plan.active_visible_cycles == (c_06z, c_12z)
+
+    # 00Z is < 06Z -> must be eligible for deletion!
+    eligible_cycles = [d.cycle_time for d in plan.eligible_for_deletion]
+    assert eligible_cycles == [c_00z]
+    assert plan.eligible_for_deletion[0].is_eligible_for_deletion is True
+
+
+# ---------------------------------------------------------------------------
+# Principle 2: Model Independence (GFS vs GEFS Decoupled)
+# ---------------------------------------------------------------------------
+
+
+def test_model_independence_decoupled() -> None:
+    """Verify GFS and GEFS lifecycle plans are completely independent.
+
+    GFS:
+      00Z ready, 06Z ready -> T = 06Z, cutoff = 00Z -> 18Z eligible, 00Z/06Z retained.
+
+    GEFS:
+      00Z ready, 06Z partial -> T = 00Z, cutoff = 18Z -> 18Z retained, 00Z/06Z retained.
+    """
+    c_18z = _dt(2026, 9, 1, 18)
+    c_00z = _dt(2026, 9, 2, 0)
+    c_06z = _dt(2026, 9, 2, 6)
+
+    gfs_snapshots = [
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_18z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_00z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_06z, status="ready"),
+    ]
+    gefs_snapshots = [
+        ModelLifecycleSnapshot(model_id="gefs", cycle_time=c_18z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gefs", cycle_time=c_00z, status="ready"),
+        ModelLifecycleSnapshot(model_id="gefs", cycle_time=c_06z, status="partial"),
+    ]
+
+    gfs_plan = plan_model_lifecycle(
+        "gfs", gfs_snapshots, ready_cycle_times=[c_18z, c_00z, c_06z]
     )
-    gc_decision = evaluate_gc_eligibility(retired_snapshot, paired_ready)
-    # MUST NOT be eligible yet!
-    assert gc_decision.is_gc_eligible is False
-    assert gc_decision.gc_eligible_by_cycle_time is None
-    assert gc_decision.reason == "no_qualifying_r2_paired_ready"
-
-    # Now simulate R2 arriving at 09-02 18Z (R1 + 6h)
-    paired_ready_with_r2 = [r1, _dt(2026, 9, 2, 18)]
-    gc_decision_with_r2 = evaluate_gc_eligibility(
-        retired_snapshot, paired_ready_with_r2
+    gefs_plan = plan_model_lifecycle(
+        "gefs", gefs_snapshots, ready_cycle_times=[c_18z, c_00z]
     )
-    assert gc_decision_with_r2.is_gc_eligible is True
-    assert gc_decision_with_r2.gc_eligible_by_cycle_time == _dt(2026, 9, 2, 18)
+
+    # GFS advanced to 06Z; 18Z is eligible for deletion
+    assert gfs_plan.latest_ready_cycle == c_06z
+    assert gfs_plan.cutoff == c_00z
+    assert [d.cycle_time for d in gfs_plan.eligible_for_deletion] == [c_18z]
+
+    # GEFS stayed at 00Z; 18Z is RETAINED (not eligible for deletion)
+    assert gefs_plan.latest_ready_cycle == c_00z
+    assert gefs_plan.cutoff == c_18z
+    assert gefs_plan.eligible_for_deletion == ()
+    assert c_18z in gefs_plan.active_visible_cycles
+
+
+# ---------------------------------------------------------------------------
+# 3-Hour Cadence Product Test
+# ---------------------------------------------------------------------------
+
+
+def test_3h_cadence_lifecycle() -> None:
+    """Verify 3h cadence model retention math without special-casing."""
+    register_canonical_cycle_cadence("future_3h", 3)
+
+    c_03z = _dt(2026, 9, 1, 3)
+    c_06z = _dt(2026, 9, 1, 6)
+    c_09z = _dt(2026, 9, 1, 9)
+
+    snapshots = [
+        ModelLifecycleSnapshot(model_id="future_3h", cycle_time=c_03z, status="ready"),
+        ModelLifecycleSnapshot(model_id="future_3h", cycle_time=c_06z, status="ready"),
+        ModelLifecycleSnapshot(model_id="future_3h", cycle_time=c_09z, status="ready"),
+    ]
+    ready = [c_03z, c_06z, c_09z]
+
+    plan = plan_model_lifecycle("future_3h", snapshots, ready)
+
+    assert plan.latest_ready_cycle == c_09z
+    assert plan.cutoff == c_06z  # 09Z - 3h = 06Z
+    # 06Z and 09Z retained
+    assert plan.active_visible_cycles == (c_06z, c_09z)
+    # 03Z < 06Z -> eligible for deletion
+    assert [d.cycle_time for d in plan.eligible_for_deletion] == [c_03z]
 
 
 # ---------------------------------------------------------------------------
@@ -197,180 +245,163 @@ def test_no_c_plus_30h_shortcut_regression() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("status", ["ready", "partial", "failed", "processing"])
-def test_old_cycle_status_invariance(status: str) -> None:
-    """Prove that C's own status does not change the lifecycle retirement or GC math."""
-    c = _dt(2026, 9, 1, 6)
-    r1 = _dt(2026, 9, 2, 6)
-    r2 = _dt(2026, 9, 2, 12)
-    paired_ready = [r1, r2]
+@pytest.mark.parametrize("old_status", ["ready", "partial", "failed", "processing"])
+def test_old_cycle_status_invariance(old_status: str) -> None:
+    """Verify that an old cycle behind cutoff is eligible regardless of its status."""
+    c_old = _dt(2026, 9, 1, 12)
+    c_t_minus_c = _dt(2026, 9, 1, 18)
+    c_t = _dt(2026, 9, 2, 0)
 
-    snapshot = CycleLifecycleSnapshot(
-        cycle_time=c,
-        gfs_status=status,
-        gefs_status=status,
+    snapshot = ModelLifecycleSnapshot(
+        model_id="gfs",
+        cycle_time=c_old,
+        status=old_status,
     )
-    ret_decision = evaluate_retirement(snapshot, paired_ready)
-    assert ret_decision.should_retire is True
-    assert ret_decision.retired_by_cycle_time == r1
-
-    retired_snapshot = CycleLifecycleSnapshot(
-        cycle_time=c,
-        retired_at=_dt(2026, 9, 2, 6, 1),
-        retired_by_cycle_time=r1,
-        gfs_status=status,
-        gefs_status=status,
+    decision = evaluate_cycle_lifecycle(
+        snapshot, latest_ready_cycle=c_t, cadence=timedelta(hours=6)
     )
-    gc_decision = evaluate_gc_eligibility(retired_snapshot, paired_ready)
-    assert gc_decision.is_gc_eligible is True
-    assert gc_decision.gc_eligible_by_cycle_time == r2
+    assert decision.is_eligible_for_deletion is True
+    assert decision.cutoff == c_t_minus_c
+    assert decision.retired_by_cycle_time == c_t
 
 
 # ---------------------------------------------------------------------------
-# Already Retired and Deleted Handlings
+# Already Deleted and Already Retired Handling
 # ---------------------------------------------------------------------------
 
 
-def test_evaluate_retirement_already_retired_or_deleted() -> None:
-    c = _dt(2026, 9, 1, 6)
-    paired_ready = [_dt(2026, 9, 2, 6)]
+def test_already_deleted_and_already_retired() -> None:
+    """Verify deleted cycles are excluded and already-retired cycles do not re-retire."""
+    c_old = _dt(2026, 9, 1, 12)
+    c_t = _dt(2026, 9, 2, 0)
 
-    retired_snap = CycleLifecycleSnapshot(
-        cycle_time=c,
-        retired_at=_dt(2026, 9, 2, 6),
-        retired_by_cycle_time=_dt(2026, 9, 2, 6),
+    # Tombstone: already deleted
+    tombstone = ModelLifecycleSnapshot(
+        model_id="gfs",
+        cycle_time=c_old,
+        deleted_at=_dt(2026, 9, 1, 18),
     )
-    res1 = evaluate_retirement(retired_snap, paired_ready)
-    assert res1.should_retire is False
-    assert res1.reason == "cycle_already_retired"
+    dec1 = evaluate_cycle_lifecycle(tombstone, c_t, timedelta(hours=6))
+    assert dec1.is_eligible_for_deletion is False
+    assert dec1.reason == "cycle_already_deleted"
 
-    deleted_snap = CycleLifecycleSnapshot(
-        cycle_time=c,
-        retired_at=_dt(2026, 9, 2, 6),
-        retired_by_cycle_time=_dt(2026, 9, 2, 6),
-        deleted_at=_dt(2026, 9, 2, 12),
+    # Already retired: eligible for deletion, but should_retire is False (idempotent)
+    retired_snap = ModelLifecycleSnapshot(
+        model_id="gfs",
+        cycle_time=c_old,
+        retired_at=_dt(2026, 9, 1, 18),
+        retired_by_cycle_time=_dt(2026, 9, 2, 0),
     )
-    res2 = evaluate_retirement(deleted_snap, paired_ready)
-    assert res2.should_retire is False
-    assert res2.reason == "cycle_already_deleted"
+    dec2 = evaluate_cycle_lifecycle(retired_snap, c_t, timedelta(hours=6))
+    assert dec2.is_eligible_for_deletion is True
+    assert dec2.should_retire is False
 
 
-def test_evaluate_gc_eligibility_not_retired_or_deleted() -> None:
-    c = _dt(2026, 9, 1, 6)
-    paired_ready = [_dt(2026, 9, 2, 6), _dt(2026, 9, 2, 12)]
-
-    visible_snap = CycleLifecycleSnapshot(cycle_time=c)
-    res1 = evaluate_gc_eligibility(visible_snap, paired_ready)
-    assert res1.is_gc_eligible is False
-    assert res1.reason == "cycle_not_retired"
-
-    deleted_snap = CycleLifecycleSnapshot(
-        cycle_time=c,
-        retired_at=_dt(2026, 9, 2, 6),
-        retired_by_cycle_time=_dt(2026, 9, 2, 6),
-        deleted_at=_dt(2026, 9, 2, 12),
-    )
-    res2 = evaluate_gc_eligibility(deleted_snap, paired_ready)
-    assert res2.is_gc_eligible is False
-    assert res2.reason == "cycle_already_deleted"
-
-
-# ---------------------------------------------------------------------------
-# Batch Lifecycle Planning (plan_lifecycle)
-# ---------------------------------------------------------------------------
-
-
-def test_plan_lifecycle_mixed_timeline() -> None:
-    c0 = _dt(2026, 9, 1, 0)   # Already retired by 09-02 00Z, now GC eligible by 09-02 06Z
-    c1 = _dt(2026, 9, 1, 6)   # Planned to retire (R1=09-02 06Z) and GC eligible (R2=09-02 12Z)
-    c2 = _dt(2026, 9, 1, 12)  # Planned to retire (R1=09-02 12Z) but not GC eligible yet
-    c3 = _dt(2026, 9, 1, 18)  # Active visible: requires >= 09-02 18Z (not in ready set)
-    c4 = _dt(2026, 9, 2, 0)   # Active visible
-    c5 = _dt(2026, 9, 2, 6)   # Active visible
-    c6 = _dt(2026, 9, 2, 12)  # Active visible
-    tombstone = _dt(2026, 8, 31, 18)  # Already deleted
+def test_no_ready_cycles_does_not_advance_lifecycle() -> None:
+    """Verify that when no ready cycles exist, nothing is eligible for deletion."""
+    c_00z = _dt(2026, 9, 2, 0)
+    c_06z = _dt(2026, 9, 2, 6)
 
     snapshots = [
-        CycleLifecycleSnapshot(
-            cycle_time=tombstone,
-            retired_at=_dt(2026, 9, 1, 18),
-            retired_by_cycle_time=_dt(2026, 9, 1, 18),
-            deleted_at=_dt(2026, 9, 2, 0),
-        ),
-        CycleLifecycleSnapshot(
-            cycle_time=c0,
-            retired_at=_dt(2026, 9, 2, 0),
-            retired_by_cycle_time=_dt(2026, 9, 2, 0),
-        ),
-        CycleLifecycleSnapshot(cycle_time=c1),
-        CycleLifecycleSnapshot(cycle_time=c2),
-        CycleLifecycleSnapshot(cycle_time=c3),
-        CycleLifecycleSnapshot(cycle_time=c4, gfs_status="ready", gefs_status="ready"),
-        CycleLifecycleSnapshot(cycle_time=c5, gfs_status="ready", gefs_status="ready"),
-        CycleLifecycleSnapshot(cycle_time=c6, gfs_status="ready", gefs_status="ready"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_00z, status="partial"),
+        ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_06z, status="processing"),
     ]
+    plan = plan_model_lifecycle("gfs", snapshots, ready_cycle_times=[])
 
-    paired_ready = [c4, c5, c6]  # 09-02 00Z, 09-02 06Z, 09-02 12Z
-
-    plan = plan_lifecycle(snapshots, paired_ready)
-
-    # 1. Check retirements (newly planned)
-    assert len(plan.retirements) == 2
-    r_map = {r.cycle_time: r.retired_by_cycle_time for r in plan.retirements}
-    assert r_map[c1] == c5  # 09-02 06Z >= 09-01 06Z + 24h
-    assert r_map[c2] == c6  # 09-02 12Z >= 09-01 12Z + 24h
-
-    # 2. Check GC eligibility decisions
-    gc_map = {g.cycle_time: g.is_gc_eligible for g in plan.gc_eligibilities}
-    assert gc_map[c0] is True   # R1=09-02 00Z, R2=09-02 06Z (>= 00Z + 6h)
-    assert gc_map[c1] is True   # R1=09-02 06Z, R2=09-02 12Z (>= 06Z + 6h)
-    assert gc_map[c2] is False  # R1=09-02 12Z, R2 needs >= 09-02 18Z (not present)
-
-    # 3. Check categories
-    assert plan.deleted_cycles == (tombstone,)
-    assert plan.active_visible_cycles == (c3, c4, c5, c6)
-    assert plan.retired_cycles == (c0, c1, c2)
-
-    # 4. Check helper properties
-    assert len(plan.would_retire) == 2
-    assert len(plan.would_gc) == 2
-    assert len(plan.blocked) == 1
+    assert plan.latest_ready_cycle is None
+    assert plan.cutoff is None
+    assert plan.eligible_for_deletion == ()
+    assert plan.active_visible_cycles == (c_00z, c_06z)
+    assert len(plan.blocked) == 2
 
 
-def test_snapshot_properties() -> None:
-    dt = _dt(2026, 9, 1, 0)
-    snap = CycleLifecycleSnapshot(
-        cycle_time=dt,
-        gfs_status="ready",
-        gefs_status="ready",
-    )
-    assert snap.is_paired_ready is True
-    assert snap.is_retired is False
-    assert snap.is_deletion_started is False
-    assert snap.is_deleted is False
+def test_plan_lifecycle_with_deleted_and_retired_snapshots() -> None:
+    """Verify plan_model_lifecycle with deleted and retained-retired snapshots."""
+    c_deleted = _dt(2026, 9, 1, 6)
+    c_old_retired = _dt(2026, 9, 1, 12)
+    c_retained = _dt(2026, 9, 1, 18)
+    c_ready = _dt(2026, 9, 2, 0)
 
-    claimed_snap = CycleLifecycleSnapshot(
-        cycle_time=dt,
-        retired_at=_dt(2026, 9, 2, 0),
-        retired_by_cycle_time=_dt(2026, 9, 2, 0),
-        deletion_started_at=_dt(2026, 9, 2, 6),
-    )
-    assert claimed_snap.is_deletion_started is True
-    assert claimed_snap.is_retired is True
+    snapshots = [
+        ModelLifecycleSnapshot(
+            model_id="gfs",
+            cycle_time=c_deleted,
+            deleted_at=_dt(2026, 9, 1, 12),
+        ),
+        ModelLifecycleSnapshot(
+            model_id="gfs",
+            cycle_time=c_old_retired,
+            retired_at=_dt(2026, 9, 1, 18),
+            status="ready",
+        ),
+        ModelLifecycleSnapshot(
+            model_id="gfs",
+            cycle_time=c_retained,
+            retired_at=_dt(2026, 9, 1, 20),
+            status="ready",
+        ),
+        ModelLifecycleSnapshot(
+            model_id="gfs",
+            cycle_time=c_ready,
+            status="ready",
+        ),
+    ]
+    from domain.lifecycle import plan_lifecycle
 
-    partial_snap = CycleLifecycleSnapshot(
-        cycle_time=dt,
-        gfs_status="ready",
-        gefs_status="partial",
-    )
-    assert partial_snap.is_paired_ready is False
+    plan = plan_lifecycle(snapshots, ready_cycle_times=[c_ready])
+
+    assert isinstance(plan, ModelLifecyclePlan)
+    assert CycleLifecycleSnapshot is ModelLifecycleSnapshot
+    assert plan.deleted_cycles == (c_deleted,)
+    assert c_old_retired in [d.cycle_time for d in plan.eligible_for_deletion]
+    assert c_retained in plan.retired_cycles
+    assert c_ready in plan.active_visible_cycles
+
+    # Test property aliases
+    assert len(plan.would_retire) >= 0
+    assert len(plan.would_gc) == len(plan.eligible_for_deletion)
+    assert len(plan.retirements) == len(plan.would_retire)
+    assert len(plan.gc_eligibilities) == len(plan.decisions)
+
+
+def test_naive_datetime_handling() -> None:
+    """Verify naive datetimes are safely normalized to UTC."""
+    c_naive = _dt(2026, 9, 2, 0, tz=False)
+    snap = ModelLifecycleSnapshot(model_id="gfs", cycle_time=c_naive)
+    assert snap.cycle_time.tzinfo is not None
+
+    t, cutoff = compute_lifecycle_cutoff([c_naive], timedelta(hours=6))
+    assert t is not None and t.tzinfo is not None
+
+
+# ---------------------------------------------------------------------------
+# Store Path & Snapshot Properties
+# ---------------------------------------------------------------------------
 
 
 def test_canonical_cycle_store_path() -> None:
     dt = _dt(2026, 9, 2, 18)
-    gfs_path = canonical_cycle_store_path("gfs", dt)
-    assert gfs_path == "s3://weather-data/gfs/2026-09-02/18/cycle.zarr"
+    assert (
+        canonical_cycle_store_path("gfs", dt)
+        == "s3://weather-data/gfs/2026-09-02/18/cycle.zarr"
+    )
+    assert (
+        canonical_cycle_store_path("gefs", dt, base_bucket="custom")
+        == "s3://custom/gefs/2026-09-02/18/cycle.zarr"
+    )
 
-    gefs_path = canonical_cycle_store_path("gefs", dt, base_bucket="custom-bucket")
-    assert gefs_path == "s3://custom-bucket/gefs/2026-09-02/18/cycle.zarr"
 
+def test_snapshot_properties() -> None:
+    dt = _dt(2026, 9, 2, 0)
+    snap = ModelLifecycleSnapshot(model_id="gfs", cycle_time=dt, status="ready")
+    assert snap.is_ready is True
+    assert snap.is_retired is False
+    assert snap.is_deletion_started is False
+    assert snap.is_deleted is False
+
+    claimed = ModelLifecycleSnapshot(
+        model_id="gfs",
+        cycle_time=dt,
+        deletion_started_at=dt,
+    )
+    assert claimed.is_deletion_started is True

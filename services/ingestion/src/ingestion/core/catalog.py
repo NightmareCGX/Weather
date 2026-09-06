@@ -199,7 +199,9 @@ def is_ready_run_store(db: Session, store_path: str) -> bool:
     return row is not None
 
 
-def is_cycle_fenced_or_deleted(db: Session, cycle_time: datetime) -> bool:
+def is_cycle_fenced_or_deleted(
+    db: Session, cycle_time: datetime, model_id: str | None = None
+) -> bool:
     """Return whether ``cycle_time`` is claimed for deletion or already tombstoned.
 
     A cycle with ``deletion_started_at IS NOT NULL`` or ``deleted_at IS NOT NULL``
@@ -207,15 +209,27 @@ def is_cycle_fenced_or_deleted(db: Session, cycle_time: datetime) -> bool:
     during or after physical GC.
     """
     c_utc = _ensure_utc_datetime(cycle_time)
-    row = db.get(ForecastCycleLifecycleRecord, c_utc)
-    if row is None:
-        return False
-    return row.deletion_started_at is not None or row.deleted_at is not None
+    if model_id is not None:
+        m_id = model_id.lower().strip()
+        row = db.get(ForecastCycleLifecycleRecord, (m_id, c_utc))
+        if row is None:
+            return False
+        return row.deletion_started_at is not None or row.deleted_at is not None
+
+    rows = db.execute(
+        select(
+            ForecastCycleLifecycleRecord.deletion_started_at,
+            ForecastCycleLifecycleRecord.deleted_at,
+        ).where(ForecastCycleLifecycleRecord.cycle_time == c_utc)
+    ).all()
+    return any(s is not None or d is not None for s, d in rows)
 
 
-def is_cycle_tombstoned(db: Session, cycle_time: datetime) -> bool:
+def is_cycle_tombstoned(
+    db: Session, cycle_time: datetime, model_id: str | None = None
+) -> bool:
     """Return whether ``cycle_time`` has a deletion fence or deleted_at tombstone."""
-    return is_cycle_fenced_or_deleted(db, cycle_time)
+    return is_cycle_fenced_or_deleted(db, cycle_time, model_id=model_id)
 
 
 
@@ -314,6 +328,9 @@ class EnsembleMemberProductRecord(CatalogBase):
 class ForecastCycleLifecycleRecord(CatalogBase):
     __tablename__ = "forecast_cycle_lifecycle"
 
+    model_id = Column(
+        String, ForeignKey("models.model_id", ondelete="CASCADE"), primary_key=True
+    )
     cycle_time = Column(DateTime(timezone=True), primary_key=True)
     retired_at = Column(DateTime(timezone=True), nullable=True)
     retired_by_cycle_time = Column(DateTime(timezone=True), nullable=True)
@@ -724,7 +741,7 @@ def record_run(
     if cycle_time.tzinfo is None:
         cycle_time = cycle_time.replace(tzinfo=timezone.utc)
 
-    if is_cycle_tombstoned(db, cycle_time):
+    if is_cycle_tombstoned(db, cycle_time, model_id=spec.model_id):
         from ingestion.core.base import CycleTombstonedError
 
         raise CycleTombstonedError(
@@ -1187,132 +1204,140 @@ def _ensure_utc_datetime(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def list_paired_ready_cycle_times(
-    db: Session, *, version_string: str = "v1.0"
+def list_model_ready_cycle_times(
+    db: Session, model_id: str, *, version_string: str = "v1.0"
 ) -> list[datetime]:
-    """Return all sorted UTC cycle times that are paired-ready for GFS and GEFS.
-
-    A cycle C is paired-ready iff both GFS(C) and GEFS(C) have status == 'ready'
-    in model_runs for the target version_string.
+    """Return all sorted UTC cycle times where model_id has status == 'ready'.
 
     Args:
         db: Database session.
+        model_id: Target model identifier ('gfs', 'gefs').
         version_string: Target model version (default 'v1.0').
 
     Returns:
         Sorted list of unique UTC timezone-aware datetimes.
     """
-    gfs_version_id = db.execute(
+    m_id = model_id.lower().strip()
+    version_id = db.execute(
         select(ModelVersionRecord.id).where(
-            (ModelVersionRecord.model_id == "gfs")
+            (ModelVersionRecord.model_id == m_id)
             & (ModelVersionRecord.version_string == version_string)
         )
     ).scalar_one_or_none()
-    gefs_version_id = db.execute(
-        select(ModelVersionRecord.id).where(
-            (ModelVersionRecord.model_id == "gefs")
-            & (ModelVersionRecord.version_string == version_string)
-        )
-    ).scalar_one_or_none()
-
-    if gfs_version_id is None or gefs_version_id is None:
+    if version_id is None:
         return []
 
-    gfs_ready = set(
-        db.execute(
-            select(ModelRunRecord.cycle_time).where(
-                (ModelRunRecord.model_version_id == gfs_version_id)
-                & (ModelRunRecord.status == "ready")
-            )
-        ).scalars().all()
-    )
-    gefs_ready = set(
-        db.execute(
-            select(ModelRunRecord.cycle_time).where(
-                (ModelRunRecord.model_version_id == gefs_version_id)
-                & (ModelRunRecord.status == "ready")
-            )
-        ).scalars().all()
-    )
+    times = db.execute(
+        select(ModelRunRecord.cycle_time).where(
+            (ModelRunRecord.model_version_id == version_id)
+            & (ModelRunRecord.status == "ready")
+        )
+    ).scalars().all()
+    return sorted(_ensure_utc_datetime(dt) for dt in set(times))
 
-    paired = gfs_ready & gefs_ready
-    return sorted(_ensure_utc_datetime(dt) for dt in paired)
+
+def list_paired_ready_cycle_times(
+    db: Session, *, version_string: str = "v1.0"
+) -> list[datetime]:
+    """Legacy helper: return intersection of ready cycle times across gfs and gefs."""
+    gfs_ready = set(list_model_ready_cycle_times(db, "gfs", version_string=version_string))
+    gefs_ready = set(list_model_ready_cycle_times(db, "gefs", version_string=version_string))
+    return sorted(gfs_ready & gefs_ready)
 
 
 def list_cycle_lifecycle_snapshots(
-    db: Session, *, version_string: str = "v1.0"
+    db: Session,
+    *,
+    model_id: str | None = None,
+    version_string: str = "v1.0",
 ) -> list[Any]:
-    """Reconstruct CycleLifecycleSnapshot for all known cycles in the catalog.
+    """Reconstruct ModelLifecycleSnapshot for cycles in the catalog.
 
     Discovers cycles from both forecast_cycle_lifecycle and model_runs so that
     newly created model_runs without a lifecycle row yet are naturally captured.
 
     Args:
         db: Database session.
+        model_id: Optional model identifier ('gfs', 'gefs'). When omitted, queries all models.
         version_string: Model version string to discover run statuses for.
 
     Returns:
-        List of CycleLifecycleSnapshot objects sorted by cycle_time ascending.
+        List of ModelLifecycleSnapshot objects sorted by cycle_time ascending.
     """
-    from domain.lifecycle import CycleLifecycleSnapshot
+    from domain.lifecycle import ModelLifecycleSnapshot
 
-    # Query all lifecycle records
+    stmt_lc = select(ForecastCycleLifecycleRecord)
+    if model_id is not None:
+        stmt_lc = stmt_lc.where(
+            ForecastCycleLifecycleRecord.model_id == model_id.lower().strip()
+        )
     lifecycle_rows = {
-        _ensure_utc_datetime(cast(datetime, row.cycle_time)): row
-        for row in db.execute(select(ForecastCycleLifecycleRecord)).scalars().all()
+        (str(row.model_id), _ensure_utc_datetime(cast(datetime, row.cycle_time))): row
+        for row in db.execute(stmt_lc).scalars().all()
     }
 
-    # Query all model_runs for gfs and gefs
-    runs = db.execute(
+    stmt_runs = (
         select(
             ModelVersionRecord.model_id,
             ModelRunRecord.cycle_time,
             ModelRunRecord.status,
         )
         .join(ModelVersionRecord, ModelRunRecord.model_version_id == ModelVersionRecord.id)
-        .where(
-            (ModelVersionRecord.version_string == version_string)
-            & (ModelVersionRecord.model_id.in_(["gfs", "gefs"]))
+        .where(ModelVersionRecord.version_string == version_string)
+    )
+    if model_id is not None:
+        stmt_runs = stmt_runs.where(
+            ModelVersionRecord.model_id == model_id.lower().strip()
         )
-    ).all()
+    else:
+        stmt_runs = stmt_runs.where(
+            ModelVersionRecord.model_id.in_(["gfs", "gefs"])
+        )
+    runs = db.execute(stmt_runs).all()
 
-    model_statuses: dict[tuple[datetime, str], str] = {}
-    all_cycle_times: set[datetime] = set(lifecycle_rows.keys())
-    for model_id, cycle_time, status in runs:
+    model_statuses: dict[tuple[str, datetime], str] = {}
+    all_keys: set[tuple[str, datetime]] = set(lifecycle_rows.keys())
+    for m_id, cycle_time, status in runs:
+        m_str = str(m_id)
         c_utc = _ensure_utc_datetime(cast(datetime, cycle_time))
-        model_statuses[(c_utc, str(model_id))] = str(status)
-        all_cycle_times.add(c_utc)
+        model_statuses[(m_str, c_utc)] = str(status)
+        all_keys.add((m_str, c_utc))
 
-    snapshots: list[CycleLifecycleSnapshot] = []
-    for c_utc in sorted(all_cycle_times):
-        lc = lifecycle_rows.get(c_utc)
+    snapshots: list[ModelLifecycleSnapshot] = []
+    for m_str, c_utc in sorted(all_keys, key=lambda k: (k[1], k[0])):
+        lc = lifecycle_rows.get((m_str, c_utc))
         snapshots.append(
-            CycleLifecycleSnapshot(
+            ModelLifecycleSnapshot(
+                model_id=m_str,
                 cycle_time=c_utc,
+                status=model_statuses.get((m_str, c_utc)),
                 retired_at=cast(datetime | None, lc.retired_at) if lc else None,
                 retired_by_cycle_time=cast(datetime | None, lc.retired_by_cycle_time) if lc else None,
                 deletion_started_at=cast(datetime | None, lc.deletion_started_at) if lc else None,
                 deleted_at=cast(datetime | None, lc.deleted_at) if lc else None,
-                gfs_status=model_statuses.get((c_utc, "gfs")),
-                gefs_status=model_statuses.get((c_utc, "gefs")),
             )
         )
     return snapshots
 
 
 def ensure_lifecycle_row(
-    db: Session, cycle_time: datetime
+    db: Session,
+    model_id: str,
+    cycle_time: datetime,
 ) -> ForecastCycleLifecycleRecord:
-    """Return the existing lifecycle record for cycle_time or create an initial row."""
+    """Return existing lifecycle record for (model_id, cycle_time) or create initial row."""
+    m_id = model_id.lower().strip()
     c_utc = _ensure_utc_datetime(cycle_time)
-    row = db.get(ForecastCycleLifecycleRecord, c_utc)
+    row = db.get(ForecastCycleLifecycleRecord, (m_id, c_utc))
     if row is not None:
         return row
     now = _utcnow()
     row = ForecastCycleLifecycleRecord(
+        model_id=m_id,
         cycle_time=c_utc,
         retired_at=None,
         retired_by_cycle_time=None,
+        deletion_started_at=None,
         deleted_at=None,
         created_at=now,
         updated_at=now,
@@ -1324,44 +1349,36 @@ def ensure_lifecycle_row(
 
 def mark_cycle_retired(
     db: Session,
+    model_id: str,
     cycle_time: datetime,
     retired_at: datetime,
     retired_by_cycle_time: datetime,
 ) -> bool:
-    """Mark a forecast cycle as retired by successor R1.
+    """Mark a forecast cycle as retired by anchor T.
 
     Idempotent: if already retired with identical retired_by_cycle_time, returns False.
-    Invariant safety: if already retired with a DIFFERENT retired_by_cycle_time,
-    preserves the original and raises ValueError.
-
-    Args:
-        db: Database session.
-        cycle_time: Cycle C to retire.
-        retired_at: Timestamp when retirement occurred.
-        retired_by_cycle_time: Successor cycle R1 that triggered retirement.
-
-    Returns:
-        True if the cycle transitioned to retired in this call, False if already retired.
     """
     import logging
 
+    m_id = model_id.lower().strip()
     c_utc = _ensure_utc_datetime(cycle_time)
     r_at_utc = _ensure_utc_datetime(retired_at)
     r_by_utc = _ensure_utc_datetime(retired_by_cycle_time)
 
-    row = ensure_lifecycle_row(db, c_utc)
+    row = ensure_lifecycle_row(db, m_id, c_utc)
     if row.retired_at is not None:
         if row.retired_by_cycle_time is not None:
             existing_r1 = _ensure_utc_datetime(cast(datetime, row.retired_by_cycle_time))
             if existing_r1 != r_by_utc:
                 logging.getLogger(__name__).error(
-                    "Cycle %s is already retired by %s; refusing to overwrite with %s",
+                    "Model %s cycle %s already retired by %s; refusing to overwrite with %s",
+                    m_id,
                     c_utc.isoformat(),
                     existing_r1.isoformat(),
                     r_by_utc.isoformat(),
                 )
                 raise ValueError(
-                    f"Cycle {c_utc.isoformat()} already retired by {existing_r1.isoformat()}; "
+                    f"Model {m_id} cycle {c_utc.isoformat()} already retired by {existing_r1.isoformat()}; "
                     f"cannot overwrite with {r_by_utc.isoformat()}"
                 )
         return False
@@ -1376,48 +1393,61 @@ def mark_cycle_retired(
 def reconcile_cycle_lifecycle(
     db: Session,
     *,
+    model_id: str | None = None,
+    models: tuple[str, ...] = ("gfs", "gefs"),
     now: datetime | None = None,
     version_string: str = "v1.0",
 ) -> Any:
-    """Evaluate lifecycle transitions and persist new retirements to PostgreSQL.
+    """Evaluate lifecycle transitions and persist new retirements to PostgreSQL per model.
 
     Args:
         db: Database session.
+        model_id: Optional model identifier. When provided, reconciles only that model.
+        models: Tuple of models to reconcile when model_id is None.
         now: Optional current timestamp override for retired_at (defaults to UTC now).
         version_string: Model version string (defaults to 'v1.0').
 
     Returns:
-        The evaluated LifecyclePlan.
+        The evaluated ModelLifecyclePlan (if single model) or dict of plans per model.
     """
     import logging
-    from domain.lifecycle import plan_lifecycle
+    from domain.lifecycle import plan_model_lifecycle
 
     log = logging.getLogger(__name__)
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
-    paired_ready = list_paired_ready_cycle_times(db, version_string=version_string)
-    snapshots = list_cycle_lifecycle_snapshots(db, version_string=version_string)
-    plan = plan_lifecycle(snapshots, paired_ready)
+    target_models = (model_id.lower().strip(),) if model_id is not None else models
 
-    for decision in plan.retirements:
-        if decision.should_retire and decision.retired_by_cycle_time is not None:
-            mark_cycle_retired(
-                db,
-                decision.cycle_time,
-                retired_at=now_utc,
-                retired_by_cycle_time=decision.retired_by_cycle_time,
-            )
-            log.info(
-                "cycle_retired: cycle_time=%s retired_by_cycle_time=%s reason=%s",
-                decision.cycle_time.isoformat(),
-                decision.retired_by_cycle_time.isoformat(),
-                decision.reason,
-                extra={
-                    "event": "cycle_retired",
-                    "cycle_time": decision.cycle_time.isoformat(),
-                    "retired_by": decision.retired_by_cycle_time.isoformat(),
-                },
-            )
+    plans: dict[str, Any] = {}
+    for m_id in target_models:
+        ready_cycles = list_model_ready_cycle_times(db, m_id, version_string=version_string)
+        snapshots = list_cycle_lifecycle_snapshots(db, model_id=m_id, version_string=version_string)
+        plan = plan_model_lifecycle(m_id, snapshots, ready_cycles)
+        plans[m_id] = plan
 
+        for decision in plan.would_retire:
+            if decision.retired_by_cycle_time is not None:
+                mark_cycle_retired(
+                    db,
+                    m_id,
+                    decision.cycle_time,
+                    retired_at=now_utc,
+                    retired_by_cycle_time=decision.retired_by_cycle_time,
+                )
+                log.info(
+                    "cycle_retired: model=%s cycle_time=%s retired_by=%s reason=%s",
+                    m_id,
+                    decision.cycle_time.isoformat(),
+                    decision.retired_by_cycle_time.isoformat(),
+                    decision.reason,
+                    extra={
+                        "event": "cycle_retired",
+                        "model": m_id,
+                        "cycle_time": decision.cycle_time.isoformat(),
+                        "retired_by": decision.retired_by_cycle_time.isoformat(),
+                    },
+                )
     db.commit()
-    return plan
+    if model_id is not None:
+        return plans[model_id.lower().strip()]
+    return plans
 
