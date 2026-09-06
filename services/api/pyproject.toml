@@ -13,7 +13,7 @@ python = "^3.12"
 # ensemble_data, verification). Declare the workspace package as a runtime
 # dependency so a clean install of ``weather-platform-api`` can import it
 # without relying on the developer's environment (ENGINEERING_CONTRACT §6).
-weather-platform-domain = { path = "../../packages/domain", develop = true }
+weather-platform-domain = { path = "../../packages/domain" }
 fastapi = "^0.110.0"
 uvicorn = "^0.28.0"
 sqlalchemy = "^2.0.28"
@@ -49,7 +49,6 @@ httpx = "^0.27.0"
 python_version = "3.12"
 strict = true
 files = ["src/api"]
-mypy_path = ["../../packages/domain/src"]
 # The SQLAlchemy declarative base (``declarative_base()``) is a runtime-factory
 # function whose return type is ``Any``; every ORM class subclasses it. mypy
 # reports each subclass as an error ("Class cannot subclass Base (has type
