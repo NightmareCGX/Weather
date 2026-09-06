@@ -36,6 +36,7 @@ from domain.models.wind import (
     derive_meteorological_direction,
     get_cardinal_direction,
 )
+from domain.temporal import INTERVAL_LEAD0_FALLBACK_VARIABLES
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -285,8 +286,6 @@ def build_point_forecast(
     candidates = _select_min_lead_winners(
         db,
         model,
-        start_lead_time_hours=start_lead_time_hours,
-        end_lead_time_hours=end_lead_time_hours,
     )
     if not candidates:
         raise HTTPException(
@@ -322,12 +321,33 @@ def build_point_forecast(
 
     resolved: dict[datetime, tuple[datetime, int]] = {}
     for valid_time, pairs in candidates.items():
+        anchor_candidate = None
         for cycle_time, lead in pairs:
             metadata = _open_cycle(cycle_time)
             if metadata is None or lead not in metadata.lead_times:
                 continue
-            resolved[valid_time] = (cycle_time, lead)
+            anchor_candidate = (cycle_time, lead)
             break
+
+        if anchor_candidate is None:
+            continue
+
+        anchor_cycle, anchor_lead = anchor_candidate
+        if start_lead_time_hours is not None and anchor_lead < start_lead_time_hours:
+            continue
+        if end_lead_time_hours is not None and anchor_lead > end_lead_time_hours:
+            continue
+
+        resolved[valid_time] = anchor_candidate
+
+        # When the anchor candidate is lead 0, pre-probe positive-lead candidates
+        # so any required fallback cycles are opened and in by_cycle before db.close().
+        if anchor_lead == 0:
+            for cycle_time, lead in pairs:
+                if lead > 0:
+                    metadata = _open_cycle(cycle_time)
+                    if metadata is not None and lead in metadata.lead_times:
+                        break
 
     if not resolved:
         raise HTTPException(
@@ -348,7 +368,7 @@ def build_point_forecast(
     # the heavy point interpolations loop.
     cycle_store_paths: dict[datetime, str | None] = {
         ct: _resolve_cycle_store_path(db, model, ct)
-        for ct, _ in resolved.values()
+        for ct in by_cycle
     }
     # Explicitly release the ORM database connection before storage reads.
     db.close()
@@ -358,19 +378,89 @@ def build_point_forecast(
         store_path = cycle_store_paths.get(cycle_time)
         if store_path is None:
             continue
-        # One bounded gate session interpolates every requested variable at the
-        # point and lead (the small 2x2 neighborhood read under the SHARED lock).
-        values_by_var = gated_point_interpolations(
-            store_path,
-            var_codes=tuple(var_codes),
-            lead=lead,
-            latitude=location.latitude,
-            longitude=location.longitude,
+
+        pairs = candidates.get(valid_time, [])
+
+        # Sourcing strategy:
+        # At lead > 0, all variables sample from the anchor source (store_path, lead).
+        # At lead == 0, interval variables (precipitation_amount_3h and cloud_cover_3h)
+        # require positive-lead fallback from the next-newest serveable candidate.
+        # Precipitation companion variables (crain, csnow, cfrzr, cicep) are source-coupled
+        # to the exact same store, cycle, and lead as precipitation_amount_3h.
+        precip_source: tuple[str, int] | None = None
+        cloud_source: tuple[str, int] | None = None
+
+        if lead == 0:
+            if "precipitation_amount_3h" in var_codes:
+                for p_cycle, p_lead in pairs:
+                    if p_lead > 0:
+                        p_meta = _open_cycle(p_cycle)
+                        if p_meta is not None and p_lead in p_meta.lead_times:
+                            p_store = cycle_store_paths.get(p_cycle)
+                            if p_store is not None:
+                                precip_source = (p_store, p_lead)
+                                break
+
+            if "cloud_cover_3h" in var_codes:
+                for c_cycle, c_lead in pairs:
+                    if c_lead > 0:
+                        c_meta = _open_cycle(c_cycle)
+                        if c_meta is not None and c_lead in c_meta.lead_times:
+                            c_store = cycle_store_paths.get(c_cycle)
+                            if c_store is not None:
+                                cloud_source = (c_store, c_lead)
+                                break
+
+        anchor_vars = tuple(
+            v for v in var_codes
+            if not (lead == 0 and v in INTERVAL_LEAD0_FALLBACK_VARIABLES)
         )
-        if values_by_var is None:
-            # The store became unreadable between winner resolution and
-            # interpolation; drop this record rather than failing the request.
-            continue
+        values_by_var: dict[str, Any] = {}
+        if anchor_vars:
+            anchor_vals = gated_point_interpolations(
+                store_path,
+                var_codes=anchor_vars,
+                lead=lead,
+                latitude=location.latitude,
+                longitude=location.longitude,
+            )
+            if anchor_vals is None:
+                continue
+            values_by_var.update(anchor_vals)
+
+        if lead == 0 and "precipitation_amount_3h" in var_codes:
+            if precip_source is not None:
+                p_store, p_lead = precip_source
+                p_vals = gated_point_interpolations(
+                    p_store,
+                    var_codes=("precipitation_amount_3h",),
+                    lead=p_lead,
+                    latitude=location.latitude,
+                    longitude=location.longitude,
+                )
+                if p_vals is not None:
+                    values_by_var.update(p_vals)
+                else:
+                    values_by_var["precipitation_amount_3h"] = None
+            else:
+                values_by_var["precipitation_amount_3h"] = None
+
+        if lead == 0 and "cloud_cover_3h" in var_codes:
+            if cloud_source is not None:
+                c_store, c_lead = cloud_source
+                c_vals = gated_point_interpolations(
+                    c_store,
+                    var_codes=("cloud_cover_3h",),
+                    lead=c_lead,
+                    latitude=location.latitude,
+                    longitude=location.longitude,
+                )
+                if c_vals is not None:
+                    values_by_var.update(c_vals)
+                else:
+                    values_by_var["cloud_cover_3h"] = None
+            else:
+                values_by_var["cloud_cover_3h"] = None
         entry: dict[str, Any] = {
             "lead_time_hours": lead,
             "valid_time": valid_time,

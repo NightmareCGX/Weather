@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from domain.coverage import get_expected_members, is_lead_servable
+from domain.temporal import requires_lead0_display_fallback
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -158,6 +159,8 @@ def resolve_valid_time_candidates(
             continue
         if end_lead_time_hours is not None and lead_num > end_lead_time_hours:
             continue
+        if lead_num == 0 and requires_lead0_display_fallback(variable):
+            continue
 
         v_time = c_utc + timedelta(hours=lead_num)
         if target_valid_time is not None and v_time != _ensure_utc(target_valid_time):
@@ -204,6 +207,8 @@ def resolve_valid_time_candidates(
             if start_lead_time_hours is not None and lead_num < start_lead_time_hours:
                 continue
             if end_lead_time_hours is not None and lead_num > end_lead_time_hours:
+                continue
+            if lead_num == 0 and requires_lead0_display_fallback(variable):
                 continue
             v_time = c_utc + timedelta(hours=lead_num)
             if target_valid_time is not None and v_time != _ensure_utc(target_valid_time):
@@ -259,8 +264,20 @@ def resolve_valid_time_source(
             detail=f"No forecast data is available for model '{model}' at valid time '{v_utc.isoformat()}'.",
         )
 
-    # First candidate is newest cycle (minimum lead)
-    cycle_time, lead_time_hours, run_id, store_path = pairs[0]
+    # First candidate is newest cycle (minimum lead), or first positive lead for interval variables
+    if requires_lead0_display_fallback(variable):
+        positive_pairs = [p for p in pairs if p[1] > 0]
+        if not positive_pairs:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No positive-lead interval forecast is available for model '{model}' "
+                    f"and variable '{variable}' at valid time '{v_utc.isoformat()}'."
+                ),
+            )
+        cycle_time, lead_time_hours, run_id, store_path = positive_pairs[0]
+    else:
+        cycle_time, lead_time_hours, run_id, store_path = pairs[0]
 
     generation = resolve_serving_generation_for_store(store_path)
 
