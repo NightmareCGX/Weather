@@ -418,8 +418,8 @@ def test_serving_contract_e2e_gfs_and_gefs(clean_db) -> None:
         assert gefs_f0.get("wind_10m") is not None
         assert not np.isnan(gefs_f0["wind_10m"])
         assert gefs_f0["wind_10m"] > 0.0
-        assert gefs_f0.get("precipitation_amount_3h") is not None
-        assert not np.isnan(gefs_f0["precipitation_amount_3h"])
+        assert gefs_f0.get("precipitation_amount_3h") is None
+        assert gefs_f0.get("cloud_cover_3h") is None
 
         # H. GEFS Vector Field (Consensus Mean Vector)
         res_vf = client.get(f"/v1/maps/gefs/wind_10m/vector-field?lead_time_hours=0&initial_time={cycle_str_gefs}")
