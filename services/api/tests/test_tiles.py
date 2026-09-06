@@ -542,41 +542,53 @@ def test_plus_minus_180_interior_regression():
 
 def test_sharded_v1_periodic_wrap():
     """Sharded v1 store format correctly appends column 0 at 360.0 for periodic grids."""
-    import os
+    import json
     import tempfile
+    from pathlib import Path
     import numpy as np
     import xarray as xr
     from api.services.tiles import _derive_grid, _slice_field, _align_longitudes, TILE_SIZE
-    from ingestion.core.zarr_writer import prepare_run_store, commit_region
-    from ingestion.core.coordinator import write_manifest
+    from tests.test_sharded_reader import _build_test_shard
 
-    lats = np.linspace(90.0, -90.0, 721, dtype=np.float32)
-    lons = np.linspace(0.0, 359.75, 1440, dtype=np.float32)
-    dims = ("latitude", "longitude")
-    data = np.full((721, 1440), 20.0, dtype=np.float32)
-    data[:, 0] = 10.0   # lon 0.0
-    data[:, -1] = 50.0  # lon 359.75
-
-    coords = {
-        "lead_time_hours": [0],
-        "latitude": lats,
-        "longitude": lons,
-        "member": [1],
-    }
-    ds = xr.Dataset(data_vars={"temperature_2m": (dims, data)}, coords=coords)
+    latitudes = [90.0 - i * 0.25 for i in range(721)]
+    longitudes = [0.0 + j * 0.25 for j in range(1440)]
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        gefs_store = os.path.join(tmp_dir, "gefs_cycle.zarr")
-        expected_members = tuple(range(1, 31))
-        prepare_run_store(ds, gefs_store, expected_lead_time_hours=(0,), expected_members=expected_members)
-        for m in expected_members:
-            ds_m = ds.assign_coords(member=[m])
-            commit_region(ds_m, gefs_store, lead_time_hours=0, member=m)
+        store_dir = Path(tmp_dir) / "gefs_test.zarr"
+        store_dir.mkdir(parents=True, exist_ok=True)
 
-        payload = {"manifest_schema_version": 1, "generation": "gen_final", "storage_format_version": "sharded_v1"}
-        write_manifest(gefs_store, payload)
+        manifest_dir = store_dir / "__commit__" / "v1"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "manifest.json").write_text(
+            json.dumps({
+                "manifest_schema_version": 1,
+                "generation": "gen_test",
+                "storage_format_version": "sharded_v1",
+            })
+        )
 
-        grid = _derive_grid(ds)
+        # Write shard container for member 1, lead 0 of temperature_2m
+        # Chunk row 4, col 0 (lon 0.0) has value 4 * 15 + 0 + 10.0 = 70.0
+        # Chunk row 4, col 14 (lon 359.75) has value 4 * 15 + 14 + 10.0 = 84.0
+        t_shard = _build_test_shard(val_offset=10.0)
+        shard_file = store_dir / "temperature_2m" / "shard.mem001_L0000.shard"
+        shard_file.parent.mkdir(parents=True, exist_ok=True)
+        shard_file.write_bytes(t_shard)
+
+        ds_meta = xr.Dataset(
+            data_vars={
+                "temperature_2m": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((1, 1, 721, 1440), dtype=np.float32)),
+            },
+            coords={
+                "member": [1],
+                "lead_time_hours": [0],
+                "latitude": latitudes,
+                "longitude": longitudes,
+            },
+        )
+        ds_meta.to_zarr(str(store_dir), mode="a", consolidated=True, zarr_format=2)
+
+        grid = _derive_grid(ds_meta)
         z, x, y = 4, 7, 8
         n = 2 ** z
         px_idx, py_idx = np.meshgrid(
@@ -591,8 +603,10 @@ def test_sharded_v1_periodic_wrap():
         lon_native = _align_longitudes(grid, pixel_lons)
 
         field, lat_axis, lon_axis = _slice_field(
-            ds, "temperature_2m", 0, grid, pixel_lats, lon_native, expected_members=30, store_path=gefs_store
+            ds_meta, "temperature_2m", 0, grid, pixel_lats, lon_native, expected_members=1, store_path=str(store_dir)
         )
         assert lon_axis[-1] == 360.0
-        assert field[0, -1] == 10.0  # wrapped from lon 0.0
-        assert field[0, -2] == 50.0  # penultimate from lon 359.75
+        # Wrapped column at 360.0 must carry data from stored lon 0.0 (chunk 60 = 70.0)
+        assert field[0, -1] == 70.0
+        # Penultimate column must carry data from stored lon 359.75 (chunk 74 = 84.0)
+        assert field[0, -2] == 84.0
