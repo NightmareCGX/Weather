@@ -319,6 +319,53 @@ describe("WeatherMap", () => {
     });
   });
 
+  it("canonicalizes unwrapped positive longitude from map click events (Antarctic Ross Sea)", () => {
+    const onSelect = jest.fn();
+    renderMap({ onSelect });
+    const [map] = getInstances();
+
+    map.fire("load");
+    map.fire("click", {
+      lngLat: {
+        lat: -77.85,
+        lng: 187.58796875,
+        wrap() {
+          return { lat: -77.85, lng: -172.41203125 };
+        },
+      },
+    });
+
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(onSelect.mock.calls[0][0]).toMatchObject({
+      object: "coordinates",
+      resolvedVia: "coordinates",
+      latitude: -77.85,
+    });
+    expect(onSelect.mock.calls[0][0].longitude).toBeCloseTo(-172.41203125, 8);
+  });
+
+  it("canonicalizes unwrapped negative longitude from map click events", () => {
+    const onSelect = jest.fn();
+    renderMap({ onSelect });
+    const [map] = getInstances();
+
+    map.fire("load");
+    map.fire("click", {
+      lngLat: {
+        lat: -80.0,
+        lng: -188.6328125,
+      },
+    });
+
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(onSelect.mock.calls[0][0]).toMatchObject({
+      object: "coordinates",
+      resolvedVia: "coordinates",
+      latitude: -80.0,
+    });
+    expect(onSelect.mock.calls[0][0].longitude).toBeCloseTo(171.3671875, 8);
+  });
+
   it("ignores click events without resolved coordinates", () => {
     const onSelect = jest.fn();
     renderMap({ onSelect });

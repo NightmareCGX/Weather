@@ -12,6 +12,18 @@ import type { SearchResult, SelectedLocation } from "@/lib/api/types";
 
 const COORDINATE_PRECISION = 4;
 
+/**
+ * Canonicalize a longitude into the half-open interval `(-180, 180]`,
+ * matching MapLibre native `LngLat.prototype.wrap()` semantics.
+ *
+ * Equivalent antimeridian representations (e.g. `-180` and `180`) map to `+180`.
+ */
+export function canonicalizeLongitude(longitude: number): number {
+  const d = 360;
+  const w = ((((longitude - -180) % d) + d) % d) - 180;
+  return w === -180 ? 180 : w;
+}
+
 /** Format a coordinate pair as a stable label, e.g. `"38.19, -106.82"`. */
 export function formatCoordinates(latitude: number, longitude: number): string {
   return `${latitude.toFixed(COORDINATE_PRECISION)}, ${longitude.toFixed(COORDINATE_PRECISION)}`;
@@ -19,10 +31,11 @@ export function formatCoordinates(latitude: number, longitude: number): string {
 
 /** Convert a `/v1/search` result into the shared selected-location model. */
 export function searchResultToSelectedLocation(result: SearchResult): SelectedLocation {
+  const canonicalLon = canonicalizeLongitude(result.longitude);
   const base = {
     name: result.name,
     latitude: result.latitude,
-    longitude: result.longitude,
+    longitude: canonicalLon,
     elevation_m: result.elevation_m,
     region: result.region,
     country: result.country,
@@ -69,11 +82,12 @@ export function coordinatesToSelectedLocation(
   latitude: number,
   longitude: number
 ): SelectedLocation {
+  const canonicalLon = canonicalizeLongitude(longitude);
   return {
-    name: formatCoordinates(latitude, longitude),
+    name: formatCoordinates(latitude, canonicalLon),
     object: "coordinates",
     latitude,
-    longitude,
+    longitude: canonicalLon,
     elevation_m: null,
     region: null,
     country: null,
