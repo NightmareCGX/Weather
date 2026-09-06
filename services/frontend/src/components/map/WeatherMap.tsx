@@ -83,7 +83,8 @@ export function WeatherMap({
       if (lngLat === undefined) {
         return;
       }
-      onSelectRef.current(coordinatesToSelectedLocation(lngLat.lat, lngLat.lng));
+      const wrapped = typeof lngLat.wrap === "function" ? lngLat.wrap() : lngLat;
+      onSelectRef.current(coordinatesToSelectedLocation(wrapped.lat, wrapped.lng));
     };
 
     const handleLoad = () => {
