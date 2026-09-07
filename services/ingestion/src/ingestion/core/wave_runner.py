@@ -211,6 +211,7 @@ class RunSpec:
     members: tuple[int, ...] = ()
     store: str | None = None
     allow_custom_store: bool = False
+    include_mean: bool = True
 
     @property
     def cycle_time(self) -> datetime:
@@ -309,7 +310,12 @@ def _resolve_concurrency_plan(
 
 
 def _destination_for(
-    spec: RunSpec, staging_dir: Path, *, lead: int, member: int | None = None
+    spec: RunSpec,
+    staging_dir: Path,
+    *,
+    lead: int,
+    member: int | None = None,
+    is_mean: bool = False,
 ) -> Path:
     """Return the staged download path for a (member,) lead file.
 
@@ -321,12 +327,15 @@ def _destination_for(
         staging_dir: The run-scoped staging directory.
         lead: Forecast lead time.
         member: GEFS member identity, or ``None`` for deterministic.
+        is_mean: Whether downloading the official ensemble mean product (geavg).
 
     Returns:
         The staging path.
     """
     date_str = f"{spec.cycle_date:%Y%m%d}"
-    if member is not None:
+    if is_mean:
+        name = f"geavg.{date_str}.t{spec.cycle_hour:02d}z.pgrb2s.0p25.f{lead:03d}"
+    elif member is not None:
         name = (
             f"gep{member:02d}.{date_str}.t{spec.cycle_hour:02d}z.pgrb2s.0p25."
             f"f{lead:03d}"
@@ -574,21 +583,22 @@ async def _run_wave_impl(
     staging_dir = Path(args.download_dir) / run_tag
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    # Each (member, lead) work item, or just (lead) for deterministic.
+    # Each (member, lead, is_mean) work item.
     # Lead-major ordering for ensemble models enables early progressive publication per settled lead.
     if spec.model != "gefs":
-        items: list[tuple[int | None, int]] = [
-            (None, lead) for lead in sorted(spec.target_lead_time_hours)
+        items: list[tuple[int | None, int, bool]] = [
+            (None, lead, False) for lead in sorted(spec.target_lead_time_hours)
         ]
     else:
-        items = [
-            (member, lead)
-            for lead in sorted(spec.target_lead_time_hours)
-            for member in sorted(spec.members)
-        ]
+        items = []
+        for lead in sorted(spec.target_lead_time_hours):
+            if spec.include_mean:
+                items.append((None, lead, True))
+            for member in sorted(spec.members):
+                items.append((member, lead, False))
 
     seed_item = items[0]
-    seed_member, seed_lead = seed_item
+    seed_member, seed_lead, seed_is_mean = seed_item
 
     # Observability: tracker and live UI renderer
     no_progress = getattr(args, "no_progress", False)
@@ -642,13 +652,13 @@ async def _run_wave_impl(
     wave_cancel_event: threading.Event = (
         cancel_event if cancel_event is not None else threading.Event()
     )
-    write_completed_events: dict[tuple[int | None, int], asyncio.Event] = {
+    write_completed_events: dict[tuple[int | None, int, bool], asyncio.Event] = {
         item: asyncio.Event() for item in items
     }
-    decode_completed_events: dict[tuple[int | None, int], asyncio.Event] = {
+    decode_completed_events: dict[tuple[int | None, int, bool], asyncio.Event] = {
         item: asyncio.Event() for item in items
     }
-    predecessor_states: dict[tuple[int | None, int], PredecessorState] = {}
+    predecessor_states: dict[tuple[int | None, int, bool], PredecessorState] = {}
     predecessor_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=plan.write_concurrency)
     # The persistent decode pool: up to ``plan.decode_concurrency`` reusable worker
@@ -665,7 +675,7 @@ async def _run_wave_impl(
             # 1. Retained seed. Download the seed first, then decode it in a
             #    worker process (the native ecCodes boundary).
             seed_dest = _destination_for(
-                spec, staging_dir, lead=seed_lead, member=seed_member
+                spec, staging_dir, lead=seed_lead, member=seed_member, is_mean=seed_is_mean
             )
             Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
             tracker.set_init_phase("seed_download")
@@ -673,14 +683,18 @@ async def _run_wave_impl(
             tracker.on_download_start(seed_member, seed_lead, is_seed=True)
             t_dl_start = time.monotonic()
             try:
+                seed_dl_kwargs: dict[str, Any] = {"variables": var_codes}
+                if seed_member is not None:
+                    seed_dl_kwargs["member"] = seed_member
+                if seed_is_mean:
+                    seed_dl_kwargs["is_mean"] = True
                 await connector.download(
                     spec.model,
                     spec.cycle_date,
                     spec.cycle_hour,
                     seed_lead,
                     seed_dest,
-                    member=seed_member,
-                    variables=var_codes,
+                    **seed_dl_kwargs,
                 )
                 tracker.record_milestone("seed_download_complete")
                 tracker.on_download_complete(
@@ -790,8 +804,9 @@ async def _run_wave_impl(
                         lead_time_hours=lead,
                         member=member,
                         generation=_new_generation(),
+                        is_mean=is_mean,
                     )
-                    for member, lead in items
+                    for member, lead, is_mean in items
                 ]
                 coordinator.pre_update_wave(
                     pre_conn,
@@ -829,7 +844,11 @@ async def _run_wave_impl(
             # Synchronous write execution: checks out DB connection only for the
             # coordinated critical section (advisory locks + Zarr write + COMPLETE marker).
             def _run_region_write(
-                dataset: xr.Dataset, member: int | None, lead: int, generation: str
+                dataset: xr.Dataset,
+                member: int | None,
+                lead: int,
+                generation: str,
+                is_mean: bool = False,
             ) -> None:
                 worker_conn = engine.connect()
                 try:
@@ -840,24 +859,30 @@ async def _run_wave_impl(
                         generation=generation,
                         expected_leads=horizon_leads,
                         expected_members=horizon_members,
+                        is_mean=is_mean,
                     )
                 finally:
                     worker_conn.close()
 
             # Retained-seed writer uses the retained dataset (no re-parse).
             def _run_seed_region() -> None:
-                region_id = _region_id_for(seed_lead, seed_member)
+                region_id = _region_id_for(seed_lead, seed_member, is_mean=seed_is_mean)
                 generation = generation_by_region.get(region_id)
                 if generation is None:
                     raise RuntimeError(f"no generation for region {region_id}")
-                _run_region_write(seed_dataset, seed_member, seed_lead, generation)
+                _run_region_write(
+                    seed_dataset,
+                    seed_member,
+                    seed_lead,
+                    generation,
+                    is_mean=seed_is_mean,
+                )
 
             loop = asyncio.get_event_loop()
 
             # Track pending tasks per lead for intermediate settled-lead publication
-            expected_members_for_lead = spec.members if spec.members else (None,)
-            lead_pending: dict[int, set[int | None]] = {
-                lead_val: set(expected_members_for_lead)
+            lead_pending: dict[int, set[tuple[int | None, bool]]] = {
+                lead_val: {(m, is_m) for m, item_lead, is_m in items if item_lead == lead_val}
                 for lead_val in spec.target_lead_time_hours
             }
             lead_settle_lock = threading.Lock()
@@ -882,10 +907,10 @@ async def _run_wave_impl(
                 finally:
                     pub_conn.close()
 
-            def _on_item_settled(member_val: int | None, lead_val: int) -> None:
+            def _on_item_settled(member_val: int | None, lead_val: int, is_mean_val: bool = False) -> None:
                 with lead_settle_lock:
                     if lead_val in lead_pending:
-                        lead_pending[lead_val].discard(member_val)
+                        lead_pending[lead_val].discard((member_val, is_mean_val))
                         if not lead_pending[lead_val]:
                             _check_and_publish_lead(lead_val)
 
@@ -922,17 +947,17 @@ async def _run_wave_impl(
                             seed_member, seed_lead, duration_ms=wr_dur
                         )
                         write_completed_events[seed_item].set()
-                        _on_item_settled(seed_member, seed_lead)
+                        _on_item_settled(seed_member, seed_lead, seed_is_mean)
                     except Exception as exc:  # noqa: BLE001 - report failure
                         wr_dur = (time.monotonic() - t_wr_start) * 1000.0
                         tracker.on_write_failed(
                             seed_member, seed_lead, duration_ms=wr_dur
                         )
                         failures.append(
-                            f"{spec.model} member={seed_member} lead={seed_lead}: {exc}"
+                            f"{spec.model} member={seed_member} lead={seed_lead} is_mean={seed_is_mean}: {exc}"
                         )
                         write_completed_events[seed_item].set()
-                        _on_item_settled(seed_member, seed_lead)
+                        _on_item_settled(seed_member, seed_lead, seed_is_mean)
 
                     if cancel_requested:
                         raise asyncio.CancelledError
@@ -941,10 +966,11 @@ async def _run_wave_impl(
 
             # Non-seed pipeline tasks:
             # bounded download -> bounded decode & parent normalize -> bounded write admission -> write
-            async def _pipeline_item(member: int | None, lead: int) -> None:
+            async def _pipeline_item(member: int | None, lead: int, is_mean: bool = False) -> None:
+                item_key = (member, lead, is_mean)
                 if wave_cancel_event.is_set():
                     return
-                dest = _destination_for(spec, staging_dir, lead=lead, member=member)
+                dest = _destination_for(spec, staging_dir, lead=lead, member=member, is_mean=is_mean)
 
                 # Stage 1: Pipeline admission (bounds total in-flight active/queued work)
                 async with staging_sem:
@@ -958,14 +984,18 @@ async def _run_wave_impl(
                         tracker.on_download_start(member, lead)
                         t_dl_start = time.monotonic()
                         try:
+                            worker_dl_kwargs: dict[str, Any] = {"variables": var_codes}
+                            if member is not None:
+                                worker_dl_kwargs["member"] = member
+                            if is_mean:
+                                worker_dl_kwargs["is_mean"] = True
                             await connector.download(
                                 spec.model,
                                 spec.cycle_date,
                                 spec.cycle_hour,
                                 lead,
                                 dest,
-                                member=member,
-                                variables=var_codes,
+                                **worker_dl_kwargs,
                             )
                             dl_dur = (time.monotonic() - t_dl_start) * 1000.0
                             tracker.on_download_complete(
@@ -977,11 +1007,11 @@ async def _run_wave_impl(
                                 member, lead, duration_ms=dl_dur
                             )
                             failures.append(
-                                f"{spec.model} member={member} lead={lead} download: {exc}"
+                                f"{spec.model} member={member} lead={lead} is_mean={is_mean} download: {exc}"
                             )
-                            decode_completed_events[(member, lead)].set()
-                            write_completed_events[(member, lead)].set()
-                            _on_item_settled(member, lead)
+                            decode_completed_events[item_key].set()
+                            write_completed_events[item_key].set()
+                            _on_item_settled(member, lead, is_mean)
                             return
 
                     # Predecessor coordination for 6h-reset leads requiring de-accumulation / reconstruction.
@@ -994,7 +1024,7 @@ async def _run_wave_impl(
                             for v in catalog_spec.variables
                         )
                     ):
-                        pred_item = (member, lead - 3)
+                        pred_item = (member, lead - 3, is_mean)
                         if pred_item in decode_completed_events:
                             await decode_completed_events[pred_item].wait()
                             if wave_cancel_event.is_set():
@@ -1016,7 +1046,7 @@ async def _run_wave_impl(
                             pred_precip = None
                             pred_cloud = None
                             if lead % 6 == 0 and lead > 0:
-                                pred_item = (member, lead - 3)
+                                pred_item = (member, lead - 3, is_mean)
                                 with predecessor_lock:
                                     pred_state = predecessor_states.pop(pred_item, None)
                                 if pred_state is not None:
@@ -1049,7 +1079,7 @@ async def _run_wave_impl(
 
                             if raw_precip_for_future is not None or raw_cloud_for_future is not None:
                                 with predecessor_lock:
-                                    predecessor_states[(member, lead)] = PredecessorState(
+                                    predecessor_states[item_key] = PredecessorState(
                                         precip_raw=raw_precip_for_future,
                                         cloud_raw=raw_cloud_for_future,
                                     )
@@ -1058,28 +1088,28 @@ async def _run_wave_impl(
                             tracker.on_decode_complete(
                                 member, lead, duration_ms=dec_dur
                             )
-                            decode_completed_events[(member, lead)].set()
+                            decode_completed_events[item_key].set()
                         except Exception as exc:  # noqa: BLE001 - report decode failure
                             dec_dur = (time.monotonic() - t_dec_start) * 1000.0
                             tracker.on_decode_failed(
                                 member, lead, duration_ms=dec_dur
                             )
                             failures.append(
-                                f"{spec.model} member={member} lead={lead} decode: {exc}"
+                                f"{spec.model} member={member} lead={lead} is_mean={is_mean} decode: {exc}"
                             )
-                            decode_completed_events[(member, lead)].set()
-                            write_completed_events[(member, lead)].set()
-                            _on_item_settled(member, lead)
+                            decode_completed_events[item_key].set()
+                            write_completed_events[item_key].set()
+                            _on_item_settled(member, lead, is_mean)
                             return
 
                     # Stage 4: Bounded write admission (application-level backpressure BEFORE thread submission)
                     if wave_cancel_event.is_set():
                         return
-                    region_id = _region_id_for(lead, member)
+                    region_id = _region_id_for(lead, member, is_mean=is_mean)
                     generation = generation_by_region.get(region_id)
                     if generation is None:
                         failures.append(
-                            f"{spec.model} member={member} lead={lead}: no generation for region {region_id}"
+                            f"{spec.model} member={member} lead={lead} is_mean={is_mean}: no generation for region {region_id}"
                         )
                         return
 
@@ -1090,7 +1120,7 @@ async def _run_wave_impl(
                         t_wr_start = time.monotonic()
                         assert ds is not None
                         worker_fut = loop.run_in_executor(
-                            executor, _run_region_write, ds, member, lead, generation
+                            executor, _run_region_write, ds, member, lead, generation, is_mean
                         )
                         with futures_lock:
                             registered_worker_futures.append(worker_fut)
@@ -1113,18 +1143,18 @@ async def _run_wave_impl(
                             tracker.on_write_complete(
                                 member, lead, duration_ms=wr_dur
                             )
-                            write_completed_events[(member, lead)].set()
-                            _on_item_settled(member, lead)
+                            write_completed_events[item_key].set()
+                            _on_item_settled(member, lead, is_mean)
                         except Exception as exc:  # noqa: BLE001 - report write failure
                             wr_dur = (time.monotonic() - t_wr_start) * 1000.0
                             tracker.on_write_failed(
                                 member, lead, duration_ms=wr_dur
                             )
                             failures.append(
-                                f"{spec.model} member={member} lead={lead} write: {exc}"
+                                f"{spec.model} member={member} lead={lead} is_mean={is_mean} write: {exc}"
                             )
-                            write_completed_events[(member, lead)].set()
-                            _on_item_settled(member, lead)
+                            write_completed_events[item_key].set()
+                            _on_item_settled(member, lead, is_mean)
                         finally:
                             # Drop local dataset reference so memory is freed promptly
                             ds = None
@@ -1133,10 +1163,10 @@ async def _run_wave_impl(
                             raise asyncio.CancelledError
 
             tracker.record_milestone("wave_tasks_created")
-            for member, lead in items:
-                if (member, lead) != seed_item:
+            for it_member, it_lead, it_is_mean in items:
+                if (it_member, it_lead, it_is_mean) != seed_item:
                     pipeline_tasks.append(
-                        asyncio.create_task(_pipeline_item(member, lead))
+                        asyncio.create_task(_pipeline_item(it_member, it_lead, is_mean=it_is_mean))
                     )
 
             # 5. Aggregate drain: wait for all outer pipeline tasks
@@ -1300,10 +1330,12 @@ def _decode_and_normalize(
     return ds
 
 
-def _region_id_for(lead: int, member: int | None) -> str:
+def _region_id_for(lead: int, member: int | None, is_mean: bool = False) -> str:
     from domain.locks import logical_region_encoding
 
-    return logical_region_encoding(lead_time_hours=lead, member=member)
+    return logical_region_encoding(
+        lead_time_hours=lead, member=member, is_mean=is_mean
+    )
 
 
 def _new_generation() -> str:

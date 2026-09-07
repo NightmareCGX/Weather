@@ -15,6 +15,7 @@ from api.core.reader_gate import (
     ReaderLockPool,
     ReaderGateLifecycle,
 )
+from api.core.zarr import shutdown_member_executor
 from api.errors import install_exception_handlers
 from api.middleware import RequestIDMiddleware
 from api.routers.admin import router as admin_router
@@ -70,6 +71,7 @@ def create_app() -> FastAPI:
                 )
                 raise
             reader_pool.dispose()
+            shutdown_member_executor()
 
     app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
     app.add_middleware(RequestIDMiddleware)

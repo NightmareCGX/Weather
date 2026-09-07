@@ -114,7 +114,9 @@ def get_ensemble_statistics(
     resolved_lead: int = 0
 
     if valid_time is not None:
-        source = resolve_valid_time_source(db, model, valid_time, variable=variable)
+        source = resolve_valid_time_source(
+            db, model, valid_time, variable=variable, require_members=True
+        )
         resolved_lead = source.lead_time_hours
         cycle_time = source.cycle_time.isoformat().replace("+00:00", "Z")
         store_path = source.store_path

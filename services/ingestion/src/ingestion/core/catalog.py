@@ -96,6 +96,7 @@ class CommittedState:
     pairs: frozenset[tuple[int, int]] | None
     is_ensemble: bool
     variables: frozenset[str] | None = None
+    mean_leads: frozenset[int] | None = None
 
     @classmethod
     def deterministic(
@@ -113,6 +114,7 @@ class CommittedState:
             pairs=None,
             is_ensemble=False,
             variables=frozenset(variables) if variables is not None else None,
+            mean_leads=None,
         )
 
     @classmethod
@@ -121,6 +123,7 @@ class CommittedState:
         pairs: set[tuple[int, int]],
         members: set[int],
         variables: set[str] | None = None,
+        mean_leads: set[int] | None = None,
     ) -> CommittedState:
         """Build the committed state of an ensemble store.
 
@@ -128,6 +131,7 @@ class CommittedState:
             pairs: The committed ``(member, lead)`` pairs.
             members: The member indices that have at least one committed pair.
             variables: The store's data-variable set, when known.
+            mean_leads: The committed leads of the official precomputed mean product (geavg).
         """
         return cls(
             leads=frozenset(lead for _, lead in pairs),
@@ -135,10 +139,17 @@ class CommittedState:
             pairs=frozenset(pairs),
             is_ensemble=True,
             variables=frozenset(variables) if variables is not None else None,
+            mean_leads=frozenset(mean_leads) if mean_leads is not None else None,
         )
 
     def lead_set(self) -> set[int]:
         """Return the committed lead set (shared by both store kinds)."""
+        return set(self.leads)
+
+    def mean_lead_set(self) -> set[int]:
+        """Return the leads with committed official ensemble mean products, or all leads."""
+        if self.mean_leads is not None and len(self.mean_leads) > 0:
+            return set(self.mean_leads)
         return set(self.leads)
 
     def member_set(self) -> set[int]:
@@ -549,7 +560,7 @@ def _reconcile_catalog_to_store(
             path, model id) used to reconstruct missing rows. ``None`` restricts
             reconciliation to delete-only (legacy behavior).
     """
-    committed_leads = committed_state.lead_set()
+    committed_leads = committed_state.mean_lead_set()
 
     if committed_state.is_ensemble:
         # 1. Delete stale member-product pairs first (child table; no FK to

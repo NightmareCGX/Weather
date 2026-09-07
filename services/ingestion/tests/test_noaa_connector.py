@@ -185,6 +185,36 @@ def test_build_url_rejects_invalid_runs(
         connector.build_url(model, CYCLE, cycle_hour, lead_time_hours, member)
 
 
+def test_geavg_url_construction_and_validation() -> None:
+    """Verify deterministic URL/key construction and strict validation for geavg."""
+    connector = NOAAConnector(conn_settings=_settings())
+
+    s3_key = connector.build_s3_key("gefs", CYCLE, 0, 6, is_mean=True)
+    assert s3_key == "gefs.20260721/00/atmos/pgrb2sp25/geavg.t00z.pgrb2s.0p25.f006"
+
+    s3_url = connector.build_s3_url("gefs", CYCLE, 12, 24, is_mean=True)
+    assert s3_url == f"{AWS_GEFS_BASE}/gefs.20260721/12/atmos/pgrb2sp25/geavg.t12z.pgrb2s.0p25.f024"
+
+    nomads_url = connector.build_nomads_url("gefs", CYCLE, 18, 72, is_mean=True)
+    assert (
+        nomads_url
+        == f"{NOMADS_BASE}/pub/data/nccf/com/gens/prod/gefs.20260721/18/atmos/pgrb2sp25/geavg.t18z.pgrb2s.0p25.f072"
+    )
+
+    # Verification of no collision with members or control
+    p01_key = connector.build_s3_key("gefs", CYCLE, 0, 6, member=1)
+    assert "gep01" in p01_key and "geavg" not in p01_key
+    assert "gec00" not in s3_key
+
+    # Validation: geavg cannot specify a member
+    with pytest.raises(InvalidRunError, match="GEFS mean product must not specify an ensemble member"):
+        connector.build_s3_key("gefs", CYCLE, 0, 6, member=1, is_mean=True)
+
+    # Validation: GEFS perturbed without member raises
+    with pytest.raises(InvalidRunError, match="GEFS member identity"):
+        connector.build_s3_key("gefs", CYCLE, 0, 6, member=None, is_mean=False)
+
+
 # ==============================================================================
 # AWS S3 Selective Range Download Tests
 # ==============================================================================

@@ -7,6 +7,7 @@ and the cache layer. When PostgreSQL is unreachable they skip, following the
 existing convention.
 """
 
+import numpy as np
 import pytest
 import redis as redis_lib
 
@@ -269,6 +270,25 @@ def test_point_gefs_returns_ensemble_mean(client):
         ensemble_precipitation_at(member, 6) for member in MEMBER_INDICES
     ]
     assert abs(entry["precipitation_rate"] - float(np.mean(member_precip))) < 1e-9
+
+
+def test_point_gefs_concurrent_reduction_regression(client):
+    """Regression test: GEFS point forecast serves HTTP 200 with complete variables under bounded concurrency."""
+    lat = LAT_START + 0.125
+    lon = LON_START + 0.125
+    resp = client.get(f"/v1/points?lat={lat}&lon={lon}&models=gefs")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "point_forecast"
+    data = body["data"]
+    assert data["model"] == "gefs"
+    assert len(data["forecasts"]) > 0
+    for entry in data["forecasts"]:
+        assert "lead_time_hours" in entry
+        assert "valid_time" in entry
+        assert "temperature_2m" in entry
+        assert entry["temperature_2m"] is not None
+        assert not np.isnan(entry["temperature_2m"])
 
 
 def test_point_blank_models_rejected(client):

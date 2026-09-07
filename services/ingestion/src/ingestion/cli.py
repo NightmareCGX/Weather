@@ -262,6 +262,16 @@ def expand_run_specs(
             return global_members or tuple(range(1, 31))
         return ()
 
+    def _resolve_include_mean(model: str) -> bool:
+        if model != "gefs":
+            return False
+        cli_flag = getattr(args, "include_mean", None)
+        if cli_flag is not None:
+            return bool(cli_flag)
+        # By default, GEFS normal batch ingestion includes geavg unless the user
+        # explicitly restricted the run to specific members via --member.
+        return not bool(global_members)
+
     return [
         RunSpec(
             model=model,
@@ -271,6 +281,7 @@ def expand_run_specs(
             members=_run_members(model),
             store=args.store,
             allow_custom_store=args.allow_custom_store,
+            include_mean=_resolve_include_mean(model),
         )
         for model, cycle_date, cycle_hour in triples
     ]
@@ -373,6 +384,7 @@ def _parse_manifest(path: str) -> list[RunSpec]:
                 members=members,
                 store=entry.get("store"),
                 allow_custom_store=bool(entry.get("allow_custom_store", False)),
+                include_mean=bool(entry.get("include_mean", True)),
             )
         )
     if not specs:
@@ -447,6 +459,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "completion order. The store's member axis is always pre-allocated "
         "with the full gep01..gep30 contract. Ignored for deterministic "
         "models.",
+    )
+    ingest.add_argument(
+        "--include-mean",
+        dest="include_mean",
+        action="store_true",
+        default=None,
+        help="Include the official precomputed GEFS ensemble mean (geavg) when ingesting specific members.",
+    )
+    ingest.add_argument(
+        "--no-mean",
+        dest="include_mean",
+        action="store_false",
+        default=None,
+        help="Skip ingesting the official precomputed GEFS ensemble mean (geavg). "
+        "By default, GEFS batch ingestion automatically includes geavg unless --member or --no-mean is specified.",
     )
     ingest.add_argument(
         "--manifest",

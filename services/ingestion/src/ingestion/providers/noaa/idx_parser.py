@@ -666,9 +666,10 @@ def _record_selection(
 
 def select_gefs_records(
     records: list[IdxRecord],
-    member: int,
+    member: int | None,
     lead_time_hours: int,
     variables: tuple[str, ...] = DEFAULT_SELECTION_VARIABLES,
+    is_mean: bool = False,
 ) -> SelectionResult:
     """Select required GEFS GRIB2 records from parsed .idx records.
 
@@ -711,7 +712,7 @@ def select_gefs_records(
                 if rec.parameter == "TMP"
                 and rec.level_description == "2 m above ground"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -737,7 +738,7 @@ def select_gefs_records(
                 if rec.parameter == "RH"
                 and rec.level_description == "2 m above ground"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -755,7 +756,7 @@ def select_gefs_records(
                 if rec.parameter == "GUST"
                 and rec.level_description == "surface"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -773,7 +774,7 @@ def select_gefs_records(
                 if rec.parameter == "VIS"
                 and rec.level_description == "surface"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -791,7 +792,7 @@ def select_gefs_records(
                 if rec.parameter == "SNOD"
                 and rec.level_description == "surface"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -809,7 +810,7 @@ def select_gefs_records(
                 if rec.parameter == "UGRD"
                 and rec.level_description == "10 m above ground"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -827,7 +828,7 @@ def select_gefs_records(
                 if rec.parameter == "VGRD"
                 and rec.level_description == "10 m above ground"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -860,7 +861,7 @@ def select_gefs_records(
                         if rec.parameter == "APCP"
                         and rec.level_description == "surface"
                         and rec.forecast_description.strip().lower() == expected_desc
-                        and _matches_gefs_member(rec.ensemble_description, member)
+                        and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
                     ]
                     if len(matches) > 1:
                         matches = [matches[0]]
@@ -896,7 +897,7 @@ def select_gefs_records(
                         if rec.parameter == param_name
                         and rec.level_description == "surface"
                         and rec.forecast_description.strip().lower() == expected_desc
-                        and _matches_gefs_member(rec.ensemble_description, member)
+                        and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
                     ]
                     if len(matches) > 1:
                         matches = [matches[0]]
@@ -932,7 +933,7 @@ def select_gefs_records(
                         if rec.parameter == "TCDC"
                         and rec.level_description == "entire atmosphere"
                         and rec.forecast_description.strip().lower() == expected_desc
-                        and _matches_gefs_member(rec.ensemble_description, member)
+                        and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
                     ]
                     if len(matches) > 1:
                         matches = [matches[0]]
@@ -952,7 +953,7 @@ def select_gefs_records(
                 if rec.parameter == "HGT"
                 and rec.level_description == "cloud ceiling"
                 and _matches_step(rec.forecast_description, lead_time_hours)
-                and _matches_gefs_member(rec.ensemble_description, member)
+                and _matches_gefs_member(rec.ensemble_description, member, is_mean=is_mean)
             ]
             _record_selection(
                 var,
@@ -987,6 +988,7 @@ def select_records(
     lead_time_hours: int,
     variables: tuple[str, ...] = DEFAULT_SELECTION_VARIABLES,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> SelectionResult:
     """Dispatch product-aware record selection for a given model.
 
@@ -995,7 +997,8 @@ def select_records(
         records: Parsed ``.idx`` records.
         lead_time_hours: Target forecast lead time.
         variables: Canonical variable codes to select.
-        member: GEFS perturbation member identity (required for GEFS).
+        member: GEFS perturbation member identity (required for GEFS perturbed runs).
+        is_mean: Whether selecting from the official GEFS ensemble mean product (geavg).
 
     Returns:
         A :class:`SelectionResult` detailing selected records.
@@ -1003,10 +1006,10 @@ def select_records(
     if model == "gfs":
         return select_gfs_records(records, lead_time_hours, variables=variables)
     if model == "gefs":
-        if member is None:
-            raise ValueError("member must be provided for GEFS record selection")
+        if member is None and not is_mean:
+            raise ValueError("member must be provided for GEFS perturbed record selection")
         return select_gefs_records(
-            records, member, lead_time_hours, variables=variables
+            records, member, lead_time_hours, variables=variables, is_mean=is_mean
         )
     raise ValueError(f"Unsupported model for selective download: {model!r}")
 
@@ -1051,18 +1054,25 @@ def _expected_categorical_description(lead_time_hours: int) -> str | None:
     return None
 
 
-def _matches_gefs_member(ens_desc: str, target_member: int) -> bool:
-    """Check whether an ensemble token matches the target member number.
+def _matches_gefs_member(
+    ens_desc: str, target_member: int | None, is_mean: bool = False
+) -> bool:
+    """Check whether an ensemble token matches the target member number or mean.
 
     Supports NOMADS conventions:
     * Perturbation members: ``"ENS=+1"``, ``"ENS=+01"``, ``"ENS=+17"``
     * Control member: ``"ENS=0"``, ``"ENS=c00"``, ``"ENS=ctl"``
+    * Ensemble mean: ``"ens mean"``
     """
     clean = ens_desc.strip()
+    if is_mean:
+        return clean.lower() in ("ens mean", "ens_mean", "")
     if not clean:
         # If no ensemble tag is present in the line (e.g. single-member file where
         # perturbation is in directory structure rather than wgrib2 index)
         return True
+    if target_member is None:
+        return False
 
     # Check ENS=+<member>
     if clean == f"ENS=+{target_member}" or clean == f"ENS=+{target_member:02d}":

@@ -463,6 +463,43 @@ def test_select_gefs_records_categorical_patterns() -> None:
         assert r.forecast_description == "0-6 hour ave fcst"
 
 
+def test_select_gefs_records_mean() -> None:
+    """GEFS mean record selection matches 'ens mean' tags across all variables."""
+    lines = [
+        "1:0:d=2026090612:VIS:surface:6 hour fcst:ens mean",
+        "2:500:d=2026090612:GUST:surface:6 hour fcst:ens mean",
+        "3:1000:d=2026090612:SNOD:surface:6 hour fcst:ens mean",
+        "4:1500:d=2026090612:TMP:2 m above ground:6 hour fcst:ens mean",
+        "5:2000:d=2026090612:RH:2 m above ground:6 hour fcst:ens mean",
+        "6:2500:d=2026090612:UGRD:10 m above ground:6 hour fcst:ens mean",
+        "7:3000:d=2026090612:VGRD:10 m above ground:6 hour fcst:ens mean",
+        "8:3500:d=2026090612:APCP:surface:0-6 hour acc fcst:ens mean",
+        "9:4000:d=2026090612:CSNOW:surface:0-6 hour ave fcst:ens mean",
+        "10:4500:d=2026090612:CICEP:surface:0-6 hour ave fcst:ens mean",
+        "11:5000:d=2026090612:CFRZR:surface:0-6 hour ave fcst:ens mean",
+        "12:5500:d=2026090612:CRAIN:surface:0-6 hour ave fcst:ens mean",
+        "13:6000:d=2026090612:TCDC:entire atmosphere:0-6 hour ave fcst:ens mean",
+        "14:6500:d=2026090612:HGT:cloud ceiling:6 hour fcst:ens mean",
+    ]
+    records = parse_idx("\n".join(lines))
+    result = select_records("gefs", records, lead_time_hours=6, is_mean=True)
+
+    assert result.is_valid
+    assert len(result.selected_records) == 14
+    assert result.missing_required == ()
+    assert "precipitation_rate" in result.unsupported
+    assert result.variable_selections["temperature_2m"].record.parameter == "TMP"
+    assert result.variable_selections["wind_u_10m"].record.parameter == "UGRD"
+    assert result.variable_selections["wind_v_10m"].record.parameter == "VGRD"
+    assert result.variable_selections["precipitation_amount_3h"].record.parameter == "APCP"
+    assert result.variable_selections["cloud_cover_3h"].record.parameter == "TCDC"
+
+    # Perturbed call without member raises ValueError
+    import pytest
+    with pytest.raises(ValueError, match="member must be provided"):
+        select_records("gefs", records, lead_time_hours=6, is_mean=False)
+
+
 def test_select_gefs_member_mismatch() -> None:
     lines = [
         "1:0:d=2026082600:VIS:surface:6 hour fcst:ENS=+01",

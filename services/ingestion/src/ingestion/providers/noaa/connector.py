@@ -129,20 +129,23 @@ class NOAAConnector(BaseConnector):
         cycle_hour: int,
         lead_time_hours: int,
         member: int | None = None,
+        is_mean: bool = False,
     ) -> str:
         """Return the deterministic AWS S3 object key for a GRIB2 file.
 
         Key layouts on AWS Open Data (us-east-1):
         * GFS 0.25°: ``gfs.YYYYMMDD/CC/atmos/gfs.tCCz.pgrb2.0p25.fXXX``
-        * GEFS 0.25°: ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/gepNN.tCCz.pgrb2s.0p25.fXXX``
+        * GEFS 0.25° Perturbed: ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/gepNN.tCCz.pgrb2s.0p25.fXXX``
+        * GEFS 0.25° Mean: ``gefs.YYYYMMDD/CC/atmos/pgrb2sp25/geavg.tCCz.pgrb2s.0p25.fXXX``
 
         Args:
             model: Model identifier, either ``gfs`` or ``gefs``.
             cycle_date: UTC date of the model run.
             cycle_hour: UTC cycle hour; one of 0, 6, 12, 18.
             lead_time_hours: Forecast lead time in hours (0-384).
-            member: GEFS perturbation member (1..30). Required for GEFS;
-                ignored for GFS.
+            member: GEFS perturbation member (1..30). Required for GEFS perturbed runs;
+                ignored for GFS or GEFS mean.
+            is_mean: Whether to target the precomputed GEFS ensemble mean product (geavg).
 
         Returns:
             Relative S3 object key.
@@ -153,22 +156,33 @@ class NOAAConnector(BaseConnector):
         """
         self._validate_run(model, cycle_hour, lead_time_hours)
         if model == "gefs":
-            if member is None:
-                raise InvalidRunError(
-                    "A GEFS member identity (1..30) is required to build a "
-                    "per-member download URL; the combined "
-                    "'gefs.tCCz.pgrb2a.0p25' product no longer exists."
-                )
-            if not _GEFS_MEMBER_MIN <= member <= _GEFS_MEMBER_MAX:
-                raise InvalidRunError(
-                    f"Invalid GEFS member: {member}; expected "
-                    f"{_GEFS_MEMBER_MIN}-{_GEFS_MEMBER_MAX} (gepNN)."
-                )
+            if is_mean:
+                if member is not None:
+                    raise InvalidRunError(
+                        "A GEFS mean product must not specify an ensemble member."
+                    )
+            else:
+                if member is None:
+                    raise InvalidRunError(
+                        "A GEFS member identity (1..30) is required to build a "
+                        "per-member download URL; the combined "
+                        "'gefs.tCCz.pgrb2a.0p25' product no longer exists."
+                    )
+                if not _GEFS_MEMBER_MIN <= member <= _GEFS_MEMBER_MAX:
+                    raise InvalidRunError(
+                        f"Invalid GEFS member: {member}; expected "
+                        f"{_GEFS_MEMBER_MIN}-{_GEFS_MEMBER_MAX} (gepNN)."
+                    )
         date_str = cycle_date.strftime("%Y%m%d")
         hour_str = f"{cycle_hour:02d}"
         lead_str = f"{lead_time_hours:03d}"
         if model == "gfs":
             return f"gfs.{date_str}/{hour_str}/atmos/gfs.t{hour_str}z.pgrb2.0p25.f{lead_str}"
+        if is_mean:
+            return (
+                f"gefs.{date_str}/{hour_str}/atmos/pgrb2sp25/"
+                f"geavg.t{hour_str}z.pgrb2s.0p25.f{lead_str}"
+            )
         return (
             f"gefs.{date_str}/{hour_str}/atmos/pgrb2sp25/"
             f"gep{member:02d}.t{hour_str}z.pgrb2s.0p25.f{lead_str}"
@@ -181,9 +195,17 @@ class NOAAConnector(BaseConnector):
         cycle_hour: int,
         lead_time_hours: int,
         member: int | None = None,
+        is_mean: bool = False,
     ) -> str:
         """Return the deterministic public HTTPS URL for an AWS S3 GRIB2 object."""
-        key = self.build_s3_key(model, cycle_date, cycle_hour, lead_time_hours, member)
+        key = self.build_s3_key(
+            model,
+            cycle_date,
+            cycle_hour,
+            lead_time_hours,
+            member,
+            is_mean=is_mean,
+        )
         base = (
             self._settings.AWS_GFS_BASE_URL
             if model == "gfs"
@@ -198,21 +220,28 @@ class NOAAConnector(BaseConnector):
         cycle_hour: int,
         lead_time_hours: int,
         member: int | None = None,
+        is_mean: bool = False,
     ) -> str:
         """Return the deterministic NOMADS download URL for a GRIB2 file."""
         self._validate_run(model, cycle_hour, lead_time_hours)
         if model == "gefs":
-            if member is None:
-                raise InvalidRunError(
-                    "A GEFS member identity (1..30) is required to build a "
-                    "per-member download URL; the combined "
-                    "'gefs.tCCz.pgrb2a.0p25' product no longer exists on NOMADS."
-                )
-            if not _GEFS_MEMBER_MIN <= member <= _GEFS_MEMBER_MAX:
-                raise InvalidRunError(
-                    f"Invalid GEFS member: {member}; expected "
-                    f"{_GEFS_MEMBER_MIN}-{_GEFS_MEMBER_MAX} (gepNN)."
-                )
+            if is_mean:
+                if member is not None:
+                    raise InvalidRunError(
+                        "A GEFS mean product must not specify an ensemble member."
+                    )
+            else:
+                if member is None:
+                    raise InvalidRunError(
+                        "A GEFS member identity (1..30) is required to build a "
+                        "per-member download URL; the combined "
+                        "'gefs.tCCz.pgrb2a.0p25' product no longer exists on NOMADS."
+                    )
+                if not _GEFS_MEMBER_MIN <= member <= _GEFS_MEMBER_MAX:
+                    raise InvalidRunError(
+                        f"Invalid GEFS member: {member}; expected "
+                        f"{_GEFS_MEMBER_MIN}-{_GEFS_MEMBER_MAX} (gepNN)."
+                    )
         date_str = cycle_date.strftime("%Y%m%d")
         hour_str = f"{cycle_hour:02d}"
         lead_str = f"{lead_time_hours:03d}"
@@ -221,6 +250,12 @@ class NOAAConnector(BaseConnector):
                 f"{self._settings.NOMADS_BASE_URL}/pub/data/nccf/com/gfs/prod/"
                 f"gfs.{date_str}/{hour_str}/atmos/"
                 f"gfs.t{hour_str}z.pgrb2.0p25.f{lead_str}"
+            )
+        if is_mean:
+            return (
+                f"{self._settings.NOMADS_BASE_URL}/pub/data/nccf/com/gens/prod/"
+                f"gefs.{date_str}/{hour_str}/atmos/pgrb2sp25/"
+                f"geavg.t{hour_str}z.pgrb2s.0p25.f{lead_str}"
             )
         return (
             f"{self._settings.NOMADS_BASE_URL}/pub/data/nccf/com/gens/prod/"
@@ -236,6 +271,7 @@ class NOAAConnector(BaseConnector):
         lead_time_hours: int,
         member: int | None = None,
         source: str | None = None,
+        is_mean: bool = False,
     ) -> str:
         """Return the deterministic download URL for a GRIB2 file.
 
@@ -244,10 +280,11 @@ class NOAAConnector(BaseConnector):
             cycle_date: UTC date of the model run.
             cycle_hour: UTC cycle hour; one of 0, 6, 12, 18.
             lead_time_hours: Forecast lead time in hours (0-384).
-            member: GEFS perturbation member (1..30). Required for GEFS;
-                ignored for GFS.
+            member: GEFS perturbation member (1..30). Required for GEFS perturbed runs;
+                ignored for GFS or GEFS mean.
             source: Upstream provider identifier (``"aws_s3"`` or ``"nomads"``).
                 Defaults to the configured ``NOAA_DOWNLOAD_SOURCE``.
+            is_mean: Whether to target the precomputed GEFS ensemble mean product (geavg).
 
         Returns:
             Absolute URL of the requested GRIB2 file.
@@ -259,10 +296,20 @@ class NOAAConnector(BaseConnector):
         src = source or getattr(self._settings, "NOAA_DOWNLOAD_SOURCE", "aws_s3")
         if src == "nomads":
             return self.build_nomads_url(
-                model, cycle_date, cycle_hour, lead_time_hours, member
+                model,
+                cycle_date,
+                cycle_hour,
+                lead_time_hours,
+                member,
+                is_mean=is_mean,
             )
         return self.build_s3_url(
-            model, cycle_date, cycle_hour, lead_time_hours, member
+            model,
+            cycle_date,
+            cycle_hour,
+            lead_time_hours,
+            member,
+            is_mean=is_mean,
         )
 
     async def download(
@@ -274,6 +321,7 @@ class NOAAConnector(BaseConnector):
         destination: Path,
         member: int | None = None,
         variables: tuple[str, ...] = DEFAULT_SELECTION_VARIABLES,
+        is_mean: bool = False,
     ) -> Path:
         """Download a GRIB2 file to ``destination`` using selective byte ranges.
 
@@ -297,9 +345,10 @@ class NOAAConnector(BaseConnector):
             lead_time_hours: Forecast lead time in hours (0-384).
             destination: Local path the GRIB2 file is written to; the
                 parent directory is created if missing.
-            member: GEFS perturbation member (1..30). Required for GEFS;
-                ignored for GFS.
+            member: GEFS perturbation member (1..30). Required for GEFS perturbed runs;
+                ignored for GFS or GEFS mean.
             variables: Canonical platform variables to select.
+            is_mean: Whether to target the precomputed GEFS ensemble mean product (geavg).
 
         Returns:
             The path the file was written to.
@@ -317,7 +366,13 @@ class NOAAConnector(BaseConnector):
 
         primary_source = getattr(self._settings, "NOAA_DOWNLOAD_SOURCE", "aws_s3")
         primary_url = self.build_url(
-            model, cycle_date, cycle_hour, lead_time_hours, member, source=primary_source
+            model,
+            cycle_date,
+            cycle_hour,
+            lead_time_hours,
+            member,
+            source=primary_source,
+            is_mean=is_mean,
         )
 
         try:
@@ -330,6 +385,7 @@ class NOAAConnector(BaseConnector):
                 destination=destination,
                 member=member,
                 variables=variables,
+                is_mean=is_mean,
             )
         except (DownloadFailedError, UpstreamUnavailableError) as primary_exc:
             if (
@@ -337,18 +393,24 @@ class NOAAConnector(BaseConnector):
                 and getattr(self._settings, "ENABLE_NOMADS_FALLBACK", True)
             ):
                 logger.warning(
-                    "download_provider_fallback: model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "download_provider_fallback: model=%s cycle=%sT%02dZ lead=%d member=%s is_mean=%s "
                     "primary_url=%s error=%s; attempting NOMADS fallback.",
                     model,
                     cycle_date,
                     cycle_hour,
                     lead_time_hours,
                     member,
+                    is_mean,
                     primary_url,
                     primary_exc,
                 )
                 nomads_url = self.build_nomads_url(
-                    model, cycle_date, cycle_hour, lead_time_hours, member
+                    model,
+                    cycle_date,
+                    cycle_hour,
+                    lead_time_hours,
+                    member,
+                    is_mean=is_mean,
                 )
                 return await self._download_single_provider(
                     url=nomads_url,
@@ -359,6 +421,7 @@ class NOAAConnector(BaseConnector):
                     destination=destination,
                     member=member,
                     variables=variables,
+                    is_mean=is_mean,
                 )
             raise
 
@@ -372,6 +435,7 @@ class NOAAConnector(BaseConnector):
         destination: Path,
         member: int | None,
         variables: tuple[str, ...],
+        is_mean: bool = False,
     ) -> Path:
         """Download from a single provider URL using selective ranges with full-download fallback."""
         if getattr(self._settings, "ENABLE_SELECTIVE_DOWNLOAD", True):
@@ -385,10 +449,11 @@ class NOAAConnector(BaseConnector):
                     destination=destination,
                     member=member,
                     variables=variables,
+                    is_mean=is_mean,
                 )
             except SelectiveFallbackError as fallback_exc:
                 logger.warning(
-                    "download_selective_fallback: url=%s model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "download_selective_fallback: url=%s model=%s cycle=%sT%02dZ lead=%d member=%s is_mean=%s "
                     "reason=%s; falling back to full download on same provider.",
                     url,
                     model,
@@ -396,12 +461,13 @@ class NOAAConnector(BaseConnector):
                     cycle_hour,
                     lead_time_hours,
                     member,
+                    is_mean,
                     fallback_exc.reason,
                 )
             except Exception as exc:
                 # Catch any unexpected selective-path error to ensure reliable full-file fallback
                 logger.warning(
-                    "download_selective_fallback: url=%s model=%s cycle=%sT%02dZ lead=%d member=%s "
+                    "download_selective_fallback: url=%s model=%s cycle=%sT%02dZ lead=%d member=%s is_mean=%s "
                     "reason=unexpected_selective_error error=%s; falling back to full download on same provider.",
                     url,
                     model,
@@ -409,6 +475,7 @@ class NOAAConnector(BaseConnector):
                     cycle_hour,
                     lead_time_hours,
                     member,
+                    is_mean,
                     exc,
                 )
 
@@ -424,6 +491,7 @@ class NOAAConnector(BaseConnector):
         destination: Path,
         member: int | None,
         variables: tuple[str, ...],
+        is_mean: bool = False,
     ) -> Path:
         """Attempt selective range download with artifact-transaction retry semantics."""
         attempts = self._settings.DOWNLOAD_RETRIES + 1
@@ -466,6 +534,7 @@ class NOAAConnector(BaseConnector):
                     lead_time_hours=lead_time_hours,
                     variables=variables,
                     member=member,
+                    is_mean=is_mean,
                 )
                 if not selection.is_valid:
                     if selection.missing_required:
@@ -732,6 +801,7 @@ class NOAAConnector(BaseConnector):
         destination: Path,
         member: int | None = None,
         source: str | None = None,
+        is_mean: bool = False,
     ) -> Path:
         """Download the GRIB2 index (``.idx``) file for a forecast product.
 
@@ -746,8 +816,10 @@ class NOAAConnector(BaseConnector):
             cycle_hour: UTC cycle hour; one of 0, 6, 12, 18.
             lead_time_hours: Forecast lead time in hours (0-384).
             destination: Local path the ``.idx`` file is written to.
-            member: GEFS perturbation member (1..30). Required for GEFS.
+            member: GEFS perturbation member (1..30). Required for GEFS perturbed runs;
+                ignored for GFS or GEFS mean.
             source: Optional upstream source override (``"aws_s3"`` or ``"nomads"``).
+            is_mean: Whether to target the precomputed GEFS ensemble mean product (geavg).
 
         Returns:
             The path the file was written to.
@@ -760,7 +832,13 @@ class NOAAConnector(BaseConnector):
                 status.
         """
         url = self.build_url(
-            model, cycle_date, cycle_hour, lead_time_hours, member, source=source
+            model,
+            cycle_date,
+            cycle_hour,
+            lead_time_hours,
+            member,
+            source=source,
+            is_mean=is_mean,
         )
         url = f"{url}.idx"
         destination = Path(destination)

@@ -799,44 +799,31 @@ def _slice_field(
         def _read_sharded_window(c_min: int, c_max: int) -> npt.NDArray[np.float64]:
             if variable in ("wind_10m", "wind_speed_10m"):
                 if is_ensemble:
-                    members_to_read = tuple(range(1, expected_members + 1))
-                    u_stack = [
-                        reader.read_window(
-                            "wind_u_10m",
-                            member=m,
-                            lead_time_hours=lead,
-                            lat_min=lat_min_idx,
-                            lat_max=lat_max_idx,
-                            lon_min=c_min,
-                            lon_max=c_max,
-                            generation=generation,
-                        )
-                        for m in members_to_read
-                    ]
-                    v_stack = [
-                        reader.read_window(
-                            "wind_v_10m",
-                            member=m,
-                            lead_time_hours=lead,
-                            lat_min=lat_min_idx,
-                            lat_max=lat_max_idx,
-                            lon_min=c_min,
-                            lon_max=c_max,
-                            generation=generation,
-                        )
-                        for m in members_to_read
-                    ]
-                    from domain.coverage import is_cell_statistically_valid
-
-                    u_arr = np.stack(u_stack, axis=0)
-                    v_arr = np.stack(v_stack, axis=0)
-                    finite_mask = np.isfinite(u_arr) & np.isfinite(v_arr)
-                    finite_counts = np.sum(finite_mask, axis=0)
-                    valid_cells = is_cell_statistically_valid(finite_counts, expected_members)
-                    speed_members = np.hypot(u_arr, v_arr)
-                    with np.errstate(all="ignore"):
-                        mean_speed = np.nanmean(speed_members, axis=0) * 3.6
-                        return np.asarray(np.where(valid_cells, mean_speed, np.nan), dtype=np.float64)
+                    if not reader.has_mean_shard("wind_u_10m", lead, generation=generation) or not reader.has_mean_shard("wind_v_10m", lead, generation=generation):
+                        raise FileNotFoundError(f"Missing official mean shard for wind_10m components at lead {lead}")
+                    u_win = reader.read_window(
+                        "wind_u_10m",
+                        member=None,
+                        lead_time_hours=lead,
+                        lat_min=lat_min_idx,
+                        lat_max=lat_max_idx,
+                        lon_min=c_min,
+                        lon_max=c_max,
+                        generation=generation,
+                        is_mean=True,
+                    )
+                    v_win = reader.read_window(
+                        "wind_v_10m",
+                        member=None,
+                        lead_time_hours=lead,
+                        lat_min=lat_min_idx,
+                        lat_max=lat_max_idx,
+                        lon_min=c_min,
+                        lon_max=c_max,
+                        generation=generation,
+                        is_mean=True,
+                    )
+                    return np.asarray(np.hypot(u_win, v_win) * 3.6, dtype=np.float64)
                 else:
                     u_win = reader.read_window(
                         "wind_u_10m",
@@ -861,18 +848,19 @@ def _slice_field(
                     return np.asarray(np.hypot(u_win, v_win) * 3.6, dtype=np.float64)
             else:
                 if is_ensemble:
-                    members_to_read = tuple(range(1, expected_members + 1))
+                    if not reader.has_mean_shard(variable, lead, generation=generation):
+                        raise FileNotFoundError(f"Missing official mean shard for {variable} at lead {lead}")
                     return np.asarray(
-                        reader.read_ensemble_mean_window(
+                        reader.read_window(
                             variable,
-                            members=members_to_read,
+                            member=None,
                             lead_time_hours=lead,
                             lat_min=lat_min_idx,
                             lat_max=lat_max_idx,
                             lon_min=c_min,
                             lon_max=c_max,
-                            expected_members=expected_members,
                             generation=generation,
+                            is_mean=True,
                         ),
                         dtype=np.float64,
                     )
@@ -1276,28 +1264,39 @@ def _resolve_run_store_path(
 
     for run in candidates:
         assert run.zarr_store_path is not None
-        # Check ensemble member coverage if model is ensemble
+        # Check ensemble member coverage if model is ensemble and product is not official mean
         if expected_members > 1:
-            member_rows = db.execute(
-                select(EnsembleMemberProduct.member_index).where(
-                    EnsembleMemberProduct.run_id == run.id,
-                    EnsembleMemberProduct.lead_time_hours == lead_time_hours,
+            mean_prod = db.execute(
+                select(ForecastProduct.id).where(
+                    ForecastProduct.run_id == run.id,
+                    ForecastProduct.variable_id == (
+                        "wind_u_10m" if variable in ("wind_10m", "wind_speed_10m") else variable
+                    ),
+                    ForecastProduct.product_type == "ensemble_mean",
+                    ForecastProduct.lead_time_hours == lead_time_hours,
                 )
-            ).scalars().all()
-            avail_members = tuple(member_rows)
-            # If no pair rows (legacy store / test fixture), allow ready runs
-            if not avail_members and run.status == "ready":
-                avail_members = tuple(range(1, expected_members + 1))
-            if not is_lead_servable(len(avail_members), expected_members):
-                if initial_time is not None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=(
-                            f"Lead {lead_time_hours}h for model '{model}' at cycle '{initial_time}' "
-                            f"is not servable ({len(avail_members)}/{expected_members} members < 85%)."
-                        ),
+            ).scalar_one_or_none()
+            if mean_prod is None:
+                member_rows = db.execute(
+                    select(EnsembleMemberProduct.member_index).where(
+                        EnsembleMemberProduct.run_id == run.id,
+                        EnsembleMemberProduct.lead_time_hours == lead_time_hours,
                     )
-                continue
+                ).scalars().all()
+                avail_members = tuple(member_rows)
+                # If no pair rows (legacy store / test fixture), allow ready runs
+                if not avail_members and run.status == "ready":
+                    avail_members = tuple(range(1, expected_members + 1))
+                if not is_lead_servable(len(avail_members), expected_members):
+                    if initial_time is not None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=(
+                                f"Lead {lead_time_hours}h for model '{model}' at cycle '{initial_time}' "
+                                f"is not servable ({len(avail_members)}/{expected_members} members < 85%)."
+                            ),
+                        )
+                    continue
 
         try:
             _require_product(db, run, variable, level, lead_time_hours)
@@ -1349,13 +1348,17 @@ def _require_product(
     """Raise 404 if no forecast product row exists for the selection."""
     from fastapi import HTTPException
 
-    check_vars = ["wind_u_10m", "wind_v_10m"] if variable == "wind_10m" else [variable]
+    check_vars = (
+        ["wind_u_10m", "wind_v_10m"]
+        if variable in ("wind_10m", "wind_speed_10m")
+        else [variable]
+    )
     for var in check_vars:
         product = db.execute(
             select(ForecastProduct.id).where(
                 ForecastProduct.run_id == run.id,
                 ForecastProduct.variable_id == var,
-                ForecastProduct.product_type == level,
+                ForecastProduct.product_type.in_((level, "ensemble_mean")),
                 ForecastProduct.lead_time_hours == lead_time_hours,
             )
         ).scalar_one_or_none()

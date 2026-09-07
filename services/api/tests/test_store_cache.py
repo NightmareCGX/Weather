@@ -759,6 +759,8 @@ def test_api_s3fs_use_listings_cache_disabled(monkeypatch) -> None:
     monkeypatch.setattr(s3fs.S3FileSystem, "ls", lambda self, *args, **kwargs: [])
 
     # 1. Manifest reader S3 resolution
+    import api.core.manifest_reader as mr
+    monkeypatch.setattr(mr, "_s3_fs_instance", None)
     s3fs.S3FileSystem.clear_instance_cache()
     _ = _read_manifest("s3://bucket/store.zarr")
     assert any(k.get("use_listings_cache") is False for k in captured_kwargs)

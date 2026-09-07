@@ -69,11 +69,17 @@ _GFS_KEY_RE = re.compile(
 )
 
 #: Full-key grammar for GEFS 0.25° pgrb2sp25 perturbation-member products
-#: (data + .idx sidecar). ``geavg``/``gespr``/``gec00`` keys do not match the
-#: ``gepNN`` grammar and are ignored (counted as unrelated keys).
+#: (data + .idx sidecar). ``gespr``/``gec00`` keys do not match and are ignored.
 _GEFS_KEY_RE = re.compile(
     r"^gefs\.\d{8}/(?P<hour>\d{2})/atmos/pgrb2sp25/"
     r"gep(?P<member>\d{2})\.t(?P=hour)z\.pgrb2s\.0p25\.f"
+    r"(?P<lead>\d{3})(?P<idx>\.idx)?$"
+)
+
+#: Full-key grammar for GEFS 0.25° pgrb2sp25 ensemble mean products (geavg).
+_GEFS_MEAN_KEY_RE = re.compile(
+    r"^gefs\.\d{8}/(?P<hour>\d{2})/atmos/pgrb2sp25/"
+    r"geavg\.t(?P=hour)z\.pgrb2s\.0p25\.f"
     r"(?P<lead>\d{3})(?P<idx>\.idx)?$"
 )
 
@@ -140,6 +146,7 @@ class CycleSnapshot:
     regions: Mapping[tuple[int | None, int], RegionArtifacts]
     ignored_key_count: int = 0
     ignored_key_samples: tuple[str, ...] = field(default_factory=tuple)
+    mean_regions: Mapping[int, RegionArtifacts] = field(default_factory=dict)
 
     # -- raw reality ---------------------------------------------------
 
@@ -164,6 +171,28 @@ class CycleSnapshot:
     def is_artifact_complete(self, member: int | None, lead: int) -> bool:
         """Whether the (member, lead) artifact has both data and .idx listed."""
         return self.region(member, lead).is_complete
+
+    def is_mean_complete(self, lead: int) -> bool:
+        """Whether the geavg ensemble-mean artifact for ``lead`` has both data and .idx listed."""
+        return self.mean_regions.get(lead, RegionArtifacts(data=None, idx=None)).is_complete
+
+    def available_mean_leads(
+        self, sequence: tuple[int, ...] | None = None
+    ) -> tuple[int, ...]:
+        """GEFS mean-product leads complete within an optional sequence."""
+        seq = (
+            sequence
+            if sequence is not None
+            else canonical_lead_time_hours(self.model)
+        )
+        allowed = set(seq)
+        return tuple(
+            sorted(
+                lead
+                for lead, region in self.mean_regions.items()
+                if lead in allowed and region.is_complete
+            )
+        )
 
     def available_members(self, lead: int) -> tuple[int, ...]:
         """Members whose artifact for ``lead`` is complete (ascending)."""
@@ -544,19 +573,37 @@ def _snapshot_from_keys(
     prefix: str,
     key_pattern: re.Pattern[str],
     listed: list[dict[str, Any]],
+    track_mean: bool = False,
 ) -> CycleSnapshot:
     """Build the immutable snapshot by applying the product grammar to keys."""
     import logging
 
     logger = logging.getLogger(__name__)
     regions: dict[tuple[int | None, int], RegionArtifacts] = {}
+    mean_regions: dict[int, RegionArtifacts] = {}
     ignored: list[str] = []
     for entry in listed:
         key = str(entry["key"])
         match = key_pattern.match(key)
         if match is None:
-            # Anything outside the exact expected product grammar is unrelated
-            # (geavg/gespr/gec00 on GEFS, .nc products, stray suffixes) —
+            if model == "gefs" and track_mean:
+                mean_match = _GEFS_MEAN_KEY_RE.match(key)
+                if mean_match is not None and int(mean_match.group("hour")) == cycle_hour:
+                    lead = int(mean_match.group("lead"))
+                    observation = ArtifactObservation(
+                        key=key,
+                        size=int(entry["size"]),
+                        etag=entry["etag"],
+                        last_modified=entry["last_modified"],
+                    )
+                    existing_mean = mean_regions.get(lead, RegionArtifacts(data=None, idx=None))
+                    if mean_match.group("idx"):
+                        mean_regions[lead] = RegionArtifacts(data=existing_mean.data, idx=observation)
+                    else:
+                        mean_regions[lead] = RegionArtifacts(data=observation, idx=existing_mean.idx)
+                    continue
+            # Anything outside the expected product grammar is unrelated
+            # (gespr/gec00 on GEFS, .nc products, stray suffixes) —
             # ignore with diagnostics instead of failing the snapshot.
             ignored.append(key)
             continue
@@ -594,6 +641,7 @@ def _snapshot_from_keys(
         regions=regions,
         ignored_key_count=len(ignored),
         ignored_key_samples=tuple(ignored[:20]),
+        mean_regions=mean_regions,
     )
 
 
@@ -607,6 +655,7 @@ async def _snapshot_cycle(
     conn_settings: IngestionSettings | None,
     transport: httpx.AsyncBaseTransport | None,
     bucket_base: str,
+    track_mean: bool = False,
 ) -> CycleSnapshot:
     """Snapshot one cycle: paginate the product prefix and parse the keys."""
     resolved = conn_settings or settings
@@ -627,4 +676,26 @@ async def _snapshot_cycle(
         prefix=prefix,
         key_pattern=key_pattern,
         listed=listed,
+        track_mean=track_mean,
+    )
+
+
+async def snapshot_gefs_mean_cycle(
+    cycle_date: date,
+    cycle_hour: int,
+    *,
+    conn_settings: IngestionSettings | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> CycleSnapshot:
+    """List what GEFS has published for one cycle including geavg ensemble mean artifacts."""
+    return await _snapshot_cycle(
+        model="gefs",
+        cycle_date=cycle_date,
+        cycle_hour=cycle_hour,
+        prefix=gefs_cycle_prefix(cycle_date, cycle_hour),
+        key_pattern=_GEFS_KEY_RE,
+        conn_settings=conn_settings,
+        transport=transport,
+        bucket_base=_bucket_base(conn_settings, gfs=False),
+        track_mean=True,
     )
