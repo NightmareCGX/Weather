@@ -39,4 +39,27 @@ describe("SelectedLocationSummary", () => {
     fireEvent.click(closeBtn);
     expect(handleClose).toHaveBeenCalledTimes(1);
   });
+
+  it("renders compact header with sticky classes containing title and Close button while metadata remains in details section", () => {
+    const handleClose = jest.fn();
+    const { container } = render(
+      <SelectedLocationSummary location={mockLocation} onClose={handleClose} />
+    );
+
+    const header = container.querySelector(".sticky");
+    expect(header).toBeInTheDocument();
+    expect(header).toHaveClass("top-0", "z-10", "bg-white");
+
+    // Close button and title are inside sticky header
+    expect(header).toHaveTextContent("Aspen");
+    expect(header?.querySelector("button")).toBeInTheDocument();
+
+    // Coordinates metadata is in the details section, not inside the sticky header
+    const detailsSection = screen.getByRole("region", { name: "Selected location" });
+    expect(detailsSection).toBeInTheDocument();
+    expect(detailsSection).not.toHaveClass("sticky");
+    expect(detailsSection).toHaveTextContent("Latitude");
+    expect(detailsSection).toHaveTextContent("Longitude");
+    expect(detailsSection).toHaveTextContent("Elevation");
+  });
 });

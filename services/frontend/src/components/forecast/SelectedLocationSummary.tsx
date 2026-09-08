@@ -17,8 +17,8 @@ interface SelectedLocationSummaryProps {
  */
 export function SelectedLocationSummary({ location, onClose }: SelectedLocationSummaryProps) {
   return (
-    <section aria-label="Selected location" className="border-b border-slate-200 px-4 py-3">
-      <div className="flex items-center justify-between gap-2">
+    <>
+      <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-600">
             {locationTypeLabel(location)}
@@ -49,29 +49,36 @@ export function SelectedLocationSummary({ location, onClose }: SelectedLocationS
           </button>
         )}
       </div>
-      {(location.region !== null || location.country !== null) && (
-        <p className="mt-0.5 text-xs text-slate-500">
-          {[location.region, location.country].filter(Boolean).join(", ")}
-        </p>
-      )}
-      <dl className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs text-slate-600">
-        <div className="flex justify-between">
-          <dt>Latitude</dt>
-          <dd className="tabular-nums">{location.latitude.toFixed(4)}</dd>
-        </div>
-        <div className="flex justify-between">
-          <dt>Longitude</dt>
-          <dd className="tabular-nums">{location.longitude.toFixed(4)}</dd>
-        </div>
-        <div className="flex justify-between">
-          <dt>Elevation</dt>
-          <dd className="tabular-nums">
-            {location.elevation_m !== null
-              ? `${Math.round(location.elevation_m).toLocaleString()} m`
-              : "unavailable"}
-          </dd>
-        </div>
-      </dl>
-    </section>
+
+      <section aria-label="Selected location" className="border-b border-slate-200 px-4 py-3">
+        {(location.region !== null || location.country !== null) && (
+          <p className="text-xs text-slate-500">
+            {[location.region, location.country].filter(Boolean).join(", ")}
+          </p>
+        )}
+        <dl
+          className={`${
+            location.region !== null || location.country !== null ? "mt-1.5 " : ""
+          }grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs text-slate-600`}
+        >
+          <div className="flex justify-between">
+            <dt>Latitude</dt>
+            <dd className="tabular-nums">{location.latitude.toFixed(4)}</dd>
+          </div>
+          <div className="flex justify-between">
+            <dt>Longitude</dt>
+            <dd className="tabular-nums">{location.longitude.toFixed(4)}</dd>
+          </div>
+          <div className="flex justify-between">
+            <dt>Elevation</dt>
+            <dd className="tabular-nums">
+              {location.elevation_m !== null
+                ? `${Math.round(location.elevation_m).toLocaleString()} m`
+                : "unavailable"}
+            </dd>
+          </div>
+        </dl>
+      </section>
+    </>
   );
 }

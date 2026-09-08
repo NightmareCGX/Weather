@@ -724,6 +724,57 @@ test("forecast panel close: clicking Close (X) deselects location, removes panel
   await expect(page.getByTestId("weather-map")).toBeVisible();
 });
 
+test("forecast panel close: Close (X) remains pinned and clickable while forecast content is scrolled downward", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // Location selected: Hourly Forecast is visible and marker is rendered on map
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+
+  // Confirm Close button is initially visible
+  const closeBtn = page.getByRole("button", { name: "Close forecast panel" });
+  await expect(closeBtn).toBeVisible();
+
+  // Scroll the forecast content container substantially downward
+  const scrollContainer = page.locator("#forecast-panel-content div.overflow-y-auto");
+  await scrollContainer.evaluate((el) => {
+    el.scrollTop = 400;
+  });
+
+  // Verify container actually scrolled
+  const scrolledTop = await scrollContainer.evaluate((el) => el.scrollTop);
+  expect(scrolledTop).toBeGreaterThanOrEqual(200);
+
+  // Confirm Close button is STILL visible after scrolling
+  await expect(closeBtn).toBeVisible();
+
+  // Verify bounding box remains inside the visible viewport and near top of sidebar
+  const closeBox = await closeBtn.boundingBox();
+  expect(closeBox).not.toBeNull();
+  expect(closeBox!.y).toBeGreaterThanOrEqual(0);
+
+  const panelBox = await page.locator("#forecast-panel").boundingBox();
+  expect(panelBox).not.toBeNull();
+  expect(closeBox!.y).toBeGreaterThanOrEqual(panelBox!.y);
+  expect(closeBox!.y + closeBox!.height).toBeLessThan(panelBox!.y + 120);
+
+  // Click Close while panel is scrolled
+  await closeBtn.click();
+
+  // Sidebar and marker are both removed
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
+
+  // Map remains fully visible
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+});
+
 test("forecast panel collapse and expand: toggle collapses panel and preserves marker/data, expand restores dashboard", async ({
   page,
 }) => {
@@ -798,9 +849,21 @@ test("mobile viewport: collapse restores map view with marker, expand restores f
 
   await expect(page.getByText("Hourly Forecast")).toBeVisible();
 
-  // Tap Close (X)
+  // On mobile: scroll forecast content downward
+  const scrollContainer = page.locator("#forecast-panel-content div.overflow-y-auto");
+  await scrollContainer.evaluate((el) => {
+    el.scrollTop = 300;
+  });
+
+  // Verify Close button remains visible while scrolled on mobile
   const closeBtn = page.getByRole("button", { name: "Close forecast panel" });
   await expect(closeBtn).toBeVisible();
+
+  const closeBox = await closeBtn.boundingBox();
+  expect(closeBox).not.toBeNull();
+  expect(closeBox!.y).toBeGreaterThanOrEqual(0);
+
+  // Tap Close (X) while scrolled
   await closeBtn.click();
 
   await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
