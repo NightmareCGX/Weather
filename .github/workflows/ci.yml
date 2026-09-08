@@ -3,17 +3,18 @@
 # GitHub Actions CI pipeline protecting domain correctness, serving contracts,
 # ingestion invariants, frontend quality, and container runtime readiness.
 #
-# Architecture (Stage 7C / 7D):
+# Architecture (Stage 7C / 7D / ARM64):
 #   1. change-detection         — dorny/paths-filter evaluates touched paths
 #   2. domain-pipeline          — Ruff + MyPy + Pytest (offline, 100% coverage gate)
 #   3. api-pipeline             — Ruff + MyPy + Pytest (PostgreSQL + Redis containers)
 #   4. ingestion-pipeline       — Ruff + MyPy + Pytest (PostgreSQL + Redis + MinIO containers)
 #   5. frontend-unit-build      — ESLint + Typecheck + Format + Jest + Next.js build
 #   6. frontend-e2e             — Playwright Chromium E2E (needs: frontend-unit-build)
-#   7. container-builds         — Multi-stage Docker image builds + runtime smoke tests
-#   8. docs-metadata            — Poetry package manifest & metadata validation
-#   9. cross-package-contracts  — Stage 7D cross-package & OpenAPI contract suite
-#  10. ci-required              — Stable branch-protection aggregation gate (if: always())
+#   7. container-builds         — Multi-stage Docker image builds + runtime smoke tests (amd64)
+#   8. arm64-builds             — ARM64 container builds + dependency resolution & CLI smoke
+#   9. docs-metadata            — Poetry package manifest & metadata validation
+#  10. cross-package-contracts  — Stage 7D cross-package & OpenAPI contract suite
+#  11. ci-required              — Stable branch-protection aggregation gate (if: always())
 
 name: CI
 
@@ -584,7 +585,91 @@ jobs:
             weather-ingestion:ci -c "import sys; sys.path.insert(0, '/app/services/ingestion/src'); import xarray as xr; ds = xr.open_dataset('/fixture.grib2', engine='cfgrib'); assert 't2m' in ds.data_vars, 'cfgrib decode produced no t2m variable'; print('GRIB decode OK; t2m range', float(ds.t2m.min()), float(ds.t2m.max()))" || { echo "Ingestion GRIB decode FAILED"; exit 1; }
 
   # ===========================================================================
-  # 7. DOCS & PACKAGE METADATA VALIDATION
+  # 7. ARM64 CONTAINER BUILDS & ARCHITECTURE GUARDRAILS
+  # ===========================================================================
+  arm64-builds:
+    name: ARM64 container builds & smoke
+    needs: [change-detection]
+    if: |
+      github.event_name == 'push' ||
+      needs.change-detection.outputs.ci == 'true' ||
+      needs.change-detection.outputs.docker == 'true' ||
+      needs.change-detection.outputs.domain == 'true' ||
+      needs.change-detection.outputs.api == 'true' ||
+      needs.change-detection.outputs.ingestion == 'true' ||
+      needs.change-detection.outputs.root_python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # --- Build Images for linux/arm64 ---
+      - name: Build ARM64 API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          platforms: linux/arm64
+          target: runtime
+          tags: weather-api:arm64-ci
+          load: true
+          cache-from: type=gha,scope=arm64-api
+          cache-to: type=gha,mode=max,scope=arm64-api
+
+      - name: Build ARM64 Ingestion image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ingestion
+          platforms: linux/arm64
+          target: runtime
+          tags: weather-ingestion:arm64-ci
+          load: true
+          cache-from: type=gha,scope=arm64-ingestion
+          cache-to: type=gha,mode=max,scope=arm64-ingestion
+
+      # --- Architecture / Platform Metadata Validation ---
+      - name: Validate built image architectures
+        run: |
+          API_ARCH=$(docker inspect weather-api:arm64-ci --format '{{.Architecture}}')
+          INGEST_ARCH=$(docker inspect weather-ingestion:arm64-ci --format '{{.Architecture}}')
+          echo "API image architecture: $API_ARCH"
+          echo "Ingestion image architecture: $INGEST_ARCH"
+          if [ "$API_ARCH" != "arm64" ]; then
+            echo "ERROR: API image architecture is '$API_ARCH', expected 'arm64'"
+            exit 1
+          fi
+          if [ "$INGEST_ARCH" != "arm64" ]; then
+            echo "ERROR: Ingestion image architecture is '$INGEST_ARCH', expected 'arm64'"
+            exit 1
+          fi
+          echo "Platform validation PASSED: all images are linux/arm64."
+
+      # --- Minimal Container Startup & CLI Smoke Tests (ARM64 Emulation) ---
+      - name: Smoke test ARM64 API imports & dependencies
+        run: |
+          docker run --rm \
+            weather-api:arm64-ci \
+            python -c "import numpy, pandas, psycopg2, zarr, numcodecs, api.main; print('API ARM64 import OK')"
+
+      - name: Smoke test ARM64 Ingestion CLI & ecCodes/cfgrib
+        run: |
+          docker run --rm weather-ingestion:arm64-ci --help
+          docker run --rm \
+            --entrypoint python \
+            weather-ingestion:arm64-ci \
+            -c "import cfgrib; print('cfgrib/ecCodes ARM64 import OK')"
+
+  # ===========================================================================
+  # 8. DOCS & PACKAGE METADATA VALIDATION
   # ===========================================================================
   docs-metadata:
     name: Docs & package metadata
@@ -686,7 +771,7 @@ jobs:
         run: npm test -- openapi_contract.test.ts
 
   # ===========================================================================
-  # 9. STABLE MERGE GATE (ci-required)
+  # 10. STABLE MERGE GATE (ci-required)
   # ===========================================================================
   ci-required:
     name: ci-required
@@ -698,6 +783,7 @@ jobs:
       - frontend-unit-build
       - frontend-e2e
       - container-builds
+      - arm64-builds
       - docs-metadata
       - cross-package-contracts
     if: always()
@@ -713,6 +799,7 @@ jobs:
           FE_UNIT_RESULT: ${{ needs.frontend-unit-build.result }}
           FE_E2E_RESULT: ${{ needs.frontend-e2e.result }}
           CONTAINER_RESULT: ${{ needs.container-builds.result }}
+          ARM64_RESULT: ${{ needs.arm64-builds.result }}
           DOCS_RESULT: ${{ needs.docs-metadata.result }}
           CONTRACTS_RESULT: ${{ needs.cross-package-contracts.result }}
           OUT_DOMAIN: ${{ needs.change-detection.outputs.domain }}
@@ -756,6 +843,7 @@ jobs:
               "frontend-unit-build": is_push or out_ci or out_fe,
               "frontend-e2e": is_push or out_ci or out_fe or out_api,
               "container-builds": is_push or out_ci or out_docker or out_domain or out_api or out_ing or out_fe,
+              "arm64-builds": is_push or out_ci or out_docker or out_domain or out_api or out_ing or out_root_py,
               "docs-metadata": is_push or out_ci or out_docs or out_root_py,
               "cross-package-contracts": out_contracts,
           }
@@ -767,6 +855,7 @@ jobs:
               "frontend-unit-build": os.environ.get("FE_UNIT_RESULT", ""),
               "frontend-e2e": os.environ.get("FE_E2E_RESULT", ""),
               "container-builds": os.environ.get("CONTAINER_RESULT", ""),
+              "arm64-builds": os.environ.get("ARM64_RESULT", ""),
               "docs-metadata": os.environ.get("DOCS_RESULT", ""),
               "cross-package-contracts": os.environ.get("CONTRACTS_RESULT", ""),
           }

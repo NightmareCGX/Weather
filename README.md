@@ -223,6 +223,7 @@ cd services/frontend && npm run lint && npm run typecheck && npm run format:chec
   * FastAPI serving layer for point forecasts, ensemble statistics/PDFs, map tiles, and vector fields.
   * Next.js 14 interactive map and forecast dashboard frontend.
   * Cycle supersession lifecycle tracking and storage retention GC.
+  * First-class multi-architecture container support (`native linux/amd64` and `native linux/arm64`) with automated GitHub Actions ARM64 build and CLI smoke guardrail (`arm64-builds`).
 * **Under Active Development (Stage 7):**
   * Engineering baseline standardization, CI workflow redesign, and deployment runbooks.
 * **Deferred Backlog Items:**

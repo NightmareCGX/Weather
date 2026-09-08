@@ -330,3 +330,15 @@ The platform employs a multi-tiered caching strategy to maximize serving through
 | **Redis Outage** | Cache layer catches Redis connection errors and computes fresh from Zarr/DB. `/v1/health` reports 503 degraded. | API continues serving with slightly higher latency. |
 | **Object Store Outage** | Ingestion waves fail and retry next poll. API Zarr reads return 500/404. `/v1/health` reports 503 degraded. | System resumes serving immediately when object store recovers. |
 | **GC Deletion Failure** | `deletion_started_at` fence persists in PostgreSQL, blocking ingestion writers from resurrecting the cycle. | Next GC pass detects incomplete deletion and resumes removal. |
+
+---
+
+## 10. Multi-Architecture Platform Support
+
+The Weather Platform is designed for native portability across standard server architectures:
+* **Officially Supported Architectures:** `native linux/amd64` (x86_64) and `native linux/arm64` (aarch64).
+* **Backing Services Multi-Arch:** PostgreSQL 18.6 with PostGIS 3.6.4 (`nickblah/postgis:18.6-trixie-postgis-3.6.4`), Redis 7 (`redis:7-alpine`), and MinIO (`minio/minio:RELEASE.2025-09-07T16-13-09Z`) publish native multi-arch manifests, eliminating architecture pinning in Compose and deployment manifests.
+* **C-Extension & Wheel Baseline:** Python scientific dependencies (`numpy`, `pandas`, `psycopg2-binary`, `zarr`, and `numcodecs 0.16.5`) resolve to prebuilt manylinux aarch64 wheels under CPython 3.12, avoiding host C compiler toolchain dependencies in multi-stage Docker builds.
+* **Native ecCodes Decoding:** Ingestion images install Debian `libeccodes-dev` to provide runtime `libeccodes.so` for `cfgrib` on both x86_64 and aarch64.
+* **Production Guardrails:** Production infrastructure strictly forbids `platform: linux/amd64` overrides or QEMU emulation dependencies. Build-time cross-architecture compatibility is continuously enforced via the `arm64-builds` CI pipeline job.
+
