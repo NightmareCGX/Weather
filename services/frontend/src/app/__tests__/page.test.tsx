@@ -3,15 +3,33 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import HomePage from "@/app/page";
 import { ForecastSelectionProvider } from "@/context/forecast-selection";
 import { SelectedLocationProvider } from "@/context/selected-location";
-import type { SpatialLayer } from "@/lib/api/types";
+import type { SelectedLocation, SpatialLayer } from "@/lib/api/types";
 
 let lastRenderedLayer: SpatialLayer | null = null;
+let lastRenderedLocation: SelectedLocation | null = null;
+let lastOnSelect: ((loc: SelectedLocation) => void) | null = null;
 
 // The real WeatherMap uses `next/dynamic(..., { ssr: false })`. Mock to record props.
 jest.mock("../../components/map/WeatherMap", () => {
-  function WeatherMapStub({ layer }: { layer: SpatialLayer | null }) {
+  function WeatherMapStub({
+    layer,
+    selectedLocation,
+    onSelect,
+  }: {
+    layer: SpatialLayer | null;
+    selectedLocation: SelectedLocation | null;
+    onSelect: (loc: SelectedLocation) => void;
+  }) {
     lastRenderedLayer = layer;
-    return <div data-testid="weather-map" data-layer-lead={layer?.lead_time_hours} />;
+    lastRenderedLocation = selectedLocation;
+    lastOnSelect = onSelect;
+    return (
+      <div
+        data-testid="weather-map"
+        data-layer-lead={layer?.lead_time_hours}
+        data-has-location={selectedLocation !== null}
+      />
+    );
   }
   return { __esModule: true, default: WeatherMapStub, WeatherMap: WeatherMapStub };
 });
@@ -45,6 +63,18 @@ const searchResult = {
   elevation_m: null,
   latitude: 38.19,
   longitude: -106.82,
+};
+
+const boulderResult: SelectedLocation = {
+  id: "city_boulder",
+  object: "city",
+  name: "Boulder",
+  region: "Colorado",
+  country: "USA",
+  elevation_m: 1624,
+  latitude: 40.015,
+  longitude: -105.27,
+  resolvedVia: "city",
 };
 
 const availabilityPayload = {
@@ -190,10 +220,12 @@ function routeFetch(input: RequestInfo | URL) {
     );
   }
   if (url.startsWith("/v1/search")) {
+    const q = new URL(url, "http://localhost").searchParams.get("q") ?? "";
+    const data = q.toLowerCase().includes("boulder") ? [boulderResult] : [searchResult];
     return Promise.resolve(
       jsonResponse({
         object: "list",
-        data: [searchResult],
+        data,
         has_more: false,
         next_cursor: null,
       })
@@ -253,6 +285,8 @@ function routeFetch(input: RequestInfo | URL) {
 
 beforeEach(() => {
   lastRenderedLayer = null;
+  lastRenderedLocation = null;
+  lastOnSelect = null;
   mockFetch.mockReset();
   mockFetch.mockImplementation(routeFetch);
   globalThis.fetch = mockFetch as unknown as typeof fetch;
@@ -373,5 +407,134 @@ describe("HomePage", () => {
     await waitFor(() => {
       expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
     });
+  });
+
+  it("clicking Close (X) clears selected location, removes sidebar and marker", async () => {
+    renderPage();
+
+    const input = await screen.findByLabelText(/Search for a city/);
+    fireEvent.change(input, { target: { value: "Aspen" } });
+    fireEvent.focus(input);
+
+    const option = await screen.findByText("Aspen");
+    fireEvent.mouseDown(option);
+
+    await waitFor(() => {
+      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+    });
+    expect(lastRenderedLocation?.name).toBe("Aspen");
+
+    const closeBtn = screen.getByRole("button", { name: "Close forecast panel" });
+    fireEvent.click(closeBtn);
+
+    await waitFor(() => {
+      expect(screen.queryByText("Hourly Forecast")).not.toBeInTheDocument();
+    });
+    expect(lastRenderedLocation).toBeNull();
+  });
+
+  it("clicking Collapse minimizes forecast panel while keeping selectedLocation and marker", async () => {
+    renderPage();
+
+    const input = await screen.findByLabelText(/Search for a city/);
+    fireEvent.change(input, { target: { value: "Aspen" } });
+    fireEvent.focus(input);
+
+    const option = await screen.findByText("Aspen");
+    fireEvent.mouseDown(option);
+
+    await waitFor(() => {
+      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+    });
+    expect(lastRenderedLocation?.name).toBe("Aspen");
+
+    const collapseBtn = screen.getByRole("button", { name: "Collapse forecast panel" });
+    expect(collapseBtn).toHaveAttribute("aria-expanded", "true");
+    expect(collapseBtn).toHaveAttribute("aria-controls", "forecast-panel-content");
+
+    fireEvent.click(collapseBtn);
+
+    const contentWrapper = document.getElementById("forecast-panel-content");
+    expect(contentWrapper).toHaveClass("hidden");
+    expect(lastRenderedLocation?.name).toBe("Aspen");
+
+    const expandBtn = screen.getByRole("button", { name: "Expand forecast panel" });
+    expect(expandBtn).toHaveAttribute("aria-expanded", "false");
+    expect(expandBtn).toHaveAttribute("aria-controls", "forecast-panel-content");
+  });
+
+  it("clicking Expand restores forecast panel without refetching /v1/points", async () => {
+    renderPage();
+
+    const input = await screen.findByLabelText(/Search for a city/);
+    fireEvent.change(input, { target: { value: "Aspen" } });
+    fireEvent.focus(input);
+
+    const option = await screen.findByText("Aspen");
+    fireEvent.mouseDown(option);
+
+    await waitFor(() => {
+      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+    });
+
+    const initialPointsCalls = mockFetch.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/v1/points")
+    ).length;
+    expect(initialPointsCalls).toBeGreaterThan(0);
+
+    // Collapse panel
+    const collapseBtn = screen.getByRole("button", { name: "Collapse forecast panel" });
+    fireEvent.click(collapseBtn);
+
+    const contentWrapper = document.getElementById("forecast-panel-content");
+    expect(contentWrapper).toHaveClass("hidden");
+
+    // Expand panel
+    const expandBtn = screen.getByRole("button", { name: "Expand forecast panel" });
+    fireEvent.click(expandBtn);
+
+    expect(contentWrapper).not.toHaveClass("hidden");
+    expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+    expect(lastRenderedLocation?.name).toBe("Aspen");
+
+    // Verify no additional /v1/points fetch was made merely because of collapse/expand
+    const afterPointsCalls = mockFetch.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/v1/points")
+    ).length;
+    expect(afterPointsCalls).toBe(initialPointsCalls);
+  });
+
+  it("selecting a new location while collapsed automatically expands the panel", async () => {
+    renderPage();
+
+    const input = await screen.findByLabelText(/Search for a city/);
+    fireEvent.change(input, { target: { value: "Aspen" } });
+    fireEvent.focus(input);
+
+    const option = await screen.findByText("Aspen");
+    fireEvent.mouseDown(option);
+
+    await waitFor(() => {
+      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+    });
+
+    // Collapse panel
+    const collapseBtn = screen.getByRole("button", { name: "Collapse forecast panel" });
+    fireEvent.click(collapseBtn);
+    expect(document.getElementById("forecast-panel-content")).toHaveClass("hidden");
+
+    // Simulate new location selection via map onSelect
+    act(() => {
+      lastOnSelect?.(boulderResult);
+    });
+
+    await waitFor(() => {
+      expect(lastRenderedLocation?.name).toBe("Boulder");
+    });
+
+    // Panel should automatically be expanded
+    const newCollapseBtn = screen.getByRole("button", { name: "Collapse forecast panel" });
+    expect(newCollapseBtn).toHaveAttribute("aria-expanded", "true");
+    expect(document.getElementById("forecast-panel-content")).not.toHaveClass("hidden");
   });
 });
