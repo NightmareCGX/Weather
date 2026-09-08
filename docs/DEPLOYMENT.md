@@ -148,3 +148,52 @@ poetry run weather-ingest gc --interval-seconds 1800
 * **Currently Implemented:** Docker multi-stage container builds, local Docker Compose stack, database migrations via Alembic, CLI daemon entrypoints for API, Ingestion, and GC, and the complete operational runbook framework in [`docs/RUNBOOKS.md`](RUNBOOKS.md).
 * **Stage 8 Server Deployment Handoff:**
   * Specific physical server sizing (CPU/RAM), PostgreSQL `max_connections`, API worker counts, and production supervisor definitions (systemd unit files, Docker Compose production profiles, or Kubernetes manifests) will be finalized during Stage 8 server deployment based on the parameter placeholders in `docs/RUNBOOKS.md`.
+
+---
+
+## 6. Architecture Support & Multi-Arch Container Readiness
+
+### 6.1 Officially Supported Architectures
+The Weather Platform officially supports two first-class Linux architectures for all production and ingestion workloads:
+* **`native linux/amd64`** (x86_64)
+* **`native linux/arm64`** (aarch64)
+
+Production deployments must NOT specify `platform: linux/amd64` in runtime Compose or container definitions, and production environments must run natively on the host architecture without QEMU or user-mode emulation.
+
+### 6.2 Backing Infrastructure Baseline
+* **PostgreSQL 18.6 + PostGIS 3.6.4 (`nickblah/postgis:18.6-trixie-postgis-3.6.4`):**
+  * Provides native multi-arch manifests for both `linux/amd64` and `linux/arm64`.
+  * Persistence layout: Image volume root mounted at `/var/lib/postgresql`, effective `PGDATA` versioned under `/var/lib/postgresql/18/docker`.
+  * Volume isolation: Uses the isolated `postgres18_data` named volume. Legacy PostgreSQL 16 volumes (`postgres_data`) must never be attached directly to PostgreSQL 18.
+* **Redis 7 (`redis:7-alpine`):** Native multi-arch support (`linux/amd64` + `linux/arm64`).
+* **MinIO (`minio/minio:RELEASE.2025-09-07T16-13-09Z`):** Native multi-arch support (`linux/amd64` + `linux/arm64`).
+
+### 6.3 Application Container Multi-Arch Support
+* **API Image (`docker/Dockerfile.api`):**
+  * Builds cleanly on both `linux/amd64` and `linux/arm64`.
+  * Depends on `numcodecs 0.16.5`, which publishes prebuilt `manylinux2014` `aarch64` wheels for CPython 3.12. This eliminates GCC build toolchain requirements in `python:3.12-slim` builders.
+  * All Python C-extensions (`numpy`, `pandas`, `psycopg2-binary`, `zarr`, `numcodecs`) install and import natively on ARM64.
+* **Ingestion Image (`docker/Dockerfile.ingestion`):**
+  * Builds cleanly on both `linux/amd64` and `linux/arm64`.
+  * Installs `libeccodes-dev` from Debian package repositories during runtime image build, providing native `libeccodes.so` for `cfgrib`/GRIB2 decoding on Linux ARM64.
+  * CLI entrypoint (`weather-ingest`) executes natively with zero external dependencies when displaying help or routing subcommands.
+* **Frontend Image (`docker/Dockerfile.frontend`):**
+  * Next.js 14 standalone build supports `linux/arm64` (`@next/swc-linux-arm64-musl` in Alpine).
+  * In CI, the frontend ARM64 Docker build is intentionally deferred under Option B to avoid excessive QEMU user-mode compilation latency and protect PR CI duration.
+
+### 6.4 ARM64 CI Guardrail (`arm64-builds`)
+The GitHub Actions CI pipeline (`.github/workflows/ci.yml`) enforces ARM64 build compatibility through the dedicated `arm64-builds` job:
+1. **QEMU & Buildx Setup:** Initializes `docker/setup-qemu-action@v3` and `docker/setup-buildx-action@v3`.
+2. **Container Construction:** Builds `weather-api:arm64-ci` and `weather-ingestion:arm64-ci` targeting `linux/arm64`.
+3. **Platform Metadata Verification:** Inspects built images (`docker inspect --format '{{.Architecture}}'`) to guarantee the artifacts are genuinely `arm64` and not silently targeting `amd64`.
+4. **Startup & CLI Smoke Tests:** Runs minimal container verification under emulation:
+   * API: Validates native module imports (`numpy`, `pandas`, `psycopg2`, `zarr`, `numcodecs`, `api.main`).
+   * Ingestion: Validates console script entrypoint (`weather-ingest --help`) and GRIB decoding stack import (`cfgrib` / `ecCodes`).
+
+### 6.5 Remaining Native-Host Acceptance
+A green Buildx/QEMU build in GitHub Actions verifies cross-compilation and package resolution compatibility, but does not substitute for native hardware runtime verification. Production acceptance on a native ARM64 host still validates:
+* Native container startup without emulation overhead.
+* Host-level service-to-service networking (API ↔ PostgreSQL 18, Ingestion ↔ MinIO).
+* PostgreSQL 18 / PostGIS 3.6 spatial query execution on ARM64.
+* Ingestion of live upstream NOAA GRIB2 byte streams with full ecCodes decoding and sharded Zarr writing.
+* Representative end-to-end point and map serving performance under load.

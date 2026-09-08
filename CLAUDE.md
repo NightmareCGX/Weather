@@ -86,6 +86,7 @@ Grounding the general matrix in the actual CI (`.github/workflows/ci.yml`, all j
 | `frontend-lint-build` | `npm run lint`, `typecheck`, `format:check`, `build` (`output: standalone`) | yes | Docker `node:20` |
 | `frontend-e2e` | Playwright Chromium, `npm run e2e` | yes, where supported | Docker / WSL |
 | `container-builds` | `docker build` of api/ingestion/frontend images + runtime smoke tests | **not reproducible on the Windows host itself** — Linux artifacts | Docker Linux build + runtime smoke |
+| `arm64-builds` | `docker buildx build --platform linux/arm64` of API & Ingestion + platform check + startup/CLI smoke | yes (via Docker Desktop Buildx/QEMU) | Docker Buildx `linux/arm64` |
 
 ### 6. No green Windows + Linux validation, no commit
 
@@ -138,7 +139,9 @@ Pay particular attention to packages whose behavior differs between Windows and 
 
 ### 10. Docker changes require Linux-oriented validation
 
-Docker images are Linux production artifacts (here all target `python:3.12-slim`, non-root `appuser` uid 1001). For Docker-related changes, Claude MUST validate: image builds, relevant runtime startup, relevant application behavior, filesystem permissions, production user behavior, required runtime libraries, and dependency availability. **"Works on the Windows host" does NOT establish "Docker/Linux production environment works."** When practical, reproduce the relevant CI `container-builds` commands (build via the same `docker/Dockerfile.*` and `target: runtime`, then run the same smoke checks).
+Docker images are Linux production artifacts (here all target `python:3.12-slim`, non-root `appuser` uid 1001, plus `node:20-alpine` for frontend). For Docker-related changes, Claude MUST validate: image builds, relevant runtime startup, relevant application behavior, filesystem permissions, production user behavior, required runtime libraries, and dependency availability. **"Works on the Windows host" does NOT establish "Docker/Linux production environment works."** When practical, reproduce the relevant CI `container-builds` commands (build via the same `docker/Dockerfile.*` and `target: runtime`, then run the same smoke checks).
+
+Furthermore, the platform officially supports native `linux/arm64` as a first-class production target alongside `linux/amd64`. Production configuration must NOT depend on `platform: linux/amd64` or QEMU emulation. The `arm64-builds` CI job enforces ARM64 container construction, dependency resolution (`numcodecs 0.16.5` baseline, native `libeccodes-dev`), platform metadata verification, and startup/CLI smoke tests.
 
 ### 11. Database and migration changes
 

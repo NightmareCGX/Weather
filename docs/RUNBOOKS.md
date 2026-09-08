@@ -502,3 +502,70 @@ The following settings remain **TBD** until physical server provisioning in Stag
 | **S3 Storage Provider & FQDN**| `<OBJECT_STORAGE_ENDPOINT>` | Cloud provider S3 endpoint | `FINALIZE IN STAGE 8` |
 | **Staging Disk Allocation** | `<STAGING_DISK_GB>` | Sized for peak concurrent wave downloads | `FINALIZE IN STAGE 8` |
 | **Retention Window Policy** | `<RETENTION_POLICY>` | Number of historical cycles to retain (e.g. 4 cycles) | `FINALIZE IN STAGE 8` |
+
+---
+
+## 18. Native ARM64 Production Host Acceptance Runbook
+
+While GitHub Actions CI verifies ARM64 image construction, dependency resolution, and basic CLI invocation under Buildx/QEMU, final acceptance for deploying to a native ARM64 host (e.g., AWS Graviton, Ampere Altra, Apple Silicon server) requires validating runtime behavior on bare metal without emulation.
+
+### Step 1: Verify Native Architecture & Kernel
+Verify the host runs native 64-bit ARM Linux:
+```bash
+uname -m
+# Expected output: aarch64 (or arm64)
+```
+
+### Step 2: Validate Backing Infrastructure
+Verify that backing services run natively without architecture emulation:
+```bash
+docker compose up -d
+docker inspect weather_postgres --format '{{.Architecture}}'  # Expected: arm64
+docker inspect weather_redis --format '{{.Architecture}}'     # Expected: arm64
+docker inspect weather_minio --format '{{.Architecture}}'     # Expected: arm64
+```
+Ensure PostgreSQL 18 is initialized with the dedicated `postgres18_data` volume:
+```bash
+docker exec weather_postgres psql -U weather_user -d weather_db -c "SELECT version(); SELECT PostGIS_Full_Version();"
+```
+
+### Step 3: Run Native Application Container Smokes
+Verify native execution of API and Ingestion images:
+```bash
+# Ingestion CLI help smoke
+docker run --rm weather-ingestion:latest --help
+
+# Ingestion native ecCodes / GRIB decoding import smoke
+docker run --rm --entrypoint python weather-ingestion:latest -c "import cfgrib; print('Native ecCodes OK')"
+
+# API serving tier imports & dependencies smoke
+docker run --rm weather-api:latest python -c "import numpy, pandas, psycopg2, zarr, numcodecs, api.main; print('Native API OK')"
+```
+
+### Step 4: Validate Real GRIB2 Decode & Zarr Write
+Execute a one-lead test ingestion against live NOAA data to verify native ecCodes GRIB2 parsing, SIMD floating-point operations, and Zarr sharded storage:
+```bash
+docker run --rm \
+  --network host \
+  -e DATABASE_URL="postgresql://weather_user:weather_password@localhost:5432/weather_db" \
+  -e MINIO_ENDPOINT="localhost:9000" \
+  -e MINIO_ACCESS_KEY="minio_admin" \
+  -e MINIO_SECRET_KEY="minio_password" \
+  -e MINIO_SECURE="false" \
+  -e WEATHER_TEST_MINIO="1" \
+  weather-ingestion:latest ingest \
+    --model gfs \
+    --cycle-date "$(date -u +%Y-%m-%d)" \
+    --cycle-hour 0 \
+    --lead-time-hours 0 \
+    --dry-run
+```
+
+### Step 5: Validate API Serving Endpoints
+Start the API container on the native host and execute an end-to-end healthcheck:
+```bash
+curl -sf http://localhost:8000/v1/health | jq .
+curl -sf http://localhost:8000/v1/models | jq .
+```
+Verify that JSON serialization, Redis caching, and coordinate projections execute without architecture-dependent regressions.
+
