@@ -30,9 +30,9 @@ numpy = "^2.0.0"
 # (api/core/zarr.py ``xr.open_zarr``), which lazily imports ``zarr`` and needs a
 # ``numcodecs`` codec stack. Both must be runtime (main) dependencies so the
 # production API image can serve forecasts, not dev-only test fixtures.
-# numcodecs is aligned with the ingestion writer's resolved version (0.15.x/0.16.x).
+# numcodecs is aligned with the ingestion writer's resolved version (0.16.x).
 zarr = "^3.3.0"
-numcodecs = "^0.15.0"
+numcodecs = "^0.16.5"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
