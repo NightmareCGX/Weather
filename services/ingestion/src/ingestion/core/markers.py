@@ -216,6 +216,7 @@ def marker_body(
     expected_write_set_fingerprint: str,
     required_materialized_object_keys: list[str],
     intentionally_omitted_fill_chunks: list[str],
+    is_mean: bool = False,
 ) -> dict[str, object]:
     """Build a stable-marker body payload.
 
@@ -228,12 +229,15 @@ def marker_body(
         required_materialized_object_keys: Keys that MUST exist.
         intentionally_omitted_fill_chunks: Keys that are all-fill and
             deliberately absent (write_empty_chunks=False).
+        is_mean: Whether the region represents an official ensemble mean product (geavg).
 
     Returns:
         A JSON-serializable marker payload.
     """
-    logical_region = {"lead_time_hours": lead_time_hours}
-    if member is not None:
+    logical_region: dict[str, object] = {"lead_time_hours": lead_time_hours}
+    if is_mean:
+        logical_region["is_mean"] = True
+    elif member is not None:
         logical_region["member"] = member
     return {
         "protocol_version": 1,

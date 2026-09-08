@@ -39,9 +39,21 @@ V_TIME = datetime(2026, 9, 6, 18, 0, tzinfo=timezone.utc)  # Lead 6
 
 
 @pytest.fixture
-def test_db():
+def test_db(monkeypatch):
     old_expected = get_expected_members("gefs", default_if_unknown=30)
     register_expected_members("gefs", 30)
+
+    # Hermetic test isolation: prevent S3/MinIO network calls in CI
+    monkeypatch.setattr(
+        "api.services.point_forecast.resolve_serving_generation_for_store",
+        lambda store_path, latest_retired_iso=None: "gen_test",
+    )
+
+    import s3fs
+    def _fail_s3(*args, **kwargs):
+        raise ConnectionRefusedError("Hermetic test: real S3/MinIO access prohibited")
+    monkeypatch.setattr(s3fs.S3FileSystem, "__init__", _fail_s3)
+
     engine = create_engine("sqlite:///:memory:")
     tables = [
         ForecastCenter.__table__,

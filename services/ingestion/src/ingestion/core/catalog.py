@@ -663,22 +663,31 @@ def _reconcile_catalog_to_store(
     #    reconstructed, consistent with step 4 and with ``record_run``).
     if spec is not None and spec.variables:
         grid_code = spec.grid_id
-        product_type = spec.product_type
+        base_product_type = spec.product_type
         zarr_chunk_path = spec.zarr_store_path or run.zarr_store_path
-        existing_products = set(
-            int(p) for p in db.execute(
-                select(ProductRecord.lead_time_hours).where(
-                    ProductRecord.run_id == run.id
-                )
-            ).scalars()
-        )
-        missing_leads = committed_leads - existing_products
         restore_variables = [
             v.code
             for v in spec.variables
             if store_vars is None or v.code in store_vars
         ]
-        for lead in sorted(missing_leads):
+        for lead in sorted(committed_leads):
+            target_product_type = (
+                "ensemble_mean"
+                if (
+                    committed_state.is_ensemble
+                    and committed_state.mean_leads is not None
+                    and lead in committed_state.mean_leads
+                )
+                else base_product_type
+            )
+            if committed_state.is_ensemble and target_product_type == "ensemble_mean":
+                db.execute(
+                    ProductRecord.__table__.delete().where(
+                        ProductRecord.run_id == run.id,
+                        ProductRecord.lead_time_hours == lead,
+                        ProductRecord.product_type != "ensemble_mean",
+                    )
+                )
             for variable_code in restore_variables:
                 _get_or_create(
                     db,
@@ -686,17 +695,17 @@ def _reconcile_catalog_to_store(
                     (ProductRecord.run_id == run.id)
                     & (ProductRecord.variable_id == variable_code)
                     & (ProductRecord.grid_id == grid_code)
-                    & (ProductRecord.product_type == product_type)
+                    & (ProductRecord.product_type == target_product_type)
                     & (ProductRecord.lead_time_hours == lead),
                     {
                         "id": (
                             f"product_{run.id}_{variable_code}_{grid_code}_"
-                            f"{product_type}_{lead}"
+                            f"{target_product_type}_{lead}"
                         ),
                         "run_id": run.id,
                         "variable_id": variable_code,
                         "grid_id": grid_code,
-                        "product_type": product_type,
+                        "product_type": target_product_type,
                         "lead_time_hours": lead,
                         "zarr_chunk_path": zarr_chunk_path,
                     },
