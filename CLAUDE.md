@@ -66,7 +66,7 @@ Where practical, Claude MUST reproduce Linux behavior using the environment that
 2. which commands those jobs execute;
 3. which operating system they run on (all CI jobs here are `ubuntu-latest`);
 4. which runtime/tool versions they use (Python `3.12`, Poetry `2.4.1`, `ruff 0.3.4`, `mypy 1.20.2`, Node `20`, `npm ci`);
-5. which services/dependencies they require (PostgreSQL `postgis/postgis:16-3.4`, Redis `redis:7-alpine`, MinIO, Linux `libeccodes-dev`);
+5. which services/dependencies they require (PostgreSQL `nickblah/postgis:18.6-trixie-postgis-3.6.4`, Redis `redis:7-alpine`, MinIO, Linux `libeccodes-dev`);
 6. which checks can be reproduced locally;
 7. which checks require Linux/container validation.
 
@@ -80,7 +80,7 @@ Grounding the general matrix in the actual CI (`.github/workflows/ci.yml`, all j
 |---|---|---|---|
 | `python-quality` | `poetry install` + `ruff check` + `mypy` per package (domain/api/ingestion) + contracts/config import | yes (`ruff`/`mypy` from the active venv, Poetry 2.4.1) | Docker `python:3.12-slim` / WSL |
 | `domain-tests` | `pytest` offline, **100% coverage gate** | yes | Docker / WSL |
-| `api-tests` | `pytest` + PostgreSQL (PostGIS 16) + Redis service containers | only if local services run | Docker Compose / CI-like service containers |
+| `api-tests` | `pytest` + PostgreSQL (PostGIS 3.6 / PG 18) + Redis service containers | only if local services run | Docker Compose / CI-like service containers |
 | `ingestion-tests` | `pytest` + PostgreSQL + Redis + MinIO, `WEATHER_TEST_MINIO=1`, real S3 Zarr round-trip (JUnit-verified not-skipped), `libeccodes-dev` | partial — Windows `eccodes` wheel bundles the native lib; services still required | Docker / WSL with `libeccodes-dev` + service containers |
 | `frontend-unit` | `npm ci` + Jest | yes | Docker `node:20` |
 | `frontend-lint-build` | `npm run lint`, `typecheck`, `format:check`, `build` (`output: standalone`) | yes | Docker `node:20` |
