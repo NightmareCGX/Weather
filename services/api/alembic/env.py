@@ -60,7 +60,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         include_object=include_object,
-        dialect_opts={"server_version_info": (16, 0)},
+        dialect_opts={"server_version_info": (18, 0)},
     )
 
     with context.begin_transaction():

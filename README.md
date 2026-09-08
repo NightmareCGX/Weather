@@ -25,7 +25,7 @@ The platform currently ingests, normalizes, stores, and serves operational forec
                       │                          │
                       ▼ (shards & manifests)     ▼ (catalog metadata & locks)
        ┌──────────────────────────────┐ ┌──────────────────────────────┐
-       │   Object Storage (S3/MinIO)  │ │ PostgreSQL 16 + PostGIS      │
+       │   Object Storage (S3/MinIO)  │ │ PostgreSQL 18 + PostGIS      │
        │   s3://weather-data/{model}/ │ │ Relational Catalog & Runs    │
        │   {date}/{hour}/cycle.zarr/  │ │ Advisory-Lock Concurrency    │
        └──────────────┬───────────────┘ └──────────────┬───────────────┘
@@ -92,7 +92,7 @@ Weather/
 ---
 
 ### Step 1: Start Local Infrastructure
-Launch PostgreSQL 16 (PostGIS 3.4), Redis 7, and MinIO:
+Launch PostgreSQL 18.6 (PostGIS 3.6.4), Redis 7, and MinIO:
 ```bash
 docker-compose up -d
 ```

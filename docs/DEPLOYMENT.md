@@ -10,11 +10,14 @@ This document describes the currently implemented deployment architecture, conta
 
 For local development and integration testing, backing services run via Docker Compose:
 
-* **PostgreSQL 16 + PostGIS 3.4 (`postgis/postgis:16-3.4`):**
+* **PostgreSQL 18.6 + PostGIS 3.6.4 (`nickblah/postgis:18.6-trixie-postgis-3.6.4`):**
   * Port: `5432`
   * Database: `weather_db`
   * Credentials: `weather_user` / `weather_password`
   * Stores relational catalog, forecast product availability, lifecycle fences, and coordinates PostgreSQL advisory locks.
+  * Image architecture: Native multi-arch support (`linux/amd64` + `linux/arm64`), without pgRouting requirement.
+  * Persistence layout: Image-level volume root mounted at `/var/lib/postgresql`, with effective PGDATA versioned under `/var/lib/postgresql/18/docker`.
+  * Named volume isolation: Uses `postgres18_data` named volume. Existing local PostgreSQL 16 volumes (`postgres_data`) must not be attached as PostgreSQL 18 PGDATA. Developers starting the updated Compose baseline cleanly receive the isolated `postgres18_data` volume.
 * **Redis 7 (`redis:7-alpine`):**
   * Port: `6379`
   * In-memory cache for API point forecast JSON envelopes and vector field grids.

@@ -48,7 +48,7 @@ This framework is cloud- and topology-agnostic. Specific hardware sizing, IP add
                       │                                │                                │
                       ▼                                ▼                                ▼
        ┌──────────────────────────────┐ ┌──────────────────────────────┐ ┌──────────────────────────────┐
-       │         PostgreSQL 16        │ │           Redis 7            │ │     Object Storage (S3)      │
+       │         PostgreSQL 18        │ │           Redis 7            │ │     Object Storage (S3)      │
        │      (+ PostGIS Extension)   │ │    (Hot-Cache Acceleration)  │ │   (s3://<BUCKET>/<model>/)   │
        │  • Relational Catalog & Runs │ └──────────────────────────────┘ └──────────────▲───────────────┘
        │  • Advisory Lock Gates       │                                                 │
@@ -210,7 +210,7 @@ DATABASE_URL="<PRODUCTION_DATABASE_URL>" poetry run alembic current
 ## 6. Service Startup & Logical Dependency Order
 
 ```text
-1. Backing Infrastructure: PostgreSQL 16 (PostGIS) ──► Redis 7 ──► S3 Object Storage
+1. Backing Infrastructure: PostgreSQL 18 (PostGIS) ──► Redis 7 ──► S3 Object Storage
                                 │
                                 ▼
 2. Core Serving Tier:      FastAPI (services/api)

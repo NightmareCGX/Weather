@@ -30,7 +30,7 @@ The Global Probabilistic Weather Platform is a high-throughput, cloud-native met
                                               │                │ Lifecycle & Advisory Locks
                                               ▼                ▼
                      ┌────────────────────────────────┐ ┌────────────────────────────────┐
-                     │    Object Storage (S3/MinIO)   │ │    PostgreSQL 16 + PostGIS     │
+                     │    Object Storage (S3/MinIO)   │ │    PostgreSQL 18 + PostGIS     │
                      │  s3://weather-data/{model}/    │ │  • Model runs, variables, grids│
                      │  {date}/{hour}/cycle.zarr/     │ │  • Progressive product catalog │
                      │  • Canonical shard containers  │ │  • Cycle lifecycle & fences    │
@@ -70,7 +70,7 @@ The Global Probabilistic Weather Platform is a high-throughput, cloud-native met
 | **Serving Tier** | `services/api` | Python 3.12, FastAPI, Uvicorn, SQLAlchemy, GeoAlchemy2, `xarray`, `s3fs`, Redis | Exposes REST endpoints, validates requested models/coordinates, acquires `SHARED` advisory locks, performs granular Range GETs against Zarr stores, and computes domain outputs. |
 | **Frontend UI** | `services/frontend` | TypeScript, Next.js 14, React 18, MapLibre GL, Recharts, Tailwind CSS | Browser-based user interface for interactive map exploration, point meteograms, ensemble spaghetti/PDF charts, and location search. |
 | **Domain Logic** | `packages/domain` | Python 3.12, NumPy, `xarray` | Pure, dependency-free mathematical domain models: grid coordinates, bilinear interpolation, ensemble statistics, precipitation phase classification, verification metrics, and advisory lock key derivation. |
-| **Relational Database** | Infrastructure | PostgreSQL 16 + PostGIS 3.4 | Stores catalog hierarchy, progressive product availability, lifecycle fences, spatial point reference data, and coordinates distributed advisory locks. |
+| **Relational Database** | Infrastructure | PostgreSQL 18.6 + PostGIS 3.6.4 | Stores catalog hierarchy, progressive product availability, lifecycle fences, spatial point reference data, and coordinates distributed advisory locks. |
 | **Object Store** | Infrastructure | AWS S3 / MinIO | Primary repository for all multidimensional meteorological raster data formatted in `sharded_v1` Zarr layout. |
 | **Response Cache** | Infrastructure | Redis 7 | Caches interpolated point forecast payloads and vector field grids by generation key to minimize repeated object storage reads. |
 
