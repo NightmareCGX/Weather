@@ -587,6 +587,7 @@ def region_expected_object_keys(
     zarray_cache: Mapping[str, Mapping[str, object]] | None = None,
     zattrs_cache: Mapping[str, Mapping[str, object]] | None = None,
     member_index_cache: Mapping[int, int] | None = None,
+    is_mean: bool = False,
 ) -> list[str]:
     """Derive the physical object keys a logical region writes.
 
@@ -642,7 +643,9 @@ def region_expected_object_keys(
 
         out_shards: list[str] = []
         for var in sorted(data_var_paths):
-            if member is not None:
+            if is_mean:
+                out_shards.append(f"{var}/shard.mean_L{lead_val:04d}.shard")
+            elif member is not None:
                 out_shards.append(f"{var}/shard.mem{member:03d}_L{lead_val:04d}.shard")
             else:
                 out_shards.append(f"{var}/shard.det_L{lead_val:04d}.shard")

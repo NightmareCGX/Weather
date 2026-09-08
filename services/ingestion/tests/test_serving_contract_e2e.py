@@ -292,6 +292,32 @@ def test_serving_contract_e2e_gfs_and_gefs(clean_db) -> None:
         body_m = marker_body(lead_time_hours=0, member=m, state="complete", generation=f"gen_m{m}", expected_write_set_fingerprint=expected_write_set_fingerprint(keys_m, []), required_materialized_object_keys=keys_m, intentionally_omitted_fill_chunks=[])
         write_region_marker(gefs_store, lead_time_hours=0, member=m, payload=body_m)
 
+    # Commit official precomputed mean (geavg) region for lead 0
+    # Set synthetic official mean temperature to 295.15 K (22.0 °C), deliberately distinguishable
+    # from the 30-member arithmetic mean (20.1 °C).
+    ds_gefs_mean = _build_synthetic_dataset(leads=(0,), t2m_val=295.15, cycle_time=cycle_gefs)
+    commit_region(ds_gefs_mean, gefs_store, lead_time_hours=0, is_mean=True)
+    keys_mean = region_expected_object_keys(
+        gefs_store,
+        member=None,
+        lead_index=0,
+        lead_time_hours=0,
+        format_version="sharded_v1",
+        data_var_paths=VARS_LIST,
+        is_mean=True,
+    )
+    body_mean = marker_body(
+        lead_time_hours=0,
+        member=None,
+        state="complete",
+        generation="gen_mean",
+        expected_write_set_fingerprint=expected_write_set_fingerprint(keys_mean, []),
+        required_materialized_object_keys=keys_mean,
+        intentionally_omitted_fill_chunks=[],
+        is_mean=True,
+    )
+    write_region_marker(gefs_store, lead_time_hours=0, member=None, payload=body_mean, is_mean=True)
+
     # Seed initial run record
     with Session(db_engine) as db:
         db.add(ModelRunRecord(id=gefs_run_id, model_version_id=gefs_version_id, cycle_time=cycle_gefs, status="partial", zarr_store_path=gefs_store))
@@ -394,14 +420,14 @@ def test_serving_contract_e2e_gfs_and_gefs(clean_db) -> None:
         assert len(res_tile_gfs.content) > 500, f"PNG tile payload unexpectedly small: {len(res_tile_gfs.content)} B"
         assert res_tile_gfs.content.startswith(b"\x89PNG\r\n\x1a\n")
 
-        # F. GEFS Map Tile PNG (Ensemble Member-Mean)
+        # F. GEFS Map Tile PNG (Official Precomputed Mean)
         res_tile_gefs = client.get(f"/v1/maps/gefs/temperature_2m/surface/0/0/0.png?lead_time_hours=0&initial_time={cycle_str_gefs}")
         assert res_tile_gefs.status_code == 200
         assert res_tile_gefs.headers.get("content-type") == "image/png"
         assert len(res_tile_gefs.content) > 500
         assert res_tile_gefs.content.startswith(b"\x89PNG\r\n\x1a\n")
 
-        # G. GEFS Point Forecast Endpoint (Ensemble Member-Mean)
+        # G. GEFS Point Forecast Endpoint (Official Precomputed Mean)
         res_gefs_point = client.get(
             f"/v1/points?lat={LAT}&lon={LON}&models=gefs&start_lead_time_hours=0&end_lead_time_hours=0"
         )
@@ -413,8 +439,11 @@ def test_serving_contract_e2e_gfs_and_gefs(clean_db) -> None:
         gefs_f0 = gefs_forecasts[0]
         assert gefs_f0.get("temperature_2m") is not None
         assert not np.isnan(gefs_f0["temperature_2m"])
-        # Members 1..30 had temperature: 290.15 + m*0.2 K -> Celsius = 17.0 + m*0.2 -> mean = 17.0 + 3.1 = 20.1 deg C
-        assert np.isclose(gefs_f0["temperature_2m"], 20.1, atol=0.2)
+        # Official geavg mean temperature was set to 295.15 K -> 22.0 °C.
+        # This proves the point forecast is sourced from official geavg rather than
+        # the 30-member arithmetic mean (20.1 °C).
+        assert np.isclose(gefs_f0["temperature_2m"], 22.0, atol=0.2)
+        assert abs(gefs_f0["temperature_2m"] - stats["mean"]) > 1.5
         assert gefs_f0.get("wind_10m") is not None
         assert not np.isnan(gefs_f0["wind_10m"])
         assert gefs_f0["wind_10m"] > 0.0

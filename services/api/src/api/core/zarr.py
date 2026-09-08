@@ -18,6 +18,7 @@ import struct
 import threading
 from collections import OrderedDict
 from collections.abc import Generator, MutableMapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from os import PathLike
 from typing import Any
@@ -33,6 +34,38 @@ from api.core.config import settings
 SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
 INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
 TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
+
+#: Bounded concurrency limit for member reads (tuned to match the connection pool
+#: and prevent socket starvation while eliminating serial member latency).
+DEFAULT_MEMBER_WORKERS: int = 16
+_member_executor: ThreadPoolExecutor | None = None
+_member_executor_lock = threading.Lock()
+
+
+def get_member_executor(max_workers: int = DEFAULT_MEMBER_WORKERS) -> ThreadPoolExecutor:
+    """Return the shared process-wide bounded member executor.
+
+    Bounded to 16 workers by default (matching API_MAX_CONCURRENT_GATED_READS)
+    to balance throughput against object-store connection pressure without
+    per-request thread churn.
+    """
+    global _member_executor
+    with _member_executor_lock:
+        if _member_executor is None:
+            _member_executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="gefs-member-",
+            )
+        return _member_executor
+
+
+def shutdown_member_executor(wait: bool = True) -> None:
+    """Shut down and reset the shared member executor (for testing and teardown)."""
+    global _member_executor
+    with _member_executor_lock:
+        if _member_executor is not None:
+            _member_executor.shutdown(wait=wait)
+            _member_executor = None
 
 
 class ShardedV1Reader:
@@ -63,21 +96,43 @@ class ShardedV1Reader:
         path = os.fspath(self.store) if isinstance(self.store, (str, PathLike)) else ""
         if path.startswith("s3://"):
             rest = path[len("s3://") :].strip("/")
-            if self._fs is None:
-                scheme = "https" if settings.MINIO_SECURE else "http"
-                self._fs = s3fs.S3FileSystem(
-                    key=settings.MINIO_ACCESS_KEY,
-                    secret=settings.MINIO_SECRET_KEY,
-                    client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
-                    use_listings_cache=False,
-                )
+            with self._cache_lock:
+                if self._fs is None:
+                    scheme = "https" if settings.MINIO_SECURE else "http"
+                    self._fs = s3fs.S3FileSystem(
+                        key=settings.MINIO_ACCESS_KEY,
+                        secret=settings.MINIO_SECRET_KEY,
+                        client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
+                        config_kwargs={"max_pool_connections": 64},
+                        use_listings_cache=False,
+                    )
             return self._fs, rest
         return None, path
 
-    def _get_shard_key(self, variable: str, member: int | None, lead_time_hours: int) -> str:
+    def _get_shard_key(
+        self,
+        variable: str,
+        member: int | None,
+        lead_time_hours: int,
+        is_mean: bool = False,
+    ) -> str:
+        if is_mean:
+            return f"{variable}/shard.mean_L{lead_time_hours:04d}.shard"
         if member is not None:
             return f"{variable}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
         return f"{variable}/shard.det_L{lead_time_hours:04d}.shard"
+
+    def has_mean_shard(
+        self,
+        variable: str,
+        lead_time_hours: int,
+        *,
+        generation: str | None = None,
+    ) -> bool:
+        """Return True if an official precomputed mean shard exists for the variable and lead."""
+        shard_key = self._get_shard_key(variable, None, lead_time_hours, is_mean=True)
+        entries = self.get_shard_index(shard_key, generation=generation)
+        return len(entries) > 0
 
     def get_shard_index(
         self,
@@ -141,13 +196,14 @@ class ShardedV1Reader:
         chunk_row: int,
         chunk_col: int,
         generation: str | None = None,
+        is_mean: bool = False,
     ) -> np.ndarray[Any, Any]:
         """Read and decompress a 100x100 float32 chunk from the target shard container."""
         if chunk_row < 0 or chunk_row >= 8 or chunk_col < 0 or chunk_col >= 15:
             return np.full((100, 100), np.nan, dtype=np.float32)
 
         chunk_idx = chunk_row * 15 + chunk_col
-        shard_key = self._get_shard_key(variable, member, lead_time_hours)
+        shard_key = self._get_shard_key(variable, member, lead_time_hours, is_mean=is_mean)
         store_path = os.fspath(self.store) if isinstance(self.store, (str, PathLike)) else ""
         chunk_cache_key = f"{store_path}::{generation or 'live'}::{shard_key}::{chunk_idx}"
 
@@ -193,6 +249,7 @@ class ShardedV1Reader:
         lat_idx: int,
         lon_idx: int,
         generation: str | None = None,
+        is_mean: bool = False,
     ) -> float:
         """Read a single cell value via granular byte-range GET."""
         chunk_row = lat_idx // 100
@@ -204,6 +261,7 @@ class ShardedV1Reader:
             chunk_row=chunk_row,
             chunk_col=chunk_col,
             generation=generation,
+            is_mean=is_mean,
         )
         sub_lat = lat_idx % 100
         sub_lon = lon_idx % 100
@@ -220,6 +278,7 @@ class ShardedV1Reader:
         t_row: float,
         t_col: float,
         generation: str | None = None,
+        is_mean: bool = False,
     ) -> float:
         """Bilinearly interpolate a variable at 2x2 neighborhood coordinates."""
         lat0, lat1 = lat_idx[0], lat_idx[1]
@@ -236,6 +295,7 @@ class ShardedV1Reader:
                 chunk_row=r0,
                 chunk_col=c0,
                 generation=generation,
+                is_mean=is_mean,
             )
             val_00 = float(arr[lat0 % 100, lon0 % 100])
             val_01 = float(arr[lat0 % 100, lon1 % 100])
@@ -243,21 +303,70 @@ class ShardedV1Reader:
             val_11 = float(arr[lat1 % 100, lon1 % 100])
         else:
             val_00 = self.read_point_value(
-                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon0, generation=generation
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon0, generation=generation, is_mean=is_mean
             )
             val_01 = self.read_point_value(
-                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon1, generation=generation
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat0, lon_idx=lon1, generation=generation, is_mean=is_mean
             )
             val_10 = self.read_point_value(
-                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon0, generation=generation
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon0, generation=generation, is_mean=is_mean
             )
             val_11 = self.read_point_value(
-                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon1, generation=generation
+                variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon1, generation=generation, is_mean=is_mean
             )
 
         lower = val_00 + (val_01 - val_00) * t_col
         upper = val_10 + (val_11 - val_10) * t_col
         return float(lower + (upper - lower) * t_row)
+
+    def interpolate_members(
+        self,
+        variable: str,
+        *,
+        members: list[int] | tuple[int, ...],
+        lead_time_hours: int,
+        lat_idx: list[int],
+        lon_idx: list[int],
+        t_row: float,
+        t_col: float,
+        generation: str | None = None,
+        executor: ThreadPoolExecutor | None = None,
+    ) -> list[float]:
+        """Interpolate point values across ensemble members with bounded concurrency.
+
+        Preserves exact member order and propagates real exceptions from workers.
+        """
+        if not members:
+            return []
+        if len(members) == 1:
+            return [
+                self.interpolate_point(
+                    variable,
+                    member=members[0],
+                    lead_time_hours=lead_time_hours,
+                    lat_idx=lat_idx,
+                    lon_idx=lon_idx,
+                    t_row=t_row,
+                    t_col=t_col,
+                    generation=generation,
+                )
+            ]
+
+        ex = executor or get_member_executor()
+
+        def _read_member(m: int) -> float:
+            return self.interpolate_point(
+                variable,
+                member=m,
+                lead_time_hours=lead_time_hours,
+                lat_idx=lat_idx,
+                lon_idx=lon_idx,
+                t_row=t_row,
+                t_col=t_col,
+                generation=generation,
+            )
+
+        return list(ex.map(_read_member, members))
 
     def read_window(
         self,
@@ -270,6 +379,7 @@ class ShardedV1Reader:
         lon_min: int,
         lon_max: int,
         generation: str | None = None,
+        is_mean: bool = False,
     ) -> np.ndarray[Any, Any]:
         """Read a bounded rectangular spatial window [lat_min..lat_max, lon_min..lon_max] (inclusive)."""
         lat_len = lat_max - lat_min + 1
@@ -307,6 +417,7 @@ class ShardedV1Reader:
                         chunk_row=r_chunk,
                         chunk_col=c_chunk,
                         generation=generation,
+                        is_mean=is_mean,
                     )
                     window[win_lat_start:win_lat_end, win_lon_start:win_lon_end] = chunk_arr[
                         sub_lat_start:sub_lat_end, sub_lon_start:sub_lon_end

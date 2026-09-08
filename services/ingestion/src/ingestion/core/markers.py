@@ -71,7 +71,13 @@ def version_sidecar_key() -> str:
     return _VERSION_ROOT
 
 
-def marker_key(store_path: str, *, lead_time_hours: int, member: int | None) -> str:
+def marker_key(
+    store_path: str,
+    *,
+    lead_time_hours: int,
+    member: int | None,
+    is_mean: bool = False,
+) -> str:
     """Return the stable marker object key for a logical region.
 
     The key is scoped under the store's commit namespace and uses the
@@ -83,11 +89,14 @@ def marker_key(store_path: str, *, lead_time_hours: int, member: int | None) -> 
             the marker key itself is a relative object key).
         lead_time_hours: The forecast lead in hours.
         member: The ensemble member identity, or ``None`` for deterministic.
+        is_mean: Whether the region represents an official ensemble mean product (geavg).
 
     Returns:
         The marker object key (relative to the store root).
     """
-    region = logical_region_encoding(lead_time_hours=lead_time_hours, member=member)
+    region = logical_region_encoding(
+        lead_time_hours=lead_time_hours, member=member, is_mean=is_mean
+    )
     return f"{_MARKER_ROOT}/{region}.json"
 
 
@@ -207,6 +216,7 @@ def marker_body(
     expected_write_set_fingerprint: str,
     required_materialized_object_keys: list[str],
     intentionally_omitted_fill_chunks: list[str],
+    is_mean: bool = False,
 ) -> dict[str, object]:
     """Build a stable-marker body payload.
 
@@ -219,12 +229,15 @@ def marker_body(
         required_materialized_object_keys: Keys that MUST exist.
         intentionally_omitted_fill_chunks: Keys that are all-fill and
             deliberately absent (write_empty_chunks=False).
+        is_mean: Whether the region represents an official ensemble mean product (geavg).
 
     Returns:
         A JSON-serializable marker payload.
     """
-    logical_region = {"lead_time_hours": lead_time_hours}
-    if member is not None:
+    logical_region: dict[str, object] = {"lead_time_hours": lead_time_hours}
+    if is_mean:
+        logical_region["is_mean"] = True
+    elif member is not None:
         logical_region["member"] = member
     return {
         "protocol_version": 1,
@@ -255,9 +268,12 @@ def read_region_marker(
     *,
     lead_time_hours: int,
     member: int | None,
+    is_mean: bool = False,
 ) -> dict[str, object]:
     """Read a region's stable marker payload (``{"state": "absent"}`` if none)."""
-    key = marker_key(store_path, lead_time_hours=lead_time_hours, member=member)
+    key = marker_key(
+        store_path, lead_time_hours=lead_time_hours, member=member, is_mean=is_mean
+    )
     return _marker_payload(store_path, key)
 
 
@@ -267,9 +283,12 @@ def write_region_marker(
     lead_time_hours: int,
     member: int | None,
     payload: Mapping[str, object],
+    is_mean: bool = False,
 ) -> None:
     """Atomically write (overwrite) a region's stable marker object."""
-    key = marker_key(store_path, lead_time_hours=lead_time_hours, member=member)
+    key = marker_key(
+        store_path, lead_time_hours=lead_time_hours, member=member, is_mean=is_mean
+    )
     data = manifest_canonical_json(dict(payload))
     _write_object_atomic(store_path, key, data)
 

@@ -160,6 +160,7 @@ def test_logical_region_encoding() -> None:
     assert logical_region_encoding(lead_time_hours=6) == "det_L0006"
     assert logical_region_encoding(lead_time_hours=6, member=17) == "mem017_L0006"
     assert logical_region_encoding(lead_time_hours=0, member=0) == "mem000_L0000"
+    assert logical_region_encoding(lead_time_hours=6, is_mean=True) == "mean_L0006"
 
 
 def test_physical_conflict_identity() -> None:

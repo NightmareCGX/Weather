@@ -1443,6 +1443,78 @@ def test_cli_concurrent_same_artifact_isolation(
     assert staging_dirs[0] != staging_dirs[1]
 
 
+def test_cli_gefs_includes_mean_by_default_and_supports_no_mean(tmp_path: Path) -> None:
+    """GEFS ingestion automatically includes geavg by default; --no-mean opts out."""
+    from ingestion.cli import _build_parser, expand_run_specs, _parse_manifest
+    import json
+
+    parser = _build_parser()
+
+    # 1. Default CLI arguments (no special flag needed)
+    args_default = parser.parse_args(
+        ["ingest", "--model", "gefs", "--cycle-date", "2026-07-21", "--cycle-hour", "0", "--lead-time-hours", "6"]
+    )
+    specs_default = expand_run_specs(args_default)
+    assert len(specs_default) == 1
+    assert specs_default[0].include_mean is True
+
+    # 2. Explicit --no-mean opt-out flag
+    args_no_mean = parser.parse_args(
+        ["ingest", "--model", "gefs", "--cycle-date", "2026-07-21", "--cycle-hour", "0", "--lead-time-hours", "6", "--no-mean"]
+    )
+    assert args_no_mean.include_mean is False
+    specs_no_mean = expand_run_specs(args_no_mean)
+    assert len(specs_no_mean) == 1
+    assert specs_no_mean[0].include_mean is False
+
+    # 3. Explicit --member without --include-mean implies member-only
+    args_members_only = parser.parse_args(
+        ["ingest", "--model", "gefs", "--cycle-date", "2026-07-21", "--cycle-hour", "0", "--lead-time-hours", "6", "--member", "1", "2"]
+    )
+    specs_members_only = expand_run_specs(args_members_only)
+    assert specs_members_only[0].include_mean is False
+
+    # 4. Explicit --member with --include-mean includes mean
+    args_members_plus_mean = parser.parse_args(
+        ["ingest", "--model", "gefs", "--cycle-date", "2026-07-21", "--cycle-hour", "0", "--lead-time-hours", "6", "--member", "1", "2", "--include-mean"]
+    )
+    specs_members_plus_mean = expand_run_specs(args_members_plus_mean)
+    assert specs_members_plus_mean[0].include_mean is True
+
+    # 5. Manifest parsing defaults to include_mean=True unless explicitly opted out
+    manifest_default = tmp_path / "manifest_default.json"
+    manifest_default.write_text(
+        json.dumps({
+            "runs": [{
+                "model": "gefs",
+                "cycle_date": "2026-07-21",
+                "cycle_hour": 0,
+                "lead_time_hours": [6],
+            }]
+        }),
+        encoding="utf-8",
+    )
+    parsed_default = _parse_manifest(str(manifest_default))
+    assert parsed_default[0].include_mean is True
+
+    manifest_no_mean = tmp_path / "manifest_no_mean.json"
+    manifest_no_mean.write_text(
+        json.dumps({
+            "runs": [{
+                "model": "gefs",
+                "cycle_date": "2026-07-21",
+                "cycle_hour": 0,
+                "lead_time_hours": [6],
+                "include_mean": False,
+            }]
+        }),
+        encoding="utf-8",
+    )
+    parsed_no_mean = _parse_manifest(str(manifest_no_mean))
+    assert parsed_no_mean[0].include_mean is False
+
+
+
 def test_finalize_run_returns_final_authoritative_committed_regions(
     session: Session, tmp_path: Path, monkeypatch
 ) -> None:

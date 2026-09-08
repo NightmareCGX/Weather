@@ -208,6 +208,7 @@ def logical_region_encoding(
     *,
     lead_time_hours: int,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> str:
     """Return an object-key-safe encoded logical region identity.
 
@@ -217,12 +218,15 @@ def logical_region_encoding(
     Args:
         lead_time_hours: The forecast lead in hours.
         member: The ensemble member identity, or ``None`` for deterministic.
+        is_mean: Whether the region represents an official ensemble mean product (geavg).
 
     Returns:
-        A filesystem/S3-object-key-safe string, e.g. ``"det_L006"`` or
-        ``"mem017_L006"``.
+        A filesystem/S3-object-key-safe string, e.g. ``"det_L0006"``,
+        ``"mem017_L0006"``, or ``"mean_L0006"``.
     """
     lead_token = f"L{int(lead_time_hours):04d}"
+    if is_mean:
+        return f"mean_{lead_token}"
     if member is None:
         return f"det_{lead_token}"
     return f"mem{int(member):03d}_{lead_token}"

@@ -1023,6 +1023,7 @@ def _commit_region(
     expected_lead_time_hours: tuple[int, ...] = (),
     expected_members: tuple[int, ...] = (),
     snapshot: Any | None = None,
+    is_mean: bool = False,
 ) -> None:
     """Commit a single-lead (and optional single-member) file to the store.
 
@@ -1100,6 +1101,7 @@ def _commit_region(
             member=member,
             lead_index=lead_idx,
             member_index=member_idx,
+            is_mean=is_mean,
         )
         return
 
@@ -1113,14 +1115,14 @@ def _commit_region(
             expected_lead_time_hours=expected_lead_time_hours,
             expected_members=expected_members,
         )
-        commit_region(dataset, store_path)
+        commit_region(dataset, store_path, is_mean=is_mean)
         return
 
     existing = read_dataset(store_path)
     _validate_store_identity(dataset, existing, store_path)
     _validate_lead_schema(dataset, existing, store_path)
 
-    commit_region(dataset, store_path)
+    commit_region(dataset, store_path, is_mean=is_mean)
 
 
 def _validate_store_identity_from_snapshot(

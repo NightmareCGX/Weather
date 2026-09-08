@@ -383,6 +383,7 @@ def commit_region(
     member: int | None = None,
     lead_index: int | None = None,
     member_index: int | None = None,
+    is_mean: bool = False,
 ) -> str:
     """Commit a single-lead (and optional single-member) file into an existing store.
 
@@ -436,6 +437,32 @@ def commit_region(
         elif member_value.size == 1:
             member = int(member_value.reshape(-1)[0])
 
+    format_version = getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1")
+    if format_version == "sharded_v1":
+        coords: dict[str, object] = {"lead_time_hours": [lead_time_hours]}
+        if member is not None:
+            coords["member"] = [member]
+        target = dataset.assign_coords(coords)
+        if "lead_time_hours" not in target.dims:
+            target = target.expand_dims("lead_time_hours")
+        if member is not None and "member" not in target.dims:
+            target = target.expand_dims("member")
+
+        try:
+            encoded_shards = encode_region_sharded_v1(
+                target,
+                member=member,
+                lead_time_hours=lead_time_hours,
+                is_mean=is_mean,
+            )
+        except Exception:
+            encoded_shards = []
+
+        if encoded_shards:
+            put_concurrency = int(getattr(settings, "GLOBAL_PUT_CONCURRENCY", 64))
+            write_encoded_chunks(store, encoded_shards, concurrency=put_concurrency)
+            return os.fspath(store) if isinstance(store, PathLike) else str(store)
+
     resolved = _resolve_store(store)
 
     # Resolve positional indices against store coordinates if not pre-resolved
@@ -454,10 +481,10 @@ def commit_region(
     # The dataset is single-lead (and, for GEFS, single-member). Build the
     # positional region slices. Data variables already carry the lead (and
     # member) dims; re-assert coordinates so the region write is exact.
-    coords: dict[str, object] = {"lead_time_hours": [lead_time_hours]}
+    legacy_coords: dict[str, object] = {"lead_time_hours": [lead_time_hours]}
     if member is not None:
-        coords["member"] = [member]
-    target = dataset.assign_coords(coords)
+        legacy_coords["member"] = [member]
+    target = dataset.assign_coords(legacy_coords)
 
     region: dict[str, slice] = {
         "lead_time_hours": slice(lead_index, lead_index + 1),
@@ -486,6 +513,7 @@ def commit_region(
                 target,
                 member=member,
                 lead_time_hours=lead_time_hours,
+                is_mean=is_mean,
             )
         except Exception:
             encoded_shards = []
@@ -560,6 +588,7 @@ def encode_region_sharded_v1(
     member: int | None,
     lead_time_hours: int,
     data_vars: Sequence[str] | None = None,
+    is_mean: bool = False,
 ) -> list[tuple[str, bytes]]:
     """Encode single-region dataset into canonical sharded_v1 container objects.
 
@@ -602,7 +631,9 @@ def encode_region_sharded_v1(
                 var_chunks.append(comp)
 
         shard_payload = build_sharded_v1_container(var_chunks)
-        if member is not None:
+        if is_mean:
+            key = f"{var_name}/shard.mean_L{lead_time_hours:04d}.shard"
+        elif member is not None:
             key = f"{var_name}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
         else:
             key = f"{var_name}/shard.det_L{lead_time_hours:04d}.shard"
@@ -821,16 +852,19 @@ def _coordinate_index(
     )
 
 
-def _parse_shard_filename(fname: str) -> tuple[int | None, int]:
-    """Parse member and lead from shard.mem001_L0006.shard or shard.det_L0006.shard."""
+def _parse_shard_filename(fname: str) -> tuple[int | None, int, bool]:
+    """Parse member, lead, and is_mean from shard.mem001_L0006.shard, shard.det_L0006.shard, or shard.mean_L0006.shard."""
     base = fname.removesuffix(".shard")
+    if ".mean_L" in base:
+        lead_str = base.split(".mean_L")[-1]
+        return None, int(lead_str), True
     if ".mem" in base:
         parts = base.split(".mem")[-1].split("_L")
-        return int(parts[0]), int(parts[1])
+        return int(parts[0]), int(parts[1]), False
     if ".det_L" in base:
         lead_str = base.split(".det_L")[-1]
-        return None, int(lead_str)
-    return None, 0
+        return None, int(lead_str), False
+    return None, 0, False
 
 
 def _populate_sharded_data(
@@ -875,15 +909,15 @@ def _populate_sharded_data(
     lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
     lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
 
-    shards_by_var: dict[str, list[tuple[str, int | None, int]]] = {}
+    shards_by_var: dict[str, list[tuple[str, int | None, int, bool]]] = {}
     if is_s3 and fs is not None:
         try:
             for item in fs.find(root):
                 rel = item[len(root) + 1 :]
                 if rel.endswith(".shard") and "/" in rel:
                     vname, fname = rel.split("/", 1)
-                    member_val, lead_val = _parse_shard_filename(fname)
-                    shards_by_var.setdefault(vname, []).append((rel, member_val, lead_val))
+                    member_val, lead_val, is_mean_val = _parse_shard_filename(fname)
+                    shards_by_var.setdefault(vname, []).append((rel, member_val, lead_val, is_mean_val))
         except Exception:
             pass
     else:
@@ -892,9 +926,9 @@ def _populate_sharded_data(
             if os.path.isdir(var_dir):
                 for fname in os.listdir(var_dir):
                     if fname.endswith(".shard"):
-                        member_val, lead_val = _parse_shard_filename(fname)
+                        member_val, lead_val, is_mean_val = _parse_shard_filename(fname)
                         shards_by_var.setdefault(str(vname), []).append(
-                            (f"{vname}/{fname}", member_val, lead_val)
+                            (f"{vname}/{fname}", member_val, lead_val, is_mean_val)
                         )
 
     if not shards_by_var:
@@ -910,7 +944,12 @@ def _populate_sharded_data(
         has_member = "member" in dataset[var_name].dims
         has_lead = "lead_time_hours" in dataset[var_name].dims
 
-        for rel_key, member, lead in shard_keys:
+        for rel_key, member, lead, is_mean_shard in shard_keys:
+            if is_mean_shard:
+                # Official precomputed mean shards are stored alongside member shards
+                # and read via ShardedV1Reader(is_mean=True); they must not be populated
+                # into the multi-member dataset array.
+                continue
             if is_s3 and fs is not None:
                 try:
                     shard_bytes = fs.cat_file(f"{root}/{rel_key}")

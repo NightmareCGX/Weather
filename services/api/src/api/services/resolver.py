@@ -100,6 +100,7 @@ def resolve_valid_time_candidates(
     variable: str | None = None,
     start_lead_time_hours: int | None = None,
     end_lead_time_hours: int | None = None,
+    require_members: bool = False,
 ) -> dict[datetime, list[tuple[datetime, int, str, str]]]:
     """Discover all servable (cycle_time, lead_time_hours, run_id, store_path) candidates per valid_time.
 
@@ -117,6 +118,7 @@ def resolve_valid_time_candidates(
             ModelRun.cycle_time,
             ModelRun.zarr_store_path,
             ForecastProduct.lead_time_hours,
+            ForecastProduct.product_type,
         )
         .join(ModelRun.model_version)
         .join(ModelVersion.model)
@@ -149,7 +151,7 @@ def resolve_valid_time_candidates(
 
     candidates_by_valid: dict[datetime, set[tuple[datetime, int, str, str]]] = {}
 
-    for run_id, cycle_time, store_path, lead in rows:
+    for run_id, cycle_time, store_path, lead, prod_type in rows:
         if store_path is None:
             continue
         c_utc = _ensure_utc(cycle_time)
@@ -166,8 +168,10 @@ def resolve_valid_time_candidates(
         if target_valid_time is not None and v_time != _ensure_utc(target_valid_time):
             continue
 
-        # Check ensemble coverage if ensemble
-        if is_ensemble:
+        # Check ensemble coverage: required for member-based paths (require_members=True)
+        # or when the product is not an official precomputed ensemble mean (prod_type != "ensemble_mean").
+        needs_members = is_ensemble and (require_members or prod_type != "ensemble_mean")
+        if needs_members:
             count = emp_counts.get((str(run_id), lead_num), 0)
             if not is_lead_servable(count, expected_members):
                 continue
@@ -213,6 +217,17 @@ def resolve_valid_time_candidates(
             v_time = c_utc + timedelta(hours=lead_num)
             if target_valid_time is not None and v_time != _ensure_utc(target_valid_time):
                 continue
+            if is_ensemble and not require_members:
+                from api.core.zarr import get_sharded_reader
+
+                reader = get_sharded_reader(str(store_path))
+                probe_var = (
+                    "wind_u_10m"
+                    if variable in ("wind_10m", "wind_speed_10m")
+                    else (variable or "temperature_2m")
+                )
+                if not reader.has_mean_shard(probe_var, lead_num):
+                    continue
             candidates_by_valid.setdefault(v_time, set()).add(
                 (c_utc, lead_num, str(run_id), str(store_path))
             )
@@ -230,6 +245,7 @@ def resolve_valid_time_source(
     valid_time: datetime | str,
     *,
     variable: str | None = None,
+    require_members: bool = False,
 ) -> ResolvedForecastSource:
     """Resolve the single newest committed source cycle and lead for a valid_time.
 
@@ -238,6 +254,9 @@ def resolve_valid_time_source(
         model: Platform model identifier ('gfs', 'gefs').
         valid_time: Requested valid datetime or ISO 8601 string.
         variable: Optional variable code constraint.
+        require_members: When True (e.g. ensemble statistics), requires at least
+            85% member coverage for ensemble models. When False (e.g. maps or mean
+            products), requires only the published forecast product.
 
     Returns:
         ResolvedForecastSource with complete provenance.
@@ -255,6 +274,7 @@ def resolve_valid_time_source(
         m_id,
         target_valid_time=v_utc,
         variable=variable,
+        require_members=require_members,
     )
 
     pairs = candidates.get(v_utc)

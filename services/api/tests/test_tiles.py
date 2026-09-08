@@ -574,6 +574,8 @@ def test_sharded_v1_periodic_wrap():
         shard_file = store_dir / "temperature_2m" / "shard.mem001_L0000.shard"
         shard_file.parent.mkdir(parents=True, exist_ok=True)
         shard_file.write_bytes(t_shard)
+        shard_mean = store_dir / "temperature_2m" / "shard.mean_L0000.shard"
+        shard_mean.write_bytes(t_shard)
 
         ds_meta = xr.Dataset(
             data_vars={

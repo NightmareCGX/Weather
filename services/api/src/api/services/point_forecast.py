@@ -36,7 +36,10 @@ from domain.models.wind import (
     derive_meteorological_direction,
     get_cardinal_direction,
 )
-from domain.temporal import INTERVAL_LEAD0_FALLBACK_VARIABLES
+from domain.temporal import (
+    INTERVAL_LEAD0_FALLBACK_VARIABLES,
+    PRECIPITATION_COMPANION_VARIABLES,
+)
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -374,6 +377,7 @@ def build_point_forecast(
     db.close()
 
     forecasts: list[ForecastSeries] = []
+    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None, float | None]] = {}
     for valid_time, (cycle_time, lead) in sorted(resolved.items()):
         store_path = cycle_store_paths.get(cycle_time)
         if store_path is None:
@@ -389,9 +393,13 @@ def build_point_forecast(
         # to the exact same store, cycle, and lead as precipitation_amount_3h.
         precip_source: tuple[str, int] | None = None
         cloud_source: tuple[str, int] | None = None
+        precip_vars = tuple(
+            v for v in var_codes
+            if v == "precipitation_amount_3h" or v in PRECIPITATION_COMPANION_VARIABLES
+        )
 
         if lead == 0:
-            if "precipitation_amount_3h" in var_codes:
+            if precip_vars:
                 for p_cycle, p_lead in pairs:
                     if p_lead > 0:
                         p_meta = _open_cycle(p_cycle)
@@ -413,7 +421,10 @@ def build_point_forecast(
 
         anchor_vars = tuple(
             v for v in var_codes
-            if not (lead == 0 and v in INTERVAL_LEAD0_FALLBACK_VARIABLES)
+            if not (
+                lead == 0
+                and v in (INTERVAL_LEAD0_FALLBACK_VARIABLES | PRECIPITATION_COMPANION_VARIABLES)
+            )
         )
         values_by_var: dict[str, Any] = {}
         if anchor_vars:
@@ -423,27 +434,35 @@ def build_point_forecast(
                 lead=lead,
                 latitude=location.latitude,
                 longitude=location.longitude,
+                precip_history=precip_history,
             )
             if anchor_vals is None:
                 continue
             values_by_var.update(anchor_vals)
 
-        if lead == 0 and "precipitation_amount_3h" in var_codes:
+        if lead == 0 and precip_vars:
             if precip_source is not None:
                 p_store, p_lead = precip_source
                 p_vals = gated_point_interpolations(
                     p_store,
-                    var_codes=("precipitation_amount_3h",),
+                    var_codes=precip_vars,
                     lead=p_lead,
                     latitude=location.latitude,
                     longitude=location.longitude,
+                    precip_history=precip_history,
                 )
                 if p_vals is not None:
-                    values_by_var.update(p_vals)
+                    for v in precip_vars:
+                        values_by_var[v] = p_vals.get(v)
+                    for k, val in p_vals.items():
+                        if k.startswith("_") or k == "precipitation_type":
+                            values_by_var[k] = val
                 else:
-                    values_by_var["precipitation_amount_3h"] = None
+                    for v in precip_vars:
+                        values_by_var[v] = None
             else:
-                values_by_var["precipitation_amount_3h"] = None
+                for v in precip_vars:
+                    values_by_var[v] = None
 
         if lead == 0 and "cloud_cover_3h" in var_codes:
             if cloud_source is not None:
@@ -455,8 +474,8 @@ def build_point_forecast(
                     latitude=location.latitude,
                     longitude=location.longitude,
                 )
-                if c_vals is not None:
-                    values_by_var.update(c_vals)
+                if c_vals is not None and "cloud_cover_3h" in c_vals:
+                    values_by_var["cloud_cover_3h"] = c_vals["cloud_cover_3h"]
                 else:
                     values_by_var["cloud_cover_3h"] = None
             else:
@@ -523,10 +542,14 @@ def build_point_forecast(
                         entry["cloud_ceiling"] = round(converted, 1)
                         entry["cloud_ceiling_unlimited"] = False
             else:
-                value = float(values_by_var[var_code])
-                entry[var_code] = _convert_value(
-                    value, units_by_code[var_code], units, var_code=var_code
-                )
+                raw_val = values_by_var.get(var_code)
+                if raw_val is None or (isinstance(raw_val, float) and math.isnan(raw_val)):
+                    entry[var_code] = None
+                else:
+                    value = float(raw_val)
+                    entry[var_code] = _convert_value(
+                        value, units_by_code[var_code], units, var_code=var_code
+                    )
         forecasts.append(ForecastSeries(**entry))
 
     if not forecasts:
@@ -641,6 +664,7 @@ def gated_point_interpolations(
     lead: int,
     latitude: float,
     longitude: float,
+    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None, float | None]] | None = None,
 ) -> dict[str, Any] | None:
     """Interpolate every requested variable at a point/lead under the gate.
 
@@ -687,14 +711,6 @@ def gated_point_interpolations(
 
             out: dict[str, Any] = {}
             is_ensemble = "member" in dataset.coords or any("member" in dataset[v].dims for v in dataset.data_vars)
-            members_in_ds: list[int] = []
-            if is_ensemble:
-                if "member" in dataset.coords:
-                    members_in_ds = [
-                        int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)
-                    ]
-                else:
-                    members_in_ds = list(range(1, 31))
 
             for var_code in var_codes:
                 if var_code == "wind_10m":
@@ -703,36 +719,35 @@ def gated_point_interpolations(
                             status_code=404,
                             detail="Variable 'wind_10m' requires 'wind_u_10m' and 'wind_v_10m' in the forecast dataset.",
                         )
-                    has_members = "member" in dataset["wind_u_10m"].dims or is_ensemble
-                    if has_members and members_in_ds:
-                        u_vals = [
+                    if is_ensemble:
+                        if not reader.has_mean_shard("wind_u_10m", lead, generation=generation) or not reader.has_mean_shard("wind_v_10m", lead, generation=generation):
+                            raise FileNotFoundError(f"Missing official mean shard for wind_10m components at lead {lead}")
+                        u_val = float(
                             reader.interpolate_point(
                                 "wind_u_10m",
-                                member=m,
+                                member=None,
                                 lead_time_hours=lead,
                                 lat_idx=lat_idx,
                                 lon_idx=lon_idx,
                                 t_row=t_row,
                                 t_col=t_col,
                                 generation=generation,
+                                is_mean=True,
                             )
-                            for m in members_in_ds
-                        ]
-                        v_vals = [
+                        )
+                        v_val = float(
                             reader.interpolate_point(
                                 "wind_v_10m",
-                                member=m,
+                                member=None,
                                 lead_time_hours=lead,
                                 lat_idx=lat_idx,
                                 lon_idx=lon_idx,
                                 t_row=t_row,
                                 t_col=t_col,
                                 generation=generation,
+                                is_mean=True,
                             )
-                            for m in members_in_ds
-                        ]
-                        u_val = float(np.nanmean(u_vals))
-                        v_val = float(np.nanmean(v_vals))
+                        )
                     else:
                         u_val = float(
                             reader.interpolate_point(
@@ -775,126 +790,137 @@ def gated_point_interpolations(
                             status_code=404,
                             detail="Variable 'precipitation_amount_3h' is not available in the forecast dataset.",
                         )
-                    has_members = "member" in dataset["precipitation_amount_3h"].dims or is_ensemble
-                    if has_members and members_in_ds:
-                        amt_vals = [
+                    if is_ensemble:
+                        if not reader.has_mean_shard("precipitation_amount_3h", lead, generation=generation):
+                            raise FileNotFoundError(f"Missing official mean shard for precipitation_amount_3h at lead {lead}")
+                        amt_val = float(
                             reader.interpolate_point(
                                 "precipitation_amount_3h",
-                                member=m,
+                                member=None,
                                 lead_time_hours=lead,
                                 lat_idx=lat_idx,
                                 lon_idx=lon_idx,
                                 t_row=t_row,
                                 t_col=t_col,
                                 generation=generation,
+                                is_mean=True,
                             )
-                            for m in members_in_ds
-                        ]
-                        amt_val = float(np.nanmean(amt_vals))
+                        )
                         out["precipitation_amount_3h"] = amt_val
 
-                        flags_curr: dict[str, int] = {}
+                        flags_curr = {}
                         for f_code in ("crain", "csnow", "cfrzr", "cicep"):
                             if f_code in dataset.data_vars:
-                                f_vals = [
+                                if f_code in out:
+                                    f_val = out[f_code]
+                                else:
+                                    f_val = float(
+                                        reader.interpolate_point(
+                                            f_code,
+                                            member=None,
+                                            lead_time_hours=lead,
+                                            lat_idx=lat_idx,
+                                            lon_idx=lon_idx,
+                                            t_row=t_row,
+                                            t_col=t_col,
+                                            generation=generation,
+                                            is_mean=True,
+                                        )
+                                    )
+                                    if f_code in var_codes:
+                                        out[f_code] = f_val
+                                flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+
+                        t2m_val = None
+                        if "temperature_2m" in dataset.data_vars:
+                            if "temperature_2m" in out:
+                                t2m_val = out["temperature_2m"]
+                            else:
+                                t2m_val = float(
                                     reader.interpolate_point(
-                                        f_code,
-                                        member=m,
+                                        "temperature_2m",
+                                        member=None,
                                         lead_time_hours=lead,
                                         lat_idx=lat_idx,
                                         lon_idx=lon_idx,
                                         t_row=t_row,
                                         t_col=t_col,
                                         generation=generation,
+                                        is_mean=True,
                                     )
-                                    for m in members_in_ds
-                                ]
-                                f_val = float(np.nanmean(f_vals))
-                                flags_curr[f_code] = 1 if f_val >= 0.5 else 0
-
-                        t2m_val: float | None = None
-                        if "temperature_2m" in dataset.data_vars:
-                            t2m_vals = [
-                                reader.interpolate_point(
-                                    "temperature_2m",
-                                    member=m,
-                                    lead_time_hours=lead,
-                                    lat_idx=lat_idx,
-                                    lon_idx=lon_idx,
-                                    t_row=t_row,
-                                    t_col=t_col,
-                                    generation=generation,
                                 )
-                                for m in members_in_ds
-                            ]
-                            t2m_val = float(np.nanmean(t2m_vals))
+                                if "temperature_2m" in var_codes:
+                                    out["temperature_2m"] = t2m_val
 
-                        amt_prev: float | None = None
-                        flags_prev: dict[str, int] | None = None
-                        t2m_start: float | None = None
+                        amt_prev = None
+                        flags_prev = None
+                        t2m_start = None
 
                         if lead % 6 == 0 and lead > 0:
                             pred_lead = lead - 3
-                            leads_in_ds = (
-                                [
-                                    int(v)
-                                    for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
-                                ]
-                                if "lead_time_hours" in dataset.coords
-                                else []
-                            )
-                            if pred_lead in leads_in_ds:
-                                amt_prev_vals = [
-                                    reader.interpolate_point(
-                                        "precipitation_amount_3h",
-                                        member=m,
-                                        lead_time_hours=pred_lead,
-                                        lat_idx=lat_idx,
-                                        lon_idx=lon_idx,
-                                        t_row=t_row,
-                                        t_col=t_col,
-                                        generation=generation,
-                                    )
-                                    for m in members_in_ds
-                                ]
-                                amt_prev = float(np.nanmean(amt_prev_vals))
-
-                                f_prev: dict[str, int] = {}
-                                for f_code in ("crain", "csnow", "cfrzr", "cicep"):
-                                    if f_code in dataset.data_vars:
-                                        f_p_vals = [
-                                            reader.interpolate_point(
-                                                f_code,
-                                                member=m,
-                                                lead_time_hours=pred_lead,
-                                                lat_idx=lat_idx,
-                                                lon_idx=lon_idx,
-                                                t_row=t_row,
-                                                t_col=t_col,
-                                                generation=generation,
-                                            )
-                                            for m in members_in_ds
-                                        ]
-                                        f_p_val = float(np.nanmean(f_p_vals))
-                                        f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
-                                if f_prev:
-                                    flags_prev = f_prev
-
-                                if "temperature_2m" in dataset.data_vars:
-                                    t2m_start_vals = [
+                            cached_prev = precip_history.get((store_path, pred_lead)) if precip_history is not None else None
+                            if cached_prev is not None:
+                                amt_prev, flags_prev, t2m_start = cached_prev
+                            else:
+                                leads_in_ds = (
+                                    [
+                                        int(v)
+                                        for v in np.atleast_1d(dataset.coords["lead_time_hours"].values).reshape(-1)
+                                    ]
+                                    if "lead_time_hours" in dataset.coords
+                                    else []
+                                )
+                                if pred_lead in leads_in_ds:
+                                    amt_prev = float(
                                         reader.interpolate_point(
-                                            "temperature_2m",
-                                            member=m,
+                                            "precipitation_amount_3h",
+                                            member=None,
                                             lead_time_hours=pred_lead,
                                             lat_idx=lat_idx,
                                             lon_idx=lon_idx,
                                             t_row=t_row,
                                             t_col=t_col,
                                             generation=generation,
+                                            is_mean=True,
                                         )
-                                        for m in members_in_ds
-                                    ]
-                                    t2m_start = float(np.nanmean(t2m_start_vals))
+                                    )
+                                    f_prev = {}
+                                    for f_code in ("crain", "csnow", "cfrzr", "cicep"):
+                                        if f_code in dataset.data_vars:
+                                            f_p_val = float(
+                                                reader.interpolate_point(
+                                                    f_code,
+                                                    member=None,
+                                                    lead_time_hours=pred_lead,
+                                                    lat_idx=lat_idx,
+                                                    lon_idx=lon_idx,
+                                                    t_row=t_row,
+                                                    t_col=t_col,
+                                                    generation=generation,
+                                                    is_mean=True,
+                                                )
+                                            )
+                                            f_prev[f_code] = 1 if f_p_val >= 0.5 else 0
+                                    if f_prev:
+                                        flags_prev = f_prev
+
+                                    if "temperature_2m" in dataset.data_vars:
+                                        t2m_start = float(
+                                            reader.interpolate_point(
+                                                "temperature_2m",
+                                                member=None,
+                                                lead_time_hours=pred_lead,
+                                                lat_idx=lat_idx,
+                                                lon_idx=lon_idx,
+                                                t_row=t_row,
+                                                t_col=t_col,
+                                                generation=generation,
+                                                is_mean=True,
+                                            )
+                                        )
+
+                        if precip_history is not None:
+                            precip_history[(store_path, lead)] = (amt_val, flags_curr, t2m_val)
 
                         phase_state = classify_precipitation_phase(
                             amt_val,
@@ -941,6 +967,8 @@ def gated_point_interpolations(
                                     )
                                 )
                                 flags_curr[f_code] = 1 if f_val >= 0.5 else 0
+                                if f_code in var_codes:
+                                    out[f_code] = f_val
 
                         t2m_val = None
                         if "temperature_2m" in dataset.data_vars:
@@ -956,6 +984,8 @@ def gated_point_interpolations(
                                     generation=generation,
                                 )
                             )
+                            if "temperature_2m" in var_codes:
+                                out["temperature_2m"] = t2m_val
 
                         amt_prev = None
                         flags_prev = None
@@ -1032,36 +1062,31 @@ def gated_point_interpolations(
                         out["_precipitation_evidence"] = phase_state.evidence.value
                         continue
 
+                if var_code in out:
+                    continue
+
                 if var_code not in dataset.data_vars:
                     raise HTTPException(
                         status_code=404,
                         detail=f"Variable '{var_code}' is not available in the forecast dataset.",
                     )
 
-                if "member" in dataset[var_code].dims or (is_ensemble and members_in_ds):
-                    target_m = (
-                        members_in_ds
-                        if members_in_ds
-                        else (
-                            [int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)]
-                            if "member" in dataset.coords
-                            else list(range(1, 31))
-                        )
-                    )
-                    member_vals = [
+                if is_ensemble:
+                    if not reader.has_mean_shard(var_code, lead, generation=generation):
+                        raise FileNotFoundError(f"Missing official mean shard for {var_code} at lead {lead}")
+                    out[var_code] = float(
                         reader.interpolate_point(
                             var_code,
-                            member=m,
+                            member=None,
                             lead_time_hours=lead,
                             lat_idx=lat_idx,
                             lon_idx=lon_idx,
                             t_row=t_row,
                             t_col=t_col,
                             generation=generation,
+                            is_mean=True,
                         )
-                        for m in target_m
-                    ]
-                    out[var_code] = float(np.nanmean(member_vals))
+                    )
                 else:
                     out[var_code] = float(
                         reader.interpolate_point(
@@ -1151,6 +1176,8 @@ def gated_point_interpolations(
                             )
                         )
                         flags_curr_l[f_code] = 1 if f_val >= 0.5 else 0
+                        if f_code in var_codes:
+                            out_legacy[f_code] = f_val
 
                 # Optional t2m
                 t2m_val_l: float | None = None

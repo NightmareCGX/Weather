@@ -95,11 +95,14 @@ class WaveRegion:
     lead_time_hours: int
     member: int | None
     generation: str
+    is_mean: bool = False
 
     @property
     def region_id(self) -> str:
         return logical_region_encoding(
-            lead_time_hours=self.lead_time_hours, member=self.member
+            lead_time_hours=self.lead_time_hours,
+            member=self.member,
+            is_mean=self.is_mean,
         )
 
 
@@ -572,6 +575,7 @@ class RunCoordinator:
                         self.store_path,
                         lead_time_hours=r.lead_time_hours,
                         member=r.member,
+                        is_mean=r.is_mean,
                         payload={
                             "protocol_version": 1,
                             "state": "updating",
@@ -579,7 +583,9 @@ class RunCoordinator:
                             "logical_region": {
                                 "lead_time_hours": r.lead_time_hours,
                                 **(
-                                    {"member": r.member} if r.member is not None else {}
+                                    {"is_mean": True}
+                                    if r.is_mean
+                                    else ({"member": r.member} if r.member is not None else {})
                                 ),
                             },
                             "expected_write_set_fingerprint": "",
@@ -603,7 +609,8 @@ class RunCoordinator:
         member: int | None,
         generation: str,
         expected_leads: tuple[int, ...],
-        expected_members: tuple[int, ...],
+        expected_members: tuple[int, ...] = (),
+        is_mean: bool = False,
     ) -> None:
         """Write one region under the SHARED gate + region locks.
 
@@ -643,7 +650,7 @@ class RunCoordinator:
             co.acquire_region_locks(region_ids)
             try:
                 marker = read_region_marker(
-                    self.store_path, lead_time_hours=lead, member=member
+                    self.store_path, lead_time_hours=lead, member=member, is_mean=is_mean
                 )
                 if (
                     marker.get("state") != "updating"
@@ -681,6 +688,7 @@ class RunCoordinator:
                             expected_lead_time_hours=expected_leads,
                             expected_members=expected_members,
                             snapshot=snapshot,
+                            is_mean=is_mean,
                         )
                         # 2. Compute physical object inventory for COMPLETE marker from snapshot
                         expected_keys = region_expected_object_keys(
@@ -693,6 +701,7 @@ class RunCoordinator:
                             zarray_cache=snapshot.zarray_by_var,
                             zattrs_cache=snapshot.zattrs_by_var,
                             member_index_cache=snapshot.member_index_map,
+                            is_mean=is_mean,
                         )
                         existing_keys = verify_expected_object_keys(
                             self.store_path,
@@ -712,13 +721,14 @@ class RunCoordinator:
                             self.store_path,
                             lead_time_hours=lead,
                             member=member,
+                            is_mean=is_mean,
                             payload={
                                 "protocol_version": 1,
                                 "state": "complete",
                                 "generation": generation,
                                 "logical_region": {
                                     "lead_time_hours": lead,
-                                    **({"member": member} if member is not None else {}),
+                                    **({"is_mean": True} if is_mean else ({"member": member} if member is not None else {})),
                                 },
                                 "expected_write_set_fingerprint": expected_write_set_fingerprint(
                                     required, omitted
@@ -1283,6 +1293,7 @@ class RunCoordinator:
                 zarray_cache=zarray_cache,
                 zattrs_cache=zattrs_cache,
                 member_index_cache=member_index_cache,
+                is_mean=is_mean_region_id(region_id),
             )
             validate_marker_evidence(
                 self.store_path,
@@ -1315,17 +1326,24 @@ class RunCoordinator:
         # partial when an expected region is not committed).
         leads: set[int] = set()
         pairs: set[tuple[int, int]] = set()
+        mean_leads: set[int] = set()
         for region_id in committed:
-            member, lead = _parse_region_id(region_id)
-            leads.add(lead)
-            if member is not None:
-                pairs.add((member, lead))
+            if is_mean_region_id(region_id):
+                _, lead = _parse_region_id(region_id)
+                mean_leads.add(lead)
+            else:
+                member, lead = _parse_region_id(region_id)
+                leads.add(lead)
+                if member is not None:
+                    pairs.add((member, lead))
         # The store's real variable set (used for catalog ↔ store variable
         # honesty during reconciliation). Read once from the store's schema.
         store_vars = set(_store_data_var_paths(self.store_path, snapshot=self._snapshot))
         if self.spec.is_ensemble:
             members = {m for m, _ in pairs}
-            return CommittedState.ensemble(pairs, members, variables=store_vars)
+            return CommittedState.ensemble(
+                pairs, members, variables=store_vars, mean_leads=mean_leads
+            )
         return CommittedState.deterministic(leads, variables=store_vars)
 
 
@@ -1553,9 +1571,12 @@ def _region_serving_states(
 
 
 def _parse_region_id(region_id: str) -> tuple[int | None, int]:
-    """Parse a logical region id (``det_L0006`` / ``mem017_L0006``)."""
+    """Parse a logical region id (``det_L0006`` / ``mem017_L0006`` / ``mean_L0006``)."""
     if region_id.startswith("det_"):
         lead = int(region_id[len("det_L") :])
+        return None, lead
+    if region_id.startswith("mean_"):
+        lead = int(region_id[len("mean_L") :])
         return None, lead
     if region_id.startswith("mem"):
         _, _, rest = region_id.partition("_L")
@@ -1563,3 +1584,8 @@ def _parse_region_id(region_id: str) -> tuple[int | None, int]:
         lead = int(rest)
         return member, lead
     raise ValueError(f"cannot parse region id {region_id!r}")
+
+
+def is_mean_region_id(region_id: str) -> bool:
+    """Return True if the logical region id represents an official mean product."""
+    return region_id.startswith("mean_")
