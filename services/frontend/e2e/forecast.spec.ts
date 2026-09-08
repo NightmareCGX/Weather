@@ -697,3 +697,112 @@ test("Lifecycle V2 user flow: select model, variable, and valid time updates map
     page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
   ).toBeVisible();
 });
+
+test("forecast panel close: clicking Close (X) deselects location, removes panel and marker, restores full map area", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // Location selected: Hourly Forecast is visible and marker is rendered on map
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+
+  // Click Close (X) button
+  const closeBtn = page.getByRole("button", { name: "Close forecast panel" });
+  await expect(closeBtn).toBeVisible();
+  await closeBtn.click();
+
+  // Sidebar and marker are both removed
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
+
+  // Map remains fully visible
+  await expect(page.getByTestId("weather-map")).toBeVisible();
+});
+
+test("forecast panel collapse and expand: toggle collapses panel and preserves marker/data, expand restores dashboard", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+
+  // Measure map width before collapse
+  const mapBefore = await page.getByTestId("weather-map").boundingBox();
+  expect(mapBefore).not.toBeNull();
+
+  // Click Collapse control
+  const collapseBtn = page.getByRole("button", { name: "Collapse forecast panel" });
+  await expect(collapseBtn).toBeVisible();
+  await expect(collapseBtn).toHaveAttribute("aria-expanded", "true");
+  await collapseBtn.click();
+
+  // Forecast content is hidden, but marker remains visible
+  await expect(page.locator("#forecast-panel-content")).toHaveClass(/hidden/);
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+
+  // Map recovers full width
+  const mapCollapsed = await page.getByTestId("weather-map").boundingBox();
+  expect(mapCollapsed).not.toBeNull();
+  expect(mapCollapsed!.width).toBeGreaterThan(mapBefore!.width);
+
+  // Expand button is visible
+  const expandBtn = page.getByRole("button", { name: "Expand forecast panel" });
+  await expect(expandBtn).toBeVisible();
+  await expect(expandBtn).toHaveAttribute("aria-expanded", "false");
+
+  // Click Expand
+  await expandBtn.click();
+
+  // Forecast dashboard returns with same location and marker
+  await expect(page.locator("#forecast-panel-content")).not.toHaveClass(/hidden/);
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+});
+
+test("mobile viewport: collapse restores map view with marker, expand restores forecast, close clears selection", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.goto("/");
+
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+
+  // On mobile, collapse reveals the map
+  const collapseBtn = page.getByRole("button", { name: "Collapse forecast panel" });
+  await expect(collapseBtn).toBeVisible();
+  await collapseBtn.click();
+
+  await expect(page.locator("#forecast-panel-content")).toHaveClass(/hidden/);
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+
+  // Tap Expand
+  const expandBtn = page.getByRole("button", { name: "Expand forecast panel" });
+  await expect(expandBtn).toBeVisible();
+  await expandBtn.click();
+
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+
+  // Tap Close (X)
+  const closeBtn = page.getByRole("button", { name: "Close forecast panel" });
+  await expect(closeBtn).toBeVisible();
+  await closeBtn.click();
+
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
+});

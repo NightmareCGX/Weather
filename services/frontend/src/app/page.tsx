@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import dynamic from "next/dynamic";
 
 import { Header } from "@/components/layout/Header";
@@ -10,6 +11,7 @@ import { ForecastDashboard } from "@/components/forecast/ForecastDashboard";
 import { useForecastSelection } from "@/context/forecast-selection";
 import { useSelectedLocation } from "@/context/selected-location";
 import { useMapLayer } from "@/hooks/useMapLayer";
+import type { SelectedLocation } from "@/lib/api/types";
 
 const WeatherMap = dynamic(() => import("@/components/map/WeatherMap").then((m) => m.WeatherMap), {
   ssr: false,
@@ -27,7 +29,18 @@ const WeatherMap = dynamic(() => import("@/components/map/WeatherMap").then((m) 
 export default function HomePage() {
   const { validTime, options } = useForecastSelection();
   const { layer, loading, error } = useMapLayer();
-  const { selectedLocation, selectLocation } = useSelectedLocation();
+  const { selectedLocation, selectLocation, clearSelection } = useSelectedLocation();
+  const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
+
+  const handleSelectLocation = (location: SelectedLocation) => {
+    selectLocation(location);
+    setIsPanelCollapsed(false);
+  };
+
+  const handleCloseForecastPanel = () => {
+    clearSelection();
+    setIsPanelCollapsed(false);
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -37,7 +50,7 @@ export default function HomePage() {
       <div className="flex min-h-0 flex-1">
         <main className="relative min-w-0 flex-1">
           <div className="absolute left-4 top-4 z-20 w-72 max-w-[calc(100%-2rem)]">
-            <LocationSearch onSelect={selectLocation} />
+            <LocationSearch onSelect={handleSelectLocation} />
           </div>
 
           {error !== null && (
@@ -59,7 +72,7 @@ export default function HomePage() {
               selectedLocation={selectedLocation}
               validTime={validTime}
               availableLeads={options.leadTimes}
-              onSelect={selectLocation}
+              onSelect={handleSelectLocation}
             />
           )}
 
@@ -67,8 +80,49 @@ export default function HomePage() {
         </main>
 
         {selectedLocation !== null && (
-          <aside className="w-96 max-w-full shrink-0 border-l border-slate-200 bg-white lg:w-[26rem]">
-            <ForecastDashboard location={selectedLocation} />
+          <aside
+            id="forecast-panel"
+            aria-label="Forecast panel"
+            className={
+              isPanelCollapsed
+                ? "relative w-0 shrink-0 bg-white"
+                : "relative w-96 max-w-[calc(100%-2rem)] shrink-0 border-l border-slate-200 bg-white lg:w-[26rem]"
+            }
+          >
+            <button
+              type="button"
+              aria-label={isPanelCollapsed ? "Expand forecast panel" : "Collapse forecast panel"}
+              aria-expanded={!isPanelCollapsed}
+              aria-controls="forecast-panel-content"
+              title={isPanelCollapsed ? "Expand forecast panel" : "Collapse forecast panel"}
+              onClick={() => setIsPanelCollapsed((prev) => !prev)}
+              className="absolute -left-7 top-1/2 z-20 flex h-11 w-7 -translate-y-1/2 items-center justify-center rounded-l-md border border-r-0 border-slate-300 bg-white text-slate-500 shadow-sm hover:bg-slate-50 hover:text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+            >
+              <svg
+                className="h-4 w-4"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+                focusable="false"
+              >
+                {isPanelCollapsed ? (
+                  <polyline points="15 18 9 12 15 6" />
+                ) : (
+                  <polyline points="9 18 15 12 9 6" />
+                )}
+              </svg>
+            </button>
+
+            <div
+              id="forecast-panel-content"
+              className={isPanelCollapsed ? "hidden" : "flex h-full flex-col"}
+            >
+              <ForecastDashboard location={selectedLocation} onClose={handleCloseForecastPanel} />
+            </div>
           </aside>
         )}
       </div>

@@ -19,6 +19,7 @@ import type { SelectedLocation } from "@/lib/api/types";
 
 interface ForecastDashboardProps {
   location: SelectedLocation;
+  onClose?: () => void;
 }
 
 /**
@@ -42,7 +43,7 @@ interface ForecastDashboardProps {
  * nothing is hard-coded. A failed secondary panel degrades in place without
  * destroying the core point forecast.
  */
-export function ForecastDashboard({ location }: ForecastDashboardProps) {
+export function ForecastDashboard({ location, onClose }: ForecastDashboardProps) {
   const { selection, options } = useForecastSelection();
   const selectedModel = selection?.model ?? null;
   const selectedModelIsEnsemble = options.model?.is_ensemble ?? false;
@@ -105,7 +106,7 @@ export function ForecastDashboard({ location }: ForecastDashboardProps) {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <SelectedLocationSummary location={location} />
+      <SelectedLocationSummary location={location} onClose={onClose} />
 
       <section aria-label="Point forecast" className="border-b border-slate-200 px-4 py-4">
         <h3 className="mb-2 text-sm font-semibold text-slate-900">Hourly Forecast</h3>
