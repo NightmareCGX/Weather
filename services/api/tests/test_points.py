@@ -80,7 +80,7 @@ def test_point_city_id_resolution(client):
     assert data["location"]["resolved_via"] == "city"
     assert abs(data["location"]["latitude"] - 38.19) < 1e-6
     assert abs(data["location"]["longitude"] - -106.82) < 1e-6
-    assert data["location"]["elevation_m"] is None
+    assert data["location"]["elevation_m"] == 2405.0
 
 
 def test_point_resort_id_resolution(client):

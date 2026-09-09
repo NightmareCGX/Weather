@@ -1,56 +1,71 @@
-"""Elevation resolution from coordinates (ACCEPTANCE_REMEDIATION_PLAN §15-17).
+"""Elevation resolution from coordinates (Tier 2 Dynamic Coordinates Architecture).
 
-The Coordinates UI must show a terrain elevation in meters for a resolved
-location, sourced from an authoritative terrain dataset — never guessed from
-forecast variables. This module provides the provider abstraction:
+The platform displays terrain elevation in meters for resolved locations as UI
+metadata only. Elevation never participates in forecast interpolation, lapse-rate
+correction, ingestion, or verification.
+
+This module provides the provider abstraction and popularity-aware caching:
 
 * :class:`ElevationProvider` is the application-level interface
   (``get_elevation(lat, lon) -> float | None``);
-* :class:`DEMElevationProvider` reads a local/server-side DEM (a global
-  xarray-readable store: Zarr or NetCDF, matching the platform's own storage
-  convention) with bilinear interpolation — no external network call and no
-  runtime dependency beyond xarray;
-* :class:`GoogleElevationProvider` is the network-API alternative behind the
-  same interface (kept for future/fallback; **not** the initial implementation);
-* :class:`RoundedElevationCache` wraps a provider with a deterministic
-  coordinate-normalization LRU, since elevation is effectively static per
-  coordinate.
+* :class:`OpenMeteoElevationProvider` queries the Open-Meteo Elevation API
+  (backed by Copernicus GLO-90 90m DEM) with bounded timeouts and graceful
+  failure fallback (returns ``None`` on failure, never raises);
+* :class:`_NullProvider` always returns ``None`` (safe offline default);
+* :class:`PopularityDecayingElevationCache` wraps a provider with a strictly
+  bounded, popularity-aware segmented cache (probationary window + protected
+  frequent segment with periodic frequency decay).
 
 Design notes:
 
-* **No-data / ocean**: ``get_elevation`` returns ``None`` for no-data cells
-  (NaN) and ocean, never ``0`` and never a guessed value. The UI renders
-  ``unavailable`` for ``None``.
-* **Interpolation**: bilinear via ``xarray.DataArray.interp`` when the DEM has
-  a regular grid; falls back to nearest-cell for single-cell stores.
-* **Caching**: coordinates are rounded to 3 decimal degrees (~100 m at the
-  equator), which does not materially degrade a city-level display, so nearby
-  clicks share a cache entry deterministically.
-* **Testability**: tests inject a tiny synthetic DEM and/or a fake provider; no
-  live Copernicus/SRTM download is ever required.
+* **UI-only & Non-blocking**: Elevation failure produces ``None`` (rendered as
+  ``unavailable`` by the frontend). It never blocks or fails forecast rendering.
+* **Coordinate Quantization**: Coordinates are quantized to 3 decimal degrees
+  (:data:`CACHE_LAT_ROUND`, :data:`CACHE_LON_ROUND`), an application-level
+  spatial bucketing (~100 m scale at the equator) for UI metadata reuse. It does
+  not represent native DEM raster grid cells.
+* **Cache Semantics**:
+  * popular + recent -> retained in protected segment;
+  * popular + quiet -> protected until frequency decays;
+  * rare + recent -> admitted to probationary window;
+  * rare + old -> evicted first from probationary window;
+  * random one-off clicks cannot trivially flush popular terrain.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import threading
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-import numpy.typing as npt
-import xarray as xr
-
 from api.core.config import settings
-from api.core.zarr import read_dataset
 
-#: Coordinate rounding precision (decimal degrees) used for the elevation cache.
-#: 3 decimals ≈ ~100 m at the equator — safe for a city-level display while
-#: ensuring nearby clicks reuse the same cached elevation.
+logger = logging.getLogger(__name__)
+
+#: Application-level coordinate quantization (decimal degrees) for the cache key.
+#: ~0.001 deg is ~111 m lat and ~70-111 m lon depending on latitude. This is an
+#: application-level spatial quantization for UI metadata reuse, NOT a native
+#: raster cell identity.
 CACHE_LAT_ROUND = 3
 CACHE_LON_ROUND = 3
-#: Default LRU cache size.
-DEFAULT_CACHE_MAX = 4096
+
+#: Default maximum entries in the dynamic coordinate cache.
+#: At ~250 bytes per entry, 10,000 entries consumes ~2.5 MB (well under 100 MB).
+DEFAULT_CACHE_MAX = 10000
+
+#: Fraction of cache reserved for the probationary admission window.
+PROBATION_RATIO = 0.20
+
+#: Number of cache lookups between periodic frequency decay cycles.
+DEFAULT_DECAY_INTERVAL = 1000
 
 
 class ElevationProvider(ABC):
@@ -58,8 +73,8 @@ class ElevationProvider(ABC):
 
     Implementations return the terrain elevation in meters for a WGS84
     coordinate, or ``None`` when no terrain value is available (ocean,
-    no-data, coverage boundary, or lookup failure). Never raises for a
-    missing value; ``None`` is the "unavailable" signal the UI renders.
+    no-data, coverage boundary, provider failure, or disabled). Never raises
+    exceptions to callers; ``None`` is the standard 'unavailable' signal.
     """
 
     @abstractmethod
@@ -67,307 +82,355 @@ class ElevationProvider(ABC):
         """Return the terrain elevation in meters, or ``None`` if unavailable.
 
         Args:
-            latitude: WGS 84 latitude in decimal degrees.
-            longitude: WGS 84 longitude in decimal degrees.
+            latitude: WGS 84 latitude in decimal degrees [-90.0, 90.0].
+            longitude: WGS 84 longitude in decimal degrees [-180.0, 180.0].
         """
 
 
-class DEMElevationProvider(ElevationProvider):
-    """Local/server-side DEM elevation provider (initial implementation).
+class OpenMeteoElevationProvider(ElevationProvider):
+    """Open-Meteo Elevation API provider (Copernicus DEM 2021 GLO-90, 90m).
 
-    Reads a global DEM from an xarray-readable store (Zarr or NetCDF) — the
-    platform's own storage convention — with ``latitude``/``longitude``
-    coordinates and an ``elevation`` data variable in meters. The DEM can be a
-    local directory (``/data/dem/global_30m.zarr``) or an ``s3://`` URL.
-    Bilinear interpolation is used on the regular grid; a no-data/ocean cell
-    (NaN) yields ``None``.
-
-    The store is opened lazily and cached so repeated lookups do not re-read
-    the DEM metadata from disk/object storage on every call.
-    """
-
-    def __init__(
-        self,
-        dem_path: str | None = None,
-        *,
-        dataset_loader: Callable[[str], xr.Dataset] = read_dataset,
-    ) -> None:
-        """Create the DEM provider.
-
-        Args:
-            dem_path: Path/URL of the DEM store. Defaults to
-                ``settings.DEM_DATA_PATH``; when unset the provider always
-                returns ``None`` (elevation unavailable), so the product runs
-                without a DEM configured.
-            dataset_loader: Injectable store reader for tests (defaults to the
-                API Zarr reader).
-        """
-        self._dem_path = dem_path if dem_path is not None else settings.DEM_DATA_PATH
-        self._dataset_loader = dataset_loader
-        self._dataset: xr.Dataset | None = None
-
-    def get_elevation(self, latitude: float, longitude: float) -> float | None:
-        if self._dem_path is None:
-            return None
-        dataset = self._dataset
-        if dataset is None:
-            try:
-                dataset = self._dataset_loader(self._dem_path)
-            except Exception:  # noqa: BLE001 - a missing/corrupt DEM means "unavailable"
-                return None
-            self._dataset = dataset
-        if "elevation" not in dataset.data_vars:
-            return None
-        elevation = dataset["elevation"]
-        try:
-            value = _bilinear_interp(
-                elevation,
-                latitude,
-                longitude,
-            )
-        except _OutOfGridError:
-            return None
-        if value is None or not np.isfinite(value):
-            return None
-        return value
-
-
-class _OutOfGridError(Exception):
-    """Raised when a coordinate is outside the DEM's grid."""
-
-
-def _bilinear_interp(
-    elevation: xr.DataArray,
-    latitude: float,
-    longitude: float,
-) -> float | None:
-    """Bilinear interpolation of a 2-D ``(latitude, longitude)`` field.
-
-    Implemented with NumPy only (xarray's ``interp`` requires scipy, which is
-    not a dependency). Handles either latitude ordering and clamps to the grid
-    edges (nearest at the boundary). Returns ``None`` when a corner cell is
-    NaN (no-data/ocean), so interpolation never fabricates a value across a
-    data gap.
-
-    Raises:
-        _OutOfGridError: If the coordinate is outside the DEM grid.
-    """
-    if elevation.ndim < 2:
-        raise _OutOfGridError("DEM elevation field is not 2-D")
-    lat_axis = np.asarray(elevation.coords["latitude"].values, dtype=float)
-    lon_axis = np.asarray(elevation.coords["longitude"].values, dtype=float)
-    if len(lat_axis) < 2 or len(lon_axis) < 2:
-        raise _OutOfGridError("DEM grid is degenerate")
-    lat_asc = lat_axis[0] <= lat_axis[-1]
-    lon_asc = lon_axis[0] <= lon_axis[-1]
-    lat_axis = np.sort(lat_axis)
-    lon_axis = np.sort(lon_axis)
-    if not (lat_axis[0] <= latitude <= lat_axis[-1] and lon_axis[0] <= longitude <= lon_axis[-1]):
-        raise _OutOfGridError("Coordinate outside DEM grid")
-
-    li = _lower_index(lat_axis, latitude)
-    ri = _lower_index(lon_axis, longitude)
-    # Indices into the *sorted* axes; map back to the stored axis orientation.
-    def _store_idx(axis_sorted_idx: int, is_asc: bool, axis_len: int) -> int:
-        return axis_sorted_idx if is_asc else (axis_len - 1 - axis_sorted_idx)
-
-    lat_lo_sorted = li
-    lon_lo_sorted = ri
-    lat_hi_sorted = min(li + 1, len(lat_axis) - 1)
-    lon_hi_sorted = min(ri + 1, len(lon_axis) - 1)
-    i00 = _store_idx(lat_lo_sorted, lat_asc, len(lat_axis))
-    i10 = _store_idx(lat_hi_sorted, lat_asc, len(lat_axis))
-    j00 = _store_idx(lon_lo_sorted, lon_asc, len(lon_axis))
-    j10 = _store_idx(lon_hi_sorted, lon_asc, len(lon_axis))
-    f00 = float(elevation.values[i00, j00])
-    f01 = float(elevation.values[i00, j10])
-    f10 = float(elevation.values[i10, j00])
-    f11 = float(elevation.values[i10, j10])
-    if not all(np.isfinite(v) for v in (f00, f01, f10, f11)):
-        return None
-    # ``np.ndarray.__getitem__`` is typed ``Any`` in numpy 1.26 stubs, so the
-    # numpy scalars read here would propagate ``Any`` through ``wx``/``wy`` and
-    # into the return, tripping ``no-any-return`` under mypy 1.9.0 (CI). The
-    # runtime values are always real scalars, so normalizing them to Python
-    # ``float`` at this boundary is the semantically-correct fix (not a
-    # suppression): the interpolation weights are genuinely floats.
-    lat_lo = float(lat_axis[lat_lo_sorted])
-    lat_hi = float(lat_axis[lat_hi_sorted])
-    lon_lo = float(lon_axis[lon_lo_sorted])
-    lon_hi = float(lon_axis[lon_hi_sorted])
-    wx = (latitude - lat_lo) / (lat_hi - lat_lo) if lat_hi > lat_lo else 0.0
-    wy = (longitude - lon_lo) / (lon_hi - lon_lo) if lon_hi > lon_lo else 0.0
-    top = f00 * (1 - wy) + f01 * wy
-    bottom = f10 * (1 - wy) + f11 * wy
-    return top * (1 - wx) + bottom * wx
-
-
-def _lower_index(axis: npt.NDArray[np.float64], value: float) -> int:
-    """Return the index of the largest axis element <= ``value`` (clamped)."""
-    pos = int(np.searchsorted(axis, value, side="right"))
-    return max(0, min(pos - 1, len(axis) - 1))
-
-
-class GoogleElevationProvider(ElevationProvider):
-    """Google Elevation API provider (alternative, not the initial choice).
-
-    The plan recommends the local DEM as primary; Google Elevation is kept
-    behind the same interface for future/fallback. Its ToS restricts caching,
-    so it is not the default. The API key lives server-side.
+    Queries the Open-Meteo elevation endpoint via HTTP GET with bounded timeouts.
+    If an API key is configured (commercial tier), it is appended as query param.
+    All network, HTTP, timeout, or parsing failures are caught and return ``None``.
     """
 
     def __init__(
         self,
         *,
+        base_url: str | None = None,
         api_key: str | None = None,
+        timeout: float | None = None,
         transport: Callable[[str], tuple[int, Any]] | None = None,
     ) -> None:
-        self._api_key = api_key if api_key is not None else settings.GOOGLE_PLACES_API_KEY
+        """Initialize the Open-Meteo elevation provider.
+
+        Args:
+            base_url: Base endpoint URL (defaults to ``settings.ELEVATION_BASE_URL``).
+            api_key: Optional API key for commercial plans.
+            timeout: Socket timeout in seconds (defaults to ``settings.ELEVATION_TIMEOUT_SECONDS``).
+            transport: Injectable transport for unit testing (returns ``(status_code, json_dict)``).
+        """
+        self._base_url = (
+            base_url if base_url is not None else str(settings.ELEVATION_BASE_URL)
+        )
+        self._api_key = (
+            api_key if api_key is not None else str(settings.ELEVATION_API_KEY)
+        )
+        self._timeout = (
+            float(timeout)
+            if timeout is not None
+            else float(settings.ELEVATION_TIMEOUT_SECONDS)
+        )
         self._transport = transport
 
     def get_elevation(self, latitude: float, longitude: float) -> float | None:
-        if not self._api_key:
-            return None
-        url = (
-            "https://maps.googleapis.com/maps/api/elevation/json"
-            f"?locations={latitude},{longitude}&key={self._api_key}"
-        )
-        status, payload = self._transport(url) if self._transport else _http_get(url)
-        if status != 200:
-            return None
-        results = payload.get("results") or []
-        if not results:
-            return None
+        """Resolve terrain elevation via Open-Meteo Elevation API."""
+        global _METRICS
+        _METRICS.provider_requests_total += 1
+
+        url = f"{self._base_url}?latitude={latitude}&longitude={longitude}"
+        if self._api_key:
+            url += f"&apikey={self._api_key}"
+
         try:
-            return float(results[0]["elevation"])
-        except (KeyError, TypeError, ValueError):
+            if self._transport is not None:
+                status, payload = self._transport(url)
+            else:
+                status, payload = _http_get_json(url, timeout=self._timeout)
+        except TimeoutError:
+            _METRICS.provider_timeouts_total += 1
+            _METRICS.provider_failures_total += 1
+            logger.warning(
+                "Open-Meteo elevation request timed out for (%f, %f)",
+                latitude,
+                longitude,
+            )
+            return None
+        except Exception as exc:
+            _METRICS.provider_failures_total += 1
+            logger.warning(
+                "Open-Meteo elevation request failed for (%f, %f): %s",
+                latitude,
+                longitude,
+                exc,
+            )
+            return None
+
+        if status != 200:
+            _METRICS.provider_failures_total += 1
+            logger.warning(
+                "Open-Meteo elevation returned HTTP %d for (%f, %f)",
+                status,
+                latitude,
+                longitude,
+            )
+            return None
+
+        if not isinstance(payload, dict):
+            _METRICS.provider_failures_total += 1
+            return None
+
+        elevations = payload.get("elevation")
+        if not isinstance(elevations, list) or len(elevations) == 0:
+            _METRICS.provider_failures_total += 1
+            return None
+
+        raw_val = elevations[0]
+        if raw_val is None:
+            return None
+
+        try:
+            val_float = float(raw_val)
+            if math.isnan(val_float) or math.isinf(val_float):
+                return None
+            return val_float
+        except (TypeError, ValueError):
+            _METRICS.provider_failures_total += 1
             return None
 
 
-def _http_get(url: str) -> tuple[int, Any]:
-    """Standard-library GET returning ``(status, json)``."""
-    import json as _json
-    import urllib.error
-    import urllib.request
-
+def _http_get_json(url: str, timeout: float) -> tuple[int, Any]:
+    """Perform standard-library HTTP GET returning (status_code, parsed_json)."""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "WeatherPlatform-Elevation/1.0", "Accept": "application/json"},
+    )
     try:
-        with urllib.request.urlopen(url, timeout=settings.GOOGLE_PLACES_TIMEOUT) as resp:
-            return resp.status, _json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return resp.status, json.loads(body)
     except urllib.error.HTTPError as exc:
         return exc.code, {}
-    except urllib.error.URLError:
-        return 0, {}
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise TimeoutError from exc
+        raise
 
 
-class RoundedElevationCache(ElevationProvider):
-    """Deterministic LRU elevation cache keyed on rounded coordinates.
+class _NullProvider(ElevationProvider):
+    """Elevation provider that always returns unavailable (safe default)."""
 
-    Elevation is effectively static per coordinate, so rounding lat/lon to
-    :data:`CACHE_LAT_ROUND`/``CACHE_LON_ROUND`` decimal degrees (~100 m) lets
-    nearby clicks reuse the same cached elevation without materially degrading
-    accuracy. The same normalized coordinate always yields the same cached
-    value; provider failures never poison the cache (only ``None`` results are
-    cached, and a ``None`` is indistinguishable from "unavailable", which is
-    also deterministic for a coordinate).
+    def get_elevation(self, latitude: float, longitude: float) -> float | None:
+        return None
+
+
+@dataclass
+class _CacheEntry:
+    """Internal cache entry with elevation value and popularity/recency metadata."""
+
+    elevation: float | None
+    frequency: int
+    last_access: int
+
+
+class PopularityDecayingElevationCache(ElevationProvider):
+    """Bounded, popularity-aware segmented cache with periodic frequency decay.
+
+    Architecture:
+    * **Probationary Segment (20%)**: New entries enter here upon first access.
+      One-off exploratory clicks cycle through probation and are evicted first
+      without disturbing the protected popular entries.
+    * **Protected Segment (80%)**: Entries hit more than once are promoted to
+      the protected segment.
+    * **Aging / Decay**: Every :data:`decay_interval` accesses, all stored
+      frequency counters are halved (``freq = max(1, freq // 2)``). This ensures
+      stale historical popularity decays so old hot entries do not persist indefinitely.
+    * **Coordinate Quantization**: Keys are normalized to :data:`CACHE_LAT_ROUND`
+      and :data:`CACHE_LON_ROUND` decimal degrees (~100 m scale).
+    * **Memory Bound**: Strictly bounded to ``max_entries`` (<= 100 MB guaranteed).
     """
 
     def __init__(
         self,
         provider: ElevationProvider,
         max_entries: int = DEFAULT_CACHE_MAX,
+        decay_interval: int = DEFAULT_DECAY_INTERVAL,
     ) -> None:
+        if max_entries < 10:
+            max_entries = 10
         self._provider = provider
         self._max_entries = max_entries
-        self._cache: dict[tuple[int, int], float | None] = {}
-        self._order: list[tuple[int, int]] = []
-        # The cache is now a process-level singleton shared across concurrent
-        # requests; guard mutations with a lock so recency reordering and
-        # eviction never race.
+        self._probation_cap = max(2, int(max_entries * PROBATION_RATIO))
+        self._protected_cap = max(2, max_entries - self._probation_cap)
+        self._decay_interval = decay_interval
+
+        # Ordered mappings for LRU order within segments
+        self._probationary: OrderedDict[tuple[int, int], _CacheEntry] = OrderedDict()
+        self._protected: OrderedDict[tuple[int, int], _CacheEntry] = OrderedDict()
+
+        self._access_counter = 0
         self._lock = threading.Lock()
 
     @staticmethod
     def _normalize(latitude: float, longitude: float) -> tuple[int, int]:
-        """Round coordinates to the cache precision (deterministic keys)."""
-        lat_key = round(latitude, CACHE_LAT_ROUND) * (10 ** CACHE_LAT_ROUND)
-        lon_key = round(longitude, CACHE_LON_ROUND) * (10 ** CACHE_LON_ROUND)
-        return int(lat_key), int(lon_key)
+        """Quantize coordinates to integer keys (~100 m application bucketing)."""
+        lat_key = int(round(latitude, CACHE_LAT_ROUND) * (10**CACHE_LAT_ROUND))
+        lon_key = int(round(longitude, CACHE_LON_ROUND) * (10**CACHE_LON_ROUND))
+        return lat_key, lon_key
+
+    def _decay_frequencies(self) -> None:
+        """Halve frequency counters across all cached entries (aging)."""
+        for entry in self._probationary.values():
+            entry.frequency = max(1, entry.frequency // 2)
+        for entry in self._protected.values():
+            entry.frequency = max(1, entry.frequency // 2)
 
     def get_elevation(self, latitude: float, longitude: float) -> float | None:
+        global _METRICS
         key = self._normalize(latitude, longitude)
+
         with self._lock:
-            if key in self._cache:
-                # Refresh recency (move to end).
-                self._order.remove(key)
-                self._order.append(key)
-                return self._cache[key]
-            value = self._provider.get_elevation(latitude, longitude)
-            self._cache[key] = value
-            self._order.append(key)
-            if len(self._order) > self._max_entries:
-                oldest = self._order.pop(0)
-                self._cache.pop(oldest, None)
-            return value
+            self._access_counter += 1
+            _METRICS.elevation_requests_total += 1
+
+            if self._access_counter % self._decay_interval == 0:
+                self._decay_frequencies()
+
+            # 1. Check Protected Segment
+            if key in self._protected:
+                _METRICS.elevation_cache_hits_total += 1
+                entry = self._protected[key]
+                entry.frequency += 1
+                entry.last_access = self._access_counter
+                self._protected.move_to_end(key)
+                return entry.elevation
+
+            # 2. Check Probationary Segment
+            if key in self._probationary:
+                _METRICS.elevation_cache_hits_total += 1
+                entry = self._probationary[key]
+                entry.frequency += 1
+                entry.last_access = self._access_counter
+
+                # Admission / Promotion check into Protected segment:
+                # If protected is not full, promote directly.
+                # If protected is full, compare newcomer frequency against the least-recently
+                # used victim in protected. A weak newcomer cannot evict a heavily used entry!
+                if len(self._protected) < self._protected_cap:
+                    self._probationary.pop(key)
+                    self._protected[key] = entry
+                else:
+                    # Peek at the LRU candidate in protected
+                    lru_protected_key = next(iter(self._protected))
+                    lru_protected_entry = self._protected[lru_protected_key]
+
+                    if entry.frequency > lru_protected_entry.frequency:
+                        # Promotion justified: demote LRU protected to probationary
+                        self._probationary.pop(key)
+                        demoted_key, demoted_entry = self._protected.popitem(last=False)
+                        self._protected[key] = entry
+                        self._probationary[demoted_key] = demoted_entry
+                        if len(self._probationary) > self._probation_cap:
+                            self._probationary.popitem(last=False)
+                    else:
+                        # Keep in probationary window; refresh its recency in probation
+                        self._probationary.move_to_end(key)
+                return entry.elevation
+
+            # Cache Miss
+            _METRICS.elevation_cache_misses_total += 1
+
+        # Resolve via underlying provider outside the lock
+        val = self._provider.get_elevation(latitude, longitude)
+
+        with self._lock:
+            # Re-check in case another thread populated it
+            if key in self._protected:
+                return self._protected[key].elevation
+            if key in self._probationary:
+                return self._probationary[key].elevation
+
+            new_entry = _CacheEntry(
+                elevation=val,
+                frequency=1,
+                last_access=self._access_counter,
+            )
+            # Add to probationary window
+            self._probationary[key] = new_entry
+            if len(self._probationary) > self._probation_cap:
+                # Evict oldest unpromoted item from probationary window
+                self._probationary.popitem(last=False)
+
+            return val
 
 
-#: Module-level cached elevation provider. Previously ``get_elevation_provider``
-#: constructed a fresh provider (and a fresh ``RoundedElevationCache``) on every
-#: request, so the cache never spanned requests and the DEM store was re-opened
-#: per request. This is the process-level singleton: it is created once, lazily,
-#: under a lock, and reused for the life of the process.
+# Alias for backward compatibility with existing tests
+RoundedElevationCache = PopularityDecayingElevationCache
+
+
+@dataclass
+class ElevationMetrics:
+    """Lightweight in-memory observability metrics for elevation resolution."""
+
+    elevation_requests_total: int = 0
+    elevation_cache_hits_total: int = 0
+    elevation_cache_misses_total: int = 0
+    provider_requests_total: int = 0
+    provider_failures_total: int = 0
+    provider_timeouts_total: int = 0
+
+
+_METRICS = ElevationMetrics()
+
+
+def get_elevation_metrics() -> ElevationMetrics:
+    """Return current elevation service operational metrics."""
+    return _METRICS
+
+
+def _reset_elevation_metrics() -> None:
+    """Reset operational metrics (test hook only)."""
+    global _METRICS
+    _METRICS = ElevationMetrics()
+
+
+#: Module-level singleton provider.
 _PROVIDER: ElevationProvider | None = None
-#: Guards lazy construction of the module-level provider (thread-safe).
 _PROVIDER_LOCK = threading.Lock()
 
 
 def get_elevation_provider() -> ElevationProvider:
-    """Return the configured elevation provider (optionally cached), process-level.
+    """Return the configured elevation provider (process-level singleton).
 
-    ``ELEVATION_PROVIDER`` selects the backend: ``dem`` (default; local
-    DEM via :class:`DEMElevationProvider`), ``google`` (network API), or
-    ``none`` (elevation always unavailable). A rounded-coordinate cache wraps
-    the provider unless disabled.
+    Configured via ``settings.ELEVATION_PROVIDER``:
+    * ``open_meteo`` -> :class:`OpenMeteoElevationProvider`
+    * ``none``       -> :class:`_NullProvider` (always returns ``None``)
 
-    The provider (and its DEM dataset load + elevation cache) is created once
-    per process and reused, so the DEM store is not re-opened on every request
-    and the elevation cache actually spans requests. Construction is guarded by
-    a lock for thread safety; the resulting provider's ``RoundedElevationCache``
-    is itself internally consistent for concurrent lookups (a dict + list, safe
-    under the GIL for the operations used).
+    Wrapped by :class:`PopularityDecayingElevationCache` unless disabled via
+    ``settings.ELEVATION_CACHE_DISABLED``.
     """
     global _PROVIDER
     if _PROVIDER is None:
         with _PROVIDER_LOCK:
             if _PROVIDER is None:
-                if settings.ELEVATION_PROVIDER == "google":
-                    provider: ElevationProvider = GoogleElevationProvider()
-                elif settings.ELEVATION_PROVIDER == "none":
+                provider_type = str(settings.ELEVATION_PROVIDER).lower()
+                if provider_type == "open_meteo":
+                    provider: ElevationProvider = OpenMeteoElevationProvider()
+                elif provider_type == "none":
                     _PROVIDER = _NullProvider()
                     return _PROVIDER
                 else:
-                    provider = DEMElevationProvider()
+                    # Unknown/unconfigured provider degrades safely to null
+                    logger.warning(
+                        "Unknown ELEVATION_PROVIDER '%s'; using null provider",
+                        provider_type,
+                    )
+                    _PROVIDER = _NullProvider()
+                    return _PROVIDER
+
                 if settings.ELEVATION_CACHE_DISABLED:
                     _PROVIDER = provider
                 else:
-                    _PROVIDER = RoundedElevationCache(
+                    _PROVIDER = PopularityDecayingElevationCache(
                         provider, max_entries=int(settings.ELEVATION_CACHE_MAX)
                     )
     return _PROVIDER
 
 
 def _reset_elevation_provider_cache() -> None:
-    """Reset the module-level provider singleton (test hook only).
-
-    Tests that change ``settings.ELEVATION_PROVIDER`` / ``DEM_DATA_PATH``
-    between cases call this so the next ``get_elevation_provider()`` rebuilds
-    with the new configuration.
-    """
+    """Reset the module-level provider singleton (test hook only)."""
     global _PROVIDER
     with _PROVIDER_LOCK:
         _PROVIDER = None
-
-
-class _NullProvider(ElevationProvider):
-    """Elevation provider that always reports unavailable."""
-
-    def get_elevation(self, latitude: float, longitude: float) -> float | None:
-        return None
+    _reset_elevation_metrics()

@@ -2,20 +2,30 @@
 
 import { locationTypeLabel } from "@/lib/forecast/selection";
 import type { SelectedLocation } from "@/lib/api/types";
+import type { ElevationFetchStatus } from "@/hooks/useElevation";
 
 interface SelectedLocationSummaryProps {
   location: SelectedLocation;
+  elevation_m?: number | null;
+  elevationStatus?: ElevationFetchStatus;
   onClose?: () => void;
 }
 
 /**
  * Presentation-only summary of the selected location: type badge, name,
  * region/country, coordinates, and elevation (when the resolved record defines
- * one). Raw coordinate selections show the coordinate label and no elevation.
+ * one or when dynamically resolved).
  *
  * Includes an optional Close button to deselect the location.
  */
-export function SelectedLocationSummary({ location, onClose }: SelectedLocationSummaryProps) {
+export function SelectedLocationSummary({
+  location,
+  elevation_m,
+  elevationStatus,
+  onClose,
+}: SelectedLocationSummaryProps) {
+  const displayElevation = elevation_m !== undefined ? elevation_m : location.elevation_m;
+  const isElevationLoading = elevationStatus === "loading" && displayElevation === null;
   return (
     <>
       <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-2.5">
@@ -72,9 +82,11 @@ export function SelectedLocationSummary({ location, onClose }: SelectedLocationS
           <div className="flex justify-between">
             <dt>Elevation</dt>
             <dd className="tabular-nums">
-              {location.elevation_m !== null
-                ? `${Math.round(location.elevation_m).toLocaleString()} m`
-                : "unavailable"}
+              {isElevationLoading
+                ? "loading…"
+                : displayElevation !== null
+                  ? `${Math.round(displayElevation).toLocaleString()} m`
+                  : "unavailable"}
             </dd>
           </div>
         </dl>

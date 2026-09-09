@@ -2,6 +2,7 @@ import { render, screen } from "@testing-library/react";
 
 import { ForecastDashboard } from "@/components/forecast/ForecastDashboard";
 import { usePointForecast } from "@/hooks/usePointForecast";
+import { useElevation } from "@/hooks/useElevation";
 import { useEnsemble } from "@/hooks/useEnsemble";
 import { useEnsembleDistribution } from "@/hooks/useEnsembleDistribution";
 import { useVariablesCatalog } from "@/hooks/useVariablesCatalog";
@@ -9,6 +10,13 @@ import { useForecastSelection } from "@/context/forecast-selection";
 import type { PointForecast, SelectedLocation } from "@/lib/api/types";
 
 jest.mock("../../../hooks/usePointForecast");
+jest.mock("../../../hooks/useElevation", () => ({
+  useElevation: jest.fn(() => ({
+    elevation_m: null,
+    status: "idle",
+    error: null,
+  })),
+}));
 jest.mock("../../../hooks/useEnsemble");
 jest.mock("../../../hooks/useEnsembleDistribution");
 jest.mock("../../../hooks/useVariablesCatalog");
@@ -36,6 +44,7 @@ jest.mock("../../charts/EnsemblePhaseSupport", () => ({
 }));
 
 const mockUsePointForecast = usePointForecast as jest.MockedFunction<typeof usePointForecast>;
+const mockUseElevation = useElevation as jest.MockedFunction<typeof useElevation>;
 const mockUseEnsemble = useEnsemble as jest.MockedFunction<typeof useEnsemble>;
 const mockUseEnsembleDistribution = useEnsembleDistribution as jest.MockedFunction<
   typeof useEnsembleDistribution
@@ -946,5 +955,36 @@ describe("ForecastDashboard", () => {
     // Ensemble phase support component is rendered
     expect(screen.getByTestId("ensemble-phase-support")).toBeInTheDocument();
     expect(screen.getByTestId("ensemble-phase-support")).toHaveAttribute("data-selected-lead", "6");
+  });
+
+  it("renders dynamically resolved elevation when location has null elevation and elevation resolves", () => {
+    mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
+    mockUseElevation.mockReturnValue({
+      elevation_m: 2404.0,
+      status: "success",
+      error: null,
+    });
+
+    render(<ForecastDashboard location={location} />);
+
+    expect(screen.getByText("2,404 m")).toBeInTheDocument();
+  });
+
+  it("renders known elevation immediately without being overridden by elevation hook", () => {
+    const knownLocation: SelectedLocation = {
+      ...location,
+      elevation_m: 3417.0,
+    };
+    mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
+    mockUseElevation.mockReturnValue({
+      elevation_m: 9999.0, // Should NOT override known elevation
+      status: "success",
+      error: null,
+    });
+
+    render(<ForecastDashboard location={knownLocation} />);
+
+    expect(screen.getByText("3,417 m")).toBeInTheDocument();
+    expect(screen.queryByText("9,999 m")).not.toBeInTheDocument();
   });
 });

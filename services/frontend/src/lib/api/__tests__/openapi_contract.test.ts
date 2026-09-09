@@ -34,6 +34,7 @@ describe("OpenAPI ↔ Frontend Client Contract (7D-A)", () => {
       { path: "/v1/forecast/availability", method: "get" },
       { path: "/v1/search", method: "get" },
       { path: "/v1/points", method: "get" },
+      { path: "/v1/elevation", method: "get" },
       { path: "/v1/ensembles", method: "get" },
       { path: "/v1/maps", method: "get" },
       { path: "/v1/maps/{model}/wind_10m/vector-field", method: "get" },

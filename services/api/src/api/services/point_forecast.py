@@ -53,7 +53,6 @@ from api.models.entities import (
     SkiResort,
 )
 from api.schemas import ForecastLocationOut, ForecastSeries, PointForecastData
-from api.services.elevation import get_elevation_provider
 from api.services.lifecycle import filter_visible_runs
 
 logger = logging.getLogger(__name__)
@@ -180,7 +179,7 @@ def resolve_location(
         return ResolvedLocation(
             latitude=lat,
             longitude=lon,
-            elevation_m=_elevation_for(lat, lon),
+            elevation_m=None,
             resolved_via=RESOLVED_VIA_COORDINATES,
         )
 
@@ -205,22 +204,10 @@ def _resolve_city(db: Session, city_id: str) -> ResolvedLocation:
     return ResolvedLocation(
         latitude=float(row[2]),
         longitude=float(row[1]),
-        # Cities have no elevation column in the Milestone 3 schema, so the
-        # elevation is resolved from the coordinate via the elevation provider.
-        elevation_m=_elevation_for(float(row[2]), float(row[1])),
+        elevation_m=row[0].elevation_m,
         resolved_via=RESOLVED_VIA_CITY,
         id=row[0].id,
     )
-
-
-def _elevation_for(latitude: float, longitude: float) -> float | None:
-    """Resolve terrain elevation (meters) for a coordinate, or ``None``.
-
-    Delegates to the configured elevation provider (a local/server-side DEM by
-    default). The provider returns ``None`` for no-data/ocean/unavailable, so
-    this never fabricates a value and never raises for a missing elevation.
-    """
-    return get_elevation_provider().get_elevation(latitude, longitude)
 
 
 def _resolve_ski_resort(db: Session, resort_id: str) -> ResolvedLocation:

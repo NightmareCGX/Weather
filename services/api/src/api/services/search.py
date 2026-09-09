@@ -161,6 +161,7 @@ def _search_cities(db: Session, pattern: str) -> list[SearchResultOut]:
             name=row[0].city_name,
             region=row[0].region,
             country=row[0].country,
+            elevation_m=row[0].elevation_m,
             latitude=float(row[2]),
             longitude=float(row[1]),
         )

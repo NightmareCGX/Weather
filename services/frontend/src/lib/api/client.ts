@@ -1,4 +1,5 @@
 import type {
+  ElevationResponse,
   EnsembleStatisticsData,
   Envelope,
   ErrorDetail,
@@ -81,8 +82,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw await toApiError(response);
   }
 
-  const envelope = (await response.json()) as Envelope<T>;
-  return envelope.data;
+  const body = (await response.json()) as Record<string, unknown>;
+  if (body !== null && typeof body === "object" && "data" in body) {
+    return (body as unknown as Envelope<T>).data;
+  }
+  return body as unknown as T;
 }
 
 async function toApiError(response: Response): Promise<ApiError> {
@@ -292,6 +296,27 @@ export async function getEnsembleStatistics({
 
 export async function listVariables(signal?: AbortSignal): Promise<VariableResource[]> {
   return request<VariableResource[]>(`/variables`, { signal });
+}
+
+export interface GetElevationParams {
+  latitude: number;
+  longitude: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Fetch terrain elevation for dynamic coordinates (GET /v1/elevation).
+ */
+export async function getElevation({
+  latitude,
+  longitude,
+  signal,
+}: GetElevationParams): Promise<ElevationResponse> {
+  const params = new URLSearchParams({
+    lat: String(latitude),
+    lon: String(longitude),
+  });
+  return request<ElevationResponse>(`/elevation?${params.toString()}`, { signal });
 }
 
 export const VECTOR_FIELD_HEADER_SIZE = 36;
