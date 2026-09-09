@@ -289,7 +289,7 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-  *Notes*: The point forecast is a **cross-cycle deterministic time series**: for every `valid_time`, the record with the **minimum `lead_time_hours`** across all READY cycles of the model is selected (DATABASE.md: `valid_time = cycle_time + lead_time_hours`). Because cycles are 00/06/12/18 and lead differences are multiples of 6, the minimum lead for a fixed valid_time is the newest cycle that covers it; if the newest/0-hour record is unavailable, the next-lowest available lead is chosen. `generated_at` is the newest winning cycle's `cycle_time`. Each forecast entry carries a `cycle_time` field (additive) identifying the source run, so a mixed-cycle series is unambiguous. `valid_time` is derived as `cycle_time + lead_time_hours`. `elevation_m` is returned when the resolved record defines it (e.g. ski resorts) **or** when the configured elevation provider (a local/server-side DEM by default) resolves terrain elevation for the coordinate; it is `null` (rendered `unavailable` by the frontend) when no elevation value is available (ocean, no-data, no DEM configured). Forecast entries carry the requested `forecast_variables` catalog codes (e.g. `temperature_2m`, `precipitation_rate`) as keys. Longitude queries are accepted in WGS84 `[-180, 180]`; datasets stored in the native GFS `[0, 360]` longitude convention are aligned automatically (a western-hemisphere longitude such as `-106.82` is mapped into a `0..360` store).
+  *Notes*: The point forecast is a **cross-cycle deterministic time series**: for every `valid_time`, the record with the **minimum `lead_time_hours`** across all READY cycles of the model is selected (DATABASE.md: `valid_time = cycle_time + lead_time_hours`). Because cycles are 00/06/12/18 and lead differences are multiples of 6, the minimum lead for a fixed valid_time is the newest cycle that covers it; if the newest/0-hour record is unavailable, the next-lowest available lead is chosen. `generated_at` is the newest winning cycle's `cycle_time`. Each forecast entry carries a `cycle_time` field (additive) identifying the source run, so a mixed-cycle series is unambiguous. `valid_time` is derived as `cycle_time + lead_time_hours`. `elevation_m` is returned when the resolved record defines it (Tier 1: cities, ski resorts, stations); for raw coordinates, elevation resolution is decoupled and served independently via `GET /v1/elevation` (Tier 2). `/v1/points` never blocks on or calls external elevation APIs, so elevation failure never affects forecast serving. Forecast entries carry the requested `forecast_variables` catalog codes (e.g. `temperature_2m`, `precipitation_rate`) as keys. Longitude queries are accepted in WGS84 `[-180, 180]`; datasets stored in the native GFS `[0, 360]` longitude convention are aligned automatically (a western-hemisphere longitude such as `-106.82` is mapped into a `0..360` store).
 - **HTTP Status Codes**: `200 OK`, `404 Not Found`, `422 Unprocessable Entity`. *`400 Bad Request` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
 - **Cache Policy**: `public, max-age=1800` (30 minutes).
 
@@ -525,6 +525,39 @@ Errors return standard HTTP status codes along with a structured machine-readabl
   ```
 - **HTTP Status Codes**: `200 OK`, `503 Service Unavailable`.
 - **Cache Policy**: `no-store`.
+
+---
+
+### DOMAIN 9: ELEVATION
+*Purpose: Resolve terrain elevation in meters for geographic coordinates (UI display metadata only).*
+
+#### 9.1 Get Coordinate Elevation
+- **HTTP Method**: `GET`
+- **Endpoint**: `/v1/elevation`
+- **Purpose**: Retrieve terrain elevation in meters above sea level for a geographic coordinate. Decoupled from forecast serving; elevation is UI display metadata only and does not participate in meteorological calculations.
+- **Required Parameters**:
+  - `lat`: Latitude in decimal degrees `[-90.0, 90.0]`.
+  - `lon`: Longitude in decimal degrees `[-180.0, 180.0]`.
+- **Example Request**: `GET /v1/elevation?lat=39.1911&lon=-106.8175`
+- **Example Response (Success)**:
+  ```json
+  {
+    "latitude": 39.1911,
+    "longitude": -106.8175,
+    "elevation_m": 2404.0
+  }
+  ```
+- **Example Response (Unavailable / Outage / Ocean / Void)**:
+  ```json
+  {
+    "latitude": 0.0,
+    "longitude": 0.0,
+    "elevation_m": null
+  }
+  ```
+- **HTTP Status Codes**: `200 OK` (returns `elevation_m: null` on provider failure/timeout so clients render "unavailable" gracefully), `422 Unprocessable Entity` (out-of-bounds coordinates).
+- **Cache Policy**: `public, max-age=86400` (24 hours; terrain elevation is static per coordinate).
+- **Backend Provider & Caching**: Sourced via Open-Meteo Elevation API (Copernicus GLO-90 DEM) when `ELEVATION_PROVIDER=open_meteo`, or null provider when `ELEVATION_PROVIDER=none`. Wrapped in a bounded, popularity-aware segmented cache with periodic frequency aging and ~100m coordinate quantization (`CACHE_LAT_ROUND=3`, `CACHE_LON_ROUND=3`).
 
 ---
 

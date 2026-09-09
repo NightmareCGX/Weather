@@ -62,4 +62,76 @@ describe("SelectedLocationSummary", () => {
     expect(detailsSection).toHaveTextContent("Longitude");
     expect(detailsSection).toHaveTextContent("Elevation");
   });
+
+  it("renders loading state when dynamic elevation request is pending", () => {
+    const dynamicCoordLocation: SelectedLocation = {
+      id: null,
+      object: "coordinates",
+      name: "39.1911, -106.8175",
+      region: null,
+      country: null,
+      elevation_m: null,
+      latitude: 39.1911,
+      longitude: -106.8175,
+      resolvedVia: "coordinates",
+    };
+
+    render(
+      <SelectedLocationSummary
+        location={dynamicCoordLocation}
+        elevationStatus="loading"
+        elevation_m={null}
+      />
+    );
+
+    expect(screen.getByText("loading…")).toBeInTheDocument();
+  });
+
+  it("renders unavailable when elevation resolution fails or is null", () => {
+    const dynamicCoordLocation: SelectedLocation = {
+      id: null,
+      object: "coordinates",
+      name: "39.1911, -106.8175",
+      region: null,
+      country: null,
+      elevation_m: null,
+      latitude: 39.1911,
+      longitude: -106.8175,
+      resolvedVia: "coordinates",
+    };
+
+    render(
+      <SelectedLocationSummary
+        location={dynamicCoordLocation}
+        elevationStatus="error"
+        elevation_m={null}
+      />
+    );
+
+    expect(screen.getByText("unavailable")).toBeInTheDocument();
+  });
+
+  it("renders dynamically resolved elevation when provided via props", () => {
+    const dynamicCoordLocation: SelectedLocation = {
+      id: null,
+      object: "coordinates",
+      name: "39.1911, -106.8175",
+      region: null,
+      country: null,
+      elevation_m: null,
+      latitude: 39.1911,
+      longitude: -106.8175,
+      resolvedVia: "coordinates",
+    };
+
+    render(
+      <SelectedLocationSummary
+        location={dynamicCoordLocation}
+        elevationStatus="success"
+        elevation_m={2404.2}
+      />
+    );
+
+    expect(screen.getByText("2,404 m")).toBeInTheDocument();
+  });
 });

@@ -303,6 +303,7 @@ def _seed_locations(session: Session) -> None:
                 region="Colorado",
                 country="USA",
                 population=700000,
+                elevation_m=1609.0,
                 geom=WKTElement("POINT(-106.82 38.19)", srid=4326),
             ),
             City(
@@ -311,6 +312,16 @@ def _seed_locations(session: Session) -> None:
                 region="Colorado",
                 country="USA",
                 population=6700,
+                elevation_m=2405.0,
+                geom=WKTElement("POINT(-106.82 38.19)", srid=4326),
+            ),
+            City(
+                id="city_boulder",
+                city_name="Boulder",
+                region="Colorado",
+                country="USA",
+                population=108000,
+                elevation_m=None,
                 geom=WKTElement("POINT(-106.82 38.19)", srid=4326),
             ),
             SkiResort(

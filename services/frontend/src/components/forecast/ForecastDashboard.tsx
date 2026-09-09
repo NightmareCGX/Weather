@@ -9,6 +9,7 @@ import { EnsembleDistribution } from "@/components/charts/EnsembleDistribution";
 import { EnsemblePhaseSupport } from "@/components/charts/EnsemblePhaseSupport";
 import { WindRose } from "@/components/charts/WindRose";
 import { usePointForecast } from "@/hooks/usePointForecast";
+import { useElevation } from "@/hooks/useElevation";
 import { useEnsemble } from "@/hooks/useEnsemble";
 import { useEnsembleDistribution } from "@/hooks/useEnsembleDistribution";
 import { useVariablesCatalog } from "@/hooks/useVariablesCatalog";
@@ -62,6 +63,8 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
     ? selectedModel
     : (options.models.find((model) => !model.is_ensemble)?.id ?? null);
 
+  const elevation = useElevation(location);
+
   const {
     forecast,
     status: pointStatus,
@@ -106,7 +109,12 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <SelectedLocationSummary location={location} onClose={onClose} />
+      <SelectedLocationSummary
+        location={location}
+        elevation_m={location.elevation_m ?? elevation.elevation_m}
+        elevationStatus={location.elevation_m !== null ? "success" : elevation.status}
+        onClose={onClose}
+      />
 
       <section aria-label="Point forecast" className="border-b border-slate-200 px-4 py-4">
         <h3 className="mb-2 text-sm font-semibold text-slate-900">Hourly Forecast</h3>

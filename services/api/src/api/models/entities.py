@@ -219,6 +219,7 @@ class City(Base):
     region = Column(String, nullable=False)
     country = Column(String, nullable=False)
     population = Column(Integer, nullable=True)
+    elevation_m = Column(Float, nullable=True)
     geom = Column(
         Geometry(geometry_type="POINT", srid=4326, spatial_index=False), nullable=False
     )

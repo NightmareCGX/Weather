@@ -21,6 +21,7 @@ from api.middleware import RequestIDMiddleware
 from api.routers.admin import router as admin_router
 from api.routers.availability import router as availability_router
 from api.routers.catalog import router as catalog_router
+from api.routers.elevation import router as elevation_router
 from api.routers.ensembles import router as ensembles_router
 from api.routers.maps import router as maps_router
 from api.routers.points import router as points_router
@@ -80,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(availability_router, prefix="/v1")
     app.include_router(search_router, prefix="/v1")
     app.include_router(points_router, prefix="/v1")
+    app.include_router(elevation_router, prefix="/v1")
     app.include_router(probabilities_router, prefix="/v1")
     app.include_router(maps_router, prefix="/v1")
     app.include_router(ensembles_router, prefix="/v1")

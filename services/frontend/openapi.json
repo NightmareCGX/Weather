@@ -775,6 +775,63 @@
         }
       }
     },
+    "/v1/elevation": {
+      "get": {
+        "summary": "Get terrain elevation for geographic coordinates",
+        "description": "Return terrain elevation in meters for a coordinate, or null if unavailable.\n\nDelegates to the configured elevation provider (Open-Meteo or null) wrapped\nin a popularity-aware, decaying coordinate cache. Provider timeouts,\noutages, or ocean/void terrain values return HTTP 200 with ``elevation_m: null``\nso the client can render 'unavailable' gracefully without error states.",
+        "operationId": "get_elevation_v1_elevation_get",
+        "parameters": [
+          {
+            "name": "lat",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "maximum": 90.0,
+              "minimum": -90.0,
+              "description": "WGS 84 latitude in decimal degrees [-90.0, 90.0].",
+              "title": "Lat"
+            },
+            "description": "WGS 84 latitude in decimal degrees [-90.0, 90.0]."
+          },
+          {
+            "name": "lon",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "maximum": 180.0,
+              "minimum": -180.0,
+              "description": "WGS 84 longitude in decimal degrees [-180.0, 180.0].",
+              "title": "Lon"
+            },
+            "description": "WGS 84 longitude in decimal degrees [-180.0, 180.0]."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ElevationOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/probabilities": {
       "get": {
         "summary": "Get exceedance probability",
@@ -1580,6 +1637,33 @@
         "required": ["id", "name", "country"],
         "title": "CenterOut",
         "description": "A forecast center resource (API.md section 1.1)."
+      },
+      "ElevationOut": {
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "title": "Latitude"
+          },
+          "longitude": {
+            "type": "number",
+            "title": "Longitude"
+          },
+          "elevation_m": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elevation M"
+          }
+        },
+        "type": "object",
+        "required": ["latitude", "longitude"],
+        "title": "ElevationOut",
+        "description": "Terrain elevation response for geographic coordinates."
       },
       "EnsembleStatisticsData": {
         "additionalProperties": true,

@@ -351,6 +351,14 @@ class SearchResultOut(BaseModel):
     place_id: str | None = None
 
 
+class ElevationOut(BaseModel):
+    """Terrain elevation response for geographic coordinates."""
+
+    latitude: float
+    longitude: float
+    elevation_m: float | None = None
+
+
 class ProbabilityLocation(BaseModel):
     """The location of a probability forecast (API.md section 3.1)."""
 

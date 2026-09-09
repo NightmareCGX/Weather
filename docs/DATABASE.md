@@ -41,6 +41,9 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 ### Migration 005: Model-Scoped Lifecycle (`005_model_scoped_lifecycle.py`)
 * `forecast_cycle_lifecycle`: Primary key updated to `(model_id, cycle_time)` with foreign key to `models.model_id` (CASCADE delete) and model-scoped indexes. Decouples model retention so GFS and GEFS advance retention independently under Lifecycle V2.
 
+### Migration 006: City Elevation (`006_city_elevation.py`)
+* `cities.elevation_m`: Adds nullable `DOUBLE PRECISION` column for authoritative persistent terrain elevation in meters. Allows known cities to resolve elevation without runtime API queries. Schema-only migration; no external network calls.
+
 ---
 
 ## 3. Table Ownership & Mutability Matrix

@@ -46,17 +46,15 @@ class Settings(BaseSettings):
     API_READER_GATE_TIMEOUT_SECONDS: Any = 30.0
     API_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: Any = 40.0
 
-    # Elevation resolution (ACCEPTANCE_REMEDIATION_PLAN §15).
-    # ``dem`` (default): local/server-side DEM via api/services/elevation.py.
-    # ``google``: Google Elevation API (ToS restricts caching; not the default).
-    # ``none``: elevation always unavailable.
-    ELEVATION_PROVIDER: Any = "dem"
-    # Path/URL of the DEM store (a global xarray-readable Zarr/NetCDF with
-    # latitude/longitude coords and an ``elevation`` variable in meters).
-    # Empty means no DEM configured -> elevation unavailable.
-    DEM_DATA_PATH: Any = ""
-    ELEVATION_CACHE_MAX: Any = 4096
-    ELEVATION_CACHE_DISABLED: Any = False
+    # Elevation resolution for dynamic coordinates (UI metadata only).
+    # ``none`` (default): elevation always unavailable (safe offline default).
+    # ``open_meteo``: Open-Meteo Elevation API (Copernicus GLO-90 DEM).
+    ELEVATION_PROVIDER: Any = "none"
+    ELEVATION_BASE_URL: Any = "https://api.open-meteo.com/v1/elevation"
+    ELEVATION_API_KEY: Any = ""
+    ELEVATION_TIMEOUT_SECONDS: float = 2.0
+    ELEVATION_CACHE_MAX: int = 10000
+    ELEVATION_CACHE_DISABLED: bool = False
 
     # Minimum member coverage ratio for serving eligibility (Phase 3).
     # Constrained to (0.0, 1.0]; default 0.85 (85%).

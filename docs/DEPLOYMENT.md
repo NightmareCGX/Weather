@@ -103,8 +103,11 @@ The repository provides multi-stage production Dockerfiles:
 * `API_READER_GATE_TIMEOUT_SECONDS`: Maximum wait time to acquire `SHARED` store gate (default `30.0` seconds).
 * `SEARCH_PROVIDER`: `google` (Google Places API) or `mapbox` (Mapbox Geocoding).
 * `GOOGLE_PLACES_API_KEY`: Server-side API key for Google Places (New).
-* `ELEVATION_PROVIDER`: `dem` (local DEM raster) or `none`.
-* `DEM_DATA_PATH`: Local or S3 path to global DEM Zarr/NetCDF dataset.
+* `ELEVATION_PROVIDER`: `none` (default, elevation unavailable) or `open_meteo` (Open-Meteo Elevation API).
+* `ELEVATION_BASE_URL`: Base elevation URL (default `https://api.open-meteo.com/v1/elevation`).
+* `ELEVATION_API_KEY`: Optional API key for commercial Open-Meteo plans.
+* `ELEVATION_TIMEOUT_SECONDS`: Request socket timeout in seconds (default `2.0`).
+* `ELEVATION_CACHE_MAX`: Maximum entries in the bounded decaying coordinate cache (default `10000`).
 
 ---
 

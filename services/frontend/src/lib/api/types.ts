@@ -48,6 +48,13 @@ export interface SearchResult {
   place_id?: string | null;
 }
 
+/** Terrain elevation response from GET /v1/elevation. */
+export interface ElevationResponse {
+  latitude: number;
+  longitude: number;
+  elevation_m: number | null;
+}
+
 /**
  * The selected location shared by search, map click, and the forecast
  * dashboard. This is a frontend model, not a backend response shape: it
