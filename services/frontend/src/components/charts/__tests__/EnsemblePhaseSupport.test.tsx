@@ -135,7 +135,7 @@ describe("EnsemblePhaseSupport (Time-Varying)", () => {
 
     expect(
       screen.getByRole("img", {
-        name: /Ensemble precipitation phase support over time/i,
+        name: /Ensemble phase support over time/i,
       })
     ).toBeInTheDocument();
     expect(

@@ -226,11 +226,7 @@ export function EnsemblePhaseSupport({
       </div>
 
       {/* 100% Stacked Bar Chart across Valid Times */}
-      <div
-        role="img"
-        aria-label="Ensemble precipitation phase support over time"
-        className="h-56 w-full"
-      >
+      <div role="img" aria-label="Ensemble phase support over time" className="h-56 w-full">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
