@@ -14,7 +14,7 @@ import {
 
 import { toMeteogramSeries } from "@/lib/forecast/transform";
 import { formatCloudCeiling, formatValue, formatWindDirection } from "@/lib/forecast/labels";
-import { formatDayHourUtc } from "@/lib/forecast/time";
+import { formatDayHourInTimeZone, formatDayHourWithTimeZone } from "@/lib/forecast/time";
 import {
   getPointForecastPhaseLabel,
   getBarColorForEntry,
@@ -32,6 +32,7 @@ interface MeteogramProps {
   forecasts: ForecastEntry[];
   variableCode: string;
   meta: VariableMeta;
+  timezone?: string | null;
 }
 
 const KNOWN_TRANSITION_GRADIENTS = [
@@ -61,7 +62,7 @@ const KNOWN_TRANSITION_GRADIENTS = [
  * - Two-phase transitions render semantic gradients without implying exact timing.
  * - Lead 0 (null accumulation) renders no bar and formats as "—" rather than 0 mm.
  */
-export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
+export function Meteogram({ forecasts, variableCode, meta, timezone }: MeteogramProps) {
   const isPrecipAmount3h = variableCode === "precipitation_amount_3h";
   const isCloudCover = variableCode === "cloud_cover_3h";
   const isCloudCeiling = variableCode === "cloud_ceiling";
@@ -96,7 +97,7 @@ export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
     return {
       lead_time_hours: point.lead_time_hours,
       valid_time: point.valid_time,
-      label: formatDayHourUtc(point.valid_time),
+      label: formatDayHourInTimeZone(point.valid_time, timezone),
       value: plotValue,
       rawValue: rawVal,
       isUnlimitedCeiling,
@@ -237,7 +238,13 @@ export function Meteogram({ forecasts, variableCode, meta }: MeteogramProps) {
                 }
                 return [formatValue(value, meta.unit), meta.name];
               }}
-              labelFormatter={(label: string) => `${label} UTC`}
+              labelFormatter={(label: string, payload: any) => {
+                const validTime = payload?.[0]?.payload?.valid_time;
+                if (validTime) {
+                  return formatDayHourWithTimeZone(validTime, timezone);
+                }
+                return timezone ? formatDayHourWithTimeZone(label, timezone) : `${label} UTC`;
+              }}
               contentStyle={{ fontSize: 12 }}
             />
             {isPrecipitation ? (

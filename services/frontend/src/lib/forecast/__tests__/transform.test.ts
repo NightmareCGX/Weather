@@ -204,14 +204,49 @@ describe("toEnsembleChartData", () => {
     expect(data.map((point) => point.lead_time_hours)).toEqual([0, 6]);
     expect(data[1]).toMatchObject({ lead_time_hours: 6, mean: 13, median: 13, p90: 16 });
   });
+
+  it("propagates valid_time from data or optional mapping", () => {
+    const withValidTimes = new Map<number, EnsembleStatisticsData>([
+      [
+        0,
+        {
+          model: "gefs",
+          lead_time_hours: 0,
+          valid_time: "2026-09-10T00:00:00Z",
+          member_count: 5,
+          statistics: {
+            mean: 10,
+            median: 10,
+            spread: 2,
+            p10: 7,
+            p25: 9,
+            p50: 10,
+            p75: 11,
+            p90: 13,
+          },
+        },
+      ],
+    ]);
+    const dataFromData = toEnsembleChartData(withValidTimes);
+    expect(dataFromData[0].valid_time).toBe("2026-09-10T00:00:00Z");
+
+    const map = new Map<number, string>([[0, "2026-09-10T00:00:00Z"]]);
+    const dataFromMap = toEnsembleChartData(ensembleByLead, map);
+    expect(dataFromMap[0].valid_time).toBe("2026-09-10T00:00:00Z");
+  });
 });
 
 describe("toEnsembleFanData", () => {
-  it("computes stacked band bases and heights from percentile statistics", () => {
-    const fan = toEnsembleFanData(ensembleByLead);
+  it("computes stacked band bases and heights from percentile statistics and preserves valid_time", () => {
+    const map = new Map<number, string>([
+      [0, "2026-09-10T00:00:00Z"],
+      [6, "2026-09-10T06:00:00Z"],
+    ]);
+    const fan = toEnsembleFanData(ensembleByLead, map);
     expect(fan).toHaveLength(2);
     expect(fan[0]).toMatchObject({
       lead_time_hours: 0,
+      valid_time: "2026-09-10T00:00:00Z",
       p10Base: 7,
       p90Height: 13 - 7,
       p25Base: 9,
@@ -219,6 +254,7 @@ describe("toEnsembleFanData", () => {
       median: 10,
       mean: 10,
     });
+    expect(fan[1].valid_time).toBe("2026-09-10T06:00:00Z");
     expect(fan[1].p90Height).toBeCloseTo(16 - 10, 6);
   });
 });

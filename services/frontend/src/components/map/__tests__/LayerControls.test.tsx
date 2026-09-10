@@ -1,7 +1,9 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import { LayerControls } from "@/components/map/LayerControls";
-import { ForecastSelectionProvider } from "@/context/forecast-selection";
+import { ForecastSelectionProvider, useForecastSelection } from "@/context/forecast-selection";
+import { SelectedLocationProvider, useSelectedLocation } from "@/context/selected-location";
+import type { SelectedLocation } from "@/lib/api/types";
 
 /**
  * The LayerControls component renders from the shared forecast-selection
@@ -196,5 +198,132 @@ describe("LayerControls (data-driven)", () => {
     );
     renderControls();
     expect(await screen.findByText("No forecast data available.")).toBeInTheDocument();
+  });
+
+  describe("selected-location local time display", () => {
+    const denverLocation: SelectedLocation = {
+      name: "Denver",
+      object: "city",
+      id: "city_denver",
+      resolvedVia: "city",
+      latitude: 39.7392,
+      longitude: -104.9903,
+      elevation_m: 1609,
+      region: "Colorado",
+      country: "USA",
+    };
+
+    const tokyoLocation: SelectedLocation = {
+      name: "Tokyo",
+      object: "city",
+      id: "city_tokyo",
+      resolvedVia: "city",
+      latitude: 35.6762,
+      longitude: 139.6503,
+      elevation_m: 40,
+      region: "Tokyo",
+      country: "Japan",
+    };
+
+    function LocationHarness() {
+      const { selectLocation, clearSelection } = useSelectedLocation();
+      const { selection } = useForecastSelection();
+      return (
+        <div>
+          <button onClick={() => selectLocation(denverLocation)}>Select Denver</button>
+          <button onClick={() => selectLocation(tokyoLocation)}>Select Tokyo</button>
+          <button onClick={() => clearSelection()}>Clear Location</button>
+          <span data-testid="canonical-valid-time">{selection?.validTime ?? "none"}</span>
+          <LayerControls />
+        </div>
+      );
+    }
+
+    function renderWithLocation() {
+      return render(
+        <ForecastSelectionProvider>
+          <SelectedLocationProvider>
+            <LocationHarness />
+          </SelectedLocationProvider>
+        </ForecastSelectionProvider>
+      );
+    }
+
+    it("renders UTC display when no location is selected", async () => {
+      renderWithLocation();
+
+      expect(await screen.findByLabelText("Valid time")).toBeInTheDocument();
+      const validTimeDisplay = screen.getByTestId("valid-time");
+      expect(validTimeDisplay).toHaveTextContent("Valid Aug 13, 06:00 UTC");
+
+      // Dropdown option remains UTC
+      expect(screen.getByText("Aug 13, 06:00 UTC")).toBeInTheDocument();
+    });
+
+    it("localizes adjacent display for Denver while dropdown remains UTC", async () => {
+      renderWithLocation();
+
+      await screen.findByLabelText("Valid time");
+
+      act(() => {
+        fireEvent.click(screen.getByText("Select Denver"));
+      });
+
+      // Dropdown option MUST remain in UTC
+      expect(screen.getByText("Aug 13, 06:00 UTC")).toBeInTheDocument();
+
+      // Adjacent display updates to Denver local time (UTC-6 in Aug -> 00:00 MDT)
+      const validTimeDisplay = screen.getByTestId("valid-time");
+      expect(validTimeDisplay.textContent).toMatch(/^Valid Aug 13, 00:00 (MDT|GMT-6)$/);
+
+      // Canonical forecast valid time must NOT change
+      expect(screen.getByTestId("canonical-valid-time")).toHaveTextContent(
+        "2026-08-13T06:00:00.000Z"
+      );
+    });
+
+    it("localizes adjacent display for Tokyo without changing canonical valid time", async () => {
+      renderWithLocation();
+
+      await screen.findByLabelText("Valid time");
+
+      act(() => {
+        fireEvent.click(screen.getByText("Select Tokyo"));
+      });
+
+      // Dropdown option MUST remain in UTC
+      expect(screen.getByText("Aug 13, 06:00 UTC")).toBeInTheDocument();
+
+      // Adjacent display updates to Tokyo local time (UTC+9 in Aug -> 15:00)
+      const validTimeDisplay = screen.getByTestId("valid-time");
+      expect(validTimeDisplay.textContent).toMatch(/^Valid Aug 13, 15:00 (JST|GMT\+9)$/);
+
+      // Canonical valid time remains untouched
+      expect(screen.getByTestId("canonical-valid-time")).toHaveTextContent(
+        "2026-08-13T06:00:00.000Z"
+      );
+    });
+
+    it("restores UTC display when location selection is cleared", async () => {
+      renderWithLocation();
+
+      await screen.findByLabelText("Valid time");
+
+      // Select Denver first
+      act(() => {
+        fireEvent.click(screen.getByText("Select Denver"));
+      });
+      expect(screen.getByTestId("valid-time").textContent).toMatch(
+        /^Valid Aug 13, 00:00 (MDT|GMT-6)$/
+      );
+
+      // Clear location
+      act(() => {
+        fireEvent.click(screen.getByText("Clear Location"));
+      });
+
+      // Adjacent display returns to UTC
+      expect(screen.getByTestId("valid-time")).toHaveTextContent("Valid Aug 13, 06:00 UTC");
+    });
   });
 });

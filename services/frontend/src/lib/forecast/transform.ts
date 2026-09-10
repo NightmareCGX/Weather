@@ -76,6 +76,7 @@ export function forecastLeadTimes(forecasts: ForecastEntry[]): number[] {
 /** A single point of the ensemble-over-time fan chart. */
 export interface EnsembleChartPoint {
   lead_time_hours: number;
+  valid_time?: string;
   mean: number | null;
   median: number | null;
   spread: number | null;
@@ -95,7 +96,8 @@ export interface EnsembleChartPoint {
  * are omitted so the chart simply has no point there.
  */
 export function toEnsembleChartData(
-  ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>
+  ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>,
+  validTimesByLead?: ReadonlyMap<number, string>
 ): EnsembleChartPoint[] {
   const leads = Array.from(ensembleByLead.keys()).sort((a, b) => a - b);
   return leads.map((lead) => {
@@ -104,8 +106,10 @@ export function toEnsembleChartData(
       throw new Error(`Missing ensemble data for lead ${lead}.`);
     }
     const stats = data.statistics;
+    const validTime = data.valid_time ?? validTimesByLead?.get(lead);
     return {
       lead_time_hours: lead,
+      valid_time: validTime,
       mean: stats.mean ?? null,
       median: stats.median ?? null,
       spread: stats.spread ?? null,
@@ -128,6 +132,7 @@ export function toEnsembleChartData(
  */
 export interface EnsembleFanPoint {
   lead_time_hours: number;
+  valid_time?: string;
   /** Lower edge of the P10–P90 band (stack base). */
   p10Base: number;
   /** Height of the P10–P90 band. */
@@ -143,9 +148,10 @@ export interface EnsembleFanPoint {
 
 /** Build the stacked fan-band points for one `/v1/ensembles` response per lead. */
 export function toEnsembleFanData(
-  ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>
+  ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>,
+  validTimesByLead?: ReadonlyMap<number, string>
 ): EnsembleFanPoint[] {
-  return toEnsembleChartData(ensembleByLead)
+  return toEnsembleChartData(ensembleByLead, validTimesByLead)
     .filter(
       (
         point
@@ -170,6 +176,7 @@ export function toEnsembleFanData(
     )
     .map((point) => ({
       lead_time_hours: point.lead_time_hours,
+      valid_time: point.valid_time,
       p10Base: point.p10,
       p90Height: point.p90 - point.p10,
       p25Base: point.p25,

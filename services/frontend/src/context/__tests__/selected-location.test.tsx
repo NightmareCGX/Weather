@@ -1,7 +1,11 @@
 import { act, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 
-import { SelectedLocationProvider, useSelectedLocation } from "@/context/selected-location";
+import {
+  SelectedLocationProvider,
+  useSelectedLocation,
+  useSelectedLocationTimezone,
+} from "@/context/selected-location";
 import type { SelectedLocation } from "@/lib/api/types";
 
 const mockLocationA: SelectedLocation = {
@@ -139,5 +143,85 @@ describe("SelectedLocationContext selectionGeneration guard", () => {
 
     expect(committed).toBe(false);
     expect(result.current.selectedLocation).toBeNull();
+  });
+});
+
+describe("SelectedLocationContext selectedTimezone derivation", () => {
+  const mockTokyo: SelectedLocation = {
+    name: "Tokyo",
+    object: "city",
+    id: "city_tokyo",
+    resolvedVia: "city",
+    latitude: 35.6762,
+    longitude: 139.6503,
+    elevation_m: 40,
+    region: "Tokyo",
+    country: "Japan",
+  };
+
+  it("initializes with null selectedTimezone", () => {
+    const { result } = renderHook(() => useSelectedLocation(), { wrapper });
+    expect(result.current.selectedTimezone).toBeNull();
+  });
+
+  it("derives IANA timezone when a location is selected", () => {
+    const { result } = renderHook(() => useSelectedLocation(), { wrapper });
+
+    act(() => {
+      result.current.selectLocation(mockLocationA);
+    });
+
+    expect(result.current.selectedTimezone).toBe("America/Denver");
+  });
+
+  it("updates timezone when selected location changes", () => {
+    const { result } = renderHook(() => useSelectedLocation(), { wrapper });
+
+    act(() => {
+      result.current.selectLocation(mockLocationA);
+    });
+    expect(result.current.selectedTimezone).toBe("America/Denver");
+
+    act(() => {
+      result.current.selectLocation(mockTokyo);
+    });
+    expect(result.current.selectedTimezone).toBe("Asia/Tokyo");
+  });
+
+  it("resets selectedTimezone to null when selection is cleared", () => {
+    const { result } = renderHook(() => useSelectedLocation(), { wrapper });
+
+    act(() => {
+      result.current.selectLocation(mockLocationA);
+    });
+    expect(result.current.selectedTimezone).toBe("America/Denver");
+
+    act(() => {
+      result.current.clearSelection();
+    });
+    expect(result.current.selectedTimezone).toBeNull();
+  });
+
+  it("useSelectedLocationTimezone hook returns timezone and safely falls back to null", () => {
+    // Within provider
+    const { result } = renderHook(
+      () => {
+        const loc = useSelectedLocation();
+        const tz = useSelectedLocationTimezone();
+        return { loc, tz };
+      },
+      { wrapper }
+    );
+
+    expect(result.current.tz).toBeNull();
+
+    act(() => {
+      result.current.loc.selectLocation(mockLocationA);
+    });
+    expect(result.current.tz).toBe("America/Denver");
+
+    // Outside provider
+    const outside = renderHook(() => useSelectedLocationTimezone());
+    expect(outside.result.current).toBeNull();
   });
 });

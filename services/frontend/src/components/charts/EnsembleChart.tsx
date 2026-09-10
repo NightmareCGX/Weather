@@ -13,16 +13,18 @@ import {
 
 import { toEnsembleFanData } from "@/lib/forecast/transform";
 import { formatValue } from "@/lib/forecast/labels";
-import { formatLeadTimeHours } from "@/lib/forecast/time";
+import { formatDayHourInTimeZone, formatDayHourWithTimeZone } from "@/lib/forecast/time";
 import type { EnsembleStatisticsData } from "@/lib/api/types";
 
 interface EnsembleChartProps {
   byLead: ReadonlyMap<number, EnsembleStatisticsData>;
   variableLabel: string;
+  timezone?: string | null;
+  validTimesByLead?: ReadonlyMap<number, string>;
 }
 
 /**
- * Ensemble statistics / spread over forecast lead time.
+ * Ensemble statistics / spread over forecast valid time.
  *
  * Renders the P10–P90 outer percentile band and the P25–P75 central range as a
  * fan (two stacked areas), with the median (P50) and mean as lines. This is a
@@ -30,16 +32,30 @@ interface EnsembleChartProps {
  * explicitly labeled "percentile range", never a min/max boxplot, because the
  * backend does not expose min/max or raw members.
  */
-export function EnsembleChart({ byLead, variableLabel }: EnsembleChartProps) {
-  const data = toEnsembleFanData(byLead).map((point) => ({
-    lead: formatLeadTimeHours(point.lead_time_hours),
-    p10Base: point.p10Base,
-    p90Height: point.p90Height,
-    p25Base: point.p25Base,
-    p75Height: point.p75Height,
-    median: point.median,
-    mean: point.mean,
-  }));
+export function EnsembleChart({
+  byLead,
+  variableLabel,
+  timezone,
+  validTimesByLead,
+}: EnsembleChartProps) {
+  const data = toEnsembleFanData(byLead, validTimesByLead).map((point) => {
+    const validTime =
+      point.valid_time ??
+      validTimesByLead?.get(point.lead_time_hours) ??
+      byLead.get(point.lead_time_hours)?.valid_time ??
+      "";
+    return {
+      lead_time_hours: point.lead_time_hours,
+      valid_time: validTime,
+      label: validTime ? formatDayHourInTimeZone(validTime, timezone) : "",
+      p10Base: point.p10Base,
+      p90Height: point.p90Height,
+      p25Base: point.p25Base,
+      p75Height: point.p75Height,
+      median: point.median,
+      mean: point.mean,
+    };
+  });
 
   return (
     <div className="mb-4">
@@ -49,13 +65,19 @@ export function EnsembleChart({ byLead, variableLabel }: EnsembleChartProps) {
       </div>
       <div
         role="img"
-        aria-label={`${variableLabel} ensemble percentile fan over lead time`}
+        aria-label={`${variableLabel} ensemble percentile fan over time`}
         className="h-48 w-full"
       >
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-            <XAxis dataKey="lead" tick={{ fontSize: 10, fill: "#64748b" }} tickLine={false} />
+            <XAxis
+              dataKey="valid_time"
+              tickFormatter={(vt: string) => (vt ? formatDayHourInTimeZone(vt, timezone) : "")}
+              tick={{ fontSize: 10, fill: "#64748b" }}
+              tickLine={false}
+              interval="preserveStartEnd"
+            />
             <YAxis
               tick={{ fontSize: 10, fill: "#64748b" }}
               tickLine={false}
@@ -65,6 +87,10 @@ export function EnsembleChart({ byLead, variableLabel }: EnsembleChartProps) {
             />
             <Tooltip
               formatter={(value: number, name: string) => [formatValue(value, ""), name]}
+              labelFormatter={(label: string, payload: any[]) => {
+                const validTime = payload?.[0]?.payload?.valid_time ?? label;
+                return validTime ? formatDayHourWithTimeZone(validTime, timezone) : "";
+              }}
               contentStyle={{ fontSize: 12 }}
             />
             {/* Transparent base stacks so the colored heights render as bands. */}

@@ -14,6 +14,9 @@ import { useEnsemble } from "@/hooks/useEnsemble";
 import { useEnsembleDistribution } from "@/hooks/useEnsembleDistribution";
 import { useVariablesCatalog } from "@/hooks/useVariablesCatalog";
 import { useForecastSelection } from "@/context/forecast-selection";
+import { useSelectedLocationTimezone } from "@/context/selected-location";
+import { resolveValidTime } from "@/lib/forecast/availability";
+import { formatDayHourWithTimeZone } from "@/lib/forecast/time";
 import { forecastVariableCodes } from "@/lib/forecast/transform";
 import { buildVariableMeta } from "@/lib/forecast/labels";
 import type { SelectedLocation } from "@/lib/api/types";
@@ -46,6 +49,7 @@ interface ForecastDashboardProps {
  */
 export function ForecastDashboard({ location, onClose }: ForecastDashboardProps) {
   const { selection, options } = useForecastSelection();
+  const selectedTimezone = useSelectedLocationTimezone();
   const selectedModel = selection?.model ?? null;
   const selectedModelIsEnsemble = options.model?.is_ensemble ?? false;
   // The Hourly Forecast tracks the UI selection. With the backend's
@@ -107,6 +111,62 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
     model: ensembleModel,
   });
 
+  // Canonical mapping from lead_time_hours -> valid_time (ISO string)
+  const validTimesByLead = useMemo(() => {
+    const map = new Map<number, string>();
+    const targetCycle = options.initialTime?.value ?? selection?.initialTime ?? null;
+
+    // 1. From variable availability valid_times matching the active source cycle (authoritative V2 mapping)
+    if (options.variable?.valid_times) {
+      for (const vt of options.variable.valid_times) {
+        if (!targetCycle || vt.source_cycle === targetCycle) {
+          map.set(vt.lead_time_hours, vt.valid_time);
+        }
+      }
+    }
+
+    // 2. From point forecast forecasts if available
+    if (forecast?.forecasts) {
+      for (const entry of forecast.forecasts) {
+        if (!map.has(entry.lead_time_hours)) {
+          if (!targetCycle || !entry.cycle_time || entry.cycle_time === targetCycle) {
+            map.set(entry.lead_time_hours, entry.valid_time);
+          }
+        }
+      }
+    }
+
+    // 3. Fallback: derive from initial_time + lead_time_hours only when canonical valid_times are absent
+    if (targetCycle !== null) {
+      for (const lead of options.leadTimes) {
+        if (!map.has(lead)) {
+          const resolved = resolveValidTime(targetCycle, lead);
+          if (resolved) map.set(lead, resolved);
+        }
+      }
+    }
+
+    return map;
+  }, [
+    options.variable?.valid_times,
+    options.initialTime?.value,
+    options.leadTimes,
+    selection?.initialTime,
+    forecast?.forecasts,
+  ]);
+
+  const distributionValidTime = useMemo(() => {
+    if (typeof distributionLead === "string") {
+      return distributionLead;
+    }
+    return (
+      validTimesByLead.get(distributionLead) ??
+      options.validTimes?.[0] ??
+      distribution.data?.valid_time ??
+      null
+    );
+  }, [distributionLead, validTimesByLead, options.validTimes, distribution.data?.valid_time]);
+
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <SelectedLocationSummary
@@ -141,6 +201,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
                 forecasts={forecast.forecasts}
                 variableCode={code}
                 meta={meta[code] ?? { name: code, unit: "" }}
+                timezone={selectedTimezone}
               />
             ))}
           </>
@@ -173,12 +234,12 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
           )}
           {ensemble.status === "success" && ensemble.byLead.size > 0 && (
             <>
-              <p className="mb-2 text-xs text-slate-500">
-                {ensembleVariable} · percentile range over lead time
-              </p>
+              <p className="mb-2 text-xs text-slate-500">{ensembleVariable} · percentile range</p>
               <EnsembleChart
                 byLead={ensemble.byLead}
                 variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
+                timezone={selectedTimezone}
+                validTimesByLead={validTimesByLead}
               />
             </>
           )}
@@ -188,6 +249,8 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
             status={distribution.status}
             error={distribution.error}
             selectedLead={distributionLead}
+            validTime={distributionValidTime}
+            timezone={selectedTimezone}
             variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
           />
 
@@ -197,7 +260,10 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
                 10m Wind Direction & Speed Distribution (Wind Rose)
               </h4>
               <p className="mb-2 text-center text-[11px] text-slate-500">
-                Lead {distributionLead}h · 30 ensemble members
+                {distributionValidTime
+                  ? `${formatDayHourWithTimeZone(distributionValidTime, selectedTimezone)} · `
+                  : ""}
+                30 ensemble members
               </p>
               <WindRose windRose={distribution.data.wind_rose} />
             </div>
@@ -208,6 +274,8 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
               phaseSupport={distribution.data.phase_support}
               transitionFrequency={distribution.data.transition_frequency}
               selectedLead={distributionLead}
+              validTime={distributionValidTime}
+              timezone={selectedTimezone}
               memberCount={distribution.data.member_count}
             />
           )}

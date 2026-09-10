@@ -11,6 +11,7 @@ import {
 } from "react";
 
 import type { SelectedLocation } from "@/lib/api/types";
+import { getTimezoneForCoordinates } from "@/lib/forecast/timezone";
 
 /**
  * Shared selected-location state for Milestone 13 & Location Discovery.
@@ -27,6 +28,8 @@ import type { SelectedLocation } from "@/lib/api/types";
 
 export interface SelectedLocationContextValue {
   selectedLocation: SelectedLocation | null;
+  /** IANA timezone identifier for the selected location, or null when no location is selected or lookup fails. */
+  selectedTimezone: string | null;
   /** Current selection generation sequence number. */
   selectionGeneration: number;
   /** Commit a synchronous location selection immediately, invalidating pending async selections. */
@@ -75,9 +78,19 @@ export function SelectedLocationProvider({ children }: { children: ReactNode }) 
     return false;
   }, []);
 
+  const selectedLat = selectedLocation?.latitude;
+  const selectedLon = selectedLocation?.longitude;
+  const selectedTimezone = useMemo(() => {
+    if (selectedLat === undefined || selectedLon === undefined) {
+      return null;
+    }
+    return getTimezoneForCoordinates(selectedLat, selectedLon);
+  }, [selectedLat, selectedLon]);
+
   const value = useMemo<SelectedLocationContextValue>(
     () => ({
       selectedLocation,
+      selectedTimezone,
       selectionGeneration: generation,
       selectLocation,
       clearSelection,
@@ -86,6 +99,7 @@ export function SelectedLocationProvider({ children }: { children: ReactNode }) 
     }),
     [
       selectedLocation,
+      selectedTimezone,
       generation,
       selectLocation,
       clearSelection,
@@ -105,4 +119,13 @@ export function useSelectedLocation(): SelectedLocationContextValue {
     throw new Error("useSelectedLocation must be used within a SelectedLocationProvider");
   }
   return context;
+}
+
+/**
+ * Convenience hook to access the resolved IANA timezone for the active selection.
+ * Safely returns null if no selection exists or if called outside of the provider.
+ */
+export function useSelectedLocationTimezone(): string | null {
+  const context = useContext(SelectedLocationContext);
+  return context?.selectedTimezone ?? null;
 }

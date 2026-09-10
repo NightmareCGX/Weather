@@ -22,7 +22,7 @@ import {
   toPdfPoints,
 } from "@/lib/forecast/transform";
 import { formatPercent, formatValue } from "@/lib/forecast/labels";
-import { formatDayHourUtc, formatLeadTimeHours } from "@/lib/forecast/time";
+import { formatDayHourWithTimeZone } from "@/lib/forecast/time";
 import type { DistributionStatus } from "@/hooks/useEnsembleDistribution";
 import type { EnsembleStatisticsData } from "@/lib/api/types";
 
@@ -32,7 +32,9 @@ interface EnsembleDistributionProps {
   status: DistributionStatus;
   error: string | null;
   /** The lead time or valid time whose distribution to show. */
-  selectedLead: number | string;
+  selectedLead?: number | string;
+  validTime?: string | null;
+  timezone?: string | null;
   variableLabel: string;
 }
 
@@ -62,6 +64,8 @@ export function EnsembleDistribution({
   status,
   error,
   selectedLead,
+  validTime,
+  timezone,
   variableLabel,
 }: EnsembleDistributionProps) {
   if (status === "loading") {
@@ -80,16 +84,16 @@ export function EnsembleDistribution({
     );
   }
 
-  const timeLabel =
-    typeof selectedLead === "string"
-      ? `${formatDayHourUtc(selectedLead)} UTC`
-      : formatLeadTimeHours(selectedLead);
+  const resolvedValidTime =
+    validTime ?? (typeof selectedLead === "string" ? selectedLead : (data?.valid_time ?? null));
+
+  const timeLabel = resolvedValidTime ? formatDayHourWithTimeZone(resolvedValidTime, timezone) : "";
 
   if (data === null) {
     return (
       <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
         <p className="text-xs text-slate-600">
-          No ensemble distribution available for {timeLabel}.
+          No ensemble distribution available{timeLabel ? ` for ${timeLabel}` : ""}.
         </p>
       </div>
     );
@@ -103,8 +107,9 @@ export function EnsembleDistribution({
     return (
       <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
         <p className="text-xs text-slate-600">
-          Ensemble distribution for {variableLabel} at {timeLabel} is not yet available: the API
-          returned no raw member values. The summary above is shown instead.
+          Ensemble distribution for {variableLabel}
+          {timeLabel ? ` at ${timeLabel}` : ""} is not yet available: the API returned no raw member
+          values. The summary above is shown instead.
         </p>
       </div>
     );
