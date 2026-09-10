@@ -4,13 +4,19 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { resolvePlace, RequestAbortedError } from "@/lib/api/client";
 import { useSearch } from "@/hooks/useSearch";
-import { searchResultToSelectedLocation } from "@/lib/forecast/selection";
+import {
+  canonicalizeLongitude,
+  isValidCoordinate,
+  searchResultToSelectedLocation,
+} from "@/lib/forecast/selection";
 import type { SearchResult, SelectedLocation } from "@/lib/api/types";
 
 interface LocationSearchProps {
   onSelect: (location: SelectedLocation) => void;
   disabled?: boolean;
   placeholder?: string;
+  /** Optional soft proximity bias getter returning the latest map center. */
+  getBias?: () => { latitude: number; longitude: number } | undefined;
 }
 
 /**
@@ -22,7 +28,12 @@ interface LocationSearchProps {
  * combobox/listbox semantics are handled here so the rest of the dashboard
  * stays presentation-only.
  */
-export function LocationSearch({ onSelect, disabled = false, placeholder }: LocationSearchProps) {
+export function LocationSearch({
+  onSelect,
+  disabled = false,
+  placeholder,
+  getBias,
+}: LocationSearchProps) {
   const id = useId();
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -30,7 +41,7 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
   const inputRef = useRef<HTMLInputElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  const { results, status, error, sessionToken } = useSearch(query);
+  const { results, status, error, sessionToken } = useSearch(query, { getBias });
 
   const resolveGenerationRef = useRef(0);
   const resolveAbortRef = useRef<AbortController | null>(null);
@@ -49,7 +60,6 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
 
   const selectResult = useCallback(
     (result: SearchResult) => {
-      // A platform record (city/resort/station) already carries coordinates.
       onSelect(searchResultToSelectedLocation(result));
     },
     [onSelect]
@@ -63,10 +73,12 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
     resolveAbortRef.current?.abort();
     const generation = ++resolveGenerationRef.current;
 
-    if (result.object === "place" && typeof result.place_id === "string") {
-      // A place suggestion carries no coordinates yet; resolve the canonical
-      // place (name + lat/lon + region) before updating the map/forecast. The
-      // same session token is reused so Google bills one session.
+    const canonicalLon =
+      typeof result.longitude === "number" ? canonicalizeLongitude(result.longitude) : NaN;
+    const hasDirectCoords = isValidCoordinate(result.latitude, canonicalLon);
+
+    if (result.object === "place" && !hasDirectCoords && typeof result.place_id === "string") {
+      // Legacy fallback: resolvePlace only when direct coordinates are missing/invalid
       const controller = new AbortController();
       resolveAbortRef.current = controller;
 
@@ -78,8 +90,7 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
         .catch((err: unknown) => {
           if (generation !== resolveGenerationRef.current) return;
           if (err instanceof RequestAbortedError) return;
-          // Fall back to the suggestion's display text so the UI degrades
-          // gracefully; the map simply won't recenter to real coordinates.
+          // Fall back to the suggestion's display text so the UI degrades gracefully
           onSelect(searchResultToSelectedLocation(result));
         });
     } else {
@@ -219,6 +230,29 @@ export function LocationSearch({ onSelect, disabled = false, placeholder }: Loca
               </span>
             </li>
           ))}
+          <li
+            role="presentation"
+            className="border-t border-slate-100 bg-slate-50/80 px-3 py-1.5 text-right text-[11px] text-slate-400"
+          >
+            <span>Powered by </span>
+            <a
+              href="https://www.geoapify.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-400"
+            >
+              Geoapify
+            </a>
+            <span> · Search by </span>
+            <a
+              href="https://locationiq.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-400"
+            >
+              LocationIQ.com
+            </a>
+          </li>
         </ul>
       )}
     </div>

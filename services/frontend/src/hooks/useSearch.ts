@@ -24,6 +24,17 @@ export const SEARCH_LIMIT = 20;
 
 export type SearchStatus = "idle" | "loading" | "success" | "error";
 
+export interface SearchBiasCoordinates {
+  latitude: number;
+  longitude: number;
+}
+
+export interface UseSearchOptions {
+  type?: "city" | "resort" | "station" | "all" | "place";
+  bias?: SearchBiasCoordinates | null;
+  getBias?: () => SearchBiasCoordinates | undefined;
+}
+
 export interface UseSearchResult {
   results: SearchResult[];
   status: SearchStatus;
@@ -39,7 +50,7 @@ function newSessionToken(): string {
   return `tok-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export function useSearch(query: string): UseSearchResult {
+export function useSearch(query: string, options?: UseSearchOptions): UseSearchResult {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [status, setStatus] = useState<SearchStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -57,6 +68,15 @@ export function useSearch(query: string): UseSearchResult {
   // change).
   const sessionTokenRef = useRef(sessionToken);
   sessionTokenRef.current = sessionToken;
+
+  // Keep bias and bias getter refs fresh without triggering query refetches when
+  // map movement updates the map center (Rule B: map movement alone must NOT refetch).
+  const getBiasRef = useRef(options?.getBias);
+  getBiasRef.current = options?.getBias;
+  const biasRef = useRef(options?.bias);
+  biasRef.current = options?.bias;
+  const searchTypeRef = useRef(options?.type ?? "place");
+  searchTypeRef.current = options?.type ?? "place";
 
   useEffect(() => {
     let active = true;
@@ -79,11 +99,21 @@ export function useSearch(query: string): UseSearchResult {
     const timer = window.setTimeout(() => {
       setStatus("loading");
       setError(null);
+
+      // Sample latest map-center bias at debounce fire time
+      const activeBias = getBiasRef.current ? getBiasRef.current() : biasRef.current;
+      const biasLat =
+        activeBias && typeof activeBias.latitude === "number" ? activeBias.latitude : undefined;
+      const biasLon =
+        activeBias && typeof activeBias.longitude === "number" ? activeBias.longitude : undefined;
+
       searchLocations({
         q: trimmed,
-        type: "place",
+        type: searchTypeRef.current,
         limit: SEARCH_LIMIT,
         sessionToken: sessionTokenRef.current,
+        biasLat,
+        biasLon,
         signal: controller.signal,
       })
         .then((next) => {

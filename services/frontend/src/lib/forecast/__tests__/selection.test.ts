@@ -1,6 +1,7 @@
 import {
   canonicalizeLongitude,
   coordinatesToSelectedLocation,
+  isValidCoordinate,
   searchResultToSelectedLocation,
   toPointSpecifier,
 } from "@/lib/forecast/selection";
@@ -55,6 +56,78 @@ describe("canonicalizeLongitude", () => {
     expect(canonicalizeLongitude(-105.0)).toBe(-105.0);
     expect(canonicalizeLongitude(174.4044)).toBeCloseTo(174.4044, 6);
     expect(canonicalizeLongitude(0)).toBe(0);
+  });
+});
+
+describe("isValidCoordinate", () => {
+  it("accepts valid geodetic coordinates including zero", () => {
+    expect(isValidCoordinate(0, 0)).toBe(true);
+    expect(isValidCoordinate(39.7392, -104.9903)).toBe(true);
+    expect(isValidCoordinate(-90, 180)).toBe(true);
+    expect(isValidCoordinate(90, -180)).toBe(true);
+    expect(isValidCoordinate(-90, -180)).toBe(true);
+    expect(isValidCoordinate(90, 180)).toBe(true);
+  });
+
+  it("rejects non-numeric, NaN, and infinite values", () => {
+    expect(isValidCoordinate(NaN, -105.0)).toBe(false);
+    expect(isValidCoordinate(40.0, NaN)).toBe(false);
+    expect(isValidCoordinate(Infinity, 0)).toBe(false);
+    expect(isValidCoordinate(0, -Infinity)).toBe(false);
+    expect(isValidCoordinate(null, 0)).toBe(false);
+    expect(isValidCoordinate(undefined, 0)).toBe(false);
+    expect(isValidCoordinate("40.0", "-105.0")).toBe(false);
+  });
+
+  it("rejects out-of-range coordinates", () => {
+    expect(isValidCoordinate(90.1, 0)).toBe(false);
+    expect(isValidCoordinate(-90.1, 0)).toBe(false);
+    expect(isValidCoordinate(0, 180.1)).toBe(false);
+    expect(isValidCoordinate(0, -180.1)).toBe(false);
+  });
+});
+
+describe("searchResultToSelectedLocation direct coordinates", () => {
+  it("converts direct place result into canonical SelectedLocation", () => {
+    const result: SearchResult = {
+      id: "place_denver",
+      object: "place",
+      name: "Denver",
+      region: "Colorado",
+      country: "United States",
+      elevation_m: null,
+      latitude: 39.7392,
+      longitude: -104.9903,
+      place_id: "51a3denver",
+    };
+    const selected = searchResultToSelectedLocation(result);
+    expect(selected).toMatchObject({
+      name: "Denver",
+      object: "coordinates",
+      id: "51a3denver",
+      resolvedVia: "coordinates",
+      latitude: 39.7392,
+      elevation_m: null,
+      region: "Colorado",
+      country: "United States",
+    });
+    expect(selected.longitude).toBeCloseTo(-104.9903, 4);
+  });
+
+  it("throws on invalid or missing coordinates", () => {
+    const invalidResult: SearchResult = {
+      id: "place_corrupt",
+      object: "place",
+      name: "Corrupt Place",
+      region: null,
+      country: null,
+      elevation_m: null,
+      latitude: 100.0,
+      longitude: -104.9903,
+    };
+    expect(() => searchResultToSelectedLocation(invalidResult)).toThrow(
+      "Invalid coordinates in search result"
+    );
   });
 });
 

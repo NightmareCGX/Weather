@@ -55,6 +55,16 @@ export interface ElevationResponse {
   elevation_m: number | null;
 }
 
+/** Approximate location response from GET /v1/locate. */
+export interface LocateResponse {
+  latitude: number;
+  longitude: number;
+  city: string | null;
+  region: string | null;
+  country: string | null;
+  approximate: boolean;
+}
+
 /**
  * The selected location shared by search, map click, and the forecast
  * dashboard. This is a frontend model, not a backend response shape: it

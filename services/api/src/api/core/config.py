@@ -24,17 +24,33 @@ class Settings(BaseSettings):
     # force HTTPS to a plain-HTTP endpoint (M14 fix).
     MINIO_SECURE: bool = False
 
-    # Location place-autocomplete provider (ACCEPTANCE_REMEDIATION_PLAN §13).
-    # ``google`` (default) uses the Places API (New) via
-    # ``api/services/places.py``; ``mapbox`` uses the Mapbox Geocoding API.
+    # Location place-autocomplete provider (Phase 1 Location Discovery).
+    # ``geoapify`` (default V1) uses Geoapify Address Autocomplete;
+    # ``locationiq`` uses LocationIQ Autocomplete;
+    # ``google`` uses the Places API (New); ``mapbox`` uses Mapbox Geocoding.
     # The API key/token lives server-side and is never exposed to the browser.
-    SEARCH_PROVIDER: Any = "google"
+    SEARCH_PROVIDER: Any = "geoapify"
+    GEOAPIFY_API_KEY: Any = ""
+    GEOAPIFY_API_BASE: Any = "https://api.geoapify.com/v1"
+    LOCATIONIQ_API_KEY: Any = ""
+    LOCATIONIQ_API_BASE: Any = "https://api.locationiq.com/v1"
+    SEARCH_PRIMARY_TIMEOUT_MS: int = 2000
+    SEARCH_FALLBACK_TIMEOUT_MS: int = 1500
+    SEARCH_CIRCUIT_BREAKER_FAILURES: int = 2
+    SEARCH_CIRCUIT_BREAKER_COOLDOWN_S: int = 60
+    SEARCH_CACHE_TTL_SECONDS: int = 300
+    SEARCH_CACHE_DISABLED: bool = False
     GOOGLE_PLACES_API_KEY: Any = ""
     GOOGLE_PLACES_API_BASE: Any = "https://places.googleapis.com/v1"
     GOOGLE_PLACES_REGION: Any = None
     # Socket timeout for Places HTTP calls (seconds).
     GOOGLE_PLACES_TIMEOUT: Any = 5.0
     MAPBOX_TOKEN: Any = ""
+
+    # Coarse IP geolocation fallback via infrastructure headers (Cloudflare Managed Transforms).
+    # Default False: externally supplied headers are NEVER trusted unless explicitly enabled
+    # in an environment where requests are strictly authenticated/firewalled to Cloudflare origins.
+    TRUST_CLOUDFLARE_LOCATION_HEADERS: bool = False
 
     # Reader-gate configuration (Zarr region-write concurrency).
     # The API serving tier participates in the SHARED store gate when reading

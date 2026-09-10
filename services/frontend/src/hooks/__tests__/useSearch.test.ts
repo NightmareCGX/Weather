@@ -214,4 +214,38 @@ describe("useSearch", () => {
     // No error or unexpected commit
     expect(result.current.results).toEqual([]);
   });
+
+  it("samples latest map-center bias when query changes", async () => {
+    mockFetch.mockResolvedValueOnce(envelopeList([]));
+    const getBias = jest.fn(() => ({ latitude: 39.2, longitude: -106.8 }));
+
+    renderHook(() => useSearch("Aspen", { getBias }));
+    advanceDebounce();
+
+    expect(getBias).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining("bias_lat=39.2&bias_lon=-106.8"),
+      expect.any(Object)
+    );
+  });
+
+  it("does NOT trigger search when map bias changes but query remains unchanged", () => {
+    let currentBias = { latitude: 39.2, longitude: -106.8 };
+    const getBias = () => currentBias;
+
+    mockFetch.mockResolvedValue(envelopeList([]));
+    const { rerender } = renderHook(({ q }) => useSearch(q, { getBias }), {
+      initialProps: { q: "Aspen" },
+    });
+    advanceDebounce();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    // Map moves: bias updates without query change
+    currentBias = { latitude: 37.77, longitude: -122.41 };
+    rerender({ q: "Aspen" });
+    advanceDebounce();
+
+    // Must NOT have issued a second fetch merely because map center moved!
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
 });

@@ -413,4 +413,99 @@ describe("WeatherMap", () => {
 
     expect(marker.remove).toHaveBeenCalled();
   });
+
+  it("calls map.flyTo when selectedLocation changes from an external source (e.g. search)", () => {
+    const { rerender } = renderMap({ selectedLocation: null });
+    const [map] = getInstances();
+
+    rerender(
+      <WeatherMap
+        layer={layer}
+        selectedLocation={coordinates}
+        validTime={null}
+        onSelect={jest.fn()}
+      />
+    );
+
+    expect(map.flyTo).toHaveBeenCalledTimes(1);
+    expect(map.flyTo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        center: [coordinates.longitude, coordinates.latitude],
+        zoom: 8,
+        essential: true,
+      })
+    );
+  });
+
+  it("does NOT call map.flyTo when selection is triggered by a direct map click", () => {
+    let currentSelected: SelectedLocation | null = null;
+    const onSelect = jest.fn((loc: SelectedLocation) => {
+      currentSelected = loc;
+    });
+
+    const { rerender } = renderMap({ onSelect, selectedLocation: currentSelected });
+    const [map] = getInstances();
+
+    map.fire("load");
+    map.fire("click", {
+      lngLat: {
+        lat: 38.1911,
+        lng: -106.8175,
+        wrap() {
+          return { lat: 38.1911, lng: -106.8175 };
+        },
+      },
+    });
+
+    expect(onSelect).toHaveBeenCalledTimes(1);
+
+    // Re-render with the location returned by click
+    rerender(
+      <WeatherMap
+        layer={layer}
+        selectedLocation={currentSelected}
+        validTime={null}
+        onSelect={onSelect}
+      />
+    );
+
+    // flyTo must NOT be called for a direct map click!
+    expect(map.flyTo).not.toHaveBeenCalled();
+  });
+
+  it("calls onCenterChange on moveend with normalized canonical coordinates", () => {
+    const onCenterChange = jest.fn();
+    renderMap({ onCenterChange });
+    const [map] = getInstances();
+
+    map.getCenter = jest.fn(() => ({ lng: 185.0, lat: 40.0 }) as any);
+
+    map.fire("load");
+    map.fire("moveend");
+
+    expect(onCenterChange).toHaveBeenCalledTimes(1);
+    // 185.0 longitude canonicalized to -175.0
+    expect(onCenterChange).toHaveBeenCalledWith({ latitude: 40.0, longitude: -175.0 });
+  });
+
+  it("renders LocateMeButton when onLocate prop is passed, and clicking it fires onLocate", () => {
+    const onLocate = jest.fn();
+    const { getByRole } = renderMap({ onLocate });
+
+    const btn = getByRole("button", { name: "Locate me" });
+    expect(btn).toBeInTheDocument();
+    expect(btn).toHaveAttribute("aria-busy", "false");
+
+    btn.click();
+    expect(onLocate).toHaveBeenCalledTimes(1);
+  });
+
+  it("displays busy state and disables LocateMeButton while locating", () => {
+    const onLocate = jest.fn();
+    const { getByRole } = renderMap({ onLocate, isLocating: true });
+
+    const btn = getByRole("button", { name: "Locate me" });
+    expect(btn).toHaveAttribute("aria-busy", "true");
+    expect(btn).toBeDisabled();
+  });
 });

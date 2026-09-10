@@ -869,3 +869,305 @@ test("mobile viewport: collapse restores map view with marker, expand restores f
   await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
 });
+
+test("direct place search selection: place with coordinates commits without calling /v1/search/places/*", async ({
+  page,
+}) => {
+  let resolvePlacesCalled = false;
+  await page.route("**/v1/search/places/*", (route) => {
+    resolvePlacesCalled = true;
+    route.fulfill({ status: 500 });
+  });
+
+  await page.goto("/");
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Vail");
+
+  const option = searchResults(page)
+    .getByRole("option", { name: /Vail, CO, USA/ })
+    .first();
+  await expect(option).toBeVisible();
+  await option.click();
+
+  // Forecast opens immediately with direct coordinates
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText("Vail, CO, USA", { exact: true })).toBeVisible();
+
+  // Verify /v1/search/places/* was never called!
+  expect(resolvePlacesCalled).toBe(false);
+});
+
+test("search attribution: search listbox renders accessible Geoapify and LocationIQ attribution footer", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+
+  await expect(searchResults(page)).toBeVisible();
+  const geoLink = searchResults(page).getByRole("link", { name: "Geoapify" });
+  await expect(geoLink).toBeVisible();
+  await expect(geoLink).toHaveAttribute("href", "https://www.geoapify.com");
+
+  const locLink = searchResults(page).getByRole("link", { name: "LocationIQ.com" });
+  await expect(locLink).toBeVisible();
+  await expect(locLink).toHaveAttribute("href", "https://locationiq.com");
+});
+
+test("startup privacy invariant: page load produces no geolocation prompt, no /v1/locate call, and null selection", async ({
+  page,
+}) => {
+  let locateEndpointCalled = false;
+  await page.route("**/v1/locate", (route) => {
+    locateEndpointCalled = true;
+    route.fulfill({ status: 404 });
+  });
+
+  await page.goto("/");
+
+  // Wait for map and header to be ready
+  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await page.waitForTimeout(1000);
+
+  // No forecast panel is open
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  // No marker on map
+  await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
+  // Zero /v1/locate calls
+  expect(locateEndpointCalled).toBe(false);
+});
+
+test("locate me allow: clicking Locate Me with granted permission commits location, moves map, and opens forecast", async ({
+  page,
+  context,
+}) => {
+  // Grant geolocation permission and configure coordinates (Seattle)
+  await context.grantPermissions(["geolocation"]);
+  await context.setGeolocation({ latitude: 47.6062, longitude: -122.3321 });
+
+  await page.goto("/");
+
+  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  await expect(locateBtn).toBeVisible();
+  await locateBtn.click();
+
+  // Marker appears and Forecast Panel opens with acquired coordinates
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText("47.6062, -122.3321")).toBeVisible();
+  await expect(page.locator(".maplibregl-marker")).toBeVisible();
+});
+
+test("locate me deny privacy: denying geolocation renders non-blocking alert and NEVER calls /v1/locate", async ({
+  page,
+  context,
+}) => {
+  let locateEndpointCalled = false;
+  await page.route("**/v1/locate", (route) => {
+    locateEndpointCalled = true;
+    route.fulfill({ status: 200 });
+  });
+
+  // Explicitly deny geolocation permissions
+  await context.clearPermissions();
+
+  await page.goto("/");
+
+  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  await locateBtn.click();
+
+  // Non-blocking alert rendered
+  const alert = page.getByRole("alert").filter({ hasText: "Location access denied" });
+  await expect(alert).toBeVisible();
+  await expect(alert).toContainText("Location access denied");
+
+  // Critical privacy invariant: NO /v1/locate was called!
+  expect(locateEndpointCalled).toBe(false);
+  // No forecast panel was opened
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+});
+
+test("mobile layout: Locate Me button, search bar, and controls remain non-overlapping at 375px", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.goto("/");
+
+  const searchInput = page.getByLabel(/Search for a city/);
+  await expect(searchInput).toBeVisible();
+
+  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  await expect(locateBtn).toBeVisible();
+
+  const searchBox = await searchInput.boundingBox();
+  const locateBox = await locateBtn.boundingBox();
+
+  expect(searchBox).not.toBeNull();
+  expect(locateBox).not.toBeNull();
+
+  // Verify Locate Me button does not overlap search input horizontally
+  expect(locateBox!.x).toBeGreaterThan(searchBox!.x + searchBox!.width);
+});
+
+test("map-pan network test: panning/zooming map does NOT issue search requests, query change samples latest bias", async ({
+  page,
+}) => {
+  let searchRequestCount = 0;
+  let lastSearchUrl = "";
+
+  await page.route("**/v1/search?*", (route) => {
+    searchRequestCount += 1;
+    lastSearchUrl = route.request().url();
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ object: "list", data: [], has_more: false, next_cursor: null }),
+    });
+  });
+
+  await page.goto("/");
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Denver");
+  await page.waitForTimeout(400); // allow debounce
+
+  const initialCount = searchRequestCount;
+  expect(initialCount).toBeGreaterThanOrEqual(1);
+
+  // Pan the map multiple times
+  const map = page.getByTestId("weather-map");
+  await map.dragTo(map, { sourcePosition: { x: 200, y: 200 }, targetPosition: { x: 100, y: 100 } });
+  await page.waitForTimeout(500);
+  await map.dragTo(map, { sourcePosition: { x: 150, y: 150 }, targetPosition: { x: 250, y: 250 } });
+  await page.waitForTimeout(500);
+
+  // Invariant: map panning alone must NOT increase search request count!
+  expect(searchRequestCount).toBe(initialCount);
+
+  // Now modify the query
+  await input.fill("Denver West");
+  await page.waitForTimeout(400); // allow debounce
+
+  // Exactly one new debounced search request must have fired
+  expect(searchRequestCount).toBe(initialCount + 1);
+  expect(lastSearchUrl).toContain("q=Denver+West");
+});
+
+test("selection race page-level test: delayed geolocation does not overwrite subsequent user selection", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["geolocation"]);
+
+  let resolveGeo!: (pos: GeolocationPosition) => void;
+  // Override navigator.geolocation in page with controlled delayed promise
+  await page.addInitScript(() => {
+    let pendingResolve: any = null;
+    (window as any).__resolveGeo = (pos: any) => {
+      if (pendingResolve) pendingResolve(pos);
+    };
+    navigator.geolocation.getCurrentPosition = (success, error, options) => {
+      new Promise((resolve) => {
+        pendingResolve = resolve;
+      }).then((pos) => success(pos as any));
+    };
+  });
+
+  await page.goto("/");
+
+  // 1. Click Locate Me (in flight)
+  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  await locateBtn.click();
+  await expect(locateBtn).toHaveAttribute("aria-busy", "true");
+
+  // 2. Before geolocation finishes, user explicitly selects a search result (Aspen)
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  const option = searchResults(page).getByRole("option", { name: /Aspen/ }).first();
+  await expect(option).toBeVisible();
+  await option.click();
+
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
+
+  // 3. Delayed geolocation fix (Seattle) arrives late
+  await page.evaluate(() => {
+    (window as any).__resolveGeo({
+      coords: { latitude: 47.6062, longitude: -122.3321 },
+    });
+  });
+  await page.waitForTimeout(500);
+
+  // Invariant: Aspen MUST remain selected; Seattle fix must be rejected by generation guard!
+  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
+  await expect(page.getByText("47.6062, -122.3321")).toHaveCount(0);
+});
+
+test("forecast panel reopen UI: Search, Map Click, and Locate Me all reopen panel after close", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["geolocation"]);
+  await context.setGeolocation({ latitude: 47.6062, longitude: -122.3321 });
+
+  await page.goto("/");
+
+  // 1. Search selection opens panel
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+
+  // Close panel
+  await page.getByRole("button", { name: "Close forecast panel" }).click();
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+
+  // 2. Map click reopens panel
+  const map = page.getByTestId("weather-map");
+  await map.click({ position: { x: 300, y: 200 } });
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+
+  // Close panel again
+  await page.getByRole("button", { name: "Close forecast panel" }).click();
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+
+  // 3. Locate Me reopens panel
+  await page.getByRole("button", { name: "Locate me" }).click();
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText("47.6062, -122.3321")).toBeVisible();
+});
+
+test("mobile runtime layout screenshots: capture 375x667 and 390x844 viewports", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["geolocation"]);
+  await context.setGeolocation({ latitude: 39.7392, longitude: -104.9903 });
+
+  for (const viewport of [
+    { width: 375, height: 667, name: "375x667" },
+    { width: 390, height: 844, name: "390x844" },
+  ]) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.goto("/");
+
+    // 1. Locate Me idle screenshot
+    await expect(page.getByRole("button", { name: "Locate me" })).toBeVisible();
+    await page.screenshot({
+      path: `services/frontend/e2e/screenshots/locate-me-idle-${viewport.name}.png`,
+    });
+
+    // 2. Search dropdown open & attribution visible screenshot
+    const input = page.getByLabel(/Search for a city/);
+    await input.fill("Aspen");
+    await expect(searchResults(page)).toBeVisible();
+    await page.screenshot({
+      path: `services/frontend/e2e/screenshots/search-dropdown-attribution-${viewport.name}.png`,
+    });
+
+    // 3. Forecast panel open screenshot
+    await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+    await expect(page.getByText("Hourly Forecast")).toBeVisible();
+    await page.screenshot({
+      path: `services/frontend/e2e/screenshots/forecast-panel-open-${viewport.name}.png`,
+    });
+  }
+});

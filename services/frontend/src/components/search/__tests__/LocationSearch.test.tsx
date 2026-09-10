@@ -457,4 +457,69 @@ describe("LocationSearch", () => {
       expect(onSelect).not.toHaveBeenCalled();
     });
   });
+
+  describe("Phase 2 direct coordinates and attribution", () => {
+    it("selects an external place with direct coordinates synchronously without calling resolvePlace", () => {
+      mockUseSearch.mockReturnValue({
+        results: [
+          {
+            id: "place_direct_denver",
+            object: "place",
+            name: "Denver",
+            region: "Colorado",
+            country: "United States",
+            elevation_m: null,
+            latitude: 39.7392,
+            longitude: -104.9903,
+            place_id: "geo_denver_51a3",
+          },
+        ],
+        status: "success",
+        error: null,
+        sessionToken: "test-session-token",
+      });
+
+      const onSelect = jest.fn();
+      render(<LocationSearch onSelect={onSelect} />);
+      const input = screen.getByRole("combobox");
+
+      typeQuery(input, "Denver");
+      fireEvent.mouseDown(optionByText("Denver"));
+
+      // Synchronous commit — resolvePlace must NOT be called!
+      expect(mockResolvePlace).not.toHaveBeenCalled();
+      expect(onSelect).toHaveBeenCalledTimes(1);
+      expect(onSelect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Denver",
+          object: "coordinates",
+          id: "geo_denver_51a3",
+          resolvedVia: "coordinates",
+          latitude: 39.7392,
+          elevation_m: null,
+          region: "Colorado",
+          country: "United States",
+        })
+      );
+      expect(onSelect.mock.calls[0][0].longitude).toBeCloseTo(-104.9903, 4);
+    });
+
+    it("renders keyboard-accessible static attribution footer for Geoapify and LocationIQ", () => {
+      mockResultsForQuery("Aspen");
+      render(<LocationSearch onSelect={jest.fn()} />);
+      const input = screen.getByRole("combobox");
+
+      typeQuery(input, "Aspen");
+
+      const geoapifyLink = screen.getByRole("link", { name: "Geoapify" });
+      expect(geoapifyLink).toBeInTheDocument();
+      expect(geoapifyLink).toHaveAttribute("href", "https://www.geoapify.com");
+      expect(geoapifyLink).toHaveAttribute("target", "_blank");
+
+      const locationiqLink = screen.getByRole("link", { name: "LocationIQ.com" });
+      expect(locationiqLink).toBeInTheDocument();
+      expect(locationiqLink).toHaveAttribute("href", "https://locationiq.com");
+      expect(locationiqLink).toHaveAttribute("target", "_blank");
+    });
+  });
 });

@@ -225,3 +225,208 @@ def test_mapbox_provider_alternative() -> None:
     assert suggestions[0].place_id == "poi.1"
     place = provider.resolve("poi.1")
     assert place.latitude == pytest.approx(39.7392)
+
+
+# --- Geoapify Provider Tests (V1 Primary) ---
+
+
+def test_geoapify_suggest_parses_geojson_with_direct_coordinates() -> None:
+    from api.schemas import SearchBias
+    from api.services.places import GeoapifyAutocompleteProvider
+
+    captured_url: list[str] = []
+
+    def transport(method: str, url: str, headers: Mapping[str, str], body: str | None, **kw) -> tuple[int, Any]:
+        captured_url.append(url)
+        return (
+            200,
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "name": "Denver",
+                            "city": "Denver",
+                            "state": "Colorado",
+                            "country": "United States",
+                            "formatted": "Denver, CO, United States",
+                            "address_line2": "Colorado, United States",
+                            "place_id": "51a3denver",
+                            "lon": -104.9903,
+                            "lat": 39.7392,
+                        },
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [-104.9903, 39.7392],
+                        },
+                    }
+                ],
+            },
+        )
+
+    provider = GeoapifyAutocompleteProvider(
+        api_key="geo-key-123",
+        transport=transport,
+    )
+    bias = SearchBias(latitude=39.74, longitude=-104.99)
+    suggestions = provider.suggest("denver", bias=bias, limit=5)
+    assert len(suggestions) == 1
+    s = suggestions[0]
+    assert s.main_text == "Denver"
+    assert s.place_id == "51a3denver"
+    assert s.latitude == pytest.approx(39.7392)
+    assert s.longitude == pytest.approx(-104.9903)
+    assert s.region == "Colorado"
+    assert s.country == "United States"
+
+    # Verify English language and bias parameter presence
+    assert len(captured_url) == 1
+    assert "lang=en" in captured_url[0]
+    assert "apiKey=geo-key-123" in captured_url[0]
+    assert "bias=proximity%3A-104.99%2C39.74" in captured_url[0] or "bias=proximity:-104.99,39.74" in captured_url[0]
+
+
+def test_geoapify_malformed_response_raises() -> None:
+    from api.services.places import GeoapifyAutocompleteProvider
+
+    # Non-dict payload
+    def transport_non_dict(method, url, headers, body, **kw):
+        return 200, ["not", "a", "dict"]
+
+    provider = GeoapifyAutocompleteProvider(api_key="k", transport=transport_non_dict)
+    with pytest.raises(PlaceAutocompleteError, match="expected dict"):
+        provider.suggest("denver")
+
+    # Missing features list
+    def transport_missing_features(method, url, headers, body, **kw):
+        return 200, {"features": "not_a_list"}
+
+    provider = GeoapifyAutocompleteProvider(api_key="k", transport=transport_missing_features)
+    with pytest.raises(PlaceAutocompleteError, match="missing features list"):
+        provider.suggest("denver")
+
+
+def test_geoapify_missing_key_raises() -> None:
+    from api.services.places import GeoapifyAutocompleteProvider
+
+    provider = GeoapifyAutocompleteProvider(api_key="")
+    with pytest.raises(PlaceAutocompleteError, match="Geoapify API key not configured"):
+        provider.suggest("denver")
+
+
+def test_geoapify_rate_limit_raises_429() -> None:
+    from api.services.places import GeoapifyAutocompleteProvider, PlaceRateLimitError
+
+    def transport(method: str, url: str, headers: Mapping[str, str], body: str | None, **kw) -> tuple[int, Any]:
+        return 429, {"message": "Daily limit reached"}
+
+    provider = GeoapifyAutocompleteProvider(api_key="k", transport=transport)
+    with pytest.raises(PlaceRateLimitError, match="rate limit"):
+        provider.suggest("denver")
+
+
+def test_geoapify_timeout_raises_timeout_error() -> None:
+    from api.services.places import GeoapifyAutocompleteProvider, PlaceTimeoutError
+
+    def transport(method: str, url: str, headers: Mapping[str, str], body: str | None, **kw) -> tuple[int, Any]:
+        return 0, {"error": {"message": "timed out"}}
+
+    provider = GeoapifyAutocompleteProvider(api_key="k", transport=transport)
+    with pytest.raises(PlaceTimeoutError, match="timed out"):
+        provider.suggest("denver")
+
+
+# --- LocationIQ Provider Tests (V1 Fallback) ---
+
+
+def test_locationiq_suggest_parses_json_with_direct_coordinates() -> None:
+    from api.schemas import SearchBias
+    from api.services.places import LocationIQAutocompleteProvider
+
+    captured_url: list[str] = []
+
+    def transport(method: str, url: str, headers: Mapping[str, str], body: str | None, **kw) -> tuple[int, Any]:
+        captured_url.append(url)
+        return (
+            200,
+            [
+                {
+                    "place_id": "12345",
+                    "lat": "39.7392",
+                    "lon": "-104.9903",
+                    "display_name": "Denver, Colorado, United States",
+                    "display_place": "Denver",
+                    "display_address": "Colorado, United States",
+                    "address": {
+                        "city": "Denver",
+                        "state": "Colorado",
+                        "country": "United States",
+                    },
+                }
+            ],
+        )
+
+    provider = LocationIQAutocompleteProvider(
+        api_key="loc-key-456",
+        transport=transport,
+    )
+    bias = SearchBias(latitude=39.74, longitude=-104.99)
+    suggestions = provider.suggest("denver", bias=bias, limit=5)
+    assert len(suggestions) == 1
+    s = suggestions[0]
+    assert s.main_text == "Denver"
+    assert s.place_id == "12345"
+    assert s.latitude == pytest.approx(39.7392)
+    assert s.longitude == pytest.approx(-104.9903)
+    assert s.region == "Colorado"
+    assert s.country == "United States"
+
+    # Verify English parameter and viewbox presence
+    assert len(captured_url) == 1
+    assert "accept-language=en" in captured_url[0]
+    assert "key=loc-key-456" in captured_url[0]
+    assert "viewbox=" in captured_url[0]
+
+
+def test_locationiq_malformed_response_raises() -> None:
+    from api.services.places import LocationIQAutocompleteProvider
+
+    # Non-list payload (e.g. dict or string)
+    def transport_non_list(method, url, headers, body, **kw):
+        return 200, {"not": "a list"}
+
+    provider = LocationIQAutocompleteProvider(api_key="k", transport=transport_non_list)
+    with pytest.raises(PlaceAutocompleteError, match="expected list"):
+        provider.suggest("denver")
+
+
+def test_locationiq_missing_key_raises() -> None:
+    from api.services.places import LocationIQAutocompleteProvider
+
+    provider = LocationIQAutocompleteProvider(api_key="")
+    with pytest.raises(PlaceAutocompleteError, match="LocationIQ API key not configured"):
+        provider.suggest("denver")
+
+
+def test_locationiq_rate_limit_raises_429() -> None:
+    from api.services.places import LocationIQAutocompleteProvider, PlaceRateLimitError
+
+    def transport(method: str, url: str, headers: Mapping[str, str], body: str | None, **kw) -> tuple[int, Any]:
+        return 429, {"error": "Rate limit exceeded"}
+
+    provider = LocationIQAutocompleteProvider(api_key="k", transport=transport)
+    with pytest.raises(PlaceRateLimitError, match="rate limit"):
+        provider.suggest("denver")
+
+
+def test_locationiq_timeout_raises_timeout_error() -> None:
+    from api.services.places import LocationIQAutocompleteProvider, PlaceTimeoutError
+
+    def transport(method: str, url: str, headers: Mapping[str, str], body: str | None, **kw) -> tuple[int, Any]:
+        return 0, {"error": {"message": "network error: timed out"}}
+
+    provider = LocationIQAutocompleteProvider(api_key="k", transport=transport)
+    with pytest.raises(PlaceTimeoutError, match="timed out"):
+        provider.suggest("denver")
+
