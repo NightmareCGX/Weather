@@ -271,17 +271,6 @@ export function getPointForecastPhaseLabel(
     return "Dry";
   }
 
-  // If multiple physical phases apply from categorical flags, classify as Mixed with constituents
-  const flagConstituents: string[] = [];
-  if (entry.crain != null && entry.crain >= 0.5) flagConstituents.push("Rain");
-  if (entry.csnow != null && entry.csnow >= 0.5) flagConstituents.push("Snow");
-  if (entry.cfrzr != null && entry.cfrzr >= 0.5) flagConstituents.push("Freezing Rain");
-  if (entry.cicep != null && entry.cicep >= 0.5) flagConstituents.push("Ice Pellets");
-
-  if (flagConstituents.length > 1) {
-    return `Mixed (${flagConstituents.join(" + ")})`;
-  }
-
   const transition = entry.precipitation_transition;
   const pType = entry.precipitation_type;
 
@@ -318,6 +307,17 @@ export function getPointForecastPhaseLabel(
       return "Mixed";
     }
     if (transition === "unknown") return "Unclassified";
+  }
+
+  // If multiple physical phases apply from categorical flags, classify as Mixed with constituents
+  const flagConstituents: string[] = [];
+  if (entry.crain != null && entry.crain >= 0.5) flagConstituents.push("Rain");
+  if (entry.csnow != null && entry.csnow >= 0.5) flagConstituents.push("Snow");
+  if (entry.cfrzr != null && entry.cfrzr >= 0.5) flagConstituents.push("Freezing Rain");
+  if (entry.cicep != null && entry.cicep >= 0.5) flagConstituents.push("Ice Pellets");
+
+  if (flagConstituents.length > 1) {
+    return `Mixed (${flagConstituents.join(" + ")})`;
   }
 
   // Fallback to precipitation_type

@@ -258,5 +258,83 @@ describe("Meteogram", () => {
         "3-Hour Precipitation Amount",
       ]);
     });
+
+    it("formats 1.83 mm Mixed precipitation with (Rain + Snow) from real API response shape", () => {
+      // Faithful reproduction of the real /v1/points API payload that previously manifested:
+      // "3-Hour Precipitation Amount: 1.83 mm · Mixed"
+      const realApiForecastEntries: ForecastEntry[] = [
+        {
+          lead_time_hours: 6,
+          valid_time: "2026-09-10T06:00:00Z",
+          cycle_time: "2026-09-10T00:00:00Z",
+          precipitation_amount_3h: 1.83,
+          precipitation_type: "mixed",
+          precipitation_transition: "mixed_transition",
+          precipitation_start_type: "none",
+          precipitation_end_type: "mixed",
+          precipitation_evidence: "strongly_inferred",
+          crain: 1.0,
+          csnow: 1.0,
+          cfrzr: 0.0,
+          cicep: 0.0,
+          temperature_2m: 1.2,
+        },
+      ];
+
+      render(
+        <Meteogram
+          forecasts={realApiForecastEntries}
+          variableCode="precipitation_amount_3h"
+          meta={{ name: "3-Hour Precipitation Amount", unit: "mm" }}
+        />
+      );
+
+      const formattedTooltip = lastTooltipProps.formatter(1.83, "3-Hour Precipitation Amount", {
+        payload: lastChartData[0],
+      });
+
+      expect(formattedTooltip).toEqual([
+        "1.83 mm · Mixed (Rain + Snow)",
+        "3-Hour Precipitation Amount",
+      ]);
+    });
+
+    it("formats GEFS ensemble-mean Mixed tooltip from real API response shape with fractional flags", () => {
+      const gefsApiForecastEntries: ForecastEntry[] = [
+        {
+          lead_time_hours: 6,
+          valid_time: "2026-09-10T06:00:00Z",
+          cycle_time: "2026-09-10T00:00:00Z",
+          precipitation_amount_3h: 1.83,
+          precipitation_type: "mixed",
+          precipitation_transition: "mixed_transition",
+          precipitation_start_type: "none",
+          precipitation_end_type: "mixed",
+          precipitation_evidence: "strongly_inferred",
+          crain: 0.65,
+          csnow: 0.55,
+          cfrzr: 0.05,
+          cicep: 0.0,
+          temperature_2m: 0.8,
+        },
+      ];
+
+      render(
+        <Meteogram
+          forecasts={gefsApiForecastEntries}
+          variableCode="precipitation_amount_3h"
+          meta={{ name: "3-Hour Precipitation Amount", unit: "mm" }}
+        />
+      );
+
+      const formattedTooltip = lastTooltipProps.formatter(1.83, "3-Hour Precipitation Amount", {
+        payload: lastChartData[0],
+      });
+
+      expect(formattedTooltip).toEqual([
+        "1.83 mm · Mixed (Rain + Snow)",
+        "3-Hour Precipitation Amount",
+      ]);
+    });
   });
 });
