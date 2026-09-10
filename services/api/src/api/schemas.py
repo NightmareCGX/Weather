@@ -8,7 +8,7 @@ no weather calculations or database access live here.
 from datetime import date, datetime, timezone
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, field_serializer, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_serializer
 
 
 def format_datetime_utc(value: datetime) -> str:
@@ -331,6 +331,13 @@ class PointForecastEnvelope(BaseModel):
     next_cursor: str | None = None
 
 
+class SearchBias(BaseModel):
+    """Soft geographic proximity bias coordinate pair (WGS84)."""
+
+    latitude: float = Field(ge=-90.0, le=90.0)
+    longitude: float = Field(ge=-180.0, le=180.0)
+
+
 class SearchResultOut(BaseModel):
     """A location search result (API.md section 6.1).
 
@@ -357,6 +364,17 @@ class ElevationOut(BaseModel):
     latitude: float
     longitude: float
     elevation_m: float | None = None
+
+
+class LocateOut(BaseModel):
+    """Approximate location resolved from trusted infrastructure IP headers."""
+
+    latitude: float
+    longitude: float
+    city: str | None = None
+    region: str | None = None
+    country: str | None = None
+    approximate: bool = True
 
 
 class ProbabilityLocation(BaseModel):

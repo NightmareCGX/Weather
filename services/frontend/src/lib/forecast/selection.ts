@@ -24,6 +24,20 @@ export function canonicalizeLongitude(longitude: number): number {
   return w === -180 ? 180 : w;
 }
 
+/**
+ * Validate that coordinates are finite numbers within standard geodetic bounds.
+ * Note that 0 is a valid latitude and longitude.
+ */
+export function isValidCoordinate(latitude: unknown, longitude: unknown): boolean {
+  if (typeof latitude !== "number" || typeof longitude !== "number") {
+    return false;
+  }
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    return false;
+  }
+  return latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180;
+}
+
 /** Format a coordinate pair as a stable label, e.g. `"38.19, -106.82"`. */
 export function formatCoordinates(latitude: number, longitude: number): string {
   return `${latitude.toFixed(COORDINATE_PRECISION)}, ${longitude.toFixed(COORDINATE_PRECISION)}`;
@@ -32,6 +46,11 @@ export function formatCoordinates(latitude: number, longitude: number): string {
 /** Convert a `/v1/search` result into the shared selected-location model. */
 export function searchResultToSelectedLocation(result: SearchResult): SelectedLocation {
   const canonicalLon = canonicalizeLongitude(result.longitude);
+  if (!isValidCoordinate(result.latitude, canonicalLon)) {
+    throw new Error(
+      `Invalid coordinates in search result: latitude=${result.latitude}, longitude=${result.longitude}`
+    );
+  }
   const base = {
     name: result.name,
     latitude: result.latitude,
@@ -83,6 +102,9 @@ export function coordinatesToSelectedLocation(
   longitude: number
 ): SelectedLocation {
   const canonicalLon = canonicalizeLongitude(longitude);
+  if (!isValidCoordinate(latitude, canonicalLon)) {
+    throw new Error(`Invalid coordinates: latitude=${latitude}, longitude=${longitude}`);
+  }
   return {
     name: formatCoordinates(latitude, canonicalLon),
     object: "coordinates",

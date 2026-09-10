@@ -842,6 +842,17 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
         longitude: -106.82,
       },
       {
+        id: "place_direct_vail",
+        object: "place",
+        name: "Vail, CO, USA",
+        place_id: "geo_vail_direct",
+        region: "Colorado",
+        country: "USA",
+        elevation_m: null,
+        latitude: 39.6403,
+        longitude: -106.3742,
+      },
+      {
         id: "place_boulder",
         object: "place",
         name: "Boulder, CO",
@@ -858,6 +869,21 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(envelope(matches, "list")),
+    });
+  });
+
+  await page.route("**/v1/locate", (route) => {
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        latitude: 39.7392,
+        longitude: -104.9903,
+        city: "Denver",
+        region: "Colorado",
+        country: "US",
+        approximate: true,
+      }),
     });
   });
 

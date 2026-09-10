@@ -523,6 +523,46 @@
               "title": "Session Token"
             },
             "description": "Places search-session token (Google billing semantics): one token spans an autocomplete session so the provider bills one Autocomplete request instead of one per keystroke."
+          },
+          {
+            "name": "bias_lat",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "maximum": 90.0,
+                  "minimum": -90.0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Latitude for soft proximity bias (-90.0 to 90.0).",
+              "title": "Bias Lat"
+            },
+            "description": "Latitude for soft proximity bias (-90.0 to 90.0)."
+          },
+          {
+            "name": "bias_lon",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "maximum": 180.0,
+                  "minimum": -180.0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Longitude for soft proximity bias (-180.0 to 180.0).",
+              "title": "Bias Lon"
+            },
+            "description": "Longitude for soft proximity bias (-180.0 to 180.0)."
           }
         ],
         "responses": {
@@ -778,7 +818,7 @@
     "/v1/elevation": {
       "get": {
         "summary": "Get terrain elevation for geographic coordinates",
-        "description": "Return terrain elevation in meters for a coordinate, or null if unavailable.\n\nDelegates to the configured elevation provider (Open-Meteo or null) wrapped\nin a popularity-aware, decaying coordinate cache. Provider timeouts,\noutages, or ocean/void terrain values return HTTP 200 with ``elevation_m: null``\nso the client can render 'unavailable' gracefully without error states.",
+        "description": "Return terrain elevation in meters for a coordinate, or null if unavailable.\n\nDelegates to the configured elevation provider (Open-Meteo or null) wrapped\nin a popularity-aware, decaying coordinate cache. Provider timeouts,\noutages, or ocean/void terrain values return HTTP 200 with ``elevation_m: null``\nso the client can render 'unavailable' gracefully without error states.\n\nHTTP Cache semantics:\n* Non-null elevation (successful lookup) -> ``public, max-age=86400``\n* Null elevation (failure/timeout/unavailable) -> ``no-store`` (prevents\n  transient provider outages from being negatively cached for 24 hours).",
         "operationId": "get_elevation_v1_elevation_get",
         "parameters": [
           {
@@ -825,6 +865,25 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/locate": {
+      "get": {
+        "summary": "Get coarse approximate location from infrastructure IP headers",
+        "description": "Resolve coarse approximate location from trusted Cloudflare headers.\n\nSafety:\n- Disabled by default (TRUST_CLOUDFLARE_LOCATION_HEADERS=False). In this\n  mode, externally supplied headers are never trusted and 404 is returned.\n- When enabled, headers are parsed, validated for finite range (lat in [-90, 90],\n  lon in [-180, 180]), and normalized.\n- If headers are missing, malformed, or out of range, returns HTTP 404\n  (location unavailable).",
+        "operationId": "locate_v1_locate_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocateOut"
                 }
               }
             }
@@ -2258,6 +2317,60 @@
         "type": "object",
         "required": ["data"],
         "title": "ListEnvelope[VariableOut]"
+      },
+      "LocateOut": {
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "title": "Latitude"
+          },
+          "longitude": {
+            "type": "number",
+            "title": "Longitude"
+          },
+          "city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Country"
+          },
+          "approximate": {
+            "type": "boolean",
+            "title": "Approximate",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": ["latitude", "longitude"],
+        "title": "LocateOut",
+        "description": "Approximate location resolved from trusted infrastructure IP headers."
       },
       "ModelAvailability": {
         "properties": {

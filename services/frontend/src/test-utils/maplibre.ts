@@ -78,6 +78,9 @@ export class MockMap {
     x: (lng + 180) * 2,
     y: (90 - lat) * 2,
   }));
+  flyTo = jest.fn();
+  getZoom = jest.fn(() => 5);
+  getCenter = jest.fn(() => ({ lng: -106.8, lat: 39.2 }));
   remove = jest.fn(() => {
     this.removed = true;
   });

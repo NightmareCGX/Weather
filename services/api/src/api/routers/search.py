@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
-from api.schemas import ListEnvelope, SearchResultOut
+from api.schemas import ListEnvelope, SearchBias, SearchResultOut
 from api.services.places import PlaceAutocompleteError
 from api.services.search import (
     DEFAULT_LIMIT,
@@ -60,6 +60,22 @@ def search(
             )
         ),
     ] = None,
+    bias_lat: Annotated[
+        float | None,
+        Query(
+            ge=-90.0,
+            le=90.0,
+            description="Latitude for soft proximity bias (-90.0 to 90.0).",
+        ),
+    ] = None,
+    bias_lon: Annotated[
+        float | None,
+        Query(
+            ge=-180.0,
+            le=180.0,
+            description="Longitude for soft proximity bias (-180.0 to 180.0).",
+        ),
+    ] = None,
     db: Session = DB,
 ) -> ListEnvelope[SearchResultOut]:
     """Search cities, ski resorts, stations, or places.
@@ -69,15 +85,34 @@ def search(
     all of them (``all``, the default), or delegates to the place-autocomplete
     provider (``place``). Results are returned in the universal list envelope.
     """
+    if (bias_lat is None) != (bias_lon is None):
+        raise HTTPException(
+            status_code=422,
+            detail="bias_lat and bias_lon must both be provided together",
+        )
+    bias = (
+        SearchBias(latitude=bias_lat, longitude=bias_lon)
+        if bias_lat is not None and bias_lon is not None
+        else None
+    )
     try:
-        results = search_locations(db, q, type, limit, session_token=session_token)
+        results = search_locations(
+            db,
+            q,
+            type,
+            limit,
+            session_token=session_token,
+            bias=bias,
+        )
     except PlaceAutocompleteError as exc:
         # The provider failed: surface a graceful 502 so the combobox shows
         # its error state rather than crashing or returning a partial result.
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     response.headers["Cache-Control"] = (
         CACHE_CONTROL_PLACES if type == "place" else CACHE_CONTROL_DAILY
     )
+
     return ListEnvelope[SearchResultOut](data=results)
 
 

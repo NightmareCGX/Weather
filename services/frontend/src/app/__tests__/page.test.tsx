@@ -15,10 +15,12 @@ jest.mock("../../components/map/WeatherMap", () => {
     layer,
     selectedLocation,
     onSelect,
+    onLocate,
   }: {
     layer: SpatialLayer | null;
     selectedLocation: SelectedLocation | null;
     onSelect: (loc: SelectedLocation) => void;
+    onLocate?: () => void;
   }) {
     lastRenderedLayer = layer;
     lastRenderedLocation = selectedLocation;
@@ -28,7 +30,13 @@ jest.mock("../../components/map/WeatherMap", () => {
         data-testid="weather-map"
         data-layer-lead={layer?.lead_time_hours}
         data-has-location={selectedLocation !== null}
-      />
+      >
+        {onLocate && (
+          <button type="button" aria-label="Locate me" onClick={onLocate}>
+            Locate me
+          </button>
+        )}
+      </div>
     );
   }
   return { __esModule: true, default: WeatherMapStub, WeatherMap: WeatherMapStub };
@@ -536,5 +544,78 @@ describe("HomePage", () => {
     const newCollapseBtn = screen.getByRole("button", { name: "Collapse forecast panel" });
     expect(newCollapseBtn).toHaveAttribute("aria-expanded", "true");
     expect(document.getElementById("forecast-panel-content")).not.toHaveClass("hidden");
+  });
+
+  it("clicking Locate Me successfully acquires location and opens forecast panel", async () => {
+    const mockGetCurrentPosition = jest.fn();
+    Object.defineProperty(globalThis, "navigator", {
+      value: {
+        geolocation: {
+          getCurrentPosition: mockGetCurrentPosition,
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    renderPage();
+
+    const locateBtn = await screen.findByRole("button", { name: "Locate me" });
+    expect(locateBtn).toBeInTheDocument();
+
+    fireEvent.click(locateBtn);
+    expect(mockGetCurrentPosition).toHaveBeenCalledTimes(1);
+
+    const [successCb] = mockGetCurrentPosition.mock.calls[0];
+    act(() => {
+      successCb({
+        coords: {
+          latitude: 39.7392,
+          longitude: -104.9903,
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+      expect(screen.getByText("39.7392, -104.9903")).toBeInTheDocument();
+    });
+  });
+
+  it("Locate Me permission denial displays non-blocking alert without calling /v1/locate", async () => {
+    const mockGetCurrentPosition = jest.fn();
+    Object.defineProperty(globalThis, "navigator", {
+      value: {
+        geolocation: {
+          getCurrentPosition: mockGetCurrentPosition,
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    renderPage();
+
+    const locateBtn = await screen.findByRole("button", { name: "Locate me" });
+    fireEvent.click(locateBtn);
+
+    const [, errorCb] = mockGetCurrentPosition.mock.calls[0];
+    act(() => {
+      errorCb({
+        code: 1, // PERMISSION_DENIED
+        PERMISSION_DENIED: 1,
+        message: "User denied Geolocation",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Location access denied");
+    });
+
+    // Strict privacy invariant: verify /v1/locate was NOT fetched
+    const locateCalls = mockFetch.mock.calls.filter((call) =>
+      String(call[0]).includes("/v1/locate")
+    );
+    expect(locateCalls).toHaveLength(0);
   });
 });

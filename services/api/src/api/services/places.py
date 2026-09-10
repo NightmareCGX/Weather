@@ -2,29 +2,28 @@
 
 The frontend combobox already provides debounce/abort/stale-guard/keyboard
 navigation; what it lacked is a real place-autocomplete data source. This
-module is the backend provider abstraction that backs ``/v1/search?type=place``
-(ACCEPTANCE_REMEDIATION_PLAN §13):
+module is the backend provider abstraction that backs ``/v1/search?type=place``:
 
 * :class:`PlaceAutocompleteProvider` is the application-level interface;
-* :class:`GooglePlacesAutocompleteProvider` calls the **Places API (New)**
-  Autocomplete + Place Details endpoints server-side, so the API key never
-  reaches the browser;
-* :class:`MapboxGeocodingProvider` is the drop-in alternative behind the same
-  interface.
-
-Session-token semantics: a fresh UUIDv4 is generated per search session, reused
-for every autocomplete keystroke and the subsequent place-details resolution, so
-Google bills one session per completed selection rather than per keystroke.
+* :class:`GeoapifyAutocompleteProvider` calls Geoapify Address Autocomplete
+  server-side (V1 Primary) and extracts native WGS84 coordinates directly;
+* :class:`LocationIQAutocompleteProvider` calls LocationIQ Autocomplete
+  server-side (V1 Fallback);
+* :class:`GooglePlacesAutocompleteProvider` calls Google Places API (New)
+  (retained for reference / backwards compatibility);
+* :class:`MapboxGeocodingProvider` calls Mapbox Geocoding
+  (retained for reference / backwards compatibility).
 
 The provider is network-free by construction for tests: the HTTP transport is a
 small injectable callable (``httpx``-style), so tests supply a fake transport and
-never touch live Google services.
+never touch live external services.
 """
 
 from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from abc import ABC, abstractmethod
@@ -32,11 +31,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from api.core.config import settings
+from api.schemas import SearchBias
 
 #: Default max suggestions returned by autocomplete.
 DEFAULT_SUGGESTION_LIMIT = 8
-#: Place types included in autocomplete so results are actual places (localities,
-#: addresses), not text queries (which are billed at the higher Text Search rate).
+#: Place types included in Google autocomplete so results are actual places.
 DEFAULT_INCLUDED_PRIMARY_TYPES = ["locality", "address", "airport", "establishment"]
 
 
@@ -49,12 +48,22 @@ class PlaceSuggestion:
         main_text: The primary display name (e.g. "Denver").
         secondary_text: The secondary line (e.g. "CO, USA").
         full_text: The full formatted suggestion text.
+        latitude: WGS 84 latitude (when returned directly by provider).
+        longitude: WGS 84 longitude (when returned directly by provider).
+        country: ISO country code/name when available.
+        region: Administrative region (state/province) when available.
+        elevation_m: Elevation in meters when available.
     """
 
     place_id: str
     main_text: str
     secondary_text: str | None = None
     full_text: str | None = None
+    latitude: float = 0.0
+    longitude: float = 0.0
+    country: str | None = None
+    region: str | None = None
+    elevation_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +91,7 @@ class ResolvedPlace:
 
 #: HTTP transport: a callable ``(method, url, headers, body) -> (status, json)``.
 #: Tests inject a fake; production uses :func:`_http_request`.
-HttpTransport = Callable[[str, str, Mapping[str, str], str | None], tuple[int, Any]]
+HttpTransport = Callable[..., tuple[int, Any]]
 
 
 def _http_request(
@@ -90,6 +99,7 @@ def _http_request(
     url: str,
     headers: Mapping[str, str],
     body: str | None,
+    timeout: float | None = None,
 ) -> tuple[int, Any]:
     """Perform an HTTP request and return ``(status, json_or_error)``.
 
@@ -97,10 +107,11 @@ def _http_request(
     A non-2xx response is returned as ``(status, parsed_error)``; callers map
     it to a domain error.
     """
+    timeout_s = timeout if timeout is not None else settings.GOOGLE_PLACES_TIMEOUT
     data = body.encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
     try:
-        with urllib.request.urlopen(req, timeout=settings.GOOGLE_PLACES_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             payload = resp.read().decode("utf-8")
             return resp.status, json.loads(payload)
     except urllib.error.HTTPError as exc:
@@ -109,20 +120,28 @@ def _http_request(
         except Exception:  # noqa: BLE001 - non-JSON error body
             err = {"error": {"message": str(exc)}}
         return exc.code, err
-    except urllib.error.URLError as exc:
-        return 0, {"error": {"message": f"network error: {exc.reason}"}}
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return 0, {"error": {"message": f"network error: {exc}"}}
 
 
 class PlaceAutocompleteError(Exception):
     """Base error for place-autocomplete provider failures."""
 
 
+class PlaceRateLimitError(PlaceAutocompleteError):
+    """Raised when an external place provider returns HTTP 429 (rate limit)."""
+
+
+class PlaceTimeoutError(PlaceAutocompleteError):
+    """Raised when an external place provider request times out."""
+
+
 class PlaceAutocompleteProvider(ABC):
     """Application-level interface for place-autocomplete providers.
 
-    Implementations call an external place service (Google Places API (New),
-    Mapbox Geocoding, ...) server-side. The interface is provider-agnostic so
-    the product is not permanently coupled to one vendor.
+    Implementations call an external place service (Geoapify, LocationIQ,
+    Google, ...) server-side. The interface is provider-agnostic so the product
+    is not permanently coupled to one vendor.
     """
 
     @abstractmethod
@@ -131,13 +150,15 @@ class PlaceAutocompleteProvider(ABC):
         text: str,
         session_token: str | None = None,
         limit: int = DEFAULT_SUGGESTION_LIMIT,
+        bias: SearchBias | None = None,
     ) -> list[PlaceSuggestion]:
         """Return ranked place suggestions for a partial query.
 
         Args:
             text: The user's partial input (e.g. "den").
-            session_token: The search-session token (Google billing semantics).
+            session_token: Optional search-session token.
             limit: Maximum number of suggestions.
+            bias: Optional soft proximity bias.
 
         Returns:
             Ranked place suggestions.
@@ -156,7 +177,7 @@ class PlaceAutocompleteProvider(ABC):
 
         Args:
             place_id: The provider's place identifier.
-            session_token: The search-session token (Google billing semantics).
+            session_token: Optional search-session token.
 
         Returns:
             The canonical place.
@@ -167,15 +188,313 @@ class PlaceAutocompleteProvider(ABC):
         """
 
 
+class GeoapifyAutocompleteProvider(PlaceAutocompleteProvider):
+    """Geoapify Address Autocomplete provider (V1 Primary).
+
+    Calls ``GET https://api.geoapify.com/v1/geocode/autocomplete`` with
+    ``lang=en`` and extracts WGS84 GeoJSON Point coordinates directly.
+    """
+
+    provider_name: str = "geoapify"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        timeout_ms: int | None = None,
+        transport: HttpTransport = _http_request,
+    ) -> None:
+        self._api_key = api_key if api_key is not None else settings.GEOAPIFY_API_KEY
+        self._api_base = (
+            api_base or settings.GEOAPIFY_API_BASE or "https://api.geoapify.com/v1"
+        ).rstrip("/")
+        timeout = timeout_ms if timeout_ms is not None else settings.SEARCH_PRIMARY_TIMEOUT_MS
+        self._timeout_s = timeout / 1000.0
+        self._transport = transport
+
+    def _call_transport(
+        self, method: str, url: str, headers: Mapping[str, str], body: str | None
+    ) -> tuple[int, Any]:
+        try:
+            return self._transport(method, url, headers, body, timeout=self._timeout_s)  # type: ignore[call-arg]
+        except TypeError:
+            return self._transport(method, url, headers, body)
+
+    def suggest(
+        self,
+        text: str,
+        session_token: str | None = None,
+        limit: int = DEFAULT_SUGGESTION_LIMIT,
+        bias: SearchBias | None = None,
+    ) -> list[PlaceSuggestion]:
+        if not self._api_key:
+            raise PlaceAutocompleteError("Geoapify API key not configured")
+
+        url = (
+            f"{self._api_base}/geocode/autocomplete"
+            f"?text={urllib.parse.quote(text)}"
+            f"&lang=en"
+            f"&limit={limit}"
+            f"&apiKey={self._api_key}"
+        )
+        if bias is not None:
+            url += f"&bias=proximity:{bias.longitude},{bias.latitude}"
+
+        status, payload = self._call_transport(
+            "GET", url, {"Accept": "application/json"}, None
+        )
+        if status == 429:
+            raise PlaceRateLimitError("Geoapify rate limit reached (HTTP 429)")
+        if status == 0:
+            raise PlaceTimeoutError(
+                f"Geoapify request timed out or network error: {_error_message(payload)}"
+            )
+        if status != 200:
+            raise PlaceAutocompleteError(
+                f"Geoapify autocomplete failed (HTTP {status}): {_error_message(payload)}"
+            )
+
+        if not isinstance(payload, dict):
+            raise PlaceAutocompleteError(
+                f"Malformed Geoapify response: expected dict, got {type(payload).__name__}"
+            )
+        features = payload.get("features")
+        if not isinstance(features, list):
+            raise PlaceAutocompleteError(
+                "Malformed Geoapify response: missing features list"
+            )
+
+        results: list[PlaceSuggestion] = []
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            try:
+                props = feature.get("properties", {})
+                geom = feature.get("geometry", {})
+                coords = geom.get("coordinates") if isinstance(geom, dict) else None
+                lon = (
+                    float(coords[0])
+                    if coords and len(coords) >= 2
+                    else float(props.get("lon", 0.0))
+                )
+                lat = (
+                    float(coords[1])
+                    if coords and len(coords) >= 2
+                    else float(props.get("lat", 0.0))
+                )
+
+                place_id = str(props.get("place_id") or f"{lon:.4f},{lat:.4f}")
+                name = (
+                    props.get("name")
+                    or props.get("city")
+                    or props.get("address_line1")
+                    or props.get("formatted")
+                    or text
+                )
+                region = props.get("state") or props.get("county") or props.get("region")
+                country = props.get("country")
+                full_text = (
+                    props.get("formatted")
+                    or f"{name}, {region or ''}, {country or ''}".strip(", ")
+                )
+                secondary = (
+                    props.get("address_line2")
+                    or ", ".join(filter(None, [region, country]))
+                    or None
+                )
+
+                results.append(
+                    PlaceSuggestion(
+                        place_id=place_id,
+                        main_text=name,
+                        secondary_text=secondary,
+                        full_text=full_text,
+                        latitude=lat,
+                        longitude=lon,
+                        country=country,
+                        region=region,
+                    )
+                )
+            except (ValueError, TypeError, KeyError) as err:
+                raise PlaceAutocompleteError(f"Malformed Geoapify feature: {err}") from err
+        return results
+
+    def resolve(
+        self,
+        place_id: str,
+        session_token: str | None = None,
+    ) -> ResolvedPlace:
+        if "," in place_id:
+            try:
+                parts = place_id.split(",")
+                lon = float(parts[0])
+                lat = float(parts[1])
+                return ResolvedPlace(
+                    place_id=place_id,
+                    display_name=place_id,
+                    latitude=lat,
+                    longitude=lon,
+                )
+            except ValueError:
+                pass
+        return ResolvedPlace(
+            place_id=place_id,
+            display_name=place_id,
+            latitude=0.0,
+            longitude=0.0,
+        )
+
+
+class LocationIQAutocompleteProvider(PlaceAutocompleteProvider):
+    """LocationIQ Autocomplete provider (V1 Secondary Failover).
+
+    Calls ``GET https://api.locationiq.com/v1/autocomplete`` with
+    ``accept-language=en`` and extracts WGS84 coordinates directly.
+    """
+
+    provider_name: str = "locationiq"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        timeout_ms: int | None = None,
+        transport: HttpTransport = _http_request,
+    ) -> None:
+        self._api_key = (
+            api_key if api_key is not None else settings.LOCATIONIQ_API_KEY
+        )
+        self._api_base = (
+            api_base or settings.LOCATIONIQ_API_BASE or "https://api.locationiq.com/v1"
+        ).rstrip("/")
+        timeout = (
+            timeout_ms if timeout_ms is not None else settings.SEARCH_FALLBACK_TIMEOUT_MS
+        )
+        self._timeout_s = timeout / 1000.0
+        self._transport = transport
+
+    def _call_transport(
+        self, method: str, url: str, headers: Mapping[str, str], body: str | None
+    ) -> tuple[int, Any]:
+        try:
+            return self._transport(method, url, headers, body, timeout=self._timeout_s)  # type: ignore[call-arg]
+        except TypeError:
+            return self._transport(method, url, headers, body)
+
+    def suggest(
+        self,
+        text: str,
+        session_token: str | None = None,
+        limit: int = DEFAULT_SUGGESTION_LIMIT,
+        bias: SearchBias | None = None,
+    ) -> list[PlaceSuggestion]:
+        if not self._api_key:
+            raise PlaceAutocompleteError("LocationIQ API key not configured")
+
+        url = (
+            f"{self._api_base}/autocomplete"
+            f"?q={urllib.parse.quote(text)}"
+            f"&key={self._api_key}"
+            f"&limit={limit}"
+            f"&format=json"
+            f"&accept-language=en"
+        )
+        if bias is not None:
+            lon = bias.longitude
+            lat = bias.latitude
+            viewbox = f"{lon - 2.0:.4f},{lat + 2.0:.4f},{lon + 2.0:.4f},{lat - 2.0:.4f}"
+            url += f"&viewbox={viewbox}&bounded=0"
+
+        status, payload = self._call_transport(
+            "GET", url, {"Accept": "application/json"}, None
+        )
+        if status == 429:
+            raise PlaceRateLimitError("LocationIQ rate limit reached (HTTP 429)")
+        if status == 0:
+            raise PlaceTimeoutError(
+                f"LocationIQ request timed out or network error: {_error_message(payload)}"
+            )
+        if status != 200:
+            raise PlaceAutocompleteError(
+                f"LocationIQ autocomplete failed (HTTP {status}): {_error_message(payload)}"
+            )
+
+        if not isinstance(payload, list):
+            raise PlaceAutocompleteError(
+                f"Malformed LocationIQ response: expected list, got {type(payload).__name__}"
+            )
+
+        results: list[PlaceSuggestion] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                place_id = str(item.get("place_id") or item.get("osm_id") or "")
+                lat = float(item.get("lat", 0.0))
+                lon = float(item.get("lon", 0.0))
+                address = (
+                    item.get("address", {})
+                    if isinstance(item.get("address"), dict)
+                    else {}
+                )
+                display_name = str(item.get("display_name") or "")
+
+                main_text = (
+                    item.get("display_place")
+                    or address.get("city")
+                    or address.get("town")
+                    or address.get("village")
+                    or (display_name.split(",")[0].strip() if display_name else text)
+                )
+                region = address.get("state") or address.get("county")
+                country = address.get("country")
+                secondary = (
+                    item.get("display_address")
+                    or ", ".join(filter(None, [region, country]))
+                    or None
+                )
+
+                results.append(
+                    PlaceSuggestion(
+                        place_id=place_id,
+                        main_text=main_text,
+                        secondary_text=secondary,
+                        full_text=display_name,
+                        latitude=lat,
+                        longitude=lon,
+                        country=country,
+                        region=region,
+                    )
+                )
+            except (ValueError, TypeError, KeyError) as err:
+                raise PlaceAutocompleteError(f"Malformed LocationIQ item: {err}") from err
+        return results
+
+    def resolve(
+        self,
+        place_id: str,
+        session_token: str | None = None,
+    ) -> ResolvedPlace:
+        return ResolvedPlace(
+            place_id=place_id,
+            display_name=place_id,
+            latitude=0.0,
+            longitude=0.0,
+        )
+
+
 class GooglePlacesAutocompleteProvider(PlaceAutocompleteProvider):
     """Google Places API (New) Autocomplete + Place Details provider.
 
     Calls ``POST https://places.googleapis.com/v1/places:autocomplete`` for
     suggestions and ``GET https://places.googleapis.com/v1/places/{placeId}``
     for canonical resolution, using a server-side API key that never reaches
-    the browser. ``includedPrimaryTypes`` is set so results are actual places
-    (not text queries billed at the higher Text Search rate).
+    the browser.
     """
+
+    provider_name: str = "google"
 
     def __init__(
         self,
@@ -184,13 +503,6 @@ class GooglePlacesAutocompleteProvider(PlaceAutocompleteProvider):
         api_base: str | None = None,
         transport: HttpTransport = _http_request,
     ) -> None:
-        """Create the provider.
-
-        Args:
-            api_key: Google Places API key (defaults to settings).
-            api_base: Base URL (defaults to the official endpoints).
-            transport: Injectable HTTP transport for tests.
-        """
         self._api_key = api_key or settings.GOOGLE_PLACES_API_KEY
         self._autocomplete_url = (
             api_base or "https://places.googleapis.com/v1"
@@ -203,6 +515,7 @@ class GooglePlacesAutocompleteProvider(PlaceAutocompleteProvider):
         text: str,
         session_token: str | None = None,
         limit: int = DEFAULT_SUGGESTION_LIMIT,
+        bias: SearchBias | None = None,
     ) -> list[PlaceSuggestion]:
         body: dict[str, Any] = {
             "input": text,
@@ -228,8 +541,6 @@ class GooglePlacesAutocompleteProvider(PlaceAutocompleteProvider):
         for item in suggestions[:limit]:
             prediction = item.get("placePrediction")
             if prediction is None:
-                # A ``queryPrediction`` (text-only) carries no placeId and is
-                # billed as Text Search; skip it rather than expose it.
                 continue
             text_ = prediction.get("text", {}).get("text", "")
             structured = prediction.get("structuredFormat", {})
@@ -291,12 +602,12 @@ class GooglePlacesAutocompleteProvider(PlaceAutocompleteProvider):
 
 
 class MapboxGeocodingProvider(PlaceAutocompleteProvider):
-    """Mapbox Geocoding provider (drop-in alternative to Google).
+    """Mapbox Geocoding provider (drop-in alternative).
 
     Uses the Mapbox Geocoding API's ``autocomplete=true`` forward geocoding.
-    This is an alternative backend behind the same interface; it is not the
-    default. The token lives server-side.
     """
+
+    provider_name: str = "mapbox"
 
     def __init__(
         self,
@@ -312,9 +623,8 @@ class MapboxGeocodingProvider(PlaceAutocompleteProvider):
         text: str,
         session_token: str | None = None,
         limit: int = DEFAULT_SUGGESTION_LIMIT,
+        bias: SearchBias | None = None,
     ) -> list[PlaceSuggestion]:
-        import urllib.parse
-
         url = (
             "https://api.mapbox.com/geocoding/v5/mapbox.places/"
             f"{urllib.parse.quote(text)}.json"
@@ -328,12 +638,15 @@ class MapboxGeocodingProvider(PlaceAutocompleteProvider):
         results: list[PlaceSuggestion] = []
         for feature in payload.get("features", [])[:limit]:
             place_id = feature.get("id", "")
+            center = feature.get("center", [0.0, 0.0])
             results.append(
                 PlaceSuggestion(
                     place_id=place_id,
                     main_text=feature.get("text", ""),
                     secondary_text=feature.get("place_name"),
                     full_text=feature.get("place_name"),
+                    latitude=float(center[1]) if len(center) > 1 else 0.0,
+                    longitude=float(center[0]) if center else 0.0,
                 )
             )
         return results
@@ -344,7 +657,7 @@ class MapboxGeocodingProvider(PlaceAutocompleteProvider):
         session_token: str | None = None,
     ) -> ResolvedPlace:
         url = (
-            "https://api.mapbox.com/geocoding/v5/mapbox.places/"
+            f"https://api.mapbox.com/geocoding/v5/mapbox.places/"
             f"{place_id}.json?access_token={self._token}"
         )
         status, payload = self._transport("GET", url, {}, None)
@@ -369,7 +682,6 @@ class MapboxGeocodingProvider(PlaceAutocompleteProvider):
 
 
 def _component(components: list[dict[str, Any]], wanted: str) -> str | None:
-    """Return the long text of an address component by type, or ``None``."""
     for comp in components:
         if wanted in comp.get("types", []):
             return comp.get("longText") or comp.get("shortText")
@@ -392,22 +704,30 @@ def _error_message(payload: Any) -> str:
 
 
 def new_session_token() -> str:
-    """Generate a fresh Places search-session token (UUIDv4).
-
-    One token spans an entire autocomplete session: generated when the user
-    focuses the search box, reused for every keystroke and the subsequent
-    place resolution, then discarded. This keeps Google billing to one
-    Autocomplete + one Place Details per completed selection.
-    """
+    """Generate a fresh search-session token (UUIDv4)."""
     return str(uuid.uuid4())
 
 
 def get_provider() -> PlaceAutocompleteProvider:
-    """Return the configured place-autocomplete provider.
+    """Return the configured primary place-autocomplete provider.
 
-    ``SEARCH_PROVIDER`` selects the backend (``google`` or ``mapbox``). The
-    provider is constructed per request (it is cheap and stateless).
+    Defaults to ``GeoapifyAutocompleteProvider`` (V1 Primary).
     """
+    if settings.SEARCH_PROVIDER == "locationiq":
+        return LocationIQAutocompleteProvider()
+    if settings.SEARCH_PROVIDER == "google":
+        return GooglePlacesAutocompleteProvider()
     if settings.SEARCH_PROVIDER == "mapbox":
         return MapboxGeocodingProvider()
-    return GooglePlacesAutocompleteProvider()
+    return GeoapifyAutocompleteProvider()
+
+
+def get_fallback_provider() -> PlaceAutocompleteProvider | None:
+    """Return the configured secondary fallback provider, if available."""
+    if settings.SEARCH_PROVIDER == "geoapify":
+        # When Geoapify is primary, LocationIQ is fallback
+        return LocationIQAutocompleteProvider()
+    if settings.SEARCH_PROVIDER == "locationiq":
+        # When LocationIQ is primary, Geoapify is fallback
+        return GeoapifyAutocompleteProvider()
+    return None

@@ -6,7 +6,8 @@ import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 import type { SelectedLocation, SpatialLayer } from "@/lib/api/types";
 import { buildBaseStyle } from "@/lib/map/baseStyle";
 import { applyWeatherLayer, removeWeatherLayer } from "@/lib/map/layers";
-import { coordinatesToSelectedLocation } from "@/lib/forecast/selection";
+import { canonicalizeLongitude, coordinatesToSelectedLocation } from "@/lib/forecast/selection";
+import { LocateMeButton } from "@/components/map/LocateMeButton";
 import { WindParticleAnimation } from "@/lib/map/windParticles";
 import { useVectorField } from "@/hooks/useVectorField";
 
@@ -21,6 +22,12 @@ interface WeatherMapProps {
   availableLeads?: number[];
   /** Fired with a coordinate location when the user clicks the map. */
   onSelect: (location: SelectedLocation) => void;
+  /** Optional callback fired when the map finishes moving (moveend) with canonical center coordinates. */
+  onCenterChange?: (center: { latitude: number; longitude: number }) => void;
+  /** Optional callback to trigger browser geolocation ("Locate Me"). */
+  onLocate?: () => void;
+  /** Whether browser geolocation is currently in-flight. */
+  isLocating?: boolean;
 }
 
 /**
@@ -42,6 +49,9 @@ export function WeatherMap({
   validTime,
   availableLeads,
   onSelect,
+  onCenterChange,
+  onLocate,
+  isLocating,
 }: WeatherMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -51,10 +61,12 @@ export function WeatherMap({
   const animRef = useRef<WindParticleAnimation | null>(null);
   const layerRef = useRef<SpatialLayer | null>(layer);
   const appliedLayerRef = useRef<SpatialLayer | null>(null);
-  // Keep the click callback fresh without recreating the map (the create
-  // effect must run once with an empty dependency array).
+  const isMapClickSelectionRef = useRef<boolean>(false);
+  // Keep callbacks fresh without recreating the map
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
+  const onCenterChangeRef = useRef(onCenterChange);
+  onCenterChangeRef.current = onCenterChange;
 
   // Progressive vector field fetching and prefetching in parallel
   const { field } = useVectorField({
@@ -83,8 +95,20 @@ export function WeatherMap({
       if (lngLat === undefined) {
         return;
       }
+      isMapClickSelectionRef.current = true;
       const wrapped = typeof lngLat.wrap === "function" ? lngLat.wrap() : lngLat;
       onSelectRef.current(coordinatesToSelectedLocation(wrapped.lat, wrapped.lng));
+    };
+
+    const handleMoveEnd = () => {
+      if (onCenterChangeRef.current && mapRef.current) {
+        const center = mapRef.current.getCenter ? mapRef.current.getCenter() : null;
+        if (center) {
+          const canonicalLon = canonicalizeLongitude(center.lng);
+          const clampedLat = Math.max(-90, Math.min(90, center.lat));
+          onCenterChangeRef.current({ latitude: clampedLat, longitude: canonicalLon });
+        }
+      }
     };
 
     const handleLoad = () => {
@@ -93,6 +117,7 @@ export function WeatherMap({
       }
       isStyleReadyRef.current = true;
       map.on("click", handleClick);
+      map.on("moveend", handleMoveEnd);
 
       if (canvasRef.current !== null && animRef.current === null) {
         animRef.current = new WindParticleAnimation(canvasRef.current, map);
@@ -114,6 +139,7 @@ export function WeatherMap({
       isStyleReadyRef.current = false;
       appliedLayerRef.current = null;
       map.off("click", handleClick);
+      map.off("moveend", handleMoveEnd);
       map.off("load", handleLoad);
       if (animRef.current !== null) {
         animRef.current.destroy();
@@ -178,6 +204,18 @@ export function WeatherMap({
     } else {
       markerRef.current.setLngLat([selectedLocation.longitude, selectedLocation.latitude]);
     }
+
+    // Fly to the location only if selection was NOT initiated by a direct map click.
+    if (isMapClickSelectionRef.current) {
+      isMapClickSelectionRef.current = false;
+    } else if (typeof map.flyTo === "function") {
+      const currentZoom = typeof map.getZoom === "function" ? map.getZoom() : 8;
+      map.flyTo({
+        center: [selectedLocation.longitude, selectedLocation.latitude],
+        zoom: Math.max(currentZoom, 8),
+        essential: true,
+      });
+    }
   }, [selectedLocation]);
 
   return (
@@ -187,6 +225,11 @@ export function WeatherMap({
         className="pointer-events-none absolute inset-0 z-10 h-full w-full"
         data-testid="wind-particle-canvas"
       />
+      {onLocate && (
+        <div className="absolute right-2.5 top-28 z-20">
+          <LocateMeButton onClick={onLocate} isLocating={isLocating} />
+        </div>
+      )}
     </div>
   );
 }

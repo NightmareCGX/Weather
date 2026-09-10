@@ -5,6 +5,7 @@ import type {
   ErrorDetail,
   ErrorEnvelope,
   ForecastAvailability,
+  LocateResponse,
   Model,
   PointForecast,
   SearchResult,
@@ -167,6 +168,10 @@ export interface SearchLocationsOptions {
   limit?: number;
   /** Places search-session token (Google billing semantics). */
   sessionToken?: string;
+  /** Optional soft proximity bias latitude (-90 to 90). */
+  biasLat?: number;
+  /** Optional soft proximity bias longitude (-180 to 180). */
+  biasLon?: number;
   signal?: AbortSignal;
 }
 
@@ -175,6 +180,8 @@ export async function searchLocations({
   type = "all",
   limit,
   sessionToken,
+  biasLat,
+  biasLon,
   signal,
 }: SearchLocationsOptions): Promise<SearchResult[]> {
   const params = new URLSearchParams({ q, type });
@@ -183,6 +190,10 @@ export async function searchLocations({
   }
   if (sessionToken !== undefined) {
     params.set("session_token", sessionToken);
+  }
+  if (biasLat !== undefined && biasLon !== undefined) {
+    params.set("bias_lat", String(biasLat));
+    params.set("bias_lon", String(biasLon));
   }
   return request<SearchResult[]>(`/search?${params.toString()}`, { signal });
 }
@@ -317,6 +328,27 @@ export async function getElevation({
     lon: String(longitude),
   });
   return request<ElevationResponse>(`/elevation?${params.toString()}`, { signal });
+}
+
+export interface GetApproximateLocationOptions {
+  signal?: AbortSignal;
+}
+
+/**
+ * Fetch coarse approximate location from trusted Cloudflare headers (GET /v1/locate).
+ * Returns null if location is unavailable (e.g. 404, untrusted mode, or missing headers).
+ */
+export async function getApproximateLocation(
+  options: GetApproximateLocationOptions = {}
+): Promise<LocateResponse | null> {
+  try {
+    return await request<LocateResponse>("/locate", { signal: options.signal });
+  } catch (err) {
+    if (err instanceof RequestAbortedError) {
+      throw err;
+    }
+    return null;
+  }
 }
 
 export const VECTOR_FIELD_HEADER_SIZE = 36;

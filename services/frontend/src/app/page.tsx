@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 
 import { Header } from "@/components/layout/Header";
@@ -10,6 +10,7 @@ import { LocationSearch } from "@/components/search/LocationSearch";
 import { ForecastDashboard } from "@/components/forecast/ForecastDashboard";
 import { useForecastSelection } from "@/context/forecast-selection";
 import { useSelectedLocation } from "@/context/selected-location";
+import { useGeolocation } from "@/hooks/useGeolocation";
 import { useMapLayer } from "@/hooks/useMapLayer";
 import type { SelectedLocation } from "@/lib/api/types";
 
@@ -32,10 +33,31 @@ export default function HomePage() {
   const { selectedLocation, selectLocation, clearSelection } = useSelectedLocation();
   const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
 
+  // Maintain latest canonical map center in a ref so map movement does NOT trigger
+  // component re-renders or premature search refetches (Rule B: map move alone does not refetch).
+  const mapCenterRef = useRef<{ latitude: number; longitude: number }>({
+    latitude: 39.2,
+    longitude: -106.8,
+  });
+
+  const handleCenterChange = useCallback((center: { latitude: number; longitude: number }) => {
+    mapCenterRef.current = center;
+  }, []);
+
+  const getMapBias = useCallback(() => {
+    return mapCenterRef.current;
+  }, []);
+
   const handleSelectLocation = (location: SelectedLocation) => {
     selectLocation(location);
     setIsPanelCollapsed(false);
   };
+
+  const { isLocating, notice, clearNotice, locateMe } = useGeolocation({
+    onLocateSuccess: () => {
+      setIsPanelCollapsed(false);
+    },
+  });
 
   const handleCloseForecastPanel = () => {
     clearSelection();
@@ -50,7 +72,7 @@ export default function HomePage() {
       <div className="flex min-h-0 flex-1">
         <main className="relative min-w-0 flex-1">
           <div className="absolute left-4 top-4 z-20 w-72 max-w-[calc(100%-2rem)]">
-            <LocationSearch onSelect={handleSelectLocation} />
+            <LocationSearch onSelect={handleSelectLocation} getBias={getMapBias} />
           </div>
 
           {error !== null && (
@@ -59,6 +81,41 @@ export default function HomePage() {
               role="alert"
             >
               {error}
+            </div>
+          )}
+
+          {notice !== null && (
+            <div
+              className={`absolute left-1/2 ${
+                error !== null ? "top-16" : "top-4"
+              } z-30 flex max-w-[90vw] -translate-x-1/2 items-center gap-2 rounded border px-3 py-1.5 text-xs shadow-md ${
+                notice.type === "alert"
+                  ? "border-amber-300 bg-amber-50 text-amber-900"
+                  : "border-blue-200 bg-blue-50 text-blue-800"
+              }`}
+              role={notice.type === "alert" ? "alert" : "status"}
+            >
+              <span>{notice.message}</span>
+              <button
+                type="button"
+                onClick={clearNotice}
+                aria-label="Dismiss notice"
+                className="ml-1 rounded p-0.5 hover:bg-black/5 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              >
+                <svg
+                  className="h-3.5 w-3.5"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
             </div>
           )}
 
@@ -73,6 +130,9 @@ export default function HomePage() {
               validTime={validTime}
               availableLeads={options.leadTimes}
               onSelect={handleSelectLocation}
+              onCenterChange={handleCenterChange}
+              onLocate={locateMe}
+              isLocating={isLocating}
             />
           )}
 
