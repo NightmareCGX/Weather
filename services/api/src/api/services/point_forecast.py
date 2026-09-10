@@ -442,14 +442,22 @@ def build_point_forecast(
                     for v in precip_vars:
                         values_by_var[v] = p_vals.get(v)
                     for k, val in p_vals.items():
-                        if k.startswith("_") or k == "precipitation_type":
+                        if (
+                            k.startswith("_")
+                            or k == "precipitation_type"
+                            or k in PRECIPITATION_COMPANION_VARIABLES
+                        ):
                             values_by_var[k] = val
                 else:
                     for v in precip_vars:
                         values_by_var[v] = None
+                    for k in PRECIPITATION_COMPANION_VARIABLES:
+                        values_by_var[k] = None
             else:
                 for v in precip_vars:
                     values_by_var[v] = None
+                for k in PRECIPITATION_COMPANION_VARIABLES:
+                    values_by_var[k] = None
 
         if lead == 0 and "cloud_cover_3h" in var_codes:
             if cloud_source is not None:
@@ -496,6 +504,8 @@ def build_point_forecast(
                     entry["precipitation_start_type"] = "none"
                     entry["precipitation_end_type"] = "none"
                     entry["precipitation_evidence"] = "exact"
+                    for f_code in PRECIPITATION_COMPANION_VARIABLES:
+                        entry[f_code] = None
                 else:
                     converted = _convert_value(
                         float(raw_mm), "mm", units, var_code="precipitation_amount_3h"
@@ -506,6 +516,9 @@ def build_point_forecast(
                     entry["precipitation_start_type"] = str(values_by_var.get("_precipitation_start_type", "none"))
                     entry["precipitation_end_type"] = str(values_by_var.get("_precipitation_end_type", "none"))
                     entry["precipitation_evidence"] = str(values_by_var.get("_precipitation_evidence", "exact"))
+                    for f_code in PRECIPITATION_COMPANION_VARIABLES:
+                        if f_code in values_by_var and values_by_var[f_code] is not None:
+                            entry[f_code] = round(float(values_by_var[f_code]), 4)
             elif var_code == "cloud_cover_3h":
                 raw_cc = values_by_var.get("cloud_cover_3h")
                 if raw_cc is None or (isinstance(raw_cc, float) and math.isnan(raw_cc)):
@@ -814,8 +827,7 @@ def gated_point_interpolations(
                                             is_mean=True,
                                         )
                                     )
-                                    if f_code in var_codes:
-                                        out[f_code] = f_val
+                                    out[f_code] = f_val
                                 flags_curr[f_code] = 1 if f_val >= 0.5 else 0
 
                         t2m_val = None
@@ -954,8 +966,7 @@ def gated_point_interpolations(
                                     )
                                 )
                                 flags_curr[f_code] = 1 if f_val >= 0.5 else 0
-                                if f_code in var_codes:
-                                    out[f_code] = f_val
+                                out[f_code] = f_val
 
                         t2m_val = None
                         if "temperature_2m" in dataset.data_vars:
@@ -1163,8 +1174,7 @@ def gated_point_interpolations(
                             )
                         )
                         flags_curr_l[f_code] = 1 if f_val >= 0.5 else 0
-                        if f_code in var_codes:
-                            out_legacy[f_code] = f_val
+                        out_legacy[f_code] = f_val
 
                 # Optional t2m
                 t2m_val_l: float | None = None

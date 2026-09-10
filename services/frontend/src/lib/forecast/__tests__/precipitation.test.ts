@@ -10,6 +10,8 @@ import {
   GEFS_PHASE_LABELS,
   PRECIPITATION_PHASE_TOKENS,
 } from "../precipitation";
+import { toEnsemblePhaseSupportData } from "../transform";
+import type { EnsembleStatisticsData } from "@/lib/api/types";
 
 describe("precipitation formatting and phase metadata", () => {
   describe("getPrecipitationPhaseMeta", () => {
@@ -278,6 +280,182 @@ describe("precipitation formatting and phase metadata", () => {
           "mm"
         )
       ).toBe("0 mm · Dry");
+    });
+
+    it("formats GFS deterministic single phase and mixed tooltips with exact constituents", () => {
+      // 1. Single phase: Rain
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 0.31,
+            precipitation_type: "rain",
+            precipitation_transition: "persistent_rain",
+            crain: 1,
+            csnow: 0,
+            cfrzr: 0,
+            cicep: 0,
+          },
+          "mm"
+        )
+      ).toBe("0.31 mm · Rain");
+
+      // 2. Deterministic Mixed: Rain + Snow (symptom reproduction case)
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 1.83,
+            precipitation_type: "mixed",
+            precipitation_transition: "mixed_transition",
+            crain: 1,
+            csnow: 1,
+            cfrzr: 0,
+            cicep: 0,
+          },
+          "mm"
+        )
+      ).toBe("1.83 mm · Mixed (Rain + Snow)");
+
+      // 3. Three-way Mixed: Snow + Freezing Rain + Ice Pellets in deterministic order
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 0.72,
+            precipitation_type: "mixed",
+            precipitation_transition: "mixed_transition",
+            crain: 0,
+            csnow: 1,
+            cfrzr: 1,
+            cicep: 1,
+          },
+          "mm"
+        )
+      ).toBe("0.72 mm · Mixed (Snow + Freezing Rain + Ice Pellets)");
+
+      // 4. Four-way Mixed: Rain + Snow + Freezing Rain + Ice Pellets in deterministic order
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 2.0,
+            precipitation_type: "mixed",
+            precipitation_transition: "mixed_transition",
+            crain: 1,
+            csnow: 1,
+            cfrzr: 1,
+            cicep: 1,
+          },
+          "mm"
+        )
+      ).toBe("2 mm · Mixed (Rain + Snow + Freezing Rain + Ice Pellets)");
+    });
+
+    it("formats GEFS ensemble-mean single-phase and mixed tooltips from mean categorical representation", () => {
+      // Single-phase ensemble mean
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 2.1,
+            precipitation_type: "rain",
+            precipitation_transition: "persistent_rain",
+            crain: 0.85,
+            csnow: 0.1,
+            cfrzr: 0,
+            cicep: 0,
+          },
+          "mm"
+        )
+      ).toBe("2.1 mm · Rain");
+
+      // Mixed ensemble mean with fractional flags from official geavg mean shards
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 1.83,
+            precipitation_type: "mixed",
+            precipitation_transition: "mixed_transition",
+            crain: 0.65,
+            csnow: 0.55,
+            cfrzr: 0.05,
+            cicep: 0.0,
+          },
+          "mm"
+        )
+      ).toBe("1.83 mm · Mixed (Rain + Snow)");
+    });
+
+    it("preserves strict separation between GEFS Hourly Forecast phase and Ensemble Phase Support", () => {
+      // Hourly Forecast entry from ensemble-mean path
+      const gefsMeanEntry = {
+        precipitation_amount_3h: 1.83,
+        precipitation_type: "mixed",
+        precipitation_transition: "mixed_transition",
+        crain: 0.65,
+        csnow: 0.55,
+        cfrzr: 0.0,
+        cicep: 0.0,
+      };
+
+      // Ensemble statistics data across 30 members for the same valid time
+      const ensembleStats: EnsembleStatisticsData = {
+        model: "gefs",
+        lead_time_hours: 6,
+        member_count: 30,
+        valid_member_count: 30,
+        valid_time: "2026-09-10T06:00:00Z",
+        statistics: {
+          mean: 1.83,
+          median: 1.75,
+          spread: 0.45,
+          p10: 1.2,
+          p25: 1.5,
+          p50: 1.75,
+          p75: 2.1,
+          p90: 2.4,
+        },
+        phase_support: {
+          dry: 0.2,
+          rain: 0.5,
+          snow: 0.3,
+          freezing_rain: 0.0,
+          ice_pellets: 0.0,
+          unknown: 0.0,
+        },
+      };
+
+      const byLead = new Map<number, EnsembleStatisticsData>([[6, ensembleStats]]);
+      const phaseSupportData = toEnsemblePhaseSupportData(byLead);
+
+      // Hourly Forecast tooltip remains derived ONLY from the ensemble-mean forecast entry
+      const hourlyTooltip = formatPointPrecipitationDisplay(gefsMeanEntry, "mm");
+      expect(hourlyTooltip).toBe("1.83 mm · Mixed (Rain + Snow)");
+
+      // Ensemble Phase Support data remains derived ONLY from across-member statistics
+      expect(phaseSupportData).toHaveLength(1);
+      const point = phaseSupportData[0];
+      expect(point.dry).toBe(20);
+      expect(point.rain).toBe(50);
+      expect(point.snow).toBe(30);
+      expect(point.freezing_rain).toBe(0);
+      expect(point.ice_pellets).toBe(0);
+      expect(point.unknown).toBe(0);
+
+      // Verify that member percentages do NOT overwrite Hourly Forecast constituents
+      expect(hourlyTooltip).not.toContain("Dry");
+      expect(hourlyTooltip).toContain("Rain + Snow");
+    });
+
+    it("preserves directed two-phase transition labels even when multiple flags are active", () => {
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 4.5,
+            precipitation_type: "mixed",
+            precipitation_transition: "rain_to_snow",
+            crain: 1.0,
+            csnow: 1.0,
+          },
+          "mm"
+        )
+      ).toBe("4.5 mm · Rain → Snow");
     });
 
     it("formats imperial units correctly", () => {
