@@ -2,7 +2,11 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import { LayerControls } from "@/components/map/LayerControls";
 import { ForecastSelectionProvider, useForecastSelection } from "@/context/forecast-selection";
-import { SelectedLocationProvider, useSelectedLocation } from "@/context/selected-location";
+import {
+  SelectedLocationProvider,
+  _resetStartupLocationPromiseForTesting,
+  useSelectedLocation,
+} from "@/context/selected-location";
 import type { SelectedLocation } from "@/lib/api/types";
 
 /**
@@ -114,6 +118,7 @@ function renderControls() {
 
 beforeEach(() => {
   mockFetch.mockReset();
+  _resetStartupLocationPromiseForTesting();
   mockFetch.mockImplementation((input: RequestInfo | URL) => {
     const url = String(input);
     if (url.startsWith("/v1/forecast/availability")) {
@@ -324,6 +329,53 @@ describe("LayerControls (data-driven)", () => {
 
       // Adjacent display returns to UTC
       expect(screen.getByTestId("valid-time")).toHaveTextContent("Valid Aug 13, 06:00 UTC");
+    });
+
+    it("uses startup coarse IP timezone for adjacent label when available and no location is selected", async () => {
+      mockFetch.mockImplementation((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/v1/forecast/availability")) {
+          return Promise.resolve(jsonResponse(availabilityPayload));
+        }
+        if (url.includes("/locate")) {
+          return Promise.resolve(
+            jsonResponse({
+              latitude: 39.7392,
+              longitude: -104.9903,
+              city: "Denver",
+              region: "Colorado",
+              country: "US",
+              approximate: true,
+            })
+          );
+        }
+        return Promise.resolve(
+          jsonResponse({ object: "list", data: [], has_more: false, next_cursor: null })
+        );
+      });
+
+      renderWithLocation();
+
+      await screen.findByLabelText("Valid time");
+
+      // Startup coarse IP localization formats adjacent valid label in Mountain Time (MDT / GMT-6)
+      const validTimeDisplay = await screen.findByTestId("valid-time");
+      expect(validTimeDisplay.textContent).toMatch(/^Valid Aug 13, 00:00 (MDT|GMT-6)$/);
+
+      // Dropdown option MUST still remain in canonical UTC
+      expect(screen.getByText("Aug 13, 06:00 UTC")).toBeInTheDocument();
+
+      // Selecting Tokyo overrides startup Denver timezone
+      act(() => {
+        fireEvent.click(screen.getByText("Select Tokyo"));
+      });
+      expect(validTimeDisplay.textContent).toMatch(/^Valid Aug 13, 15:00 (JST|GMT\+9)$/);
+
+      // Clearing selection restores startup Denver timezone
+      act(() => {
+        fireEvent.click(screen.getByText("Clear Location"));
+      });
+      expect(validTimeDisplay.textContent).toMatch(/^Valid Aug 13, 00:00 (MDT|GMT-6)$/);
     });
   });
 });

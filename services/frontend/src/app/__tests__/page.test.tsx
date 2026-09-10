@@ -2,11 +2,15 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 
 import HomePage from "@/app/page";
 import { ForecastSelectionProvider } from "@/context/forecast-selection";
-import { SelectedLocationProvider } from "@/context/selected-location";
-import type { SelectedLocation, SpatialLayer } from "@/lib/api/types";
+import {
+  SelectedLocationProvider,
+  _resetStartupLocationPromiseForTesting,
+} from "@/context/selected-location";
+import type { ApproximateStartupLocation, SelectedLocation, SpatialLayer } from "@/lib/api/types";
 
 let lastRenderedLayer: SpatialLayer | null = null;
 let lastRenderedLocation: SelectedLocation | null = null;
+let lastRenderedApproximateLocation: ApproximateStartupLocation | null = null;
 let lastOnSelect: ((loc: SelectedLocation) => void) | null = null;
 
 // The real WeatherMap uses `next/dynamic(..., { ssr: false })`. Mock to record props.
@@ -14,22 +18,28 @@ jest.mock("../../components/map/WeatherMap", () => {
   function WeatherMapStub({
     layer,
     selectedLocation,
+    approximateLocation,
     onSelect,
     onLocate,
   }: {
     layer: SpatialLayer | null;
     selectedLocation: SelectedLocation | null;
+    approximateLocation?: ApproximateStartupLocation | null;
     onSelect: (loc: SelectedLocation) => void;
     onLocate?: () => void;
   }) {
     lastRenderedLayer = layer;
     lastRenderedLocation = selectedLocation;
+    lastRenderedApproximateLocation = approximateLocation ?? null;
     lastOnSelect = onSelect;
     return (
       <div
         data-testid="weather-map"
         data-layer-lead={layer?.lead_time_hours}
         data-has-location={selectedLocation !== null}
+        data-has-approximate-location={
+          approximateLocation !== null && approximateLocation !== undefined
+        }
       >
         {onLocate && (
           <button type="button" aria-label="Locate me" onClick={onLocate}>
@@ -286,6 +296,18 @@ function routeFetch(input: RequestInfo | URL) {
       })
     );
   }
+  if (url.includes("/locate")) {
+    return Promise.resolve(
+      jsonResponse({
+        latitude: 39.7392,
+        longitude: -104.9903,
+        city: "Denver",
+        region: "Colorado",
+        country: "US",
+        approximate: true,
+      })
+    );
+  }
   return Promise.resolve(
     jsonResponse({ object: "list", data: [], has_more: false, next_cursor: null })
   );
@@ -294,7 +316,9 @@ function routeFetch(input: RequestInfo | URL) {
 beforeEach(() => {
   lastRenderedLayer = null;
   lastRenderedLocation = null;
+  lastRenderedApproximateLocation = null;
   lastOnSelect = null;
+  _resetStartupLocationPromiseForTesting();
   mockFetch.mockReset();
   mockFetch.mockImplementation(routeFetch);
   globalThis.fetch = mockFetch as unknown as typeof fetch;
@@ -597,6 +621,11 @@ describe("HomePage", () => {
     renderPage();
 
     const locateBtn = await screen.findByRole("button", { name: "Locate me" });
+    // Count locate calls before Locate Me click
+    const initialLocateCalls = mockFetch.mock.calls.filter((call) =>
+      String(call[0]).includes("/locate")
+    ).length;
+
     fireEvent.click(locateBtn);
 
     const [, errorCb] = mockGetCurrentPosition.mock.calls[0];
@@ -612,10 +641,26 @@ describe("HomePage", () => {
       expect(screen.getByRole("alert")).toHaveTextContent("Location access denied");
     });
 
-    // Strict privacy invariant: verify /v1/locate was NOT fetched
-    const locateCalls = mockFetch.mock.calls.filter((call) =>
-      String(call[0]).includes("/v1/locate")
-    );
-    expect(locateCalls).toHaveLength(0);
+    // Strict privacy invariant: verify /v1/locate was NOT called as a fallback for Locate Me
+    const afterLocateCalls = mockFetch.mock.calls.filter((call) =>
+      String(call[0]).includes("/locate")
+    ).length;
+    expect(afterLocateCalls).toBe(initialLocateCalls);
+  });
+
+  it("passes startup approximate location to WeatherMap while leaving selectedLocation null", async () => {
+    renderPage();
+
+    await waitFor(() => {
+      expect(lastRenderedApproximateLocation).not.toBeNull();
+    });
+
+    expect(lastRenderedApproximateLocation).toMatchObject({
+      latitude: 39.7392,
+      city: "Denver",
+      source: "ip",
+    });
+    expect(lastRenderedLocation).toBeNull();
+    expect(screen.queryByText("Hourly Forecast")).not.toBeInTheDocument();
   });
 });

@@ -1,7 +1,7 @@
 "use client";
 
 import { useForecastSelection } from "@/context/forecast-selection";
-import { useSelectedLocationTimezone } from "@/context/selected-location";
+import { useDisplayTimezone } from "@/context/selected-location";
 import { formatDayHourUtc, formatDayHourWithTimeZone } from "@/lib/forecast/time";
 
 /**
@@ -24,7 +24,7 @@ export function LayerControls() {
     setValidTime,
     retry,
   } = useForecastSelection();
-  const selectedTimezone = useSelectedLocationTimezone();
+  const displayTimezone = useDisplayTimezone();
 
   if (status === "loading" || status === "idle") {
     return (
@@ -115,7 +115,7 @@ export function LayerControls() {
 
       {validTime !== null && (
         <span className="text-sm text-slate-500" data-testid="valid-time">
-          Valid {formatDayHourWithTimeZone(validTime, selectedTimezone)}
+          Valid {formatDayHourWithTimeZone(validTime, displayTimezone)}
         </span>
       )}
     </div>

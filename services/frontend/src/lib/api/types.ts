@@ -66,6 +66,22 @@ export interface LocateResponse {
 }
 
 /**
+ * Coarse startup geographic context derived from IP headers.
+ *
+ * NOT a SelectedLocation. Ambient regional context only: does not place a marker,
+ * open the forecast dashboard, trigger point forecast queries, or participate in
+ * selection generation guards.
+ */
+export interface ApproximateStartupLocation {
+  latitude: number;
+  longitude: number;
+  city: string | null;
+  region: string | null;
+  country: string | null;
+  source: "ip";
+}
+
+/**
  * The selected location shared by search, map click, and the forecast
  * dashboard. This is a frontend model, not a backend response shape: it
  * unifies a `/v1/search` result, a raw map-click coordinate, and a station
