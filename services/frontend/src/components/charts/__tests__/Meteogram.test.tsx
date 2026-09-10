@@ -225,5 +225,38 @@ describe("Meteogram", () => {
       ]);
       expect(tip).toMatch(/^Sep 10, 05:45 (GMT\+5:45|\+0545)$/);
     });
+
+    it("formats Mixed precipitation with constituent phases in tooltip", () => {
+      const precipEntries: ForecastEntry[] = [
+        {
+          lead_time_hours: 3,
+          valid_time: "2026-09-10T03:00:00Z",
+          precipitation_amount_3h: 0.31,
+          precipitation_type: "mixed",
+          precipitation_transition: "mixed_transition",
+          crain: 1,
+          csnow: 1,
+          cfrzr: 0,
+          cicep: 0,
+        },
+      ];
+
+      render(
+        <Meteogram
+          forecasts={precipEntries}
+          variableCode="precipitation_amount_3h"
+          meta={{ name: "3-Hour Precipitation Amount", unit: "mm" }}
+        />
+      );
+
+      const formattedTooltip = lastTooltipProps.formatter(0.31, "3-Hour Precipitation Amount", {
+        payload: lastChartData[0],
+      });
+
+      expect(formattedTooltip).toEqual([
+        "0.31 mm · Mixed (Rain + Snow)",
+        "3-Hour Precipitation Amount",
+      ]);
+    });
   });
 });

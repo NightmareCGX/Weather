@@ -5,6 +5,7 @@ import type {
   ForecastEntry,
 } from "@/lib/api/types";
 import { isForecastDataVariable } from "@/lib/api/types";
+import { formatDayHourInTimeZone } from "@/lib/forecast/time";
 
 /**
  * Pure data transformations from API envelopes to chart-ready structures.
@@ -87,37 +88,45 @@ export interface EnsembleChartPoint {
   p90: number | null;
 }
 
+function toFiniteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 /**
  * Build the ensemble-over-time fan chart data from one `/v1/ensembles`
  * response per lead time.
  *
  * `ensembleByLead` maps a lead time to its statistics payload; `leads` defines
- * the ordering (typically the point forecast's lead set). Leads without data
- * are omitted so the chart simply has no point there.
+ * the ordering (derived from the union of ensemble data and validTimesByLead).
+ * Leads without data or carrying non-finite metrics have their metrics normalized
+ * to `null` so the chart x-domain is preserved and later valid times remain visible.
  */
 export function toEnsembleChartData(
   ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>,
   validTimesByLead?: ReadonlyMap<number, string>
 ): EnsembleChartPoint[] {
-  const leads = Array.from(ensembleByLead.keys()).sort((a, b) => a - b);
+  const leadSet = new Set<number>(Array.from(ensembleByLead.keys()));
+  if (validTimesByLead) {
+    for (const lead of Array.from(validTimesByLead.keys())) {
+      leadSet.add(lead);
+    }
+  }
+  const leads = Array.from(leadSet).sort((a, b) => a - b);
   return leads.map((lead) => {
     const data = ensembleByLead.get(lead);
-    if (data === undefined) {
-      throw new Error(`Missing ensemble data for lead ${lead}.`);
-    }
-    const stats = data.statistics;
-    const validTime = data.valid_time ?? validTimesByLead?.get(lead);
+    const validTime = data?.valid_time ?? validTimesByLead?.get(lead);
+    const stats = data?.statistics;
     return {
       lead_time_hours: lead,
       valid_time: validTime,
-      mean: stats.mean ?? null,
-      median: stats.median ?? null,
-      spread: stats.spread ?? null,
-      p10: stats.p10 ?? null,
-      p25: stats.p25 ?? null,
-      p50: stats.p50 ?? null,
-      p75: stats.p75 ?? null,
-      p90: stats.p90 ?? null,
+      mean: toFiniteOrNull(stats?.mean),
+      median: toFiniteOrNull(stats?.median),
+      spread: toFiniteOrNull(stats?.spread),
+      p10: toFiniteOrNull(stats?.p10),
+      p25: toFiniteOrNull(stats?.p25),
+      p50: toFiniteOrNull(stats?.p50),
+      p75: toFiniteOrNull(stats?.p75),
+      p90: toFiniteOrNull(stats?.p90),
     };
   });
 }
@@ -129,21 +138,23 @@ export function toEnsembleChartData(
  * Recharts renders a percentile band as a stacked pair of areas: a transparent
  * bottom stack equal to the band's lower edge, and a second stack equal to the
  * band's height. The resulting union spans exactly `[lower, upper]`.
+ * Non-finite or missing statistics are normalized to `null` so points are
+ * safely gapped without truncating the time axis.
  */
 export interface EnsembleFanPoint {
   lead_time_hours: number;
   valid_time?: string;
-  /** Lower edge of the P10–P90 band (stack base). */
-  p10Base: number;
-  /** Height of the P10–P90 band. */
-  p90Height: number;
-  /** Lower edge of the P25–P75 central band (stack base). */
-  p25Base: number;
-  /** Height of the P25–P75 central band. */
-  p75Height: number;
-  median: number;
-  mean: number;
-  spread: number;
+  /** Lower edge of the P10–P90 band (stack base), or null if missing/non-finite. */
+  p10Base: number | null;
+  /** Height of the P10–P90 band, or null if missing/non-finite. */
+  p90Height: number | null;
+  /** Lower edge of the P25–P75 central band (stack base), or null if missing/non-finite. */
+  p25Base: number | null;
+  /** Height of the P25–P75 central band, or null if missing/non-finite. */
+  p75Height: number | null;
+  median: number | null;
+  mean: number | null;
+  spread: number | null;
 }
 
 /** Build the stacked fan-band points for one `/v1/ensembles` response per lead. */
@@ -151,40 +162,23 @@ export function toEnsembleFanData(
   ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>,
   validTimesByLead?: ReadonlyMap<number, string>
 ): EnsembleFanPoint[] {
-  return toEnsembleChartData(ensembleByLead, validTimesByLead)
-    .filter(
-      (
-        point
-      ): point is EnsembleChartPoint & {
-        p10: number;
-        p25: number;
-        p50: number;
-        p75: number;
-        p90: number;
-        mean: number;
-        median: number;
-        spread: number;
-      } =>
-        point.p10 !== null &&
-        point.p25 !== null &&
-        point.p50 !== null &&
-        point.p75 !== null &&
-        point.p90 !== null &&
-        point.mean !== null &&
-        point.median !== null &&
-        point.spread !== null
-    )
-    .map((point) => ({
+  return toEnsembleChartData(ensembleByLead, validTimesByLead).map((point) => {
+    const p10 = point.p10;
+    const p90 = point.p90;
+    const p25 = point.p25;
+    const p75 = point.p75;
+    return {
       lead_time_hours: point.lead_time_hours,
       valid_time: point.valid_time,
-      p10Base: point.p10,
-      p90Height: point.p90 - point.p10,
-      p25Base: point.p25,
-      p75Height: point.p75 - point.p25,
+      p10Base: p10 !== null && p90 !== null ? p10 : null,
+      p90Height: p10 !== null && p90 !== null ? p90 - p10 : null,
+      p25Base: p25 !== null && p75 !== null ? p25 : null,
+      p75Height: p25 !== null && p75 !== null ? p75 - p25 : null,
       median: point.median,
       mean: point.mean,
       spread: point.spread,
-    }));
+    };
+  });
 }
 
 /** A single histogram bin. */
@@ -381,4 +375,100 @@ export function ensembleStatisticsEntries(
     ["p75", statistics.p75 ?? null],
     ["p90", statistics.p90 ?? null],
   ];
+}
+
+/** A single valid-time evaluation point of the ensemble phase support series. */
+export interface EnsemblePhaseSupportPoint {
+  lead_time_hours: number;
+  valid_time: string;
+  label: string;
+  dry: number | null;
+  rain: number | null;
+  snow: number | null;
+  freezing_rain: number | null;
+  ice_pellets: number | null;
+  unknown: number | null;
+  valid_member_count: number | null;
+  member_count: number;
+  has_data: boolean;
+  transition_frequency?: Record<string, number> | null;
+}
+
+/**
+ * Build time-varying ensemble phase support series data across forecast valid times.
+ *
+ * For each valid time:
+ * - Reads normalized phase support fractions across physical phases (dry, rain, snow, freezing_rain, ice_pellets, unknown).
+ * - Normalizes to 100% using available members.
+ * - Missing or unusable phase data at a timestamp is gapped (metrics = null) without truncating subsequent valid times.
+ * - Retains canonical UTC valid_time for time-axis alignment with active forecast range.
+ */
+export function toEnsemblePhaseSupportData(
+  ensembleByLead: ReadonlyMap<number, EnsembleStatisticsData>,
+  validTimesByLead?: ReadonlyMap<number, string>,
+  timezone?: string | null
+): EnsemblePhaseSupportPoint[] {
+  const leadSet = new Set<number>(Array.from(ensembleByLead.keys()));
+  if (validTimesByLead) {
+    for (const lead of Array.from(validTimesByLead.keys())) {
+      leadSet.add(lead);
+    }
+  }
+  const leads = Array.from(leadSet).sort((a, b) => a - b);
+  return leads.map((lead) => {
+    const data = ensembleByLead.get(lead);
+    const validTime = data?.valid_time ?? validTimesByLead?.get(lead) ?? "";
+
+    const phaseSupport = data?.phase_support;
+    const hasRawData =
+      phaseSupport != null &&
+      typeof phaseSupport === "object" &&
+      Object.values(phaseSupport).some((v) => typeof v === "number" && Number.isFinite(v) && v > 0);
+
+    let dry: number | null = null;
+    let rain: number | null = null;
+    let snow: number | null = null;
+    let freezing_rain: number | null = null;
+    let ice_pellets: number | null = null;
+    let unknown: number | null = null;
+    let has_data = false;
+
+    if (hasRawData && phaseSupport) {
+      const rDry = Number.isFinite(phaseSupport["dry"]) ? phaseSupport["dry"] : 0;
+      const rRain = Number.isFinite(phaseSupport["rain"]) ? phaseSupport["rain"] : 0;
+      const rSnow = Number.isFinite(phaseSupport["snow"]) ? phaseSupport["snow"] : 0;
+      const rFrzr = Number.isFinite(phaseSupport["freezing_rain"])
+        ? phaseSupport["freezing_rain"]
+        : 0;
+      const rIcep = Number.isFinite(phaseSupport["ice_pellets"]) ? phaseSupport["ice_pellets"] : 0;
+      const rUnk = Number.isFinite(phaseSupport["unknown"]) ? phaseSupport["unknown"] : 0;
+
+      const sum = rDry + rRain + rSnow + rFrzr + rIcep + rUnk;
+      if (sum > 0) {
+        dry = (rDry / sum) * 100;
+        rain = (rRain / sum) * 100;
+        snow = (rSnow / sum) * 100;
+        freezing_rain = (rFrzr / sum) * 100;
+        ice_pellets = (rIcep / sum) * 100;
+        unknown = (rUnk / sum) * 100;
+        has_data = true;
+      }
+    }
+
+    return {
+      lead_time_hours: lead,
+      valid_time: validTime,
+      label: validTime ? formatDayHourInTimeZone(validTime, timezone) : "",
+      dry,
+      rain,
+      snow,
+      freezing_rain,
+      ice_pellets,
+      unknown,
+      valid_member_count: data?.valid_member_count ?? null,
+      member_count: data?.member_count ?? 30,
+      has_data,
+      transition_frequency: data?.transition_frequency ?? null,
+    };
+  });
 }

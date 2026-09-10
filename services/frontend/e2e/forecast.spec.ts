@@ -569,7 +569,7 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
   await expect(page.getByText(/Ensemble Phase Support/)).toBeVisible();
   const phaseChart = page.getByRole("img", {
-    name: /ensemble phase support composition/i,
+    name: /ensemble phase support over time/i,
   });
   await expect(phaseChart).toBeVisible();
 
@@ -577,22 +577,18 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   await phaseChart.scrollIntoViewIfNeeded();
   await page.screenshot({ path: "e2e/screenshots/1c3-gefs-phase-support.png" });
 
-  // Verify all 6 physical phase breakdown values and no mixed segment
-  await expect(page.getByTestId("phase-segment-dry")).toBeVisible();
-  await expect(page.getByTestId("phase-segment-rain")).toBeVisible();
-  await expect(page.getByTestId("phase-segment-snow")).toBeVisible();
-  await expect(page.getByTestId("phase-segment-freezing_rain")).toBeVisible();
-  await expect(page.getByTestId("phase-segment-ice_pellets")).toBeVisible();
-  await expect(page.getByTestId("phase-segment-unknown")).toBeVisible();
-  await expect(page.locator('[data-testid="phase-segment-mixed"]')).toHaveCount(0);
+  // Verify all 6 physical phase taxonomy badges and no mixed category
+  await expect(page.getByTestId("phase-badge-dry")).toBeVisible();
+  await expect(page.getByTestId("phase-badge-rain")).toBeVisible();
+  await expect(page.getByTestId("phase-badge-snow")).toBeVisible();
+  await expect(page.getByTestId("phase-badge-freezing_rain")).toBeVisible();
+  await expect(page.getByTestId("phase-badge-ice_pellets")).toBeVisible();
+  await expect(page.getByTestId("phase-badge-unknown")).toBeVisible();
+  await expect(page.locator('[data-testid="phase-badge-mixed"]')).toHaveCount(0);
 
-  // Verify percentages
+  // Verify prominent segment percentages rendered on the chart bars
   await expect(page.getByText("52%").first()).toBeVisible(); // Rain
   await expect(page.getByText("26%").first()).toBeVisible(); // Snow
-  await expect(page.getByText("10%").first()).toBeVisible(); // Dry
-  await expect(page.getByText("8%").first()).toBeVisible(); // Freezing Rain
-  await expect(page.getByText("3%").first()).toBeVisible(); // Ice Pellets
-  await expect(page.getByText("1%").first()).toBeVisible(); // Unknown
 
   // Verify secondary transition frequency
   await expect(page.getByText(/Member Phase Transitions/)).toBeVisible();

@@ -1,8 +1,10 @@
 import type { EnsembleStatisticsData, ForecastEntry } from "@/lib/api/types";
 import {
   FORECAST_ENTRY_METADATA_FIELDS,
+  RAW_CATEGORICAL_PHASE_VARIABLES,
   isForecastDataVariable,
   isForecastEntryMetadataField,
+  isRawCategoricalPhaseVariable,
 } from "@/lib/api/types";
 import {
   distributionSummary,
@@ -13,6 +15,7 @@ import {
   histogramBins,
   toEnsembleChartData,
   toEnsembleFanData,
+  toEnsemblePhaseSupportData,
   toMemberDots,
   toMeteogramSeries,
   toPdfPoints,
@@ -92,6 +95,24 @@ describe("FORECAST_ENTRY_METADATA_FIELDS", () => {
   });
 });
 
+describe("RAW_CATEGORICAL_PHASE_VARIABLES", () => {
+  it("contains crain, csnow, cfrzr, and cicep", () => {
+    expect(RAW_CATEGORICAL_PHASE_VARIABLES.has("crain")).toBe(true);
+    expect(RAW_CATEGORICAL_PHASE_VARIABLES.has("csnow")).toBe(true);
+    expect(RAW_CATEGORICAL_PHASE_VARIABLES.has("cfrzr")).toBe(true);
+    expect(RAW_CATEGORICAL_PHASE_VARIABLES.has("cicep")).toBe(true);
+  });
+
+  it("identifies raw categorical phase variables and excludes them from candidate plottable variables", () => {
+    for (const code of ["crain", "csnow", "cfrzr", "cicep"]) {
+      expect(isRawCategoricalPhaseVariable(code)).toBe(true);
+      expect(isForecastDataVariable(code)).toBe(false);
+    }
+    expect(isRawCategoricalPhaseVariable("precipitation_amount_3h")).toBe(false);
+    expect(isForecastDataVariable("precipitation_amount_3h")).toBe(true);
+  });
+});
+
 describe("forecastVariableCodes", () => {
   it("returns only the variable keys, excluding structural keys", () => {
     expect(forecastVariableCodes(entries)).toEqual(["temperature_2m", "precipitation_rate"]);
@@ -145,6 +166,48 @@ describe("forecastVariableCodes", () => {
     ];
 
     expect(forecastVariableCodes(precipEntries)).toEqual(["precipitation_amount_3h"]);
+  });
+
+  it("excludes raw categorical phase variables (crain, csnow, cfrzr, cicep) from both deterministic and ensemble forecasts", () => {
+    const deterministicEntries: ForecastEntry[] = [
+      {
+        lead_time_hours: 3,
+        valid_time: "2026-07-21T03:00:00Z",
+        temperature_2m: 15.2,
+        precipitation_amount_3h: 2.5,
+        crain: 1,
+        csnow: 0,
+        cfrzr: 0,
+        cicep: 0,
+      },
+    ];
+
+    const ensembleEntries: ForecastEntry[] = [
+      {
+        lead_time_hours: 3,
+        valid_time: "2026-07-21T03:00:00Z",
+        temperature_2m: 14.8,
+        precipitation_amount_3h: 3.1,
+        crain: 0.8,
+        csnow: 0.2,
+        cfrzr: 0,
+        cicep: 0,
+      },
+    ];
+
+    const detCodes = forecastVariableCodes(deterministicEntries);
+    expect(detCodes.sort()).toEqual(["precipitation_amount_3h", "temperature_2m"].sort());
+    expect(detCodes).not.toContain("crain");
+    expect(detCodes).not.toContain("csnow");
+    expect(detCodes).not.toContain("cfrzr");
+    expect(detCodes).not.toContain("cicep");
+
+    const ensCodes = forecastVariableCodes(ensembleEntries);
+    expect(ensCodes.sort()).toEqual(["precipitation_amount_3h", "temperature_2m"].sort());
+    expect(ensCodes).not.toContain("crain");
+    expect(ensCodes).not.toContain("csnow");
+    expect(ensCodes).not.toContain("cfrzr");
+    expect(ensCodes).not.toContain("cicep");
   });
 });
 
@@ -256,6 +319,357 @@ describe("toEnsembleFanData", () => {
     });
     expect(fan[1].valid_time).toBe("2026-09-10T06:00:00Z");
     expect(fan[1].p90Height).toBeCloseTo(16 - 10, 6);
+  });
+
+  describe("NaN and missing percentile resilience (x-axis non-truncation invariant)", () => {
+    function makeStats(val: number | null | typeof Number.NaN) {
+      if (val === null || (typeof val === "number" && Number.isNaN(val))) {
+        return {
+          mean: val as any,
+          median: val as any,
+          spread: val as any,
+          p10: val as any,
+          p25: val as any,
+          p50: val as any,
+          p75: val as any,
+          p90: val as any,
+        };
+      }
+      return {
+        mean: val,
+        median: val,
+        spread: 2,
+        p10: val - 3,
+        p25: val - 1,
+        p50: val,
+        p75: val + 1,
+        p90: val + 3,
+      };
+    }
+
+    function createSeries(values: Array<number | null | typeof Number.NaN>) {
+      const map = new Map<number, EnsembleStatisticsData>();
+      const validTimes = new Map<number, string>();
+      values.forEach((v, idx) => {
+        const lead = idx * 3;
+        const vt = `2026-09-10T${String(lead).padStart(2, "0")}:00:00Z`;
+        validTimes.set(lead, vt);
+        map.set(lead, {
+          model: "gefs",
+          lead_time_hours: lead,
+          valid_time: vt,
+          member_count: 30,
+          statistics: makeStats(v),
+        });
+      });
+      return { map, validTimes };
+    }
+
+    it("handles pattern: finite -> finite -> NaN -> finite -> finite without dropping later times", () => {
+      const { map, validTimes } = createSeries([10, 12, Number.NaN, 14, 16]);
+      const fan = toEnsembleFanData(map, validTimes);
+
+      expect(fan).toHaveLength(5);
+      expect(fan.map((p) => p.lead_time_hours)).toEqual([0, 3, 6, 9, 12]);
+      expect(fan.map((p) => p.valid_time)).toEqual([
+        "2026-09-10T00:00:00Z",
+        "2026-09-10T03:00:00Z",
+        "2026-09-10T06:00:00Z",
+        "2026-09-10T09:00:00Z",
+        "2026-09-10T12:00:00Z",
+      ]);
+
+      // Point 0 & 1 finite
+      expect(fan[0].median).toBe(10);
+      expect(fan[1].median).toBe(12);
+
+      // Point 2 (NaN) normalized to null, geometry omitted
+      expect(fan[2].p10Base).toBeNull();
+      expect(fan[2].p90Height).toBeNull();
+      expect(fan[2].p25Base).toBeNull();
+      expect(fan[2].p75Height).toBeNull();
+      expect(fan[2].median).toBeNull();
+      expect(fan[2].mean).toBeNull();
+
+      // Later points 3 & 4 remain visible and finite
+      expect(fan[3].median).toBe(14);
+      expect(fan[3].p10Base).toBe(11);
+      expect(fan[3].p90Height).toBe(6);
+      expect(fan[4].median).toBe(16);
+    });
+
+    it("handles pattern: NaN -> finite -> finite (missing at start)", () => {
+      const { map, validTimes } = createSeries([Number.NaN, 20, 22]);
+      const fan = toEnsembleFanData(map, validTimes);
+
+      expect(fan).toHaveLength(3);
+      expect(fan[0].valid_time).toBe("2026-09-10T00:00:00Z");
+      expect(fan[0].median).toBeNull();
+      expect(fan[1].median).toBe(20);
+      expect(fan[2].median).toBe(22);
+    });
+
+    it("handles pattern: finite -> NaN -> finite (missing in middle)", () => {
+      const { map, validTimes } = createSeries([30, Number.NaN, 35]);
+      const fan = toEnsembleFanData(map, validTimes);
+
+      expect(fan).toHaveLength(3);
+      expect(fan[0].median).toBe(30);
+      expect(fan[1].median).toBeNull();
+      expect(fan[2].median).toBe(35);
+    });
+
+    it("handles pattern: finite -> finite -> NaN (missing at end)", () => {
+      const { map, validTimes } = createSeries([40, 42, Number.NaN]);
+      const fan = toEnsembleFanData(map, validTimes);
+
+      expect(fan).toHaveLength(3);
+      expect(fan[0].median).toBe(40);
+      expect(fan[1].median).toBe(42);
+      expect(fan[2].median).toBeNull();
+      expect(fan[2].valid_time).toBe("2026-09-10T06:00:00Z");
+    });
+
+    it("handles multiple separated NaNs across the series", () => {
+      const { map, validTimes } = createSeries([
+        Number.NaN,
+        50,
+        Number.NaN,
+        52,
+        Number.NaN,
+        54,
+        Number.NaN,
+      ]);
+      const fan = toEnsembleFanData(map, validTimes);
+
+      expect(fan).toHaveLength(7);
+      expect(fan[0].median).toBeNull();
+      expect(fan[1].median).toBe(50);
+      expect(fan[2].median).toBeNull();
+      expect(fan[3].median).toBe(52);
+      expect(fan[4].median).toBeNull();
+      expect(fan[5].median).toBe(54);
+      expect(fan[6].median).toBeNull();
+
+      // Verify all valid_times are preserved in order
+      expect(fan.map((p) => p.lead_time_hours)).toEqual([0, 3, 6, 9, 12, 15, 18]);
+    });
+
+    it("preserves leads from validTimesByLead even when missing from ensembleByLead", () => {
+      const ensembleMap = new Map<number, EnsembleStatisticsData>([
+        [
+          6,
+          {
+            model: "gefs",
+            lead_time_hours: 6,
+            valid_time: "2026-09-10T06:00:00Z",
+            member_count: 30,
+            statistics: makeStats(25),
+          },
+        ],
+      ]);
+
+      const validTimesMap = new Map<number, string>([
+        [0, "2026-09-10T00:00:00Z"],
+        [3, "2026-09-10T03:00:00Z"],
+        [6, "2026-09-10T06:00:00Z"],
+        [9, "2026-09-10T09:00:00Z"],
+      ]);
+
+      const fan = toEnsembleFanData(ensembleMap, validTimesMap);
+      expect(fan).toHaveLength(4);
+      expect(fan.map((p) => p.lead_time_hours)).toEqual([0, 3, 6, 9]);
+      expect(fan[0].median).toBeNull();
+      expect(fan[1].median).toBeNull();
+      expect(fan[2].median).toBe(25);
+      expect(fan[3].median).toBeNull();
+    });
+  });
+});
+
+describe("toEnsemblePhaseSupportData", () => {
+  const byLeadMulti: Map<number, EnsembleStatisticsData> = new Map([
+    [
+      0,
+      {
+        model: "gefs",
+        lead_time_hours: 0,
+        valid_time: "2026-09-10T00:00:00Z",
+        member_count: 30,
+        valid_member_count: 30,
+        statistics: {
+          mean: null,
+          median: null,
+          spread: null,
+          p10: null,
+          p25: null,
+          p50: null,
+          p75: null,
+          p90: null,
+        },
+        // Lead 0 is analysis time, precipitation accumulation is undefined / no phase
+        phase_support: null,
+      },
+    ],
+    [
+      3,
+      {
+        model: "gefs",
+        lead_time_hours: 3,
+        valid_time: "2026-09-10T03:00:00Z",
+        member_count: 30,
+        valid_member_count: 30,
+        statistics: {
+          mean: null,
+          median: null,
+          spread: null,
+          p10: null,
+          p25: null,
+          p50: null,
+          p75: null,
+          p90: null,
+        },
+        phase_support: {
+          dry: 0.1,
+          rain: 0.6,
+          snow: 0.2,
+          freezing_rain: 0.05,
+          ice_pellets: 0.03,
+          unknown: 0.02,
+        },
+      },
+    ],
+    [
+      6,
+      {
+        model: "gefs",
+        lead_time_hours: 6,
+        valid_time: "2026-09-10T06:00:00Z",
+        member_count: 30,
+        valid_member_count: 30,
+        statistics: {
+          mean: null,
+          median: null,
+          spread: null,
+          p10: null,
+          p25: null,
+          p50: null,
+          p75: null,
+          p90: null,
+        },
+        phase_support: {
+          dry: 0.2,
+          rain: 0.1,
+          snow: 0.7,
+          freezing_rain: 0.0,
+          ice_pellets: 0.0,
+          unknown: 0.0,
+        },
+      },
+    ],
+    [
+      9,
+      {
+        model: "gefs",
+        lead_time_hours: 9,
+        valid_time: "2026-09-10T09:00:00Z",
+        member_count: 30,
+        valid_member_count: 30,
+        statistics: {
+          mean: null,
+          median: null,
+          spread: null,
+          p10: null,
+          p25: null,
+          p50: null,
+          p75: null,
+          p90: null,
+        },
+        phase_support: {
+          dry: 0.8,
+          rain: 0.0,
+          snow: 0.15,
+          freezing_rain: 0.0,
+          ice_pellets: 0.0,
+          unknown: 0.05,
+        },
+      },
+    ],
+  ]);
+
+  const validTimes = new Map<number, string>([
+    [0, "2026-09-10T00:00:00Z"],
+    [3, "2026-09-10T03:00:00Z"],
+    [6, "2026-09-10T06:00:00Z"],
+    [9, "2026-09-10T09:00:00Z"],
+  ]);
+
+  it("computes phase support independently for multiple valid times across the forecast series", () => {
+    const series = toEnsemblePhaseSupportData(byLeadMulti, validTimes);
+
+    expect(series).toHaveLength(4);
+    expect(series.map((p) => p.lead_time_hours)).toEqual([0, 3, 6, 9]);
+    expect(series.map((p) => p.valid_time)).toEqual([
+      "2026-09-10T00:00:00Z",
+      "2026-09-10T03:00:00Z",
+      "2026-09-10T06:00:00Z",
+      "2026-09-10T09:00:00Z",
+    ]);
+
+    // Lead 3 has high rain support
+    expect(series[1].has_data).toBe(true);
+    expect(series[1].rain).toBeCloseTo(60, 2);
+    expect(series[1].snow).toBeCloseTo(20, 2);
+
+    // Lead 6 transitions to snow dominance
+    expect(series[2].has_data).toBe(true);
+    expect(series[2].snow).toBeCloseTo(70, 2);
+    expect(series[2].rain).toBeCloseTo(10, 2);
+
+    // Lead 9 dries out
+    expect(series[3].has_data).toBe(true);
+    expect(series[3].dry).toBeCloseTo(80, 2);
+  });
+
+  it("totals approximately 100% for each valid time with phase data", () => {
+    const series = toEnsemblePhaseSupportData(byLeadMulti, validTimes);
+
+    for (const point of series) {
+      if (point.has_data) {
+        const total =
+          (point.dry ?? 0) +
+          (point.rain ?? 0) +
+          (point.snow ?? 0) +
+          (point.freezing_rain ?? 0) +
+          (point.ice_pellets ?? 0) +
+          (point.unknown ?? 0);
+        expect(total).toBeCloseTo(100, 1);
+      }
+    }
+  });
+
+  it("gaps missing/invalid times without dropping subsequent valid times", () => {
+    const series = toEnsemblePhaseSupportData(byLeadMulti, validTimes);
+
+    // Lead 0 had null phase_support: must have has_data: false and null metrics
+    expect(series[0].has_data).toBe(false);
+    expect(series[0].rain).toBeNull();
+    expect(series[0].dry).toBeNull();
+    expect(series[0].snow).toBeNull();
+    expect(series[0].valid_time).toBe("2026-09-10T00:00:00Z");
+
+    // Later leads 3, 6, 9 remain intact and fully populated
+    expect(series[1].has_data).toBe(true);
+    expect(series[2].has_data).toBe(true);
+    expect(series[3].has_data).toBe(true);
+  });
+
+  it("formats localized time labels with display timezone", () => {
+    const series = toEnsemblePhaseSupportData(byLeadMulti, validTimes, "America/Denver");
+    // 2026-09-10T00:00:00Z in Denver MDT is Sep 9, 18:00
+    expect(series[0].label).toBe("Sep 9, 18:00");
+    // 2026-09-10T06:00:00Z in Denver MDT is Sep 10, 00:00
+    expect(series[2].label).toBe("Sep 10, 00:00");
   });
 });
 

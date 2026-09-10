@@ -83,6 +83,10 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
       precipitation_end_type: entry?.precipitation_end_type as string | undefined,
       precipitation_evidence: entry?.precipitation_evidence as string | undefined,
       lead_time_hours: point.lead_time_hours,
+      crain: typeof entry?.crain === "number" ? entry.crain : null,
+      csnow: typeof entry?.csnow === "number" ? entry.csnow : null,
+      cfrzr: typeof entry?.cfrzr === "number" ? entry.cfrzr : null,
+      cicep: typeof entry?.cicep === "number" ? entry.cicep : null,
     };
 
     const rawVal = point.value;

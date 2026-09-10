@@ -2,6 +2,7 @@ import {
   formatPointPrecipitationDisplay,
   formatTransitionName,
   getBarColorForEntry,
+  getMixedPhaseConstituents,
   getPointForecastPhaseLabel,
   getPrecipitationPhaseMeta,
   getTransitionPhases,
@@ -161,7 +162,7 @@ describe("precipitation formatting and phase metadata", () => {
       ).toBe("Rain → Freezing Rain");
     });
 
-    it("returns 'Mixed' for complex multi-phase transitions", () => {
+    it("returns 'Mixed' for complex multi-phase transitions when constituents are unspecified", () => {
       expect(
         getPointForecastPhaseLabel({
           precipitation_amount_3h: 1.1,
@@ -169,6 +170,55 @@ describe("precipitation formatting and phase metadata", () => {
           precipitation_transition: "mixed_transition",
         })
       ).toBe("Mixed");
+    });
+
+    it("classifies Mixed with explicit constituent list derived from categorical flags", () => {
+      // Rain + Snow
+      expect(
+        getPointForecastPhaseLabel({
+          precipitation_amount_3h: 0.31,
+          precipitation_type: "mixed",
+          crain: 1,
+          csnow: 1,
+          cfrzr: 0,
+          cicep: 0,
+        })
+      ).toBe("Mixed (Rain + Snow)");
+
+      // Rain + Freezing Rain
+      expect(
+        getPointForecastPhaseLabel({
+          precipitation_amount_3h: 0.18,
+          precipitation_type: "mixed",
+          crain: 1,
+          csnow: 0,
+          cfrzr: 1,
+          cicep: 0,
+        })
+      ).toBe("Mixed (Rain + Freezing Rain)");
+
+      // Three constituents in deterministic order: Rain + Snow + Ice Pellets
+      expect(
+        getPointForecastPhaseLabel({
+          precipitation_amount_3h: 0.45,
+          precipitation_type: "mixed",
+          crain: 1,
+          csnow: 1,
+          cfrzr: 0,
+          cicep: 1,
+        })
+      ).toBe("Mixed (Rain + Snow + Ice Pellets)");
+    });
+
+    it("maintains deterministic constituent ordering regardless of flag evaluation sequence", () => {
+      const constituents = getMixedPhaseConstituents({
+        cicep: 1,
+        crain: 1,
+        csnow: 1,
+        cfrzr: 1,
+      });
+      // Established physical order: Rain, Snow, Freezing Rain, Ice Pellets
+      expect(constituents).toEqual(["Rain", "Snow", "Freezing Rain", "Ice Pellets"]);
     });
 
     it("returns 'Unclassified' for wet intervals lacking microphysical diagnostics", () => {
@@ -205,6 +255,18 @@ describe("precipitation formatting and phase metadata", () => {
           "mm"
         )
       ).toBe("5.1 mm · Rain → Snow");
+
+      expect(
+        formatPointPrecipitationDisplay(
+          {
+            precipitation_amount_3h: 0.31,
+            precipitation_type: "mixed",
+            crain: 1,
+            csnow: 1,
+          },
+          "mm"
+        )
+      ).toBe("0.31 mm · Mixed (Rain + Snow)");
 
       expect(
         formatPointPrecipitationDisplay(
