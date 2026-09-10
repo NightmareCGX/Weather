@@ -9,7 +9,7 @@ import {
 } from "@/test-utils/maplibre";
 
 import { WeatherMap } from "@/components/map/WeatherMap";
-import type { SelectedLocation, SpatialLayer } from "@/lib/api/types";
+import type { ApproximateStartupLocation, SelectedLocation, SpatialLayer } from "@/lib/api/types";
 
 const layer: SpatialLayer = {
   tile_url_template: "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=12",
@@ -507,5 +507,315 @@ describe("WeatherMap", () => {
     const btn = getByRole("button", { name: "Locate me" });
     expect(btn).toHaveAttribute("aria-busy", "true");
     expect(btn).toBeDisabled();
+  });
+
+  describe("startup coarse IP localization camera transition & race protection", () => {
+    const mockApproximateLocation: ApproximateStartupLocation = {
+      latitude: 39.7392,
+      longitude: -104.9903,
+      city: "Denver",
+      region: "Colorado",
+      country: "US",
+      source: "ip",
+    };
+
+    it("performs one regional easeTo when approximateLocation is provided on startup", () => {
+      renderMap({ approximateLocation: mockApproximateLocation });
+      const [map] = getInstances();
+
+      expect(map.easeTo).toHaveBeenCalledTimes(1);
+      expect(map.easeTo).toHaveBeenCalledWith({
+        center: [-104.9903, 39.7392],
+        zoom: 6.5,
+        duration: 800,
+        essential: false,
+      });
+    });
+
+    it("creates NO map marker for approximate startup location", () => {
+      renderMap({ approximateLocation: mockApproximateLocation });
+      expect(getMarkers()).toHaveLength(0);
+    });
+
+    it("manual pan (dragstart) before delayed IP response permanently prevents easeTo", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+
+      map.fire("load");
+      map.fire("dragstart");
+
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
+
+    it("manual zoom (zoomstart with originalEvent) before delayed IP response permanently prevents easeTo", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+
+      map.fire("load");
+      map.fire("zoomstart", { originalEvent: new MouseEvent("wheel") });
+
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
+
+    it("manual rotate (rotatestart) before delayed IP response permanently prevents easeTo", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+
+      map.fire("load");
+      map.fire("rotatestart");
+
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
+
+    it("manual pitch (pitchstart) before delayed IP response permanently prevents easeTo", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+
+      map.fire("load");
+      map.fire("pitchstart");
+
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
+
+    it("programmatic camera transitions (zoomstart without originalEvent) do not falsely disqualify startup centering", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+
+      map.fire("load");
+      // Programmatic zoomstart has no originalEvent
+      map.fire("zoomstart", {});
+
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.easeTo).toHaveBeenCalledTimes(1);
+    });
+
+    it("canonical location selection before delayed IP response permanently prevents easeTo", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+
+      // User selects a location (e.g. from search) before IP returns
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={coordinates}
+          approximateLocation={null}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.flyTo).toHaveBeenCalled();
+
+      // Delayed IP response arrives
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={coordinates}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
+
+    it("clicking Locate Me before delayed IP response permanently prevents easeTo", () => {
+      const onLocate = jest.fn();
+      const { getByRole, rerender } = renderMap({ approximateLocation: null, onLocate });
+      const [map] = getInstances();
+
+      const btn = getByRole("button", { name: "Locate me" });
+      btn.click();
+      expect(onLocate).toHaveBeenCalledTimes(1);
+
+      // Delayed IP response arrives
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+          onLocate={onLocate}
+        />
+      );
+
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
+
+    it("isLocating active before delayed IP response permanently prevents easeTo even after isLocating ends without selection", () => {
+      const { rerender } = renderMap({ approximateLocation: null, isLocating: true });
+      const [map] = getInstances();
+
+      // Geolocation denied or failed: isLocating returns to false, selectedLocation is null
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={null}
+          validTime={null}
+          onSelect={jest.fn()}
+          isLocating={false}
+        />
+      );
+
+      // Delayed IP response arrives
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+          isLocating={false}
+        />
+      );
+
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
+
+    it("does not repeat easeTo on subsequent re-renders after auto-centering was applied", () => {
+      const { rerender } = renderMap({ approximateLocation: mockApproximateLocation });
+      const [map] = getInstances();
+
+      expect(map.easeTo).toHaveBeenCalledTimes(1);
+
+      // Re-render with another approximateLocation or update
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={{ ...mockApproximateLocation, latitude: 40.0 }}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      // easeTo must NOT have been called a second time
+      expect(map.easeTo).toHaveBeenCalledTimes(1);
+    });
+
+    it("selecting a location and then clearing it does NOT recenter to startup IP", () => {
+      const { rerender } = renderMap({ approximateLocation: mockApproximateLocation });
+      const [map] = getInstances();
+
+      expect(map.easeTo).toHaveBeenCalledTimes(1);
+
+      // Select a location (e.g. Tokyo)
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={coordinates}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      // Clear the selection
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      // Marker is removed, but easeTo is NOT called again
+      expect(map.easeTo).toHaveBeenCalledTimes(1);
+    });
+
+    it("selecting and clearing a location before delayed IP response still prevents easeTo", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+
+      // Select a location
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={coordinates}
+          approximateLocation={null}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      // Clear the selection before IP response arrives
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={null}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      // Delayed IP response arrives
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      // Must NOT easeTo
+      expect(map.easeTo).not.toHaveBeenCalled();
+    });
   });
 });

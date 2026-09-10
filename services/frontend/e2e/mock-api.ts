@@ -812,6 +812,16 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
     const q = (url.searchParams.get("q") ?? "").toLowerCase();
     const all = [
       {
+        id: "city_tokyo",
+        object: "city",
+        name: "Tokyo",
+        region: "Tokyo",
+        country: "Japan",
+        elevation_m: 40,
+        latitude: 35.6762,
+        longitude: 139.6503,
+      },
+      {
         id: "city_denver",
         object: "city",
         name: "Denver",
@@ -874,15 +884,10 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
 
   await page.route("**/v1/locate", (route) => {
     route.fulfill({
-      status: 200,
+      status: 404,
       contentType: "application/json",
       body: JSON.stringify({
-        latitude: 39.7392,
-        longitude: -104.9903,
-        city: "Denver",
-        region: "Colorado",
-        country: "US",
-        approximate: true,
+        detail: "Location unavailable",
       }),
     });
   });

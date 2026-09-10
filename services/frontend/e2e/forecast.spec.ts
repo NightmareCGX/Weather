@@ -913,13 +913,36 @@ test("search attribution: search listbox renders accessible Geoapify and Locatio
   await expect(locLink).toHaveAttribute("href", "https://locationiq.com");
 });
 
-test("startup privacy invariant: page load produces no geolocation prompt, no /v1/locate call, and null selection", async ({
+test("startup privacy invariant: page load makes best-effort /v1/locate call without browser geolocation prompt or marker", async ({
   page,
 }) => {
   let locateEndpointCalled = false;
   await page.route("**/v1/locate", (route) => {
     locateEndpointCalled = true;
-    route.fulfill({ status: 404 });
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        latitude: 39.7392,
+        longitude: -104.9903,
+        city: "Denver",
+        region: "Colorado",
+        country: "US",
+        approximate: true,
+      }),
+    });
+  });
+
+  // Track if browser navigator.geolocation is ever invoked
+  await page.addInitScript(() => {
+    (window as any).__geolocationInvoked = false;
+    if (navigator.geolocation) {
+      const origGetCurrentPosition = navigator.geolocation.getCurrentPosition;
+      navigator.geolocation.getCurrentPosition = function (...args) {
+        (window as any).__geolocationInvoked = true;
+        return origGetCurrentPosition.apply(this, args);
+      };
+    }
   });
 
   await page.goto("/");
@@ -928,12 +951,16 @@ test("startup privacy invariant: page load produces no geolocation prompt, no /v
   await expect(page.getByText("Weather Platform")).toBeVisible();
   await page.waitForTimeout(1000);
 
-  // No forecast panel is open
+  // Best-effort /v1/locate was invoked on startup
+  expect(locateEndpointCalled).toBe(true);
+
+  // Critical privacy invariant: navigator.geolocation was NEVER called automatically!
+  const geolocationInvoked = await page.evaluate(() => (window as any).__geolocationInvoked);
+  expect(geolocationInvoked).toBe(false);
+
+  // Invariant: startup IP location does NOT open forecast panel or place a selection marker
   await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
-  // No marker on map
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
-  // Zero /v1/locate calls
-  expect(locateEndpointCalled).toBe(false);
 });
 
 test("locate me allow: clicking Locate Me with granted permission commits location, moves map, and opens forecast", async ({
@@ -956,20 +983,26 @@ test("locate me allow: clicking Locate Me with granted permission commits locati
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 });
 
-test("locate me deny privacy: denying geolocation renders non-blocking alert and NEVER calls /v1/locate", async ({
+test("locate me deny privacy: denying geolocation renders non-blocking alert and NEVER calls /v1/locate as fallback", async ({
   page,
   context,
 }) => {
-  let locateEndpointCalled = false;
+  let locateFallbackCalled = false;
+  let startupCompleted = false;
+
   await page.route("**/v1/locate", (route) => {
-    locateEndpointCalled = true;
-    route.fulfill({ status: 200 });
+    if (startupCompleted) {
+      locateFallbackCalled = true;
+    }
+    route.fulfill({ status: 404 });
   });
 
   // Explicitly deny geolocation permissions
   await context.clearPermissions();
 
   await page.goto("/");
+  await expect(page.getByText("Weather Platform")).toBeVisible();
+  startupCompleted = true;
 
   const locateBtn = page.getByRole("button", { name: "Locate me" });
   await locateBtn.click();
@@ -979,8 +1012,8 @@ test("locate me deny privacy: denying geolocation renders non-blocking alert and
   await expect(alert).toBeVisible();
   await expect(alert).toContainText("Location access denied");
 
-  // Critical privacy invariant: NO /v1/locate was called!
-  expect(locateEndpointCalled).toBe(false);
+  // Critical privacy invariant: NO /v1/locate was called as a fallback for Locate Me!
+  expect(locateFallbackCalled).toBe(false);
   // No forecast panel was opened
   await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
 });
@@ -1242,4 +1275,253 @@ test("ensemble statistics valid-time display: renders calendar valid times and l
   // Close panel
   await page.getByRole("button", { name: "Close forecast panel" }).click();
   await expect(page.getByText("Hourly Forecast")).not.toBeVisible();
+});
+
+test("startup coarse IP success: moves map to regional viewport and localizes valid-time", async ({
+  page,
+}) => {
+  await page.route("**/v1/locate", (route) => {
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        latitude: 39.7392,
+        longitude: -104.9903,
+        city: "Denver",
+        region: "Colorado",
+        country: "US",
+        approximate: true,
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("Weather Platform")).toBeVisible();
+
+  // Wait for map to load and easeTo Denver region (lat ~ 39.7, lon ~ -105.0, zoom ~ 6.5)
+  await page.waitForFunction(() => {
+    const map = (window as any).__weatherMap;
+    if (!map || typeof map.getCenter !== "function") return false;
+    const c = map.getCenter();
+    const z = map.getZoom();
+    return Math.abs(c.lat - 39.7392) < 0.5 && Math.abs(c.lng - -104.9903) < 0.5 && z >= 6.0;
+  });
+
+  // Valid label display uses Mountain Time (MDT/GMT-6)
+  const validTimeDisplay = page.getByTestId("valid-time");
+  await expect(validTimeDisplay).toBeVisible();
+  await expect(validTimeDisplay).toHaveText(/Valid .* (MDT|GMT-6)/);
+
+  // Valid Time dropdown remains in canonical UTC
+  const validSelect = page.getByLabel("Valid time");
+  await expect(validSelect).toBeVisible();
+  const dropdownText = await validSelect.evaluate(
+    (sel: HTMLSelectElement) => sel.options[sel.selectedIndex]?.text
+  );
+  expect(dropdownText).toContain("UTC");
+
+  // Invariant: no marker, no forecast panel
+  await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+});
+
+test("startup coarse IP failure (404): map remains at CONUS viewport and valid-time is UTC", async ({
+  page,
+}) => {
+  await page.route("**/v1/locate", (route) => {
+    route.fulfill({ status: 404 });
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await page.waitForTimeout(1000);
+
+  // Map remains at default CONUS center (lat ~ 39.2, lng ~ -106.8, zoom 5)
+  const center = await page.evaluate(() => {
+    const map = (window as any).__weatherMap;
+    return map ? { lng: map.getCenter().lng, lat: map.getCenter().lat, zoom: map.getZoom() } : null;
+  });
+  expect(center).not.toBeNull();
+  expect(center!.lat).toBeCloseTo(39.2, 1);
+  expect(center!.lng).toBeCloseTo(-106.8, 1);
+  expect(center!.zoom).toBeCloseTo(5, 0);
+
+  // Valid label display remains UTC
+  const validTimeDisplay = page.getByTestId("valid-time");
+  await expect(validTimeDisplay).toHaveText(/Valid .* UTC/);
+  await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
+  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+});
+
+test("late IP response after user map pan does NOT move camera", async ({ page }) => {
+  let fulfillLocate!: () => void;
+  const locatePromise = new Promise<void>((resolve) => {
+    fulfillLocate = resolve;
+  });
+
+  await page.route("**/v1/locate", async (route) => {
+    await locatePromise;
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        latitude: 39.7392,
+        longitude: -104.9903,
+        city: "Denver",
+        region: "Colorado",
+        country: "US",
+        approximate: true,
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("Weather Platform")).toBeVisible();
+
+  // Wait for map style to be loaded
+  await page.waitForFunction(() => {
+    const map = (window as any).__weatherMap;
+    return map && map.isStyleLoaded();
+  });
+
+  // Simulate manual user pan/drag on the map canvas
+  const mapCanvas = page.locator("canvas.maplibregl-canvas");
+  await expect(mapCanvas).toBeVisible();
+  const box = await mapCanvas.boundingBox();
+  expect(box).not.toBeNull();
+
+  const startX = box!.x + box!.width / 2;
+  const startY = box!.y + box!.height / 2;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  await page.mouse.move(startX + 100, startY + 100, { steps: 10 });
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+
+  // Read camera position after user pan
+  const pannedCenter = await page.evaluate(() => {
+    const map = (window as any).__weatherMap;
+    return { lat: map.getCenter().lat, lng: map.getCenter().lng };
+  });
+
+  // Now release the delayed IP response
+  fulfillLocate();
+  await page.waitForTimeout(1000);
+
+  // Camera must NOT have snapped back to Denver!
+  const finalCenter = await page.evaluate(() => {
+    const map = (window as any).__weatherMap;
+    return { lat: map.getCenter().lat, lng: map.getCenter().lng };
+  });
+
+  expect(finalCenter.lat).toBeCloseTo(pannedCenter.lat, 1);
+  expect(finalCenter.lng).toBeCloseTo(pannedCenter.lng, 1);
+  // Explicitly verify it did NOT easeTo Denver (-104.9903, 39.7392)
+  expect(Math.abs(finalCenter.lng - -104.9903)).toBeGreaterThan(2);
+});
+
+test("late IP response after Locate Me attempt does NOT move camera", async ({ page, context }) => {
+  let fulfillLocate!: () => void;
+  const locatePromise = new Promise<void>((resolve) => {
+    fulfillLocate = resolve;
+  });
+
+  await page.route("**/v1/locate", async (route) => {
+    await locatePromise;
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        latitude: 39.7392,
+        longitude: -104.9903,
+        city: "Denver",
+        region: "Colorado",
+        country: "US",
+        approximate: true,
+      }),
+    });
+  });
+
+  await context.clearPermissions();
+  await page.goto("/");
+  await expect(page.getByText("Weather Platform")).toBeVisible();
+
+  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  await locateBtn.click();
+  const alert = page.getByRole("alert").filter({ hasText: "Location access denied" });
+  await expect(alert).toBeVisible();
+
+  // Release delayed IP response
+  fulfillLocate();
+  await page.waitForTimeout(1000);
+
+  // Camera remains at default CONUS (lat ~ 39.2, lng ~ -106.8, zoom 5), NOT eased to Denver
+  const center = await page.evaluate(() => {
+    const map = (window as any).__weatherMap;
+    return { lat: map.getCenter().lat, lng: map.getCenter().lng, zoom: map.getZoom() };
+  });
+  expect(center.lat).toBeCloseTo(39.2, 1);
+  expect(center.lng).toBeCloseTo(-106.8, 1);
+  expect(center.zoom).toBeCloseTo(5, 0);
+});
+
+test("selecting and clearing location does NOT recenter map to startup IP", async ({ page }) => {
+  await page.route("**/v1/locate", (route) => {
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        latitude: 39.7392,
+        longitude: -104.9903,
+        city: "Denver",
+        region: "Colorado",
+        country: "US",
+        approximate: true,
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("Weather Platform")).toBeVisible();
+
+  // Wait for initial easeTo Denver to complete
+  await page.waitForFunction(() => {
+    const map = (window as any).__weatherMap;
+    if (!map) return false;
+    return Math.abs(map.getCenter().lat - 39.7392) < 0.5;
+  });
+
+  // Select Tokyo from search
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Tokyo");
+  await searchResults(page).getByRole("option", { name: /Tokyo/ }).first().click();
+
+  // Wait for Tokyo selection and flyTo
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await page.waitForFunction(() => {
+    const map = (window as any).__weatherMap;
+    if (!map) return false;
+    return Math.abs(map.getCenter().lat - 35.6762) < 1.0;
+  });
+
+  // Close forecast panel (clearing selectedLocation)
+  await page.getByRole("button", { name: "Close forecast panel" }).click();
+  await expect(page.getByText("Hourly Forecast")).not.toBeVisible();
+
+  // Wait a moment to ensure no easeTo back to Denver happens
+  await page.waitForTimeout(1000);
+
+  // Camera must remain in Tokyo area, NOT ease back to Denver!
+  const center = await page.evaluate(() => {
+    const map = (window as any).__weatherMap;
+    return map.getCenter();
+  });
+  expect(center.lat).toBeCloseTo(35.6762, 0);
+  expect(center.lng).toBeGreaterThan(130);
+  // Explicitly verify it did NOT easeTo Denver (-104.9903, 39.7392)
+  expect(center.lng).not.toBeCloseTo(-104.9903, 0);
+
+  // But display timezone returned to Denver!
+  const validTimeDisplay = page.getByTestId("valid-time");
+  await expect(validTimeDisplay).toHaveText(/Valid .* (MDT|GMT-6)/);
 });

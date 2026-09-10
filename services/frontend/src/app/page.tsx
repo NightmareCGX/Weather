@@ -9,7 +9,7 @@ import { Legend } from "@/components/map/Legend";
 import { LocationSearch } from "@/components/search/LocationSearch";
 import { ForecastDashboard } from "@/components/forecast/ForecastDashboard";
 import { useForecastSelection } from "@/context/forecast-selection";
-import { useSelectedLocation } from "@/context/selected-location";
+import { useSelectedLocation, useStartupLocation } from "@/context/selected-location";
 import { useGeolocation } from "@/hooks/useGeolocation";
 import { useMapLayer } from "@/hooks/useMapLayer";
 import type { SelectedLocation } from "@/lib/api/types";
@@ -31,6 +31,7 @@ export default function HomePage() {
   const { validTime, options } = useForecastSelection();
   const { layer, loading, error } = useMapLayer();
   const { selectedLocation, selectLocation, clearSelection } = useSelectedLocation();
+  const startupLocation = useStartupLocation();
   const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
 
   // Maintain latest canonical map center in a ref so map movement does NOT trigger
@@ -127,6 +128,7 @@ export default function HomePage() {
             <WeatherMap
               layer={layer}
               selectedLocation={selectedLocation}
+              approximateLocation={startupLocation}
               validTime={validTime}
               availableLeads={options.leadTimes}
               onSelect={handleSelectLocation}

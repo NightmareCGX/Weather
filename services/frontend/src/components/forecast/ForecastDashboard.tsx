@@ -14,7 +14,7 @@ import { useEnsemble } from "@/hooks/useEnsemble";
 import { useEnsembleDistribution } from "@/hooks/useEnsembleDistribution";
 import { useVariablesCatalog } from "@/hooks/useVariablesCatalog";
 import { useForecastSelection } from "@/context/forecast-selection";
-import { useSelectedLocationTimezone } from "@/context/selected-location";
+import { useDisplayTimezone } from "@/context/selected-location";
 import { resolveValidTime } from "@/lib/forecast/availability";
 import { formatDayHourWithTimeZone } from "@/lib/forecast/time";
 import { forecastVariableCodes } from "@/lib/forecast/transform";
@@ -49,7 +49,7 @@ interface ForecastDashboardProps {
  */
 export function ForecastDashboard({ location, onClose }: ForecastDashboardProps) {
   const { selection, options } = useForecastSelection();
-  const selectedTimezone = useSelectedLocationTimezone();
+  const displayTimezone = useDisplayTimezone();
   const selectedModel = selection?.model ?? null;
   const selectedModelIsEnsemble = options.model?.is_ensemble ?? false;
   // The Hourly Forecast tracks the UI selection. With the backend's
@@ -201,7 +201,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
                 forecasts={forecast.forecasts}
                 variableCode={code}
                 meta={meta[code] ?? { name: code, unit: "" }}
-                timezone={selectedTimezone}
+                timezone={displayTimezone}
               />
             ))}
           </>
@@ -238,7 +238,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
               <EnsembleChart
                 byLead={ensemble.byLead}
                 variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
-                timezone={selectedTimezone}
+                timezone={displayTimezone}
                 validTimesByLead={validTimesByLead}
               />
             </>
@@ -250,7 +250,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
             error={distribution.error}
             selectedLead={distributionLead}
             validTime={distributionValidTime}
-            timezone={selectedTimezone}
+            timezone={displayTimezone}
             variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
           />
 
@@ -261,7 +261,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
               </h4>
               <p className="mb-2 text-center text-[11px] text-slate-500">
                 {distributionValidTime
-                  ? `${formatDayHourWithTimeZone(distributionValidTime, selectedTimezone)} · `
+                  ? `${formatDayHourWithTimeZone(distributionValidTime, displayTimezone)} · `
                   : ""}
                 30 ensemble members
               </p>
@@ -275,7 +275,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
               transitionFrequency={distribution.data.transition_frequency}
               selectedLead={distributionLead}
               validTime={distributionValidTime}
-              timezone={selectedTimezone}
+              timezone={displayTimezone}
               memberCount={distribution.data.member_count}
             />
           )}

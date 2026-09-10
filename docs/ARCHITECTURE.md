@@ -342,3 +342,98 @@ The Weather Platform is designed for native portability across standard server a
 * **Native ecCodes Decoding:** Ingestion images install Debian `libeccodes-dev` to provide runtime `libeccodes.so` for `cfgrib` on both x86_64 and aarch64.
 * **Production Guardrails:** Production infrastructure strictly forbids `platform: linux/amd64` overrides or QEMU emulation dependencies. Build-time cross-architecture compatibility is continuously enforced via the `arm64-builds` CI pipeline job.
 
+---
+
+## 11. Location Discovery, Startup Coarse IP Localization & Presentation Timezones
+
+The frontend application provides ambient geographic and temporal context on startup while preserving strict privacy invariants and keeping canonical user selections authoritative.
+
+### 11.1 Startup Coarse IP Context vs. Canonical SelectedLocation
+
+A fundamental invariant governs the location model:
+
+$$\text{ApproximateStartupLocation} \neq \text{SelectedLocation}$$
+
+```text
+Hierarchy of Authority:
+EXPLICIT USER INTENT  >  SELECTED LOCATION  >  STARTUP COARSE IP CONTEXT  >  DEFAULT CONUS / UTC FALLBACK
+```
+
+1. **`SelectedLocation` (Canonical Point Selection):**
+   - Represents an explicit user action: Search selection, Map Click, or successful "Locate Me" browser geolocation.
+   - Places a pinpoint selection marker on the map.
+   - Opens the Forecast Dashboard sidebar.
+   - Triggers point forecast queries (`/v1/points`), elevation lookup (`/v1/elevation`), and point-specific ensemble statistics (`/v1/ensembles`).
+   - Participates in the monotonic race guard (`selectionGeneration`).
+2. **`ApproximateStartupLocation` (Ambient Regional Context):**
+   - Derived asynchronously on application mount via a best-effort, non-blocking request to `GET /v1/locate`.
+   - **Never** sets `SelectedLocation` (`selectedLocation === null` on startup).
+   - **Never** places a map marker or implies GPS-level precision.
+   - **Never** opens the Forecast Dashboard or triggers point forecast / elevation queries.
+   - **Never** increments or interacts with `selectionGeneration`.
+   - Safely degrades silently to default CONUS (`[-106.8, 39.2]`, zoom 5) and UTC if `/v1/locate` is unavailable, disabled, or fails.
+
+### 11.2 Dual-Use Architecture of `/v1/locate`
+
+The infrastructure endpoint `GET /v1/locate` serves two distinct purposes in the frontend lifecycle:
+
+```text
+                     ┌───────────────────┐
+                     │   GET /v1/locate  │
+                     └─────────┬─────────┘
+                               │
+               ┌───────────────┴───────────────┐
+               │                               │
+               ▼                               ▼
+    [ Startup Lifecycle ]             [ Locate Me Fallback ]
+  • Automatic, best-effort on mount • Explicit user click on Locate Me
+  • Ambient context only            • Invoked ONLY on POSITION_UNAVAILABLE or TIMEOUT
+  • NO SelectedLocation             • Commits canonical SelectedLocation
+  • Regional easeTo (zoom 6.5)      • Point flyTo (zoom 8) + opens forecast
+  • Fails silently to CONUS/UTC     • NEVER called on PERMISSION_DENIED (Privacy Invariant)
+```
+
+1. **Passive Startup Coarse Context:**
+   - On application startup, `useStartupLocation()` and `useDisplayTimezone()` subscribe to `getCachedStartupLocation()`.
+   - Request is executed once and cached in a module-level Promise, ensuring React Strict Mode double-mount safety without duplicate fetches or aborted requests.
+2. **Explicit Browser Geolocation Fallback (`useGeolocation`):**
+   - Triggered only by user click on "Locate Me" (`LocateMeButton`).
+   - Requests native `navigator.geolocation.getCurrentPosition()`.
+   - If geolocation fails with `POSITION_UNAVAILABLE` or `TIMEOUT`, falls back to `/v1/locate` and commits an approximate `SelectedLocation`.
+   - **Privacy Invariant:** If the user denies browser permission (`PERMISSION_DENIED`), the explicit fallback is strictly aborted. `/v1/locate` is **never** called as a substitute for denied permission.
+
+### 11.3 Infrastructure Trust Boundary & Production Deployment Requirements
+
+`GET /v1/locate` extracts visitor coordinates from Cloudflare Managed Transforms headers (`cf-iplatitude`, `cf-iplongitude`, `cf-ipcity`, `cf-region`, `cf-ipcountry`).
+
+- **Default Safety:** The backend setting `TRUST_CLOUDFLARE_LOCATION_HEADERS` defaults to `False`. When disabled, the API returns HTTP 404 (`Location unavailable`) for all `/v1/locate` requests.
+- **Production Deployment Requirement:** Enabling `TRUST_CLOUDFLARE_LOCATION_HEADERS=True` is safe **only** when the API origin is strictly firewalled to Cloudflare IP ranges or authenticated using Cloudflare Authenticated Origin Pulls (mTLS). In this architecture, Cloudflare edge transforms sanitize client requests and inject authoritative geolocation headers; direct client-to-origin connections with spoofed `cf-*` headers are rejected at the network edge.
+
+### 11.4 Startup Camera Transition & Race Protection
+
+When startup coarse IP coordinates arrive, the map gently transitions from the default CONUS view (`[-106.8, 39.2]`, zoom 5) to the approximate regional viewport (`zoom: 6.5`, duration 800ms).
+
+Startup auto-centering is a **one-time opportunity** guarded by `startupAutoCenterEligibleRef`. It permanently expires when ANY of the following occurs:
+1. The startup IP camera transition (`map.easeTo`) is successfully applied.
+2. The user manually interacts with the map (drag, pan, rotate, pitch, or wheel/touch gesture).
+3. A canonical `SelectedLocation` is ever committed (e.g. search result chosen before IP returns).
+4. A "Locate Me" attempt is initiated, regardless of whether permission is granted, denied, or fails.
+
+**Clearing Selection Invariant:** If a user selects a location (e.g. Tokyo) and subsequently closes the forecast panel (`selectedLocation` becomes null), the map camera **remains at its current position**. It does **not** ease back to the startup IP location.
+
+### 11.5 Timezone Resolution Precedence
+
+All backend meteorological datasets store timestamps in canonical UTC (ISO 8601 strings ending in `Z`). The frontend resolves presentation times using a three-tier precedence model:
+
+$$\text{SelectedLocation timezone} > \text{Startup coarse IP timezone} > \text{UTC}$$
+
+```typescript
+displayTimezone = selectedLocationTimezone ?? startupCoarseIpTimezone ?? null;
+```
+
+- **Selected Location Active:** Forecast valid times in the adjacent Valid label, Hourly Meteograms, and Ensemble Statistics display in the IANA timezone derived from `SelectedLocation` coordinates (via client-side `@photostructure/tz-lookup`).
+- **No Selection + Startup IP Available:** General forecast valid-time labels display in the coarse IP timezone (e.g. `Aug 13, 00:00 MDT`).
+- **No Selection + Startup IP Unavailable (or 404):** Falls back to UTC (`Aug 13, 06:00 UTC`).
+- **Valid Time Dropdown Invariant:** The Valid Time selector dropdown options **always remain canonical UTC** (`{formatDayHourUtc(vt)} UTC`) across all application states.
+
+

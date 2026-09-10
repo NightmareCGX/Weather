@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
-import type { SelectedLocation, SpatialLayer } from "@/lib/api/types";
+import type { ApproximateStartupLocation, SelectedLocation, SpatialLayer } from "@/lib/api/types";
 import { buildBaseStyle } from "@/lib/map/baseStyle";
 import { applyWeatherLayer, removeWeatherLayer } from "@/lib/map/layers";
 import { canonicalizeLongitude, coordinatesToSelectedLocation } from "@/lib/forecast/selection";
@@ -16,6 +16,8 @@ interface WeatherMapProps {
   layer: SpatialLayer | null;
   /** The shared selected location; a marker is shown at its coordinates. */
   selectedLocation: SelectedLocation | null;
+  /** Ambient coarse startup IP location context (null if unavailable or still resolving). */
+  approximateLocation?: ApproximateStartupLocation | null;
   /** The valid time of the current selection; drives layer keying. */
   validTime: string | null;
   /** Available forecast lead hours for prefetch (optional). */
@@ -46,6 +48,7 @@ interface WeatherMapProps {
 export function WeatherMap({
   layer,
   selectedLocation,
+  approximateLocation,
   validTime,
   availableLeads,
   onSelect,
@@ -62,11 +65,23 @@ export function WeatherMap({
   const layerRef = useRef<SpatialLayer | null>(layer);
   const appliedLayerRef = useRef<SpatialLayer | null>(null);
   const isMapClickSelectionRef = useRef<boolean>(false);
+  const startupAutoCenterEligibleRef = useRef<boolean>(true);
+
+  // If a location is selected or Locate Me is active, permanently disqualify startup auto-centering
+  if (selectedLocation !== null || isLocating) {
+    startupAutoCenterEligibleRef.current = false;
+  }
+
   // Keep callbacks fresh without recreating the map
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
   const onCenterChangeRef = useRef(onCenterChange);
   onCenterChangeRef.current = onCenterChange;
+
+  const handleLocate = useCallback(() => {
+    startupAutoCenterEligibleRef.current = false;
+    onLocate?.();
+  }, [onLocate]);
 
   // Progressive vector field fetching and prefetching in parallel
   const { field } = useVectorField({
@@ -88,9 +103,25 @@ export function WeatherMap({
       zoom: 5,
     });
     mapRef.current = map;
+    if (typeof window !== "undefined") {
+      (window as unknown as { __weatherMap?: MapLibreMap }).__weatherMap = map;
+    }
     map.addControl(new maplibregl.NavigationControl(), "top-right");
 
+    const container = containerRef.current;
+
+    const handleUserGesture = (event: Event) => {
+      if (event.isTrusted) {
+        startupAutoCenterEligibleRef.current = false;
+      }
+    };
+
+    container.addEventListener("pointerdown", handleUserGesture);
+    container.addEventListener("wheel", handleUserGesture, { passive: true });
+    container.addEventListener("touchstart", handleUserGesture, { passive: true });
+
     const handleClick = (event: maplibregl.MapMouseEvent) => {
+      startupAutoCenterEligibleRef.current = false;
       const lngLat = event.lngLat;
       if (lngLat === undefined) {
         return;
@@ -98,6 +129,18 @@ export function WeatherMap({
       isMapClickSelectionRef.current = true;
       const wrapped = typeof lngLat.wrap === "function" ? lngLat.wrap() : lngLat;
       onSelectRef.current(coordinatesToSelectedLocation(wrapped.lat, wrapped.lng));
+    };
+
+    const handleManualInteraction = () => {
+      startupAutoCenterEligibleRef.current = false;
+    };
+
+    const handleManualZoomStart = (event?: { originalEvent?: unknown }) => {
+      // Only user-initiated zoom gestures have an original DOM event.
+      // Programmatic easeTo/flyTo calls omit originalEvent.
+      if (event?.originalEvent) {
+        startupAutoCenterEligibleRef.current = false;
+      }
     };
 
     const handleMoveEnd = () => {
@@ -111,13 +154,18 @@ export function WeatherMap({
       }
     };
 
+    map.on("click", handleClick);
+    map.on("dragstart", handleManualInteraction);
+    map.on("rotatestart", handleManualInteraction);
+    map.on("pitchstart", handleManualInteraction);
+    map.on("zoomstart", handleManualZoomStart);
+    map.on("moveend", handleMoveEnd);
+
     const handleLoad = () => {
       if (isStyleReadyRef.current) {
         return;
       }
       isStyleReadyRef.current = true;
-      map.on("click", handleClick);
-      map.on("moveend", handleMoveEnd);
 
       if (canvasRef.current !== null && animRef.current === null) {
         animRef.current = new WindParticleAnimation(canvasRef.current, map);
@@ -138,7 +186,14 @@ export function WeatherMap({
     return () => {
       isStyleReadyRef.current = false;
       appliedLayerRef.current = null;
+      container.removeEventListener("pointerdown", handleUserGesture);
+      container.removeEventListener("wheel", handleUserGesture);
+      container.removeEventListener("touchstart", handleUserGesture);
       map.off("click", handleClick);
+      map.off("dragstart", handleManualInteraction);
+      map.off("rotatestart", handleManualInteraction);
+      map.off("pitchstart", handleManualInteraction);
+      map.off("zoomstart", handleManualZoomStart);
       map.off("moveend", handleMoveEnd);
       map.off("load", handleLoad);
       if (animRef.current !== null) {
@@ -151,6 +206,9 @@ export function WeatherMap({
       }
       map.remove();
       mapRef.current = null;
+      if (typeof window !== "undefined") {
+        delete (window as unknown as { __weatherMap?: MapLibreMap }).__weatherMap;
+      }
     };
   }, []);
 
@@ -183,6 +241,37 @@ export function WeatherMap({
     }
     animRef.current.setField(field);
   }, [field, layer]);
+
+  // Best-effort startup coarse IP localization camera transition.
+  // Applied at most once per session when eligible.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (map === null || !approximateLocation) {
+      return;
+    }
+
+    // Canonical location or active locate attempt permanently disqualifies auto-centering
+    if (selectedLocation !== null || isLocating) {
+      startupAutoCenterEligibleRef.current = false;
+      return;
+    }
+
+    if (!startupAutoCenterEligibleRef.current) {
+      return;
+    }
+
+    // One-time opportunity: mark ineligible immediately
+    startupAutoCenterEligibleRef.current = false;
+
+    if (typeof map.easeTo === "function") {
+      map.easeTo({
+        center: [approximateLocation.longitude, approximateLocation.latitude],
+        zoom: 6.5,
+        duration: 800,
+        essential: false,
+      });
+    }
+  }, [approximateLocation, selectedLocation, isLocating]);
 
   // Keep the selection marker in sync with the shared selected location.
   useEffect(() => {
@@ -227,7 +316,7 @@ export function WeatherMap({
       />
       {onLocate && (
         <div className="absolute right-2.5 top-28 z-20">
-          <LocateMeButton onClick={onLocate} isLocating={isLocating} />
+          <LocateMeButton onClick={handleLocate} isLocating={isLocating} />
         </div>
       )}
     </div>
