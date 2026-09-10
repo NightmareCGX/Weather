@@ -134,4 +134,39 @@ describe("time formatters", () => {
       expect(tooltip1).not.toBe(tooltip2);
     });
   });
+
+  describe("midnight formatting regression coverage (00:00 vs 24:00 portability)", () => {
+    it("formats UTC midnight as 00:00 (never 24:00)", () => {
+      const utcMidnight = "2026-09-10T00:00:00Z";
+      const formatted = formatDayHourInTimeZone(utcMidnight, null);
+      expect(formatted).toBe("Sep 10, 00:00");
+      expect(formatted).not.toContain("24:00");
+
+      const formattedWithTz = formatDayHourWithTimeZone(utcMidnight, null);
+      expect(formattedWithTz).toBe("Sep 10, 00:00 UTC");
+      expect(formattedWithTz).not.toContain("24:00");
+
+      // Also verify older UTC formatters
+      expect(formatTimeUtc(utcMidnight)).toBe("00:00");
+      expect(formatTimeUtc(utcMidnight)).not.toContain("24:00");
+
+      expect(formatDayHourUtc(utcMidnight)).toBe("Sep 10, 00:00");
+      expect(formatDayHourUtc(utcMidnight)).not.toContain("24:00");
+
+      expect(formatFullUtc(utcMidnight)).toBe("Sep 10, 2026, 00:00");
+      expect(formatFullUtc(utcMidnight)).not.toContain("24:00");
+    });
+
+    it("formats Denver local midnight as 00:00 MDT (never 24:00)", () => {
+      // 2026-09-10T06:00:00Z in America/Denver (MDT) is midnight
+      const denverMidnight = "2026-09-10T06:00:00Z";
+      const formatted = formatDayHourInTimeZone(denverMidnight, "America/Denver");
+      expect(formatted).toBe("Sep 10, 00:00");
+      expect(formatted).not.toContain("24:00");
+
+      const formattedWithTz = formatDayHourWithTimeZone(denverMidnight, "America/Denver");
+      expect(formattedWithTz).toMatch(/^Sep 10, 00:00 (MDT|GMT-6)$/);
+      expect(formattedWithTz).not.toContain("24:00");
+    });
+  });
 });

@@ -10,7 +10,7 @@ const UTC_TIME_FORMATTER = new Intl.DateTimeFormat("en", {
   timeZone: "UTC",
   hour: "2-digit",
   minute: "2-digit",
-  hour12: false,
+  hourCycle: "h23",
 });
 
 const UTC_DAY_HOUR_FORMATTER = new Intl.DateTimeFormat("en", {
@@ -19,7 +19,7 @@ const UTC_DAY_HOUR_FORMATTER = new Intl.DateTimeFormat("en", {
   day: "numeric",
   hour: "2-digit",
   minute: "2-digit",
-  hour12: false,
+  hourCycle: "h23",
 });
 
 const UTC_FULL_FORMATTER = new Intl.DateTimeFormat("en", {
@@ -29,7 +29,7 @@ const UTC_FULL_FORMATTER = new Intl.DateTimeFormat("en", {
   day: "numeric",
   hour: "2-digit",
   minute: "2-digit",
-  hour12: false,
+  hourCycle: "h23",
 });
 
 /** Format a valid time as a short UTC time-of-day, e.g. `"06:00"`. */
@@ -62,7 +62,6 @@ const UTC_DAY_HOUR_WITH_TZ_FORMATTER = new Intl.DateTimeFormat("en", {
   day: "numeric",
   hour: "2-digit",
   minute: "2-digit",
-  hour12: false,
   hourCycle: "h23",
   timeZoneName: "short",
 });
@@ -90,7 +89,6 @@ function getDayHourFormatter(timeZone: string): Intl.DateTimeFormat {
         day: "numeric",
         hour: "2-digit",
         minute: "2-digit",
-        hour12: false,
         hourCycle: "h23",
       });
     } catch {
@@ -111,7 +109,6 @@ function getDayHourWithTzFormatter(timeZone: string): Intl.DateTimeFormat {
         day: "numeric",
         hour: "2-digit",
         minute: "2-digit",
-        hour12: false,
         hourCycle: "h23",
         timeZoneName: "short",
       });
