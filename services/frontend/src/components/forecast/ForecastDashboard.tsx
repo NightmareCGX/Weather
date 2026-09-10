@@ -269,16 +269,20 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
             </div>
           )}
 
-          {ensembleVariable === "precipitation_amount_3h" && distribution.data?.phase_support && (
-            <EnsemblePhaseSupport
-              phaseSupport={distribution.data.phase_support}
-              transitionFrequency={distribution.data.transition_frequency}
-              selectedLead={distributionLead}
-              validTime={distributionValidTime}
-              timezone={displayTimezone}
-              memberCount={distribution.data.member_count}
-            />
-          )}
+          {ensembleVariable === "precipitation_amount_3h" &&
+            (distribution.data?.phase_support ||
+              (ensemble.status === "success" && ensemble.byLead.size > 0)) && (
+              <EnsemblePhaseSupport
+                byLead={ensemble.byLead}
+                validTimesByLead={validTimesByLead}
+                timezone={displayTimezone}
+                phaseSupport={distribution.data?.phase_support ?? undefined}
+                transitionFrequency={distribution.data?.transition_frequency}
+                selectedLead={distributionLead}
+                validTime={distributionValidTime}
+                memberCount={distribution.data?.member_count ?? 30}
+              />
+            )}
         </section>
       )}
     </div>

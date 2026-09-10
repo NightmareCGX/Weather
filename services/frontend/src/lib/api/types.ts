@@ -148,6 +148,24 @@ export const FORECAST_ENTRY_METADATA_FIELDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Raw categorical precipitation-phase diagnostic variables.
+ *
+ * These variables are required internally to derive:
+ * - deterministic precipitation phase;
+ * - deterministic mixed-phase constituents;
+ * - GEFS ensemble phase support.
+ *
+ * However, they must NOT appear as standalone user-visible Hourly Forecast
+ * variables or charts (for either deterministic models or ensemble models).
+ */
+export const RAW_CATEGORICAL_PHASE_VARIABLES: ReadonlySet<string> = new Set([
+  "crain",
+  "csnow",
+  "cfrzr",
+  "cicep",
+]);
+
+/**
  * Whether a forecast-entry key is a structural/metadata field rather than a
  * forecast data variable. Shared by the point-forecast and map-variable
  * extractors so the metadata boundary is governed by one source of truth.
@@ -156,9 +174,20 @@ export function isForecastEntryMetadataField(key: string): boolean {
   return FORECAST_ENTRY_METADATA_FIELDS.has(key);
 }
 
-/** Whether a forecast-entry key is a candidate forecast data variable. */
+/** Whether a forecast-entry key is a raw categorical phase flag. */
+export function isRawCategoricalPhaseVariable(key: string): boolean {
+  return RAW_CATEGORICAL_PHASE_VARIABLES.has(key);
+}
+
+/**
+ * Whether a forecast-entry key is a candidate plottable forecast data variable
+ * for standalone Hourly Forecast presentation.
+ *
+ * Excludes metadata/structural fields AND raw categorical precipitation phase
+ * variables (crain, csnow, cfrzr, cicep).
+ */
 export function isForecastDataVariable(key: string): boolean {
-  return !isForecastEntryMetadataField(key);
+  return !isForecastEntryMetadataField(key) && !isRawCategoricalPhaseVariable(key);
 }
 
 /** The resolved location of a point forecast (API.md section 2.1). */

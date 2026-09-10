@@ -155,6 +155,11 @@ describe("OpenAPI ↔ Frontend Client Contract (7D-A)", () => {
         precipitation_end_type: "none",
         precipitation_evidence: "exact",
         cloud_ceiling_unlimited: false,
+        // Raw categorical precipitation phase diagnostics (must NOT appear as standalone charts):
+        crain: 1,
+        csnow: 0,
+        cfrzr: 0,
+        cicep: 0,
         // Actual weather variables:
         temperature_2m: 18.2,
         precipitation_rate: 1.5,

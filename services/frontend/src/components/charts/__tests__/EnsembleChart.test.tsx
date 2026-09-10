@@ -182,4 +182,134 @@ describe("EnsembleChart", () => {
     expect(lastChartData[0].valid_time).toBe("2026-09-10T00:00:00Z");
     expect(lastXAxisProps.tickFormatter(lastChartData[0].valid_time)).toBe("Sep 10, 00:00");
   });
+
+  describe("x-axis retention with NaN percentile points", () => {
+    it("retains full x-domain when an interior valid time has NaN statistics", () => {
+      const byLeadWithNaN = new Map<number, EnsembleStatisticsData>([
+        [
+          0,
+          {
+            model: "gefs",
+            lead_time_hours: 0,
+            valid_time: "2026-09-10T00:00:00Z",
+            member_count: 30,
+            statistics: {
+              mean: 10,
+              median: 10,
+              spread: 2,
+              p10: 7,
+              p25: 9,
+              p50: 10,
+              p75: 11,
+              p90: 13,
+            },
+          },
+        ],
+        [
+          3,
+          {
+            model: "gefs",
+            lead_time_hours: 3,
+            valid_time: "2026-09-10T03:00:00Z",
+            member_count: 30,
+            statistics: {
+              mean: 11,
+              median: 11,
+              spread: 2,
+              p10: 8,
+              p25: 10,
+              p50: 11,
+              p75: 12,
+              p90: 14,
+            },
+          },
+        ],
+        [
+          6,
+          {
+            model: "gefs",
+            lead_time_hours: 6,
+            valid_time: "2026-09-10T06:00:00Z",
+            member_count: 30,
+            // NaN stats (e.g. cloud ceiling when clear)
+            statistics: {
+              mean: Number.NaN,
+              median: Number.NaN,
+              spread: Number.NaN,
+              p10: Number.NaN,
+              p25: Number.NaN,
+              p50: Number.NaN,
+              p75: Number.NaN,
+              p90: Number.NaN,
+            },
+          },
+        ],
+        [
+          9,
+          {
+            model: "gefs",
+            lead_time_hours: 9,
+            valid_time: "2026-09-10T09:00:00Z",
+            member_count: 30,
+            statistics: {
+              mean: 14,
+              median: 14,
+              spread: 2,
+              p10: 11,
+              p25: 13,
+              p50: 14,
+              p75: 15,
+              p90: 17,
+            },
+          },
+        ],
+        [
+          12,
+          {
+            model: "gefs",
+            lead_time_hours: 12,
+            valid_time: "2026-09-10T12:00:00Z",
+            member_count: 30,
+            statistics: {
+              mean: 15,
+              median: 15,
+              spread: 2,
+              p10: 12,
+              p25: 14,
+              p50: 15,
+              p75: 16,
+              p90: 18,
+            },
+          },
+        ],
+      ]);
+
+      render(<EnsembleChart byLead={byLeadWithNaN} variableLabel="Cloud Ceiling Height" />);
+
+      // All 5 timestamps must be retained in chart data (finite, finite, NaN, finite, finite)
+      expect(lastChartData).toHaveLength(5);
+      expect(lastChartData.map((d) => d.valid_time)).toEqual([
+        "2026-09-10T00:00:00Z",
+        "2026-09-10T03:00:00Z",
+        "2026-09-10T06:00:00Z",
+        "2026-09-10T09:00:00Z",
+        "2026-09-10T12:00:00Z",
+      ]);
+
+      // Point 2 has null for all geometry
+      expect(lastChartData[2].p10Base).toBeNull();
+      expect(lastChartData[2].p90Height).toBeNull();
+      expect(lastChartData[2].median).toBeNull();
+      expect(lastChartData[2].mean).toBeNull();
+
+      // Later points 3 and 4 remain finite and visible
+      expect(lastChartData[3].median).toBe(14);
+      expect(lastChartData[4].median).toBe(15);
+
+      // Tooltip formatting for null / NaN renders "—" and not "0" or "NaN"
+      expect(lastTooltipProps.formatter(null, "Median (P50)", {})).toEqual(["—", "Median (P50)"]);
+      expect(lastTooltipProps.formatter(Number.NaN, "Mean", {})).toEqual(["—", "Mean"]);
+      expect(lastTooltipProps.formatter(15, "Mean", {})).toEqual(["15", "Mean"]);
+    });
+  });
 });

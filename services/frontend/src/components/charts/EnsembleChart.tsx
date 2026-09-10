@@ -86,7 +86,24 @@ export function EnsembleChart({
               domain={["auto", "auto"]}
             />
             <Tooltip
-              formatter={(value: number, name: string) => [formatValue(value, ""), name]}
+              formatter={(value: any, name: string, item: any) => {
+                if (
+                  name === undefined ||
+                  item?.dataKey === "p10Base" ||
+                  item?.dataKey === "p25Base"
+                ) {
+                  return null;
+                }
+                if (
+                  value === null ||
+                  value === undefined ||
+                  typeof value !== "number" ||
+                  !Number.isFinite(value)
+                ) {
+                  return ["—", name];
+                }
+                return [formatValue(value, ""), name];
+              }}
               labelFormatter={(label: string, payload: any[]) => {
                 const validTime = payload?.[0]?.payload?.valid_time ?? label;
                 return validTime ? formatDayHourWithTimeZone(validTime, timezone) : "";
@@ -100,6 +117,7 @@ export function EnsembleChart({
               stroke="none"
               fill="none"
               isAnimationActive={false}
+              connectNulls={false}
             />
             <Area
               dataKey="p90Height"
@@ -108,6 +126,7 @@ export function EnsembleChart({
               fill="#93c5fd"
               fillOpacity={0.35}
               isAnimationActive={false}
+              connectNulls={false}
               name="P10–P90"
             />
             <Area
@@ -116,6 +135,7 @@ export function EnsembleChart({
               stroke="none"
               fill="none"
               isAnimationActive={false}
+              connectNulls={false}
             />
             <Area
               dataKey="p75Height"
@@ -124,6 +144,7 @@ export function EnsembleChart({
               fill="#3b82f6"
               fillOpacity={0.45}
               isAnimationActive={false}
+              connectNulls={false}
               name="P25–P75"
             />
             <Line
@@ -132,6 +153,7 @@ export function EnsembleChart({
               strokeWidth={2}
               dot={false}
               isAnimationActive={false}
+              connectNulls={false}
               name="Median (P50)"
             />
             <Line
@@ -141,6 +163,7 @@ export function EnsembleChart({
               strokeDasharray="4 4"
               dot={false}
               isAnimationActive={false}
+              connectNulls={false}
               name="Mean"
             />
           </ComposedChart>

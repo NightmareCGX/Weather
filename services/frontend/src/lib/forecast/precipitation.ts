@@ -169,6 +169,80 @@ export interface PointForecastPrecipEntry {
   precipitation_end_type?: PrecipitationType | string;
   precipitation_evidence?: string;
   lead_time_hours?: number;
+  crain?: number | null;
+  csnow?: number | null;
+  cfrzr?: number | null;
+  cicep?: number | null;
+}
+
+/**
+ * Deterministic ordering of physical precipitation phases for constituent lists.
+ * Follows the established physical phase order: Rain, Snow, Freezing Rain, Ice Pellets.
+ */
+export const DETERMINISTIC_PHASE_CONSTITUENTS = [
+  { code: "crain", phase: "rain", name: "Rain" },
+  { code: "csnow", phase: "snow", name: "Snow" },
+  { code: "cfrzr", phase: "freezing_rain", name: "Freezing Rain" },
+  { code: "cicep", phase: "ice_pellets", name: "Ice Pellets" },
+] as const;
+
+/**
+ * Derive constituent physical phases for a mixed-phase precipitation entry.
+ *
+ * Checks underlying categorical diagnostic fields (crain, csnow, cfrzr, cicep)
+ * using the established deterministic phase order (Rain, Snow, Freezing Rain, Ice Pellets)
+ * so ordering remains stable across renders.
+ * If flags are missing or yield <= 1 phase, falls back to transition/start/end types.
+ */
+export function getMixedPhaseConstituents(
+  entry: PointForecastPrecipEntry | null | undefined
+): string[] {
+  if (!entry) return [];
+  const constituents: string[] = [];
+
+  // 1. Check explicit categorical flags
+  if (entry.crain != null && entry.crain >= 0.5) constituents.push("Rain");
+  if (entry.csnow != null && entry.csnow >= 0.5) constituents.push("Snow");
+  if (entry.cfrzr != null && entry.cfrzr >= 0.5) constituents.push("Freezing Rain");
+  if (entry.cicep != null && entry.cicep >= 0.5) constituents.push("Ice Pellets");
+
+  if (constituents.length > 1) {
+    return constituents;
+  }
+
+  // 2. Fallback: check discrete transition identifier (e.g. rain_to_snow)
+  const tr = entry.precipitation_transition;
+  if (tr) {
+    const trPhases = getTransitionPhases(tr);
+    if (trPhases) {
+      const sName = PRECIPITATION_PHASE_TOKENS[trPhases.start]?.name;
+      const eName = PRECIPITATION_PHASE_TOKENS[trPhases.end]?.name;
+      if (sName && eName && sName !== eName && sName !== "Dry" && eName !== "Dry") {
+        const names = new Set([sName, eName]);
+        return DETERMINISTIC_PHASE_CONSTITUENTS.map((c) => c.name).filter((name) =>
+          names.has(name)
+        );
+      }
+    }
+  }
+
+  // 3. Fallback: check start_type and end_type
+  if (
+    entry.precipitation_start_type &&
+    entry.precipitation_end_type &&
+    entry.precipitation_start_type !== entry.precipitation_end_type &&
+    entry.precipitation_start_type !== "none" &&
+    entry.precipitation_end_type !== "none"
+  ) {
+    const sName = PRECIPITATION_PHASE_TOKENS[entry.precipitation_start_type]?.name;
+    const eName = PRECIPITATION_PHASE_TOKENS[entry.precipitation_end_type]?.name;
+    if (sName && eName && sName !== eName && sName !== "Dry" && eName !== "Dry") {
+      const names = new Set([sName, eName]);
+      return DETERMINISTIC_PHASE_CONSTITUENTS.map((c) => c.name).filter((name) => names.has(name));
+    }
+  }
+
+  return constituents;
 }
 
 /**
@@ -177,7 +251,7 @@ export interface PointForecastPrecipEntry {
  * Examples:
  * - Persistent rain: "Rain"
  * - Rain to snow transition: "Rain → Snow"
- * - Multi-phase ambiguous: "Mixed"
+ * - Multi-phase ambiguous: "Mixed (Rain + Snow)" or "Mixed"
  * - Dry: "Dry"
  * - Unclassified: "Unclassified"
  */
@@ -195,6 +269,17 @@ export function getPointForecastPhaseLabel(
   // Dry interval
   if (amount <= 0.05 || entry.precipitation_type === "none") {
     return "Dry";
+  }
+
+  // If multiple physical phases apply from categorical flags, classify as Mixed with constituents
+  const flagConstituents: string[] = [];
+  if (entry.crain != null && entry.crain >= 0.5) flagConstituents.push("Rain");
+  if (entry.csnow != null && entry.csnow >= 0.5) flagConstituents.push("Snow");
+  if (entry.cfrzr != null && entry.cfrzr >= 0.5) flagConstituents.push("Freezing Rain");
+  if (entry.cicep != null && entry.cicep >= 0.5) flagConstituents.push("Ice Pellets");
+
+  if (flagConstituents.length > 1) {
+    return `Mixed (${flagConstituents.join(" + ")})`;
   }
 
   const transition = entry.precipitation_transition;
@@ -225,7 +310,13 @@ export function getPointForecastPhaseLabel(
     if (transition === "persistent_ice_pellets" || transition === "dry_to_ice_pellets") {
       return "Ice Pellets";
     }
-    if (transition === "mixed_transition") return "Mixed";
+    if (transition === "mixed_transition") {
+      const constituents = getMixedPhaseConstituents(entry);
+      if (constituents.length > 1) {
+        return `Mixed (${constituents.join(" + ")})`;
+      }
+      return "Mixed";
+    }
     if (transition === "unknown") return "Unclassified";
   }
 
@@ -234,7 +325,13 @@ export function getPointForecastPhaseLabel(
   if (pType === "snow") return "Snow";
   if (pType === "freezing_rain") return "Freezing Rain";
   if (pType === "ice_pellets") return "Ice Pellets";
-  if (pType === "mixed") return "Mixed";
+  if (pType === "mixed") {
+    const constituents = getMixedPhaseConstituents(entry);
+    if (constituents.length > 1) {
+      return `Mixed (${constituents.join(" + ")})`;
+    }
+    return "Mixed";
+  }
   if (pType === "unknown") return "Unclassified";
 
   return "Dry";
@@ -306,7 +403,7 @@ export function getBarColorForEntry(entry: PointForecastPrecipEntry | null | und
   if (label === "Snow") return PRECIPITATION_PHASE_TOKENS.snow.color;
   if (label === "Freezing Rain") return PRECIPITATION_PHASE_TOKENS.freezing_rain.color;
   if (label === "Ice Pellets") return PRECIPITATION_PHASE_TOKENS.ice_pellets.color;
-  if (label === "Mixed") return PRECIPITATION_PHASE_TOKENS.mixed.color;
+  if (label === "Mixed" || label.startsWith("Mixed")) return PRECIPITATION_PHASE_TOKENS.mixed.color;
   if (label === "Unclassified") return PRECIPITATION_PHASE_TOKENS.unknown.color;
 
   // Transitions: default to mixed or transition start color
