@@ -217,7 +217,7 @@ class GeoapifyAutocompleteProvider(PlaceAutocompleteProvider):
         self, method: str, url: str, headers: Mapping[str, str], body: str | None
     ) -> tuple[int, Any]:
         try:
-            return self._transport(method, url, headers, body, timeout=self._timeout_s)  # type: ignore[call-arg]
+            return self._transport(method, url, headers, body, timeout=self._timeout_s)
         except TypeError:
             return self._transport(method, url, headers, body)
 
@@ -379,7 +379,7 @@ class LocationIQAutocompleteProvider(PlaceAutocompleteProvider):
         self, method: str, url: str, headers: Mapping[str, str], body: str | None
     ) -> tuple[int, Any]:
         try:
-            return self._transport(method, url, headers, body, timeout=self._timeout_s)  # type: ignore[call-arg]
+            return self._transport(method, url, headers, body, timeout=self._timeout_s)
         except TypeError:
             return self._transport(method, url, headers, body)
 
