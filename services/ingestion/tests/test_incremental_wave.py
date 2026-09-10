@@ -502,3 +502,143 @@ def test_gefs_full_horizon_converges_to_ready_exact_pairs(
     assert pairs == {(m, lead) for m in members for lead in horizon3}
     assert _catalog_pairs(catalog_db, _run_id(catalog_db, store)) == pairs
     assert _run_status(catalog_db, store) == "ready"
+
+
+def test_gefs_cross_wave_predecessor_normalization_regression(
+    tmp_path: Path,
+    catalog_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: GEFS Wave 1 (0..21) -> Wave 2 (begins at 24).
+
+    At lead 24 (6h reset lead), predecessor lead 21 must be read from storage.
+    Verifies that:
+    1. The official ensemble mean (is_mean=True, member=None) reads shard.mean_L0021.shard
+       and correctly de-accumulates precipitation and reconstructs cloud cover.
+    2. Perturbation members (is_mean=False, member=1) read shard.mem001_L0021.shard.
+    3. Storage-based predecessor reading succeeds across the wave boundary.
+    """
+    from domain.horizon import MODEL_CANONICAL_HORIZONS, register_canonical_lead_horizon
+    from ingestion.core.decode_worker import DecodePool
+    from ingestion.core.zarr_writer import read_slice
+
+    horizon_extended = tuple(range(0, 30, 3))  # 0, 3, 6, 9, 12, 15, 18, 21, 24, 27
+    saved = dict(MODEL_CANONICAL_HORIZONS)
+    register_canonical_lead_horizon("gefs", horizon_extended)
+
+    def _synthetic_precip_cloud(lead: int, member: int | None = None) -> xr.Dataset:
+        # At lead % 6 == 3 (e.g. 21): APCP is 3h accumulation = 10.0 mm, TCDC is 3h avg = 40.0%
+        # At lead % 6 == 0 (e.g. 24): APCP is 6h accumulation = 25.0 mm, TCDC is 6h avg = 60.0%
+        tp_val = 10.0 if lead % 6 == 3 else (25.0 if lead % 6 == 0 and lead > 0 else (0.0 if lead == 0 else 5.0))
+        tcc_val = 40.0 if lead % 6 == 3 else (60.0 if lead % 6 == 0 and lead > 0 else (0.0 if lead == 0 else 50.0))
+        lat = np.linspace(90.0, -90.0, 721, dtype=np.float32)
+        lon = np.linspace(0.0, 359.75, 1440, dtype=np.float32)
+        shape = (721, 1440)
+        coords: dict[str, object] = {
+            "lead_time_hours": lead,
+            "latitude": lat,
+            "longitude": lon,
+        }
+        if member is not None:
+            coords["member"] = member
+        return xr.Dataset(
+            data_vars={
+                "temperature_2m": (
+                    ("latitude", "longitude"),
+                    np.full(shape, 280.0 + lead, dtype=np.float32),
+                    {"units": "°C"},
+                ),
+                "tp": (
+                    ("latitude", "longitude"),
+                    np.full(shape, tp_val, dtype=np.float32),
+                    {"units": "mm"},
+                ),
+                "tcc": (
+                    ("latitude", "longitude"),
+                    np.full(shape, tcc_val, dtype=np.float32),
+                    {"units": "%"},
+                ),
+            },
+            coords=coords,  # type: ignore[arg-type]
+            attrs={"cycle_time": "2026-07-21T00:00:00", "model_id": "gefs"},
+        )
+
+    async def _fake_download(
+        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None, variables=None, **kwargs
+    ):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"stub-grib2")
+        return destination
+
+    def _fake_submit(self, path):
+        name = Path(path).name
+        lead = int(name.rsplit(".f", 1)[1].removesuffix(".grib2"))
+        member = int(name[3:5]) if name.startswith("gep") else None
+        fut: Future = Future()
+        fut.set_result(_synthetic_precip_cloud(lead, member))
+        return fut
+
+    monkeypatch.setattr(
+        "ingestion.providers.noaa.connector.NOAAConnector.download", _fake_download
+    )
+    monkeypatch.setattr(DecodePool, "submit", _fake_submit)
+
+    store = str(tmp_path / "gefs.zarr")
+    args = _args(tmp_path)
+    members = (1,)  # perturbation member 1 + mean (include_mean=True)
+
+    try:
+        # Wave 1: leads 0..21 (8 leads: 0, 3, 6, 9, 12, 15, 18, 21)
+        spec1 = RunSpec(
+            model="gefs",
+            cycle_date=CYCLE,
+            cycle_hour=0,
+            target_lead_time_hours=tuple(range(0, 24, 3)),
+            members=members,
+            include_mean=True,
+        )
+        status1 = _run_wave_sync(monkeypatch, catalog_db, spec1, args, store)
+        assert status1 == "partial"
+
+        # Verify lead 21 shards exist on disk
+        mean_precip_shard = Path(store) / "precipitation_amount_3h" / "shard.mean_L0021.shard"
+        mem1_precip_shard = Path(store) / "precipitation_amount_3h" / "shard.mem001_L0021.shard"
+        assert mean_precip_shard.is_file()
+        assert mem1_precip_shard.is_file()
+
+        # Wave 2: targets lead 24 (begins at 24)
+        spec2 = RunSpec(
+            model="gefs",
+            cycle_date=CYCLE,
+            cycle_hour=0,
+            target_lead_time_hours=(24,),
+            members=members,
+            include_mean=True,
+        )
+        status2 = _run_wave_sync(monkeypatch, catalog_db, spec2, args, store)
+        assert status2 == "partial"
+
+        # Verify de-accumulation and cloud reconstruction for the official ensemble mean
+        slice_mean_precip = read_slice(store, "precipitation_amount_3h", lead_time_hours=24, is_mean=True)
+        assert slice_mean_precip is not None
+        # 25.0 mm (lead 24 APCP) - 10.0 mm (lead 21 APCP) = 15.0 mm
+        np.testing.assert_allclose(slice_mean_precip, 15.0, rtol=1e-5)
+
+        slice_mean_cloud = read_slice(store, "cloud_cover_3h", lead_time_hours=24, is_mean=True)
+        assert slice_mean_cloud is not None
+        # 2 * 60.0% (lead 24 TCDC) - 40.0% (lead 21 C_3h) = 80.0%
+        np.testing.assert_allclose(slice_mean_cloud, 80.0, rtol=1e-5)
+
+        # Verify de-accumulation and cloud reconstruction for perturbation member 1
+        slice_mem1_precip = read_slice(store, "precipitation_amount_3h", lead_time_hours=24, member=1, is_mean=False)
+        assert slice_mem1_precip is not None
+        np.testing.assert_allclose(slice_mem1_precip, 15.0, rtol=1e-5)
+
+        slice_mem1_cloud = read_slice(store, "cloud_cover_3h", lead_time_hours=24, member=1, is_mean=False)
+        assert slice_mem1_cloud is not None
+        np.testing.assert_allclose(slice_mem1_cloud, 80.0, rtol=1e-5)
+
+    finally:
+        MODEL_CANONICAL_HORIZONS.clear()
+        MODEL_CANONICAL_HORIZONS.update(saved)
