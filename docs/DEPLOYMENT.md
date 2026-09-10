@@ -72,6 +72,17 @@ The repository provides multi-stage production Dockerfiles:
 
 ## 3. Production Configuration & Environment Variables
 
+### 3.0 Configuration Architecture & Precedence
+The platform enforces a deterministic configuration precedence hierarchy across all tiers:
+1. **Real process / container environment variables** (highest precedence, overrides everything);
+2. **`<repository-root>/.env`** (canonical dotenv file for local development, resolved deterministically by all Python services regardless of CWD);
+3. **Application defaults** (safe offline defaults, e.g. `ELEVATION_PROVIDER=none`).
+
+**Dotenv Policy:**
+* For local development, copy `.env.example` to `.env` at the **repository root**. Do not create service-local `.env` files (`services/api/.env`, `services/ingestion/.env`, etc.).
+* Changes to `.env` apply on next service restart (no runtime hot reload).
+* In production and CI, containers run directly with externally injected environment variables. The repository root `.env` is **not required** to exist in production container images or CI runners.
+
 ### 3.1 Common Infrastructure Settings
 * `DATABASE_URL`: PostgreSQL connection string (e.g. `postgresql://user:pass@db-host:5432/weather_db`).
 * `REDIS_URL`: Redis connection string (e.g. `redis://redis-host:6379/0`).

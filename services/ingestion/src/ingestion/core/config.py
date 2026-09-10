@@ -1,9 +1,64 @@
 """Ingestion service configuration."""
 
+from pathlib import Path
 from typing import Any
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def find_repository_root(start_path: Path | None = None) -> Path | None:
+    """Deterministically locate the repository root directory.
+
+    Searches upward from ``start_path`` (or this file's location) for canonical
+    repository root markers (e.g. ``.git``, ``docker-compose.yml``).
+
+    Args:
+        start_path: Optional starting filesystem path for search (defaults to
+            this file's location).
+
+    Returns:
+        Absolute Path to the repository root directory if identified, or None
+        if executed in a container/installed layout where no repository root
+        markers exist.
+    """
+    current = (start_path or Path(__file__)).resolve()
+    if current.is_file():
+        current = current.parent
+
+    for parent in [current, *current.parents]:
+        if (
+            (parent / ".git").exists()
+            or (parent / "docker-compose.yml").is_file()
+            or (parent / "compose.yaml").is_file()
+        ):
+            return parent
+
+    return None
+
+
+def find_repository_env_file(start_path: Path | None = None) -> Path | None:
+    """Deterministically locate the canonical repository-root ``.env`` file.
+
+    Searches upward from ``start_path`` (or this file's location) for the
+    repository root and resolves ``<repository-root>/.env``.
+
+    Args:
+        start_path: Optional starting filesystem path for search.
+
+    Returns:
+        Absolute Path to ``<repository-root>/.env`` if a repository root is
+        identified, or None if no repository root is found (e.g. production
+        container).
+    """
+    root = find_repository_root(start_path)
+    if root is not None:
+        return root / ".env"
+
+    return None
+
+
+ENV_FILE: Path | None = find_repository_env_file()
 
 
 class IngestionSettings(BaseSettings):
@@ -229,7 +284,11 @@ class IngestionSettings(BaseSettings):
             )
         return self
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = IngestionSettings()

@@ -91,7 +91,22 @@ Weather/
 
 ---
 
-### Step 1: Start Local Infrastructure
+### Step 1: Configure Local Environment
+The repository root `.env` is the **single canonical configuration source** for local development:
+```bash
+# Windows PowerShell
+Copy-Item .env.example .env
+
+# Linux / macOS
+cp .env.example .env
+```
+Configure your credentials and settings once in `<repository-root>/.env`. Both the API serving tier and the ingestion worker automatically resolve this file regardless of current working directory. Do not create service-local `.env` files.
+* Changes to `.env` apply on next service restart (no hot-reloading).
+* Production environments rely on real process/container environment variables; an absent `.env` is fully supported and falls back to defaults.
+
+---
+
+### Step 2: Start Local Infrastructure
 Launch PostgreSQL 18.6 (PostGIS 3.6.4), Redis 7, and MinIO:
 ```bash
 docker-compose up -d
@@ -105,7 +120,7 @@ Services are exposed at:
 
 ---
 
-### Step 2: Install Python & Frontend Dependencies
+### Step 3: Install Python & Frontend Dependencies
 
 ```bash
 # Install domain package
@@ -123,7 +138,7 @@ cd services/frontend && npm ci && cd ../..
 
 ---
 
-### Step 3: Run Database Migrations
+### Step 4: Run Database Migrations
 Apply schema migrations (001–004) to PostgreSQL:
 ```bash
 cd services/api && poetry run alembic upgrade head && cd ../..
@@ -131,7 +146,7 @@ cd services/api && poetry run alembic upgrade head && cd ../..
 
 ---
 
-### Step 4: Start Applications
+### Step 5: Start Applications
 
 #### Start FastAPI Serving Tier (Port 8000)
 ```bash
