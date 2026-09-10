@@ -718,7 +718,11 @@ async def _run_wave_impl(
             try:
                 seed_future = decode_pool.submit(seed_dest)
                 seed_dataset = _decode_and_normalize(
-                    seed_future, catalog_spec, store_path=store_path, member=seed_member
+                    seed_future,
+                    catalog_spec,
+                    store_path=store_path,
+                    member=seed_member,
+                    is_mean=seed_is_mean,
                 )
 
                 raw_precip_for_future = None
@@ -1060,6 +1064,7 @@ async def _run_wave_impl(
                                 predecessor_array=pred_precip,
                                 predecessor_cloud_array=pred_cloud,
                                 member=member,
+                                is_mean=is_mean,
                             )
                             _validate_requested_lead(ds, lead)
                             _validate_requested_member(ds, member)
@@ -1274,6 +1279,7 @@ def _decode_and_normalize(
     predecessor_array: Any | None = None,
     predecessor_cloud_array: Any | None = None,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> xr.Dataset:
     """Await a decode worker result and normalize it in the parent process.
 
@@ -1295,6 +1301,7 @@ def _decode_and_normalize(
         predecessor_array: Optional explicit predecessor 2D array for precipitation.
         predecessor_cloud_array: Optional explicit predecessor 2D array for cloud cover.
         member: Optional member identity for ensemble predecessor lookup.
+        is_mean: Whether normalizing the official ensemble mean product (geavg).
 
     Returns:
         The mapped, canonical-unit, model-tagged dataset.
@@ -1311,6 +1318,7 @@ def _decode_and_normalize(
         store_path=store_path,
         predecessor_array=predecessor_array,
         member=member,
+        is_mean=is_mean,
     )
     cloud_pred = (
         predecessor_cloud_array
@@ -1323,6 +1331,7 @@ def _decode_and_normalize(
         store_path=store_path,
         predecessor_array=cloud_pred,
         member=member,
+        is_mean=is_mean,
     )
     ds = _apply_variable_mapping(ds, catalog_spec.variables)
     ds = _normalize_canonical_units(ds, catalog_spec.variables)

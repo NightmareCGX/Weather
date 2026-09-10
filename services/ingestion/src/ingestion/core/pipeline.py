@@ -369,6 +369,7 @@ def read_predecessor_precipitation(
     lead_time_hours: int,
     *,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> npt.NDArray[np.float32]:
     """Read a committed precipitation_amount_3h slice from a cycle's Zarr store.
 
@@ -378,7 +379,8 @@ def read_predecessor_precipitation(
     Args:
         store_path: Path/URL to the target Zarr store.
         lead_time_hours: The predecessor lead time (e.g. lead - 3).
-        member: Ensemble member index (None for deterministic).
+        member: Ensemble member index (None for deterministic or mean).
+        is_mean: Whether reading the official ensemble mean product (geavg).
 
     Returns:
         2D numpy array of predecessor precipitation amounts (dtype float32).
@@ -396,15 +398,17 @@ def read_predecessor_precipitation(
         "precipitation_amount_3h",
         lead_time_hours=lead_time_hours,
         member=member,
+        is_mean=is_mean,
     )
+    ident_str = "is_mean=True" if is_mean else f"member={member}"
     if vals is None:
         raise MissingPredecessorLeadError(
             f"Cannot read predecessor precipitation: variable 'precipitation_amount_3h' "
-            f"at lead {lead_time_hours} (member={member}) is missing from store {store_path!r}."
+            f"at lead {lead_time_hours} ({ident_str}) is missing from store {store_path!r}."
         )
     if np.all(np.isnan(vals)):
         raise MissingPredecessorLeadError(
-            f"Predecessor lead {lead_time_hours} (member={member}) in {store_path!r} "
+            f"Predecessor lead {lead_time_hours} ({ident_str}) in {store_path!r} "
             "is uncommitted (contains only NaN values)."
         )
     return vals
@@ -417,6 +421,7 @@ def _normalize_precipitation_increments(
     store_path: str | None = None,
     predecessor_array: npt.NDArray[Any] | None = None,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> xr.Dataset:
     """Normalize precipitation accumulation fields to canonical 3-hour increments.
 
@@ -432,6 +437,7 @@ def _normalize_precipitation_increments(
         store_path: Optional store path for predecessor lookup at 6h leads.
         predecessor_array: Optional explicit predecessor 2D array.
         member: Optional member identity for ensemble predecessor lookup.
+        is_mean: Whether normalizing the official ensemble mean product (geavg).
 
     Returns:
         The dataset with normalized precipitation_amount_3h values.
@@ -507,7 +513,7 @@ def _normalize_precipitation_increments(
                     f"Cannot de-accumulate lead {lead_val}: no store_path or predecessor_array provided."
                 )
             predecessor_array = read_predecessor_precipitation(
-                store_path, pred_lead, member=member
+                store_path, pred_lead, member=member, is_mean=is_mean
             )
 
         curr_vals = dataset[precip_var_name].values
@@ -528,6 +534,7 @@ def read_predecessor_cloud_cover(
     lead_time_hours: int,
     *,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> npt.NDArray[np.float32]:
     """Read a committed cloud_cover_3h slice from a cycle's Zarr store.
 
@@ -537,7 +544,8 @@ def read_predecessor_cloud_cover(
     Args:
         store_path: Path/URL to the target Zarr store.
         lead_time_hours: The predecessor lead time (e.g. lead - 3).
-        member: Ensemble member index (None for deterministic).
+        member: Ensemble member index (None for deterministic or mean).
+        is_mean: Whether reading the official ensemble mean product (geavg).
 
     Returns:
         2D numpy array of predecessor cloud cover percentages (dtype float32).
@@ -555,15 +563,17 @@ def read_predecessor_cloud_cover(
         "cloud_cover_3h",
         lead_time_hours=lead_time_hours,
         member=member,
+        is_mean=is_mean,
     )
+    ident_str = "is_mean=True" if is_mean else f"member={member}"
     if vals is None:
         raise MissingPredecessorLeadError(
             f"Cannot read predecessor cloud cover: variable 'cloud_cover_3h' "
-            f"at lead {lead_time_hours} (member={member}) is missing from store {store_path!r}."
+            f"at lead {lead_time_hours} ({ident_str}) is missing from store {store_path!r}."
         )
     if np.all(np.isnan(vals)):
         raise MissingPredecessorLeadError(
-            f"Predecessor lead {lead_time_hours} (member={member}) in {store_path!r} "
+            f"Predecessor lead {lead_time_hours} ({ident_str}) in {store_path!r} "
             "is uncommitted (contains only NaN values)."
         )
     return vals
@@ -576,6 +586,7 @@ def _normalize_cloud_cover_intervals(
     store_path: str | None = None,
     predecessor_array: npt.NDArray[Any] | None = None,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> xr.Dataset:
     """Normalize cloud cover interval-average fields to canonical preceding 3-hour averages.
 
@@ -592,6 +603,7 @@ def _normalize_cloud_cover_intervals(
         store_path: Optional store path for predecessor lookup at 6h leads.
         predecessor_array: Optional explicit predecessor 2D array.
         member: Optional member identity for ensemble predecessor lookup.
+        is_mean: Whether normalizing the official ensemble mean product (geavg).
 
     Returns:
         The dataset with normalized cloud_cover_3h values.
@@ -650,7 +662,7 @@ def _normalize_cloud_cover_intervals(
                     "no store_path or predecessor_array provided."
                 )
             predecessor_array = read_predecessor_cloud_cover(
-                store_path, pred_lead, member=member
+                store_path, pred_lead, member=member, is_mean=is_mean
             )
 
         curr_vals = dataset[cloud_var_name].values
@@ -767,6 +779,7 @@ def ingest_grib_file(
     *,
     requested_lead_time_hours: int | None = None,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> ModelRunRecord:
     """Parse a GRIB2 file, write it to a Zarr store, and record it in the catalog.
 
@@ -809,6 +822,7 @@ def ingest_grib_file(
             files. The member identity maps to the store's ``member``
             coordinate position, so ``gep17`` lands in member 17 regardless of
             completion order.
+        is_mean: Whether ingesting the official ensemble mean product (geavg).
 
     Returns:
         The recorded :class:`ModelRunRecord` (in its current, possibly
@@ -853,12 +867,14 @@ def ingest_grib_file(
         spec.variables,
         store_path=store_path,
         member=member,
+        is_mean=is_mean,
     )
     dataset = _normalize_cloud_cover_intervals(
         dataset,
         spec.variables,
         store_path=store_path,
         member=member,
+        is_mean=is_mean,
     )
     dataset = _apply_variable_mapping(dataset, spec.variables)
     dataset = _normalize_canonical_units(dataset, spec.variables)
@@ -874,6 +890,7 @@ def ingest_grib_file(
         member=member,
         expected_lead_time_hours=spec.expected_lead_time_hours,
         expected_members=spec.expected_members,
+        is_mean=is_mean,
     )
     # Read the actual committed state AFTER the store write (the source of
     # truth for catalog reconciliation and the store↔catalog READY gate). The

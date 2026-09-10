@@ -1405,3 +1405,135 @@ def test_normalize_categorical_flags_lead_zero_zeros() -> None:
     assert normalized["crain"].values.dtype == np.uint8
     np.testing.assert_array_equal(normalized["crain"].values, [[[0, 0], [0, 0]]])
 
+
+def test_read_predecessor_precipitation_and_cloud_cover_sharded_mean(tmp_path: Path) -> None:
+    """read_predecessor_precipitation/cloud_cover extracts correct 2D slice for sharded_v1 mean."""
+    import xarray as xr
+    from ingestion.core.base import MissingPredecessorLeadError
+    from ingestion.core.pipeline import (
+        read_predecessor_cloud_cover,
+        read_predecessor_precipitation,
+    )
+    from ingestion.core.zarr_writer import commit_region, prepare_run_store
+
+    store = str(tmp_path / "gefs.zarr")
+    lat = np.linspace(90.0, -90.0, 721, dtype=np.float32)
+    lon = np.linspace(0.0, 359.75, 1440, dtype=np.float32)
+    shape = (721, 1440)
+
+    ds_seed = xr.Dataset(
+        data_vars={
+            "precipitation_amount_3h": (("latitude", "longitude"), np.full(shape, 12.5, dtype=np.float32)),
+            "cloud_cover_3h": (("latitude", "longitude"), np.full(shape, 75.0, dtype=np.float32)),
+        },
+        coords={
+            "lead_time_hours": [21],
+            "latitude": lat,
+            "longitude": lon,
+            "member": [1],
+            "time": np.datetime64("2026-09-10T00:00:00"),
+        },
+    )
+    prepare_run_store(
+        ds_seed,
+        store,
+        expected_lead_time_hours=(0, 3, 6, 9, 12, 15, 18, 21, 24),
+        expected_members=(1, 2),
+    )
+
+    # Commit lead 21 official ensemble mean (member=None, is_mean=True)
+    ds_mean = xr.Dataset(
+        data_vars={
+            "precipitation_amount_3h": (("latitude", "longitude"), np.full(shape, 12.5, dtype=np.float32)),
+            "cloud_cover_3h": (("latitude", "longitude"), np.full(shape, 75.0, dtype=np.float32)),
+        },
+        coords={
+            "lead_time_hours": [21],
+            "latitude": lat,
+            "longitude": lon,
+            "time": np.datetime64("2026-09-10T00:00:00"),
+        },
+    )
+    commit_region(ds_mean, store, lead_time_hours=21, is_mean=True)
+
+    # Shards exist as shard.mean_L0021.shard
+    mean_precip_shard = Path(store) / "precipitation_amount_3h" / "shard.mean_L0021.shard"
+    mean_cloud_shard = Path(store) / "cloud_cover_3h" / "shard.mean_L0021.shard"
+    assert mean_precip_shard.is_file()
+    assert mean_cloud_shard.is_file()
+
+    # 1. Successful read with is_mean=True
+    slice_precip = read_predecessor_precipitation(store, 21, member=None, is_mean=True)
+    np.testing.assert_allclose(slice_precip, 12.5, rtol=1e-5)
+
+    slice_cloud = read_predecessor_cloud_cover(store, 21, member=None, is_mean=True)
+    np.testing.assert_allclose(slice_cloud, 75.0, rtol=1e-5)
+
+    # 2. Reproduction of production failure: is_mean=False looks for shard.det_L0021.shard
+    # and sees uncommitted/NaN, raising MissingPredecessorLeadError
+    with pytest.raises(MissingPredecessorLeadError, match="is uncommitted"):
+        read_predecessor_precipitation(store, 21, member=None, is_mean=False)
+
+    with pytest.raises(MissingPredecessorLeadError, match="is uncommitted"):
+        read_predecessor_cloud_cover(store, 21, member=None, is_mean=False)
+
+    # 3. Genuinely uncommitted lead raises MissingPredecessorLeadError
+    with pytest.raises(MissingPredecessorLeadError, match="is uncommitted"):
+        read_predecessor_precipitation(store, 18, member=None, is_mean=True)
+
+    with pytest.raises(MissingPredecessorLeadError, match="is uncommitted"):
+        read_predecessor_cloud_cover(store, 18, member=None, is_mean=True)
+
+
+def test_read_slice_storage_identities(tmp_path: Path) -> None:
+    """Verify distinct storage identities: det (None, False), mean (None, True), mem (M, False)."""
+    import xarray as xr
+    from ingestion.core.zarr_writer import commit_region, prepare_run_store, read_slice
+
+    store = str(tmp_path / "ident_store.zarr")
+    lat = np.linspace(90.0, -90.0, 721, dtype=np.float32)
+    lon = np.linspace(0.0, 359.75, 1440, dtype=np.float32)
+    shape = (721, 1440)
+
+    ds_init = xr.Dataset(
+        data_vars={"temperature_2m": (("latitude", "longitude"), np.full(shape, 280.0, dtype=np.float32))},
+        coords={"lead_time_hours": [21], "latitude": lat, "longitude": lon, "member": [17], "time": np.datetime64("2026-09-10T00:00:00")},
+    )
+    prepare_run_store(ds_init, store, expected_lead_time_hours=(21,), expected_members=(17,))
+
+    # Commit det: member=None, is_mean=False
+    ds_det = xr.Dataset(
+        data_vars={"temperature_2m": (("latitude", "longitude"), np.full(shape, 10.0, dtype=np.float32))},
+        coords={"lead_time_hours": [21], "latitude": lat, "longitude": lon, "time": np.datetime64("2026-09-10T00:00:00")},
+    )
+    commit_region(ds_det, store, lead_time_hours=21, member=None, is_mean=False)
+
+    # Commit mean: member=None, is_mean=True
+    ds_mean = xr.Dataset(
+        data_vars={"temperature_2m": (("latitude", "longitude"), np.full(shape, 20.0, dtype=np.float32))},
+        coords={"lead_time_hours": [21], "latitude": lat, "longitude": lon, "time": np.datetime64("2026-09-10T00:00:00")},
+    )
+    commit_region(ds_mean, store, lead_time_hours=21, member=None, is_mean=True)
+
+    # Commit member 17: member=17, is_mean=False
+    ds_m17 = xr.Dataset(
+        data_vars={"temperature_2m": (("latitude", "longitude"), np.full(shape, 30.0, dtype=np.float32))},
+        coords={"lead_time_hours": [21], "latitude": lat, "longitude": lon, "member": [17], "time": np.datetime64("2026-09-10T00:00:00")},
+    )
+    commit_region(ds_m17, store, lead_time_hours=21, member=17, is_mean=False)
+
+    # Verify distinct physical shard files
+    var_dir = Path(store) / "temperature_2m"
+    assert (var_dir / "shard.det_L0021.shard").is_file()
+    assert (var_dir / "shard.mean_L0021.shard").is_file()
+    assert (var_dir / "shard.mem017_L0021.shard").is_file()
+
+    # Read each identity
+    val_det = read_slice(store, "temperature_2m", lead_time_hours=21, member=None, is_mean=False)
+    val_mean = read_slice(store, "temperature_2m", lead_time_hours=21, member=None, is_mean=True)
+    val_m17 = read_slice(store, "temperature_2m", lead_time_hours=21, member=17, is_mean=False)
+
+    assert val_det is not None and np.allclose(val_det, 10.0)
+    assert val_mean is not None and np.allclose(val_mean, 20.0)
+    assert val_m17 is not None and np.allclose(val_m17, 30.0)
+

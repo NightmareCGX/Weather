@@ -494,7 +494,7 @@ class NOAAConnector(BaseConnector):
         is_mean: bool = False,
     ) -> Path:
         """Attempt selective range download with artifact-transaction retry semantics."""
-        attempts = self._settings.DOWNLOAD_RETRIES + 1
+        attempts = int(self._settings.DOWNLOAD_RETRIES) + 1
         last_error: BaseException | None = None
 
         for attempt in range(1, attempts + 1):
@@ -707,7 +707,7 @@ class NOAAConnector(BaseConnector):
                 temp_dest.unlink(missing_ok=True)
                 last_error = exc
                 if attempt < attempts:
-                    await asyncio.sleep(self._settings.RETRY_BACKOFF_SECONDS * attempt)
+                    await asyncio.sleep(float(self._settings.RETRY_BACKOFF_SECONDS) * attempt)
             except Exception as exc:
                 temp_dest.unlink(missing_ok=True)
                 raise SelectiveFallbackError("unexpected_selective_exception", str(exc)) from exc
@@ -734,7 +734,7 @@ class NOAAConnector(BaseConnector):
 
     async def _download_full_with_retry(self, url: str, destination: Path) -> Path:
         """Download full GRIB2 file with retries (operational fallback path)."""
-        attempts = self._settings.DOWNLOAD_RETRIES + 1
+        attempts = int(self._settings.DOWNLOAD_RETRIES) + 1
         last_error: BaseException | None = None
         start_time = time.monotonic()
 
@@ -751,7 +751,7 @@ class NOAAConnector(BaseConnector):
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                 last_error = exc
             if attempt < attempts:
-                await asyncio.sleep(self._settings.RETRY_BACKOFF_SECONDS * attempt)
+                await asyncio.sleep(float(self._settings.RETRY_BACKOFF_SECONDS) * attempt)
 
         assert last_error is not None
         if isinstance(last_error, httpx.HTTPStatusError):

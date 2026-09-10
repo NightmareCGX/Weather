@@ -1016,6 +1016,7 @@ def read_slice(
     *,
     lead_time_hours: int,
     member: int | None = None,
+    is_mean: bool = False,
 ) -> np.ndarray[Any, Any] | None:
     """Read a single 2D (latitude, longitude) float32 slice from a Zarr store.
 
@@ -1038,7 +1039,9 @@ def read_slice(
         root = rest
 
     # Construct candidate shard filename
-    if member is not None:
+    if is_mean:
+        shard_filename = f"shard.mean_L{lead_time_hours:04d}.shard"
+    elif member is not None:
         shard_filename = f"shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
     else:
         shard_filename = f"shard.det_L{lead_time_hours:04d}.shard"
