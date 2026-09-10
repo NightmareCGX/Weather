@@ -136,13 +136,16 @@ test("selecting an ensemble model renders the percentile fan and member distribu
   // The ensemble statistics section renders the fan chart for the selected
   // ensemble model.
   await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByText(/temperature_2m · percentile range/)).toBeVisible();
+  await expect(page.getByText(/over lead time/)).toHaveCount(0);
+  await expect(page.getByRole("img", { name: /ensemble percentile fan over time/ })).toBeVisible();
 
   // The mock returns members and pdf for /v1/ensembles, so the Distribution View
   // renders both the histogram bars and the continuous PDF line.
   await expect(page.getByText(/Member distribution/)).toBeVisible();
+  // Valid-time is localized for Aspen (Mountain Time: MDT) and no lead-time "+6h" is displayed
+  await expect(page.getByText(/Member distribution · .* (MDT|GMT-6)/)).toBeVisible();
+  await expect(page.getByText(/Member distribution · \+6h/)).toHaveCount(0);
   const distribution = page.getByRole("img", {
     name: /Histogram and PDF of 5 ensemble members/,
   });
@@ -326,9 +329,7 @@ test("state sync regression: GFS precipitation -> GEFS switch queries temperatur
 
   // 5. Ensemble Statistics (GEFS) panel must appear and render without error
   await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByRole("img", { name: /ensemble percentile fan over time/ })).toBeVisible();
 
   // 6. Assert that ALL ensemble requests dispatched for GEFS used temperature_2m
   await expect.poll(() => ensembleRequests.length > 0).toBe(true);
@@ -400,9 +401,7 @@ test("phase 1a gefs variable selection: selecting GEFS relative humidity updates
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /ensemble percentile fan over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByRole("img", { name: /ensemble percentile fan over time/ })).toBeVisible();
 });
 
 test("phase 1b wind product: selecting Wind updates map, meteogram, and ensemble Wind Rose", async ({
@@ -1170,4 +1169,77 @@ test("mobile runtime layout screenshots: capture 375x667 and 390x844 viewports",
       path: `services/frontend/e2e/screenshots/forecast-panel-open-${viewport.name}.png`,
     });
   }
+});
+
+test("selected-location local time display: dropdown remains UTC, adjacent display and hourly forecast localize", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  // Initial state: no location selected -> UTC
+  const validTimeDisplay = page.getByTestId("valid-time");
+  await expect(validTimeDisplay).toBeVisible();
+  await expect(validTimeDisplay).toHaveText(/Valid .* UTC/);
+
+  // Dropdown option is in UTC
+  const validSelect = page.getByLabel("Valid time");
+  await expect(validSelect).toBeVisible();
+  const dropdownText = await validSelect.evaluate(
+    (sel: HTMLSelectElement) => sel.options[sel.selectedIndex]?.text
+  );
+  expect(dropdownText).toContain("UTC");
+
+  // Search and select Aspen (Mountain Time zone: America/Denver)
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // Hourly Forecast opens
+  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+
+  // Dropdown MUST still remain UTC
+  const dropdownTextAfter = await validSelect.evaluate(
+    (sel: HTMLSelectElement) => sel.options[sel.selectedIndex]?.text
+  );
+  expect(dropdownTextAfter).toContain("UTC");
+
+  // Adjacent display updates to Mountain Time (MDT / GMT-6)
+  await expect(validTimeDisplay).toHaveText(/Valid .* (MDT|GMT-6)/);
+
+  // Close forecast panel
+  await page.getByRole("button", { name: "Close forecast panel" }).click();
+  await expect(page.getByText("Hourly Forecast")).not.toBeVisible();
+
+  // Adjacent display returns to UTC
+  await expect(validTimeDisplay).toHaveText(/Valid .* UTC/);
+});
+
+test("ensemble statistics valid-time display: renders calendar valid times and localizes with selected location", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  // Switch to GEFS ensemble model
+  await page.getByLabel("Model").selectOption("gefs");
+
+  // Select Aspen (Mountain Time: America/Denver)
+  const input = page.getByLabel(/Search for a city/);
+  await input.fill("Aspen");
+  await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
+
+  // Ensemble statistics panel opens
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+
+  // Ensemble chart is visible with valid-time-based accessible label
+  const fanChart = page.getByRole("img", { name: /ensemble percentile fan over time/ });
+  await expect(fanChart).toBeVisible();
+
+  // Distribution header shows localized valid time in MDT and NO "+6h"
+  await expect(page.getByText(/Member distribution · .* (MDT|GMT-6)/)).toBeVisible();
+  await expect(page.getByText(/Member distribution · \+6h/)).toHaveCount(0);
+  await expect(page.getByText(/over lead time/)).toHaveCount(0);
+
+  // Close panel
+  await page.getByRole("button", { name: "Close forecast panel" }).click();
+  await expect(page.getByText("Hourly Forecast")).not.toBeVisible();
 });

@@ -75,7 +75,7 @@ const withoutMembers: EnsembleStatisticsData = {
 };
 
 const baseProps = {
-  selectedLead: 6,
+  validTime: "2026-09-10T06:00:00Z",
   variableLabel: "Temperature (2 m)",
 };
 
@@ -91,7 +91,8 @@ describe("EnsembleDistribution", () => {
     expect(
       screen.getByRole("img", { name: /Member values for Temperature \(2 m\)/ })
     ).toBeInTheDocument();
-    expect(screen.getByText(/Member distribution · \+6h/)).toBeInTheDocument();
+    expect(screen.getByText(/Member distribution · Sep 10, 06:00 UTC/)).toBeInTheDocument();
+    expect(screen.queryByText(/\+6h/)).not.toBeInTheDocument();
     expect(screen.getByText("Min")).toBeInTheDocument();
     expect(screen.getByText("Max")).toBeInTheDocument();
     expect(screen.getByText(/canonical Gaussian kernel density estimate/)).toBeInTheDocument();
@@ -112,6 +113,36 @@ describe("EnsembleDistribution", () => {
     // Semantic SVG mark assertion for member rug dots
     const dots = container.querySelectorAll(".recharts-scatter-symbol");
     expect(dots.length).toBe(withMembersAndPdf.members!.length);
+  });
+
+  it("localizes valid-time header for America/Denver and Asia/Tokyo", () => {
+    const { rerender } = render(
+      <EnsembleDistribution
+        {...baseProps}
+        data={withMembersAndPdf}
+        status="success"
+        error={null}
+        timezone="America/Denver"
+      />
+    );
+
+    // 2026-09-10T06:00:00Z in Denver MDT is Sep 10, 00:00 MDT
+    expect(screen.getByText(/Member distribution · Sep 10, 00:00 (MDT|GMT-6)/)).toBeInTheDocument();
+
+    rerender(
+      <EnsembleDistribution
+        {...baseProps}
+        data={withMembersAndPdf}
+        status="success"
+        error={null}
+        timezone="Asia/Tokyo"
+      />
+    );
+
+    // 2026-09-10T06:00:00Z in Tokyo is Sep 10, 15:00 JST
+    expect(
+      screen.getByText(/Member distribution · Sep 10, 15:00 (JST|GMT\+9)/)
+    ).toBeInTheDocument();
   });
 
   it("handles null pdf gracefully by rendering histogram, dots, and warning note", () => {
@@ -182,6 +213,9 @@ describe("EnsembleDistribution", () => {
 
   it("shows an unavailable state when there is no data", () => {
     render(<EnsembleDistribution {...baseProps} data={null} status="success" error={null} />);
-    expect(screen.getByText(/No ensemble distribution available for \+6h/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No ensemble distribution available for Sep 10, 06:00 UTC/)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/\+6h/)).not.toBeInTheDocument();
   });
 });

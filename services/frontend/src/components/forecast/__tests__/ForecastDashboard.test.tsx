@@ -22,6 +22,10 @@ jest.mock("../../../hooks/useEnsembleDistribution");
 jest.mock("../../../hooks/useVariablesCatalog");
 jest.mock("../../../context/forecast-selection");
 
+let lastEnsembleChartProps: any = null;
+let lastEnsembleDistributionProps: any = null;
+let lastEnsemblePhaseSupportProps: any = null;
+
 // The chart components are covered by their own tests; stub them here so the
 // dashboard test focuses on container behavior.
 jest.mock("../../charts/Meteogram", () => ({
@@ -30,17 +34,34 @@ jest.mock("../../charts/Meteogram", () => ({
   ),
 }));
 jest.mock("../../charts/EnsembleChart", () => ({
-  EnsembleChart: () => <div data-testid="ensemble-chart" />,
+  EnsembleChart: (props: any) => {
+    lastEnsembleChartProps = props;
+    return <div data-testid="ensemble-chart" />;
+  },
 }));
 jest.mock("../../charts/EnsembleDistribution", () => ({
-  EnsembleDistribution: ({ selectedLead }: { selectedLead?: number }) => (
-    <div data-testid="ensemble-distribution" data-selected-lead={selectedLead} />
-  ),
+  EnsembleDistribution: (props: any) => {
+    lastEnsembleDistributionProps = props;
+    return (
+      <div
+        data-testid="ensemble-distribution"
+        data-selected-lead={props.selectedLead}
+        data-valid-time={props.validTime}
+      />
+    );
+  },
 }));
 jest.mock("../../charts/EnsemblePhaseSupport", () => ({
-  EnsemblePhaseSupport: ({ selectedLead }: { selectedLead?: number }) => (
-    <div data-testid="ensemble-phase-support" data-selected-lead={selectedLead} />
-  ),
+  EnsemblePhaseSupport: (props: any) => {
+    lastEnsemblePhaseSupportProps = props;
+    return (
+      <div
+        data-testid="ensemble-phase-support"
+        data-selected-lead={props.selectedLead}
+        data-valid-time={props.validTime}
+      />
+    );
+  },
 }));
 
 const mockUsePointForecast = usePointForecast as jest.MockedFunction<typeof usePointForecast>;
@@ -986,5 +1007,213 @@ describe("ForecastDashboard", () => {
 
     expect(screen.getByText("3,417 m")).toBeInTheDocument();
     expect(screen.queryByText("9,999 m")).not.toBeInTheDocument();
+  });
+
+  describe("Ensemble valid-time provenance under Lifecycle V2", () => {
+    it("associates leads with authoritative valid_times from active source cycle without cross-cycle mixing", () => {
+      // Simulate availability with valid_times across TWO different source cycles:
+      // Cycle 00Z: lead 6 -> valid 06Z, lead 12 -> valid 12Z
+      // Cycle 06Z: lead 6 -> valid 12Z, lead 12 -> valid 18Z
+      const validTimesAvailability = [
+        {
+          valid_time: "2026-08-13T06:00:00Z",
+          source_cycle: "2026-08-13T00:00:00Z",
+          lead_time_hours: 6,
+          servable: true,
+          available_members: 30,
+          expected_members: 30,
+          coverage_ratio: 1.0,
+        },
+        {
+          valid_time: "2026-08-13T12:00:00Z",
+          source_cycle: "2026-08-13T00:00:00Z",
+          lead_time_hours: 12,
+          servable: true,
+          available_members: 30,
+          expected_members: 30,
+          coverage_ratio: 1.0,
+        },
+        {
+          valid_time: "2026-08-13T12:00:00Z",
+          source_cycle: "2026-08-13T06:00:00Z",
+          lead_time_hours: 6,
+          servable: true,
+          available_members: 30,
+          expected_members: 30,
+          coverage_ratio: 1.0,
+        },
+        {
+          valid_time: "2026-08-13T18:00:00Z",
+          source_cycle: "2026-08-13T06:00:00Z",
+          lead_time_hours: 12,
+          servable: true,
+          available_members: 30,
+          expected_members: 30,
+          coverage_ratio: 1.0,
+        },
+      ];
+
+      // Test Scenario A: Active cycle is 00Z
+      mockSelectionContext({
+        selection: {
+          model: "gefs",
+          variable: "temperature_2m",
+          validTime: "2026-08-13T06:00:00Z",
+          initialTime: "2026-08-13T00:00:00Z",
+          leadTimeHours: 6,
+        },
+        options: {
+          models: [
+            {
+              id: "gefs",
+              name: "Global Ensemble Forecast System",
+              is_ensemble: true,
+              variables: [],
+            },
+          ],
+          model: {
+            id: "gefs",
+            name: "Global Ensemble Forecast System",
+            is_ensemble: true,
+            variables: [],
+          },
+          variables: [
+            {
+              id: "temperature_2m",
+              name: "2-Meter Temperature",
+              unit: "°C",
+              initial_times: [],
+              valid_times: validTimesAvailability,
+            },
+          ],
+          variable: {
+            id: "temperature_2m",
+            name: "2-Meter Temperature",
+            unit: "°C",
+            initial_times: [],
+            valid_times: validTimesAvailability,
+          },
+          initialTimes: [{ value: "2026-08-13T00:00:00Z", lead_time_hours: [6, 12] }],
+          initialTime: { value: "2026-08-13T00:00:00Z", lead_time_hours: [6, 12] },
+          validTimes: ["2026-08-13T06:00:00Z", "2026-08-13T12:00:00Z", "2026-08-13T18:00:00Z"],
+          leadTimes: [6, 12],
+        },
+      });
+
+      mockUsePointForecast.mockReturnValue({ forecast: null, status: "loading", error: null });
+      mockUseEnsemble.mockReturnValue({
+        byLead: new Map([
+          [
+            6,
+            {
+              model: "gefs",
+              lead_time_hours: 6,
+              member_count: 30,
+              statistics: {
+                mean: 10,
+                median: 10,
+                spread: 2,
+                p10: 7,
+                p25: 9,
+                p50: 10,
+                p75: 11,
+                p90: 13,
+              },
+            },
+          ],
+          [
+            12,
+            {
+              model: "gefs",
+              lead_time_hours: 12,
+              member_count: 30,
+              statistics: {
+                mean: 12,
+                median: 12,
+                spread: 2,
+                p10: 9,
+                p25: 11,
+                p50: 12,
+                p75: 13,
+                p90: 15,
+              },
+            },
+          ],
+        ]),
+        status: "success",
+        error: null,
+        model: "gefs",
+      });
+      mockUseEnsembleDistribution.mockReturnValue({
+        data: null,
+        status: "idle",
+        error: null,
+      });
+
+      const { rerender } = render(<ForecastDashboard location={location} />);
+
+      // Under cycle 00Z: lead 6 must map to 06Z, lead 12 must map to 12Z
+      const mappingA = lastEnsembleChartProps.validTimesByLead;
+      expect(mappingA.get(6)).toBe("2026-08-13T06:00:00Z");
+      expect(mappingA.get(12)).toBe("2026-08-13T12:00:00Z");
+      // Distribution view gets authoritative validTime from selection
+      expect(lastEnsembleDistributionProps.validTime).toBe("2026-08-13T06:00:00Z");
+
+      // Test Scenario B: Active cycle changes to 06Z (same validTime 2026-08-13T12:00:00Z now served by lead 6)
+      mockSelectionContext({
+        selection: {
+          model: "gefs",
+          variable: "temperature_2m",
+          validTime: "2026-08-13T12:00:00Z",
+          initialTime: "2026-08-13T06:00:00Z",
+          leadTimeHours: 6,
+        },
+        options: {
+          models: [
+            {
+              id: "gefs",
+              name: "Global Ensemble Forecast System",
+              is_ensemble: true,
+              variables: [],
+            },
+          ],
+          model: {
+            id: "gefs",
+            name: "Global Ensemble Forecast System",
+            is_ensemble: true,
+            variables: [],
+          },
+          variables: [
+            {
+              id: "temperature_2m",
+              name: "2-Meter Temperature",
+              unit: "°C",
+              initial_times: [],
+              valid_times: validTimesAvailability,
+            },
+          ],
+          variable: {
+            id: "temperature_2m",
+            name: "2-Meter Temperature",
+            unit: "°C",
+            initial_times: [],
+            valid_times: validTimesAvailability,
+          },
+          initialTimes: [{ value: "2026-08-13T06:00:00Z", lead_time_hours: [6, 12] }],
+          initialTime: { value: "2026-08-13T06:00:00Z", lead_time_hours: [6, 12] },
+          validTimes: ["2026-08-13T06:00:00Z", "2026-08-13T12:00:00Z", "2026-08-13T18:00:00Z"],
+          leadTimes: [6, 12],
+        },
+      });
+
+      rerender(<ForecastDashboard location={location} />);
+
+      // Under cycle 06Z: lead 6 must map to 12Z, lead 12 must map to 18Z
+      const mappingB = lastEnsembleChartProps.validTimesByLead;
+      expect(mappingB.get(6)).toBe("2026-08-13T12:00:00Z");
+      expect(mappingB.get(12)).toBe("2026-08-13T18:00:00Z");
+      // Distribution view gets authoritative validTime from selection
+      expect(lastEnsembleDistributionProps.validTime).toBe("2026-08-13T12:00:00Z");
+    });
   });
 });

@@ -1,7 +1,8 @@
 "use client";
 
 import { useForecastSelection } from "@/context/forecast-selection";
-import { formatDayHourUtc } from "@/lib/forecast/time";
+import { useSelectedLocationTimezone } from "@/context/selected-location";
+import { formatDayHourUtc, formatDayHourWithTimeZone } from "@/lib/forecast/time";
 
 /**
  * Presentation-only forecast selection controls for the map layer (Lifecycle V2).
@@ -23,6 +24,7 @@ export function LayerControls() {
     setValidTime,
     retry,
   } = useForecastSelection();
+  const selectedTimezone = useSelectedLocationTimezone();
 
   if (status === "loading" || status === "idle") {
     return (
@@ -113,7 +115,7 @@ export function LayerControls() {
 
       {validTime !== null && (
         <span className="text-sm text-slate-500" data-testid="valid-time">
-          Valid {formatDayHourUtc(validTime)} UTC
+          Valid {formatDayHourWithTimeZone(validTime, selectedTimezone)}
         </span>
       )}
     </div>

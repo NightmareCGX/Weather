@@ -22,16 +22,18 @@ describe("EnsemblePhaseSupport", () => {
       <EnsemblePhaseSupport
         phaseSupport={defaultPhaseSupport}
         transitionFrequency={defaultTransitionFrequency}
-        selectedLead={12}
+        validTime="2026-09-10T12:00:00Z"
         memberCount={30}
       />
     );
 
     expect(
       screen.getByRole("img", {
-        name: /Ensemble phase support composition at lead 12h/i,
+        name: /Ensemble phase support composition at Sep 10, 12:00 UTC/i,
       })
     ).toBeInTheDocument();
+    expect(screen.getByText(/Ensemble Phase Support \(Sep 10, 12:00 UTC\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/lead 12h/i)).not.toBeInTheDocument();
 
     // Check that segments exist for all 6 phases
     expect(screen.getByTestId("phase-segment-dry")).toBeInTheDocument();
@@ -43,6 +45,36 @@ describe("EnsemblePhaseSupport", () => {
 
     // Invariant: no mixed segment
     expect(screen.queryByTestId("phase-segment-mixed")).not.toBeInTheDocument();
+  });
+
+  it("localizes valid-time header for America/Denver and Asia/Tokyo", () => {
+    const { rerender } = render(
+      <EnsemblePhaseSupport
+        phaseSupport={defaultPhaseSupport}
+        validTime="2026-09-10T12:00:00Z"
+        timezone="America/Denver"
+        memberCount={30}
+      />
+    );
+
+    // 2026-09-10T12:00:00Z in Denver MDT is Sep 10, 06:00 MDT
+    expect(
+      screen.getByText(/Ensemble Phase Support \(Sep 10, 06:00 (MDT|GMT-6)\)/)
+    ).toBeInTheDocument();
+
+    rerender(
+      <EnsemblePhaseSupport
+        phaseSupport={defaultPhaseSupport}
+        validTime="2026-09-10T12:00:00Z"
+        timezone="Asia/Tokyo"
+        memberCount={30}
+      />
+    );
+
+    // 2026-09-10T12:00:00Z in Tokyo JST is Sep 10, 21:00 JST
+    expect(
+      screen.getByText(/Ensemble Phase Support \(Sep 10, 21:00 (JST|GMT\+9)\)/)
+    ).toBeInTheDocument();
   });
 
   it("displays honest breakdown percentages summing to 100%", () => {
