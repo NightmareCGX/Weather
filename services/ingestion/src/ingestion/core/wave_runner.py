@@ -417,6 +417,35 @@ def _cleanup_sources(staging_dir: Path, destinations: list[Path] | set[Path]) ->
         )
 
 
+def _format_residual_staging_entries(staging_dir: Path, limit: int = 20) -> list[str]:
+    """Capture a bounded summary of residual entries when staging cleanup fails."""
+    residuals: list[str] = []
+    try:
+        if not staging_dir.exists():
+            return ["(directory no longer exists)"]
+        for idx, entry in enumerate(sorted(staging_dir.rglob("*"))):
+            if idx >= limit:
+                residuals.append("... (truncated)")
+                break
+            try:
+                rel = entry.relative_to(staging_dir)
+                if entry.is_file():
+                    try:
+                        size = entry.stat().st_size
+                        residuals.append(f"{rel} [file, {size} bytes]")
+                    except OSError:
+                        residuals.append(f"{rel} [file]")
+                elif entry.is_dir():
+                    residuals.append(f"{rel}/ [dir]")
+                else:
+                    residuals.append(f"{rel} [other]")
+            except (ValueError, OSError):
+                residuals.append(str(entry.name))
+    except OSError as scan_exc:
+        residuals.append(f"(error scanning residuals: {scan_exc})")
+    return residuals
+
+
 def _cleanup_source(destination: Path) -> None:
     """Delete a successfully-ingested source file and its associated .idx cache files.
 
@@ -1227,7 +1256,11 @@ async def _run_wave_impl(
                     committed_gen = finalize_result.committed_regions.get(r.region_id)
                     if committed_gen is not None and committed_gen == r.generation:
                         dest = _destination_for(
-                            spec, staging_dir, lead=r.lead_time_hours, member=r.member
+                            spec,
+                            staging_dir,
+                            lead=r.lead_time_hours,
+                            member=r.member,
+                            is_mean=r.is_mean,
                         )
                         committed_dests.append(dest)
                 if committed_dests:
@@ -1236,10 +1269,15 @@ async def _run_wave_impl(
                 try:
                     staging_dir.rmdir()
                 except OSError as exc:
+                    residuals = _format_residual_staging_entries(staging_dir)
+                    residual_desc = (
+                        f"; residual entries: {residuals}" if residuals else ""
+                    )
                     logger.warning(
-                        "Failed to remove staging directory %s: %s; data is safe.",
+                        "Failed to remove staging directory %s: %s%s; data is safe.",
                         staging_dir,
                         exc,
+                        residual_desc,
                     )
         except Exception:
             fin_dur = (time.monotonic() - t_fin_start) * 1000.0

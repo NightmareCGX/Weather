@@ -1387,6 +1387,84 @@ def test_cli_parallel_member_cleanup_isolation(tmp_path: Path) -> None:
     assert gep02_idx.exists()
 
 
+def test_destination_for_ensemble_mean_and_member_isolation(tmp_path: Path) -> None:
+    """Ensemble mean, numbered members, and deterministic files resolve distinct staging paths."""
+    from ingestion.cli import RunSpec, _destination_for
+    from ingestion.core.coordinator import WaveRegion
+
+    spec_gefs = RunSpec(
+        model="gefs",
+        cycle_date=date(2026, 9, 10),
+        cycle_hour=18,
+        target_lead_time_hours=(24,),
+        members=tuple(range(1, 31)),
+        include_mean=True,
+    )
+
+    # 1. GEFS official mean: member=None, is_mean=True -> geavg.*
+    mean_dest = _destination_for(spec_gefs, tmp_path, lead=24, member=None, is_mean=True)
+    assert mean_dest.name == "geavg.20260910.t18z.pgrb2s.0p25.f024.grib2"
+
+    # 2. GEFS numbered member: member=1..30, is_mean=False -> gepXX.*
+    mem_dest = _destination_for(spec_gefs, tmp_path, lead=24, member=1, is_mean=False)
+    assert mem_dest.name == "gep01.20260910.t18z.pgrb2s.0p25.f024.grib2"
+
+    # 3. Deterministic model: member=None, is_mean=False -> gfs.*
+    spec_gfs = RunSpec(
+        model="gfs",
+        cycle_date=date(2026, 9, 10),
+        cycle_hour=18,
+        target_lead_time_hours=(24,),
+    )
+    gfs_dest = _destination_for(spec_gfs, tmp_path, lead=24, member=None, is_mean=False)
+    assert gfs_dest.name == "gfs.20260910.t18z.pgrb2.0p25.f024.grib2"
+
+    # 4. Region identity round-trip: WaveRegion preserves is_mean
+    r_mean = WaveRegion(lead_time_hours=24, member=None, generation="gen_mean", is_mean=True)
+    r_dest = _destination_for(
+        spec_gefs,
+        tmp_path,
+        lead=r_mean.lead_time_hours,
+        member=r_mean.member,
+        is_mean=r_mean.is_mean,
+    )
+    assert r_dest == mean_dest
+    assert r_dest != gfs_dest
+
+
+def test_format_residual_staging_entries(tmp_path: Path) -> None:
+    """_format_residual_staging_entries produces bounded, structured diagnostic descriptions."""
+    from ingestion.core.wave_runner import _format_residual_staging_entries
+
+    staging_dir = tmp_path / "staging_sample"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    f1 = staging_dir / "geavg.grib2"
+    f1.write_bytes(b"12345")
+    f2 = staging_dir / "geavg.idx"
+    f2.write_bytes(b"12")
+    sub = staging_dir / "nested_dir"
+    sub.mkdir(parents=True, exist_ok=True)
+    f3 = sub / "other.tmp"
+    f3.write_bytes(b"hello world")
+
+    entries = _format_residual_staging_entries(staging_dir, limit=10)
+    assert any("geavg.grib2 [file, 5 bytes]" in e for e in entries)
+    assert any("geavg.idx [file, 2 bytes]" in e for e in entries)
+    assert any("nested_dir/ [dir]" in e for e in entries)
+    assert any("other.tmp [file, 11 bytes]" in e for e in entries)
+
+    # Verify bounding/truncation
+    bounded = _format_residual_staging_entries(staging_dir, limit=2)
+    assert len(bounded) == 3  # 2 entries + 1 "... (truncated)"
+    assert bounded[-1] == "... (truncated)"
+
+    # Verify non-existent directory handled cleanly
+    non_existent = tmp_path / "does_not_exist"
+    missing_entries = _format_residual_staging_entries(non_existent)
+    assert missing_entries == ["(directory no longer exists)"]
+
+
 def test_cli_concurrent_same_artifact_isolation(
     session: Session, tmp_path: Path, monkeypatch
 ) -> None:
