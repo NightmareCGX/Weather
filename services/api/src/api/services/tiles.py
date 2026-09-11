@@ -1310,17 +1310,18 @@ def _resolve_run_store_path(
 
     for run in candidates:
         assert run.zarr_store_path is not None
+        run_id_str = str(run.id)
         # Check deterministic physical availability
         if expected_members == 1:
             if variable in ("wind_10m", "wind_speed_10m"):
-                if (run.id, "wind_u_10m", 0) in fenced_vars or (run.id, "wind_v_10m", 0) in fenced_vars:
+                if (run_id_str, "wind_u_10m", 0) in fenced_vars or (run_id_str, "wind_v_10m", 0) in fenced_vars:
                     if initial_time is not None:
                         raise HTTPException(
                             status_code=404,
                             detail=f"Wind component shards for model '{model}' at cycle '{initial_time}' are not available.",
                         )
                     continue
-            elif (run.id, variable, 0) in fenced_vars:
+            elif (run_id_str, variable, 0) in fenced_vars:
                 if initial_time is not None:
                     raise HTTPException(
                         status_code=404,
@@ -1331,7 +1332,7 @@ def _resolve_run_store_path(
         # Check ensemble member coverage if model is ensemble
         if expected_members > 1:
             var_for_mean = "wind_u_10m" if variable in ("wind_10m", "wind_speed_10m") else variable
-            mean_fenced = (run.id, var_for_mean, -1) in fenced_vars
+            mean_fenced = (run_id_str, var_for_mean, -1) in fenced_vars
             mean_prod = None
             if not mean_fenced:
                 mean_prod = db.execute(
@@ -1349,7 +1350,7 @@ def _resolve_run_store_path(
                         EnsembleMemberProduct.lead_time_hours == lead_time_hours,
                     )
                 ).scalars().all()
-                avail_members = tuple(m for m in member_rows if (run.id, variable, int(m)) not in fenced_vars)
+                avail_members = tuple(m for m in member_rows if (run_id_str, variable, int(m)) not in fenced_vars)
                 # If no pair rows (legacy store / test fixture), allow ready runs
                 if not avail_members and run.status == "ready":
                     avail_members = tuple(range(1, expected_members + 1))
