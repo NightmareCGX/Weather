@@ -642,3 +642,88 @@ def test_gefs_cross_wave_predecessor_normalization_regression(
     finally:
         MODEL_CANONICAL_HORIZONS.clear()
         MODEL_CANONICAL_HORIZONS.update(saved)
+
+
+def test_gefs_wave_cleanup_removes_ensemble_mean_and_idx_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_db,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Successful GEFS wave with keep_downloads=False cleanly deletes geavg.*, gepXX.*, and .idx sidecars."""
+    import logging
+    from domain.horizon import MODEL_CANONICAL_HORIZONS, register_canonical_lead_horizon
+    from ingestion.core.decode_worker import DecodePool
+    from ingestion.core.wave_runner import RunSpec
+
+    saved = dict(MODEL_CANONICAL_HORIZONS)
+    register_canonical_lead_horizon("gefs", (0, 3, 6))
+
+    async def _fake_download(
+        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None, variables=None, **kwargs
+    ):
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"mock-grib2-data")
+        idx_sidecar = dest.parent / f"{dest.name}.e1e82.idx"
+        idx_sidecar.write_bytes(b"mock-idx-data")
+        return dest
+
+    def _fake_submit(self, path):
+        name = Path(path).name
+        lead = int(name.rsplit(".f", 1)[1].removesuffix(".grib2"))
+        member = int(name[3:5]) if name.startswith("gep") else None
+        fut: Future = Future()
+        fut.set_result(_synthetic_dataset(lead, member))
+        return fut
+
+    monkeypatch.setattr(
+        "ingestion.providers.noaa.connector.NOAAConnector.download", _fake_download
+    )
+    monkeypatch.setattr(DecodePool, "submit", _fake_submit)
+
+    store = str(tmp_path / "gefs_cleanup.zarr")
+    dl_dir = tmp_path / "downloads"
+    args = SimpleNamespace(
+        download_dir=str(dl_dir),
+        keep_downloads=False,
+        no_progress=True,
+        lock_timeout=5.0,
+        center_id="noaa",
+        version_string="v1.0",
+        grid_id="global_025deg",
+        variable=None,
+    )
+    members = (1, 2)  # perturbation members 1, 2 + official mean
+
+    try:
+        spec = RunSpec(
+            model="gefs",
+            cycle_date=CYCLE,
+            cycle_hour=0,
+            target_lead_time_hours=(0,),
+            members=members,
+            include_mean=True,
+        )
+        with caplog.at_level(logging.WARNING):
+            status = _run_wave_sync(monkeypatch, catalog_db, spec, args, store)
+        assert status == "partial"
+
+        # 1. No staging directories remain under dl_dir
+        staging_dirs = list(dl_dir.glob("staging_gefs_*"))
+        assert not staging_dirs, f"Staging directories were not removed: {staging_dirs}"
+
+        # 2. No .grib2 or .idx files remain under dl_dir
+        remaining_files = list(dl_dir.rglob("*"))
+        assert not remaining_files, f"Residual files remain under {dl_dir}: {remaining_files}"
+
+        # 3. No staging directory cleanup warning logged
+        cleanup_warnings = [
+            rec.message
+            for rec in caplog.records
+            if "Failed to remove staging directory" in rec.message
+        ]
+        assert not cleanup_warnings, f"Unexpected cleanup warnings logged: {cleanup_warnings}"
+    finally:
+        MODEL_CANONICAL_HORIZONS.clear()
+        MODEL_CANONICAL_HORIZONS.update(saved)

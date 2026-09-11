@@ -1375,6 +1375,11 @@ def _read_marker_payload(store_path: str, key: str) -> dict[str, object]:
     if region_id.startswith("det_"):
         lead = int(region_id[len("det_L") :])
         return read_region_marker(store_path, lead_time_hours=lead, member=None)
+    if region_id.startswith("mean_"):
+        lead = int(region_id[len("mean_L") :])
+        return read_region_marker(
+            store_path, lead_time_hours=lead, member=None, is_mean=True
+        )
     if region_id.startswith("mem"):
         _, _, rest = region_id.partition("_L")
         member = int(region_id[3:6])
