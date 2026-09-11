@@ -55,6 +55,7 @@ from tests.test_sharded_reader import _build_test_shard
 @pytest.fixture(autouse=True)
 def _no_reader_pool(monkeypatch):
     """Force direct bounded read path for standalone SQLite tests."""
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-09-10T00:00:00Z")
     try:
         import api.main as main
         if hasattr(main, "reader_pool"):

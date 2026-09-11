@@ -22,6 +22,7 @@ calculations live in the handler.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -31,6 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
+from api.core.time import get_current_time
 from api.models.entities import ForecastVariable, Model
 from api.schemas import (
     SpatialLayerData,
@@ -43,11 +45,14 @@ from api.services.tiles import (
     _color_stops,
     render_tile_png,
 )
+from domain.temporal import serving_start_valid_time
 
 router = APIRouter()
 
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
+#: Current UTC time dependency for serving window left boundary.
+CURRENT_TIME = Depends(get_current_time)
 
 #: Cache policy for spatial layer metadata: resolves to the newest ready run
 #: when initial_time is omitted, so revalidation (no-cache) ensures new cycles
@@ -121,6 +126,7 @@ def get_spatial_layer(
         ),
     ] = None,
     db: Session = DB,
+    now: datetime = CURRENT_TIME,
 ) -> SpatialLayerEnvelope:
     """Return the tile template and legend for a weather map layer.
 
@@ -143,7 +149,7 @@ def get_spatial_layer(
     if valid_time is not None:
         from api.services.resolver import resolve_valid_time_source
 
-        source = resolve_valid_time_source(db, model, valid_time, variable=variable)
+        source = resolve_valid_time_source(db, model, valid_time, variable=variable, now=now)
         resolved_lead = source.lead_time_hours
         resolved_valid = source.valid_time
         template_path = (
@@ -159,6 +165,17 @@ def get_spatial_layer(
         assert lead_time_hours is not None
         resolved_lead = lead_time_hours
         _require_available(db, model, variable, level, resolved_lead, initial_time)
+        if initial_time is not None:
+            from api.services.lifecycle import parse_cycle_time
+
+            c_time = parse_cycle_time(initial_time)
+            v_time = c_time + timedelta(hours=resolved_lead)
+            start_vt = serving_start_valid_time(now)
+            if v_time < start_vt:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Valid time '{v_time.isoformat()}' is before the active serving window ({start_vt.isoformat()}).",
+                )
 
         template_path = (
             f"/v1/maps/{model}/{variable}/{level}/{{z}}/{{x}}/{{y}}.png"
@@ -216,6 +233,7 @@ def get_wind_vector_field(
         ),
     ] = None,
     db: Session = DB,
+    now: datetime = CURRENT_TIME,
 ) -> StarletteResponse:
     """Return the quantized Int16 binary wind vector field for particle flow animation."""
     from api.services.vector_field import render_vector_field_binary
@@ -227,6 +245,7 @@ def get_wind_vector_field(
             lead_time_hours=lead_time_hours,
             valid_time=valid_time,
             initial_time=initial_time,
+            now=now,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -270,6 +289,7 @@ def get_map_tile(
         ),
     ] = None,
     db: Session = DB,
+    now: datetime = CURRENT_TIME,
 ) -> StarletteResponse:
     """Render a 256x256 PNG tile of the forecast field for the selection."""
     try:
@@ -284,6 +304,7 @@ def get_map_tile(
             lead_time_hours=lead_time_hours,
             valid_time=valid_time,
             initial_time=initial_time,
+            now=now,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -21,9 +21,11 @@ from domain.coverage import (
     get_expected_members,
     is_lead_servable,
 )
-from domain.temporal import requires_lead0_display_fallback
+from domain.temporal import requires_lead0_display_fallback, serving_start_valid_time
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+from api.core.time import get_current_time
 
 from api.models.entities import (
     EnsembleMemberProduct,
@@ -94,7 +96,10 @@ class _ModelAccumulator:
     variables: dict[str, _VariableAccumulator] = field(default_factory=dict)
 
 
-def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
+def build_forecast_availability(
+    db: Session,
+    now: datetime | None = None,
+) -> ForecastAvailabilityData:
     """Build the nested model/variable/initial-time/lead-time availability.
 
     Queries runs in ``ready``, ``processing``, and ``partial`` statuses that
@@ -102,13 +107,23 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
     serving threshold for the simple ``lead_time_hours`` list while exposing rich
     per-lead coverage descriptors in ``leads``.
 
+    Under Data Lifecycle V3 Phase 1, valid times strictly before
+    ``serving_start_valid_time(now_utc)`` are excluded from the unified
+    ``valid_times`` arrays, and the authoritative boundary is stamped on
+    the response payload.
+
     Args:
         db: Database session.
+        now: Optional reference current datetime for serving window evaluation.
+            Defaults to ``get_current_time()``.
 
     Returns:
         The availability payload, with models ordered by model id, variables
         by variable code, initial times newest-first, and lead times ascending.
     """
+    now_utc = now if now is not None else get_current_time()
+    serving_start = serving_start_valid_time(now_utc)
+
     stmt = (
         select(
             Model.model_id,
@@ -226,18 +241,19 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
 
                         # Valid time candidate for wind
                         v_time = cycle_time + timedelta(hours=lead)
-                        cand_w = ValidTimeAvailabilityOut(
-                            valid_time=v_time,
-                            source_cycle=cycle_time,
-                            lead_time_hours=lead,
-                            servable=servable,
-                            available_members=avail_count,
-                            expected_members=expected_members,
-                            coverage_ratio=ratio,
-                        )
-                        ex_w = valid_times_wind_map.get(v_time)
-                        if ex_w is None or (cand_w.servable and not ex_w.servable) or (cand_w.servable and cand_w.source_cycle > ex_w.source_cycle):
-                            valid_times_wind_map[v_time] = cand_w
+                        if v_time >= serving_start:
+                            cand_w = ValidTimeAvailabilityOut(
+                                valid_time=v_time,
+                                source_cycle=cycle_time,
+                                lead_time_hours=lead,
+                                servable=servable,
+                                available_members=avail_count,
+                                expected_members=expected_members,
+                                coverage_ratio=ratio,
+                            )
+                            ex_w = valid_times_wind_map.get(v_time)
+                            if ex_w is None or (cand_w.servable and not ex_w.servable) or (cand_w.servable and cand_w.source_cycle > ex_w.source_cycle):
+                                valid_times_wind_map[v_time] = cand_w
 
                     initial_times_wind.append(
                         InitialTimeAvailability(
@@ -319,18 +335,19 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
                     # Valid time candidate (interval variables at lead 0 contain NaN and are not servable valid times)
                     if not (lead == 0 and requires_lead0_display_fallback(variable_code)):
                         v_time = cycle_time + timedelta(hours=lead)
-                        cand_v = ValidTimeAvailabilityOut(
-                            valid_time=v_time,
-                            source_cycle=cycle_time,
-                            lead_time_hours=lead,
-                            servable=servable,
-                            available_members=avail_count,
-                            expected_members=expected_members,
-                            coverage_ratio=ratio,
-                        )
-                        ex_v = valid_times_var_map.get(v_time)
-                        if ex_v is None or (cand_v.servable and not ex_v.servable) or (cand_v.servable and cand_v.source_cycle > ex_v.source_cycle):
-                            valid_times_var_map[v_time] = cand_v
+                        if v_time >= serving_start:
+                            cand_v = ValidTimeAvailabilityOut(
+                                valid_time=v_time,
+                                source_cycle=cycle_time,
+                                lead_time_hours=lead,
+                                servable=servable,
+                                available_members=avail_count,
+                                expected_members=expected_members,
+                                coverage_ratio=ratio,
+                            )
+                            ex_v = valid_times_var_map.get(v_time)
+                            if ex_v is None or (cand_v.servable and not ex_v.servable) or (cand_v.servable and cand_v.source_cycle > ex_v.source_cycle):
+                                valid_times_var_map[v_time] = cand_v
 
                 initial_times.append(
                     InitialTimeAvailability(
@@ -378,4 +395,8 @@ def build_forecast_availability(db: Session) -> ForecastAvailabilityData:
             )
         )
 
-    return ForecastAvailabilityData(models=models)
+    return ForecastAvailabilityData(
+        models=models,
+        serving_start_valid_time=serving_start,
+        generated_at=now_utc,
+    )

@@ -48,6 +48,12 @@ from api.models.entities import (
 from api.services.point_forecast import _select_min_lead_winners
 
 
+@pytest.fixture(autouse=True)
+def _set_simulated_time(monkeypatch):
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-08-14T00:00:00Z")
+    yield
+
+
 @pytest.fixture
 def memory_db() -> Session:
     """In-memory SQLite database session with complete catalog schema."""

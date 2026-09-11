@@ -365,6 +365,8 @@ export interface ModelAvailability {
 /** The payload of the forecast availability endpoint. */
 export interface ForecastAvailability {
   models: ModelAvailability[];
+  serving_start_valid_time?: string | null;
+  generated_at?: string | null;
 }
 
 export interface SpatialLayer {

@@ -39,10 +39,13 @@ from domain.models.wind import (
 from domain.temporal import (
     INTERVAL_LEAD0_FALLBACK_VARIABLES,
     PRECIPITATION_COMPANION_VARIABLES,
+    serving_start_valid_time,
 )
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+from api.core.time import get_current_time
 
 from api.models.entities import (
     City,
@@ -238,6 +241,7 @@ def build_point_forecast(
     units: str,
     start_lead_time_hours: int | None,
     end_lead_time_hours: int | None,
+    now: datetime | None = None,
 ) -> PointForecastData:
     """Build a point forecast payload for a resolved location and model.
 
@@ -247,6 +251,10 @@ def build_point_forecast(
     model (DATABASE.md: ``valid_time = cycle_time + lead_time_hours``). Because
     cycles are 00/06/12/18 and lead differences are multiples of 6, the minimum
     lead for a fixed valid_time is the newest cycle that covers it.
+
+    Under Data Lifecycle V3 Phase 1, valid times strictly before
+    ``serving_start_valid_time(now_utc)`` are excluded from the returned
+    forecast series so that point forecasts agree with authoritative availability.
 
     The winner selection is done **entirely from catalog metadata** (a
     ``model_runs`` ⋈ ``forecast_products`` query) — no large Zarr dataset is
@@ -265,6 +273,8 @@ def build_point_forecast(
         units: ``metric`` (default) or ``imperial``.
         start_lead_time_hours: Inclusive lower bound of the lead-time window.
         end_lead_time_hours: Inclusive upper bound of the lead-time window.
+        now: Optional reference current datetime for serving window evaluation.
+            Defaults to ``get_current_time()``.
 
     Returns:
         The point forecast payload.
@@ -273,9 +283,13 @@ def build_point_forecast(
         HTTPException: 404 when no ready run, no data for the location, or an
             unknown variable is encountered; 422/500 for invalid data.
     """
+    now_utc = now if now is not None else get_current_time()
+    start_vt = serving_start_valid_time(now_utc)
+
     candidates = _select_min_lead_winners(
         db,
         model,
+        now=now_utc,
     )
     if not candidates:
         raise HTTPException(
@@ -311,6 +325,8 @@ def build_point_forecast(
 
     resolved: dict[datetime, tuple[datetime, int]] = {}
     for valid_time, pairs in candidates.items():
+        if valid_time < start_vt:
+            continue
         anchor_candidate = None
         for cycle_time, lead in pairs:
             metadata = _open_cycle(cycle_time)
@@ -580,6 +596,7 @@ def _select_min_lead_winners(
     *,
     start_lead_time_hours: int | None = None,
     end_lead_time_hours: int | None = None,
+    now: datetime | None = None,
 ) -> dict[datetime, list[tuple[datetime, int]]]:
     """Return the minimum-lead candidate(s) per valid_time.
 
@@ -594,6 +611,7 @@ def _select_min_lead_winners(
         model,
         start_lead_time_hours=start_lead_time_hours,
         end_lead_time_hours=end_lead_time_hours,
+        now=now,
     )
     return {
         v_time: [(c_time, lead) for (c_time, lead, _run_id, _path) in pairs]

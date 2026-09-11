@@ -34,6 +34,12 @@ from api.services.resolver import (
 
 from domain.coverage import get_expected_members, register_expected_members
 
+
+@pytest.fixture(autouse=True)
+def _set_simulated_time(monkeypatch):
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-09-06T12:00:00Z")
+    yield
+
 CYCLE = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
 V_TIME = datetime(2026, 9, 6, 18, 0, tzinfo=timezone.utc)  # Lead 6
 

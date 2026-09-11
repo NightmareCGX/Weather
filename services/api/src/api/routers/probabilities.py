@@ -15,7 +15,7 @@ Specification notes:
   rejected when ``operator`` is ``gt`` or ``lt``.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -23,23 +23,27 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
+from api.core.time import get_current_time
 from api.schemas import ProbabilityForecastEnvelope
 from api.services.cache import (
     PointCache,
     build_probability_cache_key,
 )
 from api.services.ensemble_data import build_probability_forecast
-from api.services.lifecycle import require_cycle_visible
+from api.services.lifecycle import parse_cycle_time, require_cycle_visible
 from api.services.point_forecast import (
     resolve_latest_run_cycle_time,
     resolve_latest_run_store_path_and_retirement,
     resolve_serving_generation_for_store,
 )
+from domain.temporal import serving_start_valid_time
 
 router = APIRouter()
 
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
+#: Current UTC time dependency for serving window left boundary.
+CURRENT_TIME = Depends(get_current_time)
 
 #: Cache policy for probability forecasts: resolves to the newest ready run
 #: when initial_time is omitted, so revalidation (no-cache) ensures new cycles
@@ -122,6 +126,7 @@ def get_probability(
         ),
     ] = None,
     db: Session = DB,
+    now: datetime = CURRENT_TIME,
 ) -> ProbabilityForecastEnvelope:
     """Return the exceedance probability for a forecast variable.
 
@@ -155,7 +160,7 @@ def get_probability(
 
     if valid_time is not None:
         source = resolve_valid_time_source(
-            db, model, valid_time, variable=variable, require_members=True
+            db, model, valid_time, variable=variable, require_members=True, now=now
         )
         resolved_lead = source.lead_time_hours
         cycle_time = source.cycle_time.isoformat().replace("+00:00", "Z")
@@ -173,6 +178,15 @@ def get_probability(
             require_cycle_visible(db, target_initial, model_id=model)
 
         cycle_time = resolve_latest_run_cycle_time(db, model, target_initial)
+        if cycle_time is not None:
+            c_utc = parse_cycle_time(cycle_time)
+            computed_valid_time = c_utc + timedelta(hours=resolved_lead)
+            start_vt = serving_start_valid_time(now)
+            if computed_valid_time < start_vt:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Valid time '{computed_valid_time.isoformat()}' is before the active serving window ({start_vt.isoformat()}).",
+                )
         store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
             db, model, target_initial
         )

@@ -13,10 +13,13 @@ is thin (ENGINEERING_CONTRACT section 2): it calls the availability service
 and serializes the envelope.
 """
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
+from api.core.time import get_current_time
 from api.schemas import ForecastAvailabilityEnvelope
 from api.services.availability import build_forecast_availability
 
@@ -24,6 +27,8 @@ router = APIRouter()
 
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
+#: Current UTC time dependency for serving window left boundary.
+CURRENT_TIME = Depends(get_current_time)
 
 #: Cache policy: availability is derived dynamically from PostgreSQL, so
 #: revalidation (no-cache) guarantees newly ingested runs are visible
@@ -39,6 +44,7 @@ CACHE_CONTROL_AVAILABILITY = "no-cache"
 def get_forecast_availability(
     response: Response,
     db: Session = DB,
+    now: datetime = CURRENT_TIME,
 ) -> ForecastAvailabilityEnvelope:
     """Return the available model/variable/initial-time/lead-time structure.
 
@@ -46,6 +52,6 @@ def get_forecast_availability(
     ingested runs (new models, variables, initial times, or lead times)
     become visible automatically without any code or configuration change.
     """
-    data = build_forecast_availability(db)
+    data = build_forecast_availability(db, now=now)
     response.headers["Cache-Control"] = CACHE_CONTROL_AVAILABILITY
     return ForecastAvailabilityEnvelope(data=data)

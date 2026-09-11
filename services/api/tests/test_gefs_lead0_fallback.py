@@ -34,6 +34,12 @@ from api.models.entities import (
     ModelRun,
     ModelVersion,
 )
+
+
+@pytest.fixture(autouse=True)
+def _set_simulated_time(monkeypatch):
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-09-07T00:00:00Z")
+    yield
 from api.services.point_forecast import (
     ResolvedLocation,
     build_point_forecast,

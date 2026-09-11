@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from alembic import command
 from api.core.database import get_db
+from api.core.time import get_current_time
 from api.main import app
 from api.models.entities import ForecastVariable, ModelRun
 from fastapi.testclient import TestClient
@@ -137,11 +138,13 @@ def catalog_db(tmp_path_factory):
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_time] = lambda: CYCLE
     try:
         with TestClient(app) as test_client:
             yield {"engine": engine, "client": test_client}
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_time, None)
         command.downgrade(alembic_cfg, "base")
         engine.dispose()
 

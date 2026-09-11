@@ -28,6 +28,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
+from api.core.time import get_current_time
 from api.main import app
 from api.models.entities import (
     ForecastCenter,
@@ -147,11 +148,13 @@ def fallback_client(tmp_path_factory):
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_time] = lambda: datetime(2026, 7, 20, 0, 0, tzinfo=timezone.utc)
     try:
         with TestClient(app) as test_client:
             yield test_client
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_time, None)
         command.downgrade(alembic_cfg, "base")
         engine.dispose()
 

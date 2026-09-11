@@ -56,6 +56,7 @@ from tests.test_tiles import _png_has_opaque_pixels
 @pytest.fixture(autouse=True)
 def _no_reader_pool(monkeypatch):
     """Force the direct (no-DB-gate) bounded read path for standalone SQLite tests."""
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-09-05T00:00:00Z")
     try:
         import api.main as main
 
@@ -132,8 +133,9 @@ def _build_test_dataset(
 
 
 @pytest.fixture
-def fallback_env(tmp_path):
+def fallback_env(tmp_path, monkeypatch):
     """Setup an isolated database and two Zarr stores (previous 18Z and current 00Z)."""
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-09-05T00:00:00Z")
     db_path = f"sqlite:///{tmp_path}/fallback_test.db"
     engine = create_engine(db_path, connect_args={"check_same_thread": False})
     tables = [
@@ -510,7 +512,7 @@ def test_availability_interval_lead0_filtering(fallback_env):
     engine, _, _ = fallback_env
 
     with Session(engine) as session:
-        avail = build_forecast_availability(session)
+        avail = build_forecast_availability(session, now=_dt(2026, 9, 5, 0))
 
     gfs_avail = next(m for m in avail.models if m.id == "gfs")
     v_map = {v.id: v for v in gfs_avail.variables}
