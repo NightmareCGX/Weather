@@ -195,6 +195,22 @@ class IngestionSettings(BaseSettings):
     #: Maximum retry backoff (seconds) for active wave failures.
     REALTIME_ACTIVE_MAX_BACKOFF_SECONDS: float = 300.0
 
+    # --- Granular physical reclamation (Lifecycle V3 Phase 4) ---
+    #: Master switch for granular reclamation.
+    RECLAMATION_ENABLED: bool = True
+    #: Dry-run mode: plans candidates and validates reachability without mutations.
+    RECLAMATION_DRY_RUN: bool = True
+    #: Physical deletion authorization switch: when False, worker never issues DeleteObject calls.
+    RECLAMATION_DELETE_ENABLED: bool = False
+    #: Maximum shard targets claimed per worker batch.
+    RECLAMATION_BATCH_SIZE: int = 100
+    #: Lease expiration duration (seconds) for claimed deleting batches.
+    RECLAMATION_LEASE_SECONDS: float = 60.0
+    #: Maximum retry attempts before a target is quarantined in 'failed' status.
+    RECLAMATION_MAX_RETRIES: int = 5
+    #: Base exponential backoff (seconds) for failed reclamation attempts.
+    RECLAMATION_BASE_BACKOFF_SECONDS: float = 2.0
+
     @model_validator(mode="after")
     def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
         pool_size = int(self.DB_POOL_SIZE)
@@ -314,6 +330,26 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"REALTIME_ACTIVE_MAX_BACKOFF_SECONDS ({active_max}) must be >= "
                 f"REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS ({active_retry})"
+            )
+        reclamation_batch = int(self.RECLAMATION_BATCH_SIZE)
+        reclamation_lease = float(self.RECLAMATION_LEASE_SECONDS)
+        reclamation_retries = int(self.RECLAMATION_MAX_RETRIES)
+        reclamation_backoff = float(self.RECLAMATION_BASE_BACKOFF_SECONDS)
+        if reclamation_batch < 1:
+            raise ValueError(
+                f"RECLAMATION_BATCH_SIZE must be >= 1, got {reclamation_batch}"
+            )
+        if reclamation_lease <= 0.0:
+            raise ValueError(
+                f"RECLAMATION_LEASE_SECONDS must be > 0.0, got {reclamation_lease}"
+            )
+        if reclamation_retries < 1:
+            raise ValueError(
+                f"RECLAMATION_MAX_RETRIES must be >= 1, got {reclamation_retries}"
+            )
+        if reclamation_backoff <= 0.0:
+            raise ValueError(
+                f"RECLAMATION_BASE_BACKOFF_SECONDS must be > 0.0, got {reclamation_backoff}"
             )
         return self
 

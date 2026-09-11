@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     Index,
+    CheckConstraint,
 )
 from sqlalchemy.orm import relationship
 
@@ -306,4 +307,79 @@ class ForecastCycleLifecycle(Base):
         Index("idx_cycle_lifecycle_claimed", "model_id", "deletion_started_at"),
         Index("idx_cycle_lifecycle_deleted", "model_id", "deleted_at"),
     )
+
+
+class ReclamationQueue(Base):
+    __tablename__ = "reclamation_queue"
+
+    id = Column(String(length=64), primary_key=True)
+    run_id = Column(
+        String, ForeignKey("model_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    model_id = Column(
+        String, ForeignKey("models.model_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    cycle_time = Column(DateTime(timezone=True), nullable=False)
+    lead_time_hours = Column(Integer, nullable=False)
+    variable_code = Column(String, nullable=False)
+    target_kind = Column(String(length=16), nullable=False)
+    member_index = Column(Integer, nullable=False, default=0)
+    valid_time = Column(DateTime(timezone=True), nullable=False)
+    store_path = Column(String, nullable=False)
+    physical_key = Column(String, nullable=False)
+    status = Column(String(length=16), nullable=False, default="queued")
+    attempt_count = Column(Integer, nullable=False, default=0)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String, nullable=True)
+    reclaimed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "lead_time_hours",
+            "variable_code",
+            "target_kind",
+            "member_index",
+            name="uq_reclamation_queue_target",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'deleting', 'deleted', 'failed')",
+            name="ck_reclamation_queue_status",
+        ),
+        CheckConstraint(
+            "target_kind IN ('det', 'mean', 'mem')",
+            name="ck_reclamation_queue_target_kind",
+        ),
+        CheckConstraint(
+            "(target_kind = 'det' AND member_index = 0) OR "
+            "(target_kind = 'mean' AND member_index = -1) OR "
+            "(target_kind = 'mem' AND member_index >= 1 AND member_index <= 30)",
+            name="ck_reclamation_queue_member_index",
+        ),
+        Index("idx_reclamation_claim", "status", "next_retry_at", "lease_expires_at"),
+        Index("idx_reclamation_run_status", "run_id", "status"),
+        Index("idx_reclamation_physical_fence", "run_id", "physical_key", "status"),
+        Index(
+            "idx_reclamation_region_audit",
+            "run_id",
+            "lead_time_hours",
+            "target_kind",
+            "member_index",
+            "status",
+        ),
+        Index("idx_reclamation_model_cycle", "model_id", "cycle_time", "lead_time_hours"),
+    )
+
 

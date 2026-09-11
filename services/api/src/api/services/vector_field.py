@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import xarray as xr
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.services.point_forecast import (
@@ -336,5 +337,29 @@ def render_vector_field_binary(
             excluded.add(current_store_path)
             continue
         break
+
+    # Post-read validation: verify wind components did not transition to deleting/deleted during read
+    try:
+        from api.models.entities import ReclamationQueue
+        from domain.reclamation import make_shard_relative_key
+
+        t_kind = "mean" if model == "gefs" else "det"
+        u_key = make_shard_relative_key("wind_u_10m", t_kind, resolved_lead)
+        v_key = make_shard_relative_key("wind_v_10m", t_kind, resolved_lead)
+        with SessionLocal() as check_session:
+            fenced_shards = check_session.execute(
+                select(ReclamationQueue.id).where(
+                    ReclamationQueue.store_path == current_store_path,
+                    ReclamationQueue.physical_key.in_([u_key, v_key]),
+                    ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                )
+            ).scalars().all()
+            if fenced_shards:
+                raise HTTPException(status_code=404, detail="Wind component shards became unavailable during read.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
     _vector_cache_set(cache_key, payload)
     return payload

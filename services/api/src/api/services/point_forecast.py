@@ -381,6 +381,10 @@ def build_point_forecast(
 
     forecasts: list[ForecastSeries] = []
     precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None, float | None]] = {}
+    used_targets: set[tuple[str, str]] = set()
+    t_kind = "mean" if model == "gefs" else "det"
+    from domain.reclamation import make_shard_relative_key
+
     for valid_time, (cycle_time, lead) in sorted(resolved.items()):
         store_path = cycle_store_paths.get(cycle_time)
         if store_path is None:
@@ -410,6 +414,8 @@ def build_point_forecast(
                             p_store = cycle_store_paths.get(p_cycle)
                             if p_store is not None:
                                 precip_source = (p_store, p_lead)
+                                for pv in precip_vars:
+                                    used_targets.add((p_store, make_shard_relative_key(pv, t_kind, p_lead)))
                                 break
 
             if "cloud_cover_3h" in var_codes:
@@ -420,6 +426,7 @@ def build_point_forecast(
                             c_store = cycle_store_paths.get(c_cycle)
                             if c_store is not None:
                                 cloud_source = (c_store, c_lead)
+                                used_targets.add((c_store, make_shard_relative_key("cloud_cover_3h", t_kind, c_lead)))
                                 break
 
         anchor_vars = tuple(
@@ -431,6 +438,12 @@ def build_point_forecast(
         )
         values_by_var: dict[str, Any] = {}
         if anchor_vars:
+            for av in anchor_vars:
+                if av == "wind_10m":
+                    used_targets.add((store_path, make_shard_relative_key("wind_u_10m", t_kind, lead)))
+                    used_targets.add((store_path, make_shard_relative_key("wind_v_10m", t_kind, lead)))
+                else:
+                    used_targets.add((store_path, make_shard_relative_key(av, t_kind, lead)))
             anchor_vals = gated_point_interpolations(
                 store_path,
                 var_codes=anchor_vars,
@@ -573,6 +586,30 @@ def build_point_forecast(
             status_code=404,
             detail=f"No readable forecast data was found for model '{model}'.",
         )
+
+    # Post-read validation: verify used targets did not enter deleting/deleted
+    if used_targets:
+        try:
+            from api.core.database import SessionLocal
+            from api.models.entities import ReclamationQueue
+
+            with SessionLocal() as post_read_session:
+                fenced = post_read_session.execute(
+                    select(ReclamationQueue.id).where(
+                        ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                        ReclamationQueue.store_path.in_([s for s, _ in used_targets]),
+                        ReclamationQueue.physical_key.in_([k for _, k in used_targets]),
+                    )
+                ).scalars().all()
+                if fenced:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Forecast data became unavailable during read.",
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
     # ``generated_at`` is the newest winning cycle (the "generation time" of the
     # series), keeping the payload deterministic.

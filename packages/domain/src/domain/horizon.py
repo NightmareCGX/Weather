@@ -58,19 +58,38 @@ def _build_lead_sequence(
 #: Authoritative fixed canonical horizon per model (the complete lead set a
 #: cycle store is expected to serve when fully ingested).
 MODEL_CANONICAL_HORIZONS: dict[str, tuple[int, ...]] = {
-    "gfs": _build_lead_sequence(0, CANONICAL_LEAD_CADENCE_HOURS, CANONICAL_MAX_LEAD_HOURS),
-    "gefs": _build_lead_sequence(0, CANONICAL_LEAD_CADENCE_HOURS, CANONICAL_MAX_LEAD_HOURS),
+    "gfs": _build_lead_sequence(
+        0, CANONICAL_LEAD_CADENCE_HOURS, CANONICAL_MAX_LEAD_HOURS
+    ),
+    "gefs": _build_lead_sequence(
+        0, CANONICAL_LEAD_CADENCE_HOURS, CANONICAL_MAX_LEAD_HOURS
+    ),
+}
+
+#: Authoritative fixed canonical horizon per (model, version).
+MODEL_VERSION_HORIZONS: dict[tuple[str, str], tuple[int, ...]] = {
+    ("gfs", "v1.0"): _build_lead_sequence(
+        0, CANONICAL_LEAD_CADENCE_HOURS, CANONICAL_MAX_LEAD_HOURS
+    ),
+    ("gefs", "v1.0"): _build_lead_sequence(
+        0, CANONICAL_LEAD_CADENCE_HOURS, CANONICAL_MAX_LEAD_HOURS
+    ),
 }
 
 
-def register_canonical_lead_horizon(model_id: str, leads: tuple[int, ...]) -> None:
-    """Register or override the canonical horizon for a model (test/startup).
+def register_canonical_lead_horizon(
+    model_id: str,
+    leads: tuple[int, ...],
+    version_string: str | None = None,
+) -> None:
+    """Register or override the canonical horizon for a model / version (test/startup).
 
     Args:
         model_id: Platform model identifier (e.g. ``gfs``, ``gefs``).
         leads: The complete ordered lead sequence. Must be non-empty and
             strictly increasing (the horizon is walked in order by frontier
             logic), with non-negative lead values.
+        version_string: Optional version string (e.g. ``v1.0``, ``v2.0``).
 
     Raises:
         ValueError: If the sequence is empty, not strictly increasing, or
@@ -84,13 +103,19 @@ def register_canonical_lead_horizon(model_id: str, leads: tuple[int, ...]) -> No
         raise ValueError(
             f"canonical lead horizon must be strictly increasing: {leads!r}"
         )
-    MODEL_CANONICAL_HORIZONS[model_id.lower().strip()] = tuple(leads)
+    m_clean = model_id.lower().strip()
+    if version_string is not None:
+        v_clean = version_string.lower().strip()
+        MODEL_VERSION_HORIZONS[(m_clean, v_clean)] = tuple(leads)
+    MODEL_CANONICAL_HORIZONS[m_clean] = tuple(leads)
 
 
 def canonical_lead_time_hours(
-    model_id: str, default_if_unknown: tuple[int, ...] | None = None
+    model_id: str,
+    version_string: str | None = None,
+    default_if_unknown: tuple[int, ...] | None = None,
 ) -> tuple[int, ...]:
-    """Return the authoritative canonical horizon for a model.
+    """Return the authoritative canonical horizon for a model / version.
 
     The horizon is a fixed specification of the platform's product contract.
     It is NOT dynamically inferred from the current run, upstream publication,
@@ -98,23 +123,47 @@ def canonical_lead_time_hours(
 
     Args:
         model_id: Platform model identifier (e.g. ``gfs``, ``gefs``).
+        version_string: Optional version identifier (e.g. ``v1.0``).
         default_if_unknown: Optional fallback horizon if the model is not in
             the authoritative registry. When ``None`` (the default), an
             unrecognized model raises ``ValueError``.
 
     Returns:
-        The canonical, strictly increasing lead sequence for the model.
+        The canonical, strictly increasing lead sequence for the model/version.
 
     Raises:
-        ValueError: If ``model_id`` is not registered and ``default_if_unknown``
+        ValueError: If model/version is not registered and ``default_if_unknown``
             is ``None``.
     """
-    normalized = model_id.lower().strip()
-    if normalized in MODEL_CANONICAL_HORIZONS:
-        return MODEL_CANONICAL_HORIZONS[normalized]
+    m_clean = model_id.lower().strip()
+    if version_string is not None:
+        v_clean = version_string.lower().strip()
+        if (m_clean, v_clean) in MODEL_VERSION_HORIZONS:
+            return MODEL_VERSION_HORIZONS[(m_clean, v_clean)]
+    if m_clean in MODEL_CANONICAL_HORIZONS:
+        return MODEL_CANONICAL_HORIZONS[m_clean]
     if default_if_unknown is not None:
         return default_if_unknown
     raise ValueError(
         f"Unknown model identifier {model_id!r}; registered models: "
         f"{sorted(MODEL_CANONICAL_HORIZONS)}"
     )
+
+
+def model_max_lead_hours(
+    model_id: str,
+    version_string: str | None = None,
+    default_if_unknown: int | None = None,
+) -> int:
+    """Return the authoritative maximum lead time in hours for a model and version.
+
+    For current GFS and GEFS v1.0, resolves to 240h.
+    """
+    default_seq = (0, default_if_unknown) if default_if_unknown is not None else None
+    leads = canonical_lead_time_hours(
+        model_id,
+        version_string=version_string,
+        default_if_unknown=default_seq,
+    )
+    return leads[-1]
+

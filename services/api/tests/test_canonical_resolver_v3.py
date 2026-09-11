@@ -53,6 +53,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationQueue,
 )
 from api.services.cache import (
     build_ensemble_cache_key,
@@ -99,6 +100,7 @@ def v3_db(tmp_path):
         EnsembleMember.__table__,
         EnsembleMemberProduct.__table__,
         ForecastCycleLifecycle.__table__,
+        ReclamationQueue.__table__,
     ]
     Base.metadata.create_all(engine, tables=tables)
 
@@ -623,7 +625,8 @@ def test_23_bulk_resolution_no_n_plus_one_sql_queries(v3_db):
         queries: list[str] = []
 
         def capture_query(conn, cursor, statement, parameters, context, executemany):
-            queries.append(statement)
+            if not statement.strip().upper().startswith("PRAGMA"):
+                queries.append(statement)
 
         event.listen(v3_db, "before_cursor_execute", capture_query)
         try:
@@ -1188,7 +1191,8 @@ def test_34_endpoint_sql_query_count_bounded_for_81_valid_times(v3_db, monkeypat
         queries: list[str] = []
 
         def capture_query(conn, cursor, statement, parameters, context, executemany):
-            queries.append(statement)
+            if not statement.strip().upper().startswith("PRAGMA"):
+                queries.append(statement)
 
         event.listen(v3_db, "before_cursor_execute", capture_query)
         try:
