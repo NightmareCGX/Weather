@@ -635,7 +635,9 @@ def _resolve_cycle_store_path(
         .where(ModelRun.zarr_store_path.isnot(None))
         .where(ModelRun.cycle_time == cycle_time)
     )
-    run = db.execute(filter_visible_runs(stmt)).scalars().one_or_none()
+    from api.services.lifecycle import filter_fenced_runs
+
+    run = db.execute(filter_fenced_runs(stmt, model_id=model)).scalars().one_or_none()
     return str(run) if run is not None else None
 
 

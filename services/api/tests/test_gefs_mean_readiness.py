@@ -10,6 +10,7 @@ D. Neither ready: returns 404 cleanly.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from fastapi import HTTPException
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -128,11 +129,13 @@ def test_db(monkeypatch):
 
 
 def test_readiness_case_a_mean_ready_members_incomplete(test_db):
-    """Case A: geavg mean product is committed, but member coverage is below 85% threshold.
+    """Case A: geavg mean product is committed, but member coverage is below 85% threshold (Lifecycle V3 Strict Coherent Vintage).
 
     Expected:
-    - Mean candidates (require_members=False) resolve successfully.
-    - Member candidates (require_members=True) are rejected (not servable).
+    - Under V3 strict coherent vintage, a GEFS cycle is canonical for valid_time V if and only if
+      BOTH geavg AND member coverage >= 85% (>= 26/30) are committed.
+    - When member coverage is < 85% (5 members), the cycle is NOT canonical for any endpoint.
+    - Both mean candidates and member candidates reject the under-covered cycle.
     """
     with Session(test_db) as db:
         # Add ForecastProduct (mean product committed for lead 6)
@@ -158,26 +161,23 @@ def test_readiness_case_a_mean_ready_members_incomplete(test_db):
             )
         db.commit()
 
-        # Mean path (points / maps): require_members=False
+        # Under V3 Strict Coherent Vintage, neither mean nor member path promotes with incomplete members
         mean_candidates = resolve_valid_time_candidates(
             db, "gefs", target_valid_time=V_TIME, require_members=False
         )
-        assert V_TIME in mean_candidates
-        assert len(mean_candidates[V_TIME]) == 1
-        assert mean_candidates[V_TIME][0][1] == 6  # lead 6
+        assert V_TIME not in mean_candidates
 
-        # Source resolves cleanly for mean
-        source_mean = resolve_valid_time_source(
-            db, "gefs", V_TIME, variable="temperature_2m", require_members=False
-        )
-        assert source_mean.lead_time_hours == 6
-
-        # Member path (ensembles / probabilities): require_members=True
         member_candidates = resolve_valid_time_candidates(
             db, "gefs", target_valid_time=V_TIME, require_members=True
         )
-        # Should be empty because member count (5) < 26
         assert V_TIME not in member_candidates
+
+        # Direct source resolution raises 404 because no coherent source exists
+        with pytest.raises(HTTPException) as exc:
+            resolve_valid_time_source(
+                db, "gefs", V_TIME, variable="temperature_2m", require_members=False
+            )
+        assert exc.value.status_code == 404
 
 
 def test_readiness_case_b_members_ready_mean_missing(test_db):
@@ -310,6 +310,16 @@ def test_map_and_points_gefs_mean_cross_cycle_alignment(test_db):
                 lead_time_hours=6,
             )
         )
+        # 12Z also has 30 members for lead 6, satisfying coherent vintage
+        for m in range(1, 31):
+            db.add(
+                EnsembleMemberProduct(
+                    id=f"emp_12z_{m}_6",
+                    run_id="run_gefs_2026090612",
+                    member_index=m,
+                    lead_time_hours=6,
+                )
+            )
         db.commit()
 
         # 1. Map tile context resolution for valid_time V_TIME

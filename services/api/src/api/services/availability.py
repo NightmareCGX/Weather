@@ -14,14 +14,14 @@ excluded.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from domain.coverage import (
     compute_coverage_ratio,
     get_expected_members,
     is_lead_servable,
 )
-from domain.temporal import requires_lead0_display_fallback, serving_start_valid_time
+from domain.temporal import serving_start_valid_time
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -204,13 +204,52 @@ def build_forecast_availability(
         )
         variables: list[VariableAvailability] = []
 
+        # Canonical V3 valid-time resolution for this model
+        model_vars = [vc for vc in model_acc.variables if vc not in INTERNAL_VARIABLES]
+        has_wind = "wind_u_10m" in model_acc.variables and "wind_v_10m" in model_acc.variables
+        if has_wind:
+            model_vars.append("wind_10m")
+
+        from api.services.resolver import resolve_canonical_sources_bulk
+
+        anchors, var_sources = resolve_canonical_sources_bulk(
+            db,
+            model_id,
+            variables=model_vars,
+            now=now_utc,
+        )
+
+        def _build_valid_times(var_code: str) -> list[ValidTimeAvailabilityOut]:
+            vts: list[ValidTimeAvailabilityOut] = []
+            for vt in sorted(anchors.keys()):
+                src = var_sources.get((var_code, vt))
+                if src is not None:
+                    avail_count = (
+                        len(src.member_indices)
+                        if (model_acc.is_ensemble and src.member_indices is not None)
+                        else (expected_members if model_acc.is_ensemble else 1)
+                    )
+                    ratio = compute_coverage_ratio(avail_count, expected_members)
+                    servable = is_lead_servable(avail_count, expected_members)
+                    vts.append(
+                        ValidTimeAvailabilityOut(
+                            valid_time=src.valid_time,
+                            source_cycle=src.cycle_time,
+                            lead_time_hours=src.lead_time_hours,
+                            servable=servable,
+                            available_members=avail_count,
+                            expected_members=expected_members,
+                            coverage_ratio=ratio,
+                        )
+                    )
+            return vts
+
         # Synthesize public wind_10m product when both wind_u_10m and wind_v_10m exist
-        if "wind_u_10m" in model_acc.variables and "wind_v_10m" in model_acc.variables:
+        if has_wind:
             u_acc = model_acc.variables["wind_u_10m"]
             v_acc = model_acc.variables["wind_v_10m"]
             common_cycles = set(u_acc.initial_times.keys()).intersection(v_acc.initial_times.keys())
             initial_times_wind: list[InitialTimeAvailability] = []
-            valid_times_wind_map: dict[datetime, ValidTimeAvailabilityOut] = {}
             for cycle_time in sorted(common_cycles, reverse=True):
                 u_info = u_acc.initial_times[cycle_time]
                 v_info = v_acc.initial_times[cycle_time]
@@ -238,22 +277,6 @@ def build_forecast_availability(
                                 servable=servable,
                             )
                         )
-
-                        # Valid time candidate for wind
-                        v_time = cycle_time + timedelta(hours=lead)
-                        if v_time >= serving_start:
-                            cand_w = ValidTimeAvailabilityOut(
-                                valid_time=v_time,
-                                source_cycle=cycle_time,
-                                lead_time_hours=lead,
-                                servable=servable,
-                                available_members=avail_count,
-                                expected_members=expected_members,
-                                coverage_ratio=ratio,
-                            )
-                            ex_w = valid_times_wind_map.get(v_time)
-                            if ex_w is None or (cand_w.servable and not ex_w.servable) or (cand_w.servable and cand_w.source_cycle > ex_w.source_cycle):
-                                valid_times_wind_map[v_time] = cand_w
 
                     initial_times_wind.append(
                         InitialTimeAvailability(
@@ -295,7 +318,7 @@ def build_forecast_availability(
                         name="10-Meter Wind",
                         unit="km/h",
                         initial_times=initial_times_wind,
-                        valid_times=sorted(valid_times_wind_map.values(), key=lambda vt: vt.valid_time),
+                        valid_times=_build_valid_times("wind_10m"),
                         layer=layer_wind,
                     )
                 )
@@ -304,8 +327,7 @@ def build_forecast_availability(
             if variable_code in INTERNAL_VARIABLES:
                 continue
             variable_acc = model_acc.variables[variable_code]
-            initial_times: list[InitialTimeAvailability] = []
-            valid_times_var_map: dict[datetime, ValidTimeAvailabilityOut] = {}
+            initial_times = []
             for cycle_time, cycle_info in sorted(
                 variable_acc.initial_times.items(),
                 key=lambda item: item[0],
@@ -331,23 +353,6 @@ def build_forecast_availability(
                             servable=servable,
                         )
                     )
-
-                    # Valid time candidate (interval variables at lead 0 contain NaN and are not servable valid times)
-                    if not (lead == 0 and requires_lead0_display_fallback(variable_code)):
-                        v_time = cycle_time + timedelta(hours=lead)
-                        if v_time >= serving_start:
-                            cand_v = ValidTimeAvailabilityOut(
-                                valid_time=v_time,
-                                source_cycle=cycle_time,
-                                lead_time_hours=lead,
-                                servable=servable,
-                                available_members=avail_count,
-                                expected_members=expected_members,
-                                coverage_ratio=ratio,
-                            )
-                            ex_v = valid_times_var_map.get(v_time)
-                            if ex_v is None or (cand_v.servable and not ex_v.servable) or (cand_v.servable and cand_v.source_cycle > ex_v.source_cycle):
-                                valid_times_var_map[v_time] = cand_v
 
                 initial_times.append(
                     InitialTimeAvailability(
@@ -381,7 +386,7 @@ def build_forecast_availability(
                     name=variable_acc.name,
                     unit=variable_acc.unit,
                     initial_times=initial_times,
-                    valid_times=sorted(valid_times_var_map.values(), key=lambda vt: vt.valid_time),
+                    valid_times=_build_valid_times(variable_code),
                     layer=layer,
                 )
             )

@@ -279,6 +279,7 @@ def build_point_cache_key(
     end_lead_time_hours: int | None,
     cross_cycle: bool = False,
     serving_start: str | None = None,
+    provenance_digest: str | None = None,
 ) -> str:
     """Build a deterministic cache key for a point forecast request.
 
@@ -296,6 +297,11 @@ def build_point_cache_key(
     can never satisfy a request for another cycle of the same model at the
     same location/lead (ACCEPTANCE_REMEDIATION_PLAN §9).
 
+    ``provenance_digest`` captures the deterministic SHA-256 digest of the exact
+    canonical source provenance across all requested valid times and fallback sources
+    (Lifecycle V3). When any lead promotes or fallback changes, this digest changes,
+    invalidating stale cache entries immediately.
+
     ``cross_cycle`` discriminates the cross-cycle time-series response (which
     may combine multiple cycles) from the legacy single-cycle response. A
     cross-cycle payload must never be served from a single-cycle cache entry
@@ -306,6 +312,7 @@ def build_point_cache_key(
         "model": model,
         "cycle_time": cycle_time,
         "serving_generation": serving_generation,
+        "provenance_digest": provenance_digest,
         "latitude": latitude,
         "longitude": longitude,
         "resolved_via": resolved_via,
@@ -336,6 +343,7 @@ def build_probability_cache_key(
     cycle_time: str | None = None,
     serving_generation: str | None = None,
     valid_time: str | None = None,
+    member_fingerprint: str | None = None,
 ) -> str:
     """Build a deterministic cache key for a probability forecast request.
 
@@ -345,11 +353,14 @@ def build_probability_cache_key(
     ``cycle_time`` (the resolved run's cycle) and ``serving_generation`` (the
     committed-manifest generation) are part of the key so a cached response for
     one forecast run (or one data generation) never satisfies another.
+    ``member_fingerprint`` captures the exact sorted committed member indices (Lifecycle V3)
+    so subsequent member commits within the same cycle/lead invalidate the cached output.
     """
     payload = {
         "model": model,
         "cycle_time": cycle_time,
         "serving_generation": serving_generation,
+        "member_fingerprint": member_fingerprint,
         "latitude": latitude,
         "longitude": longitude,
         "variable": variable,
@@ -376,6 +387,7 @@ def build_ensemble_cache_key(
     cycle_time: str | None = None,
     serving_generation: str | None = None,
     valid_time: str | None = None,
+    member_fingerprint: str | None = None,
 ) -> str:
     """Build a deterministic cache key for an ensemble statistics request.
 
@@ -384,13 +396,15 @@ def build_ensemble_cache_key(
     part of the key so a statistics-only cached response (which omits the
     member array) can never satisfy a distribution request, and a member-heavy
     response can never satisfy a statistics-only request. ``cycle_time`` (the
-    resolved run's cycle) and ``serving_generation`` (the committed-manifest
-    generation) are part of the key.
+    resolved run's cycle), ``serving_generation`` (the committed-manifest
+    generation), and ``member_fingerprint`` (sorted committed member indices)
+    are part of the key.
     """
     payload = {
         "model": model,
         "cycle_time": cycle_time,
         "serving_generation": serving_generation,
+        "member_fingerprint": member_fingerprint,
         "latitude": latitude,
         "longitude": longitude,
         "variable": variable,

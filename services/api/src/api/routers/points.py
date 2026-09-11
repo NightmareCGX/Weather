@@ -92,6 +92,16 @@ def get_point_forecast(
     )
     var_codes = _parse_variables(variables)
 
+    from api.services.resolver import resolve_point_provenance_digest
+
+    provenance_digest = resolve_point_provenance_digest(
+        db,
+        model=model_ids[0],
+        variables=var_codes,
+        start_lead_time_hours=start_lead_time_hours,
+        end_lead_time_hours=end_lead_time_hours,
+        now=now,
+    )
     cycle_time = resolve_latest_run_cycle_time(db, model_ids[0])
     store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
         db, model_ids[0]
@@ -116,6 +126,7 @@ def get_point_forecast(
         # from all READY cycles.
         cycle_time=cycle_time,
         serving_generation=serving_generation,
+        provenance_digest=provenance_digest,
         variables=tuple(var_codes) if var_codes else None,
         units=units,
         start_lead_time_hours=start_lead_time_hours,

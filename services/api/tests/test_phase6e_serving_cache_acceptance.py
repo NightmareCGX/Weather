@@ -408,13 +408,14 @@ def test_progressive_serving_blends_visible_runs_and_excludes_retired(client, mi
         _seed_gfs_run(session, c_ready, p_ready, [0, 6, 12, 18], "ready")
         _seed_gfs_run(session, c_part, p_part, [0], "partial")
 
-        # Mark c_ret retired
+        # Mark c_ret retired and fenced
         session.add(
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c_ret,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_part,
+                deleted_at=_dt(2026, 9, 2, 0),
             )
         )
         session.commit()
