@@ -8,6 +8,7 @@ from domain.horizon import (
     CANONICAL_MAX_LEAD_HOURS,
     MODEL_CANONICAL_HORIZONS,
     canonical_lead_time_hours,
+    model_max_lead_hours,
     register_canonical_lead_horizon,
 )
 
@@ -15,10 +16,15 @@ from domain.horizon import (
 @pytest.fixture()
 def _restore_horizons():
     """Preserve and restore the horizon registry around each test."""
+    from domain.horizon import MODEL_VERSION_HORIZONS
+
     saved = dict(MODEL_CANONICAL_HORIZONS)
+    saved_versions = dict(MODEL_VERSION_HORIZONS)
     yield
     MODEL_CANONICAL_HORIZONS.clear()
     MODEL_CANONICAL_HORIZONS.update(saved)
+    MODEL_VERSION_HORIZONS.clear()
+    MODEL_VERSION_HORIZONS.update(saved_versions)
 
 
 def test_canonical_horizon_is_81_leads_0_to_240_at_3h() -> None:
@@ -80,3 +86,27 @@ def test_register_rejects_non_increasing_sequence(_restore_horizons) -> None:
 def test_register_normalizes_model_id(_restore_horizons) -> None:
     register_canonical_lead_horizon(" GEFS ", (0, 12))
     assert canonical_lead_time_hours("gefs") == (0, 12)
+
+
+def test_model_max_lead_hours_for_contract_and_custom_models(_restore_horizons) -> None:
+    assert model_max_lead_hours("gfs") == 240
+    assert model_max_lead_hours("gefs") == 240
+    assert model_max_lead_hours(" GFS ") == 240
+
+    with pytest.raises(ValueError, match="Unknown model identifier"):
+        model_max_lead_hours("ecmwf")
+
+    assert model_max_lead_hours("ecmwf", default_if_unknown=384) == 384
+
+    # Register a custom model supporting 384h
+    register_canonical_lead_horizon("future_gfs", tuple(range(0, 385, 3)))
+    assert model_max_lead_hours("future_gfs") == 384
+
+    # Version-specific registration: v1.0 remains 240, v2.0 is 120
+    register_canonical_lead_horizon("gfs", tuple(range(0, 121, 3)), version_string="v2.0")
+    assert model_max_lead_hours("gfs", version_string="v2.0") == 120
+    assert model_max_lead_hours("gfs", version_string="v1.0") == 240
+    assert canonical_lead_time_hours("gfs", version_string="v2.0") == tuple(range(0, 121, 3))
+    assert canonical_lead_time_hours("gfs", version_string="v1.0") == tuple(range(0, 241, 3))
+
+

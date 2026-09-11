@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -484,6 +485,29 @@ def render_tile_png(
             session = SessionLocal()
             continue
         break
+
+    # Post-read validation: verify physical shard did not transition to deleting/deleted during read
+    try:
+        from api.models.entities import ReclamationQueue
+        from domain.reclamation import make_shard_relative_key
+
+        t_kind = "mean" if context.expected_members > 1 else "det"
+        rel_key = make_shard_relative_key(variable, t_kind, context.lead_time_hours)
+        with SessionLocal() as check_session:
+            fenced_shards = check_session.execute(
+                select(ReclamationQueue.id).where(
+                    ReclamationQueue.store_path == context.store_path,
+                    ReclamationQueue.physical_key == rel_key,
+                    ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                )
+            ).scalars().all()
+            if fenced_shards:
+                raise HTTPException(status_code=404, detail="Forecast shard became unavailable during read.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
     return _render_window_to_png(
         windowed,
         variable=variable,
@@ -1265,20 +1289,60 @@ def _resolve_run_store_path(
             ),
         )
 
+    fenced_vars: set[tuple[str, str, int]] = set()
+    try:
+        from api.models.entities import ReclamationQueue
+
+        q_rows = db.execute(
+            select(
+                ReclamationQueue.run_id,
+                ReclamationQueue.variable_code,
+                ReclamationQueue.member_index,
+            ).where(
+                ReclamationQueue.run_id.in_([r.id for r in candidates]),
+                ReclamationQueue.lead_time_hours == lead_time_hours,
+                ReclamationQueue.status.in_(("deleting", "deleted")),
+            )
+        ).all()
+        fenced_vars = {(str(r), str(v), int(m)) for r, v, m in q_rows}
+    except Exception:
+        fenced_vars = set()
+
     for run in candidates:
         assert run.zarr_store_path is not None
-        # Check ensemble member coverage if model is ensemble and product is not official mean
+        run_id_str = str(run.id)
+        # Check deterministic physical availability
+        if expected_members == 1:
+            if variable in ("wind_10m", "wind_speed_10m"):
+                if (run_id_str, "wind_u_10m", 0) in fenced_vars or (run_id_str, "wind_v_10m", 0) in fenced_vars:
+                    if initial_time is not None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Wind component shards for model '{model}' at cycle '{initial_time}' are not available.",
+                        )
+                    continue
+            elif (run_id_str, variable, 0) in fenced_vars:
+                if initial_time is not None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Forecast shard for model '{model}', variable '{variable}', lead '{lead_time_hours}h' at cycle '{initial_time}' is not available.",
+                    )
+                continue
+
+        # Check ensemble member coverage if model is ensemble
         if expected_members > 1:
-            mean_prod = db.execute(
-                select(ForecastProduct.id).where(
-                    ForecastProduct.run_id == run.id,
-                    ForecastProduct.variable_id == (
-                        "wind_u_10m" if variable in ("wind_10m", "wind_speed_10m") else variable
-                    ),
-                    ForecastProduct.product_type == "ensemble_mean",
-                    ForecastProduct.lead_time_hours == lead_time_hours,
-                )
-            ).scalar_one_or_none()
+            var_for_mean = "wind_u_10m" if variable in ("wind_10m", "wind_speed_10m") else variable
+            mean_fenced = (run_id_str, var_for_mean, -1) in fenced_vars
+            mean_prod = None
+            if not mean_fenced:
+                mean_prod = db.execute(
+                    select(ForecastProduct.id).where(
+                        ForecastProduct.run_id == run.id,
+                        ForecastProduct.variable_id == var_for_mean,
+                        ForecastProduct.product_type == "ensemble_mean",
+                        ForecastProduct.lead_time_hours == lead_time_hours,
+                    )
+                ).scalar_one_or_none()
             if mean_prod is None:
                 member_rows = db.execute(
                     select(EnsembleMemberProduct.member_index).where(
@@ -1286,7 +1350,7 @@ def _resolve_run_store_path(
                         EnsembleMemberProduct.lead_time_hours == lead_time_hours,
                     )
                 ).scalars().all()
-                avail_members = tuple(member_rows)
+                avail_members = tuple(m for m in member_rows if (run_id_str, variable, int(m)) not in fenced_vars)
                 # If no pair rows (legacy store / test fixture), allow ready runs
                 if not avail_members and run.status == "ready":
                     avail_members = tuple(range(1, expected_members + 1))

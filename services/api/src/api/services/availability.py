@@ -149,6 +149,25 @@ def build_forecast_availability(
     )
     rows = db.execute(filter_visible_runs(stmt)).all()
 
+    # Pre-query physically fenced shards from reclamation_queue
+    fenced_leads: set[tuple[str, int, str]] = set()
+    try:
+        from api.models.entities import ReclamationQueue
+
+        fenced_rows = db.execute(
+            select(
+                ReclamationQueue.run_id,
+                ReclamationQueue.lead_time_hours,
+                ReclamationQueue.variable_code,
+            ).where(
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                ReclamationQueue.target_kind.in_(("det", "mean")),
+            )
+        ).all()
+        fenced_leads = {(str(r), int(ld), str(v)) for r, ld, v in fenced_rows}
+    except Exception:
+        fenced_leads = set()
+
     # Pre-query committed ensemble member counts per (run_id, lead_time_hours)
     emp_rows = db.execute(
         select(
@@ -177,6 +196,8 @@ def build_forecast_availability(
         run_status,
         lead,
     ) in rows:
+        if (str(run_id), int(lead), str(variable_code)) in fenced_leads:
+            continue
         c_utc = (
             cycle_time.replace(tzinfo=timezone.utc)
             if cycle_time.tzinfo is None

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
@@ -152,6 +153,37 @@ def get_ensemble_statistics(
         store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
             db, model, target_initial
         )
+
+        if target_initial is not None:
+            # Pinned path: validate physical availability BEFORE cache lookup
+            try:
+                from api.models.entities import ReclamationQueue
+                from domain.coverage import get_expected_members, is_lead_servable
+
+                exp_m = get_expected_members(model, default_if_unknown=30)
+                c_p = parse_cycle_time(target_initial)
+                fenced_cnt = (
+                    db.execute(
+                        select(func.count(ReclamationQueue.id)).where(
+                            ReclamationQueue.model_id == model.lower().strip(),
+                            ReclamationQueue.cycle_time == c_p,
+                            ReclamationQueue.lead_time_hours == resolved_lead,
+                            ReclamationQueue.target_kind == "mem",
+                            ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                        )
+                    ).scalar()
+                    or 0
+                )
+                if not is_lead_servable(exp_m - fenced_cnt, exp_m):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Forecast lead {resolved_lead}h for model '{model}' at cycle '{target_initial}' is not available.",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
         db.close()
 
         serving_generation = resolve_serving_generation_for_store(

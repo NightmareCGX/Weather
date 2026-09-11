@@ -43,6 +43,8 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    Index,
+    CheckConstraint,
     select,
 )
 from sqlalchemy.exc import IntegrityError
@@ -339,16 +341,81 @@ class EnsembleMemberProductRecord(CatalogBase):
 class ForecastCycleLifecycleRecord(CatalogBase):
     __tablename__ = "forecast_cycle_lifecycle"
 
-    model_id = Column(
+    model_id: Any = Column(
         String, ForeignKey("models.model_id", ondelete="CASCADE"), primary_key=True
     )
-    cycle_time = Column(DateTime(timezone=True), primary_key=True)
-    retired_at = Column(DateTime(timezone=True), nullable=True)
-    retired_by_cycle_time = Column(DateTime(timezone=True), nullable=True)
-    deletion_started_at = Column(DateTime(timezone=True), nullable=True)
-    deleted_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
-    updated_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    cycle_time: Any = Column(DateTime(timezone=True), primary_key=True)
+    retired_at: Any = Column(DateTime(timezone=True), nullable=True)
+    retired_by_cycle_time: Any = Column(DateTime(timezone=True), nullable=True)
+    deletion_started_at: Any = Column(DateTime(timezone=True), nullable=True)
+    deleted_at: Any = Column(DateTime(timezone=True), nullable=True)
+    created_at: Any = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at: Any = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class ReclamationQueueRecord(CatalogBase):
+    __tablename__ = "reclamation_queue"
+
+    id: Any = Column(String(length=64), primary_key=True)
+    run_id: Any = Column(
+        String, ForeignKey("model_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    model_id: Any = Column(
+        String, ForeignKey("models.model_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    cycle_time: Any = Column(DateTime(timezone=True), nullable=False)
+    lead_time_hours: Any = Column(Integer, nullable=False)
+    variable_code: Any = Column(String, nullable=False)
+    target_kind: Any = Column(String(length=16), nullable=False)
+    member_index: Any = Column(Integer, nullable=False, default=0)
+    valid_time: Any = Column(DateTime(timezone=True), nullable=False)
+    store_path: Any = Column(String, nullable=False)
+    physical_key: Any = Column(String, nullable=False)
+    status: Any = Column(String(length=16), nullable=False, default="queued")
+    attempt_count: Any = Column(Integer, nullable=False, default=0)
+    lease_expires_at: Any = Column(DateTime(timezone=True), nullable=True)
+    next_retry_at: Any = Column(DateTime(timezone=True), nullable=True)
+    last_error: Any = Column(String, nullable=True)
+    reclaimed_at: Any = Column(DateTime(timezone=True), nullable=True)
+    created_at: Any = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at: Any = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "lead_time_hours",
+            "variable_code",
+            "target_kind",
+            "member_index",
+            name="uq_reclamation_queue_target",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'deleting', 'deleted', 'failed')",
+            name="ck_reclamation_queue_status",
+        ),
+        CheckConstraint(
+            "target_kind IN ('det', 'mean', 'mem')",
+            name="ck_reclamation_queue_target_kind",
+        ),
+        CheckConstraint(
+            "(target_kind = 'det' AND member_index = 0) OR "
+            "(target_kind = 'mean' AND member_index = -1) OR "
+            "(target_kind = 'mem' AND member_index >= 1 AND member_index <= 30)",
+            name="ck_reclamation_queue_member_index",
+        ),
+        Index("idx_reclamation_claim", "status", "next_retry_at", "lease_expires_at"),
+        Index("idx_reclamation_run_status", "run_id", "status"),
+        Index("idx_reclamation_physical_fence", "run_id", "physical_key", "status"),
+        Index(
+            "idx_reclamation_region_audit",
+            "run_id",
+            "lead_time_hours",
+            "target_kind",
+            "member_index",
+            "status",
+        ),
+        Index("idx_reclamation_model_cycle", "model_id", "cycle_time", "lead_time_hours"),
+    )
 
 
 
@@ -562,6 +629,25 @@ def _reconcile_catalog_to_store(
     """
     committed_leads = committed_state.mean_lead_set()
 
+    # Pre-query intentionally reclaimed physical shards for this run so intentional
+    # V3 physical reclamation is NEVER wiped out as stale catalog corruption.
+    reclaimed_rows = db.execute(
+        select(
+            ReclamationQueueRecord.lead_time_hours,
+            ReclamationQueueRecord.variable_code,
+            ReclamationQueueRecord.target_kind,
+            ReclamationQueueRecord.member_index,
+        ).where(
+            ReclamationQueueRecord.run_id == run.id,
+            ReclamationQueueRecord.status.in_(["deleting", "deleted", "failed"]),
+        )
+    ).all()
+    reclaimed_pairs = {
+        (int(mem), int(lead)) for lead, var, kind, mem in reclaimed_rows if kind == "mem"
+    }
+    reclaimed_leads = {int(lead) for lead, var, kind, mem in reclaimed_rows}
+    reclaimed_vars = {str(var) for lead, var, kind, mem in reclaimed_rows}
+
     if committed_state.is_ensemble:
         # 1. Delete stale member-product pairs first (child table; no FK to
         #    ensemble_members, but deleting rows before parent member rows keeps
@@ -578,7 +664,7 @@ def _reconcile_catalog_to_store(
         committed_pairs = set(committed_state.pairs or ())
         for member_num, lead_num in existing_pairs:
             key = (int(member_num), int(lead_num))
-            if key not in committed_pairs:
+            if key not in committed_pairs and key not in reclaimed_pairs:
                 db.execute(
                     EnsembleMemberProductRecord.__table__.delete().where(
                         EnsembleMemberProductRecord.run_id == run.id,
@@ -587,13 +673,14 @@ def _reconcile_catalog_to_store(
                     )
                 )
 
-        # 2. Delete ensemble_members whose member index has no committed pair.
+        # 2. Delete ensemble_members whose member index has no committed or reclaimed pair.
         committed_members = committed_state.member_set()
+        all_live_members = committed_members | {m for m, _ in reclaimed_pairs}
         db.execute(
             EnsembleMemberRecord.__table__.delete().where(
                 EnsembleMemberRecord.run_id == run.id,
-                EnsembleMemberRecord.member_index.not_in(committed_members)
-                if committed_members
+                EnsembleMemberRecord.member_index.not_in(all_live_members)
+                if all_live_members
                 else EnsembleMemberRecord.member_index.is_not(None),
             )
         )
@@ -629,28 +716,24 @@ def _reconcile_catalog_to_store(
                     },
                 )
 
-    # 4. Delete forecast_products the store does not actually carry. Two stale
-    #    classes are removed: products whose lead is absent from the committed
-    #    set, and (when the store's real variable set is known) products whose
-    #    variable is absent from the store (e.g. a GEFS store that never holds
-    #    ``precipitation_rate`` because GEFS pgrb2s has no instant prate). A
-    #    store-absent variable must never remain advertised — that is exactly
-    #    the map-422 / ensemble-404 false-availability class.
+    # 4. Delete forecast_products the store does not actually carry (unless intentionally reclaimed).
+    all_live_leads = committed_leads | reclaimed_leads
     db.execute(
         ProductRecord.__table__.delete().where(
             ProductRecord.run_id == run.id,
-            ProductRecord.lead_time_hours.not_in(committed_leads)
-            if committed_leads
+            ProductRecord.lead_time_hours.not_in(all_live_leads)
+            if all_live_leads
             else ProductRecord.lead_time_hours.is_not(None),
         )
     )
     store_vars = committed_state.variables
     if store_vars is not None:
+        all_live_vars = store_vars | reclaimed_vars
         db.execute(
             ProductRecord.__table__.delete().where(
                 ProductRecord.run_id == run.id,
-                ProductRecord.variable_id.not_in(store_vars)
-                if store_vars
+                ProductRecord.variable_id.not_in(all_live_vars)
+                if all_live_vars
                 else ProductRecord.variable_id.is_not(None),
             )
         )

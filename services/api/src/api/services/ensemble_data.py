@@ -173,6 +173,24 @@ def _resolve_eligible_ensemble_run_and_members(
             except Exception:
                 continue
 
+        # Filter out physically fenced members from reclamation_queue
+        try:
+            from api.models.entities import ReclamationQueue
+
+            fenced_rows = db.execute(
+                select(ReclamationQueue.member_index).where(
+                    ReclamationQueue.run_id == run.id,
+                    ReclamationQueue.lead_time_hours == lead_time_hours,
+                    ReclamationQueue.target_kind == "mem",
+                    ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                )
+            ).scalars().all()
+            fenced_set = {int(m) for m in fenced_rows}
+            if fenced_set:
+                avail_members = tuple(m for m in avail_members if m not in fenced_set)
+        except Exception:
+            pass
+
         if not is_lead_servable(len(avail_members), expected_members):
             if initial_time is not None:
                 raise HTTPException(
@@ -348,6 +366,26 @@ def build_probability_forecast(
             )
         probability = _probability(finite_members, threshold, operator, threshold_max)
         lower, upper = probability_confidence_interval(probability, len(finite_members))
+
+    # Post-read validation: verify participating member shards did not transition to deleting/deleted
+    try:
+        from api.models.entities import ReclamationQueue
+
+        fenced_during_read = db.execute(
+            select(ReclamationQueue.id).where(
+                ReclamationQueue.run_id == run.id,
+                ReclamationQueue.lead_time_hours == lead_time_hours,
+                ReclamationQueue.target_kind == "mem",
+                ReclamationQueue.member_index.in_(avail_members),
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+            )
+        ).scalars().all()
+        if fenced_during_read:
+            raise HTTPException(status_code=404, detail="Ensemble member shards became unavailable during read.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     data: dict[str, Any] = {
         "location": ProbabilityLocation(latitude=latitude, longitude=longitude),
@@ -588,6 +626,26 @@ def build_ensemble_statistics(
                 mean=None, median=None, spread=None,
                 p10=None, p25=None, p50=None, p75=None, p90=None
             )
+
+    # Post-read validation: verify participating member shards did not transition to deleting/deleted
+    try:
+        from api.models.entities import ReclamationQueue
+
+        fenced_during_read = db.execute(
+            select(ReclamationQueue.id).where(
+                ReclamationQueue.run_id == run.id,
+                ReclamationQueue.lead_time_hours == lead_time_hours,
+                ReclamationQueue.target_kind == "mem",
+                ReclamationQueue.member_index.in_(avail_members),
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+            )
+        ).scalars().all()
+        if fenced_during_read:
+            raise HTTPException(status_code=404, detail="Ensemble member shards became unavailable during read.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     return EnsembleStatisticsData(
         model=model,

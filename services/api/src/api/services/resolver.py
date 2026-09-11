@@ -57,6 +57,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
+from domain.canonical import (
+    CanonicalCandidate as _CandidateRecord,
+    select_canonical_anchor,
+    select_canonical_sources_bulk,
+    select_variable_source,
+)
 from domain.coverage import get_expected_members, is_lead_servable
 from domain.temporal import (
     is_precipitation_companion,
@@ -64,7 +70,7 @@ from domain.temporal import (
     serving_start_valid_time,
 )
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from api.core.time import get_current_time
@@ -74,6 +80,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationQueue,
 )
 from api.services.lifecycle import filter_fenced_runs, parse_cycle_time
 
@@ -134,19 +141,6 @@ class ResolvedForecastSource:
         return f"m_{'_'.join(str(m) for m in self.member_indices)}"
 
 
-@dataclass(frozen=True)
-class _CandidateRecord:
-    """Internal candidate representation with its committed variable and member capabilities."""
-
-    cycle_time: datetime
-    lead_time_hours: int
-    run_id: str
-    store_path: str
-    product_types: frozenset[str]
-    variables: frozenset[str]
-    member_indices: tuple[int, ...] | None
-
-
 def _discover_candidates_bulk(
     db: Session,
     model: str,
@@ -160,6 +154,7 @@ def _discover_candidates_bulk(
     Applies model-scoped physical deletion fencing and ignores legacy retired_at.
     For GEFS ensembles, strictly enforces that candidates have both official geavg
     and servable member coverage (>=85%).
+    Filters out physical shards that are in reclamation_queue with status IN ('deleting', 'deleted').
     """
     now_utc = now if now is not None else get_current_time()
     start_vt = serving_start_valid_time(now_utc)
@@ -168,6 +163,15 @@ def _discover_candidates_bulk(
     is_ensemble = expected_members > 1
 
     # 1. Main catalog query: model_runs ⋈ forecast_products with physical fence filter
+    has_reclamation_queue = True
+    try:
+        bind = db.get_bind()
+        if bind.dialect.name == "sqlite":
+            from sqlalchemy import inspect
+            has_reclamation_queue = inspect(bind).has_table("reclamation_queue")
+    except Exception:
+        has_reclamation_queue = False
+
     stmt = (
         select(
             ModelRun.id,
@@ -185,6 +189,23 @@ def _discover_candidates_bulk(
         .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
         .where(ModelRun.zarr_store_path.isnot(None))
     )
+    if has_reclamation_queue:
+        reclaim_subq = (
+            select(1)
+            .select_from(ReclamationQueue)
+            .where(
+                ReclamationQueue.run_id == ForecastProduct.run_id,
+                ReclamationQueue.lead_time_hours == ForecastProduct.lead_time_hours,
+                ReclamationQueue.variable_code == ForecastProduct.variable_id,
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                or_(
+                    and_(ForecastProduct.product_type == "ensemble_mean", ReclamationQueue.target_kind == "mean"),
+                    and_(ForecastProduct.product_type != "ensemble_mean", ReclamationQueue.target_kind == "det"),
+                ),
+            )
+        )
+        stmt = stmt.where(~reclaim_subq.exists())
+
     stmt = filter_fenced_runs(stmt, model_id=m_id)
     rows = db.execute(stmt).all()
 
@@ -202,6 +223,20 @@ def _discover_candidates_bulk(
             .join(ModelVersion, ModelRun.model_version_id == ModelVersion.id)
             .where(ModelVersion.model_id == m_id)
         )
+        if has_reclamation_queue:
+            emp_reclaim_subq = (
+                select(1)
+                .select_from(ReclamationQueue)
+                .where(
+                    ReclamationQueue.run_id == EnsembleMemberProduct.run_id,
+                    ReclamationQueue.lead_time_hours == EnsembleMemberProduct.lead_time_hours,
+                    ReclamationQueue.member_index == EnsembleMemberProduct.member_index,
+                    ReclamationQueue.target_kind == "mem",
+                    ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                )
+            )
+            emp_stmt = emp_stmt.where(~emp_reclaim_subq.exists())
+
         emp_rows = db.execute(emp_stmt).all()
         for r_id, lead, mem_idx in emp_rows:
             emp_members.setdefault((str(r_id), int(lead)), []).append(int(mem_idx))
@@ -221,13 +256,15 @@ def _discover_candidates_bulk(
         if end_lead_time_hours is not None and lead_num > end_lead_time_hours:
             continue
 
-        key = (str(run_id), lead_num)
+        r_str = str(run_id)
+
+        key = (r_str, lead_num)
         rec = by_run_lead.setdefault(
             key,
             {
                 "cycle_time": _ensure_utc(cycle_time),
                 "lead_time_hours": lead_num,
-                "run_id": str(run_id),
+                "run_id": r_str,
                 "store_path": str(store_path),
                 "status": str(run_status),
                 "product_types": set(),
@@ -274,6 +311,7 @@ def _discover_candidates_bulk(
             product_types=frozenset(rec["product_types"]),
             variables=frozenset(rec["variables"]),
             member_indices=m_indices,
+            status=rec["status"],
         )
         candidates_by_valid.setdefault(v_time, []).append(cand)
 
@@ -428,7 +466,12 @@ def resolve_canonical_source(
             detail=f"No forecast data is available for model '{model}' at valid time '{v_utc.isoformat()}'.",
         )
 
-    winner = cands[0]
+    winner = select_canonical_anchor(cands)
+    if winner is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No forecast data is available for model '{model}' at valid time '{v_utc.isoformat()}'.",
+        )
     gen = _resolve_store_generation(winner.store_path)
 
     return ResolvedForecastSource(
@@ -480,82 +523,30 @@ def resolve_variable_source(
             detail=f"No forecast data is available for model '{model}' and variable '{variable}' at valid time '{v_utc.isoformat()}'.",
         )
 
-    # 2. Interval variables requiring lead-0 fallback
-    if requires_lead0_display_fallback(variable):
-        # Anchor is newest cycle
-        anchor = cands[0]
-        if anchor.lead_time_hours > 0:
-            # Positive lead: use anchor if variable present, or next candidate with variable
-            for cand in cands:
-                if not cand.variables or variable in cand.variables:
-                    gen = _resolve_store_generation(cand.store_path)
-                    return ResolvedForecastSource(
-                        model=model.lower().strip(),
-                        valid_time=v_utc,
-                        cycle_time=cand.cycle_time,
-                        lead_time_hours=cand.lead_time_hours,
-                        run_id=cand.run_id,
-                        store_path=cand.store_path,
-                        serving_generation=gen,
-                        member_indices=cand.member_indices,
-                    )
+    cand = select_variable_source(cands, variable)
+    if cand is None:
+        if requires_lead0_display_fallback(variable) or is_precipitation_companion(variable):
             return None
-        else:
-            # Anchor is lead 0: interval fallback required to newest older cycle with lead > 0
-            for cand in cands:
-                if cand.lead_time_hours > 0 and (not cand.variables or variable in cand.variables):
-                    gen = _resolve_store_generation(cand.store_path)
-                    return ResolvedForecastSource(
-                        model=model.lower().strip(),
-                        valid_time=v_utc,
-                        cycle_time=cand.cycle_time,
-                        lead_time_hours=cand.lead_time_hours,
-                        run_id=cand.run_id,
-                        store_path=cand.store_path,
-                        serving_generation=gen,
-                        member_indices=cand.member_indices,
-                    )
-            # Cold start: no positive-lead candidate exists -> return None gracefully
-            return None
-
-    # 3. Synthetic wind_10m: requires both wind_u_10m and wind_v_10m
-    if variable == "wind_10m":
-        for cand in cands:
-            if not cand.variables or {"wind_u_10m", "wind_v_10m"}.issubset(cand.variables):
-                gen = _resolve_store_generation(cand.store_path)
-                return ResolvedForecastSource(
-                    model=model.lower().strip(),
-                    valid_time=v_utc,
-                    cycle_time=cand.cycle_time,
-                    lead_time_hours=cand.lead_time_hours,
-                    run_id=cand.run_id,
-                    store_path=cand.store_path,
-                    serving_generation=gen,
-                    member_indices=cand.member_indices,
-                )
+        if variable == "wind_10m":
+            raise HTTPException(
+                status_code=404,
+                detail=f"No coherent wind components available for model '{model}' at valid time '{v_utc.isoformat()}'.",
+            )
         raise HTTPException(
             status_code=404,
-            detail=f"No coherent wind components available for model '{model}' at valid time '{v_utc.isoformat()}'.",
+            detail=f"Variable '{variable}' is not available for model '{model}' at valid time '{v_utc.isoformat()}'.",
         )
 
-    # 4. Ordinary stored variables (e.g. temperature_2m, precipitation_rate, cloud_ceiling)
-    for cand in cands:
-        if not cand.variables or variable in cand.variables:
-            gen = _resolve_store_generation(cand.store_path)
-            return ResolvedForecastSource(
-                model=model.lower().strip(),
-                valid_time=v_utc,
-                cycle_time=cand.cycle_time,
-                lead_time_hours=cand.lead_time_hours,
-                run_id=cand.run_id,
-                store_path=cand.store_path,
-                serving_generation=gen,
-                member_indices=cand.member_indices,
-            )
-
-    raise HTTPException(
-        status_code=404,
-        detail=f"Variable '{variable}' is not available for model '{model}' at valid time '{v_utc.isoformat()}'.",
+    gen = _resolve_store_generation(cand.store_path)
+    return ResolvedForecastSource(
+        model=model.lower().strip(),
+        valid_time=v_utc,
+        cycle_time=cand.cycle_time,
+        lead_time_hours=cand.lead_time_hours,
+        run_id=cand.run_id,
+        store_path=cand.store_path,
+        serving_generation=gen,
+        member_indices=cand.member_indices,
     )
 
 
@@ -606,6 +597,7 @@ def resolve_canonical_sources_bulk(
         - resolved_variables: (variable, valid_time) -> ResolvedForecastSource | None
     """
     now_utc = now if now is not None else get_current_time()
+    start_vt = serving_start_valid_time(now_utc)
     m_id = model.lower().strip()
     var_list = list(variables) if variables is not None else []
 
@@ -632,17 +624,18 @@ def resolve_canonical_sources_bulk(
             gen_cache[path] = _resolve_store_generation(path)
         return gen_cache[path]
 
+    canon_res = select_canonical_sources_bulk(
+        cands_map,
+        variables=var_list,
+        target_valid_times=allowed_vts,
+        start_valid_time=start_vt,
+    )
+
     resolved_anchors: dict[datetime, ResolvedForecastSource] = {}
     resolved_variables: dict[tuple[str, datetime], ResolvedForecastSource | None] = {}
 
-    for v_time, cands in sorted(cands_map.items()):
-        if allowed_vts is not None and v_time not in allowed_vts:
-            continue
-        if not cands:
-            continue
-
-        anchor_cand = cands[0]
-        anchor_src = ResolvedForecastSource(
+    for v_time, anchor_cand in canon_res.anchors.items():
+        resolved_anchors[v_time] = ResolvedForecastSource(
             model=m_id,
             valid_time=v_time,
             cycle_time=anchor_cand.cycle_time,
@@ -652,121 +645,67 @@ def resolve_canonical_sources_bulk(
             serving_generation=get_gen(anchor_cand.store_path),
             member_indices=anchor_cand.member_indices,
         )
-        resolved_anchors[v_time] = anchor_src
 
-        # Resolve requested variables for this valid_time
-        precip_src: ResolvedForecastSource | None = None
-        has_precip = "precipitation_amount_3h" in var_list or any(
-            is_precipitation_companion(v) for v in var_list
-        )
-
-        if has_precip:
-            if anchor_cand.lead_time_hours == 0:
-                for cand in cands:
-                    if cand.lead_time_hours > 0 and (
-                        not cand.variables or "precipitation_amount_3h" in cand.variables
-                    ):
-                        precip_src = ResolvedForecastSource(
-                            model=m_id,
-                            valid_time=v_time,
-                            cycle_time=cand.cycle_time,
-                            lead_time_hours=cand.lead_time_hours,
-                            run_id=cand.run_id,
-                            store_path=cand.store_path,
-                            serving_generation=get_gen(cand.store_path),
-                            member_indices=cand.member_indices,
-                        )
-                        break
-            else:
-                for cand in cands:
-                    if not cand.variables or "precipitation_amount_3h" in cand.variables:
-                        precip_src = ResolvedForecastSource(
-                            model=m_id,
-                            valid_time=v_time,
-                            cycle_time=cand.cycle_time,
-                            lead_time_hours=cand.lead_time_hours,
-                            run_id=cand.run_id,
-                            store_path=cand.store_path,
-                            serving_generation=get_gen(cand.store_path),
-                            member_indices=cand.member_indices,
-                        )
-                        break
-            resolved_variables[("precipitation_amount_3h", v_time)] = precip_src
-            for comp in ("crain", "csnow", "cfrzr", "cicep"):
-                if comp in var_list:
-                    resolved_variables[(comp, v_time)] = precip_src
-
-        for var in var_list:
-            if var == "precipitation_amount_3h" or is_precipitation_companion(var):
-                continue
-            if var == "cloud_cover_3h":
-                c_src: ResolvedForecastSource | None = None
-                if anchor_cand.lead_time_hours == 0:
-                    for cand in cands:
-                        if cand.lead_time_hours > 0 and (
-                            not cand.variables or "cloud_cover_3h" in cand.variables
-                        ):
-                            c_src = ResolvedForecastSource(
-                                model=m_id,
-                                valid_time=v_time,
-                                cycle_time=cand.cycle_time,
-                                lead_time_hours=cand.lead_time_hours,
-                                run_id=cand.run_id,
-                                store_path=cand.store_path,
-                                serving_generation=get_gen(cand.store_path),
-                                member_indices=cand.member_indices,
-                            )
-                            break
-                else:
-                    for cand in cands:
-                        if not cand.variables or "cloud_cover_3h" in cand.variables:
-                            c_src = ResolvedForecastSource(
-                                model=m_id,
-                                valid_time=v_time,
-                                cycle_time=cand.cycle_time,
-                                lead_time_hours=cand.lead_time_hours,
-                                run_id=cand.run_id,
-                                store_path=cand.store_path,
-                                serving_generation=get_gen(cand.store_path),
-                                member_indices=cand.member_indices,
-                            )
-                            break
-                resolved_variables[(var, v_time)] = c_src
-            elif var == "wind_10m":
-                w_src: ResolvedForecastSource | None = None
-                for cand in cands:
-                    if not cand.variables or {"wind_u_10m", "wind_v_10m"}.issubset(cand.variables):
-                        w_src = ResolvedForecastSource(
-                            model=m_id,
-                            valid_time=v_time,
-                            cycle_time=cand.cycle_time,
-                            lead_time_hours=cand.lead_time_hours,
-                            run_id=cand.run_id,
-                            store_path=cand.store_path,
-                            serving_generation=get_gen(cand.store_path),
-                            member_indices=cand.member_indices,
-                        )
-                        break
-                resolved_variables[(var, v_time)] = w_src
-            else:
-                # Ordinary variable: check commitment
-                o_src: ResolvedForecastSource | None = None
-                for cand in cands:
-                    if not cand.variables or var in cand.variables:
-                        o_src = ResolvedForecastSource(
-                            model=m_id,
-                            valid_time=v_time,
-                            cycle_time=cand.cycle_time,
-                            lead_time_hours=cand.lead_time_hours,
-                            run_id=cand.run_id,
-                            store_path=cand.store_path,
-                            serving_generation=get_gen(cand.store_path),
-                            member_indices=cand.member_indices,
-                        )
-                        break
-                resolved_variables[(var, v_time)] = o_src
+    for (var, v_time), v_cand in canon_res.variable_sources.items():
+        if v_cand is not None:
+            resolved_variables[(var, v_time)] = ResolvedForecastSource(
+                model=m_id,
+                valid_time=v_time,
+                cycle_time=v_cand.cycle_time,
+                lead_time_hours=v_cand.lead_time_hours,
+                run_id=v_cand.run_id,
+                store_path=v_cand.store_path,
+                serving_generation=get_gen(v_cand.store_path),
+                member_indices=v_cand.member_indices,
+            )
+        else:
+            resolved_variables[(var, v_time)] = None
 
     return resolved_anchors, resolved_variables
+
+
+def check_physical_targets_fenced(
+    db: Session,
+    targets: Iterable[tuple[str, str]],
+    resolved_at: datetime | None = None,
+) -> set[tuple[str, str]]:
+    """Return any (run_id, physical_key) targets that entered deleting or deleted.
+
+    If resolved_at is provided, filters for transitions on or after resolved_at.
+    """
+    target_list = list(targets)
+    if not target_list:
+        return set()
+
+    try:
+        bind = db.get_bind()
+        if bind.dialect.name == "sqlite":
+            from sqlalchemy import inspect
+
+            if not inspect(bind).has_table("reclamation_queue"):
+                return set()
+    except Exception:
+        return set()
+
+    run_ids = {r for r, _ in target_list}
+    stmt = select(
+        ReclamationQueue.run_id,
+        ReclamationQueue.physical_key,
+    ).where(
+        ReclamationQueue.run_id.in_(run_ids),
+        ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+    )
+    if resolved_at is not None:
+        r_utc = _ensure_utc(resolved_at)
+        stmt = stmt.where(ReclamationQueue.updated_at >= r_utc)
+
+    rows = db.execute(stmt).all()
+    target_set = set(target_list)
+    return {
+        (str(r_id), str(p_key))
+        for r_id, p_key in rows
+        if (str(r_id), str(p_key)) in target_set
+    }
 
 
 def build_canonical_provenance_digest(

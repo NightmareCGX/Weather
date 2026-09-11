@@ -633,6 +633,64 @@ def _build_parser() -> argparse.ArgumentParser:
         default="weather-data",
         help="S3/MinIO bucket name holding forecast cycle stores (default 'weather-data').",
     )
+
+    reclamation = subparsers.add_parser(
+        "reclamation",
+        help="granular physical reclamation engine (Lifecycle V3 Phase 4)",
+        description="Plan, execute, or requeue granular physical shard reclamation.",
+    )
+    rec_sub = reclamation.add_subparsers(dest="rec_action", required=True)
+
+    rec_plan = rec_sub.add_parser("plan", help="Plan granular reclamation candidates")
+    rec_plan.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="Plan without queue writes (default True)",
+    )
+    rec_plan.add_argument(
+        "--write",
+        action="store_true",
+        help="Write planned targets to reclamation_queue",
+    )
+    rec_plan.add_argument(
+        "--models",
+        default="gfs,gefs",
+        help="Comma-separated model identifiers (default 'gfs,gefs')",
+    )
+
+    rec_work = rec_sub.add_parser("work", help="Execute granular reclamation worker pass")
+    rec_work.add_argument(
+        "--delete",
+        action="store_true",
+        default=False,
+        help="Authorize physical S3 deletion (default False)",
+    )
+    rec_work.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="Max shard targets per batch (default 100)",
+    )
+    rec_work.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=60.0,
+        help="Lease duration in seconds (default 60.0)",
+    )
+
+    rec_requeue = rec_sub.add_parser("requeue", help="Requeue failed quarantined reclamation targets")
+    rec_requeue.add_argument(
+        "--model-id",
+        default=None,
+        help="Optional model identifier to filter requeue",
+    )
+    rec_requeue.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional run ID to filter requeue",
+    )
+
     return parser
 
 
@@ -918,6 +976,57 @@ def _run_gc(args: argparse.Namespace) -> int:
         leadership.release()
 
 
+def _run_reclamation(args: argparse.Namespace) -> int:
+    """Execute granular reclamation CLI action (plan, work, or requeue)."""
+    from ingestion.core.db import SessionLocal
+    from ingestion.gc.planner import plan_reclamation_pass
+    from ingestion.gc.worker import (
+        requeue_failed_reclamation_targets,
+        run_reclamation_worker_pass,
+    )
+
+    action = getattr(args, "rec_action", None)
+    with SessionLocal() as session:
+        if action == "plan":
+            dry_run = not bool(getattr(args, "write", False))
+            models = [m.strip().lower() for m in str(args.models).split(",") if m.strip()]
+            res = plan_reclamation_pass(session, models=models, dry_run=dry_run)
+            print(
+                f"Reclamation Plan: dry_run={res.dry_run}, "
+                f"total_committed={res.total_committed_shards}, "
+                f"active_held={res.active_held_shards}, "
+                f"reclaimable={res.reclaimable_shards}, "
+                f"enqueued={res.enqueued_count}"
+            )
+            return 0
+        if action == "work":
+            del_en = bool(getattr(args, "delete", False))
+            b_size = int(getattr(args, "batch_size", 100))
+            l_secs = float(getattr(args, "lease_seconds", 60.0))
+            w_res = run_reclamation_worker_pass(
+                session,
+                batch_size=b_size,
+                lease_seconds=l_secs,
+                delete_enabled=del_en,
+            )
+            print(
+                f"Reclamation Worker: claimed={w_res.claimed_count}, "
+                f"deleted={w_res.deleted_count}, "
+                f"revalidated={w_res.revalidated_held_count}, "
+                f"failed={w_res.failed_count}, "
+                f"markers_cleaned={w_res.markers_cleaned_count}"
+            )
+            return 0
+        if action == "requeue":
+            m_id = getattr(args, "model_id", None)
+            r_id = getattr(args, "run_id", None)
+            count = requeue_failed_reclamation_targets(session, model_id=m_id, run_id=r_id)
+            print(f"Requeued {count} failed reclamation targets.")
+            return 0
+    print(f"Unknown reclamation action: {action}")
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return the process exit code."""
     args = _build_parser().parse_args(argv)
@@ -927,6 +1036,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_realtime(args)
     if args.command == "gc":
         return _run_gc(args)
+    if args.command == "reclamation":
+        return _run_reclamation(args)
     return 2
 
 
