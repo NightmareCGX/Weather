@@ -90,6 +90,7 @@ class HarnessWorld:
     """Configurable test harness for realtime scheduler interactions."""
 
     def __init__(self) -> None:
+        self.clock_time: float = 1000.0
         self.snapshots: dict[str, tuple[CycleSnapshot, CycleSnapshot]] = {}
         self.discover_queue: list = []
         self.committed_queue: list = []
@@ -173,7 +174,7 @@ def _make_scheduler(
         read_committed=world.read_committed,
         dispatch_wave=world.dispatch_wave,
         leadership=leadership,
-        clock=lambda: 1000.0,
+        clock=lambda: world.clock_time,
         sleep=_sleep,
         stop_event=stop_event,
         cycle_override=cycle_override,
@@ -281,23 +282,37 @@ def test_scenario_c_gefs_succeeds_gfs_fails_retries_only_gfs() -> None:
     )
     world.dispatch_failures.clear()
 
-    # Poll 2: Next reconciliation retries ONLY GFS
+    # Poll 2 (while still inside active failure backoff):
+    # Verify wave targets planned for GFS but active dispatch yields during backoff
     outcome2 = scheduler.poll_once()
     assert outcome2.plan is not None
     assert outcome2.plan.wave_targets_gfs == (0,)
     assert outcome2.plan.wave_targets_gefs == ()
-    assert [d.model for d in outcome2.dispatches] == ["gfs"]
-    assert outcome2.dispatches[0].ok
+    assert outcome2.dispatches == []
 
-    # Poll 3: Both durably committed -> no further dispatch
+    # Advance deterministic scheduler clock beyond active retry deadline
+    world.clock_time += (
+        scheduler.settings.REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS + 1.0
+    )
+
+    # Poll 3 (after backoff expires): Next reconciliation retries ONLY GFS
+    outcome3 = scheduler.poll_once()
+    assert outcome3.plan is not None
+    assert outcome3.plan.wave_targets_gfs == (0,)
+    assert outcome3.plan.wave_targets_gefs == ()
+    assert [d.model for d in outcome3.dispatches] == ["gfs"]
+    assert outcome3.dispatches[0].targets == (0,)
+    assert outcome3.dispatches[0].ok
+
+    # Poll 4: Both durably committed -> no further dispatch
     world.committed_state = (
         ModelCommittedState(leads=frozenset({0})),
         ModelCommittedState(
             leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)
         ),
     )
-    outcome3 = scheduler.poll_once()
-    assert outcome3.dispatches == []
+    outcome4 = scheduler.poll_once()
+    assert outcome4.dispatches == []
 
 
 # ===========================================================================
