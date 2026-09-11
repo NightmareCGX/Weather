@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from domain.coverage import register_expected_members
 from alembic import command
 from api.core.database import get_db
+from api.core.time import get_current_time
 from api.main import app
 from api.models.entities import (
     City,
@@ -47,6 +48,13 @@ from tests.fixtures import (
     write_ensemble_zarr,
     write_forecast_zarr,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_test_simulated_time(monkeypatch):
+    if "WEATHER_SIMULATED_NOW" not in os.environ:
+        monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-07-21T00:00:00Z")
+    yield
 
 
 @pytest.fixture(scope="session")
@@ -507,6 +515,8 @@ def client(migrated_db, seed_data):
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_time] = lambda: datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_current_time, None)

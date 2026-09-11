@@ -226,6 +226,20 @@ class ForecastAvailabilityData(BaseModel):
     """
 
     models: list[ModelAvailability]
+    serving_start_valid_time: datetime | None = None
+    generated_at: datetime | None = None
+
+    @field_serializer("serving_start_valid_time")
+    def _serialize_serving_start_valid_time(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return format_datetime_utc(value)
+
+    @field_serializer("generated_at")
+    def _serialize_generated_at(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return format_datetime_utc(value)
 
 
 class ForecastAvailabilityEnvelope(BaseModel):

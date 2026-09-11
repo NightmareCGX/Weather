@@ -14,13 +14,15 @@ import { getForecastAvailability, RequestAbortedError } from "@/lib/api/client";
 import type { ForecastAvailability } from "@/lib/api/types";
 import {
   buildForecastOptions,
+  calculateNextBoundaryDelayMs,
+  computeServingStartValidTime,
   defaultModel,
   defaultValidTime,
   defaultVariable,
   extractVariableValidTimes,
   findModel,
   findVariable,
-  isWithinGraceWindow,
+  isServableValidTime,
   type ForecastOptions,
   type ForecastSelection,
 } from "@/lib/forecast/availability";
@@ -65,13 +67,42 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
   const [selection, setSelection] = useState<ForecastSelection | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
-  // 60-second periodic timer to advance nowMs for the 3h UI grace window
+  // 60-second periodic timer to refresh availability and advance nowMs (heartbeat resilience)
   useEffect(() => {
     const timer = setInterval(() => {
       setNowMs(Date.now());
+      getForecastAvailability()
+        .then((next) => {
+          setAvailability(next);
+        })
+        .catch(() => {
+          // Swallow background refresh errors so active UI is not disrupted
+        });
     }, 60_000);
     return () => clearInterval(timer);
   }, []);
+
+  // Proactive cadence boundary synchronization timer:
+  // Revalidates backend availability exactly at the server-authoritative 3-hour transition
+  // without waiting for the next arbitrary 60-second polling tick.
+  useEffect(() => {
+    if (!availability) return;
+
+    const delayMs = calculateNextBoundaryDelayMs(availability);
+    if (delayMs === null) return;
+
+    const boundaryTimer = setTimeout(() => {
+      getForecastAvailability()
+        .then((next) => {
+          setAvailability(next);
+        })
+        .catch(() => {
+          // Keep current availability on network error; fallback heartbeat will retry
+        });
+    }, delayMs);
+
+    return () => clearTimeout(boundaryTimer);
+  }, [availability]);
 
   const load = useCallback((signal?: AbortSignal) => {
     setStatus("loading");
@@ -111,14 +142,16 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
         const variable = defaultVariable(model);
         const variableEntry = findVariable(model, variable);
         const validTimes = extractVariableValidTimes(variableEntry);
-        // Preserve currently selected validTime if still available and within grace window
+        const servingStart =
+          availability?.serving_start_valid_time ?? computeServingStartValidTime(nowMs);
+        // Preserve currently selected validTime if still available and within serving window
         const nextVt =
           current !== null &&
           current.validTime !== undefined &&
           validTimes.includes(current.validTime) &&
-          isWithinGraceWindow(current.validTime, nowMs)
+          isServableValidTime(current.validTime, servingStart, nowMs)
             ? current.validTime
-            : defaultValidTime(validTimes, nowMs);
+            : defaultValidTime(validTimes, servingStart, nowMs);
 
         if (variable === null || nextVt === null) {
           return current !== null && current.model === modelId ? current : null;
@@ -135,14 +168,16 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
         const model = current !== null ? findModel(availability, current.model) : null;
         const variableEntry = findVariable(model, variableId);
         const validTimes = extractVariableValidTimes(variableEntry);
-        // Preserve currently selected validTime if available in new variable
+        const servingStart =
+          availability?.serving_start_valid_time ?? computeServingStartValidTime(nowMs);
+        // Preserve currently selected validTime if available in new variable and within serving window
         const nextVt =
           current !== null &&
           current.validTime !== undefined &&
           validTimes.includes(current.validTime) &&
-          isWithinGraceWindow(current.validTime, nowMs)
+          isServableValidTime(current.validTime, servingStart, nowMs)
             ? current.validTime
-            : defaultValidTime(validTimes, nowMs);
+            : defaultValidTime(validTimes, servingStart, nowMs);
 
         if (current === null || variableEntry === null || nextVt === null) {
           return current;
@@ -192,15 +227,17 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
       const variableCode = current !== null ? current.variable : null;
       const variable = model !== null ? findVariable(model, variableCode) : null;
       const allValidTimes = extractVariableValidTimes(variable);
+      const servingStart =
+        availability?.serving_start_valid_time ?? computeServingStartValidTime(nowMs);
 
-      // If the current selection is still fully valid and within grace window, keep it
+      // If the current selection is still fully valid and within serving window, keep it
       if (
         model !== null &&
         variable !== null &&
         current !== null &&
         current.validTime !== undefined &&
         allValidTimes.includes(current.validTime) &&
-        isWithinGraceWindow(current.validTime, nowMs)
+        isServableValidTime(current.validTime, servingStart, nowMs)
       ) {
         return current;
       }
@@ -209,7 +246,7 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
       const nextVariable = defaultVariable(nextModel);
       const nextVariableEntry = findVariable(nextModel, nextVariable);
       const nextValidTimes = extractVariableValidTimes(nextVariableEntry);
-      const nextVt = defaultValidTime(nextValidTimes, nowMs);
+      const nextVt = defaultValidTime(nextValidTimes, servingStart, nowMs);
 
       if (nextModel === null || nextVariable === null || nextVt === null) {
         return null;

@@ -39,6 +39,12 @@ from sqlalchemy.orm import Session
 from api.core.config import settings as api_settings
 from api.core.manifest_reader import manifest_storage_format
 from api.main import create_app
+
+
+@pytest.fixture(autouse=True)
+def _set_simulated_time(monkeypatch):
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-07-10T00:00:00Z")
+    yield
 from ingestion.core.catalog import (
     ModelRunRecord,
     ModelVersionRecord,

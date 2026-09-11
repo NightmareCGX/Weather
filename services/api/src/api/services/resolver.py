@@ -42,10 +42,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from domain.coverage import get_expected_members, is_lead_servable
-from domain.temporal import requires_lead0_display_fallback
+from domain.temporal import requires_lead0_display_fallback, serving_start_valid_time
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+from api.core.time import get_current_time
 
 from api.models.entities import (
     EnsembleMemberProduct,
@@ -101,13 +103,20 @@ def resolve_valid_time_candidates(
     start_lead_time_hours: int | None = None,
     end_lead_time_hours: int | None = None,
     require_members: bool = False,
+    now: datetime | None = None,
 ) -> dict[datetime, list[tuple[datetime, int, str, str]]]:
     """Discover all servable (cycle_time, lead_time_hours, run_id, store_path) candidates per valid_time.
+
+    Under Data Lifecycle V3 Phase 1, only candidates with valid_time >= serving_start_valid_time
+    are discovered.
 
     Returns:
         Mapping of valid_time -> list of (cycle_time, lead, run_id, store_path) tuples,
         sorted by ascending lead (newest cycle first).
     """
+    now_utc = now if now is not None else None
+    start_vt = serving_start_valid_time(now_utc) if now_utc is not None else None
+
     m_id = model.lower().strip()
     expected_members = get_expected_members(m_id, default_if_unknown=1)
     is_ensemble = expected_members > 1
@@ -167,6 +176,8 @@ def resolve_valid_time_candidates(
         v_time = c_utc + timedelta(hours=lead_num)
         if target_valid_time is not None and v_time != _ensure_utc(target_valid_time):
             continue
+        if start_vt is not None and v_time < start_vt:
+            continue
 
         # Check ensemble coverage: required for member-based paths (require_members=True)
         # or when the product is not an official precomputed ensemble mean (prod_type != "ensemble_mean").
@@ -217,6 +228,8 @@ def resolve_valid_time_candidates(
             v_time = c_utc + timedelta(hours=lead_num)
             if target_valid_time is not None and v_time != _ensure_utc(target_valid_time):
                 continue
+            if start_vt is not None and v_time < start_vt:
+                continue
             if is_ensemble and not require_members:
                 from api.core.zarr import get_sharded_reader
 
@@ -246,8 +259,14 @@ def resolve_valid_time_source(
     *,
     variable: str | None = None,
     require_members: bool = False,
+    now: datetime | None = None,
 ) -> ResolvedForecastSource:
     """Resolve the single newest committed source cycle and lead for a valid_time.
+
+    Under Data Lifecycle V3 Phase 1:
+    - Requests with valid_time strictly before serving_start_valid_time(now_utc)
+      are rejected with HTTP 404.
+    - Requests with valid_time == serving_start_valid_time remain valid and servable.
 
     Args:
         db: Database session.
@@ -257,17 +276,30 @@ def resolve_valid_time_source(
         require_members: When True (e.g. ensemble statistics), requires at least
             85% member coverage for ensemble models. When False (e.g. maps or mean
             products), requires only the published forecast product.
+        now: Optional reference current datetime for serving window evaluation.
+            Defaults to ``get_current_time()``.
 
     Returns:
         ResolvedForecastSource with complete provenance.
 
     Raises:
-        HTTPException: 404 if no eligible source cycle can serve the valid_time.
+        HTTPException: 404 if the valid_time is expired or no eligible source
+            cycle can serve it.
     """
     from api.services.point_forecast import resolve_serving_generation_for_store
 
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
     m_id = model.lower().strip()
+    now_utc = now if now is not None else get_current_time()
+    start_vt = serving_start_valid_time(now_utc)
+
+    if v_utc < start_vt:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Valid time '{v_utc.isoformat()}' is before the active serving window ({start_vt.isoformat()})."
+            ),
+        )
 
     candidates = resolve_valid_time_candidates(
         db,
@@ -275,6 +307,7 @@ def resolve_valid_time_source(
         target_valid_time=v_utc,
         variable=variable,
         require_members=require_members,
+        now=now_utc,
     )
 
     pairs = candidates.get(v_utc)

@@ -314,6 +314,7 @@ def resolve_tile_read_context(
     valid_time: str | None = None,
     initial_time: str | None = None,
     excluded: set[str] | None = None,
+    now: datetime | None = None,
 ) -> TileReadContext:
     """Resolve all catalog, lifecycle, and store metadata in a short-lived DB scope.
 
@@ -335,7 +336,7 @@ def resolve_tile_read_context(
                 status_code=422,
                 detail="Provide either valid_time or initial_time, not both.",
             )
-        source = resolve_valid_time_source(db, model, valid_time, variable=variable)
+        source = resolve_valid_time_source(db, model, valid_time, variable=variable, now=now)
         store_path = source.store_path
         resolved_lead = source.lead_time_hours
         resolved_initial = source.cycle_time.isoformat().replace("+00:00", "Z")
@@ -407,6 +408,7 @@ def render_tile_png(
     lead_time_hours: int | None = None,
     valid_time: str | None = None,
     initial_time: str | None = None,
+    now: datetime | None = None,
 ) -> bytes:
     """Render one PNG tile for a forecast variable and selection.
 
@@ -430,6 +432,7 @@ def render_tile_png(
                 valid_time=valid_time,
                 initial_time=initial_time,
                 excluded=excluded,
+                now=now,
             )
         finally:
             # Release this session's DB connection immediately upon context resolution.

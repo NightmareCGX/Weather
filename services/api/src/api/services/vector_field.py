@@ -14,6 +14,7 @@ For GEFS:
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -221,6 +222,7 @@ def render_vector_field_binary(
     valid_time: str | None = None,
     initial_time: str | None = None,
     stride: int = 2,
+    now: datetime | None = None,
 ) -> bytes:
     """Render the quantized Int16 binary vector field for the given forecast selection.
 
@@ -241,7 +243,7 @@ def render_vector_field_binary(
                 status_code=422,
                 detail="Provide either valid_time or initial_time, not both.",
             )
-        source = resolve_valid_time_source(db, model, valid_time, variable="wind_10m")
+        source = resolve_valid_time_source(db, model, valid_time, variable="wind_10m", now=now)
         store_path = source.store_path
         resolved_lead = source.lead_time_hours
         resolved_initial = source.cycle_time.isoformat().replace("+00:00", "Z")

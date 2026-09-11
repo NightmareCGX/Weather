@@ -278,6 +278,7 @@ def build_point_cache_key(
     start_lead_time_hours: int | None,
     end_lead_time_hours: int | None,
     cross_cycle: bool = False,
+    serving_start: str | None = None,
 ) -> str:
     """Build a deterministic cache key for a point forecast request.
 
@@ -314,6 +315,7 @@ def build_point_cache_key(
         "start_lead_time_hours": start_lead_time_hours,
         "end_lead_time_hours": end_lead_time_hours,
         "cross_cycle": cross_cycle,
+        "serving_start": serving_start,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "point:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

@@ -47,6 +47,12 @@ from api.models.entities import (
 )
 from api.services.point_forecast import _select_min_lead_winners
 
+
+@pytest.fixture(autouse=True)
+def _set_simulated_time(monkeypatch):
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-07-20T00:00:00Z")
+    yield
+
 LAT = 38.125
 LON = -106.875
 

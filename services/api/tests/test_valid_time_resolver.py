@@ -28,6 +28,12 @@ def _dt(year: int, month: int, day: int, hour: int) -> datetime:
     return datetime(year, month, day, hour, 0, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _set_simulated_time(monkeypatch):
+    monkeypatch.setenv("WEATHER_SIMULATED_NOW", "2026-09-01T00:00:00Z")
+    yield
+
+
 @pytest.fixture
 def resolver_test_db(tmp_path):
     """Create an isolated test database with schema and seed metadata for resolver testing."""

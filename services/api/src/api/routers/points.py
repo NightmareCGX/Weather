@@ -23,14 +23,17 @@ Specification gaps (not implemented in Milestone 9):
   resolve in a future contract update.
 """
 
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
-from api.schemas import PointForecastEnvelope
+from api.core.time import get_current_time
+from api.schemas import PointForecastEnvelope, format_datetime_utc
 from api.services.cache import PointCache, build_point_cache_key
+from domain.temporal import serving_start_valid_time
 from api.services.point_forecast import (
     ResolvedLocation,
     build_point_forecast,
@@ -44,6 +47,8 @@ router = APIRouter()
 
 #: Database session dependency (module-level to satisfy ruff B008).
 DB = Depends(get_db)
+#: Current UTC time dependency for serving window left boundary.
+CURRENT_TIME = Depends(get_current_time)
 
 #: Cache policy for point forecasts: cross-cycle minimum-lead series mutates
 #: upon new cycle or lead ingestion, so revalidation (no-cache) ensures the
@@ -71,6 +76,7 @@ def get_point_forecast(
     start_lead_time_hours: Annotated[int | None, Query(ge=0)] = None,
     end_lead_time_hours: Annotated[int | None, Query(ge=0)] = None,
     db: Session = DB,
+    now: datetime = CURRENT_TIME,
 ) -> PointForecastEnvelope:
     """Return hourly forecasts for a resolved geographic location.
 
@@ -97,6 +103,7 @@ def get_point_forecast(
     serving_generation = resolve_serving_generation_for_store(
         store_path, latest_retired_iso
     )
+    serving_start_str = format_datetime_utc(serving_start_valid_time(now))
     cache_key = build_point_cache_key(
         model=model_ids[0],
         latitude=location.latitude,
@@ -114,12 +121,14 @@ def get_point_forecast(
         start_lead_time_hours=start_lead_time_hours,
         end_lead_time_hours=end_lead_time_hours,
         cross_cycle=True,
+        serving_start=serving_start_str,
     )
     query_params = (
         f"lat={lat}&lon={lon}&city_id={city_id}&resort_id={resort_id}"
         f"&models={models}&variables={variables}&units={units}"
         f"&start_lead_time_hours={start_lead_time_hours}"
         f"&end_lead_time_hours={end_lead_time_hours}"
+        f"&serving_start={serving_start_str}"
     )
 
     envelope = _cache.compute_or_retrieve(
@@ -133,6 +142,7 @@ def get_point_forecast(
             units,
             start_lead_time_hours,
             end_lead_time_hours,
+            now=now,
         ),
     )
     response.headers["Cache-Control"] = CACHE_CONTROL_POINT
@@ -178,6 +188,7 @@ def _compute(
     units: str,
     start_lead_time_hours: int | None,
     end_lead_time_hours: int | None,
+    now: datetime | None = None,
 ) -> PointForecastEnvelope:
     from api.core.database import SessionLocal
 
@@ -190,5 +201,6 @@ def _compute(
             units=units,
             start_lead_time_hours=start_lead_time_hours,
             end_lead_time_hours=end_lead_time_hours,
+            now=now,
         )
     return PointForecastEnvelope(data=data)
