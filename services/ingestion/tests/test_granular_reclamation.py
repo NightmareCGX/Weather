@@ -1104,12 +1104,15 @@ def test_acceptance_reconciliation_intentional_v3_vs_accidental_corruption(catal
     """Intentional reclamation preserves catalog rows; accidental data loss without tombstone is pruned."""
     c0 = _dt(2026, 9, 2, 0)
     r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
-    _seed_gfs_products(catalog_engine, r0, [6, 12], ["temperature_2m"], tmp_path / "c0")
+    _seed_gfs_products(catalog_engine, r0, [6, 12, 18, 24], ["temperature_2m"], tmp_path / "c0")
 
     now = _dt(2026, 9, 2, 12)
     with Session(catalog_engine) as session:
-        # Lead 6 was intentionally reclaimed (has tombstone in reclamation_queue)
-        session.add(
+        # Case A: Lead 6 has status='deleted'
+        # Case B: Lead 12 has status='deleting'
+        # Case C: Lead 18 has status='failed' (ambiguous delete outcome)
+        # Case D: Lead 24 has NO row in reclamation_queue
+        session.add_all([
             ReclamationQueueRecord(
                 id="intentional_tombstone_l6",
                 run_id=r0,
@@ -1125,27 +1128,71 @@ def test_acceptance_reconciliation_intentional_v3_vs_accidental_corruption(catal
                 status=RECLAMATION_STATUS_DELETED,
                 created_at=now,
                 updated_at=now,
-            )
-        )
+            ),
+            ReclamationQueueRecord(
+                id="intentional_tombstone_l12",
+                run_id=r0,
+                model_id="gfs",
+                cycle_time=c0,
+                lead_time_hours=12,
+                variable_code="temperature_2m",
+                target_kind=TARGET_KIND_DET,
+                member_index=0,
+                valid_time=c0 + timedelta(hours=12),
+                store_path=str(tmp_path / "c0"),
+                physical_key=make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 12),
+                status=RECLAMATION_STATUS_DELETING,
+                created_at=now,
+                updated_at=now,
+            ),
+            ReclamationQueueRecord(
+                id="intentional_tombstone_l18",
+                run_id=r0,
+                model_id="gfs",
+                cycle_time=c0,
+                lead_time_hours=18,
+                variable_code="temperature_2m",
+                target_kind=TARGET_KIND_DET,
+                member_index=0,
+                valid_time=c0 + timedelta(hours=18),
+                store_path=str(tmp_path / "c0"),
+                physical_key=make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 18),
+                status=RECLAMATION_STATUS_FAILED,
+                created_at=now,
+                updated_at=now,
+            ),
+        ])
         session.commit()
 
-        # Suppose store is read by reconciliation and finds neither lead 6 nor lead 12 in physical storage
+        # Suppose store is read by reconciliation and finds none of the leads in physical storage
         # (committed_state is empty)
         run_record = session.get(ModelRunRecord, r0)
         c_state = CommittedState.deterministic(leads=set(), variables=set())
         _reconcile_catalog_to_store(session, run_record, c_state)
 
-        # Invariant 1: Lead 6 was intentionally reclaimed -> catalog row is PRESERVED!
+        # Case A: status='deleted' -> catalog row is PRESERVED!
         p6 = session.execute(
             select(ProductRecord).where(ProductRecord.run_id == r0, ProductRecord.lead_time_hours == 6)
         ).scalar_one_or_none()
         assert p6 is not None
 
-        # Invariant 2: Lead 12 had NO reclamation tombstone -> treated as accidental corruption and PRUNED!
+        # Case B: status='deleting' -> catalog row is PRESERVED!
         p12 = session.execute(
             select(ProductRecord).where(ProductRecord.run_id == r0, ProductRecord.lead_time_hours == 12)
         ).scalar_one_or_none()
-        assert p12 is None
+        assert p12 is not None
+
+        # Case C: status='failed' -> catalog row is PRESERVED!
+        p18 = session.execute(
+            select(ProductRecord).where(ProductRecord.run_id == r0, ProductRecord.lead_time_hours == 18)
+        ).scalar_one_or_none()
+        assert p18 is not None
+
+        # Case D: Lead 24 had NO reclamation row -> treated as accidental corruption and PRUNED!
+        p24 = session.execute(
+            select(ProductRecord).where(ProductRecord.run_id == r0, ProductRecord.lead_time_hours == 24)
+        ).scalar_one_or_none()
+        assert p24 is None
 
 
 # ===========================================================================

@@ -639,7 +639,7 @@ def _reconcile_catalog_to_store(
             ReclamationQueueRecord.member_index,
         ).where(
             ReclamationQueueRecord.run_id == run.id,
-            ReclamationQueueRecord.status.in_(["deleting", "deleted"]),
+            ReclamationQueueRecord.status.in_(["deleting", "deleted", "failed"]),
         )
     ).all()
     reclaimed_pairs = {

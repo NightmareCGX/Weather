@@ -247,7 +247,13 @@ def run_reclamation_worker_pass(
                 ReclamationQueueRecord.target_kind,
                 ReclamationQueueRecord.member_index,
             ).where(
-                ReclamationQueueRecord.status.in_([RECLAMATION_STATUS_DELETING, RECLAMATION_STATUS_DELETED]),
+                ReclamationQueueRecord.status.in_(
+                    [
+                        RECLAMATION_STATUS_DELETING,
+                        RECLAMATION_STATUS_DELETED,
+                        RECLAMATION_STATUS_FAILED,
+                    ]
+                ),
                 ReclamationQueueRecord.id.not_in(claimed_ids),
             )
             other_fenced = {

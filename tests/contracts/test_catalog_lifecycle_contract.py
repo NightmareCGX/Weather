@@ -26,6 +26,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationQueue,
 )
 from api.services.availability import build_forecast_availability
 from api.services.lifecycle import filter_visible_runs
@@ -55,6 +56,7 @@ def db_session() -> Session:
         ForecastGrid.__table__,
         ForecastProduct.__table__,
         ForecastCycleLifecycle.__table__,
+        ReclamationQueue.__table__,
     ]
     Base.metadata.create_all(engine, tables=contract_tables)
     session_factory = sessionmaker(bind=engine)
