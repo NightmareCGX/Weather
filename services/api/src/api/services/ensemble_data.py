@@ -224,17 +224,28 @@ def build_probability_forecast(
     direction_sector: str | None = None,
     phase: str | None = None,
     initial_time: str | None = None,
+    source: Any | None = None,
 ) -> ProbabilityForecastData:
     """Build an exceedance probability forecast for a resolved point."""
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
     expected_members = get_expected_members(model, default_if_unknown=30)
-    run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
-        db, model, lead_time_hours, initial_time=initial_time
-    )
+    if source is not None:
+        avail_members = (
+            source.member_indices
+            if source.member_indices is not None
+            else tuple(range(1, expected_members + 1))
+        )
+        store_path_str = str(source.store_path)
+        lead_time_hours = source.lead_time_hours
+        metadata = gated_cycle_metadata(store_path_str)
+    else:
+        run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
+            db, model, lead_time_hours, initial_time=initial_time
+        )
+        assert run.zarr_store_path is not None
+        store_path_str = str(run.zarr_store_path)
     _resolve_variables(db, metadata, [variable])
-    assert run.zarr_store_path is not None
-    store_path_str = str(run.zarr_store_path)
     # Release ORM DB connection before storage reads.
     db.close()
 
@@ -366,17 +377,28 @@ def build_ensemble_statistics(
     lead_time_hours: int,
     include_members: bool = False,
     initial_time: str | None = None,
+    source: Any | None = None,
 ) -> EnsembleStatisticsData:
     """Build ensemble statistics for a resolved point."""
     _validate_coordinates(latitude, longitude)
     _require_ensemble_model(db, model)
     expected_members = get_expected_members(model, default_if_unknown=30)
-    run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
-        db, model, lead_time_hours, initial_time=initial_time
-    )
+    if source is not None:
+        avail_members = (
+            source.member_indices
+            if source.member_indices is not None
+            else tuple(range(1, expected_members + 1))
+        )
+        store_path_str = str(source.store_path)
+        lead_time_hours = source.lead_time_hours
+        metadata = gated_cycle_metadata(store_path_str)
+    else:
+        run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
+            db, model, lead_time_hours, initial_time=initial_time
+        )
+        assert run.zarr_store_path is not None
+        store_path_str = str(run.zarr_store_path)
     _resolve_variables(db, metadata, [variable])
-    assert run.zarr_store_path is not None
-    store_path_str = str(run.zarr_store_path)
     # Release ORM DB connection before storage reads.
     db.close()
 

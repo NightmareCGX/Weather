@@ -149,7 +149,7 @@ def test_postgres_serving_retirement_lifecycle_transition(
     )
     assert res_map.status_code == 200
 
-    # 2. Mark c1 as RETIRED in PostgreSQL
+    # 2. Mark c1 as RETIRED and fenced in PostgreSQL
     with Session(migrated_db) as session:
         session.add(
             ForecastCycleLifecycle(
@@ -157,6 +157,7 @@ def test_postgres_serving_retirement_lifecycle_transition(
                 cycle_time=c1,
                 retired_at=_dt(2026, 9, 2, 6, 30),
                 retired_by_cycle_time=c2,
+                deleted_at=_dt(2026, 9, 2, 6, 30),
             )
         )
         session.commit()

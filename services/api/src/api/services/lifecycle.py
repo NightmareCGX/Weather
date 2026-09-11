@@ -135,6 +135,95 @@ def filter_visible_runs(stmt: TSelect, model_id: str | None = None) -> TSelect:
     return stmt.where(~retired_subq.exists())
 
 
+def filter_fenced_runs(stmt: TSelect, model_id: str | None = None) -> TSelect:
+    """Apply the physical safety fence filter to a SQLAlchemy query selecting ModelRun.
+
+    Excludes all model_runs whose (model_id, cycle_time) has a durable lifecycle row with
+    deletion_started_at IS NOT NULL or deleted_at IS NOT NULL.
+    Specifically ignores retired_at (Lifecycle V3 per-valid-time canonical ownership).
+
+    Args:
+        stmt: The SQLAlchemy select statement to decorate.
+        model_id: Optional model_id filter. When omitted, correlates with ModelRun's
+            model_version_id -> models.model_id.
+
+    Returns:
+        The decorated statement with the physical deletion fence applied.
+    """
+    if model_id is not None:
+        fenced_subq = (
+            select(1)
+            .select_from(ForecastCycleLifecycle)
+            .where(
+                ForecastCycleLifecycle.model_id == model_id.lower().strip(),
+                ForecastCycleLifecycle.cycle_time == ModelRun.cycle_time,
+                or_(
+                    ForecastCycleLifecycle.deletion_started_at.isnot(None),
+                    ForecastCycleLifecycle.deleted_at.isnot(None),
+                ),
+            )
+            .correlate(ModelRun)
+        )
+    else:
+        fenced_subq = (
+            select(1)
+            .select_from(ForecastCycleLifecycle)
+            .join(
+                ModelVersion,
+                ModelVersion.model_id == ForecastCycleLifecycle.model_id,
+            )
+            .where(
+                ModelVersion.id == ModelRun.model_version_id,
+                ForecastCycleLifecycle.cycle_time == ModelRun.cycle_time,
+                or_(
+                    ForecastCycleLifecycle.deletion_started_at.isnot(None),
+                    ForecastCycleLifecycle.deleted_at.isnot(None),
+                ),
+            )
+            .correlate(ModelRun)
+        )
+    return stmt.where(~fenced_subq.exists())
+
+
+def is_cycle_fenced(
+    db: Session,
+    cycle_time: datetime | str,
+    model_id: str | None = None,
+) -> bool:
+    """Return True if cycle_time has a physical deletion fence (deletion_started_at or deleted_at).
+
+    Args:
+        db: Database session.
+        cycle_time: Cycle datetime or ISO 8601 string.
+        model_id: Optional model identifier ('gfs', 'gefs').
+
+    Returns:
+        True if the cycle has an active deletion fence or is deleted, False otherwise.
+    """
+    dt_utc = parse_cycle_time(cycle_time)
+    dt_naive = dt_utc.replace(tzinfo=None)
+    time_pred = or_(
+        ForecastCycleLifecycle.cycle_time == dt_utc,
+        ForecastCycleLifecycle.cycle_time == dt_naive,
+    )
+    query = select(
+        ForecastCycleLifecycle.deletion_started_at,
+        ForecastCycleLifecycle.deleted_at,
+    ).where(time_pred)
+
+    if model_id is not None:
+        query = query.where(ForecastCycleLifecycle.model_id == model_id.lower().strip())
+
+    rows = db.execute(query).all()
+    if not rows:
+        return False
+
+    return any(
+        deletion_started_at is not None or deleted_at is not None
+        for deletion_started_at, deleted_at in rows
+    )
+
+
 def is_cycle_visible(
     db: Session,
     cycle_time: datetime | str,

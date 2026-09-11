@@ -344,8 +344,8 @@ def test_resolver_gefs_member_coverage_threshold(resolver_test_db):
         register_expected_members("gefs", old_expected)
 
 
-def test_resolver_excludes_retired_and_deleted_cycles(resolver_test_db):
-    """Verify that cycles marked retired or deleted in forecast_cycle_lifecycle are excluded."""
+def test_resolver_retired_at_does_not_exclude_canonical_representation(resolver_test_db):
+    """Verify V3 architectural decoupling: legacy retired_at does not exclude an otherwise valid representation."""
     c_retired = _dt(2026, 9, 1, 0)
     target_v = _dt(2026, 9, 1, 6)
 
@@ -374,7 +374,44 @@ def test_resolver_excludes_retired_and_deleted_cycles(resolver_test_db):
         session.add_all([r, p, lc])
         session.commit()
 
-        # Attempting to resolve target_v must raise 404 because c_retired is retired
+        # In V3, retired_at is legacy V2 whole-cycle logical state and does NOT exclude the representation
+        source = resolve_valid_time_source(session, "gfs", target_v, variable="temperature_2m")
+        assert source.valid_time == target_v
+        assert source.cycle_time == c_retired
+        assert source.lead_time_hours == 6
+
+
+def test_resolver_physical_deletion_fences_exclude_source(resolver_test_db):
+    """Verify that physical safety fences (deletion_started_at or deleted_at) strictly exclude the source."""
+    c_fenced = _dt(2026, 9, 1, 0)
+    target_v = _dt(2026, 9, 1, 6)
+
+    with Session(resolver_test_db) as session:
+        r = ModelRun(
+            id="run_gfs_fenced",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_fenced,
+            status="ready",
+            zarr_store_path="/stores/gfs/fenced",
+            created_at=c_fenced,
+        )
+        p = ForecastProduct(
+            id="prod_gfs_fenced_06",
+            run_id="run_gfs_fenced",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=6,
+        )
+        lc = ForecastCycleLifecycle(
+            model_id="gfs",
+            cycle_time=c_fenced,
+            deletion_started_at=_dt(2026, 9, 1, 12),
+        )
+        session.add_all([r, p, lc])
+        session.commit()
+
+        # deletion_started_at is an authoritative physical safety fence -> raises 404
         with pytest.raises(HTTPException) as exc:
             resolve_valid_time_source(session, "gfs", target_v, variable="temperature_2m")
         assert exc.value.status_code == 404

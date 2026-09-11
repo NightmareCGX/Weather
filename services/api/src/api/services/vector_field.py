@@ -49,6 +49,7 @@ def _vector_cache_key(
     serving_generation: str | None,
     stride: int,
     valid_time: str | None = None,
+    member_fingerprint: str | None = None,
 ) -> tuple[object, ...]:
     """Build the vector field cache key with full forecast and generation identity."""
     return (
@@ -59,6 +60,7 @@ def _vector_cache_key(
         serving_generation,
         stride,
         valid_time,
+        member_fingerprint,
         "v1_i16",
     )
 
@@ -283,6 +285,7 @@ def render_vector_field_binary(
             store_path, latest_retired_iso
         )
 
+    member_fingerprint = source.member_fingerprint if valid_time is not None else None
     cache_key = _vector_cache_key(
         model,
         "wind_10m",
@@ -291,6 +294,7 @@ def render_vector_field_binary(
         serving_generation,
         stride,
         valid_time=resolved_valid_iso,
+        member_fingerprint=member_fingerprint,
     )
     cached = _vector_cache_get(cache_key)
     if cached is not None:

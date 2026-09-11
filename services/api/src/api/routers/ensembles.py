@@ -8,7 +8,7 @@ calls the ensemble-data and cache services, and serializes the documented
 """
 
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
@@ -118,6 +118,8 @@ def get_ensemble_statistics(
     serving_generation: str | None = None
     resolved_lead: int = 0
 
+    source = None
+    member_fingerprint = None
     if valid_time is not None:
         source = resolve_valid_time_source(
             db, model, valid_time, variable=variable, require_members=True, now=now
@@ -129,6 +131,7 @@ def get_ensemble_statistics(
         target_initial = cycle_time
         resolved_valid_time = source.valid_time
         resolved_source_cycle = source.cycle_time
+        member_fingerprint = source.member_fingerprint
         db.close()
     else:
         resolved_lead = lead_time_hours if lead_time_hours is not None else 0
@@ -165,6 +168,7 @@ def get_ensemble_statistics(
         cycle_time=cycle_time,
         serving_generation=serving_generation,
         valid_time=valid_time,
+        member_fingerprint=member_fingerprint,
     )
     query_params = (
         f"lat={lat}&lon={lon}&variable={variable}&model={model}"
@@ -186,6 +190,7 @@ def get_ensemble_statistics(
             target_initial,
             resolved_valid_time,
             resolved_source_cycle,
+            source=source,
         ),
         model_type=EnsembleStatisticsEnvelope,
     )
@@ -203,6 +208,7 @@ def _compute(
     initial_time: str | None,
     valid_time_dt: datetime | None = None,
     source_cycle_dt: datetime | None = None,
+    source: Any | None = None,
 ) -> EnsembleStatisticsEnvelope:
     from api.core.database import SessionLocal
 
@@ -216,6 +222,7 @@ def _compute(
             lead_time_hours=lead_time_hours,
             include_members=include_members,
             initial_time=initial_time,
+            source=source,
         )
         if valid_time_dt is not None:
             data.valid_time = valid_time_dt
