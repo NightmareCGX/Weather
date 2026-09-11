@@ -35,52 +35,57 @@ def _obs(key: str) -> ArtifactObservation:
     return ArtifactObservation(key=key, size=1, etag=None, last_modified=None)
 
 
-def gfs_snapshot(complete: tuple[int, ...]) -> CycleSnapshot:
+def gfs_snapshot(complete: tuple[int, ...], cycle: CycleIdentity = CYCLE) -> CycleSnapshot:
     regions = {
         (None, lead): RegionArtifacts(data=_obs(f"g{lead}"), idx=_obs(f"g{lead}i"))
         for lead in complete
     }
     return CycleSnapshot(
-        model="gfs", cycle_date=CYCLE.cycle_date, cycle_hour=CYCLE.cycle_hour,
+        model="gfs", cycle_date=cycle.cycle_date, cycle_hour=cycle.cycle_hour,
         prefix="p", regions=regions,
     )
 
 
-def gefs_snapshot(complete: tuple[int, ...]) -> CycleSnapshot:
+def gefs_snapshot(complete: tuple[int, ...], cycle: CycleIdentity = CYCLE) -> CycleSnapshot:
     regions = {
         (member, lead): RegionArtifacts(data=_obs(f"m{member}l{lead}"), idx=_obs(f"m{member}l{lead}i"))
         for lead in complete
         for member in MEMBERS
     }
     return CycleSnapshot(
-        model="gefs", cycle_date=CYCLE.cycle_date, cycle_hour=CYCLE.cycle_hour,
+        model="gefs", cycle_date=cycle.cycle_date, cycle_hour=cycle.cycle_hour,
         prefix="p", regions=regions,
     )
 
 
 def _settings(**overrides) -> IngestionSettings:
-    return IngestionSettings(
-        REALTIME_ACTIVE_POLL_SECONDS=600.0,
-        REALTIME_PUBLICATION_POLL_SECONDS=120.0,
-        REALTIME_IDLE_BACKOFF_INITIAL_SECONDS=1800.0,
-        REALTIME_IDLE_BACKOFF_MAX_SECONDS=3600.0,
-        REALTIME_POLL_JITTER_FRACTION=0.10,
-        REALTIME_WAVE_MAX_LEADS=1,
-        REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0,
-        **overrides,
-    )
+    defaults: dict[str, object] = {
+        "REALTIME_ACTIVE_POLL_SECONDS": 600.0,
+        "REALTIME_PUBLICATION_POLL_SECONDS": 120.0,
+        "REALTIME_IDLE_BACKOFF_INITIAL_SECONDS": 1800.0,
+        "REALTIME_IDLE_BACKOFF_MAX_SECONDS": 3600.0,
+        "REALTIME_POLL_JITTER_FRACTION": 0.10,
+        "REALTIME_WAVE_MAX_LEADS": 1,
+        "REALTIME_WAVE_MAX_WAIT_SECONDS": 1200.0,
+    }
+    defaults.update(overrides)
+    return IngestionSettings(**defaults)
 
 
 class FakeWorld:
     """Configurable fakes for discovery, committed state, and dispatch."""
 
     def __init__(self) -> None:
+        self.clock_time: float = 1000.0
         self.snapshots: dict[str, tuple[CycleSnapshot, CycleSnapshot]] = {}
         self.discover_responses: list = []  # explicit queue if set
         self.committed_state: tuple[ModelCommittedState, ModelCommittedState] = (
             ModelCommittedState(),
             ModelCommittedState(),
         )
+        self.committed_states: dict[str, tuple[ModelCommittedState, ModelCommittedState]] = {}
+        self.candidates: list[CycleIdentity] = []
+        self.complete_cycles: set[str] = set()
         self.dispatch_failures: set[str] = set()
         self.dispatch_block_on_cancel = False
         self.dispatch_started = threading.Event()
@@ -97,7 +102,15 @@ class FakeWorld:
         return self.snapshots.get(cycle.label, (gfs_snapshot(()), gefs_snapshot(())))
 
     def read_committed(self, cycle: CycleIdentity):
+        if cycle.label in self.committed_states:
+            return self.committed_states[cycle.label]
         return self.committed_state
+
+    def discover_candidates(self, active_cycle, now_utc):
+        return [c for c in self.candidates if active_cycle is None or c != active_cycle]
+
+    def is_complete(self, cycle: CycleIdentity):
+        return cycle.label in self.complete_cycles
 
     def dispatch_wave(
         self, model: str, targets: tuple[int, ...], cycle: CycleIdentity, cancel_event: threading.Event
@@ -132,8 +145,10 @@ def _scheduler(
         discover=world.discover,
         read_committed=world.read_committed,
         dispatch_wave=world.dispatch_wave,
+        discover_candidates=world.discover_candidates,
+        is_complete=world.is_complete,
         leadership=leadership,
-        clock=lambda: 1000.0,
+        clock=lambda: world.clock_time,
         sleep=_sleep,
         stop_event=stop_event,
         cycle_override=cycle_override,
@@ -197,6 +212,8 @@ def test_gfs_success_gefs_failure_retries_only_gefs() -> None:
         ModelCommittedState(leads=frozenset({0})),
         ModelCommittedState(),
     )
+    # Advance clock past active failure backoff
+    world.clock_time += 60.0
     outcome2 = scheduler.poll_once()
     # Next reconciliation retries ONLY the missing GEFS work.
     assert [d.model for d in outcome2.dispatches] == ["gefs"]
@@ -493,3 +510,699 @@ def test_run_once_returns_after_single_iteration() -> None:
     assert scheduler.run(once=True) == 0
     assert len(world.discover_calls) == 1
     assert len(world.dispatch_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Data Lifecycle V3 Phase 2 — Backlog recovery & bounded dispatch tests
+# ---------------------------------------------------------------------------
+
+CYCLE_00 = CycleIdentity(cycle_date=date(2026, 7, 21), cycle_hour=0)
+CYCLE_06 = CycleIdentity(cycle_date=date(2026, 7, 21), cycle_hour=6)
+CYCLE_12 = CycleIdentity(cycle_date=date(2026, 7, 21), cycle_hour=12)
+CYCLE_18 = CycleIdentity(cycle_date=date(2026, 7, 21), cycle_hour=18)
+
+
+def test_original_abandonment_regression_cycle_resumes_from_committed_frontier() -> None:
+    """Cycle N (06Z) was interrupted at L21.
+
+    When N+1 (12Z) appears and is active, N remains a recoverable candidate.
+    While 12Z waits on upstream publication, 06Z dispatches L24.. and resumes
+    progress towards L240 without restarting from L0.
+    """
+    world = FakeWorld()
+    # 15:30 UTC -> 12Z is newest eligible cycle
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active cycle 12Z has only published lead 0 (shared wave not due under max_leads=4)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # Incomplete historical candidate 06Z has leads 0..21 committed
+    committed_06_leads = frozenset(range(0, 24, 3))  # 0, 3, 6, 9, 12, 15, 18, 21
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=committed_06_leads),
+        ModelCommittedState(
+            leads=committed_06_leads,
+            pairs=frozenset((m, lead) for lead in committed_06_leads for m in MEMBERS),
+        ),
+    )
+    # 06Z has all leads 0..48 published upstream
+    leads_06_upstream = tuple(range(0, 51, 3))
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot(leads_06_upstream, CYCLE_06),
+        gefs_snapshot(leads_06_upstream, CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    outcome = scheduler.poll_once()
+
+    # Priority 2: 12Z is waiting, so 06Z backlog wave is dispatched!
+    assert outcome.kind == "planned"
+    assert outcome.cycle == CYCLE_06
+    assert [d.model for d in outcome.dispatches] == ["gfs", "gefs"]
+    # Verify targets start at L24 (resuming from committed L21), NOT restarting at L0!
+    assert outcome.dispatches[0].targets == (24, 27, 30, 33)
+    assert outcome.dispatches[1].targets == (24, 27, 30, 33)
+    assert {d[2] for d in world.dispatch_calls} == {CYCLE_06.label}
+
+
+def test_multiple_historical_incomplete_candidates_bounded_dispatch() -> None:
+    """Catalog contains multiple partial cycles (06Z, 00Z).
+
+    Runtime dispatch remains bounded: active 12Z + at most one selected backlog (06Z).
+    00Z remains in persistent candidate state and rotates in once 06Z completes.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # 12Z active has only L0 (no wave due)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # 06Z has L0 committed; L3 ready upstream
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0, 3), CYCLE_06),
+        gefs_snapshot((0, 3), CYCLE_06),
+    )
+
+    # 00Z has L0 committed; L3 ready upstream
+    world.committed_states[CYCLE_00.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_00.label] = (
+        gfs_snapshot((0, 3), CYCLE_00),
+        gefs_snapshot((0, 3), CYCLE_00),
+    )
+
+    world.candidates = [CYCLE_06, CYCLE_00]
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    # First poll: 06Z (newest incomplete) is selected as backlog
+    outcome = scheduler.poll_once()
+    assert outcome.cycle == CYCLE_06
+    assert [d.model for d in outcome.dispatches] == ["gfs", "gefs"]
+    assert outcome.dispatches[0].targets == (3,)
+
+    # Mark 06Z complete
+    world.complete_cycles.add(CYCLE_06.label)
+
+    # Second poll: 00Z rotates in as selected backlog cycle!
+    outcome2 = scheduler.poll_once()
+    assert outcome2.cycle == CYCLE_00
+    assert outcome2.dispatches[0].targets == (3,)
+
+
+def test_backlog_rotation_on_upstream_block() -> None:
+    """Preferred backlog candidate 06Z is blocked upstream (missing lead 3).
+
+    Scheduler puts 06Z in temporary backoff and rotates to 00Z, which has ready work.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active 12Z has no wave due
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # 06Z is committed at L0, but upstream only has L0 (missing L3)
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0,), CYCLE_06),
+        gefs_snapshot((0,), CYCLE_06),
+    )
+
+    # 00Z is committed at L0, and upstream has L0, L3
+    world.committed_states[CYCLE_00.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_00.label] = (
+        gfs_snapshot((0, 3), CYCLE_00),
+        gefs_snapshot((0, 3), CYCLE_00),
+    )
+
+    world.candidates = [CYCLE_06, CYCLE_00]
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    outcome = scheduler.poll_once()
+    # Rotates past blocked 06Z and dispatches 00Z!
+    assert outcome.cycle == CYCLE_00
+    assert outcome.dispatches[0].targets == (3,)
+    # 06Z is in temporary backoff
+    assert CYCLE_06.label in scheduler._backlog_blocked_until
+
+
+def test_active_strict_priority_over_backlog() -> None:
+    """Both active cycle (12Z) and backlog candidate (06Z) have ready waves due.
+
+    Active cycle strictly takes Priority 1; backlog does not dispatch this iteration.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active 12Z has wave ready (max_leads=1)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # Backlog 06Z also has wave ready
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((3,), CYCLE_06),
+        gefs_snapshot((3,), CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    scheduler = _scheduler(world, cycle_override=None)
+    outcome = scheduler.poll_once()
+
+    # Priority 1: Active 12Z wins
+    assert outcome.cycle == CYCLE_12
+    assert outcome.dispatches[0].targets == (0,)
+
+
+def test_active_idle_backlog_catchup() -> None:
+    """Active cycle 12Z is waiting on upstream publication.
+
+    Backlog candidate 06Z dispatches immediately without artificial delay.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active 12Z has nothing published yet (empty snapshots -> waiting)
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot(()), gefs_snapshot(()))
+
+    # Backlog 06Z has leads 0, 3 ready
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0, 3), CYCLE_06),
+        gefs_snapshot((0, 3), CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    scheduler = _scheduler(world, cycle_override=None)
+    outcome = scheduler.poll_once()
+
+    assert outcome.cycle == CYCLE_06
+    assert outcome.dispatches[0].targets == (0,)
+
+
+def test_backlog_failure_isolation() -> None:
+    """Backlog wave dispatch raises an exception.
+
+    Active cycle remains healthy and unaffected; backlog enters backoff.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active 12Z has no wave due (1 lead < 4)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # Backlog 06Z has lead 0 committed, lead 3 ready, but simulated failure is injected
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0, 3), CYCLE_06),
+        gefs_snapshot((0, 3), CYCLE_06),
+    )
+    world.dispatch_failures.add("gfs")
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+    outcome = scheduler.poll_once()
+
+    assert outcome.cycle == CYCLE_06
+    assert not outcome.dispatches[0].ok
+    # Backlog failure recorded and backoff active
+    assert scheduler._backlog_failures[CYCLE_06.label] == 1
+    assert scheduler._backlog_blocked_until[CYCLE_06.label] > world.clock_time
+
+    # Next poll: active cycle 12Z publishes full batch of 4 leads and is ready to dispatch
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0, 3, 6, 9), CYCLE_12),
+        gefs_snapshot((0, 3, 6, 9), CYCLE_12),
+    )
+    world.dispatch_failures.clear()
+    outcome2 = scheduler.poll_once()
+
+    # Active cycle dispatches normally
+    assert outcome2.cycle == CYCLE_12
+    assert outcome2.dispatches[0].ok
+
+
+def test_backlog_capped_retry_never_permanently_abandoned() -> None:
+    """Repeated failures on backlog candidate clamp at max_backoff without dropping candidate."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (gfs_snapshot((0, 3), CYCLE_06), gefs_snapshot((0, 3), CYCLE_06))
+    world.dispatch_failures.add("gfs")
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(
+        REALTIME_WAVE_MAX_LEADS=4,
+        REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0,
+        REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS=10.0,
+        REALTIME_BACKLOG_MAX_BACKOFF_SECONDS=50.0,
+    )
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    # Trigger 6 consecutive failures
+    for i in range(1, 7):
+        outcome = scheduler.poll_once()
+        assert outcome.cycle == CYCLE_06
+        assert scheduler._backlog_failures[CYCLE_06.label] == i
+        # Advance clock to after the backoff
+        world.clock_time = scheduler._backlog_blocked_until[CYCLE_06.label] + 1.0
+
+    # Backoff is clamped at max_backoff (50s), not exponentially unbounded
+    backoff_duration = scheduler._backlog_blocked_until[CYCLE_06.label] - (world.clock_time - 1.0)
+    assert backoff_duration <= 50.0
+    # Candidate remains in candidate pool (never permanently dropped)
+    assert CYCLE_06 in world.candidates
+
+
+def test_active_failure_fairness_allows_backlog_progress() -> None:
+    """Active cycle wave dispatch fails and enters failure backoff.
+
+    While active is in backoff, backlog candidate progresses instead of being starved.
+    When active backoff elapses, active regains Priority 1.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active 12Z has wave ready (4 leads for max_leads=4)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0, 3, 6, 9), CYCLE_12),
+        gefs_snapshot((0, 3, 6, 9), CYCLE_12),
+    )
+
+    # Backlog 06Z has wave ready (lead 3)
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0, 3), CYCLE_06),
+        gefs_snapshot((0, 3), CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(
+        REALTIME_WAVE_MAX_LEADS=4,
+        REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0,
+        REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS=60.0,
+        REALTIME_ACTIVE_MAX_BACKOFF_SECONDS=300.0,
+    )
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    # Iteration 1: Active 12Z dispatches and fails
+    world.dispatch_failures.add("gfs")
+    outcome1 = scheduler.poll_once()
+    assert outcome1.cycle == CYCLE_12
+    assert not outcome1.dispatches[0].ok
+    assert scheduler._active_failures == 1
+    assert scheduler._active_blocked_until == world.clock_time + 60.0
+
+    # Iteration 2: 10s later (still in active backoff)
+    world.clock_time += 10.0
+    world.dispatch_failures.clear()  # Backlog can succeed
+    outcome2 = scheduler.poll_once()
+
+    # Active yields; Backlog 06Z dispatches!
+    assert outcome2.cycle == CYCLE_06
+    assert outcome2.dispatches[0].ok
+    assert outcome2.dispatches[0].targets == (3,)
+
+    # Iteration 3: 60s later (active backoff expired)
+    world.clock_time += 60.0
+    outcome3 = scheduler.poll_once()
+
+    # Active 12Z regains Priority 1!
+    assert outcome3.cycle == CYCLE_12
+    assert outcome3.dispatches[0].ok
+    assert outcome3.dispatches[0].targets == (0, 3, 6, 9)
+
+
+def test_restart_reconstruction_from_catalog() -> None:
+    """Fresh scheduler startup reconstructs active + historical candidate state from catalog."""
+    world = FakeWorld()
+    # 21:30 UTC -> 18Z is newest eligible cycle
+    world.clock_time = datetime(2026, 7, 21, 21, 30, tzinfo=timezone.utc).timestamp()
+
+    # 18Z active has only L0 (no wave due with max_leads=2)
+    world.snapshots[CYCLE_18.label] = (
+        gfs_snapshot((0,), CYCLE_18),
+        gefs_snapshot((0,), CYCLE_18),
+    )
+
+    # Catalog state before restart:
+    # 12Z committed to L21
+    leads_12 = frozenset(range(0, 24, 3))
+    world.committed_states[CYCLE_12.label] = (
+        ModelCommittedState(leads=leads_12),
+        ModelCommittedState(leads=leads_12, pairs=frozenset((m, lead) for lead in leads_12 for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot(tuple(range(0, 51, 3)), CYCLE_12),
+        gefs_snapshot(tuple(range(0, 51, 3)), CYCLE_12),
+    )
+
+    # 06Z committed to L48
+    leads_06 = frozenset(range(0, 51, 3))
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=leads_06),
+        ModelCommittedState(leads=leads_06, pairs=frozenset((m, lead) for lead in leads_06 for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot(tuple(range(0, 80, 3)), CYCLE_06),
+        gefs_snapshot(tuple(range(0, 80, 3)), CYCLE_06),
+    )
+
+    world.candidates = [CYCLE_12, CYCLE_06]
+
+    # Fresh scheduler instance with no prior memory
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=2, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    outcome = scheduler.poll_once()
+
+    # Reconstructs active 18Z, selects 12Z (newest backlog), dispatches L24..L27
+    assert outcome.cycle == CYCLE_12
+    assert outcome.dispatches[0].targets == (24, 27)
+
+
+def test_predecessor_safe_backlog_recovery() -> None:
+    """Predecessor check passes for 6h-reset lead L24 because L21 is durably committed."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
+
+    # 06Z has L0..L21 committed
+    leads_21 = frozenset(range(0, 24, 3))
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=leads_21),
+        ModelCommittedState(leads=leads_21, pairs=frozenset((m, lead) for lead in leads_21 for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0, 3, 6, 9, 12, 15, 18, 21, 24), CYCLE_06),
+        gefs_snapshot((0, 3, 6, 9, 12, 15, 18, 21, 24), CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    outcome = scheduler.poll_once()
+    assert outcome.cycle == CYCLE_06
+    # Lead 24 (6h reset lead requiring predecessor L21) is safely planned and dispatched!
+    assert outcome.dispatches[0].targets == (24,)
+
+
+def test_active_cycle_transition_resets_active_failure_backoff() -> None:
+    """Transitioning to a new active cycle clears active failure backoff immediately."""
+    world = FakeWorld()
+    # Start at 09:30 UTC -> 06Z active
+    world.clock_time = datetime(2026, 7, 21, 9, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_06.label] = (gfs_snapshot((0,), CYCLE_06), gefs_snapshot((0,), CYCLE_06))
+    world.dispatch_failures.add("gfs")
+
+    scheduler = _scheduler(world, cycle_override=None)
+    scheduler.poll_once()
+    assert scheduler._active_failures == 1
+    assert scheduler._active_blocked_until > world.clock_time
+
+    # Advance time to 15:30 UTC -> 12Z becomes active!
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
+    world.dispatch_failures.clear()
+
+    outcome = scheduler.poll_once()
+    # 12Z is adopted, active failures reset to 0, wave dispatches immediately
+    assert outcome.cycle == CYCLE_12
+    assert scheduler._active_failures == 0
+    assert scheduler._active_blocked_until == 0.0
+    assert outcome.dispatches[0].ok
+
+
+def test_no_unnecessary_duplicate_ingestion_of_committed_leads() -> None:
+    """Leads already committed are deducted from wave targets."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
+
+    # 06Z has leads 0, 3 committed
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=frozenset({0, 3})),
+        ModelCommittedState(leads=frozenset({0, 3}), pairs=frozenset((m, lead) for lead in (0, 3) for m in MEMBERS)),
+    )
+    # Upstream has 0, 3, 6, 9
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0, 3, 6, 9), CYCLE_06),
+        gefs_snapshot((0, 3, 6, 9), CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    outcome = scheduler.poll_once()
+    assert outcome.cycle == CYCLE_06
+    # Only missing leads 6, 9 are targeted; 0, 3 are not re-ingested
+    assert outcome.dispatches[0].targets == (6, 9)
+    assert outcome.dispatches[1].targets == (6, 9)
+
+
+def test_backlog_snapshot_reprobe_after_blocked_backoff_expires() -> None:
+    """When a backlog candidate was blocked upstream on L24, backoff expiration triggers
+
+    a fresh discovery/snapshot rather than indefinitely reusing the stale cached snapshot.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
+
+    # 06Z committed through L21
+    leads_21 = frozenset(range(0, 24, 3))
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=leads_21),
+        ModelCommittedState(leads=leads_21, pairs=frozenset((m, lead) for lead in leads_21 for m in MEMBERS)),
+    )
+    # Initial upstream snapshot does NOT contain complete L24 (only up to L21)
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot(tuple(range(0, 24, 3)), CYCLE_06),
+        gefs_snapshot(tuple(range(0, 24, 3)), CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(
+        REALTIME_WAVE_MAX_LEADS=4,
+        REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0,
+        REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS=300.0,
+    )
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    # Poll 1: 06Z is blocked upstream on L24 -> enters backoff (300s)
+    outcome1 = scheduler.poll_once()
+    assert outcome1.cycle == CYCLE_12  # Active cycle outcome (no wave dispatched)
+    assert outcome1.dispatches == []
+    assert CYCLE_06.label in scheduler._backlog_blocked_until
+
+    # Later upstream publishes complete L24
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot(tuple(range(0, 27, 3)), CYCLE_06),
+        gefs_snapshot(tuple(range(0, 27, 3)), CYCLE_06),
+    )
+
+    # Advance clock past backoff
+    world.clock_time += 301.0
+
+    # Poll 2: Fresh discovery probes upstream, observes L24, predecessor L21 holds -> dispatches L24!
+    outcome2 = scheduler.poll_once()
+    assert outcome2.cycle == CYCLE_06
+    assert [d.model for d in outcome2.dispatches] == ["gfs", "gefs"]
+    assert outcome2.dispatches[0].targets == (24,)
+    assert outcome2.dispatches[1].targets == (24,)
+
+
+def test_gefs_success_gfs_failure_retries_only_gfs() -> None:
+    """When GEFS succeeds and GFS fails, the retry dispatches ONLY the missing GFS work."""
+    world = FakeWorld()
+    world.snapshots[CYCLE.label] = (gfs_snapshot((0,)), gefs_snapshot((0,)))
+    world.dispatch_failures.add("gfs")
+    scheduler = _scheduler(world)
+    outcome = scheduler.poll_once()
+
+    assert [d.model for d in outcome.dispatches] == ["gfs", "gefs"]
+    assert not outcome.dispatches[0].ok  # GFS failed
+    assert outcome.dispatches[1].ok      # GEFS succeeded
+
+    # GEFS committed (simulated durable catalog result); GFS not committed
+    world.committed_state = (
+        ModelCommittedState(),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.clock_time += 60.0
+    world.dispatch_failures.clear()
+
+    outcome2 = scheduler.poll_once()
+    # Next reconciliation retries ONLY missing GFS work
+    assert [d.model for d in outcome2.dispatches] == ["gfs"]
+    assert outcome2.dispatches[0].targets == (0,)
+
+
+def test_process_restart_with_instance_discard_reconstructs_correctly() -> None:
+    """Simulate discarding scheduler instance A and launching fresh scheduler instance B."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 21, 30, tzinfo=timezone.utc).timestamp()
+
+    world.snapshots[CYCLE_18.label] = (gfs_snapshot((0,), CYCLE_18), gefs_snapshot((0,), CYCLE_18))
+
+    leads_12 = frozenset(range(0, 24, 3))
+    world.committed_states[CYCLE_12.label] = (
+        ModelCommittedState(leads=leads_12),
+        ModelCommittedState(leads=leads_12, pairs=frozenset((m, lead) for lead in leads_12 for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot(tuple(range(0, 51, 3)), CYCLE_12),
+        gefs_snapshot(tuple(range(0, 51, 3)), CYCLE_12),
+    )
+
+    leads_06 = frozenset(range(0, 51, 3))
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=leads_06),
+        ModelCommittedState(leads=leads_06, pairs=frozenset((m, lead) for lead in leads_06 for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot(tuple(range(0, 80, 3)), CYCLE_06),
+        gefs_snapshot(tuple(range(0, 80, 3)), CYCLE_06),
+    )
+
+    world.candidates = [CYCLE_12, CYCLE_06]
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=2, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+
+    # Instance A runs
+    scheduler_a = _scheduler(world, settings=settings, cycle_override=None)
+    outcome_a = scheduler_a.poll_once()
+    assert outcome_a.cycle == CYCLE_12
+
+    # Discard Instance A completely
+    del scheduler_a
+
+    # Instance B starts with completely fresh in-memory state
+    scheduler_b = _scheduler(world, settings=settings, cycle_override=None)
+    assert scheduler_b._active_cycle is None
+    assert scheduler_b._selected_backlog_cycle is None
+    assert scheduler_b._cached_candidates is None
+
+    outcome_b = scheduler_b.poll_once()
+    # Reconstructs active 18Z, selects 12Z backlog from catalog, targets L24..L27
+    assert outcome_b.cycle == CYCLE_12
+    assert outcome_b.dispatches[0].targets == (24, 27)
+
+
+def test_healthy_path_performance_isolation() -> None:
+    """During healthy active dispatch, zero backlog discovery, planning, or DB scans occur."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active 12Z has 4 leads ready (full wave due under max_leads=4)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0, 3, 6, 9), CYCLE_12),
+        gefs_snapshot((0, 3, 6, 9), CYCLE_12),
+    )
+
+    # Backlog candidates exist in catalog
+    world.candidates = [CYCLE_06, CYCLE_00]
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot((0, 3), CYCLE_06),
+        gefs_snapshot((0, 3), CYCLE_06),
+    )
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    outcome = scheduler.poll_once()
+
+    # 1. Active wave is dispatched
+    assert outcome.cycle == CYCLE_12
+    assert len(outcome.dispatches) == 2
+    # 2. Backlog discovery was NEVER called: only active 12Z was probed!
+    assert world.discover_calls == [CYCLE_12.label]
+    # 3. Only 1 wave (active wave) dispatched in total
+    assert len(world.dispatch_calls) == 2
+    assert {d[2] for d in world.dispatch_calls} == {CYCLE_12.label}
+
+
+def test_no_loss_of_existing_historical_horizon_state() -> None:
+    """Cycle N has durable committed leads through L180.
+
+    When N+1 begins publishing and becomes active, N's committed state is untouched,
+    no L0..L180 leads are re-ingested, and catch-up resumes strictly after L180.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+
+    # Active 12Z waiting (only L0)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # 06Z committed all leads through L180!
+    committed_180_leads = frozenset(range(0, 183, 3))
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=committed_180_leads),
+        ModelCommittedState(
+            leads=committed_180_leads,
+            pairs=frozenset((m, lead) for lead in committed_180_leads for m in MEMBERS),
+        ),
+    )
+    # Upstream has all leads through L192
+    upstream_leads = tuple(range(0, 195, 3))
+    world.snapshots[CYCLE_06.label] = (
+        gfs_snapshot(upstream_leads, CYCLE_06),
+        gefs_snapshot(upstream_leads, CYCLE_06),
+    )
+    world.candidates = [CYCLE_06]
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    outcome = scheduler.poll_once()
+
+    assert outcome.cycle == CYCLE_06
+    # Targets resume strictly at L183 (committed frontier L180 + 3), no duplicate L0..L180!
+    assert outcome.dispatches[0].targets == (183, 186, 189, 192)
+    assert outcome.dispatches[1].targets == (183, 186, 189, 192)
+
+

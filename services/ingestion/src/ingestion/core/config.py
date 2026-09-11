@@ -184,6 +184,17 @@ class IngestionSettings(BaseSettings):
     #: begins roughly 3-3.5h after cycle time, probed in Phase 5A).
     REALTIME_FIRST_PUBLICATION_DELAY_SECONDS: float = 10800.0
 
+    #: Master switch for backlog recovery in realtime scheduler (Lifecycle V3 Phase 2).
+    REALTIME_BACKLOG_ENABLED: bool = True
+    #: Base retry backoff (seconds) for failing/blocked backlog candidates.
+    REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS: float = 300.0
+    #: Maximum capped backoff (seconds) for failing backlog candidates.
+    REALTIME_BACKLOG_MAX_BACKOFF_SECONDS: float = 3600.0
+    #: Base retry backoff (seconds) for active wave failures (anti-starvation).
+    REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS: float = 60.0
+    #: Maximum retry backoff (seconds) for active wave failures.
+    REALTIME_ACTIVE_MAX_BACKOFF_SECONDS: float = 300.0
+
     @model_validator(mode="after")
     def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
         pool_size = int(self.DB_POOL_SIZE)
@@ -206,6 +217,10 @@ class IngestionSettings(BaseSettings):
         first_publication_delay = float(
             self.REALTIME_FIRST_PUBLICATION_DELAY_SECONDS
         )
+        backlog_retry = float(self.REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS)
+        backlog_max = float(self.REALTIME_BACKLOG_MAX_BACKOFF_SECONDS)
+        active_retry = float(self.REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS)
+        active_max = float(self.REALTIME_ACTIVE_MAX_BACKOFF_SECONDS)
 
         if pool_size < 1:
             raise ValueError(f"DB_POOL_SIZE must be >= 1, got {pool_size}")
@@ -281,6 +296,24 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"REALTIME_FIRST_PUBLICATION_DELAY_SECONDS must be >= 0.0, got "
                 f"{first_publication_delay}"
+            )
+        if backlog_retry <= 0.0:
+            raise ValueError(
+                f"REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS must be > 0.0, got {backlog_retry}"
+            )
+        if backlog_max < backlog_retry:
+            raise ValueError(
+                f"REALTIME_BACKLOG_MAX_BACKOFF_SECONDS ({backlog_max}) must be >= "
+                f"REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS ({backlog_retry})"
+            )
+        if active_retry <= 0.0:
+            raise ValueError(
+                f"REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS must be > 0.0, got {active_retry}"
+            )
+        if active_max < active_retry:
+            raise ValueError(
+                f"REALTIME_ACTIVE_MAX_BACKOFF_SECONDS ({active_max}) must be >= "
+                f"REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS ({active_retry})"
             )
         return self
 
