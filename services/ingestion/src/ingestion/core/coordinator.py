@@ -222,6 +222,18 @@ class RunCoordinator:
         # Immutable metadata snapshot of the store built under the exclusive gate.
         self._snapshot: StoreMetadataSnapshot | None = None
 
+    def _assert_not_fenced_under_gate(self, conn: Connection, operation: str) -> None:
+        """Re-verify under store gate that cycle has not been claimed or deleted by GC (Guarantee C)."""
+        from ingestion.core.base import CycleTombstonedError
+        from ingestion.core.catalog import is_cycle_fenced_or_deleted
+
+        with Session(bind=conn) as db:
+            if is_cycle_fenced_or_deleted(db, self.spec.cycle_time, model_id=self.spec.model_id):
+                raise CycleTombstonedError(
+                    f"Refusing {operation} for cycle {self.spec.cycle_time.isoformat()}: "
+                    "cycle was claimed for deletion or tombstoned by physical GC."
+                )
+
     def _lead_index_for(self, lead: int) -> int:
         """Return the positional lead index, caching per lead value."""
         if self._snapshot is not None and lead in self._snapshot.lead_index_map:
@@ -449,6 +461,7 @@ class RunCoordinator:
         if observer is not None and hasattr(observer, "record_milestone"):
             observer.record_milestone("store_gate_acquired")
         try:
+            self._assert_not_fenced_under_gate(conn, "store initialization")
             if store_exists(self.store_path):
                 # Existing store: validate identity only; the region worker's
                 # _commit_region performs schema validation after expanding the
@@ -524,6 +537,7 @@ class RunCoordinator:
         co.acquire_admission()
         co.acquire_exclusive_gate()
         try:
+            self._assert_not_fenced_under_gate(conn, "wave pre-update")
             if run_id is not None and is_same_cycle:
                 with Session(bind=conn) as db:
                     set_run_partial(db, run_id)
@@ -629,6 +643,7 @@ class RunCoordinator:
         co.acquire_shared_admission()
         co.acquire_shared_gate()
         try:
+            self._assert_not_fenced_under_gate(conn, "region write")
             snapshot = self._snapshot or self._build_snapshot()
             lead_values = dataset.coords["lead_time_hours"].values
             lead = int(np.asarray(lead_values).reshape(-1)[0])
@@ -813,6 +828,7 @@ class RunCoordinator:
         co.acquire_admission()
         co.acquire_exclusive_gate()
         try:
+            self._assert_not_fenced_under_gate(conn, "run finalization")
             mode = read_protocol_version(self.store_path)
 
             # Phase 1: Marker Listing
@@ -1019,6 +1035,7 @@ class RunCoordinator:
         co.acquire_admission()
         co.acquire_exclusive_gate()
         try:
+            self._assert_not_fenced_under_gate(conn, "lead publication")
             mode = read_protocol_version(self.store_path)
             committed_for_lead: set[int] = set()
             if spec.is_ensemble:

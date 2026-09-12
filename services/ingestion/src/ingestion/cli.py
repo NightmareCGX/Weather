@@ -911,7 +911,7 @@ def _run_gc(args: argparse.Namespace) -> int:
     import time
     from ingestion.core.db import engine as catalog_engine
     from ingestion.gc.leadership import GcLeadership
-    from ingestion.gc.reconciler import run_gc_pass
+    from ingestion.gc.finalizer import run_finalizer_pass
 
     dry_run = bool(args.dry_run)
     interval = max(1.0, float(args.interval_seconds))
@@ -920,7 +920,7 @@ def _run_gc(args: argparse.Namespace) -> int:
 
     if dry_run:
         # Dry-run performs zero mutations and does not acquire destructive leadership
-        run_gc_pass(
+        run_finalizer_pass(
             catalog_engine,
             dry_run=True,
             base_bucket=bucket,
@@ -957,7 +957,7 @@ def _run_gc(args: argparse.Namespace) -> int:
                     logger.error("Failed to reacquire GC leadership; exiting.")
                     return 1
 
-            run_gc_pass(
+            run_finalizer_pass(
                 catalog_engine,
                 dry_run=False,
                 base_bucket=bucket,

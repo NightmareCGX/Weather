@@ -1470,7 +1470,6 @@ def test_cli_concurrent_same_artifact_isolation(
 ) -> None:
     """17. Multiple waves allocate distinct run-scoped staging subdirectories."""
     store1 = str(tmp_path / "gfs1.zarr")
-    store2 = str(tmp_path / "gfs2.zarr")
     dl_dir = tmp_path / "dl"
 
     # Run two waves targeting the same cycle and lead with --keep-downloads
@@ -1507,7 +1506,7 @@ def test_cli_concurrent_same_artifact_isolation(
             "--lead-time-hours",
             "6",
             "--store",
-            store2,
+            store1,
             "--allow-custom-store",
             "--download-dir",
             str(dl_dir),

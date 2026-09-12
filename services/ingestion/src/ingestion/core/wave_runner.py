@@ -793,13 +793,13 @@ async def _run_wave_impl(
                 tracker.set_init_phase("failed")
                 raise
 
-            # 2. Determine run id + same-cycle.
-            run_id: str | None = None
+            # 2. Determine run id + same-cycle and durably reserve pre-write identity (Guarantee A & B).
+            run_id: str
             is_same_cycle = False
             tracker.set_init_phase("catalog_init")
             tracker.record_milestone("catalog_init_start")
             with _catalog_session() as db:
-                from ingestion.core.catalog import ModelRunRecord
+                from ingestion.core.catalog import ModelRunRecord, reserve_run
                 from sqlalchemy import select
 
                 row = (
@@ -811,9 +811,10 @@ async def _run_wave_impl(
                     .scalars()
                     .first()
                 )
-                if row is not None:
-                    run_id = str(row.id)
-                    is_same_cycle = True
+                was_existing = row is not None
+                run = reserve_run(db, catalog_spec)
+                run_id = str(run.id)
+                is_same_cycle = was_existing
             tracker.record_milestone("catalog_init_complete")
 
             # 3. Wave-level EXCLUSIVE pre-update (init + UPDATING markers).
