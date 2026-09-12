@@ -1,23 +1,23 @@
 """Centralized lifecycle and serviceability authority for API serving paths.
 
 This service is the single source of truth for forecast cycle visibility in the
-serving tier (Data Lifecycle V2).
+serving tier (Data Lifecycle V3).
 
 Serviceability Invariant:
 -------------------------
 A forecast cycle C for model M is SERVICEABLE (visible) iff it has NOT been
-retired or deleted in the durable lifecycle table:
+claimed for deletion or deleted in the durable lifecycle table:
 
-    forecast_cycle_lifecycle.retired_at IS NULL
+    forecast_cycle_lifecycle.deletion_started_at IS NULL
     AND
     forecast_cycle_lifecycle.deleted_at IS NULL
     AND
     forecast_cycle_lifecycle.model_id = M
 
 Cycles without a row in ``forecast_cycle_lifecycle`` are lazily created and
-treated as VISIBLE (not retired).
+treated as VISIBLE (unfenced).
 
-Once a model's cycle is marked retired (or deleted), it must become completely
+Once a model's cycle is deletion-fenced or deleted, it must become completely
 inaccessible across all user-facing serving paths for that model:
 - /v1/forecast/availability
 - /v1/points (cross-cycle min-lead winner selection)
@@ -27,9 +27,7 @@ inaccessible across all user-facing serving paths for that model:
 - /v1/maps/.../{z}/{x}/{y}.png (raster tile rendering and cache)
 - /v1/maps/.../vector-field (flow field rendering)
 - /v1/verifications (run discovery)
-- /v1/runs (public catalog listing)
-
-Explicit historical requests for retired cycles raise HTTP 404 Not Found.
+- /v1/runs (public catalog listing filters fenced runs from serving views)
 """
 
 from __future__ import annotations
@@ -73,25 +71,11 @@ def parse_cycle_time(cycle_time: datetime | str) -> datetime:
     return _ensure_utc(dt)
 
 
-def retired_cycle_times_subquery(model_id: str | None = None) -> Select[tuple[datetime]]:
-    """Return a subquery selecting physically fenced or deleted cycle_time values."""
-    stmt = select(ForecastCycleLifecycle.cycle_time).where(
-        or_(
-            ForecastCycleLifecycle.deletion_started_at.isnot(None),
-            ForecastCycleLifecycle.deleted_at.isnot(None),
-        )
-    )
-    if model_id is not None:
-        stmt = stmt.where(ForecastCycleLifecycle.model_id == model_id.lower().strip())
-    return stmt
-
-
 def filter_visible_runs(stmt: TSelect, model_id: str | None = None) -> TSelect:
     """Apply the centralized visibility filter to a SQLAlchemy query selecting ModelRun.
 
     Excludes all model_runs whose (model_id, cycle_time) has a durable lifecycle row with
-    deletion_started_at IS NOT NULL or deleted_at IS NOT NULL.
-    Legacy retired_at has zero effect on run visibility (Lifecycle V3).
+    deletion_started_at IS NOT NULL or deleted_at IS NOT NULL (Lifecycle V3).
 
     Args:
         stmt: The SQLAlchemy select statement to decorate.
@@ -108,8 +92,7 @@ def filter_fenced_runs(stmt: TSelect, model_id: str | None = None) -> TSelect:
     """Apply the physical safety fence filter to a SQLAlchemy query selecting ModelRun.
 
     Excludes all model_runs whose (model_id, cycle_time) has a durable lifecycle row with
-    deletion_started_at IS NOT NULL or deleted_at IS NOT NULL.
-    Specifically ignores retired_at (Lifecycle V3 per-valid-time canonical ownership).
+    deletion_started_at IS NOT NULL or deleted_at IS NOT NULL (Lifecycle V3 per-valid-time canonical ownership).
 
     Args:
         stmt: The SQLAlchemy select statement to decorate.
@@ -202,8 +185,7 @@ def is_cycle_visible(
 
     Cycles with no row in forecast_cycle_lifecycle are visible by default.
     Under Lifecycle V3, a cycle is visible iff it is not physically fenced
-    (deletion_started_at is None and deleted_at is None). Legacy retired_at
-    has zero effect on visibility.
+    (deletion_started_at is None and deleted_at is None).
 
     Args:
         db: Database session.

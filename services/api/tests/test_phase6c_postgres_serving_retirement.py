@@ -2,7 +2,7 @@
 
 Verifies against real PostgreSQL and physical Zarr stores:
 1. Active cycle C is servable via /v1/points, /v1/ensembles, /v1/probabilities, /v1/maps.
-2. Retirement transaction commits (forecast_cycle_lifecycle.retired_at populated).
+2. Deletion transaction commits (forecast_cycle_lifecycle.deleted_at populated).
 3. Physical Zarr store still exists on disk.
 4. Serving immediately returns 404 / excludes cycle C from min-lead and availability.
 5. Non-retired partial cycles continue to serve progressively under Phase 3.
@@ -155,8 +155,6 @@ def test_postgres_serving_retirement_lifecycle_transition(
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c1,
-                retired_at=_dt(2026, 9, 2, 6, 30),
-                retired_by_cycle_time=c2,
                 deleted_at=_dt(2026, 9, 2, 6, 30),
             )
         )

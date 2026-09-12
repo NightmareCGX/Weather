@@ -420,14 +420,15 @@ ORDER BY run_id DESC
 LIMIT 10;
 ```
 
-### 3. Check Cycle Retirement & Deletion Fences
+### 3. Check Cycle Deletion Fences & Tombstones
 ```sql
 SELECT 
+    model_id,
     cycle_time,
-    retired_at,
-    retired_by_cycle_time,
     deletion_started_at,
-    deleted_at
+    deleted_at,
+    created_at,
+    updated_at
 FROM forecast_cycle_lifecycle
 ORDER BY cycle_time DESC
 LIMIT 10;

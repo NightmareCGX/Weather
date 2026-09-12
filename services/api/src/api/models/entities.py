@@ -286,8 +286,6 @@ class ForecastCycleLifecycle(Base):
         String, ForeignKey("models.model_id", ondelete="CASCADE"), primary_key=True
     )
     cycle_time = Column(DateTime(timezone=True), primary_key=True)
-    retired_at = Column(DateTime(timezone=True), nullable=True)
-    retired_by_cycle_time = Column(DateTime(timezone=True), nullable=True)
     deletion_started_at = Column(DateTime(timezone=True), nullable=True)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(
@@ -303,7 +301,6 @@ class ForecastCycleLifecycle(Base):
     )
 
     __table_args__ = (
-        Index("idx_cycle_lifecycle_retired", "model_id", "retired_at"),
         Index("idx_cycle_lifecycle_claimed", "model_id", "deletion_started_at"),
         Index("idx_cycle_lifecycle_deleted", "model_id", "deleted_at"),
     )

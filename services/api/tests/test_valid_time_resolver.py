@@ -344,8 +344,8 @@ def test_resolver_gefs_member_coverage_threshold(resolver_test_db):
         register_expected_members("gefs", old_expected)
 
 
-def test_resolver_retired_at_does_not_exclude_canonical_representation(resolver_test_db):
-    """Verify V3 architectural decoupling: legacy retired_at does not exclude an otherwise valid representation."""
+def test_resolver_unfenced_cycle_serves_canonical_representation(resolver_test_db):
+    """Verify V3 architectural model: an unfenced cycle serves canonical representation."""
     c_retired = _dt(2026, 9, 1, 0)
     target_v = _dt(2026, 9, 1, 6)
 
@@ -369,12 +369,11 @@ def test_resolver_retired_at_does_not_exclude_canonical_representation(resolver_
         lc = ForecastCycleLifecycle(
             model_id="gfs",
             cycle_time=c_retired,
-            retired_at=_dt(2026, 9, 1, 12),
         )
         session.add_all([r, p, lc])
         session.commit()
 
-        # In V3, retired_at is legacy V2 whole-cycle logical state and does NOT exclude the representation
+        # In V3, an unfenced lifecycle row does NOT exclude the representation
         source = resolve_valid_time_source(session, "gfs", target_v, variable="temperature_2m")
         assert source.valid_time == target_v
         assert source.cycle_time == c_retired

@@ -53,7 +53,7 @@ def test_db(monkeypatch):
     # Hermetic test isolation: prevent S3/MinIO network calls in CI
     monkeypatch.setattr(
         "api.services.point_forecast.resolve_serving_generation_for_store",
-        lambda store_path, latest_retired_iso=None: "gen_test",
+        lambda store_path, *args, **kwargs: "gen_test",
     )
 
     import s3fs

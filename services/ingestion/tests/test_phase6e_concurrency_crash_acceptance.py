@@ -26,7 +26,6 @@ from ingestion.core.catalog import (
     ModelRunRecord,
     RunCatalogSpec,
     VariableSpec,
-    mark_cycle_retired,
     record_run,
 )
 from ingestion.core.zarr_writer import write_dataset
@@ -173,7 +172,6 @@ def test_crash_boundary_a_after_claim_before_gfs_delete(postgres_crash_env):
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
         claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     # Crash occurs before any store delete
@@ -204,7 +202,6 @@ def test_crash_boundary_b_after_gfs_delete_before_gefs(postgres_crash_env):
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
         claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0)
@@ -235,7 +232,6 @@ def test_crash_boundary_c_after_both_stores_deleted_before_db_cleanup(postgres_c
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
         claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0)
@@ -267,7 +263,6 @@ def test_crash_boundary_d_db_transaction_rollback_and_retry(postgres_crash_env):
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
         claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
 
     delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0)

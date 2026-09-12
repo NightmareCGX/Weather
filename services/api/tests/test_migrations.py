@@ -97,3 +97,135 @@ def test_postgres_alembic_migration_smoke(postgres_engine):
 
     # 6. Second Alembic upgrade head (idempotency test)
     command.upgrade(alembic_cfg, "head")
+
+
+def test_migration_008_upgrade_downgrade_postgres(postgres_engine):
+    """Test focused Migration 008 upgrade, downgrade, and re-upgrade on PostgreSQL."""
+    db_url = str(postgres_engine.url)
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    alembic_cfg = Config(os.path.join(api_dir, "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    alembic_cfg.set_main_option("script_location", os.path.join(api_dir, "alembic"))
+
+    # 1. Start at revision 007
+    command.upgrade(alembic_cfg, "007_reclamation_queue")
+
+    # Verify 007 has retired_at and retired_by_cycle_time
+    inspector_007 = inspect(postgres_engine)
+    cols_007 = {c["name"] for c in inspector_007.get_columns("forecast_cycle_lifecycle")}
+    assert "retired_at" in cols_007
+    assert "retired_by_cycle_time" in cols_007
+    indexes_007 = {idx["name"] for idx in inspector_007.get_indexes("forecast_cycle_lifecycle")}
+    assert "idx_cycle_lifecycle_retired" in indexes_007
+
+    # Seed prerequisite model and lifecycle row with non-null retired fields
+    with postgres_engine.connect() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO forecast_centers (id, center_id, name, country, created_at) "
+                "VALUES ('center_noaa', 'noaa', 'NOAA', 'US', NOW()) ON CONFLICT DO NOTHING;"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO models (id, model_id, center_id, name, is_ensemble, resolution_km, created_at) "
+                "VALUES ('model_gfs', 'gfs', 'noaa', 'GFS', false, 25.0, NOW()) ON CONFLICT DO NOTHING;"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO forecast_cycle_lifecycle "
+                "(model_id, cycle_time, retired_at, retired_by_cycle_time, deletion_started_at, deleted_at, created_at, updated_at) "
+                "VALUES ('gfs', '2026-09-01 00:00:00+00', '2026-09-02 06:00:00+00', '2026-09-02 12:00:00+00', "
+                "'2026-09-02 13:00:00+00', '2026-09-02 14:00:00+00', NOW(), NOW());"
+            )
+        )
+        conn.commit()
+
+    # 2. Upgrade to 008
+    command.upgrade(alembic_cfg, "008_drop_retired_fields")
+
+    # Assert columns and index dropped
+    inspector_008 = inspect(postgres_engine)
+    cols_008 = {c["name"] for c in inspector_008.get_columns("forecast_cycle_lifecycle")}
+    assert "retired_at" not in cols_008
+    assert "retired_by_cycle_time" not in cols_008
+    assert "deletion_started_at" in cols_008
+    assert "deleted_at" in cols_008
+    assert "created_at" in cols_008
+    assert "updated_at" in cols_008
+    assert "model_id" in cols_008
+    assert "cycle_time" in cols_008
+
+    indexes_008 = {idx["name"] for idx in inspector_008.get_indexes("forecast_cycle_lifecycle")}
+    assert "idx_cycle_lifecycle_retired" not in indexes_008
+    assert "idx_cycle_lifecycle_claimed" in indexes_008
+    assert "idx_cycle_lifecycle_deleted" in indexes_008
+
+    # Verify seeded row preserved V3 fields
+    with postgres_engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT model_id, cycle_time, deletion_started_at, deleted_at FROM forecast_cycle_lifecycle WHERE model_id = 'gfs'")
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "gfs"
+        assert row[2] is not None
+        assert row[3] is not None
+
+    # 3. Downgrade to 007
+    command.downgrade(alembic_cfg, "007_reclamation_queue")
+
+    inspector_down = inspect(postgres_engine)
+    cols_down = {c["name"]: c for c in inspector_down.get_columns("forecast_cycle_lifecycle")}
+    assert "retired_at" in cols_down
+    assert cols_down["retired_at"]["nullable"] is True
+    assert "retired_by_cycle_time" in cols_down
+    assert cols_down["retired_by_cycle_time"]["nullable"] is True
+
+    indexes_down = {idx["name"]: idx for idx in inspector_down.get_indexes("forecast_cycle_lifecycle")}
+    assert "idx_cycle_lifecycle_retired" in indexes_down
+    assert indexes_down["idx_cycle_lifecycle_retired"]["column_names"] == ["model_id", "retired_at"]
+
+    # Verify NULL-only restoration semantics (existing row has NULL retired fields, V3 preserved)
+    with postgres_engine.connect() as conn:
+        row_down = conn.execute(
+            text("SELECT retired_at, retired_by_cycle_time, deletion_started_at, deleted_at FROM forecast_cycle_lifecycle WHERE model_id = 'gfs'")
+        ).fetchone()
+        assert row_down is not None
+        assert row_down[0] is None  # retired_at NULL
+        assert row_down[1] is None  # retired_by_cycle_time NULL
+        assert row_down[2] is not None  # deletion_started_at preserved
+        assert row_down[3] is not None  # deleted_at preserved
+
+    # 4. Re-upgrade to 008 (idempotent roundtrip)
+    command.upgrade(alembic_cfg, "008_drop_retired_fields")
+    inspector_reup = inspect(postgres_engine)
+    cols_reup = {c["name"] for c in inspector_reup.get_columns("forecast_cycle_lifecycle")}
+    assert "retired_at" not in cols_reup
+    assert "retired_by_cycle_time" not in cols_reup
+
+    # 5. Verify API ORM works against contracted schema
+    from sqlalchemy.orm import Session
+    from api.models.entities import ForecastCycleLifecycle
+    from datetime import datetime, timezone
+
+    with Session(postgres_engine) as session:
+        c_test = datetime(2026, 9, 3, 0, 0, tzinfo=timezone.utc)
+        session.add(
+            ForecastCycleLifecycle(
+                model_id="gfs",
+                cycle_time=c_test,
+                deletion_started_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+        queried = session.get(ForecastCycleLifecycle, ("gfs", c_test))
+        assert queried is not None
+        assert queried.model_id == "gfs"
+        assert queried.deletion_started_at is not None
+        assert not hasattr(queried, "retired_at")
+        assert not hasattr(queried, "retired_by_cycle_time")
+
+
+

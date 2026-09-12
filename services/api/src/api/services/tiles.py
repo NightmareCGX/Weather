@@ -299,7 +299,6 @@ class TileReadContext:
     store_path: str
     expected_members: int
     valid_time: str | None = None
-    latest_retired_iso: str | None = None
 
 
 def resolve_tile_read_context(

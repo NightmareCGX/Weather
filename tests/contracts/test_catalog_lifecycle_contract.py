@@ -162,8 +162,8 @@ def test_ready_run_completion_to_api_resolution(db_session: Session) -> None:
     assert resolved_cycle == "2026-09-03T06:00:00Z"
 
 
-def test_retired_cycle_filtered_by_api_lifecycle(db_session: Session) -> None:
-    """Cycle marked retired -> API default resolution filters it out."""
+def test_fenced_cycle_filtered_by_api_lifecycle(db_session: Session) -> None:
+    """Cycle marked with deletion fence -> API default resolution filters it out."""
     c_old = datetime(2026, 9, 3, 0, 0, tzinfo=timezone.utc)
     c_new = datetime(2026, 9, 3, 6, 0, tzinfo=timezone.utc)
 
@@ -189,19 +189,18 @@ def test_retired_cycle_filtered_by_api_lifecycle(db_session: Session) -> None:
     record_run(db_session, spec_old, ds, committed_state=committed)
     record_run(db_session, spec_new, ds, committed_state=committed)
 
-    # Mark c_old as retired in forecast_cycle_lifecycle
-    lifecycle_old = ForecastCycleLifecycle(
+    # Fence c_new with deletion_started_at in forecast_cycle_lifecycle
+    lifecycle_new = ForecastCycleLifecycle(
         model_id="gfs",
-        cycle_time=c_old,
-        retired_at=datetime.now(timezone.utc),
-        retired_by_cycle_time=c_new,
+        cycle_time=c_new,
+        deletion_started_at=datetime.now(timezone.utc),
     )
-    db_session.add(lifecycle_old)
+    db_session.add(lifecycle_new)
     db_session.commit()
 
-    # API resolution should pick the active non-retired cycle c_new
+    # API resolution should filter out fenced c_new and resolve active c_old
     resolved_cycle = resolve_latest_run_cycle_time(db_session, "gfs")
-    assert resolved_cycle == "2026-09-03T06:00:00Z"
+    assert resolved_cycle == "2026-09-03T00:00:00Z"
 
 
 def test_deletion_fenced_cycle_rejected_and_safely_skipped(db_session: Session) -> None:

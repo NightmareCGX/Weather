@@ -44,6 +44,13 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 ### Migration 006: City Elevation (`006_city_elevation.py`)
 * `cities.elevation_m`: Adds nullable `DOUBLE PRECISION` column for authoritative persistent terrain elevation in meters. Allows known cities to resolve elevation without runtime API queries. Schema-only migration; no external network calls.
 
+### Migration 007: Reclamation Queue (`007_reclamation_queue.py`)
+* `reclamation_queue`: Adds dependency-aware granular physical variable shard reclamation table for `sharded_v1` Zarr stores. Tracks shard lifecycle: `queued` (physically available), `deleting` (leased and fenced), `deleted` (physically removed from object storage), `failed` (quarantined after retries).
+
+### Migration 008: Schema Contraction (`008_drop_retired_fields.py`)
+* `forecast_cycle_lifecycle`: Drops legacy columns `retired_at` and `retired_by_cycle_time`, and drops index `idx_cycle_lifecycle_retired`. Lifecycle authority is fully transitioned to physical fences (`deletion_started_at`, `deleted_at`) and granular reclamation (`reclamation_queue`).
+* **Rollback Caveat**: Downgrade recreates `retired_at` and `retired_by_cycle_time` as nullable `TIMESTAMPTZ` with `NULL` defaults and restores `idx_cycle_lifecycle_retired` for schema compatibility only. Downgrade does **NOT** restore legacy V2 runtime semantics, historical timestamps, deleted physical stores, or purged metadata. Schema rollback != data rollback.
+
 ---
 
 ## 3. Table Ownership & Mutability Matrix
@@ -67,20 +74,30 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 
 ## 4. Lifecycle & Availability Semantics
 
-### 4.1 Run Status Transitions
+### 4.1 Run & Lifecycle State Transitions (Lifecycle V3)
 ```text
 [discovered] ──► [processing] ──► [partial] ──► [ready]
                                      │             │
                                      ▼             ▼
-                                  [failed]     [retired] ──► [deleted]
+                                  [failed]     [active serving]
+                                                   │
+                                                   ▼ (cycle_time + max_lead < serving_start)
+                                        [deletion_started_at]  (serving & mutation fence)
+                                                   │
+                                                   ▼ (physical stores deleted sequentially)
+                                              [deleted_at]      (anti-resurrection tombstone)
+                                                   │
+                                                   ▼ (14-day retention window)
+                                            [metadata purged]   (tombstone survives indefinitely)
 ```
 
 * `processing`: Run record created in PostgreSQL; initial wave download/write in progress.
 * `partial`: One or more lead waves have committed and published to `forecast_products`. Serving tier can serve available leads.
 * `ready`: **The complete canonical horizon (`domain.horizon.canonical_lead_time_hours`, e.g. 0–240h at 3h cadence for GFS, and 30 members × full leads for GEFS) is fully committed.**
 * `failed`: Wave unrecoverably failed or aborted.
-* `retired`: Cycle has been superseded by a newer model cycle (tracked in `forecast_cycle_lifecycle.retired_at`).
-* `deleted`: Storage files purged by GC engine (`forecast_cycle_lifecycle.deleted_at` set).
+* `deletion_started_at`: Established by GC finalizer before acquiring exclusive store gates. Serves as a durable physical deletion claim and serving/mutation fence. Stale writers and public requests are rejected with 404/CycleTombstonedError.
+* `deleted_at`: Committed atomically after all physical stores for the cycle are deleted. Serves as a permanent anti-resurrection tombstone.
+* `14-Day Detailed Metadata Retention`: Child records (`model_runs`, `forecast_products`, `ensemble_members`, `ensemble_member_products`) are retained intact for 14 days after `deleted_at` (`METADATA_RETENTION_DAYS = 14`), after which the metadata sweeper purges child records while preserving the `forecast_cycle_lifecycle` tombstone row.
 
 ### 4.2 Same-Cycle Re-Ingestion (PATCH Semantics)
 * Ingestion of a lead or member wave acts as a **PATCH** on the cycle store.
@@ -109,12 +126,19 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
                                                                                 [forecast_grids]
 
 [forecast_cycle_lifecycle]
+  ├── model_id (PK, FK -> models.model_id)
   ├── cycle_time (PK, TIMESTAMP WITH TIME ZONE)
-  ├── retired_at (TIMESTAMP WITH TIME ZONE)
-  ├── retired_by_cycle_time (TIMESTAMP WITH TIME ZONE)
   ├── deletion_started_at (TIMESTAMP WITH TIME ZONE)
   ├── deleted_at (TIMESTAMP WITH TIME ZONE)
   └── created_at / updated_at
+
+[reclamation_queue]
+  ├── id (PK, VARCHAR(64))
+  ├── run_id (FK -> model_runs.id)
+  ├── model_id (FK -> models.model_id)
+  ├── cycle_time, lead_time_hours, variable_code, target_kind, member_index
+  ├── status (queued | deleting | deleted | failed)
+  └── store_path, physical_key, lease_expires_at, next_retry_at
 
 [cities], [stations], [ski_resorts] (PostGIS geometry tables)
 ```

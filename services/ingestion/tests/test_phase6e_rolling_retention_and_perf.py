@@ -19,8 +19,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from domain.lifecycle import (
-    CycleLifecycleSnapshot,
-    plan_lifecycle,
+    ModelLifecycleSnapshot,
+    is_cycle_horizon_expired,
 )
 from ingestion.cli import main
 from ingestion.core.catalog import (
@@ -171,7 +171,7 @@ def test_migration_upgrade_from_existing_database(tmp_path):
         snapshots = list_cycle_lifecycle_snapshots(session)
         assert len(snapshots) == 1
         assert snapshots[0].cycle_time == c1
-        assert snapshots[0].is_retired is False
+        assert snapshots[0].is_deletion_started is False
         assert snapshots[0].is_deleted is False
 
 
@@ -258,22 +258,22 @@ def test_performance_sanity_planning_and_admission_bounds(postgres_clean_env):
     # 1. Pure planner performance with 50 synthetic cycles
     c_base = _dt(2026, 8, 1, 0)
     snapshots = [
-        CycleLifecycleSnapshot(
+        ModelLifecycleSnapshot(
             model_id="gfs",
             cycle_time=_dt(2026, 8, 1 + i // 4, (i % 4) * 6),
             status="ready",
         )
         for i in range(50)
     ]
-    ready = [s.cycle_time for s in snapshots]
+    now_serving = _dt(2026, 8, 20, 0)
 
     t0 = time.monotonic()
-    plan = plan_lifecycle(snapshots, ready, model_id="gfs")
+    for s in snapshots:
+        is_cycle_horizon_expired(s.cycle_time, max_lead_hours=240, serving_start=now_serving)
     plan_dur_ms = (time.monotonic() - t0) * 1000.0
 
     # Must be fast across 50 cycles
     assert plan_dur_ms < 50.0
-    assert len(plan.would_retire) >= 0
 
     # 2. Database admission check latency
     with Session(engine) as session:

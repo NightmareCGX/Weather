@@ -28,9 +28,8 @@ from ingestion.core.catalog import (
     ModelRecord,
     ModelRunRecord,
     ModelVersionRecord,
+    ensure_lifecycle_row,
     list_paired_ready_cycle_times,
-    mark_cycle_retired,
-    reconcile_cycle_lifecycle,
 )
 
 
@@ -154,47 +153,13 @@ def test_postgres_paired_ready_query(postgres_catalog_session: Session) -> None:
     assert paired == [c1, c3]
 
 
-def test_postgres_reconcile_cycle_lifecycle_e2e(postgres_catalog_session: Session) -> None:
-    c0 = _dt(2026, 9, 1, 6)   # Will retire
-    c1 = _dt(2026, 9, 2, 6)   # R1 for c0
-    c2 = _dt(2026, 9, 2, 12)  # R2 for c0
-
-    _add_run(postgres_catalog_session, "gfs", c0, "ready")
-    _add_run(postgres_catalog_session, "gefs", c0, "ready")
-
-    _add_run(postgres_catalog_session, "gfs", c1, "ready")
-    _add_run(postgres_catalog_session, "gefs", c1, "ready")
-
-    _add_run(postgres_catalog_session, "gfs", c2, "ready")
-    _add_run(postgres_catalog_session, "gefs", c2, "ready")
-
-    now = _dt(2026, 9, 2, 12, 45)
-    plan = reconcile_cycle_lifecycle(postgres_catalog_session, model_id="gfs", now=now)
-
-    assert len(plan.retirements) == 1
-    assert plan.retirements[0].cycle_time == c0
-    assert plan.retirements[0].retired_by_cycle_time == c2
-
-    # Verify persisted in PostgreSQL
-    row = postgres_catalog_session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
-    assert row is not None
-    assert row.retired_at == now
-    assert row.retired_by_cycle_time == c2
-    assert row.deleted_at is None
-    assert row.created_at is not None
-    assert row.updated_at is not None
-
-    # Reconciling again is idempotent
-    plan2 = reconcile_cycle_lifecycle(postgres_catalog_session, model_id="gfs", now=_dt(2026, 9, 2, 13, 0))
-    assert len(plan2.retirements) == 0
-
-
 def test_postgres_tombstone_survives_model_run_deletion(postgres_catalog_session: Session) -> None:
     c = _dt(2026, 9, 1, 0)
     gfs_run = _add_run(postgres_catalog_session, "gfs", c, "ready")
     gefs_run = _add_run(postgres_catalog_session, "gefs", c, "ready")
 
-    mark_cycle_retired(postgres_catalog_session, "gfs", c, _dt(2026, 9, 2, 0), _dt(2026, 9, 2, 0))
+    row = ensure_lifecycle_row(postgres_catalog_session, "gfs", c)
+    setattr(row, "deleted_at", _dt(2026, 9, 2, 0))
     postgres_catalog_session.commit()
 
     # Delete the model_runs rows directly via SQL in PostgreSQL
@@ -203,6 +168,6 @@ def test_postgres_tombstone_survives_model_run_deletion(postgres_catalog_session
     postgres_catalog_session.commit()
 
     # Verify lifecycle record still exists and holds tombstone
-    row = postgres_catalog_session.get(ForecastCycleLifecycleRecord, ("gfs", c))
-    assert row is not None
-    assert row.retired_by_cycle_time == _dt(2026, 9, 2, 0)
+    row_after = postgres_catalog_session.get(ForecastCycleLifecycleRecord, ("gfs", c))
+    assert row_after is not None
+    assert row_after.deleted_at == _dt(2026, 9, 2, 0)

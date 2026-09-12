@@ -696,7 +696,7 @@ def test_finalizer_discovers_and_finalizes_legacy_cycle_without_lifecycle_row(
     4. Physical store is deleted.
     5. deleted_at is committed atomically.
     6. ModelRunRecord remains retained in the catalog.
-    7. No reliance on retired_at or retired_by_cycle_time.
+    7. Clean execution against contracted lifecycle schema.
     """
     legacy_store = tmp_path / "legacy_gfs.zarr"
     legacy_store.mkdir(parents=True, exist_ok=True)
@@ -764,9 +764,6 @@ def test_finalizer_discovers_and_finalizes_legacy_cycle_without_lifecycle_row(
         assert lc is not None
         assert _ensure_utc_datetime(lc.deletion_started_at) == now_utc
         assert _ensure_utc_datetime(lc.deleted_at) == now_utc
-        # Proves zero reliance on retired_at
-        assert lc.retired_at is None
-        assert lc.retired_by_cycle_time is None
 
         # 7. Verify ModelRunRecord is RETAINED (M2 does not purge catalog metadata)
         legacy_run = session.get(ModelRunRecord, "run_legacy_gfs_2026070200")

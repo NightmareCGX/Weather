@@ -287,17 +287,19 @@ The PostgreSQL database tracks platform metadata and progressive publication sta
                                            ▼ (1:N)
                              [ensemble_member_products]
 
-[forecast_cycle_lifecycle] ((model_id, cycle_time) PK, retired_at, deletion_started_at, deleted_at)
+[forecast_cycle_lifecycle] ((model_id, cycle_time) PK, deletion_started_at, deleted_at)
+[reclamation_queue]        (id PK, run_id FK, status: queued/deleting/deleted/failed)
 [forecast_variables]       (variable_code PK, name, unit)
 [forecast_grids]           (grid_code PK, name, resolution_km)
 [stations], [cities], [ski_resorts] (PostGIS spatial reference tables)
 ```
 
 ### Table Responsibilities:
-* `model_runs`: Primary record of a model cycle (`status`, `zarr_store_path`, `cycle_time`). Status transitions: `processing` → `partial` → `ready` / `failed` → `retired`.
+* `model_runs`: Primary record of a model cycle (`status`, `zarr_store_path`, `cycle_time`). Status transitions: `processing` → `partial` → `ready` / `failed`.
 * `forecast_products`: Records committed lead times per variable and grid.
 * `ensemble_member_products`: Records committed `(member_index, lead_time_hours)` pairs for GEFS.
-* `forecast_cycle_lifecycle`: Tracks durable cycle supersession, retirement timestamps (`retired_at`), and deletion fences (`deletion_started_at`, `deleted_at`).
+* `forecast_cycle_lifecycle`: Tracks durable physical lifecycle state: deletion claim fence (`deletion_started_at`) and anti-resurrection tombstone (`deleted_at`).
+* `reclamation_queue`: Tracks granular variable shard reclamation lifecycle (`queued` → `deleting` → `deleted` / `failed`).
 * `cities`, `stations`, `ski_resorts`: Geospatial tables with PostGIS `GEOMETRY(Point, 4326)` for autocomplete and point resolution.
 
 ---

@@ -20,11 +20,9 @@ Canonical V3 Principles:
    actually committed. Older cycles continue serving farther valid times.
    The serving right boundary does not collapse.
 
-2. Decoupling from Legacy retired_at:
-   ``forecast_cycle_lifecycle.retired_at`` is legacy V2 whole-cycle logical state
-   and is strictly ignored for V3 canonical resolution. Physical safety fences
-   (``deletion_started_at`` and ``deleted_at``) remain authoritative and are
-   properly model-scoped.
+2. Authoritative Physical Safety Fences:
+   Physical safety fences (``deletion_started_at`` and ``deleted_at``) remain
+   authoritative and are properly model-scoped.
 
 3. Strict GEFS Coherent Vintage:
    A GEFS cycle is canonical for valid_time V if and only if BOTH:
@@ -151,7 +149,7 @@ def _discover_candidates_bulk(
 ) -> dict[datetime, list[_CandidateRecord]]:
     """Discover all valid-time candidates using exactly 1 catalog query (+1 member query for ensembles).
 
-    Applies model-scoped physical deletion fencing and ignores legacy retired_at.
+    Applies model-scoped physical deletion fencing.
     For GEFS ensembles, strictly enforces that candidates have both official geavg
     and servable member coverage (>=85%).
     Filters out physical shards that are in reclamation_queue with status IN ('deleting', 'deleted').
@@ -445,7 +443,7 @@ def resolve_canonical_source(
     Invariants:
     - Rejects valid_time strictly before serving_start_valid_time(now_utc) with HTTP 404.
     - Selects the newest committed representation covering valid_time.
-    - Strictly ignores legacy retired_at; strictly excludes deletion fences.
+    - Strictly excludes deletion fences.
     - Strictly enforces GEFS coherent vintage (both geavg and >=85% members).
     """
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)

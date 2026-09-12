@@ -419,7 +419,7 @@ def test_13_27_28_29_gefs_coherent_vintage_and_anti_resurrection(catalog_engine,
 
 
 # ===========================================================================
-# 14. retired_at alone does not authorize reclamation
+# 14. Unfenced cycle does not authorize reclamation
 # 15. Granular GC never stamps cycle deletion_started_at
 # 16. Enqueue is idempotent
 # 17. Unique queue identity distinguishes different run_ids
@@ -429,12 +429,11 @@ def test_14_15_16_17_lifecycle_isolation_and_idempotent_enqueue(catalog_engine, 
     r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
     _seed_gfs_products(catalog_engine, r0, [24], ["temperature_2m"], tmp_path / "c0")
 
-    # Mark cycle as retired in forecast_cycle_lifecycle
+    # Seed lifecycle row in forecast_cycle_lifecycle
     with Session(catalog_engine) as session:
         lc = ForecastCycleLifecycleRecord(
             model_id="gfs",
             cycle_time=c0,
-            retired_at=_dt(2026, 9, 2, 6),
             created_at=c0,
             updated_at=c0,
         )
@@ -443,7 +442,7 @@ def test_14_15_16_17_lifecycle_isolation_and_idempotent_enqueue(catalog_engine, 
 
     now = _dt(2026, 9, 2, 1)  # c0 lead 24 is still canonical anchor
     with Session(catalog_engine) as session:
-        # retired_at alone does NOT authorize reclamation of canonical shard!
+        # Unfenced cycle does NOT authorize reclamation of canonical shard!
         plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
         assert not any(t.run_id == r0 and t.lead_time_hours == 24 for t in plan.would_enqueue)
 
