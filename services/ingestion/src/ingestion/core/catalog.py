@@ -1532,27 +1532,7 @@ def reserve_run(
     cycle_time = _ensure_utc_datetime(spec.cycle_time)
     m_id = spec.model_id.lower().strip()
 
-    # 1. Race-safely ensure lifecycle row exists
-    ensure_lifecycle_row(db, m_id, cycle_time)
-
-    # 2. Lock lifecycle row FOR UPDATE
-    lc = db.execute(
-        select(ForecastCycleLifecycleRecord)
-        .where(
-            ForecastCycleLifecycleRecord.model_id == m_id,
-            ForecastCycleLifecycleRecord.cycle_time == cycle_time,
-        )
-        .with_for_update()
-    ).scalar_one()
-
-    # 3. Check claim fences
-    if lc.deletion_started_at is not None or lc.deleted_at is not None:
-        raise CycleTombstonedError(
-            f"Refusing to reserve run for cycle {cycle_time.isoformat()}: "
-            "cycle is claimed for deletion or already tombstoned."
-        )
-
-    # 4. Idempotently ensure parent hierarchy
+    # 1. Idempotently ensure parent hierarchy (required before lifecycle FK)
     center = _get_or_create(
         db,
         CenterRecord,
@@ -1588,6 +1568,26 @@ def reserve_run(
             "version_string": spec.version_string,
         },
     )
+
+    # 2. Race-safely ensure lifecycle row exists
+    ensure_lifecycle_row(db, m_id, cycle_time)
+
+    # 3. Lock lifecycle row FOR UPDATE
+    lc = db.execute(
+        select(ForecastCycleLifecycleRecord)
+        .where(
+            ForecastCycleLifecycleRecord.model_id == m_id,
+            ForecastCycleLifecycleRecord.cycle_time == cycle_time,
+        )
+        .with_for_update()
+    ).scalar_one()
+
+    # 4. Check claim fences
+    if lc.deletion_started_at is not None or lc.deleted_at is not None:
+        raise CycleTombstonedError(
+            f"Refusing to reserve run for cycle {cycle_time.isoformat()}: "
+            "cycle is claimed for deletion or already tombstoned."
+        )
 
     # 5. Create or retrieve ModelRunRecord
     run = db.execute(
