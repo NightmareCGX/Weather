@@ -40,7 +40,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 from domain.coverage import get_expected_members
-from domain.horizon import CANONICAL_MAX_LEAD_HOURS, canonical_lead_time_hours
+from domain.horizon import canonical_lead_time_hours, max_model_lead_hours
+from domain.lifecycle import is_cycle_horizon_expired
 from domain.temporal import serving_start_valid_time
 from ingestion.core.config import IngestionSettings, settings
 from ingestion.core.wave_runner import RunSpec, _build_spec, _run_wave
@@ -175,6 +176,7 @@ class RealtimeScheduler:
         cycle_override: CycleIdentity | None = None,
         download_dir: str = "downloads",
         concurrency: int = 4,
+        version_string: str = "v1.0",
     ) -> None:
         """Create a scheduler.
 
@@ -192,6 +194,7 @@ class RealtimeScheduler:
         self._cycle_override = cycle_override
         self._download_dir = download_dir
         self._concurrency = concurrency
+        self.version_string = version_string
 
         self.discover = discover or self._discover_production
         self.read_committed = read_committed or self._read_committed_production
@@ -294,7 +297,9 @@ class RealtimeScheduler:
     ) -> tuple[ModelCommittedState, ModelCommittedState]:
         from ingestion.core.db import engine
 
-        return read_cycle_committed_state(engine, cycle_time=cycle.cycle_time)
+        return read_cycle_committed_state(
+            engine, cycle_time=cycle.cycle_time, version_string=self.version_string
+        )
 
     def _discover_candidates_production(
         self, active_cycle: CycleIdentity | None, now_utc: datetime
@@ -307,7 +312,7 @@ class RealtimeScheduler:
             engine,
             active_cycle_time=ref_time,
             now_utc=now_utc,
-            version_string="v1.0",
+            version_string=self.version_string,
         )
 
     def _is_complete_production(self, cycle: CycleIdentity) -> bool:
@@ -315,7 +320,7 @@ class RealtimeScheduler:
         from ingestion.realtime.committed import is_cycle_durably_complete
 
         return is_cycle_durably_complete(
-            engine, cycle_time=cycle.cycle_time, version_string="v1.0"
+            engine, cycle_time=cycle.cycle_time, version_string=self.version_string
         )
 
     def _dispatch_production(
@@ -496,6 +501,9 @@ class RealtimeScheduler:
 
         candidates = self._get_candidates(active_cycle, now, now_utc)
         serving_start = serving_start_valid_time(now_utc)
+        scheduler_max_lead = max_model_lead_hours(
+            ("gfs", "gefs"), version_string=self.version_string
+        )
         backlog_policy = WavePolicy(
             max_leads=int(self.settings.REALTIME_WAVE_MAX_LEADS),
             max_wait_seconds=0.0,  # Catch-up does not delay ready work
@@ -508,10 +516,10 @@ class RealtimeScheduler:
             label = candidate.label
 
             # 1. Horizon expiry check
-            if (
-                candidate.cycle_time
-                + timedelta(hours=CANONICAL_MAX_LEAD_HOURS)
-                < serving_start
+            if is_cycle_horizon_expired(
+                candidate.cycle_time,
+                max_lead_hours=scheduler_max_lead,
+                serving_start=serving_start,
             ):
                 continue
 
