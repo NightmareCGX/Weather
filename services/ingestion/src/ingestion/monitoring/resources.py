@@ -161,16 +161,20 @@ class SystemResourceCollector:
                     ]
 
                 self._pmc_cls = PROCESS_MEMORY_COUNTERS
-                psapi = ctypes.windll.psapi  # type: ignore[attr-defined]
-                psapi.GetProcessMemoryInfo.argtypes = [
-                    wintypes.HANDLE,
-                    ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
-                    wintypes.DWORD,
-                ]
-                psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
-                self._psapi = psapi
-                self._kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-                self._has_win_api = True
+                win_dll = getattr(ctypes, "windll", None)
+                if win_dll is not None:
+                    psapi = win_dll.psapi
+                    psapi.GetProcessMemoryInfo.argtypes = [
+                        wintypes.HANDLE,
+                        ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                        wintypes.DWORD,
+                    ]
+                    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+                    self._psapi = psapi
+                    self._kernel32 = win_dll.kernel32
+                    self._has_win_api = True
+                else:
+                    self._has_win_api = False
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Windows psapi initialization failed: %s", exc)
                 self._has_win_api = False
