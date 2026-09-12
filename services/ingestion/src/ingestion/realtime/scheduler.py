@@ -175,8 +175,13 @@ class RealtimeScheduler:
         stop_event: threading.Event | None = None,
         cycle_override: CycleIdentity | None = None,
         download_dir: str = "downloads",
-        concurrency: int = 4,
+        concurrency: int | None = None,
         version_string: str = "v1.0",
+        download_concurrency: int | None = None,
+        decode_concurrency: int | None = None,
+        write_concurrency: int | None = None,
+        marker_put_concurrency: int | None = None,
+        marker_get_concurrency: int | None = None,
     ) -> None:
         """Create a scheduler.
 
@@ -194,6 +199,11 @@ class RealtimeScheduler:
         self._cycle_override = cycle_override
         self._download_dir = download_dir
         self._concurrency = concurrency
+        self._download_concurrency = download_concurrency
+        self._decode_concurrency = decode_concurrency
+        self._write_concurrency = write_concurrency
+        self._marker_put_concurrency = marker_put_concurrency
+        self._marker_get_concurrency = marker_get_concurrency
         self.version_string = version_string
 
         self.discover = discover or self._discover_production
@@ -349,6 +359,11 @@ class RealtimeScheduler:
                     concurrency=self._concurrency,
                     failures=failures,
                     cancel_event=cancel_event,
+                    download_concurrency=self._download_concurrency,
+                    decode_concurrency=self._decode_concurrency,
+                    write_concurrency=self._write_concurrency,
+                    marker_put_concurrency=self._marker_put_concurrency,
+                    marker_get_concurrency=self._marker_get_concurrency,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - one model failing must not stop the other
@@ -372,6 +387,12 @@ class RealtimeScheduler:
             version_string="v1.0",
             grid_id="global_025deg",
             variable=None,
+            concurrency=self._concurrency,
+            download_concurrency=self._download_concurrency,
+            decode_concurrency=self._decode_concurrency,
+            write_concurrency=self._write_concurrency,
+            marker_put_concurrency=self._marker_put_concurrency,
+            marker_get_concurrency=self._marker_get_concurrency,
         )
 
     # ------------------------------------------------------------------

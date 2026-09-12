@@ -530,10 +530,39 @@ def _build_parser() -> argparse.ArgumentParser:
     ingest.add_argument(
         "--concurrency",
         type=int,
-        default=4,
-        help="Maximum number of forecast files fetched/ingested concurrently "
-        "per run (default 4). Bounded so NOMADS is not flooded and disk "
-        "staging stays bounded.",
+        default=None,
+        help="Generic concurrency shorthand: sets download, decode, and write concurrency "
+        "when stage-specific flags are omitted.",
+    )
+    ingest.add_argument(
+        "--download-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent file downloads from upstream (overrides --concurrency and WEATHER_INGEST_DOWNLOAD_CONCURRENCY).",
+    )
+    ingest.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent GRIB2 decode processes (overrides --concurrency and WEATHER_INGEST_DECODE_CONCURRENCY).",
+    )
+    ingest.add_argument(
+        "--write-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent region writers (overrides --concurrency and WEATHER_INGEST_WRITE_CONCURRENCY).",
+    )
+    ingest.add_argument(
+        "--marker-put-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent pre-update marker PUT operations (overrides WEATHER_INGEST_MARKER_PUT_CONCURRENCY).",
+    )
+    ingest.add_argument(
+        "--marker-get-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent finalization marker GET operations (overrides WEATHER_INGEST_MARKER_GET_CONCURRENCY).",
     )
     ingest.add_argument("--center-id", default="noaa")
     ingest.add_argument("--version-string", default="v1.0")
@@ -592,9 +621,38 @@ def _build_parser() -> argparse.ArgumentParser:
     realtime.add_argument(
         "--concurrency",
         type=int,
-        default=4,
-        help="Per-wave requested concurrency passed to the wave runner "
-        "(default 4).",
+        default=None,
+        help="Per-wave generic concurrency shorthand passed to the wave runner.",
+    )
+    realtime.add_argument(
+        "--download-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent file downloads per wave (overrides --concurrency and WEATHER_INGEST_DOWNLOAD_CONCURRENCY).",
+    )
+    realtime.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent GRIB2 decode processes per wave (overrides --concurrency and WEATHER_INGEST_DECODE_CONCURRENCY).",
+    )
+    realtime.add_argument(
+        "--write-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent region writers per wave (overrides --concurrency and WEATHER_INGEST_WRITE_CONCURRENCY).",
+    )
+    realtime.add_argument(
+        "--marker-put-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent pre-update marker PUT operations per wave (overrides WEATHER_INGEST_MARKER_PUT_CONCURRENCY).",
+    )
+    realtime.add_argument(
+        "--marker-get-concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent finalization marker GET operations per wave (overrides WEATHER_INGEST_MARKER_GET_CONCURRENCY).",
     )
 
     gc = subparsers.add_parser(
@@ -855,7 +913,9 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
         allow_custom_store=spec.allow_custom_store,
     )
     catalog_spec = _build_spec(spec, args, store_path)
-    concurrency = max(1, int(getattr(args, "concurrency", 4)))
+    req_concurrency = getattr(args, "concurrency", None)
+    if req_concurrency is not None:
+        req_concurrency = max(1, int(req_concurrency))
 
     # Each (member, lead) work item, or just (lead) for deterministic.
     # Lead-major ordering for ensemble models enables early progressive publication per settled lead.
@@ -877,8 +937,13 @@ def _ingest_one_run(spec: RunSpec, args: argparse.Namespace) -> None:
             args=args,
             catalog_spec=catalog_spec,
             store_path=store_path,
-            concurrency=concurrency,
+            concurrency=req_concurrency,
             failures=failures,
+            download_concurrency=getattr(args, "download_concurrency", None),
+            decode_concurrency=getattr(args, "decode_concurrency", None),
+            write_concurrency=getattr(args, "write_concurrency", None),
+            marker_put_concurrency=getattr(args, "marker_put_concurrency", None),
+            marker_get_concurrency=getattr(args, "marker_get_concurrency", None),
         )
     )
 
@@ -934,12 +999,20 @@ def _run_realtime(args: argparse.Namespace) -> int:
         cycle_override = CycleIdentity(
             cycle_date=args.cycle_date, cycle_hour=args.cycle_hour
         )
+    req_concurrency = getattr(args, "concurrency", None)
+    if req_concurrency is not None:
+        req_concurrency = max(1, int(req_concurrency))
     scheduler = RealtimeScheduler(
         conn_settings=settings,
         leadership=SchedulerLeadership(catalog_engine),
         cycle_override=cycle_override,
         download_dir=args.download_dir,
-        concurrency=max(1, int(args.concurrency)),
+        concurrency=req_concurrency,
+        download_concurrency=getattr(args, "download_concurrency", None),
+        decode_concurrency=getattr(args, "decode_concurrency", None),
+        write_concurrency=getattr(args, "write_concurrency", None),
+        marker_put_concurrency=getattr(args, "marker_put_concurrency", None),
+        marker_get_concurrency=getattr(args, "marker_get_concurrency", None),
     )
 
     def _handle_signal(signum: int, frame: object) -> None:

@@ -13,9 +13,11 @@ management lives here.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import struct
 import threading
+import time
 from collections.abc import Sequence
 from os import PathLike
 from typing import Any, Hashable, Mapping, MutableMapping
@@ -27,6 +29,8 @@ from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.config import IngestionSettings, settings
 from ingestion.core.s3 import resolve_s3_mapper
+
+logger = logging.getLogger(__name__)
 
 #: Canonical Weather Platform Sharded v1 (sharded_v1) binary layout constants
 SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
@@ -333,11 +337,15 @@ def prepare_run_store(
             ).item()
         )
 
+    t_init_start = time.monotonic()
     resolved = _resolve_store(store)
+    t_coords_start = time.monotonic()
     ds_coords.to_zarr(resolved, mode="w", consolidated=False, zarr_format=2)
+    coords_dur = time.monotonic() - t_coords_start
 
     # Initialize data variables directly via Zarr schema metadata without
     # allocating full logical forecast cubes or creating empty data chunks.
+    t_vars_start = time.monotonic()
     root = zarr.open_group(resolved, mode="a", zarr_format=2)
     for name, da in dataset.data_vars.items():
         # Only the spatial axes come from the source file; the lead (and for
@@ -370,8 +378,30 @@ def prepare_run_store(
         var_attrs: dict[str, object] = {"_ARRAY_DIMENSIONS": list(dims)}
         var_attrs.update(da.attrs)
         arr.attrs.update(var_attrs)  # type: ignore[arg-type]
+    vars_dur = time.monotonic() - t_vars_start
 
+    t_cons_start = time.monotonic()
     zarr.consolidate_metadata(resolved)
+    cons_dur = time.monotonic() - t_cons_start
+
+    total_init_dur = time.monotonic() - t_init_start
+    if total_init_dur >= 5.0:
+        logger.warning(
+            "prepare_run_store latency anomaly: total=%.3fs (threshold 5.0s) [coords=%.3fs, vars=%.3fs, consolidate=%.3fs]",
+            total_init_dur,
+            coords_dur,
+            vars_dur,
+            cons_dur,
+        )
+    else:
+        logger.debug(
+            "prepare_run_store: total=%.3fs [coords=%.3fs, vars=%.3fs, consolidate=%.3fs]",
+            total_init_dur,
+            coords_dur,
+            vars_dur,
+            cons_dur,
+        )
+
     return os.fspath(store) if isinstance(store, PathLike) else str(store)
 
 
