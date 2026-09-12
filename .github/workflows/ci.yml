@@ -504,6 +504,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # --- Validate Docker Compose Infrastructure Images ---
+      - name: Validate Compose configuration and pull infrastructure images
+        run: |
+          docker compose config
+          docker compose pull weather_postgres weather_redis weather_minio weather_minio_init
+
       - uses: docker/setup-buildx-action@v3
 
       # --- Build Images in Parallel via Buildx ---
