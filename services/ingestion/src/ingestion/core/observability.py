@@ -451,6 +451,12 @@ class PipelineProgressTracker:
             event="complete",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "download", success=True)
+        except Exception:
+            pass
 
     def on_download_failed(
         self, member: int | None, lead: int, *, duration_ms: float
@@ -466,6 +472,12 @@ class PipelineProgressTracker:
             event="failed",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "download", success=False)
+        except Exception:
+            pass
 
     def on_decode_start(self, member: int | None, lead: int) -> None:
         with self._lock:
@@ -490,6 +502,12 @@ class PipelineProgressTracker:
             event="complete",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "decode", success=True)
+        except Exception:
+            pass
 
     def on_decode_failed(
         self, member: int | None, lead: int, *, duration_ms: float
@@ -505,6 +523,12 @@ class PipelineProgressTracker:
             event="failed",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "decode", success=False)
+        except Exception:
+            pass
 
     def on_write_start(self, member: int | None, lead: int, *, is_seed: bool = False) -> None:
         with self._lock:
@@ -529,6 +553,12 @@ class PipelineProgressTracker:
             event="complete",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "write", success=True)
+        except Exception:
+            pass
 
     def on_write_failed(
         self, member: int | None, lead: int, *, duration_ms: float
@@ -544,6 +574,12 @@ class PipelineProgressTracker:
             event="failed",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "write", success=False)
+        except Exception:
+            pass
 
     def on_finalize_start(self) -> None:
         with self._lock:
@@ -553,6 +589,12 @@ class PipelineProgressTracker:
         self.log_stage_transition(
             member=None, lead=None, stage="finalize", event="start"
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "finalize", success=True)
+        except Exception:
+            pass
 
     def on_finalize_complete(self, *, duration_ms: float) -> None:
         with self._lock:
@@ -565,6 +607,12 @@ class PipelineProgressTracker:
             event="complete",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "finalize", success=True)
+        except Exception:
+            pass
 
     def on_finalize_failed(self, *, duration_ms: float) -> None:
         with self._lock:
@@ -576,6 +624,12 @@ class PipelineProgressTracker:
             event="failed",
             duration_ms=duration_ms,
         )
+        try:
+            from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+
+            INGESTION_COLLECTOR.record_progress(self.model, "finalize", success=False)
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # Progress rendering helpers

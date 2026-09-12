@@ -636,6 +636,20 @@ async def _run_wave_impl(
         cycle_str=spec.cycle_time.strftime("%Y-%m-%d %H:%MZ"),
         total_items=len(items),
     )
+    pre_rss = 0
+    try:
+        from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+        from ingestion.monitoring.resources import RESOURCE_COLLECTOR
+
+        INGESTION_COLLECTOR.register_run_start(
+            spec.model,
+            spec.cycle_time.strftime("%Y-%m-%d %H:%MZ"),
+            tracker,
+        )
+        pre_rss = RESOURCE_COLLECTOR.get_memory_info().rss_bytes
+    except Exception as exc:
+        logger.debug("Monitoring run start registration failed: %s", exc)
+
     renderer = create_progress_renderer(tracker, no_progress=no_progress)
     renderer.start()
     tracker.record_milestone("run_start")
@@ -1303,6 +1317,33 @@ async def _run_wave_impl(
     if not no_progress:
         print("\n" + report)
     logger.info("Startup timeline breakdown:\n%s", report)
+
+    try:
+        from ingestion.monitoring.ingestion_collector import INGESTION_COLLECTOR
+        from ingestion.monitoring.resources import LEAK_DETECTOR, RESOURCE_COLLECTOR
+
+        timeline_breakdown = {
+            "cold_start": tracker.timeline.duration("seed_download_start", "first_non_seed_download_start") or 0.0,
+            "prepare_run_store": tracker.timeline.duration("prepare_run_store_start", "prepare_run_store_complete") or 0.0,
+            "pre_update": tracker.timeline.duration("pre_update_start", "pre_update_complete") or 0.0,
+            "finalize": tracker.timeline.duration("finalize_start", "finalize_complete") or 0.0,
+        }
+        INGESTION_COLLECTOR.register_run_finish(
+            spec.model,
+            success=(len(failures) == 0 and not cancelled),
+            duration_s=tracker.elapsed,
+            timeline_breakdown=timeline_breakdown,
+        )
+        post_mem = RESOURCE_COLLECTOR.get_memory_info()
+        LEAK_DETECTOR.record_cycle(
+            cycle_key=f"{spec.model}_{spec.cycle_time.strftime('%Y%m%d_%H%M')}",
+            pre_baseline_rss=pre_rss,
+            peak_rss=post_mem.peak_rss_bytes,
+            post_baseline_rss=post_mem.rss_bytes,
+            threads=RESOURCE_COLLECTOR.get_thread_count(),
+        )
+    except Exception as exc:
+        logger.debug("Monitoring run finish registration failed: %s", exc)
 
     if cancelled:
         raise asyncio.CancelledError

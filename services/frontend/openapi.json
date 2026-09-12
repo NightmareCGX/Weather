@@ -1667,6 +1667,44 @@
           }
         }
       }
+    },
+    "/v1/metrics": {
+      "get": {
+        "summary": "Get Prometheus metrics for the API serving layer",
+        "description": "Return API serving layer and platform metrics in Prometheus text exposition format.",
+        "operationId": "get_api_metrics_v1_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health/detailed": {
+      "get": {
+        "summary": "Get detailed system health diagnostics",
+        "description": "Return detailed system diagnostics including memory, threads, and pool state.",
+        "operationId": "get_detailed_system_health_v1_health_detailed_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Detailed System Health V1 Health Detailed Get"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1769,6 +1807,28 @@
             },
             "type": "array",
             "title": "Models"
+          },
+          "serving_start_valid_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Serving Start Valid Time"
+          },
+          "generated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generated At"
           }
         },
         "type": "object",

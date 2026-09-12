@@ -1,0 +1,468 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "1. Platform Overview",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 2,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "Postgres Status",
+      "type": "stat",
+      "targets": [
+        { "expr": "weather_postgres_connected", "legendFormat": "Postgres" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 3,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "MinIO Status",
+      "type": "stat",
+      "targets": [
+        { "expr": "weather_storage_connected", "legendFormat": "MinIO" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 4,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "GFS Lag (Cycles)",
+      "type": "stat",
+      "targets": [
+        { "expr": "weather_ingestion_lag_cycles{model=\"gfs\"}", "legendFormat": "GFS Lag" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 5,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "GEFS Lag (Cycles)",
+      "type": "stat",
+      "targets": [
+        { "expr": "weather_ingestion_lag_cycles{model=\"gefs\"}", "legendFormat": "GEFS Lag" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 6,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "Pipeline Stuck Alert",
+      "type": "stat",
+      "targets": [
+        { "expr": "max(weather_ingestion_stuck_warning)", "legendFormat": "Stuck" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 7,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "Anti-Resurrection Invariants",
+      "type": "stat",
+      "targets": [
+        { "expr": "weather_anti_resurrection_violations_count + weather_lifecycle_invariant_violations_count", "legendFormat": "Violations" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 8,
+      "title": "2. Resource Usage & Memory Trends",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
+      "id": 9,
+      "title": "Process Memory (RSS / VMS / Peak)",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "weather_process_memory_rss_bytes", "legendFormat": "RSS" },
+        { "expr": "weather_process_memory_vms_bytes", "legendFormat": "VMS" },
+        { "expr": "weather_process_memory_peak_rss_bytes", "legendFormat": "Peak RSS" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
+      "id": 10,
+      "title": "Process CPU Utilization %",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "weather_process_cpu_percent", "legendFormat": "CPU %" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "id": 11,
+      "title": "Disk Utilization % & Capacity",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "weather_disk_used_percent", "legendFormat": "Used % ({{path}})" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 12,
+      "title": "3. GFS Ingestion Pipeline",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "id": 13,
+      "title": "GFS Stage Latencies (Cold-Start / Prepare / Marker / Finalize)",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "weather_ingestion_cold_start_duration_seconds{model=\"gfs\"}", "legendFormat": "Cold Start" },
+        { "expr": "weather_ingestion_prepare_store_duration_seconds{model=\"gfs\"}", "legendFormat": "Prepare Store" },
+        { "expr": "weather_ingestion_pre_update_duration_seconds{model=\"gfs\"}", "legendFormat": "Pre-Update" },
+        { "expr": "weather_ingestion_finalization_duration_seconds{model=\"gfs\"}", "legendFormat": "Finalization" },
+        { "expr": "weather_ingestion_cycle_duration_seconds{model=\"gfs\"}", "legendFormat": "Total Run" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "id": 14,
+      "title": "GFS Target Throughput (Regions/sec)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(weather_ingestion_items_completed_total{model=\"gfs\"}[5m])", "legendFormat": "Completed ({{phase}})" },
+        { "expr": "rate(weather_ingestion_items_failed_total{model=\"gfs\"}[5m])", "legendFormat": "Failed ({{phase}})" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "id": 15,
+      "title": "4. GEFS Ensemble Ingestion",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 16,
+      "title": "GEFS Member Completeness & Servability",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "weather_gefs_available_members_count", "legendFormat": "Committed Members" },
+        { "expr": "weather_gefs_servable_status * 26", "legendFormat": "Servable (>=26)" },
+        { "expr": "weather_gefs_ready_status * 30", "legendFormat": "Ready (30/30)" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 17,
+      "title": "GEFS Cycle Duration & Finalization",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "weather_ingestion_cycle_duration_seconds{model=\"gefs\"}", "legendFormat": "Cycle Duration" },
+        { "expr": "weather_ingestion_finalization_duration_seconds{model=\"gefs\"}", "legendFormat": "Finalization" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 18,
+      "title": "5. PostgreSQL Database Health",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 33 },
+      "id": 19,
+      "title": "Connection Utilization",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "weather_postgres_active_connections", "legendFormat": "Active Connections" },
+        { "expr": "weather_postgres_max_connections", "legendFormat": "Max Connections" },
+        { "expr": "weather_postgres_pool_checked_out", "legendFormat": "Pool Checked Out" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 33 },
+      "id": 20,
+      "title": "Database & Table Sizes",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "weather_postgres_total_size_bytes", "legendFormat": "Total DB Size" },
+        { "expr": "weather_postgres_table_size_bytes", "legendFormat": "{{table_name}}" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 33 },
+      "id": 21,
+      "title": "Dead Tuples & Lock Waits",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "weather_postgres_table_dead_tuples", "legendFormat": "Dead Tuples ({{table_name}})" },
+        { "expr": "weather_postgres_lock_waits", "legendFormat": "Lock Waits" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "id": 22,
+      "title": "6. MinIO / Object Storage",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 42 },
+      "id": 23,
+      "title": "Storage Probe Latency",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [
+        { "expr": "weather_storage_probe_latency_milliseconds", "legendFormat": "Probe Latency (ms)" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 42 },
+      "id": 24,
+      "title": "Operations & Failures",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(weather_storage_operations_total[5m])", "legendFormat": "Ops/s ({{operation}})" },
+        { "expr": "rate(weather_storage_operation_failures_total[5m])", "legendFormat": "Failures/s ({{operation}})" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
+      "id": 25,
+      "title": "7. Lifecycle & Finalizer",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+      "id": 26,
+      "title": "Cycle States (Active / Claimed / Tombstones)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "weather_lifecycle_active_cycles", "legendFormat": "Active Cycles" },
+        { "expr": "weather_lifecycle_claimed_cycles", "legendFormat": "Claimed Deletion" },
+        { "expr": "weather_lifecycle_tombstone_cycles", "legendFormat": "Permanent Tombstones" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+      "id": 27,
+      "title": "Oldest Deletion Claim Age",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "weather_lifecycle_oldest_claim_age_seconds", "legendFormat": "Oldest Claim Age (s)" },
+        { "expr": "weather_lifecycle_stuck_claims_warning", "legendFormat": "Claims > 1h" },
+        { "expr": "weather_lifecycle_stuck_claims_critical", "legendFormat": "Claims > 4h" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 },
+      "id": 28,
+      "title": "8. Granular Shard Reclamation",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 },
+      "id": 29,
+      "title": "Reclamation Queue Depth by State",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "weather_reclamation_queue_count{status=\"queued\"}", "legendFormat": "Queued" },
+        { "expr": "weather_reclamation_queue_count{status=\"deleting\"}", "legendFormat": "Deleting" },
+        { "expr": "weather_reclamation_queue_count{status=\"deleted\"}", "legendFormat": "Deleted" },
+        { "expr": "weather_reclamation_queue_count{status=\"failed\"}", "legendFormat": "Failed" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 },
+      "id": 30,
+      "title": "Oldest Ages in Queue",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "weather_reclamation_oldest_queued_age_seconds", "legendFormat": "Oldest Queued" },
+        { "expr": "weather_reclamation_oldest_deleting_age_seconds", "legendFormat": "Oldest Deleting (Lease)" },
+        { "expr": "weather_reclamation_oldest_failed_age_seconds", "legendFormat": "Oldest Failed" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 68 },
+      "id": 31,
+      "title": "9. Metadata Retention Sweeper",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 69 },
+      "id": 32,
+      "title": "14-Day Retention Backlog",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "weather_metadata_sweeper_eligible_tombstones", "legendFormat": "Eligible Tombstones" },
+        { "expr": "weather_metadata_sweeper_unpurged_metadata_count", "legendFormat": "Unpurged Metadata Backlog" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 69 },
+      "id": 33,
+      "title": "Oldest Overdue Metadata Past 14-Day Window",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "weather_metadata_sweeper_oldest_overdue_seconds", "legendFormat": "Overdue Age (s)" }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 77 },
+      "id": 34,
+      "title": "10. Invariants, Errors & Alerts",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 78 },
+      "id": 35,
+      "title": "Active Invariant & Anti-Resurrection Violations",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "weather_anti_resurrection_violations_count", "legendFormat": "Anti-Resurrection Violations" },
+        { "expr": "weather_lifecycle_invariant_violations_count", "legendFormat": "Lifecycle Invariant Violations" },
+        { "expr": "weather_memory_leak_warning", "legendFormat": "Memory Leak Indicator" }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["weather", "production", "monitoring"],
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"] },
+  "timezone": "utc",
+  "title": "Global Probabilistic Weather Platform — Operations Dashboard",
+  "version": 1
+}
