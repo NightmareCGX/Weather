@@ -510,9 +510,10 @@ class RunCoordinator:
         regions: list[WaveRegion],
         run_id: str | None,
         is_same_cycle: bool,
-        executor: object,
+        executor: object | None = None,
         cancel_event: threading.Event,
         observer: object | None = None,
+        marker_concurrency: int | None = None,
     ) -> list[WaveRegion]:
         """Declare UPDATING markers for every target under the EXCLUSIVE gate.
 
@@ -526,7 +527,8 @@ class RunCoordinator:
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        assert isinstance(executor, ThreadPoolExecutor)
+        if executor is not None:
+            assert isinstance(executor, ThreadPoolExecutor)
         co = StoreLockCoordinator(
             conn,
             store_path=self.store_path,
@@ -557,15 +559,38 @@ class RunCoordinator:
             targets = {r.region_id: r for r in regions}
             region_ids = sorted(targets)
             put_one = self._make_updating_put(regions)
-            result = put_markers_rolling(
-                region_ids,
-                put_one,
-                concurrency=min(8, max(1, len(region_ids))),
-                cancel_event=cancel_event,
-                timeout_seconds=self.timeout_seconds,
-                executor=executor,
-                observer=observer,
+
+            effective_concurrency = (
+                int(marker_concurrency)
+                if marker_concurrency is not None
+                else int(getattr(settings, "MARKER_PUT_CONCURRENCY", 32))
             )
+            max_exec_workers = getattr(executor, "_max_workers", None)
+            if max_exec_workers is not None and isinstance(max_exec_workers, int) and max_exec_workers > 0:
+                effective_concurrency = min(effective_concurrency, max_exec_workers)
+            effective_concurrency = max(1, min(effective_concurrency, len(region_ids), 64))
+
+            if executor is not None:
+                result = put_markers_rolling(
+                    region_ids,
+                    put_one,
+                    concurrency=effective_concurrency,
+                    cancel_event=cancel_event,
+                    timeout_seconds=self.timeout_seconds,
+                    executor=executor,
+                    observer=observer,
+                )
+            else:
+                with ThreadPoolExecutor(max_workers=effective_concurrency) as marker_executor:
+                    result = put_markers_rolling(
+                        region_ids,
+                        put_one,
+                        concurrency=effective_concurrency,
+                        cancel_event=cancel_event,
+                        timeout_seconds=self.timeout_seconds,
+                        executor=marker_executor,
+                        observer=observer,
+                    )
             if observer is not None and hasattr(observer, "record_milestone"):
                 observer.record_milestone("pre_update_complete")
 

@@ -238,11 +238,18 @@ class ConcurrencyPlan:
       pipeline, bounding peak resident decoded datasets in memory.
     """
 
-    requested: int
     download_concurrency: int
     decode_concurrency: int
     write_concurrency: int
     staging_concurrency: int
+    marker_put_concurrency: int = 32
+    marker_get_concurrency: int = 32
+    requested: int | None = None
+    download_requested: int | None = None
+    decode_requested: int | None = None
+    write_requested: int | None = None
+    marker_put_requested: int | None = None
+    marker_get_requested: int | None = None
 
 
 def _detect_effective_cpus() -> int:
@@ -272,14 +279,28 @@ def _detect_effective_cpus() -> int:
 
 
 def _resolve_concurrency_plan(
-    requested: int, settings: Any | None = None
+    requested: int | None = None,
+    settings: Any | None = None,
+    *,
+    download_override: int | None = None,
+    decode_override: int | None = None,
+    write_override: int | None = None,
+    marker_put_override: int | None = None,
+    marker_get_override: int | None = None,
 ) -> ConcurrencyPlan:
-    """Derive decoupled stage capacities from requested CLI concurrency.
+    """Derive decoupled stage capacities from CLI/ENV/default configuration.
+
+    Precedence:
+        stage_override > legacy requested (--concurrency) > ENV / settings > code default
 
     Args:
-        requested: Requested concurrency integer (from ``--concurrency``).
-        settings: Optional ``IngestionSettings`` instance. Defaults to the
-            global settings object.
+        requested: Optional generic concurrency integer (from legacy ``--concurrency``).
+        settings: Optional ``IngestionSettings`` instance. Defaults to global settings.
+        download_override: Stage-specific download concurrency override.
+        decode_override: Stage-specific decode concurrency override.
+        write_override: Stage-specific write concurrency override.
+        marker_put_override: Stage-specific marker PUT concurrency override.
+        marker_get_override: Stage-specific marker GET concurrency override.
 
     Returns:
         The resolved :class:`ConcurrencyPlan`.
@@ -289,23 +310,72 @@ def _resolve_concurrency_plan(
 
         settings = default_settings
 
-    req = max(1, requested)
-    eff_cpus = _detect_effective_cpus()
-    max_download = max(1, int(settings.MAX_DOWNLOAD_CONCURRENCY))
-    max_decode = max(1, int(settings.MAX_DECODE_CONCURRENCY))
-    max_write = max(1, int(settings.MAX_WRITE_CONCURRENCY))
+    from ingestion.core.config import (
+        ABSOLUTE_MAX_DECODE_CONCURRENCY,
+        ABSOLUTE_MAX_DOWNLOAD_CONCURRENCY,
+        ABSOLUTE_MAX_MARKER_GET_CONCURRENCY,
+        ABSOLUTE_MAX_MARKER_PUT_CONCURRENCY,
+        ABSOLUTE_MAX_WRITE_CONCURRENCY,
+    )
 
-    download = min(req, max_download)
-    decode = min(req, eff_cpus, max_decode)
-    write = min(req, max_write)
+    eff_cpus = _detect_effective_cpus()
+    db_pool = int(getattr(settings, "DB_POOL_SIZE", 10))
+
+    # Layer 2: Configured deployment max ceilings bounded by Layer 3 absolute emergency caps
+    max_dl = min(int(settings.MAX_DOWNLOAD_CONCURRENCY), ABSOLUTE_MAX_DOWNLOAD_CONCURRENCY)
+    max_dec = min(int(settings.MAX_DECODE_CONCURRENCY), eff_cpus, ABSOLUTE_MAX_DECODE_CONCURRENCY)
+    max_wr = min(int(settings.MAX_WRITE_CONCURRENCY), db_pool, ABSOLUTE_MAX_WRITE_CONCURRENCY)
+    max_put = min(int(settings.MAX_MARKER_PUT_CONCURRENCY), ABSOLUTE_MAX_MARKER_PUT_CONCURRENCY)
+    max_get = min(int(settings.MAX_MARKER_GET_CONCURRENCY), ABSOLUTE_MAX_MARKER_GET_CONCURRENCY)
+
+    # Layer 1 / CLI requested concurrency:
+    # stage override > requested legacy > operational setting / default
+    req_dl = (
+        download_override
+        if download_override is not None
+        else (requested if requested is not None else int(settings.DOWNLOAD_CONCURRENCY))
+    )
+    req_dec = (
+        decode_override
+        if decode_override is not None
+        else (requested if requested is not None else int(settings.DECODE_CONCURRENCY))
+    )
+    req_wr = (
+        write_override
+        if write_override is not None
+        else (requested if requested is not None else int(settings.WRITE_CONCURRENCY))
+    )
+    req_put = (
+        marker_put_override
+        if marker_put_override is not None
+        else int(settings.MARKER_PUT_CONCURRENCY)
+    )
+    req_get = (
+        marker_get_override
+        if marker_get_override is not None
+        else int(settings.MARKER_GET_CONCURRENCY)
+    )
+
+    download = min(max(1, req_dl), max_dl)
+    decode = min(max(1, req_dec), max_dec)
+    write = min(max(1, req_wr), max_wr)
     staging = download + decode + write
+    marker_put = min(max(1, req_put), max_put)
+    marker_get = min(max(1, req_get), max_get)
 
     return ConcurrencyPlan(
-        requested=req,
         download_concurrency=download,
         decode_concurrency=decode,
         write_concurrency=write,
         staging_concurrency=staging,
+        marker_put_concurrency=marker_put,
+        marker_get_concurrency=marker_get,
+        requested=requested,
+        download_requested=req_dl,
+        decode_requested=req_dec,
+        write_requested=req_wr,
+        marker_put_requested=req_put,
+        marker_get_requested=req_get,
     )
 
 
@@ -464,9 +534,15 @@ async def _run_wave(
     args: Any,
     catalog_spec: RunCatalogSpec,
     store_path: str,
-    concurrency: int,
-    failures: list[str],
+    concurrency: int | None = None,
+    failures: list[str] | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    download_concurrency: int | None = None,
+    decode_concurrency: int | None = None,
+    write_concurrency: int | None = None,
+    marker_put_concurrency: int | None = None,
+    marker_get_concurrency: int | None = None,
 ) -> str:
     """Download and ingest every lead/member target of a single forecast run.
 
@@ -476,6 +552,7 @@ async def _run_wave(
     """
     from ingestion.core.s3 import close_wave_data_s3_fs
 
+    failures_list = failures if failures is not None else []
     try:
         return await _run_wave_impl(
             spec=spec,
@@ -483,8 +560,13 @@ async def _run_wave(
             catalog_spec=catalog_spec,
             store_path=store_path,
             concurrency=concurrency,
-            failures=failures,
+            failures=failures_list,
             cancel_event=cancel_event,
+            download_concurrency=download_concurrency,
+            decode_concurrency=decode_concurrency,
+            write_concurrency=write_concurrency,
+            marker_put_concurrency=marker_put_concurrency,
+            marker_get_concurrency=marker_get_concurrency,
         )
     finally:
         close_wave_data_s3_fs()
@@ -495,9 +577,15 @@ async def _run_wave_impl(
     args: Any,
     catalog_spec: RunCatalogSpec,
     store_path: str,
-    concurrency: int,
-    failures: list[str],
+    concurrency: int | None = None,
+    failures: list[str] | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    download_concurrency: int | None = None,
+    decode_concurrency: int | None = None,
+    write_concurrency: int | None = None,
+    marker_put_concurrency: int | None = None,
+    marker_get_concurrency: int | None = None,
 ) -> str:
     """Internal wave execution pipeline.
 
@@ -549,12 +637,16 @@ async def _run_wave_impl(
         LeadTimeMismatchError: If a downloaded file's lead disagrees with the
             requested lead.
     """
+    if failures is None:
+        failures = []
+
     import logging
     import uuid
     from concurrent.futures import ThreadPoolExecutor
 
     from ingestion.core.cancel import await_all_workers_non_abandoning
-    from ingestion.core.config import settings
+    import ingestion.core.config as config_mod
+    settings = config_mod.settings
     from ingestion.core.coordinator import (
         RunCoordinator,
         WaveRegion,
@@ -668,23 +760,72 @@ async def _run_wave_impl(
 
     ui_task = asyncio.create_task(_ui_update_loop())
 
+    def _opt_int(val: Any) -> int | None:
+        if isinstance(val, int) and not isinstance(val, bool):
+            return val
+        return None
+
+    dl_override = (
+        _opt_int(download_concurrency)
+        if download_concurrency is not None
+        else _opt_int(getattr(args, "download_concurrency", None))
+    )
+    dec_override = (
+        _opt_int(decode_concurrency)
+        if decode_concurrency is not None
+        else _opt_int(getattr(args, "decode_concurrency", None))
+    )
+    wr_override = (
+        _opt_int(write_concurrency)
+        if write_concurrency is not None
+        else _opt_int(getattr(args, "write_concurrency", None))
+    )
+    put_override = (
+        _opt_int(marker_put_concurrency)
+        if marker_put_concurrency is not None
+        else _opt_int(getattr(args, "marker_put_concurrency", None))
+    )
+    get_override = (
+        _opt_int(marker_get_concurrency)
+        if marker_get_concurrency is not None
+        else _opt_int(getattr(args, "marker_get_concurrency", None))
+    )
+    req_concurrency = (
+        _opt_int(concurrency)
+        if concurrency is not None
+        else _opt_int(getattr(args, "concurrency", None))
+    )
+
     # Resolve decoupled stage capacities
-    plan = _resolve_concurrency_plan(concurrency, settings)
+    plan = _resolve_concurrency_plan(
+        requested=req_concurrency,
+        settings=settings,
+        download_override=dl_override,
+        decode_override=dec_override,
+        write_override=wr_override,
+        marker_put_override=put_override,
+        marker_get_override=get_override,
+    )
+    eff_cpus_detected = _detect_effective_cpus()
     logger.info(
-        "Starting wave: model=%s cycle=%s items=%d requested_concurrency=%d "
-        "effective_concurrency=(download=%d, decode=%d, write=%d, staging=%d) "
-        "db_pool=(size=%d, max_overflow=%d, timeout=%.1fs)",
-        spec.model,
-        spec.cycle_time,
-        len(items),
-        concurrency,
+        "Ingestion concurrency: download=%d (req=%s, max=%d) decode=%d (req=%s, max=%d, cpu=%d) "
+        "write=%d (req=%s, max=%d, db_pool=%d) staging=%d marker_put=%d (max=%d) marker_get=%d (max=%d)",
         plan.download_concurrency,
+        plan.download_requested,
+        int(settings.MAX_DOWNLOAD_CONCURRENCY),
         plan.decode_concurrency,
+        plan.decode_requested,
+        int(settings.MAX_DECODE_CONCURRENCY),
+        eff_cpus_detected,
         plan.write_concurrency,
-        plan.staging_concurrency,
+        plan.write_requested,
+        int(settings.MAX_WRITE_CONCURRENCY),
         int(settings.DB_POOL_SIZE),
-        int(settings.DB_MAX_OVERFLOW),
-        float(settings.DB_POOL_TIMEOUT_SECONDS),
+        plan.staging_concurrency,
+        plan.marker_put_concurrency,
+        int(settings.MAX_MARKER_PUT_CONCURRENCY),
+        plan.marker_get_concurrency,
+        int(settings.MAX_MARKER_GET_CONCURRENCY),
     )
 
     coordinator = RunCoordinator(
@@ -856,15 +997,17 @@ async def _run_wave_impl(
                     )
                     for member, lead, is_mean in items
                 ]
-                coordinator.pre_update_wave(
-                    pre_conn,
-                    regions=regions,
-                    run_id=run_id,
-                    is_same_cycle=is_same_cycle,
-                    executor=executor,
-                    cancel_event=wave_cancel_event,
-                    observer=tracker,
-                )
+                with ThreadPoolExecutor(max_workers=plan.marker_put_concurrency) as marker_executor:
+                    coordinator.pre_update_wave(
+                        pre_conn,
+                        regions=regions,
+                        run_id=run_id,
+                        is_same_cycle=is_same_cycle,
+                        executor=marker_executor,
+                        cancel_event=wave_cancel_event,
+                        observer=tracker,
+                        marker_concurrency=plan.marker_put_concurrency,
+                    )
                 tracker.set_init_phase("store_ready")
                 tracker.record_milestone("store_ready")
             except Exception:
@@ -1110,6 +1253,7 @@ async def _run_wave_impl(
                                 member=member,
                                 is_mean=is_mean,
                             )
+                            del decode_fut
                             _validate_requested_lead(ds, lead)
                             _validate_requested_member(ds, member)
 
@@ -1238,8 +1382,10 @@ async def _run_wave_impl(
                     raise RuntimeError(
                         "Finalization gate invariant violated: active executor worker detected"
                     )
+            registered_worker_futures.clear()
+            pipeline_tasks.clear()
 
-                tracker.record_milestone("download_client_close_start")
+            tracker.record_milestone("download_client_close_start")
         tracker.record_milestone("download_client_close_complete")
 
         # 7. Coalesced finalization (after all worker Futures drained).
@@ -1258,6 +1404,7 @@ async def _run_wave_impl(
                 expected_leads=horizon_leads,
                 expected_members=horizon_members,
                 observer=tracker,
+                marker_concurrency=plan.marker_get_concurrency,
             )
             status = finalize_result.status
             fin_dur = (time.monotonic() - t_fin_start) * 1000.0

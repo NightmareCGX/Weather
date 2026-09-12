@@ -3,8 +3,17 @@
 from pathlib import Path
 from typing import Any
 
-from pydantic import model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: LAYER 3: Code-only absolute emergency ceilings for ingestion stage concurrency.
+#: These protect against accidental operator configuration (e.g. MAX=100000).
+#: These are NOT ordinary deployment tuning knobs.
+ABSOLUTE_MAX_DOWNLOAD_CONCURRENCY: int = 128
+ABSOLUTE_MAX_DECODE_CONCURRENCY: int = 128
+ABSOLUTE_MAX_WRITE_CONCURRENCY: int = 32
+ABSOLUTE_MAX_MARKER_PUT_CONCURRENCY: int = 128
+ABSOLUTE_MAX_MARKER_GET_CONCURRENCY: int = 256
 
 
 def find_repository_root(start_path: Path | None = None) -> Path | None:
@@ -115,10 +124,96 @@ class IngestionSettings(BaseSettings):
     DB_MAX_OVERFLOW: Any = 5
     DB_POOL_TIMEOUT_SECONDS: Any = 30.0
 
-    #: Default stage concurrency ceilings (clamped by CLI requested concurrency).
-    MAX_DOWNLOAD_CONCURRENCY: Any = 24
-    MAX_DECODE_CONCURRENCY: Any = 8
-    MAX_WRITE_CONCURRENCY: Any = 6
+    # -------------------------------------------------------------------------
+    # LAYER 1: Operational Concurrency (Normal deployment tuning)
+    # -------------------------------------------------------------------------
+    #: Conservative code defaults: download=8, decode=4, write=4, marker_put=32, marker_get=32.
+    DOWNLOAD_CONCURRENCY: int = Field(
+        default=8,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_DOWNLOAD_CONCURRENCY",
+            "DOWNLOAD_CONCURRENCY",
+        ),
+        description="Operational concurrency for upstream file downloads.",
+    )
+    DECODE_CONCURRENCY: int = Field(
+        default=4,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_DECODE_CONCURRENCY",
+            "DECODE_CONCURRENCY",
+        ),
+        description="Operational concurrency for GRIB2 decode processes.",
+    )
+    WRITE_CONCURRENCY: int = Field(
+        default=4,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_WRITE_CONCURRENCY",
+            "WRITE_CONCURRENCY",
+        ),
+        description="Operational concurrency for region writers.",
+    )
+    MARKER_PUT_CONCURRENCY: int = Field(
+        default=32,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_MARKER_PUT_CONCURRENCY",
+            "MARKER_PUT_CONCURRENCY",
+        ),
+        description="Operational concurrency for pre-update marker PUT operations.",
+    )
+    MARKER_GET_CONCURRENCY: int = Field(
+        default=32,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_MARKER_GET_CONCURRENCY",
+            "MARKER_GET_CONCURRENCY",
+        ),
+        description="Operational concurrency for finalization marker GET operations.",
+    )
+
+    # -------------------------------------------------------------------------
+    # LAYER 2: Configurable Deployment Max Ceilings (Advanced ceiling overrides)
+    # -------------------------------------------------------------------------
+    #: Code defaults: download=64, decode=64, write=16, marker_put=64, marker_get=128.
+    #: Legacy MAX_*_CONCURRENCY names map here to preserve ceiling semantics.
+    MAX_DOWNLOAD_CONCURRENCY: int = Field(
+        default=64,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_MAX_DOWNLOAD_CONCURRENCY",
+            "MAX_DOWNLOAD_CONCURRENCY",
+        ),
+        description="Configured deployment ceiling for concurrent downloads.",
+    )
+    MAX_DECODE_CONCURRENCY: int = Field(
+        default=64,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_MAX_DECODE_CONCURRENCY",
+            "MAX_DECODE_CONCURRENCY",
+        ),
+        description="Configured deployment ceiling for concurrent decode workers.",
+    )
+    MAX_WRITE_CONCURRENCY: int = Field(
+        default=6,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_MAX_WRITE_CONCURRENCY",
+            "MAX_WRITE_CONCURRENCY",
+        ),
+        description="Configured deployment ceiling for concurrent region writes.",
+    )
+    MAX_MARKER_PUT_CONCURRENCY: int = Field(
+        default=64,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_MAX_MARKER_PUT_CONCURRENCY",
+            "MAX_MARKER_PUT_CONCURRENCY",
+        ),
+        description="Configured deployment ceiling for pre-update marker PUT operations.",
+    )
+    MAX_MARKER_GET_CONCURRENCY: int = Field(
+        default=128,
+        validation_alias=AliasChoices(
+            "WEATHER_INGEST_MAX_MARKER_GET_CONCURRENCY",
+            "MAX_MARKER_GET_CONCURRENCY",
+        ),
+        description="Configured deployment ceiling for finalization marker GET operations.",
+    )
 
     MINIO_ENDPOINT: Any = "localhost:9000"
     MINIO_ACCESS_KEY: Any = "minio_admin"
@@ -130,11 +225,7 @@ class IngestionSettings(BaseSettings):
     MINIO_SECURE: bool = False
     MINIO_BUCKET_NAME: Any = "weather-data"
 
-    # Wave pre-update marker-PUT concurrency / timeout (region-write protocol).
-    MARKER_PUT_CONCURRENCY: Any = 8
     MARKER_PUT_TIMEOUT_SECONDS: Any = 30.0
-    # Coalesced finalization marker-GET concurrency (P1-B bounded retrieval).
-    MARKER_GET_CONCURRENCY: Any = 32
     # Advisory-lock acquisition timeout for the ingestion coordinator.
     ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
 
@@ -216,10 +307,17 @@ class IngestionSettings(BaseSettings):
         pool_size = int(self.DB_POOL_SIZE)
         max_overflow = int(self.DB_MAX_OVERFLOW)
         pool_timeout = float(self.DB_POOL_TIMEOUT_SECONDS)
+        download = int(self.DOWNLOAD_CONCURRENCY)
         max_download = int(self.MAX_DOWNLOAD_CONCURRENCY)
+        decode = int(self.DECODE_CONCURRENCY)
         max_decode = int(self.MAX_DECODE_CONCURRENCY)
+        write = int(self.WRITE_CONCURRENCY)
         max_write = int(self.MAX_WRITE_CONCURRENCY)
-        max_marker_get = int(self.MARKER_GET_CONCURRENCY)
+        marker_put = int(self.MARKER_PUT_CONCURRENCY)
+        max_marker_put = int(self.MAX_MARKER_PUT_CONCURRENCY)
+        marker_get = int(self.MARKER_GET_CONCURRENCY)
+        max_marker_get = int(self.MAX_MARKER_GET_CONCURRENCY)
+
         s3_max_pool = int(self.S3_MAX_POOL_CONNECTIONS)
         s3_ctrl_pool = int(self.S3_CONTROL_MAX_POOL_CONNECTIONS)
         active_poll = float(self.REALTIME_ACTIVE_POLL_SECONDS)
@@ -246,27 +344,77 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"DB_POOL_TIMEOUT_SECONDS must be > 0.0, got {pool_timeout}"
             )
+
+        # 1. Operational concurrency must be >= 1
+        if download < 1:
+            raise ValueError(f"DOWNLOAD_CONCURRENCY must be >= 1, got {download}")
+        if decode < 1:
+            raise ValueError(f"DECODE_CONCURRENCY must be >= 1, got {decode}")
+        if write < 1:
+            raise ValueError(f"WRITE_CONCURRENCY must be >= 1, got {write}")
+        if marker_put < 1:
+            raise ValueError(f"MARKER_PUT_CONCURRENCY must be >= 1, got {marker_put}")
+        if marker_get < 1:
+            raise ValueError(f"MARKER_GET_CONCURRENCY must be >= 1, got {marker_get}")
+
+        # 2. Configured deployment max ceilings >= 1 and <= absolute emergency ceilings
         if max_download < 1:
+            raise ValueError(f"MAX_DOWNLOAD_CONCURRENCY must be >= 1, got {max_download}")
+        if max_download > ABSOLUTE_MAX_DOWNLOAD_CONCURRENCY:
             raise ValueError(
-                f"MAX_DOWNLOAD_CONCURRENCY must be >= 1, got {max_download}"
+                f"MAX_DOWNLOAD_CONCURRENCY ({max_download}) must not exceed "
+                f"emergency ceiling ({ABSOLUTE_MAX_DOWNLOAD_CONCURRENCY})"
             )
+
         if max_decode < 1:
+            raise ValueError(f"MAX_DECODE_CONCURRENCY must be >= 1, got {max_decode}")
+        if max_decode > ABSOLUTE_MAX_DECODE_CONCURRENCY:
             raise ValueError(
-                f"MAX_DECODE_CONCURRENCY must be >= 1, got {max_decode}"
+                f"MAX_DECODE_CONCURRENCY ({max_decode}) must not exceed "
+                f"emergency ceiling ({ABSOLUTE_MAX_DECODE_CONCURRENCY})"
             )
+
         if max_write < 1:
+            raise ValueError(f"MAX_WRITE_CONCURRENCY must be >= 1, got {max_write}")
+        if max_write > ABSOLUTE_MAX_WRITE_CONCURRENCY:
             raise ValueError(
-                f"MAX_WRITE_CONCURRENCY must be >= 1, got {max_write}"
+                f"MAX_WRITE_CONCURRENCY ({max_write}) must not exceed "
+                f"emergency ceiling ({ABSOLUTE_MAX_WRITE_CONCURRENCY})"
             )
         if max_write > pool_size:
             raise ValueError(
                 f"MAX_WRITE_CONCURRENCY ({max_write}) must not exceed "
                 f"DB_POOL_SIZE ({pool_size}) to prevent QueuePool saturation"
             )
-        if max_marker_get < 1:
+
+        if max_marker_put < 1:
+            raise ValueError(f"MAX_MARKER_PUT_CONCURRENCY must be >= 1, got {max_marker_put}")
+        if max_marker_put > ABSOLUTE_MAX_MARKER_PUT_CONCURRENCY:
             raise ValueError(
-                f"MARKER_GET_CONCURRENCY must be >= 1, got {max_marker_get}"
+                f"MAX_MARKER_PUT_CONCURRENCY ({max_marker_put}) must not exceed "
+                f"emergency ceiling ({ABSOLUTE_MAX_MARKER_PUT_CONCURRENCY})"
             )
+
+        if max_marker_get < 1:
+            raise ValueError(f"MAX_MARKER_GET_CONCURRENCY must be >= 1, got {max_marker_get}")
+        if max_marker_get > ABSOLUTE_MAX_MARKER_GET_CONCURRENCY:
+            raise ValueError(
+                f"MAX_MARKER_GET_CONCURRENCY ({max_marker_get}) must not exceed "
+                f"emergency ceiling ({ABSOLUTE_MAX_MARKER_GET_CONCURRENCY})"
+            )
+
+        # 3. Operational concurrency naturally clamped to configured deployment max ceiling
+        download = min(download, max_download)
+        decode = min(decode, max_decode)
+        write = min(write, max_write)
+        marker_put = min(marker_put, max_marker_put)
+        marker_get = min(marker_get, max_marker_get)
+
+        self.DOWNLOAD_CONCURRENCY = download
+        self.DECODE_CONCURRENCY = decode
+        self.WRITE_CONCURRENCY = write
+        self.MARKER_PUT_CONCURRENCY = marker_put
+        self.MARKER_GET_CONCURRENCY = marker_get
         if s3_max_pool < 1:
             raise ValueError(
                 f"S3_MAX_POOL_CONNECTIONS must be >= 1, got {s3_max_pool}"
@@ -357,6 +505,7 @@ class IngestionSettings(BaseSettings):
         env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
 

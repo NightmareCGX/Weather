@@ -119,7 +119,7 @@ def test_small_queue_pool_stress_with_high_logical_concurrency(
     store_path = str(tmp_path / "small_pool_test.zarr")
     spec = RunSpec(
         model="gfs",
-        cycle_date=date(2026, 7, 21),
+        cycle_date=date(2026, 7, 23),
         cycle_hour=0,
         target_lead_time_hours=leads,
         store=store_path,
@@ -128,8 +128,9 @@ def test_small_queue_pool_stress_with_high_logical_concurrency(
     args = MagicMock()
     args.download_dir = str(tmp_path / "downloads")
     args.keep_downloads = True
+    import uuid
     args.center_id = "noaa"
-    args.version_string = "v1.0"
+    args.version_string = f"v_{uuid.uuid4().hex[:8]}"
     args.grid_id = "global_025deg"
     args.variable = None
     args.lock_timeout = 10.0
