@@ -28,6 +28,8 @@ canonical 81-lead sequence registered below.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 #: Lead cadence of the canonical platform horizon, in hours.
 CANONICAL_LEAD_CADENCE_HOURS: int = 3
 
@@ -166,4 +168,36 @@ def model_max_lead_hours(
         default_if_unknown=default_seq,
     )
     return leads[-1]
+
+
+def max_model_lead_hours(
+    model_ids: Iterable[str],
+    version_string: str | None = None,
+    default_if_unknown: int | None = None,
+) -> int:
+    """Return the maximum canonical lead hours across the specified models and version.
+
+    Args:
+        model_ids: Iterable of model identifiers (e.g. ('gfs', 'gefs')).
+        version_string: Optional version string (e.g. 'v1.0').
+        default_if_unknown: Optional fallback lead if a model is unregistered.
+
+    Returns:
+        The highest maximum lead hour among the given models.
+
+    Raises:
+        ValueError: If model_ids is empty or a model is unknown and default_if_unknown is None.
+    """
+    leads = [
+        model_max_lead_hours(
+            m,
+            version_string=version_string,
+            default_if_unknown=default_if_unknown,
+        )
+        for m in model_ids
+    ]
+    if not leads:
+        raise ValueError("model_ids must not be empty")
+    return max(leads)
+
 

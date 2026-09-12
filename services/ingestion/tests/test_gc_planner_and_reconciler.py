@@ -144,19 +144,19 @@ def test_recheck_gc_eligibility_safely_rejects_unready_state(catalog_engine):
     r1 = _dt(2026, 9, 2, 6)
 
     with Session(catalog_engine) as session:
-        # 1. Not in lifecycle table
+        # 1. Without ready cycles, cutoff is None -> retained
         is_el, reason, _ = recheck_gc_eligibility(session, "gfs", c)
         assert is_el is False
-        assert reason == "no_lifecycle_record"
+        assert reason == "retained_at_or_above_cutoff"
 
-        # 2. Not retired
+        # 2. Lifecycle row exists but unfenced and no qualifying ready cycle -> retained
         ensure_lifecycle_row(session, "gfs", c)
         session.commit()
         is_el2, reason2, _ = recheck_gc_eligibility(session, "gfs", c)
         assert is_el2 is False
-        assert reason2 == "cycle_not_retired"
+        assert reason2 == "retained_at_or_above_cutoff"
 
-        # 3. Retired but no qualifying ready cycle advances cutoff past c
+        # 3. Legacy retired_at has zero effect on eligibility; still retained until ready cycle advances cutoff
         mark_cycle_retired(session, "gfs", c, r1, r1)
         session.commit()
         is_el3, reason3, _ = recheck_gc_eligibility(session, "gfs", c)

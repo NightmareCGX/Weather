@@ -41,6 +41,46 @@ from typing import Iterable
 
 from domain.cadence import canonical_cycle_cadence
 
+#: Locked product policy: detailed metadata is retained for 14 days after physical deletion.
+METADATA_RETENTION_DAYS: int = 14
+
+
+def is_cycle_horizon_expired(
+    cycle_time: datetime,
+    *,
+    max_lead_hours: int,
+    serving_start: datetime,
+) -> bool:
+    """Return True strictly if cycle_time + max_lead_hours < serving_start.
+
+    Strict boundary:
+    cycle_time + max_lead_hours == serving_start -> False (NOT expired)
+    cycle_time + max_lead_hours < serving_start  -> True (expired)
+    """
+    c_utc = _ensure_utc(cycle_time)
+    s_utc = _ensure_utc(serving_start)
+    return c_utc + timedelta(hours=max_lead_hours) < s_utc
+
+
+def is_metadata_purge_eligible(
+    deleted_at: datetime | None,
+    *,
+    now_utc: datetime,
+) -> bool:
+    """Return True if detailed metadata for a cycle is eligible for retention purge.
+
+    Locked policy contract:
+    - deleted_at is None -> False (cycle not yet physically deleted)
+    - deleted_at <= now_utc - 14 days -> True (eligible)
+    - deleted_at > now_utc - 14 days -> False (must be retained)
+    """
+    if deleted_at is None:
+        return False
+    d_utc = _ensure_utc(deleted_at)
+    n_utc = _ensure_utc(now_utc)
+    return d_utc <= n_utc - timedelta(days=METADATA_RETENTION_DAYS)
+
+
 
 def _ensure_utc(dt: datetime) -> datetime:
     """Normalize a datetime to UTC timezone-aware."""

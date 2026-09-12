@@ -633,6 +633,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default="weather-data",
         help="S3/MinIO bucket name holding forecast cycle stores (default 'weather-data').",
     )
+    gc.add_argument(
+        "--sweep-metadata",
+        action="store_true",
+        help="Execute M3 14-day detailed metadata retention sweeper pass.",
+    )
+    gc.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Maximum number of cycles to process per sweeper pass (default 50).",
+    )
 
     reclamation = subparsers.add_parser(
         "reclamation",
@@ -895,6 +906,7 @@ def _run_gc(args: argparse.Namespace) -> int:
     """Run the garbage collection (GC) and storage reclamation engine (Phase 6D).
 
     Supported modes:
+    * ``--sweep-metadata``: Execute M3 14-day detailed metadata retention sweeper pass.
     * ``--once --dry-run``: Plan and log diagnostics without acquiring exclusive
       locks or mutating S3/PostgreSQL.
     * ``--once``: Acquire GC leadership, execute one reconciliation/deletion pass,
@@ -911,7 +923,25 @@ def _run_gc(args: argparse.Namespace) -> int:
     import time
     from ingestion.core.db import engine as catalog_engine
     from ingestion.gc.leadership import GcLeadership
-    from ingestion.gc.reconciler import run_gc_pass
+    from ingestion.gc.finalizer import run_finalizer_pass
+
+    if getattr(args, "sweep_metadata", False):
+        from ingestion.gc.sweeper import run_metadata_sweeper_pass
+
+        b_size = int(getattr(args, "batch_size", 50))
+        res = run_metadata_sweeper_pass(
+            catalog_engine,
+            dry_run=bool(args.dry_run),
+            batch_size=b_size,
+        )
+        print(
+            f"Metadata Sweeper Pass: dry_run={res.dry_run}, "
+            f"candidates={len(res.candidates)}, "
+            f"swept={len(res.swept_cycles)}, "
+            f"failed={len(res.failed_cycles)}, "
+            f"model_runs_deleted={res.total_model_runs_deleted}"
+        )
+        return 0 if len(res.failed_cycles) == 0 else 1
 
     dry_run = bool(args.dry_run)
     interval = max(1.0, float(args.interval_seconds))
@@ -920,7 +950,7 @@ def _run_gc(args: argparse.Namespace) -> int:
 
     if dry_run:
         # Dry-run performs zero mutations and does not acquire destructive leadership
-        run_gc_pass(
+        run_finalizer_pass(
             catalog_engine,
             dry_run=True,
             base_bucket=bucket,
@@ -957,7 +987,7 @@ def _run_gc(args: argparse.Namespace) -> int:
                     logger.error("Failed to reacquire GC leadership; exiting.")
                     return 1
 
-            run_gc_pass(
+            run_finalizer_pass(
                 catalog_engine,
                 dry_run=False,
                 base_bucket=bucket,

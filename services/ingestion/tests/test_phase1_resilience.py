@@ -14,7 +14,6 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -26,11 +25,21 @@ from ingestion.core.base import (
     is_retryable_storage_error,
 )
 from ingestion.core.catalog import RunCatalogSpec, VariableSpec
+from ingestion.core.db import CatalogBase
 from ingestion.core.pipeline import (
     _normalize_precipitation_increments,
     deaccumulate_precipitation,
 )
 from ingestion.core.zarr_writer import write_dataset
+from sqlalchemy import create_engine
+
+
+@pytest.fixture()
+def catalog_engine():
+    engine = create_engine("sqlite:///:memory:")
+    CatalogBase.metadata.create_all(engine)
+    yield engine
+    engine.dispose()
 
 
 # =============================================================================
@@ -256,7 +265,9 @@ def test_is_retryable_storage_error_classification() -> None:
     assert is_retryable_storage_error(ClientError(403, "AccessDenied")) is False
 
 
-def test_write_region_worker_transient_retry_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_write_region_worker_transient_retry_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog_engine: Any
+) -> None:
     """Mock transient failure on attempts 1 and 2, then success on attempt 3.
     Verifies that region write completes and COMPLETE marker is written.
     """
@@ -338,15 +349,15 @@ def test_write_region_worker_transient_retry_success(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr("ingestion.core.inventory.verify_expected_object_keys", lambda *args, **kwargs: set())
 
     # Execute region write worker
-    mock_conn = MagicMock()
-    coordinator.write_region_worker(
-        mock_conn,
-        dataset=ds,
-        member=None,
-        generation="gen-123",
-        expected_leads=(6,),
-        expected_members=(),
-    )
+    with catalog_engine.connect() as conn:
+        coordinator.write_region_worker(
+            conn,
+            dataset=ds,
+            member=None,
+            generation="gen-123",
+            expected_leads=(6,),
+            expected_members=(),
+        )
 
     assert attempts["count"] == 3
     marker = read_region_marker(store_path, lead_time_hours=6, member=None)
@@ -354,7 +365,9 @@ def test_write_region_worker_transient_retry_success(monkeypatch: pytest.MonkeyP
     assert marker.get("generation") == "gen-123"
 
 
-def test_write_region_worker_deterministic_error_no_retry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_write_region_worker_deterministic_error_no_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog_engine: Any
+) -> None:
     """Deterministic error fails immediately with 1 attempt (zero retries)."""
     from ingestion.core.coordinator import RunCoordinator, StoreMetadataSnapshot
 
@@ -422,16 +435,16 @@ def test_write_region_worker_deterministic_error_no_retry(monkeypatch: pytest.Mo
 
     monkeypatch.setattr("ingestion.core.coordinator._commit_region", _mock_deterministic_fail)
 
-    mock_conn = MagicMock()
-    with pytest.raises(ValueError, match="Deterministic programming"):
-        coordinator.write_region_worker(
-            mock_conn,
-            dataset=ds,
-            member=None,
-            generation="gen-123",
-            expected_leads=(6,),
-            expected_members=(),
-        )
+    with catalog_engine.connect() as conn:
+        with pytest.raises(ValueError, match="Deterministic programming"):
+            coordinator.write_region_worker(
+                conn,
+                dataset=ds,
+                member=None,
+                generation="gen-123",
+                expected_leads=(6,),
+                expected_members=(),
+            )
 
     assert attempts["count"] == 1
 

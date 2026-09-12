@@ -8,6 +8,7 @@ from domain.horizon import (
     CANONICAL_MAX_LEAD_HOURS,
     MODEL_CANONICAL_HORIZONS,
     canonical_lead_time_hours,
+    max_model_lead_hours,
     model_max_lead_hours,
     register_canonical_lead_horizon,
 )
@@ -108,5 +109,31 @@ def test_model_max_lead_hours_for_contract_and_custom_models(_restore_horizons) 
     assert model_max_lead_hours("gfs", version_string="v1.0") == 240
     assert canonical_lead_time_hours("gfs", version_string="v2.0") == tuple(range(0, 121, 3))
     assert canonical_lead_time_hours("gfs", version_string="v1.0") == tuple(range(0, 241, 3))
+
+
+def test_max_model_lead_hours_multi_model(_restore_horizons) -> None:
+    # Contract models default v1.0: both 240
+    assert max_model_lead_hours(("gfs", "gefs")) == 240
+    assert max_model_lead_hours(("gfs", "gefs"), version_string="v1.0") == 240
+
+    # Synthetic v2.0: gfs=240, gefs=300
+    register_canonical_lead_horizon("gfs", tuple(range(0, 241, 3)), version_string="v2.0")
+    register_canonical_lead_horizon("gefs", tuple(range(0, 301, 3)), version_string="v2.0")
+
+    # Multi-model max lead takes the conservative maximum (300h)
+    assert max_model_lead_hours(("gfs", "gefs"), version_string="v2.0") == 300
+    assert max_model_lead_hours(("gfs",), version_string="v2.0") == 240
+    assert max_model_lead_hours(("gefs",), version_string="v2.0") == 300
+
+    # Empty model_ids raises ValueError
+    with pytest.raises(ValueError, match="must not be empty"):
+        max_model_lead_hours(())
+
+    # Unknown model raises ValueError unless default provided
+    with pytest.raises(ValueError, match="Unknown model identifier"):
+        max_model_lead_hours(("unknown_model",))
+
+    assert max_model_lead_hours(("unknown_model",), default_if_unknown=120) == 120
+
 
 

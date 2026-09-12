@@ -13,6 +13,7 @@ Validates:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -451,7 +452,9 @@ def test_g_same_cycle_reingestion(tmp_path: Path) -> None:
         is_ensemble=False,
         resolution_km=25.0,
         version_string="v1.0",
-        cycle_time=seed.attrs["cycle_time"],
+        cycle_time=datetime.fromisoformat(seed.attrs["cycle_time"]).replace(
+            tzinfo=timezone.utc
+        ),
         grid_id="global_025deg",
         grid_name="g",
         grid_resolution_km=25.0,
@@ -463,9 +466,10 @@ def test_g_same_cycle_reingestion(tmp_path: Path) -> None:
     mock_conn = MagicMock()
     coord = RunCoordinator(spec, store_path)
 
-    # Patch StoreLockCoordinator and Session
+    # Patch StoreLockCoordinator and Session (unfenced active cycle)
     with patch("ingestion.core.coordinator.StoreLockCoordinator"), \
-         patch("ingestion.core.coordinator.Session"):
+         patch("ingestion.core.coordinator.Session") as mock_session_cls:
+        mock_session_cls.return_value.__enter__.return_value.get.return_value = None
         coord.initialize_run_store(
             mock_conn,
             seed_dataset=seed,

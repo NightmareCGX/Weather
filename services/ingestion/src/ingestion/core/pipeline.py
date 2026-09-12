@@ -848,7 +848,7 @@ def ingest_grib_file(
     )
 
     with _session_local() as db:
-        if is_cycle_fenced_or_deleted(db, spec.cycle_time):
+        if is_cycle_fenced_or_deleted(db, spec.cycle_time, model_id=spec.model_id):
             raise CycleTombstonedError(
                 f"Refusing ingestion for cycle {spec.cycle_time.isoformat()}: "
                 "cycle is claimed for deletion or already tombstoned."

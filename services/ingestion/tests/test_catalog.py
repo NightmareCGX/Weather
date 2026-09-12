@@ -206,12 +206,16 @@ def test_record_run_naive_cycle_time_normalized_to_utc(session: Session) -> None
 
 
 def test_record_run_update_existing_run_store_path(session: Session) -> None:
-    # Re-record with a different store path must refresh the same run.
-    record_run(session, _spec(zarr_store_path="/tmp/gfs_v1.zarr"), _dataset())
-    second = record_run(session, _spec(zarr_store_path="/tmp/gfs_v2.zarr"), _dataset())
-    assert second.id == session.query(ModelRunRecord).one().id
-    assert second.zarr_store_path == "/tmp/gfs_v2.zarr"
+    # Re-recording with the same store path is allowed and reuses the existing run.
+    first = record_run(session, _spec(zarr_store_path="/tmp/gfs_v1.zarr"), _dataset())
+    second = record_run(session, _spec(zarr_store_path="/tmp/gfs_v1.zarr"), _dataset())
+    assert second.id == first.id
+    assert second.zarr_store_path == "/tmp/gfs_v1.zarr"
     assert session.query(ModelRunRecord).count() == 1
+
+    # Conflicting non-null store path is rejected under M2 store path immutability.
+    with pytest.raises(ValueError, match="Cannot change immutable store path"):
+        record_run(session, _spec(zarr_store_path="/tmp/gfs_v2.zarr"), _dataset())
 
 
 def test_record_run_counts_unique_run_model_version(session: Session) -> None:

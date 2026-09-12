@@ -9,7 +9,9 @@ dependency. The committed-state reader itself is exercised against SQLite in
 from __future__ import annotations
 
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+
+import pytest
 
 
 from ingestion.core.config import IngestionSettings
@@ -28,6 +30,20 @@ from ingestion.realtime.scheduler import (
 )
 
 CYCLE = CycleIdentity(cycle_date=date(2026, 7, 21), cycle_hour=0)
+
+
+@pytest.fixture()
+def _restore_horizons():
+    from domain.horizon import MODEL_CANONICAL_HORIZONS, MODEL_VERSION_HORIZONS
+
+    saved = dict(MODEL_CANONICAL_HORIZONS)
+    saved_versions = dict(MODEL_VERSION_HORIZONS)
+    yield
+    MODEL_CANONICAL_HORIZONS.clear()
+    MODEL_CANONICAL_HORIZONS.update(saved)
+    MODEL_VERSION_HORIZONS.clear()
+    MODEL_VERSION_HORIZONS.update(saved_versions)
+
 MEMBERS = tuple(range(1, 31))
 
 
@@ -133,6 +149,7 @@ def _scheduler(
     sleeps: list[float] | None = None,
     cycle_override: CycleIdentity | None = CYCLE,
     leadership=None,
+    version_string: str = "v1.0",
 ) -> RealtimeScheduler:
     rng_seed = {"rng": __import__("random").Random(42)}
 
@@ -152,6 +169,7 @@ def _scheduler(
         sleep=_sleep,
         stop_event=stop_event,
         cycle_override=cycle_override,
+        version_string=version_string,
         **rng_seed,
     )
 
@@ -1204,5 +1222,63 @@ def test_no_loss_of_existing_historical_horizon_state() -> None:
     # Targets resume strictly at L183 (committed frontier L180 + 3), no duplicate L0..L180!
     assert outcome.dispatches[0].targets == (183, 186, 189, 192)
     assert outcome.dispatches[1].targets == (183, 186, 189, 192)
+
+
+def test_backlog_horizon_expiry_uses_configured_version(_restore_horizons) -> None:
+    """Verify that RealtimeScheduler backlog cycle horizon expiry uses the configured version.
+
+    GFS v1.0 / GEFS v1.0: 240h
+    GFS v2.0 / GEFS v2.0: 300h
+
+    For candidate at serving_start - 270h:
+    Under v1.0 -> candidate.cycle_time + 240h < serving_start -> expired, skipped.
+    Under v2.0 -> candidate.cycle_time + 300h >= serving_start -> not expired, dispatched.
+    """
+    from domain.horizon import register_canonical_lead_horizon
+    from domain.temporal import serving_start_valid_time
+
+    register_canonical_lead_horizon("gfs", tuple(range(0, 301, 3)), version_string="v2.0")
+    register_canonical_lead_horizon("gefs", tuple(range(0, 301, 3)), version_string="v2.0")
+
+    world = FakeWorld()
+    # 15:30 UTC -> 12Z is newest eligible cycle
+    now_dt = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc)
+    world.clock_time = now_dt.timestamp()
+
+    # Active cycle: 12Z (only lead 0 published -> no wave due under max_leads=4)
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # Backlog candidate 270h old (e.g. 270h before serving_start)
+    c_270h_dt = serving_start_valid_time(now_dt) - timedelta(hours=270)
+    c_backlog = CycleIdentity(cycle_date=c_270h_dt.date(), cycle_hour=c_270h_dt.hour)
+
+    world.snapshots[c_backlog.label] = (
+        gfs_snapshot((0, 3, 6, 9), c_backlog),
+        gefs_snapshot((0, 3, 6, 9), c_backlog),
+    )
+    world.candidates = [c_backlog]
+
+    settings = _settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0)
+
+    # 1. Under v1.0 (240h horizon): 270h candidate is expired -> NOT dispatched (outcome is active cycle)
+    scheduler_v1 = _scheduler(
+        world, settings=settings, cycle_override=None, version_string="v1.0"
+    )
+    outcome_v1 = scheduler_v1.poll_once()
+    assert outcome_v1.cycle == CYCLE_12
+    assert outcome_v1.dispatches == []
+
+    # 2. Under v2.0 (300h horizon): 270h candidate is NOT expired -> backlog wave dispatched!
+    scheduler_v2 = _scheduler(
+        world, settings=settings, cycle_override=None, version_string="v2.0"
+    )
+    outcome_v2 = scheduler_v2.poll_once()
+    assert outcome_v2.cycle == c_backlog
+    assert len(outcome_v2.dispatches) == 2
+
+
 
 

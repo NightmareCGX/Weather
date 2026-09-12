@@ -21,7 +21,8 @@ from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from domain.horizon import CANONICAL_MAX_LEAD_HOURS
+from domain.horizon import max_model_lead_hours
+from domain.lifecycle import is_cycle_horizon_expired
 from domain.temporal import serving_start_valid_time
 from ingestion.core.catalog import (
     EnsembleMemberProductRecord,
@@ -169,7 +170,7 @@ def discover_incomplete_historical_cycles(
     3. Cycle is not durably complete (both GFS and GEFS ready)
     4. Cycle is not tombstoned/fenced for deletion in forecast_cycle_lifecycle
     5. Cycle remains in the useful forecast horizon:
-       cycle_time >= serving_start_valid_time(now_utc) - CANONICAL_MAX_LEAD_HOURS
+       cycle_time + max_lead >= serving_start_valid_time(now_utc)
 
     Returns:
         List of CycleIdentity objects sorted by cycle_time descending (newest first).
@@ -190,13 +191,13 @@ def discover_incomplete_historical_cycles(
         )
 
 
-def is_cycle_retired_or_deleted(
+def is_cycle_fenced_or_deleted(
     db: Session, cycle_time: datetime, model_id: str | None = None
 ) -> bool:
-    """Return whether cycle_time is logically retired or claimed/tombstoned for deletion.
+    """Return whether cycle_time is claimed or tombstoned for deletion.
 
-    A cycle with retired_at IS NOT NULL, deletion_started_at IS NOT NULL, or
-    deleted_at IS NOT NULL is excluded from scheduling recovery.
+    A cycle with deletion_started_at IS NOT NULL or deleted_at IS NOT NULL is
+    excluded from scheduling recovery. Legacy retired_at has zero effect (Lifecycle V3).
     """
     c_utc = (
         cycle_time.replace(tzinfo=timezone.utc)
@@ -209,21 +210,23 @@ def is_cycle_retired_or_deleted(
         if row is None:
             return False
         return (
-            row.retired_at is not None
-            or row.deletion_started_at is not None
+            row.deletion_started_at is not None
             or row.deleted_at is not None
         )
 
     rows = db.execute(
         select(
-            ForecastCycleLifecycleRecord.retired_at,
             ForecastCycleLifecycleRecord.deletion_started_at,
             ForecastCycleLifecycleRecord.deleted_at,
         ).where(ForecastCycleLifecycleRecord.cycle_time == c_utc)
     ).all()
     return any(
-        r is not None or s is not None or d is not None for r, s, d in rows
+        s is not None or d is not None for s, d in rows
     )
+
+
+# Backward-compatible alias
+is_cycle_retired_or_deleted = is_cycle_fenced_or_deleted
 
 
 def _discover_incomplete_historical_cycles_db(
@@ -246,7 +249,9 @@ def _discover_incomplete_historical_cycles_db(
         else now_utc.astimezone(timezone.utc)
     )
     serving_start = serving_start_valid_time(now_tz)
-    min_cycle_time = serving_start - timedelta(hours=CANONICAL_MAX_LEAD_HOURS)
+    target_models = ("gfs", "gefs")
+    scan_max_lead = max_model_lead_hours(target_models, version_string=version_string)
+    min_cycle_time = serving_start - timedelta(hours=scan_max_lead)
 
     stmt = (
         select(
@@ -260,7 +265,7 @@ def _discover_incomplete_historical_cycles_db(
         )
         .where(
             ModelVersionRecord.version_string == version_string,
-            ModelVersionRecord.model_id.in_(["gfs", "gefs"]),
+            ModelVersionRecord.model_id.in_(target_models),
             ModelRunRecord.cycle_time < act_utc,
             ModelRunRecord.cycle_time >= min_cycle_time,
         )
@@ -284,12 +289,18 @@ def _discover_incomplete_historical_cycles_db(
         if statuses.get("gfs") == "ready" and statuses.get("gefs") == "ready":
             continue
 
-        # Exclude if lifecycle retired, deletion started, or deleted
-        if is_cycle_retired_or_deleted(db, c_utc):
+        # Exclude if lifecycle deletion started or deleted
+        if is_cycle_fenced_or_deleted(db, c_utc):
             continue
 
-        # Exclude if horizon expired
-        if c_utc + timedelta(hours=CANONICAL_MAX_LEAD_HOURS) < serving_start:
+        # Exclude if horizon expired for all incomplete target models
+        incomplete_models = [m for m in target_models if statuses.get(m) != "ready"]
+        candidate_max_lead = max_model_lead_hours(
+            incomplete_models or target_models, version_string=version_string
+        )
+        if is_cycle_horizon_expired(
+            c_utc, max_lead_hours=candidate_max_lead, serving_start=serving_start
+        ):
             continue
 
         candidates.append(

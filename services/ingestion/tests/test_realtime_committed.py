@@ -8,7 +8,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from domain.horizon import CANONICAL_MAX_LEAD_HOURS
+from domain.horizon import (
+    CANONICAL_MAX_LEAD_HOURS,
+    MODEL_CANONICAL_HORIZONS,
+    MODEL_VERSION_HORIZONS,
+    register_canonical_lead_horizon,
+)
+from domain.temporal import serving_start_valid_time
 from ingestion.core.catalog import (
     CatalogBase,
     EnsembleMemberProductRecord,
@@ -26,6 +32,18 @@ from ingestion.realtime.committed import (
 
 CYCLE = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
 MEMBERS = tuple(range(1, 31))
+
+
+@pytest.fixture()
+def _restore_horizons():
+    saved = dict(MODEL_CANONICAL_HORIZONS)
+    saved_versions = dict(MODEL_VERSION_HORIZONS)
+    yield
+    MODEL_CANONICAL_HORIZONS.clear()
+    MODEL_CANONICAL_HORIZONS.update(saved)
+    MODEL_VERSION_HORIZONS.clear()
+    MODEL_VERSION_HORIZONS.update(saved_versions)
+
 
 
 @pytest.fixture()
@@ -361,17 +379,17 @@ def test_discover_incomplete_historical_cycles_zero_evidence_not_synthesized(
     assert candidates == []
 
 
-def test_discover_incomplete_historical_cycles_excludes_retired_cycle(
+def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_retired(
     catalog_engine,
 ) -> None:
-    """A partial cycle with retired_at != NULL must be excluded from recovery candidates,
+    """Under Lifecycle V3, retired_at alone does NOT exclude a cycle from backlog recovery,
 
-    while its committed data remains completely intact and unretired control cycles remain eligible.
+    while deletion_started_at / deleted_at physical fences strictly exclude it.
     """
     now_utc = datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc)
     c_active = datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc)
-    c_retired = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
-    c_control = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
+    c_retired_unfenced = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    c_fenced = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
 
     with Session(catalog_engine) as session:
         session.add(
@@ -385,12 +403,12 @@ def test_discover_incomplete_historical_cycles_excludes_retired_cycle(
             )
         )
 
-        # c_retired: Partial, retired_at is set, deletion_started_at is None, deleted_at is None
+        # c_retired_unfenced: Partial, retired_at is set, deletion_started_at is None, deleted_at is None
         session.add(
             ModelRunRecord(
                 id="r_gfs_ret",
                 model_version_id="ver_gfs_r",
-                cycle_time=c_retired,
+                cycle_time=c_retired_unfenced,
                 status="partial",
             )
         )
@@ -407,51 +425,271 @@ def test_discover_incomplete_historical_cycles_excludes_retired_cycle(
         session.add(
             ForecastCycleLifecycleRecord(
                 model_id="gfs",
-                cycle_time=c_retired,
+                cycle_time=c_retired_unfenced,
                 retired_at=now_utc,
                 deletion_started_at=None,
                 deleted_at=None,
             )
         )
 
-        # c_control: Partial, retired_at is None, deletion_started_at is None, deleted_at is None
+        # c_fenced: Partial, deletion_started_at is set
         session.add(
             ModelRunRecord(
-                id="r_gfs_ctrl",
+                id="r_gfs_fenced",
                 model_version_id="ver_gfs_r",
-                cycle_time=c_control,
+                cycle_time=c_fenced,
                 status="partial",
             )
         )
         session.add(
             ProductRecord(
-                id="p_gfs_ctrl_0",
-                run_id="r_gfs_ctrl",
+                id="p_gfs_fenced_0",
+                run_id="r_gfs_fenced",
                 variable_id="temperature_2m",
                 grid_id="global_025deg",
                 product_type="surface",
                 lead_time_hours=0,
             )
         )
+        session.add(
+            ForecastCycleLifecycleRecord(
+                model_id="gfs",
+                cycle_time=c_fenced,
+                retired_at=None,
+                deletion_started_at=now_utc,
+                deleted_at=None,
+            )
+        )
 
         session.commit()
 
-    # 1. Candidate discovery excludes c_retired and includes c_control
+    # 1. Candidate discovery includes c_retired_unfenced and excludes c_fenced
     candidates = discover_incomplete_historical_cycles(
         catalog_engine,
         active_cycle_time=c_active,
         now_utc=now_utc,
     )
     candidate_times = [c.cycle_time for c in candidates]
-    assert c_retired not in candidate_times
-    assert c_control in candidate_times
+    assert c_retired_unfenced in candidate_times
+    assert c_fenced not in candidate_times
 
     # 2. Lifecycle query confirms status
     with Session(catalog_engine) as session:
-        assert is_cycle_retired_or_deleted(session, c_retired) is True
-        assert is_cycle_retired_or_deleted(session, c_control) is False
+        assert is_cycle_retired_or_deleted(session, c_retired_unfenced) is False
+        assert is_cycle_retired_or_deleted(session, c_fenced) is True
 
     # 3. Existing committed state for retired cycle remains completely intact!
-    gfs_ret, _ = read_cycle_committed_state(catalog_engine, cycle_time=c_retired)
+    gfs_ret, _ = read_cycle_committed_state(catalog_engine, cycle_time=c_retired_unfenced)
     assert gfs_ret.leads == frozenset({0})
+
+
+def test_discover_incomplete_historical_cycles_multi_model_recall(
+    catalog_engine, _restore_horizons
+) -> None:
+    """Multi-model recall test:
+    GFS v2.0 = 240h
+    GEFS v2.0 = 300h
+
+    A cycle 270h old (older than 240h, but within 300h) must NOT be excluded
+    by broad scan or candidate filter when GEFS is incomplete.
+    """
+    register_canonical_lead_horizon(
+        "gfs", tuple(range(0, 241, 3)), version_string="v2.0"
+    )
+    register_canonical_lead_horizon(
+        "gefs", tuple(range(0, 301, 3)), version_string="v2.0"
+    )
+
+    now_utc = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    serving_start = serving_start_valid_time(now_utc)
+    c_active = now_utc - timedelta(hours=6)
+
+    # 270h before serving_start: older than GFS (240h), but within GEFS (300h)
+    c_270h = serving_start - timedelta(hours=270)
+    # 306h before serving_start: older than both 240h and 300h
+    c_306h = serving_start - timedelta(hours=306)
+
+    with Session(catalog_engine) as session:
+        session.add(
+            ModelVersionRecord(id="ver_gfs_v2", model_id="gfs", version_string="v2.0")
+        )
+        session.add(
+            ModelVersionRecord(id="ver_gefs_v2", model_id="gefs", version_string="v2.0")
+        )
+
+        # c_270h: GFS ready (or missing), GEFS partial -> must remain discoverable
+        session.add(
+            ModelRunRecord(
+                id="r_gfs_270",
+                model_version_id="ver_gfs_v2",
+                cycle_time=c_270h,
+                status="ready",
+            )
+        )
+        session.add(
+            ModelRunRecord(
+                id="r_gefs_270",
+                model_version_id="ver_gefs_v2",
+                cycle_time=c_270h,
+                status="partial",
+            )
+        )
+
+        # c_306h: Both partial -> expired for both
+        session.add(
+            ModelRunRecord(
+                id="r_gfs_306",
+                model_version_id="ver_gfs_v2",
+                cycle_time=c_306h,
+                status="partial",
+            )
+        )
+        session.add(
+            ModelRunRecord(
+                id="r_gefs_306",
+                model_version_id="ver_gefs_v2",
+                cycle_time=c_306h,
+                status="partial",
+            )
+        )
+        session.commit()
+
+    candidates = discover_incomplete_historical_cycles(
+        catalog_engine,
+        active_cycle_time=c_active,
+        now_utc=now_utc,
+        version_string="v2.0",
+    )
+    candidate_times = [c.cycle_time for c in candidates]
+
+    # c_270h is preserved because GEFS is incomplete and within 300h horizon
+    assert c_270h in candidate_times
+    # c_306h is expired because both models are past horizon
+    assert c_306h not in candidate_times
+
+
+def test_discover_incomplete_historical_cycles_true_version_awareness(
+    catalog_engine, _restore_horizons
+) -> None:
+    """True version-awareness test:
+    GFS v1.0 = 240h
+    GFS v2.0 = 300h
+
+    For a cycle 270h old:
+    Under v1.0 -> expired (270 > 240) -> NOT discovered.
+    Under v2.0 -> within horizon (270 <= 300) -> IS discovered.
+    """
+    register_canonical_lead_horizon(
+        "gfs", tuple(range(0, 241, 3)), version_string="v1.0"
+    )
+    register_canonical_lead_horizon(
+        "gefs", tuple(range(0, 241, 3)), version_string="v1.0"
+    )
+    register_canonical_lead_horizon(
+        "gfs", tuple(range(0, 301, 3)), version_string="v2.0"
+    )
+    register_canonical_lead_horizon(
+        "gefs", tuple(range(0, 301, 3)), version_string="v2.0"
+    )
+
+    now_utc = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    serving_start = serving_start_valid_time(now_utc)
+    c_active = now_utc - timedelta(hours=6)
+    c_270h = serving_start - timedelta(hours=270)
+
+    with Session(catalog_engine) as session:
+        session.add(
+            ModelVersionRecord(id="ver_gfs_v1", model_id="gfs", version_string="v1.0")
+        )
+        session.add(
+            ModelVersionRecord(id="ver_gfs_v2", model_id="gfs", version_string="v2.0")
+        )
+        session.add(
+            ModelRunRecord(
+                id="r_gfs_v1_270",
+                model_version_id="ver_gfs_v1",
+                cycle_time=c_270h,
+                status="partial",
+            )
+        )
+        session.add(
+            ModelRunRecord(
+                id="r_gfs_v2_270",
+                model_version_id="ver_gfs_v2",
+                cycle_time=c_270h,
+                status="partial",
+            )
+        )
+        session.commit()
+
+    # Under v1.0: 270h > 240h -> excluded
+    cands_v1 = discover_incomplete_historical_cycles(
+        catalog_engine,
+        active_cycle_time=c_active,
+        now_utc=now_utc,
+        version_string="v1.0",
+    )
+    assert c_270h not in [c.cycle_time for c in cands_v1]
+
+    # Under v2.0: 270h < 300h -> included
+    cands_v2 = discover_incomplete_historical_cycles(
+        catalog_engine,
+        active_cycle_time=c_active,
+        now_utc=now_utc,
+        version_string="v2.0",
+    )
+    assert c_270h in [c.cycle_time for c in cands_v2]
+
+
+def test_discover_incomplete_historical_cycles_strict_boundary(
+    catalog_engine,
+) -> None:
+    """Strict < boundary test:
+    cycle_time + max_lead == serving_start -> NOT expired (included).
+    cycle_time + max_lead < serving_start  -> expired (excluded).
+    """
+    now_utc = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    serving_start = serving_start_valid_time(now_utc)
+    c_active = now_utc - timedelta(hours=6)
+
+    # Exact boundary: 240h before serving_start (cycle + 240 == serving_start)
+    c_exact = serving_start - timedelta(hours=240)
+    # 1 second past boundary (< serving_start)
+    c_past_1s = c_exact - timedelta(seconds=1)
+
+    with Session(catalog_engine) as session:
+        session.add(
+            ModelVersionRecord(id="ver_gfs_b", model_id="gfs", version_string="v1.0")
+        )
+        session.add(
+            ModelRunRecord(
+                id="r_exact",
+                model_version_id="ver_gfs_b",
+                cycle_time=c_exact,
+                status="partial",
+            )
+        )
+        session.add(
+            ModelRunRecord(
+                id="r_past_1s",
+                model_version_id="ver_gfs_b",
+                cycle_time=c_past_1s,
+                status="partial",
+            )
+        )
+        session.commit()
+
+    candidates = discover_incomplete_historical_cycles(
+        catalog_engine,
+        active_cycle_time=c_active,
+        now_utc=now_utc,
+        version_string="v1.0",
+    )
+    candidate_times = [c.cycle_time for c in candidates]
+
+    # Exact boundary: NOT expired -> included
+    assert c_exact in candidate_times
+    # Past boundary: expired -> excluded
+    assert c_past_1s not in candidate_times
+
 

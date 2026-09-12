@@ -22,7 +22,7 @@ from domain.coverage import (
     is_lead_servable,
 )
 from domain.temporal import serving_start_valid_time
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from api.core.time import get_current_time
@@ -34,6 +34,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationQueue,
 )
 from api.services.lifecycle import filter_visible_runs
 from api.schemas import (
@@ -124,6 +125,16 @@ def build_forecast_availability(
     now_utc = now if now is not None else get_current_time()
     serving_start = serving_start_valid_time(now_utc)
 
+    has_reclamation_queue = True
+    try:
+        bind = db.get_bind()
+        if bind.dialect.name == "sqlite":
+            from sqlalchemy import inspect
+
+            has_reclamation_queue = inspect(bind).has_table("reclamation_queue")
+    except Exception:
+        has_reclamation_queue = False
+
     stmt = (
         select(
             Model.model_id,
@@ -147,38 +158,57 @@ def build_forecast_availability(
         )
         .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
     )
+    if has_reclamation_queue:
+        reclaim_subq = (
+            select(1)
+            .select_from(ReclamationQueue)
+            .where(
+                ReclamationQueue.run_id == ForecastProduct.run_id,
+                ReclamationQueue.lead_time_hours == ForecastProduct.lead_time_hours,
+                ReclamationQueue.variable_code == ForecastProduct.variable_id,
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                or_(
+                    and_(
+                        ForecastProduct.product_type == "ensemble_mean",
+                        ReclamationQueue.target_kind == "mean",
+                    ),
+                    and_(
+                        ForecastProduct.product_type != "ensemble_mean",
+                        ReclamationQueue.target_kind == "det",
+                    ),
+                ),
+            )
+        )
+        stmt = stmt.where(~reclaim_subq.exists())
+
     rows = db.execute(filter_visible_runs(stmt)).all()
 
-    # Pre-query physically fenced shards from reclamation_queue
-    fenced_leads: set[tuple[str, int, str]] = set()
-    try:
-        from api.models.entities import ReclamationQueue
-
-        fenced_rows = db.execute(
-            select(
-                ReclamationQueue.run_id,
-                ReclamationQueue.lead_time_hours,
-                ReclamationQueue.variable_code,
-            ).where(
-                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
-                ReclamationQueue.target_kind.in_(("det", "mean")),
-            )
-        ).all()
-        fenced_leads = {(str(r), int(ld), str(v)) for r, ld, v in fenced_rows}
-    except Exception:
-        fenced_leads = set()
-
     # Pre-query committed ensemble member counts per (run_id, lead_time_hours)
-    emp_rows = db.execute(
-        select(
-            EnsembleMemberProduct.run_id,
-            EnsembleMemberProduct.lead_time_hours,
-            func.count(EnsembleMemberProduct.member_index),
-        ).group_by(
-            EnsembleMemberProduct.run_id,
-            EnsembleMemberProduct.lead_time_hours,
+    # excluding member shards fenced in reclamation_queue with status in ('deleting', 'deleted', 'failed').
+    emp_stmt = select(
+        EnsembleMemberProduct.run_id,
+        EnsembleMemberProduct.lead_time_hours,
+        func.count(EnsembleMemberProduct.member_index),
+    )
+    if has_reclamation_queue:
+        emp_reclaim_subq = (
+            select(1)
+            .select_from(ReclamationQueue)
+            .where(
+                ReclamationQueue.run_id == EnsembleMemberProduct.run_id,
+                ReclamationQueue.lead_time_hours == EnsembleMemberProduct.lead_time_hours,
+                ReclamationQueue.member_index == EnsembleMemberProduct.member_index,
+                ReclamationQueue.target_kind == "mem",
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+            )
         )
-    ).all()
+        emp_stmt = emp_stmt.where(~emp_reclaim_subq.exists())
+
+    emp_stmt = emp_stmt.group_by(
+        EnsembleMemberProduct.run_id,
+        EnsembleMemberProduct.lead_time_hours,
+    )
+    emp_rows = db.execute(emp_stmt).all()
     emp_counts: dict[tuple[str, int], int] = {
         (str(r_id), int(lead)): int(cnt) for r_id, lead, cnt in emp_rows
     }
@@ -196,8 +226,6 @@ def build_forecast_availability(
         run_status,
         lead,
     ) in rows:
-        if (str(run_id), int(lead), str(variable_code)) in fenced_leads:
-            continue
         c_utc = (
             cycle_time.replace(tzinfo=timezone.utc)
             if cycle_time.tzinfo is None

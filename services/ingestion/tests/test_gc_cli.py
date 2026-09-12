@@ -52,3 +52,70 @@ def test_gc_dry_run_main_dispatch(monkeypatch):
     # Run against dry-run pass
     code = main(["gc", "--once", "--dry-run"])
     assert code == 0
+
+
+def test_gc_subcommand_parser_sweep_metadata():
+    parser = _build_parser()
+    args = parser.parse_args(["gc", "--sweep-metadata"])
+    assert args.command == "gc"
+    assert args.sweep_metadata is True
+    assert args.batch_size == 50
+    assert args.dry_run is False
+
+    args2 = parser.parse_args([
+        "gc",
+        "--sweep-metadata",
+        "--batch-size", "25",
+        "--dry-run",
+    ])
+    assert args2.command == "gc"
+    assert args2.sweep_metadata is True
+    assert args2.batch_size == 25
+    assert args2.dry_run is True
+
+
+def test_gc_sweep_metadata_dry_run_main_dispatch(monkeypatch):
+    """Verify that main(["gc", "--sweep-metadata", "--dry-run"]) executes cleanly."""
+    code = main(["gc", "--sweep-metadata", "--dry-run"])
+    assert code == 0
+
+
+def test_gc_sweep_metadata_dispatch_results(monkeypatch):
+    from unittest.mock import patch
+    from datetime import datetime, timezone
+    from ingestion.gc.sweeper import SweeperPassResult
+
+    now = datetime(2026, 8, 20, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Success case -> exit code 0
+    mock_res_ok = SweeperPassResult(
+        dry_run=False,
+        evaluated_at=now,
+        cutoff=now,
+        candidates=(),
+        swept_cycles=(),
+        failed_cycles=(),
+        total_model_runs_deleted=0,
+    )
+    with patch("ingestion.gc.sweeper.run_metadata_sweeper_pass", return_value=mock_res_ok) as m_pass:
+        code = main(["gc", "--sweep-metadata", "--batch-size", "10"])
+        assert code == 0
+        m_pass.assert_called_once()
+        assert m_pass.call_args.kwargs["batch_size"] == 10
+        assert m_pass.call_args.kwargs["dry_run"] is False
+
+    # 2. Failure case -> exit code 1
+    mock_res_fail = SweeperPassResult(
+        dry_run=False,
+        evaluated_at=now,
+        cutoff=now,
+        candidates=(),
+        swept_cycles=(),
+        failed_cycles=(("gfs", now),),
+        total_model_runs_deleted=0,
+    )
+    with patch("ingestion.gc.sweeper.run_metadata_sweeper_pass", return_value=mock_res_fail):
+        code = main(["gc", "--sweep-metadata"])
+        assert code == 1
+
+

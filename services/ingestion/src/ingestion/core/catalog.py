@@ -917,12 +917,17 @@ def record_run(
             },
         ),
     )
-    # An existing row is updated to the current store path. Readiness is
-    # recomputed after the product/member rows are written (see
-    # ``_derive_run_status``). ``setattr`` is used because the ORM
-    # ``Column``-typed class attributes are not instrumented for mypy's
-    # assignment checking under strict mode.
-    if spec.zarr_store_path is not None:
+    # An existing row is updated to the current store path with immutability check.
+    if (
+        run.zarr_store_path is not None
+        and spec.zarr_store_path is not None
+        and run.zarr_store_path != spec.zarr_store_path
+    ):
+        raise ValueError(
+            f"Cannot change immutable store path {run.zarr_store_path!r} to "
+            f"{spec.zarr_store_path!r} for run {run.id!r}"
+        )
+    if run.zarr_store_path is None and spec.zarr_store_path is not None:
         setattr(run, "zarr_store_path", spec.zarr_store_path)
 
     grid = _get_or_create(
@@ -1428,26 +1433,199 @@ def ensure_lifecycle_row(
     model_id: str,
     cycle_time: datetime,
 ) -> ForecastCycleLifecycleRecord:
-    """Return existing lifecycle record for (model_id, cycle_time) or create initial row."""
+    """Return existing lifecycle record for (model_id, cycle_time) or create initial row race-safely."""
     m_id = model_id.lower().strip()
     c_utc = _ensure_utc_datetime(cycle_time)
     row = db.get(ForecastCycleLifecycleRecord, (m_id, c_utc))
     if row is not None:
         return row
     now = _utcnow()
-    row = ForecastCycleLifecycleRecord(
-        model_id=m_id,
-        cycle_time=c_utc,
-        retired_at=None,
-        retired_by_cycle_time=None,
-        deletion_started_at=None,
-        deleted_at=None,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(row)
-    db.flush()
+    bind = db.get_bind()
+    dialect_name = getattr(bind.dialect, "name", "") if bind is not None else ""
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        pg_stmt = (
+            pg_insert(ForecastCycleLifecycleRecord)
+            .values(
+                model_id=m_id,
+                cycle_time=c_utc,
+                retired_at=None,
+                retired_by_cycle_time=None,
+                deletion_started_at=None,
+                deleted_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            .on_conflict_do_nothing(index_elements=["model_id", "cycle_time"])
+        )
+        db.execute(pg_stmt)
+    elif dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        sqlite_stmt = (
+            sqlite_insert(ForecastCycleLifecycleRecord)
+            .values(
+                model_id=m_id,
+                cycle_time=c_utc,
+                retired_at=None,
+                retired_by_cycle_time=None,
+                deletion_started_at=None,
+                deleted_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            .on_conflict_do_nothing(index_elements=["model_id", "cycle_time"])
+        )
+        db.execute(sqlite_stmt)
+    else:
+        row = ForecastCycleLifecycleRecord(
+            model_id=m_id,
+            cycle_time=c_utc,
+            retired_at=None,
+            retired_by_cycle_time=None,
+            deletion_started_at=None,
+            deleted_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        try:
+            db.flush()
+        except IntegrityError:
+            pass
+
+    row = db.get(ForecastCycleLifecycleRecord, (m_id, c_utc))
+    assert row is not None
     return row
+
+
+def reserve_run(
+    db: Session,
+    spec: RunCatalogSpec,
+) -> ModelRunRecord:
+    """Durably reserve ModelRun identity and physical store path before physical store writes.
+
+    Guarantee A & Guarantee B implementation:
+    1. Ensures parent ForecastCenter, Model, and ModelVersion rows exist idempotently.
+    2. Race-safely ensures forecast_cycle_lifecycle row exists via ON CONFLICT DO NOTHING.
+    3. Locks forecast_cycle_lifecycle row FOR UPDATE in the current transaction.
+    4. Re-checks that cycle is neither claimed for deletion (deletion_started_at IS NOT NULL)
+       nor deleted (deleted_at IS NOT NULL); raises CycleTombstonedError if fenced.
+    5. Inserts or retrieves ModelRunRecord with status='processing' and requested zarr_store_path.
+    6. Enforces write-once store-path immutability: rejects conflicting store path on existing run.
+    7. Does NOT insert products, ensemble members, or derive readiness status.
+
+    Args:
+        db: Database session.
+        spec: Catalog spec containing model_id, cycle_time, version_string, zarr_store_path.
+
+    Returns:
+        The reserved ModelRunRecord in status 'processing'.
+
+    Raises:
+        CycleTombstonedError: If cycle has deletion_started_at or deleted_at set.
+        ValueError: If an existing run has a conflicting non-null zarr_store_path.
+    """
+    from ingestion.core.base import CycleTombstonedError
+
+    cycle_time = _ensure_utc_datetime(spec.cycle_time)
+    m_id = spec.model_id.lower().strip()
+
+    # 1. Idempotently ensure parent hierarchy (required before lifecycle FK)
+    center = _get_or_create(
+        db,
+        CenterRecord,
+        CenterRecord.center_id == spec.center_id,
+        {
+            "id": f"center_{spec.center_id}",
+            "center_id": spec.center_id,
+            "name": spec.center_name,
+            "country": spec.center_country,
+        },
+    )
+    model = _get_or_create(
+        db,
+        ModelRecord,
+        ModelRecord.model_id == spec.model_id,
+        {
+            "id": f"model_{spec.model_id}",
+            "model_id": spec.model_id,
+            "name": spec.model_name,
+            "center_id": center.center_id,
+            "is_ensemble": spec.is_ensemble,
+            "resolution_km": spec.resolution_km,
+        },
+    )
+    version = _get_or_create(
+        db,
+        ModelVersionRecord,
+        (ModelVersionRecord.model_id == spec.model_id)
+        & (ModelVersionRecord.version_string == spec.version_string),
+        {
+            "id": f"version_{spec.model_id}_{spec.version_string}",
+            "model_id": model.model_id,
+            "version_string": spec.version_string,
+        },
+    )
+
+    # 2. Race-safely ensure lifecycle row exists
+    ensure_lifecycle_row(db, m_id, cycle_time)
+
+    # 3. Lock lifecycle row FOR UPDATE
+    lc = db.execute(
+        select(ForecastCycleLifecycleRecord)
+        .where(
+            ForecastCycleLifecycleRecord.model_id == m_id,
+            ForecastCycleLifecycleRecord.cycle_time == cycle_time,
+        )
+        .with_for_update()
+    ).scalar_one()
+
+    # 4. Check claim fences
+    if lc.deletion_started_at is not None or lc.deleted_at is not None:
+        raise CycleTombstonedError(
+            f"Refusing to reserve run for cycle {cycle_time.isoformat()}: "
+            "cycle is claimed for deletion or already tombstoned."
+        )
+
+    # 5. Create or retrieve ModelRunRecord
+    run = db.execute(
+        select(ModelRunRecord).where(
+            ModelRunRecord.model_version_id == version.id,
+            ModelRunRecord.cycle_time == cycle_time,
+        )
+    ).scalars().first()
+
+    now = _utcnow()
+    if run is None:
+        run = ModelRunRecord(
+            id=f"run_{version.id}_{cycle_time.strftime('%Y%m%d%H%M')}_{spec.model_id}",
+            model_version_id=version.id,
+            cycle_time=cycle_time,
+            status="processing",
+            zarr_store_path=spec.zarr_store_path,
+            created_at=now,
+        )
+        db.add(run)
+        db.flush()
+    else:
+        # Enforce write-once store-path immutability
+        if (
+            run.zarr_store_path is not None
+            and spec.zarr_store_path is not None
+            and run.zarr_store_path != spec.zarr_store_path
+        ):
+            raise ValueError(
+                f"Cannot change immutable store path {run.zarr_store_path!r} to "
+                f"{spec.zarr_store_path!r} for run {run.id!r}"
+            )
+        if run.zarr_store_path is None and spec.zarr_store_path is not None:
+            setattr(run, "zarr_store_path", spec.zarr_store_path)
+            db.flush()
+
+    return run
+
 
 
 def mark_cycle_retired(

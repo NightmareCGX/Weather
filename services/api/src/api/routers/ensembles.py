@@ -22,7 +22,7 @@ from api.services.ensemble_data import build_ensemble_statistics
 from api.services.lifecycle import parse_cycle_time, require_cycle_visible
 from api.services.point_forecast import (
     resolve_latest_run_cycle_time,
-    resolve_latest_run_store_path_and_retirement,
+    resolve_latest_run_store_path,
     resolve_serving_generation_for_store,
 )
 from domain.temporal import serving_start_valid_time
@@ -150,7 +150,7 @@ def get_ensemble_statistics(
                     status_code=404,
                     detail=f"Valid time '{computed_valid_time.isoformat()}' is before the active serving window ({start_vt.isoformat()}).",
                 )
-        store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+        store_path = resolve_latest_run_store_path(
             db, model, target_initial
         )
 
@@ -186,9 +186,7 @@ def get_ensemble_statistics(
 
         db.close()
 
-        serving_generation = resolve_serving_generation_for_store(
-            store_path, latest_retired_iso
-        )
+        serving_generation = resolve_serving_generation_for_store(store_path)
 
     cache_key = build_ensemble_cache_key(
         model=model,
