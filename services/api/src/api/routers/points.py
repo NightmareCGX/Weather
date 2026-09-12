@@ -38,7 +38,7 @@ from api.services.point_forecast import (
     ResolvedLocation,
     build_point_forecast,
     resolve_latest_run_cycle_time,
-    resolve_latest_run_store_path_and_retirement,
+    resolve_latest_run_store_path,
     resolve_serving_generation_for_store,
     resolve_location,
 )
@@ -103,16 +103,12 @@ def get_point_forecast(
         now=now,
     )
     cycle_time = resolve_latest_run_cycle_time(db, model_ids[0])
-    store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
-        db, model_ids[0]
-    )
+    store_path = resolve_latest_run_store_path(db, model_ids[0])
     # Explicitly release the request-scoped database connection before manifest
     # reading, Redis querying, and point compute.
     db.close()
 
-    serving_generation = resolve_serving_generation_for_store(
-        store_path, latest_retired_iso
-    )
+    serving_generation = resolve_serving_generation_for_store(store_path)
     serving_start_str = format_datetime_utc(serving_start_valid_time(now))
     cache_key = build_point_cache_key(
         model=model_ids[0],

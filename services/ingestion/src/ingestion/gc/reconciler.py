@@ -58,7 +58,6 @@ from ingestion.core.catalog import (
     ensure_lifecycle_row,
     list_cycle_lifecycle_snapshots,
     list_model_ready_cycle_times,
-    reconcile_cycle_lifecycle,
 )
 from ingestion.core.config import settings
 from ingestion.core.locks import LockTimeoutError, StoreLockCoordinator
@@ -198,17 +197,13 @@ def recheck_gc_eligibility(
     c_utc = _ensure_utc_datetime(cycle_time)
     m_id = model_id.lower().strip()
     lc = session.get(ForecastCycleLifecycleRecord, (m_id, c_utc))
-    if lc is None:
-        return False, "no_lifecycle_record", None
-    if lc.deleted_at is not None:
-        return False, "cycle_already_deleted", None
+    if lc is not None:
+        if lc.deleted_at is not None:
+            return False, "cycle_already_deleted", None
 
-    # Monotonic recovery: if deletion fence was already committed, deletion is authorized to resume
-    if lc.deletion_started_at is not None:
-        return True, "gc_claimed_resumable", lc.retired_by_cycle_time
-
-    if lc.retired_at is None:
-        return False, "cycle_not_retired", None
+        # Monotonic recovery: if deletion fence was already committed, deletion is authorized to resume
+        if lc.deletion_started_at is not None:
+            return True, "gc_claimed_resumable", lc.retired_by_cycle_time
 
     ready_cycles = list_model_ready_cycle_times(session, m_id, version_string=version_string)
     cadence = canonical_cycle_cadence(m_id)
@@ -431,11 +426,7 @@ def run_gc_pass(
     logger.info("gc_pass_started: dry_run=%s now=%s models=%s", dry_run, now_utc.isoformat(), models)
 
     with Session(engine) as session:
-        if not dry_run:
-            # 1. Reconcile newly eligible retirements per model
-            reconcile_cycle_lifecycle(session, models=models, now=now_utc, version_string=version_string)
-
-        # 2. Discover recorded store paths from model_runs for accurate deletion
+        # Discover recorded store paths from model_runs for accurate deletion
         runs = session.execute(
             select(
                 ModelVersionRecord.model_id,

@@ -37,7 +37,7 @@ import numpy as np
 import numpy.typing as npt
 import xarray as xr
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.core.png import encode_rgba_png
@@ -298,8 +298,8 @@ class TileReadContext:
     initial_time: str | None
     store_path: str
     expected_members: int
-    latest_retired_iso: str | None
     valid_time: str | None = None
+    latest_retired_iso: str | None = None
 
 
 def resolve_tile_read_context(
@@ -367,20 +367,6 @@ def resolve_tile_read_context(
 
     expected_members = get_expected_members(model, default_if_unknown=1)
 
-    latest_retired_iso: str | None = None
-    if resolved_initial is None and valid_time is None:
-        from api.models.entities import ForecastCycleLifecycle
-
-        latest_retired = db.execute(
-            select(func.max(ForecastCycleLifecycle.retired_at)).where(
-                ForecastCycleLifecycle.model_id == model.lower().strip()
-            )
-        ).scalar_one_or_none()
-        if latest_retired is not None:
-            if latest_retired.tzinfo is None:
-                latest_retired = latest_retired.replace(tzinfo=timezone.utc)
-            latest_retired_iso = latest_retired.astimezone(timezone.utc).isoformat()
-
     return TileReadContext(
         model=model,
         variable=variable,
@@ -392,7 +378,6 @@ def resolve_tile_read_context(
         initial_time=resolved_initial,
         store_path=store_path,
         expected_members=expected_members,
-        latest_retired_iso=latest_retired_iso,
         valid_time=resolved_valid_iso,
     )
 
@@ -440,9 +425,7 @@ def render_tile_png(
             # Even on cache hits, no connection remains checked out during response send.
             session.close()
 
-        serving_generation = resolve_serving_generation_for_store(
-            context.store_path, context.latest_retired_iso
-        )
+        serving_generation = resolve_serving_generation_for_store(context.store_path)
         cache_key = _tile_cache_key(
             model,
             variable,

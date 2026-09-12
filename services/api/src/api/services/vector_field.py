@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.services.point_forecast import (
-    resolve_latest_run_store_path_and_retirement,
+    resolve_latest_run_store_path,
     resolve_serving_generation_for_store,
 )
 from api.services.tiles import (
@@ -276,15 +276,13 @@ def render_vector_field_binary(
             initial_time=resolved_initial,
         )
 
-        store_path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
+        store_path = resolve_latest_run_store_path(
             db, model, resolved_initial
         )
         # Release DB connection immediately before S3 manifest read and cache check.
         db.close()
 
-        serving_generation = resolve_serving_generation_for_store(
-            store_path, latest_retired_iso
-        )
+        serving_generation = resolve_serving_generation_for_store(store_path)
 
     member_fingerprint = source.member_fingerprint if valid_time is not None else None
     cache_key = _vector_cache_key(

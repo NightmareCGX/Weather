@@ -265,8 +265,8 @@ def test_phase6e_staggered_3day_multicycle_acceptance(postgres_acceptance_env):
             assert lc is not None
             assert lc.deleted_at is not None
             assert lc.deletion_started_at is not None
-            assert lc.retired_at is not None
-            assert lc.retired_by_cycle_time is not None
+            assert lc.retired_at is None
+            assert lc.retired_by_cycle_time is None
 
         # C09, C10: active visible
         for c_act in [c09, c10]:

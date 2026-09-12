@@ -1361,16 +1361,16 @@ def _merge_var_names(by_cycle: dict[datetime, _CycleMetadata]) -> Iterable[str]:
     return sorted(names)
 
 
-def resolve_latest_run_store_path_and_retirement(
+def resolve_latest_run_store_path(
     db: Session, model: str, initial_time: str | None = None
-) -> tuple[str | None, str | None]:
-    """Resolve the latest run's store path and retirement timestamp in a single DB query.
+) -> str | None:
+    """Resolve the latest run's store path in a single DB query.
 
-    All database queries for serving generation resolution are executed here,
+    All database queries for store resolution are executed here,
     allowing the ORM session to be closed before the S3 manifest read.
 
     Returns:
-        A tuple of ``(store_path, latest_retired_iso)``.
+        The Zarr store path string, or None if no eligible run exists.
     """
     stmt = (
         select(ModelRun.zarr_store_path)
@@ -1384,33 +1384,25 @@ def resolve_latest_run_store_path_and_retirement(
         stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
     stmt = filter_visible_runs(stmt, model_id=model).order_by(ModelRun.cycle_time.desc())
     path = db.execute(stmt).scalars().first()
-    if path is None:
-        return None, None
+    return str(path) if path is not None else None
 
-    latest_retired_iso: str | None = None
-    if initial_time is None:
-        from api.models.entities import ForecastCycleLifecycle
 
-        latest_retired = db.execute(
-            select(func.max(ForecastCycleLifecycle.retired_at)).where(
-                ForecastCycleLifecycle.model_id == model.lower().strip()
-            )
-        ).scalar_one_or_none()
-        if latest_retired is not None:
-            if latest_retired.tzinfo is None:
-                latest_retired = latest_retired.replace(tzinfo=timezone.utc)
-            latest_retired_iso = latest_retired.astimezone(timezone.utc).isoformat()
-
-    return str(path), latest_retired_iso
+def resolve_latest_run_store_path_and_retirement(
+    db: Session, model: str, initial_time: str | None = None
+) -> tuple[str | None, str | None]:
+    """Backward-compatible wrapper returning ``(store_path, None)`` (Lifecycle V3)."""
+    return resolve_latest_run_store_path(db, model, initial_time), None
 
 
 def resolve_serving_generation_for_store(
-    store_path: str | None, latest_retired_iso: str | None = None
+    store_path: str | None, *args: Any, **kwargs: Any
 ) -> str | None:
     """Derive the serving generation from a store path outside the DB scope.
 
     Performs the storage-backed committed manifest read with ZERO database
-    connections held.
+    connections held. Derives generation exclusively from the committed physical
+    store manifest (Lifecycle V3). Legacy retired_at discriminators are completely
+    omitted.
 
     Returns:
         The serving generation discriminator string, or ``None``.
@@ -1420,15 +1412,10 @@ def resolve_serving_generation_for_store(
     from api.core.manifest_reader import ManifestReadError, manifest_generation
 
     try:
-        gen = manifest_generation(store_path)
+        return manifest_generation(store_path)
     except ManifestReadError:
         # A malformed manifest fails closed: do not serve a stale cache key.
         return None
-
-    if latest_retired_iso is not None:
-        return f"{gen}:{latest_retired_iso}" if gen else f"ret_{latest_retired_iso}"
-
-    return gen
 
 
 def resolve_latest_run_serving_generation(
@@ -1445,10 +1432,8 @@ def resolve_latest_run_serving_generation(
         The serving generation string, or ``None`` when no ready run exists, no
         manifest exists, or the store path cannot be resolved.
     """
-    path, latest_retired_iso = resolve_latest_run_store_path_and_retirement(
-        db, model, initial_time
-    )
-    return resolve_serving_generation_for_store(path, latest_retired_iso)
+    path = resolve_latest_run_store_path(db, model, initial_time)
+    return resolve_serving_generation_for_store(path)
 
 
 def resolve_latest_run_cycle_time(

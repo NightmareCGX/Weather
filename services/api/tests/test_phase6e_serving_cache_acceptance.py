@@ -283,7 +283,7 @@ def test_adversarial_cache_bypass_immunity(client, migrated_db, tmp_path):
     )
     assert res_vec.status_code == 200
 
-    # 2. Retire cycle c_ret in PostgreSQL
+    # 2. Retire cycle c_ret in PostgreSQL (retired_at alone) -> in V3, has zero effect
     with Session(migrated_db) as session:
         session.add(
             ForecastCycleLifecycle(
@@ -303,7 +303,20 @@ def test_adversarial_cache_bypass_immunity(client, migrated_db, tmp_path):
         )
         session.commit()
 
-    # 3. Query all 5 cached endpoints immediately: MUST return 404
+    # V3: retired_at alone does NOT invalidate or 404 cached responses
+    assert client.get(
+        f"/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&initial_time={c_ret_iso}"
+    ).status_code == 200
+
+    # 3. Now stamp physical deletion fence (deletion_started_at)
+    with Session(migrated_db) as session:
+        for m_id in ("gfs", "gefs"):
+            row = session.get(ForecastCycleLifecycle, (m_id, c_ret))
+            assert row is not None
+            row.deletion_started_at = _dt(2026, 9, 2, 7, 0)
+        session.commit()
+
+    # 4. Query all 5 cached endpoints immediately: physical fence MUST return 404
     assert client.get(
         f"/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&initial_time={c_ret_iso}"
     ).status_code == 404
@@ -353,7 +366,7 @@ def test_in_flight_reader_safe_during_concurrent_retirement(client, migrated_db,
     reader_session.acquire(timeout_seconds=5.0)
 
     try:
-        # T1: Retirement commits in PostgreSQL
+        # T1: Physical deletion fence commits in PostgreSQL
         with Session(migrated_db) as session:
             session.add(
                 ForecastCycleLifecycle(
@@ -361,11 +374,12 @@ def test_in_flight_reader_safe_during_concurrent_retirement(client, migrated_db,
                     cycle_time=c0,
                     retired_at=_dt(2026, 9, 2, 6, 30),
                     retired_by_cycle_time=c1,
+                    deletion_started_at=_dt(2026, 9, 2, 6, 30),
                 )
             )
             session.commit()
 
-        # T2: New requests observe retirement and return 404
+        # T2: New requests observe physical fence and return 404
         res_new = client.get(
             f"/v1/maps?model=gfs&variable=temperature_2m&level=surface&lead_time_hours=0&initial_time={c0_iso}"
         )

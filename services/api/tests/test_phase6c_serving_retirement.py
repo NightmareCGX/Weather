@@ -171,7 +171,7 @@ def test_lifecycle_service_predicates(test_db):
         assert is_cycle_visible(session, c2, model_id="gfs") is True
         assert require_cycle_visible(session, c2, model_id="gfs") == c2
 
-        # c3: row with retired_at set -> NOT visible (404)
+        # c3: row with retired_at set alone -> in V3 remains VISIBLE (retired_at has zero effect)
         session.add(
             ForecastCycleLifecycle(
                 model_id="gfs",
@@ -180,6 +180,14 @@ def test_lifecycle_service_predicates(test_db):
                 retired_by_cycle_time=_dt(2026, 9, 2, 12),
             )
         )
+        session.commit()
+        assert is_cycle_visible(session, c3, model_id="gfs") is True
+        assert require_cycle_visible(session, c3, model_id="gfs") == c3
+
+        # Setting deletion_started_at on c3 -> NOT visible (404)
+        lc3 = session.get(ForecastCycleLifecycle, ("gfs", c3))
+        assert lc3 is not None
+        lc3.deletion_started_at = _dt(2026, 9, 2, 13)
         session.commit()
         assert is_cycle_visible(session, c3, model_id="gfs") is False
         with pytest.raises(HTTPException) as exc_info:
@@ -278,7 +286,7 @@ def test_availability_excludes_retired_cycles(test_db):
     assert "2026-09-01T06:00:00Z" in init_times
     assert "2026-09-02T06:00:00Z" in init_times
 
-    # 2. Mark c1 as RETIRED
+    # 2. Mark c1 as RETIRED alone (V3: retired_at has zero effect on availability)
     with Session(test_db) as session:
         session.add(
             ForecastCycleLifecycle(
@@ -290,7 +298,23 @@ def test_availability_excludes_retired_cycles(test_db):
         )
         session.commit()
 
-    # 3. After retirement: only c2 appears; c1 is strictly excluded
+    res_retired = client.get("/v1/forecast/availability")
+    assert res_retired.status_code == 200
+    data_ret = res_retired.json()["data"]
+    gfs_avail_ret = next(m for m in data_ret["models"] if m["id"] == "gfs")
+    t2m_avail_ret = next(v for v in gfs_avail_ret["variables"] if v["id"] == "temperature_2m")
+    init_times_ret = [it["value"] for it in t2m_avail_ret["initial_times"]]
+    assert "2026-09-01T06:00:00Z" in init_times_ret
+    assert "2026-09-02T06:00:00Z" in init_times_ret
+
+    # 3. Now mark c1 with physical deletion fence: deletion_started_at
+    with Session(test_db) as session:
+        lc1 = session.get(ForecastCycleLifecycle, ("gfs", c1))
+        assert lc1 is not None
+        lc1.deletion_started_at = _dt(2026, 9, 2, 7)
+        session.commit()
+
+    # 4. After physical fence: only c2 appears; c1 is strictly excluded
     res2 = client.get("/v1/forecast/availability")
     assert res2.status_code == 200
     data2 = res2.json()["data"]
@@ -353,18 +377,19 @@ def test_ensemble_and_probability_explicit_retired_returns_404(test_db):
                 cycle_time=c_retired,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_visible,
+                deletion_started_at=_dt(2026, 9, 2, 0),
             )
         )
         session.commit()
 
-    # Explicit request for retired initial_time on /v1/ensembles -> 404
+    # Explicit request for physically fenced initial_time on /v1/ensembles -> 404
     res_ens = client.get(
         f"/v1/ensembles?lat=38.0&lon=-105.0&variable=temperature_2m&model=gefs&initial_time={c_retired.isoformat().replace('+00:00', 'Z')}"
     )
     assert res_ens.status_code == 404
     assert "not available" in res_ens.json()["error"]["message"]
 
-    # Explicit request for retired initial_time on /v1/probabilities -> 404
+    # Explicit request for physically fenced initial_time on /v1/probabilities -> 404
     res_prob = client.get(
         f"/v1/probabilities?lat=38.0&lon=-105.0&variable=temperature_2m&threshold=0&operator=gt&lead_time_hours=0&model=gefs&initial_time={c_retired.isoformat().replace('+00:00', 'Z')}"
     )
@@ -389,6 +414,7 @@ def test_maps_metadata_explicit_retired_returns_404(test_db):
                 cycle_time=c_retired,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_visible,
+                deletion_started_at=_dt(2026, 9, 2, 0),
             )
         )
         session.commit()
@@ -412,6 +438,7 @@ def test_raster_tile_and_vector_field_explicit_retired_returns_404(test_db):
                 cycle_time=c_retired,
                 retired_at=_dt(2026, 9, 2, 0),
                 retired_by_cycle_time=c_visible,
+                deletion_started_at=_dt(2026, 9, 2, 0),
             )
         )
         session.commit()
@@ -435,7 +462,7 @@ def test_raster_tile_and_vector_field_explicit_retired_returns_404(test_db):
 
 
 def test_cached_tile_cannot_bypass_retirement(test_db):
-    """Prove that if a tile was cached before retirement, it returns 404 once retired."""
+    """Prove that if a tile was cached before physical fence, it returns 404 once fenced."""
     client = TestClient(app)
     c = _dt(2026, 9, 1, 0)
     init_str = c.isoformat().replace("+00:00", "Z")
@@ -448,7 +475,7 @@ def test_cached_tile_cannot_bypass_retirement(test_db):
     with Session(test_db) as session:
         assert is_cycle_visible(session, c, model_id="gfs") is True
 
-    # Now mark cycle as RETIRED
+    # Mark cycle as retired alone: in V3 remains visible
     with Session(test_db) as session:
         session.add(
             ForecastCycleLifecycle(
@@ -459,6 +486,15 @@ def test_cached_tile_cannot_bypass_retirement(test_db):
             )
         )
         session.commit()
+        assert is_cycle_visible(session, c, model_id="gfs") is True
+
+    # Now mark cycle with deletion_started_at physical fence
+    with Session(test_db) as session:
+        lc = session.get(ForecastCycleLifecycle, ("gfs", c))
+        assert lc is not None
+        lc.deletion_started_at = _dt(2026, 9, 2, 0)
+        session.commit()
+        assert is_cycle_visible(session, c, model_id="gfs") is False
 
     # Request tile: must raise 404 and NOT return the cached PNG bytes
     res = client.get(
@@ -503,9 +539,24 @@ def test_runs_catalog_excludes_retired_runs(test_db):
         )
         session.commit()
 
+    # V3: retired_at alone does NOT exclude run from /v1/runs
     res = client.get("/v1/runs?model_id=gfs")
     assert res.status_code == 200
     runs = res.json()["data"]
     run_ids = [r["id"] for r in runs]
     assert "run_gfs_visible" in run_ids
-    assert "run_gfs_retired" not in run_ids
+    assert "run_gfs_retired" in run_ids
+
+    # Adding deletion_started_at physical fence excludes the run
+    with Session(test_db) as session:
+        lc_ret = session.get(ForecastCycleLifecycle, ("gfs", c_ret))
+        assert lc_ret is not None
+        lc_ret.deletion_started_at = _dt(2026, 9, 2, 1)
+        session.commit()
+
+    res2 = client.get("/v1/runs?model_id=gfs")
+    assert res2.status_code == 200
+    runs2 = res2.json()["data"]
+    run_ids2 = [r["id"] for r in runs2]
+    assert "run_gfs_visible" in run_ids2
+    assert "run_gfs_retired" not in run_ids2

@@ -191,13 +191,13 @@ def discover_incomplete_historical_cycles(
         )
 
 
-def is_cycle_retired_or_deleted(
+def is_cycle_fenced_or_deleted(
     db: Session, cycle_time: datetime, model_id: str | None = None
 ) -> bool:
-    """Return whether cycle_time is logically retired or claimed/tombstoned for deletion.
+    """Return whether cycle_time is claimed or tombstoned for deletion.
 
-    A cycle with retired_at IS NOT NULL, deletion_started_at IS NOT NULL, or
-    deleted_at IS NOT NULL is excluded from scheduling recovery.
+    A cycle with deletion_started_at IS NOT NULL or deleted_at IS NOT NULL is
+    excluded from scheduling recovery. Legacy retired_at has zero effect (Lifecycle V3).
     """
     c_utc = (
         cycle_time.replace(tzinfo=timezone.utc)
@@ -210,21 +210,23 @@ def is_cycle_retired_or_deleted(
         if row is None:
             return False
         return (
-            row.retired_at is not None
-            or row.deletion_started_at is not None
+            row.deletion_started_at is not None
             or row.deleted_at is not None
         )
 
     rows = db.execute(
         select(
-            ForecastCycleLifecycleRecord.retired_at,
             ForecastCycleLifecycleRecord.deletion_started_at,
             ForecastCycleLifecycleRecord.deleted_at,
         ).where(ForecastCycleLifecycleRecord.cycle_time == c_utc)
     ).all()
     return any(
-        r is not None or s is not None or d is not None for r, s, d in rows
+        s is not None or d is not None for s, d in rows
     )
+
+
+# Backward-compatible alias
+is_cycle_retired_or_deleted = is_cycle_fenced_or_deleted
 
 
 def _discover_incomplete_historical_cycles_db(
@@ -287,8 +289,8 @@ def _discover_incomplete_historical_cycles_db(
         if statuses.get("gfs") == "ready" and statuses.get("gefs") == "ready":
             continue
 
-        # Exclude if lifecycle retired, deletion started, or deleted
-        if is_cycle_retired_or_deleted(db, c_utc):
+        # Exclude if lifecycle deletion started or deleted
+        if is_cycle_fenced_or_deleted(db, c_utc):
             continue
 
         # Exclude if horizon expired for all incomplete target models

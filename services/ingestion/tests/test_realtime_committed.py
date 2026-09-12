@@ -379,17 +379,17 @@ def test_discover_incomplete_historical_cycles_zero_evidence_not_synthesized(
     assert candidates == []
 
 
-def test_discover_incomplete_historical_cycles_excludes_retired_cycle(
+def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_retired(
     catalog_engine,
 ) -> None:
-    """A partial cycle with retired_at != NULL must be excluded from recovery candidates,
+    """Under Lifecycle V3, retired_at alone does NOT exclude a cycle from backlog recovery,
 
-    while its committed data remains completely intact and unretired control cycles remain eligible.
+    while deletion_started_at / deleted_at physical fences strictly exclude it.
     """
     now_utc = datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc)
     c_active = datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc)
-    c_retired = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
-    c_control = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
+    c_retired_unfenced = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    c_fenced = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
 
     with Session(catalog_engine) as session:
         session.add(
@@ -403,12 +403,12 @@ def test_discover_incomplete_historical_cycles_excludes_retired_cycle(
             )
         )
 
-        # c_retired: Partial, retired_at is set, deletion_started_at is None, deleted_at is None
+        # c_retired_unfenced: Partial, retired_at is set, deletion_started_at is None, deleted_at is None
         session.add(
             ModelRunRecord(
                 id="r_gfs_ret",
                 model_version_id="ver_gfs_r",
-                cycle_time=c_retired,
+                cycle_time=c_retired_unfenced,
                 status="partial",
             )
         )
@@ -425,52 +425,61 @@ def test_discover_incomplete_historical_cycles_excludes_retired_cycle(
         session.add(
             ForecastCycleLifecycleRecord(
                 model_id="gfs",
-                cycle_time=c_retired,
+                cycle_time=c_retired_unfenced,
                 retired_at=now_utc,
                 deletion_started_at=None,
                 deleted_at=None,
             )
         )
 
-        # c_control: Partial, retired_at is None, deletion_started_at is None, deleted_at is None
+        # c_fenced: Partial, deletion_started_at is set
         session.add(
             ModelRunRecord(
-                id="r_gfs_ctrl",
+                id="r_gfs_fenced",
                 model_version_id="ver_gfs_r",
-                cycle_time=c_control,
+                cycle_time=c_fenced,
                 status="partial",
             )
         )
         session.add(
             ProductRecord(
-                id="p_gfs_ctrl_0",
-                run_id="r_gfs_ctrl",
+                id="p_gfs_fenced_0",
+                run_id="r_gfs_fenced",
                 variable_id="temperature_2m",
                 grid_id="global_025deg",
                 product_type="surface",
                 lead_time_hours=0,
             )
         )
+        session.add(
+            ForecastCycleLifecycleRecord(
+                model_id="gfs",
+                cycle_time=c_fenced,
+                retired_at=None,
+                deletion_started_at=now_utc,
+                deleted_at=None,
+            )
+        )
 
         session.commit()
 
-    # 1. Candidate discovery excludes c_retired and includes c_control
+    # 1. Candidate discovery includes c_retired_unfenced and excludes c_fenced
     candidates = discover_incomplete_historical_cycles(
         catalog_engine,
         active_cycle_time=c_active,
         now_utc=now_utc,
     )
     candidate_times = [c.cycle_time for c in candidates]
-    assert c_retired not in candidate_times
-    assert c_control in candidate_times
+    assert c_retired_unfenced in candidate_times
+    assert c_fenced not in candidate_times
 
     # 2. Lifecycle query confirms status
     with Session(catalog_engine) as session:
-        assert is_cycle_retired_or_deleted(session, c_retired) is True
-        assert is_cycle_retired_or_deleted(session, c_control) is False
+        assert is_cycle_retired_or_deleted(session, c_retired_unfenced) is False
+        assert is_cycle_retired_or_deleted(session, c_fenced) is True
 
     # 3. Existing committed state for retired cycle remains completely intact!
-    gfs_ret, _ = read_cycle_committed_state(catalog_engine, cycle_time=c_retired)
+    gfs_ret, _ = read_cycle_committed_state(catalog_engine, cycle_time=c_retired_unfenced)
     assert gfs_ret.leads == frozenset({0})
 
 
