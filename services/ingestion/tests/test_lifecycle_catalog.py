@@ -189,7 +189,7 @@ def test_ensure_lifecycle_row(db_session: Session) -> None:
     c = _dt(2026, 9, 1, 6)
     row1 = ensure_lifecycle_row(db_session, "gfs", c)
     assert row1.model_id == "gfs"
-    assert row1.cycle_time == c
+    assert _ensure_utc_datetime(row1.cycle_time) == c
     assert row1.retired_at is None
     assert row1.retired_by_cycle_time is None
     assert row1.deleted_at is None
@@ -197,7 +197,10 @@ def test_ensure_lifecycle_row(db_session: Session) -> None:
 
     # Second call returns existing
     row2 = ensure_lifecycle_row(db_session, "gfs", c)
-    assert (row1.model_id, row1.cycle_time) == (row2.model_id, row2.cycle_time)
+    assert (row1.model_id, _ensure_utc_datetime(row1.cycle_time)) == (
+        row2.model_id,
+        _ensure_utc_datetime(row2.cycle_time),
+    )
 
 
 def test_mark_cycle_retired_idempotency_and_conflict_safety(db_session: Session) -> None:
