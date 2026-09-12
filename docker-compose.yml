@@ -56,7 +56,7 @@ services:
           - weather-minio
 
   weather_minio_init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: weather_minio_init
     depends_on:
       weather_minio:
