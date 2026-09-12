@@ -570,3 +570,139 @@ curl -sf http://localhost:8000/v1/models | jq .
 ```
 Verify that JSON serialization, Redis caching, and coordinate projections execute without architecture-dependent regressions.
 
+---
+
+## 19. Runtime Health, Resource & Alert Response Runbooks
+
+### 19.1 Ingestion Pipeline Stuck (`#ingestion-stuck`)
+* **Symptom:** Alert `ingestion_pipeline_stuck` triggers (`CRITICAL`). A model run remains in `processing` or `partial` with zero forward progress in download, decode, write, or finalize for $> 10\text{ minutes}$.
+* **Diagnostic Procedure:**
+  1. Run `weather-ingest diagnostics` to identify which stage is stalled (`download_active`, `decode_active`, `write_active`, or `finalize_state`).
+  2. Inspect active threads and system logs:
+     - If download stalled: check NOAA upstream reachability (`curl -I https://nomads.ncep.noaa.gov` or AWS S3 open data).
+     - If decode stalled: check `DecodePool` processes. A corrupted upstream GRIB2 message can crash ecCodes native parser.
+     - If write stalled: check `pg_locks` to see if a writer is waiting for a database advisory lock or store gate.
+     - If finalize stalled: check MinIO latency and marker read responses.
+* **Remediation:**
+  - If a worker process hung, restart the ingestion worker service. Wave tasks are transactional and idempotent; the restarted runner will resume with clean state.
+  - If NOAA upstream is rate-limiting, verify `ENABLE_NOMADS_FALLBACK` and AWS Open Data configuration.
+
+### 19.2 Ingestion Lag vs. Upstream Availability (`#ingestion-lag`)
+* **Symptom:** Alert `ingestion_lag_warning` (1 cycle behind) or `ingestion_lag_critical` (2+ cycles behind) triggers.
+* **Important Operational Distinction:**
+  - **Upstream Unavailable:** If NOAA has not yet published the cycle, this is an external delay, not an ingestion failure. The lag alert only triggers when upstream data is confirmed available.
+* **Diagnostic Procedure:**
+  1. Run `weather-ingest status` to check `latest ready cycle`, `expected latest`, and `ingestion lag`.
+  2. Query NOAA discovery endpoint:
+     ```bash
+     weather-ingest realtime --once --dry-run
+     ```
+* **Remediation:**
+  - If the scheduler fell behind due to downtime, it will automatically process backlogged waves sequentially.
+  - For manual catch-up, dispatch the missing cycle explicitly:
+    ```bash
+    weather-ingest ingest --model <model> --cycle-date <YYYY-MM-DD> --cycle-hour <HH> --lead-time-hours 0 3 6 ... 240
+    ```
+
+### 19.3 Process Memory Growth & Sustained Leak (`#memory-leak`)
+* **Symptom:** Alert `memory_leak_warning` triggers (`WARNING`). Process post-cycle baseline RSS has grown monotonically over 5+ consecutive cycles by $\ge 15\%$ and $\ge 150\text{ MB}$.
+* **Diagnostic Procedure:**
+  1. Run `weather-ingest diagnostics` to inspect Python heap and garbage collection stats (`gc.get_count()`).
+  2. Note that temporary RSS peaks during GEFS 30-member writes are expected; only sustained post-cycle baseline growth constitutes a leak.
+  3. Inspect open file descriptors / handles (`weather_process_open_file_descriptors`).
+* **Remediation:**
+  - If `DecodePool` native C memory is leaking from repetitive ecCodes handles, restart the ingestion worker daemon. Worker process recycling ensures complete C-heap release.
+
+### 19.4 PostgreSQL Connection Saturation, Locks & Deadlocks (`#database-connections`, `#database-lock-waits`, `#database-deadlocks`, `#database-unreachable`)
+* **Symptom:** Alert `postgres_connections_warning` ($\ge 80\%$), `postgres_connections_critical` ($\ge 95\%$), `postgres_lock_waits`, or `postgres_deadlocks_detected` triggers.
+* **Deadlock Semantics:** Note that `pg_stat_database.deadlocks` is cumulative; the alert only fires when **new deadlocks occur within the observation interval** (`deadlocks_delta > 0`). Historical deadlocks that resolved never cause ongoing alerts.
+* **Diagnostic Procedure:**
+  1. Run `weather-ingest diagnostics` to view active connection counts, locked sessions, and long-running queries.
+  2. Inspect connection allocation across services:
+     ```sql
+     SELECT application_name, count(*) FROM pg_stat_activity GROUP BY application_name;
+     ```
+  3. Check for ungranted locks and blocked sessions:
+     ```sql
+     SELECT * FROM pg_locks WHERE NOT granted;
+     ```
+* **Remediation:**
+  - Terminate hung long-running sessions via `SELECT pg_terminate_backend(<PID>);`.
+  - If connection saturation occurs under high traffic, verify that `API_READER_LOCK_POOL_SIZE` and `DB_POOL_SIZE` obey the Stage 7F connection formula.
+  - If deadlocks repeat across concurrent ingestion waves, verify that writers sort catalog row insertions in canonical primary key order.
+
+### 19.5 Disk Storage & MinIO Volume Full (`#disk-space-warning`, `#disk-space-critical`, `#minio-unreachable`)
+* **Symptom:** Alert `disk_space_warning` ($\ge 80\%$) or `disk_space_critical` ($\ge 90\%$) triggers on temporary staging directory or object storage volume.
+* **Diagnostic Procedure:**
+  1. Check disk utilization: `df -h` or `weather-ingest status`.
+  2. Inspect staging directory `downloads/` for abandoned partial downloads from crashed runs.
+* **Remediation:**
+  - Purge orphaned temporary downloads: `rm -rf downloads/tmp_*`.
+  - Check whether the GC finalizer is running. If retired cycles are not being purged, verify `weather-ingest gc` daemon status.
+
+### 19.6 Stuck Physical Deletion Claims (`#stuck-deletion-claim`)
+* **Symptom:** Alert `finalizer_claim_stuck_warning` ($> 1\text{h}$) or `finalizer_claim_stuck_critical` ($> 4\text{h}$) triggers. A cycle has `deletion_started_at` set but `deleted_at` is null.
+* **Diagnostic Procedure:**
+  1. Query the stuck cycle:
+     ```sql
+     SELECT model_id, cycle_time, deletion_started_at
+     FROM forecast_cycle_lifecycle
+     WHERE deletion_started_at IS NOT NULL AND deleted_at IS NULL;
+     ```
+  2. Check if a GC worker process crashed while deleting S3 keys.
+  3. Verify object storage responsiveness: slow S3 prefix deletion can cause lease timeouts.
+* **Remediation:**
+  - Run a single-pass GC reconciliation to resume recovery candidates:
+    ```bash
+    weather-ingest gc --once
+    ```
+  - The finalizer will detect existing `deletion_started_at` claims, resume store deletion without re-evaluating horizon eligibility, and commit `deleted_at`.
+
+### 19.7 14-Day Metadata Sweeper Backlog Overdue (`#sweeper-backlog`)
+* **Symptom:** Alert `metadata_sweeper_backlog_overdue` triggers (`WARNING`). Tombstones older than 14 days retain detailed `model_runs` metadata.
+* **Diagnostic Procedure:**
+  1. Check unpurged tombstones count:
+     ```sql
+     SELECT count(*) FROM forecast_cycle_lifecycle l
+     JOIN model_runs r ON r.cycle_time = l.cycle_time
+     WHERE l.deleted_at <= NOW() - INTERVAL '14 days';
+     ```
+* **Remediation:**
+  - Trigger a manual metadata sweeper pass:
+    ```bash
+    weather-ingest gc --once --sweep-metadata --batch-size 100
+    ```
+  - The sweeper will purge child records (`model_runs`, `forecast_products`, `ensemble_member_products`) while preserving the `forecast_cycle_lifecycle` tombstone row.
+
+### 19.8 Granular Reclamation Failures & Lease Expiry (`#reclamation-failures`, `#reclamation-stuck`)
+* **Symptom:** Alert `reclamation_failed_shards` or `reclamation_deleting_stuck` triggers.
+* **Diagnostic Procedure:**
+  1. Inspect failed reclamation records:
+     ```sql
+     SELECT id, model_id, cycle_time, variable_code, lead_time_hours, last_error
+     FROM reclamation_queue
+     WHERE status = 'failed';
+     ```
+* **Remediation:**
+  - If failures were caused by transient S3 reachability, requeue the failed targets:
+    ```bash
+    weather-ingest reclamation requeue
+    ```
+  - Re-run the reclamation worker pass:
+    ```bash
+    weather-ingest reclamation work --delete --batch-size 100
+    ```
+
+### 19.9 Data Lifecycle Invariant & Anti-Resurrection Violations (`#anti-resurrection-violation`)
+* **Symptom:** Alert `invariant_anti_resurrection_violation` or `invariant_invalid_lifecycle_transition` triggers (`CRITICAL`).
+* **Diagnostic Procedure:**
+  1. Run `weather-ingest audit` immediately to display the exact offending rows:
+     ```bash
+     weather-ingest audit
+     ```
+  2. Verify if a writer attempted to ingest or recreate a cycle whose tombstone `deleted_at` was already committed.
+* **Remediation:**
+  - Under no circumstances should a permanent tombstone be bypassed. Check scheduler and manual ingestion logs to identify the unauthorized source.
+  - Delete any resurrected uncommitted run rows in `model_runs` that violate the permanent tombstone.
+
+

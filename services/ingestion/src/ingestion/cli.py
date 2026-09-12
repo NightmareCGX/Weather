@@ -702,6 +702,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional run ID to filter requeue",
     )
 
+    # -------------------------------------------------------------------------
+    # Monitoring & Operational Health Subcommands (Runtime Monitoring)
+    # -------------------------------------------------------------------------
+    status_parser = subparsers.add_parser(
+        "status",
+        help="print runtime platform health summary and operational metrics (TASK 20)",
+        description="Operator-facing runtime health summary covering PostgreSQL, MinIO, "
+        "GFS/GEFS ingestion, Lifecycle, Reclamation, and active alerts.",
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output health summary in JSON format",
+    )
+    status_parser.add_argument(
+        "--download-dir",
+        default="downloads",
+        help="Path to temporary download staging directory to inspect capacity",
+    )
+
+    subparsers.add_parser(
+        "diagnostics",
+        help="print deep operational diagnostics and stage latency breakdown",
+        description="Deep operational diagnostics covering process internals, PostgreSQL "
+        "catalog tables, lock waits, recent pipeline milestone timings, and alert history.",
+    )
+
+    subparsers.add_parser(
+        "audit",
+        help="run deep lifecycle contract, invariant, and anti-resurrection audit",
+        description="Audit permanent anti-resurrection tombstones, lifecycle state transitions, "
+        "and GEFS perturbation member completeness.",
+    )
+
+    subparsers.add_parser(
+        "alert-check",
+        help="evaluate alert rules and dispatch notifications to configured sinks",
+        description="Evaluates all monitoring rules (resources, database, storage, ingestion, "
+        "lifecycle). Dispatches to logs and optional webhook. Exits with code 0 (healthy/info), "
+        "1 (warning), or 2 (critical).",
+    )
+
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="export Prometheus metrics in text format",
+        description="Generates Prometheus exposition text format (version 0.0.4) for scraping.",
+    )
+    metrics_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Optional HTTP port to run Prometheus scraper server daemon",
+    )
+
     return parser
 
 
@@ -1057,6 +1111,296 @@ def _run_reclamation(args: argparse.Namespace) -> int:
     return 2
 
 
+def _run_status(args: argparse.Namespace) -> int:
+    import json
+    from dataclasses import asdict
+    from ingestion.core.config import settings
+    from ingestion.core.db import engine
+    from ingestion.monitoring import (
+        ALERT_ENGINE,
+        INGESTION_COLLECTOR,
+        LEAK_DETECTOR,
+        RESOURCE_COLLECTOR,
+        AlertSeverity,
+        LifecycleHealthCollector,
+        PostgresHealthCollector,
+        StorageHealthCollector,
+        render_platform_status,
+    )
+
+    dl_dir = getattr(args, "download_dir", "downloads")
+    res_data = RESOURCE_COLLECTOR.collect_and_export(disk_paths=(".", dl_dir))
+    pg_data = PostgresHealthCollector(engine).collect()
+    storage_data = StorageHealthCollector(
+        endpoint_url=getattr(settings, "MINIO_ENDPOINT", "http://localhost:9000"),
+        bucket=getattr(settings, "MINIO_BUCKET_NAME", "weather-data"),
+        access_key=getattr(settings, "MINIO_ACCESS_KEY", "minio_admin"),
+        secret_key=getattr(settings, "MINIO_SECRET_KEY", "minio_password"),
+    ).probe()
+    lifecycle_data = LifecycleHealthCollector(engine).collect()
+    gfs_lag = INGESTION_COLLECTOR.evaluate_lag("gfs")
+    gefs_lag = INGESTION_COLLECTOR.evaluate_lag("gefs")
+    gfs_state = INGESTION_COLLECTOR.get_model_state("gfs")
+    gefs_state = INGESTION_COLLECTOR.get_model_state("gefs")
+    leak_data = LEAK_DETECTOR.evaluate_leak()
+
+    ingestion_data = {
+        "gfs": {"lag": gfs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gfs")},
+        "gefs": {"lag": gefs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gefs")},
+    }
+
+    active_alerts = ALERT_ENGINE.evaluate_rules(
+        resource_data=res_data,
+        postgres_data=pg_data,
+        lifecycle_data=lifecycle_data,
+        ingestion_data=ingestion_data,
+        storage_data=storage_data,
+        leak_data=leak_data,
+    )
+
+    if getattr(args, "json", False):
+        summary_dict = {
+            "platform_status": (
+                "CRITICAL"
+                if any(a.severity == AlertSeverity.CRITICAL for a in active_alerts)
+                else ("DEGRADED" if active_alerts else "HEALTHY")
+            ),
+            "postgres": {
+                "connected": pg_data.connected,
+                "connections": pg_data.active_connections,
+                "max_connections": pg_data.max_connections,
+                "utilization_pct": pg_data.connection_utilization_pct,
+                "total_size_bytes": pg_data.total_size_bytes,
+            },
+            "storage": {
+                "connected": storage_data.connected,
+                "latency_ms": storage_data.latency_ms,
+            },
+            "gfs": {
+                "lag_cycles": gfs_lag.lag_cycles,
+                "lag_hours": gfs_lag.lag_hours,
+                "latest_ready": str(gfs_lag.latest_ready_cycle),
+                "expected_latest": str(gfs_lag.latest_expected_cycle),
+            },
+            "gefs": {
+                "lag_cycles": gefs_lag.lag_cycles,
+                "lag_hours": gefs_lag.lag_hours,
+                "latest_ready": str(gefs_lag.latest_ready_cycle),
+                "expected_latest": str(gefs_lag.latest_expected_cycle),
+            },
+            "lifecycle": {
+                "active_cycles": lifecycle_data.active_cycles,
+                "claimed_cycles": lifecycle_data.claimed_cycles,
+                "stuck_claims": lifecycle_data.stuck_claims_warning + lifecycle_data.stuck_claims_critical,
+                "tombstones": lifecycle_data.tombstone_cycles,
+            },
+            "reclamation": {
+                "queued": lifecycle_data.reclamation.queued_count,
+                "deleting": lifecycle_data.reclamation.deleting_count,
+                "deleted": lifecycle_data.reclamation.deleted_count,
+                "failed": lifecycle_data.reclamation.failed_count,
+            },
+            "metadata_retention": {
+                "eligible_backlog": lifecycle_data.sweeper_unpurged_count,
+                "oldest_overdue_seconds": lifecycle_data.sweeper_oldest_overdue_s,
+            },
+            "active_alerts": [asdict(a) for a in active_alerts],
+        }
+        print(json.dumps(summary_dict, indent=2, default=str))
+    else:
+        text_out = render_platform_status(
+            resource_data=res_data,
+            postgres_data=pg_data,
+            storage_data=storage_data,
+            lifecycle_data=lifecycle_data,
+            gfs_lag=gfs_lag,
+            gefs_lag=gefs_lag,
+            gfs_state=gfs_state,
+            gefs_state=gefs_state,
+            leak_data=leak_data,
+            active_alerts=active_alerts,
+        )
+        print(text_out)
+
+    return 0
+
+
+def _run_diagnostics(args: argparse.Namespace) -> int:
+    from ingestion.core.config import settings
+    from ingestion.core.db import engine
+    from ingestion.monitoring import (
+        ALERT_ENGINE,
+        INGESTION_COLLECTOR,
+        LifecycleHealthCollector,
+        PostgresHealthCollector,
+        RESOURCE_COLLECTOR,
+        StorageHealthCollector,
+        render_diagnostics,
+    )
+
+    res_data = RESOURCE_COLLECTOR.collect_and_export()
+    pg_data = PostgresHealthCollector(engine).collect()
+    storage_data = StorageHealthCollector(
+        endpoint_url=getattr(settings, "MINIO_ENDPOINT", "http://localhost:9000"),
+        bucket=getattr(settings, "MINIO_BUCKET_NAME", "weather-data"),
+        access_key=getattr(settings, "MINIO_ACCESS_KEY", "minio_admin"),
+        secret_key=getattr(settings, "MINIO_SECRET_KEY", "minio_password"),
+    ).probe()
+    lifecycle_data = LifecycleHealthCollector(engine).collect()
+    gfs_state = INGESTION_COLLECTOR.get_model_state("gfs")
+    gefs_state = INGESTION_COLLECTOR.get_model_state("gefs")
+    recent_events = ALERT_ENGINE.memory_sink.get_recent(limit=20)
+
+    out = render_diagnostics(
+        resource_data=res_data,
+        postgres_data=pg_data,
+        storage_data=storage_data,
+        lifecycle_data=lifecycle_data,
+        gfs_state=gfs_state,
+        gefs_state=gefs_state,
+        recent_events=recent_events,
+    )
+    print(out)
+    return 0
+
+
+def _run_audit(args: argparse.Namespace) -> int:
+    from ingestion.core.db import engine
+    from ingestion.monitoring import (
+        INGESTION_COLLECTOR,
+        LifecycleHealthCollector,
+        render_audit,
+    )
+
+    lifecycle_data = LifecycleHealthCollector(engine).collect()
+    gfs_comp = INGESTION_COLLECTOR.evaluate_gfs_completeness()
+    gefs_comp = INGESTION_COLLECTOR.evaluate_gefs_completeness()
+    out = render_audit(
+        lifecycle_data=lifecycle_data,
+        gfs_completeness=gfs_comp,
+        gefs_completeness=gefs_comp,
+    )
+    print(out)
+    return 1 if lifecycle_data.violations else 0
+
+
+def _run_alert_check(args: argparse.Namespace) -> int:
+    from ingestion.core.config import settings
+    from ingestion.core.db import engine
+    from ingestion.monitoring import (
+        ALERT_ENGINE,
+        AlertSeverity,
+        INGESTION_COLLECTOR,
+        LEAK_DETECTOR,
+        LifecycleHealthCollector,
+        PostgresHealthCollector,
+        RESOURCE_COLLECTOR,
+        StorageHealthCollector,
+    )
+
+    res_data = RESOURCE_COLLECTOR.collect_and_export()
+    pg_data = PostgresHealthCollector(engine).collect()
+    storage_data = StorageHealthCollector(
+        endpoint_url=getattr(settings, "MINIO_ENDPOINT", "http://localhost:9000"),
+        bucket=getattr(settings, "MINIO_BUCKET_NAME", "weather-data"),
+        access_key=getattr(settings, "MINIO_ACCESS_KEY", "minio_admin"),
+        secret_key=getattr(settings, "MINIO_SECRET_KEY", "minio_password"),
+    ).probe()
+    lifecycle_data = LifecycleHealthCollector(engine).collect()
+    gfs_lag = INGESTION_COLLECTOR.evaluate_lag("gfs")
+    gefs_lag = INGESTION_COLLECTOR.evaluate_lag("gefs")
+    leak_data = LEAK_DETECTOR.evaluate_leak()
+
+    ingestion_data = {
+        "gfs": {"lag": gfs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gfs")},
+        "gefs": {"lag": gefs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gefs")},
+    }
+
+    ALERT_ENGINE.evaluate_and_dispatch(
+        resource_data=res_data,
+        postgres_data=pg_data,
+        lifecycle_data=lifecycle_data,
+        ingestion_data=ingestion_data,
+        storage_data=storage_data,
+        leak_data=leak_data,
+    )
+
+    active = ALERT_ENGINE.deduplicator.get_active_alerts()
+    crit_count = sum(1 for a in active if a.severity == AlertSeverity.CRITICAL)
+    warn_count = sum(1 for a in active if a.severity == AlertSeverity.WARNING)
+
+    if crit_count > 0:
+        print(f"ALERT CHECK: CRITICAL ({crit_count} critical, {warn_count} warning alerts active)")
+        for a in active:
+            if a.severity == AlertSeverity.CRITICAL:
+                print(f"  [CRITICAL] {a.name} ({a.scope}): {a.summary}")
+        return 2
+    if warn_count > 0:
+        print(f"ALERT CHECK: WARNING ({warn_count} warning alerts active)")
+        for a in active:
+            if a.severity == AlertSeverity.WARNING:
+                print(f"  [WARNING] {a.name} ({a.scope}): {a.summary}")
+        return 1
+    print("ALERT CHECK: OK (all systems healthy)")
+    return 0
+
+
+def _run_metrics(args: argparse.Namespace) -> int:
+    from ingestion.core.config import settings
+    from ingestion.core.db import engine
+    from ingestion.monitoring import (
+        INGESTION_COLLECTOR,
+        LifecycleHealthCollector,
+        PostgresHealthCollector,
+        REGISTRY,
+        RESOURCE_COLLECTOR,
+        StorageHealthCollector,
+    )
+
+    RESOURCE_COLLECTOR.collect_and_export()
+    PostgresHealthCollector(engine).collect()
+    StorageHealthCollector(
+        endpoint_url=getattr(settings, "MINIO_ENDPOINT", "http://localhost:9000"),
+        bucket=getattr(settings, "MINIO_BUCKET_NAME", "weather-data"),
+        access_key=getattr(settings, "MINIO_ACCESS_KEY", "minio_admin"),
+        secret_key=getattr(settings, "MINIO_SECRET_KEY", "minio_password"),
+    ).probe()
+    LifecycleHealthCollector(engine).collect()
+    INGESTION_COLLECTOR.evaluate_lag("gfs")
+    INGESTION_COLLECTOR.evaluate_lag("gefs")
+
+    port = getattr(args, "port", None)
+    if port is not None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path in ("/metrics", "/"):
+                    content = REGISTRY.generate_latest().encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; version=0.0.4")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+        server = HTTPServer(("0.0.0.0", port), MetricsHandler)
+        print(f"Prometheus exporter running on http://0.0.0.0:{port}/metrics (Press Ctrl+C to stop)")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            server.server_close()
+        return 0
+
+    print(REGISTRY.generate_latest(), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return the process exit code."""
     args = _build_parser().parse_args(argv)
@@ -1068,6 +1412,16 @@ def main(argv: list[str] | None = None) -> int:
         return _run_gc(args)
     if args.command == "reclamation":
         return _run_reclamation(args)
+    if args.command == "status":
+        return _run_status(args)
+    if args.command == "diagnostics":
+        return _run_diagnostics(args)
+    if args.command == "audit":
+        return _run_audit(args)
+    if args.command == "alert-check":
+        return _run_alert_check(args)
+    if args.command == "metrics":
+        return _run_metrics(args)
     return 2
 
 

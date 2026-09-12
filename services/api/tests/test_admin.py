@@ -82,3 +82,36 @@ def test_health_database_probe_live(client, monkeypatch):
     assert data["database"] in ("connected", "disconnected")
     assert data["redis"] == "connected"
     assert data["object_storage"] == "connected"
+
+
+def test_api_metrics_endpoint(client, monkeypatch):
+    monkeypatch.setattr(admin_router, "_database_connected", lambda: True)
+    monkeypatch.setattr(admin_router, "_redis_connected", lambda: True)
+    monkeypatch.setattr(admin_router, "_object_storage_connected", lambda: True)
+
+    resp = client.get("/v1/metrics")
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["Content-Type"]
+    text = resp.text
+    assert "weather_api_database_connected 1.0" in text
+    assert "weather_api_redis_connected 1.0" in text
+    assert "weather_api_storage_connected 1.0" in text
+    assert "weather_api_process_memory_rss_bytes" in text
+    assert "weather_api_process_active_threads" in text
+
+
+def test_api_health_detailed_endpoint(client, monkeypatch):
+    monkeypatch.setattr(admin_router, "_database_connected", lambda: True)
+    monkeypatch.setattr(admin_router, "_redis_connected", lambda: True)
+    monkeypatch.setattr(admin_router, "_object_storage_connected", lambda: True)
+
+    resp = client.get("/v1/health/detailed")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "healthy"
+    assert body["version"] == "1.1.0"
+    assert body["dependencies"]["database"] == "connected"
+    assert "resources" in body
+    assert "rss_bytes" in body["resources"]
+    assert "threads" in body["resources"]
+
