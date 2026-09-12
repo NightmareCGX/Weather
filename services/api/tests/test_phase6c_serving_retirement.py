@@ -539,7 +539,7 @@ def test_runs_catalog_excludes_retired_runs(test_db):
         )
         session.commit()
 
-    # V3: retired_at alone does NOT exclude run from /v1/runs
+    # V3 M5: /v1/runs is an operational catalog; retired_at alone does NOT exclude run from /v1/runs
     res = client.get("/v1/runs?model_id=gfs")
     assert res.status_code == 200
     runs = res.json()["data"]
@@ -547,7 +547,7 @@ def test_runs_catalog_excludes_retired_runs(test_db):
     assert "run_gfs_visible" in run_ids
     assert "run_gfs_retired" in run_ids
 
-    # Adding deletion_started_at physical fence excludes the run
+    # V3 M5: Adding deletion_started_at physical fence does NOT exclude run from operational catalog /v1/runs
     with Session(test_db) as session:
         lc_ret = session.get(ForecastCycleLifecycle, ("gfs", c_ret))
         assert lc_ret is not None
@@ -559,4 +559,17 @@ def test_runs_catalog_excludes_retired_runs(test_db):
     runs2 = res2.json()["data"]
     run_ids2 = [r["id"] for r in runs2]
     assert "run_gfs_visible" in run_ids2
-    assert "run_gfs_retired" not in run_ids2
+    assert "run_gfs_retired" in run_ids2
+
+    # After M3 retention purge deletes model_runs metadata, run is absent
+    with Session(test_db) as session:
+        r_to_delete = session.get(ModelRun, "run_gfs_retired")
+        session.delete(r_to_delete)
+        session.commit()
+
+    res3 = client.get("/v1/runs?model_id=gfs")
+    assert res3.status_code == 200
+    runs3 = res3.json()["data"]
+    run_ids3 = [r["id"] for r in runs3]
+    assert "run_gfs_visible" in run_ids3
+    assert "run_gfs_retired" not in run_ids3
