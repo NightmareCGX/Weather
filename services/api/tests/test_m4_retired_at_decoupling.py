@@ -1,7 +1,7 @@
-"""Data Lifecycle V3 Milestone 4: retired_at Decoupling & Physical Fence Tests.
+"""Data Lifecycle V3 Milestone 4: Physical Fence & Serving Safety Tests.
 
 Validates that:
-1. retired_at != NULL has ZERO behavioral effect on:
+1. Unfenced cycles remain servable across:
    - serving endpoints (/v1/points, /v1/ensembles, /v1/probabilities, /v1/maps, tiles, vector-field)
    - explicit initial_time resolution
    - /v1/forecast/availability
@@ -144,33 +144,30 @@ def m4_db(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 1. retired_at Zero Behavioral Effect
+# 1. Unfenced Cycle Serving Visibility
 # ---------------------------------------------------------------------------
 
 
-def test_retired_at_does_not_block_is_cycle_visible(m4_db):
-    """is_cycle_visible and require_cycle_visible ignore retired_at completely."""
+def test_unfenced_cycle_is_visible(m4_db):
+    """is_cycle_visible and require_cycle_visible confirm unfenced cycles are visible."""
     c = _dt(2026, 9, 1, 6)
     with Session(m4_db) as session:
         session.add(
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c,
-                retired_at=_dt(2026, 9, 2, 6),
-                retired_by_cycle_time=_dt(2026, 9, 2, 12),
                 deletion_started_at=None,
                 deleted_at=None,
             )
         )
         session.commit()
 
-        # In V3, retired_at alone leaves the cycle visible
         assert is_cycle_visible(session, c, model_id="gfs") is True
         assert require_cycle_visible(session, c, model_id="gfs") == c
 
 
-def test_retired_at_does_not_block_availability_or_runs(m4_db):
-    """retired_at != NULL runs remain visible in /v1/forecast/availability and /v1/runs."""
+def test_unfenced_cycle_in_availability_and_runs(m4_db):
+    """Unfenced runs remain visible in /v1/forecast/availability and /v1/runs."""
     client = TestClient(app)
     c1 = _dt(2026, 9, 1, 6)
 
@@ -191,12 +188,10 @@ def test_retired_at_does_not_block_availability_or_runs(m4_db):
             product_type="surface",
             lead_time_hours=0,
         )
-        # Seed lifecycle row with retired_at populated, but unfenced
+        # Seed unfenced lifecycle row
         lc1 = ForecastCycleLifecycle(
             model_id="gfs",
             cycle_time=c1,
-            retired_at=_dt(2026, 9, 2, 6),
-            retired_by_cycle_time=_dt(2026, 9, 2, 12),
             deletion_started_at=None,
             deleted_at=None,
         )
@@ -219,8 +214,8 @@ def test_retired_at_does_not_block_availability_or_runs(m4_db):
     assert any(r["id"] == "run_gfs_c1" for r in runs)
 
 
-def test_filter_visible_runs_preserves_retired_and_excludes_fenced(m4_db):
-    """filter_visible_runs keeps retired_at visible, but excludes deletion_started_at/deleted_at."""
+def test_filter_visible_runs_preserves_unfenced_and_excludes_fenced(m4_db):
+    """filter_visible_runs keeps unfenced visible, but excludes deletion_started_at/deleted_at."""
     c_unfenced = _dt(2026, 9, 1, 0)
     c_claimed = _dt(2026, 9, 1, 6)
     c_deleted = _dt(2026, 9, 1, 12)
@@ -261,7 +256,6 @@ def test_filter_visible_runs_preserves_retired_and_excludes_fenced(m4_db):
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c_unfenced,
-                retired_at=_dt(2026, 9, 2, 0),
                 deletion_started_at=None,
                 deleted_at=None,
             )
@@ -270,7 +264,6 @@ def test_filter_visible_runs_preserves_retired_and_excludes_fenced(m4_db):
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c_claimed,
-                retired_at=_dt(2026, 9, 2, 0),
                 deletion_started_at=_dt(2026, 9, 2, 1),
                 deleted_at=None,
             )
@@ -279,7 +272,6 @@ def test_filter_visible_runs_preserves_retired_and_excludes_fenced(m4_db):
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c_deleted,
-                retired_at=_dt(2026, 9, 2, 0),
                 deletion_started_at=_dt(2026, 9, 2, 1),
                 deleted_at=_dt(2026, 9, 2, 2),
             )
@@ -299,13 +291,13 @@ def test_filter_visible_runs_preserves_retired_and_excludes_fenced(m4_db):
 # ---------------------------------------------------------------------------
 
 
-def test_cache_generation_does_not_contain_retired_at():
+def test_cache_generation_manifest_only():
     """resolve_serving_generation_for_store derives generation exclusively from manifest."""
     # Manifest read error or missing returns None
     gen = resolve_serving_generation_for_store(None)
     assert gen is None
 
-    # Even if legacy arguments are supplied, generation does not append retired_at
+    # Even if arguments are supplied, generation derives from manifest
     # (tested hermetically without requiring live S3)
     gen_dummy = resolve_serving_generation_for_store(None, "2026-09-02T12:00:00Z")
     assert gen_dummy is None
@@ -322,7 +314,6 @@ def test_explicit_initial_time_404_on_deletion_started_at(m4_db):
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c,
-                retired_at=None,
                 deletion_started_at=_dt(2026, 9, 2, 6),
                 deleted_at=None,
             )
@@ -347,7 +338,6 @@ def test_explicit_initial_time_404_on_deleted_at(m4_db):
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c,
-                retired_at=None,
                 deletion_started_at=_dt(2026, 9, 2, 6),
                 deleted_at=_dt(2026, 9, 2, 7),
             )
@@ -371,20 +361,18 @@ def test_cached_tile_rejected_after_deletion_started_at(m4_db):
     cache_key = ("gfs", "temperature_2m", "surface", 0, 0, 0, 0, init_str, "gen_test")
     _tile_cache[cache_key] = (1000000000.0, b"\x89PNG\r\n\x1a\nFakeTileBytes")
 
-    # Cycle with retired_at alone: cache hit / visible
+    # Unfenced cycle: cache hit / visible
     with Session(m4_db) as session:
         session.add(
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c,
-                retired_at=_dt(2026, 9, 2, 0),
                 deletion_started_at=None,
                 deleted_at=None,
             )
         )
         session.commit()
 
-    # In V3, retired_at alone does NOT invalidate or 404
     assert is_cycle_visible(Session(m4_db), c, model_id="gfs") is True
 
     # Now stamp deletion_started_at
@@ -451,12 +439,11 @@ def test_implicit_latest_cycle_advances_when_claimed(m4_db):
         )
         session.add_all([r1, r2])
 
-        # c2 has retired_at set alone -> remains latest
+        # c2 unfenced -> remains latest
         session.add(
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c2,
-                retired_at=_dt(2026, 9, 2, 0),
             )
         )
         session.commit()
@@ -467,6 +454,12 @@ def test_implicit_latest_cycle_advances_when_claimed(m4_db):
         # Now claim c2 for deletion
         lc2 = session.get(ForecastCycleLifecycle, ("gfs", c2))
         assert lc2 is not None
+        lc2.deletion_started_at = _dt(2026, 9, 2, 1)
+        session.commit()
+
+        # Advanced past c2 back to c1
+        latest2 = resolve_latest_run_cycle_time(session, "gfs")
+        assert latest2 == "2026-09-01T00:00:00Z"
         lc2.deletion_started_at = _dt(2026, 9, 2, 1)
         session.commit()
 

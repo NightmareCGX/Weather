@@ -220,13 +220,6 @@ def test_phase6e_staggered_3day_multicycle_acceptance(postgres_acceptance_env):
     res_dry = run_gc_pass(engine, dry_run=True, now=now_sim)
     assert res_dry.dry_run is True
 
-    # Assert expected retirements
-    would_retire_times = {r.cycle_time for r in res_dry.would_retire}
-    for c_exp in [c01, c02, c03, c04, c05, c06, c07, c08]:
-        assert c_exp in would_retire_times
-    assert c09 not in would_retire_times
-    assert c10 not in would_retire_times
-
     # Assert expected GC candidates (C01 through C08)
     would_gc_times = {g.cycle_time for g in res_dry.would_gc}
     assert would_gc_times == {c01, c02, c03, c04, c05, c06, c07, c08}
@@ -257,7 +250,7 @@ def test_phase6e_staggered_3day_multicycle_acceptance(postgres_acceptance_env):
 
     # 6. Verify catalog records:
     # - C01..C08: model_runs rows deleted, tombstones present with deleted_at
-    # - C09..C10: model_runs present, retired_at NULL
+    # - C09..C10: model_runs present, unfenced
     with Session(engine) as session:
         for c_del in [c01, c02, c03, c04, c05, c06, c07, c08]:
             assert session.execute(select(ModelRunRecord).where(ModelRunRecord.cycle_time == c_del)).scalars().all() == []
@@ -265,8 +258,6 @@ def test_phase6e_staggered_3day_multicycle_acceptance(postgres_acceptance_env):
             assert lc is not None
             assert lc.deleted_at is not None
             assert lc.deletion_started_at is not None
-            assert lc.retired_at is None
-            assert lc.retired_by_cycle_time is None
 
         # C09, C10: active visible
         for c_act in [c09, c10]:
@@ -274,5 +265,4 @@ def test_phase6e_staggered_3day_multicycle_acceptance(postgres_acceptance_env):
             assert len(runs) == 2
             lc_act = session.get(ForecastCycleLifecycleRecord, ("gfs", c_act))
             if lc_act is not None:
-                assert lc_act.retired_at is None
                 assert lc_act.deleted_at is None

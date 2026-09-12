@@ -7,18 +7,15 @@ Validates that:
    - record_run (CycleTombstonedError)
    - wave_runner._run_wave (CycleTombstonedError)
    - scheduler / backlog recovery (excluded)
-2. Incomplete cycle with retired_at != NULL and deleted_at == NULL is admitted to
-   backlog recovery (retired_at no longer blocks recovery).
-3. Legacy GC eligibility (recheck_gc_eligibility) does not require retired_at.
-4. run_gc_pass no longer calls reconcile_cycle_lifecycle.
-5. Production finalizer and metadata sweeper passes perform zero writes to retired_at.
+2. Unfenced cycle with deleted_at == NULL is admitted to backlog recovery.
+3. GC eligibility does not depend on legacy retired fields.
+4. Production finalizer and metadata sweeper passes work cleanly against contracted schema.
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -35,12 +32,13 @@ from ingestion.core.catalog import (
     ProductRecord,
     RunCatalogSpec,
     VariableSpec,
+    _ensure_utc_datetime,
     record_run,
     reserve_run,
 )
 from ingestion.core.wave_runner import RunSpec, _run_wave
 from ingestion.gc.finalizer import run_finalizer_pass
-from ingestion.gc.reconciler import recheck_gc_eligibility, run_gc_pass
+from ingestion.gc.reconciler import recheck_gc_eligibility
 from ingestion.gc.sweeper import run_metadata_sweeper_pass
 from ingestion.realtime.committed import (
     discover_incomplete_historical_cycles,
@@ -222,12 +220,12 @@ def test_tombstone_only_excluded_from_scheduler_recovery(catalog_engine):
 
 
 # ---------------------------------------------------------------------------
-# 2. Incomplete Cycle with retired_at != NULL Admitted
+# 2. Incomplete Cycle Unfenced Admitted
 # ---------------------------------------------------------------------------
 
 
-def test_unfenced_cycle_with_retired_at_admitted_to_recovery(catalog_engine):
-    """An incomplete cycle with retired_at != NULL and deleted_at == NULL is admitted."""
+def test_unfenced_cycle_admitted_to_recovery(catalog_engine):
+    """An incomplete cycle with deleted_at == NULL is admitted."""
     now_utc = _dt(2026, 9, 2, 18)
     c_active = _dt(2026, 9, 2, 18)
     c_partial_retired = _dt(2026, 9, 2, 12)
@@ -252,12 +250,11 @@ def test_unfenced_cycle_with_retired_at_admitted_to_recovery(catalog_engine):
                 lead_time_hours=0,
             )
         )
-        # Marked retired, but NOT claimed or deleted
+        # Unfenced (NOT claimed or deleted)
         session.add(
             ForecastCycleLifecycleRecord(
                 model_id="gfs",
                 cycle_time=c_partial_retired,
-                retired_at=_dt(2026, 9, 2, 13),
                 deletion_started_at=None,
                 deleted_at=None,
             )
@@ -280,8 +277,8 @@ def test_unfenced_cycle_with_retired_at_admitted_to_recovery(catalog_engine):
 # ---------------------------------------------------------------------------
 
 
-def test_recheck_gc_eligibility_ignores_retired_at(catalog_engine):
-    """recheck_gc_eligibility does not require retired_at to be populated."""
+def test_recheck_gc_eligibility_unfenced_cycle(catalog_engine):
+    """recheck_gc_eligibility evaluates cutoff without requiring legacy fields."""
     c_old = _dt(2026, 9, 1, 0)
     c_ready = _dt(2026, 9, 1, 12)
 
@@ -295,12 +292,11 @@ def test_recheck_gc_eligibility_ignores_retired_at(catalog_engine):
                 status="ready",
             )
         )
-        # c_old has NO retired_at, but lifecycle row exists
+        # c_old is unfenced, lifecycle row exists
         session.add(
             ForecastCycleLifecycleRecord(
                 model_id="gfs",
                 cycle_time=c_old,
-                retired_at=None,
                 deletion_started_at=None,
                 deleted_at=None,
             )
@@ -314,17 +310,8 @@ def test_recheck_gc_eligibility_ignores_retired_at(catalog_engine):
         assert t_ready == c_ready
 
 
-def test_run_gc_pass_does_not_call_reconcile_cycle_lifecycle(catalog_engine):
-    """run_gc_pass no longer calls reconcile_cycle_lifecycle (zero retirement writes)."""
-    with patch("ingestion.core.catalog.reconcile_cycle_lifecycle") as mock_reconcile:
-        # Run a real (non-dry-run) GC pass
-        run_gc_pass(catalog_engine, dry_run=False, models=("gfs",))
-        # Reconcile cycle lifecycle must NOT be invoked
-        mock_reconcile.assert_not_called()
-
-
-def test_finalizer_and_sweeper_zero_retired_at_writes(catalog_engine):
-    """Production finalizer and sweeper passes perform zero writes to retired_at."""
+def test_finalizer_and_sweeper_preserve_contracted_lifecycle(catalog_engine):
+    """Production finalizer and sweeper passes work cleanly against contracted lifecycle schema."""
     c = _dt(2026, 8, 1, 0)
     now = _dt(2026, 9, 1, 0)
 
@@ -335,8 +322,6 @@ def test_finalizer_and_sweeper_zero_retired_at_writes(catalog_engine):
                 cycle_time=c,
                 deletion_started_at=_dt(2026, 8, 2, 0),
                 deleted_at=_dt(2026, 8, 2, 1),
-                retired_at=None,
-                retired_by_cycle_time=None,
             )
         )
         session.commit()
@@ -347,9 +332,8 @@ def test_finalizer_and_sweeper_zero_retired_at_writes(catalog_engine):
     # 2. Run metadata sweeper pass
     run_metadata_sweeper_pass(catalog_engine, dry_run=False, now=now)
 
-    # Verify retired_at and retired_by_cycle_time remain strictly None
+    # Verify lifecycle row remains intact
     with Session(catalog_engine) as session:
         row = session.get(ForecastCycleLifecycleRecord, ("gfs", c))
         assert row is not None
-        assert row.retired_at is None
-        assert row.retired_by_cycle_time is None
+        assert _ensure_utc_datetime(row.deleted_at) == _dt(2026, 8, 2, 1)

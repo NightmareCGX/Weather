@@ -6,14 +6,12 @@ Validates the locked M5 contract:
    - Lists runs with deletion_started_at != NULL while model_runs metadata exists
    - Lists runs with deleted_at != NULL while model_runs metadata exists
    - Naturally omits runs once model_runs metadata is deleted (M3 purge)
-   - retired_at has zero effect
    - Query filters (model_id, status, pagination) work normally
    - No include_deleted parameter is added or accepted
 
 2. /v1/forecast/availability represents ACTUAL V3 SERVABLE FORECAST AVAILABILITY:
    - deletion_started_at cycles contribute 0 availability
    - deleted_at cycles contribute 0 availability
-   - retired_at alone has zero effect on availability
    - serving_start_valid_time(now) strictly enforced: 06Z included, 03Z excluded when now = 07Z
    - Granular product fences: deleting/deleted/failed excluded, queued remains eligible
    - Target-kind correlation: det does not mask mean, mean does not mask det
@@ -287,8 +285,8 @@ def test_04_runs_disappears_after_metadata_purge(m5_env):
     assert "run_purged_4" not in ids
 
 
-def test_05_runs_retired_at_has_no_effect(m5_env):
-    """5. retired_at != NULL alone has zero effect on /v1/runs."""
+def test_05_runs_unfenced_included(m5_env):
+    """5. Unfenced run is included in /v1/runs."""
     client = TestClient(app)
     c5 = _dt(2026, 9, 11, 0)
     with Session(m5_env) as session:
@@ -306,7 +304,6 @@ def test_05_runs_retired_at_has_no_effect(m5_env):
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c5,
-                retired_at=_dt(2026, 9, 11, 6),
             )
         )
         session.commit()
@@ -469,8 +466,8 @@ def test_08_availability_excludes_deleted_at_cycle(m5_env):
             assert not any(vt["source_cycle"] == c_iso for vt in t2m["valid_times"])
 
 
-def test_09_availability_retired_at_has_no_effect(m5_env):
-    """9. retired_at alone has zero effect on availability."""
+def test_09_availability_unfenced_included(m5_env):
+    """9. Unfenced run is included in availability."""
     client = TestClient(app)
     c = _dt(2026, 9, 12, 12)
     app.dependency_overrides[get_current_time] = lambda: _dt(2026, 9, 12, 12)
@@ -500,7 +497,6 @@ def test_09_availability_retired_at_has_no_effect(m5_env):
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c,
-                retired_at=_dt(2026, 9, 12, 13),
             )
         )
         session.commit()

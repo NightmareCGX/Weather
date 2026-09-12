@@ -26,7 +26,7 @@ from ingestion.core.catalog import (
 from ingestion.realtime.committed import (
     discover_incomplete_historical_cycles,
     is_cycle_durably_complete,
-    is_cycle_retired_or_deleted,
+    is_cycle_fenced_or_deleted,
     read_cycle_committed_state,
 )
 
@@ -379,10 +379,10 @@ def test_discover_incomplete_historical_cycles_zero_evidence_not_synthesized(
     assert candidates == []
 
 
-def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_retired(
+def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_unfenced(
     catalog_engine,
 ) -> None:
-    """Under Lifecycle V3, retired_at alone does NOT exclude a cycle from backlog recovery,
+    """Under Lifecycle V3, an unfenced cycle is admitted to backlog recovery,
 
     while deletion_started_at / deleted_at physical fences strictly exclude it.
     """
@@ -403,7 +403,7 @@ def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_
             )
         )
 
-        # c_retired_unfenced: Partial, retired_at is set, deletion_started_at is None, deleted_at is None
+        # c_retired_unfenced: Partial, unfenced (deletion_started_at is None, deleted_at is None)
         session.add(
             ModelRunRecord(
                 id="r_gfs_ret",
@@ -426,7 +426,6 @@ def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_
             ForecastCycleLifecycleRecord(
                 model_id="gfs",
                 cycle_time=c_retired_unfenced,
-                retired_at=now_utc,
                 deletion_started_at=None,
                 deleted_at=None,
             )
@@ -455,7 +454,6 @@ def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_
             ForecastCycleLifecycleRecord(
                 model_id="gfs",
                 cycle_time=c_fenced,
-                retired_at=None,
                 deletion_started_at=now_utc,
                 deleted_at=None,
             )
@@ -475,8 +473,8 @@ def test_discover_incomplete_historical_cycles_excludes_fenced_cycle_and_admits_
 
     # 2. Lifecycle query confirms status
     with Session(catalog_engine) as session:
-        assert is_cycle_retired_or_deleted(session, c_retired_unfenced) is False
-        assert is_cycle_retired_or_deleted(session, c_fenced) is True
+        assert is_cycle_fenced_or_deleted(session, c_retired_unfenced) is False
+        assert is_cycle_fenced_or_deleted(session, c_fenced) is True
 
     # 3. Existing committed state for retired cycle remains completely intact!
     gfs_ret, _ = read_cycle_committed_state(catalog_engine, cycle_time=c_retired_unfenced)

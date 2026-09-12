@@ -17,7 +17,7 @@ Implements all 30 deterministic test scenarios mandated by the acceptance contra
 14. GEFS geavg + <26 members: all endpoints remain on older coherent vintage.
 15. GEFS geavg + 26 members: all GEFS endpoints promote to the newer coherent vintage.
 16. GEFS 30/30 remains formal readiness requirement; 26/30 does not mark run ready.
-17. retired_at != NULL does not remove an otherwise valid representation from V3 valid_time resolution.
+17. Unfenced lifecycle row does not remove an otherwise valid representation from V3 valid_time resolution.
 18. deletion_started_at != NULL excludes the affected physical source.
 19. deleted_at != NULL excludes the affected physical source.
 20. Physical lifecycle fence is correctly model-scoped (GFS fence does not fence GEFS).
@@ -497,22 +497,20 @@ def test_16_gefs_30_members_remains_formal_readiness_requirement(v3_db):
 
 
 # ---------------------------------------------------------------------------
-# Test Scenarios 17 - 20: Legacy retired_at Decoupling & Physical Fences
+# Test Scenarios 17 - 20: Lifecycle Visibility & Physical Fences
 # ---------------------------------------------------------------------------
 
-def test_17_retired_at_not_null_does_not_remove_valid_representation(v3_db):
-    """17. retired_at != NULL does not exclude an otherwise valid representation from V3 valid_time resolution."""
+def test_17_unfenced_lifecycle_row_does_not_remove_valid_representation(v3_db):
+    """17. Unfenced lifecycle row does not exclude an otherwise valid representation from V3 valid_time resolution."""
     c_00z = _dt(2026, 9, 2, 0)
     target_v = _dt(2026, 9, 2, 6)
 
     with Session(v3_db) as session:
         session.add(ModelRun(id="r_ret", model_version_id="v_gfs", cycle_time=c_00z, status="ready", zarr_store_path="/store/ret"))
         session.add(ForecastProduct(id="p_ret_6", run_id="r_ret", variable_id="temperature_2m", grid_id="global_025deg", product_type="surface", lead_time_hours=6))
-        # Stamped with legacy V2 retired_at
-        session.add(ForecastCycleLifecycle(model_id="gfs", cycle_time=c_00z, retired_at=_dt(2026, 9, 2, 8)))
+        session.add(ForecastCycleLifecycle(model_id="gfs", cycle_time=c_00z))
         session.commit()
 
-        # V3 ignores retired_at -> representation is successfully resolved
         src = resolve_canonical_source(session, "gfs", target_v)
         assert src.cycle_time == c_00z
         assert src.lead_time_hours == 6

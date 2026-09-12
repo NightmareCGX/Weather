@@ -23,7 +23,6 @@ from ingestion.core.catalog import (
     RunCatalogSpec,
     VariableSpec,
     _ensure_utc_datetime,
-    mark_cycle_retired,
     record_run,
 )
 from ingestion.core.locks import StoreLockCoordinator
@@ -190,11 +189,6 @@ def test_active_reader_gate_blocks_physical_gc(postgres_gc_env):
     _seed_cycle(engine, tmp_path, c1, "ready")
     _seed_cycle(engine, tmp_path, c2, "ready")
 
-    # Mark c0 retired by c1
-    with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
-        session.commit()
-
     # Start a reader session holding SHARED store gate on gfs_path
     reader_pool = ReaderLockPool(db_url, pool_size=2, max_overflow=0, pool_timeout=5.0)
     reader_session = _ReaderGateSession(reader_pool, gfs_path)
@@ -204,7 +198,6 @@ def test_active_reader_gate_blocks_physical_gc(postgres_gc_env):
         candidate = GcCandidateInfo(
             model_id="gfs",
             cycle_time=c0,
-            retired_by_cycle_time=c1,
             cutoff=c1,
             store_path=gfs_path,
             gfs_store_path=gfs_path,
@@ -247,14 +240,9 @@ def test_active_writer_gate_blocks_physical_gc(postgres_gc_env):
     _seed_cycle(engine, tmp_path, c1, "ready")
     _seed_cycle(engine, tmp_path, c2, "ready")
 
-    with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
-        session.commit()
-
     candidate = GcCandidateInfo(
         model_id="gfs",
         cycle_time=c0,
-        retired_by_cycle_time=c1,
         cutoff=c1,
         store_path=gfs_path,
         gfs_store_path=gfs_path,
@@ -301,10 +289,6 @@ def test_crash_recovery_after_partial_store_deletion(postgres_gc_env):
     _seed_cycle(engine, tmp_path, c1, "ready")
     _seed_cycle(engine, tmp_path, c2, "ready")
 
-    with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
-        session.commit()
-
     # Manually delete GFS to simulate crash midway
     shutil.rmtree(gfs_path)
     assert not os.path.exists(gfs_path)
@@ -314,7 +298,6 @@ def test_crash_recovery_after_partial_store_deletion(postgres_gc_env):
     candidate = GcCandidateInfo(
         model_id="gfs",
         cycle_time=c0,
-        retired_by_cycle_time=c1,
         cutoff=c1,
         store_path=gfs_path,
         gfs_store_path=gfs_path,
@@ -347,11 +330,9 @@ def test_full_e2e_lifecycle_retirement_dryrun_gc_tombstone(postgres_gc_env):
     _seed_cycle(engine, tmp_path, c1, "ready")
     _seed_cycle(engine, tmp_path, c2, "ready")
 
-    # 1. Run GC pass in DRY RUN mode -> shows would_retire and would_gc
+    # 1. Run GC pass in DRY RUN mode -> shows would_gc
     res_dry = run_gc_pass(engine, dry_run=True, now=_dt(2026, 9, 2, 12, 30))
     assert res_dry.dry_run is True
-    assert len(res_dry.would_retire) >= 1
-    assert c0 in [r.cycle_time for r in res_dry.would_retire]
     assert len(res_dry.would_gc) >= 1
     assert c0 in [g.cycle_time for g in res_dry.would_gc]
 
@@ -416,10 +397,6 @@ def test_reingestion_race_closure_after_gfs_release(postgres_gc_env):
     gfs_path, gefs_path = _seed_cycle(engine, tmp_path, c0, "ready")
     _seed_cycle(engine, tmp_path, c1, "ready")
     _seed_cycle(engine, tmp_path, c2, "ready")
-
-    with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
-        session.commit()
 
     # Step 1: Claim deletion fence
     with Session(engine) as session:
@@ -491,7 +468,6 @@ def test_crash_fence_persists_across_process_restart(postgres_gc_env):
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
         # Process 1 claims cycle and deletes GFS, then crashes
         claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
         session.commit()
@@ -547,7 +523,6 @@ def test_claimed_deletion_monotonic_recovery_without_historical_r2(postgres_gc_e
     _seed_cycle(engine, tmp_path, c2, "ready")
 
     with Session(engine) as session:
-        mark_cycle_retired(session, "gfs", c0, c1, c1)
         claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
         session.commit()
 

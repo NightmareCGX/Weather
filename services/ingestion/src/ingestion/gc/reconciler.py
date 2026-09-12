@@ -34,18 +34,14 @@ import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from domain.cadence import canonical_cycle_cadence
-from domain.lifecycle import (
-    LifecycleDecision,
-    canonical_cycle_store_path,
-    compute_lifecycle_cutoff,
-    plan_model_lifecycle,
-)
+from domain.lifecycle import canonical_cycle_store_path
 from ingestion.core.catalog import (
     EnsembleMemberProductRecord,
     EnsembleMemberRecord,
@@ -72,11 +68,8 @@ class GcCandidateInfo:
 
     model_id: str
     cycle_time: datetime
-    retired_by_cycle_time: datetime | None
     cutoff: datetime | None
     store_path: str
-    # Optional legacy compatibility fields
-    gc_eligible_by_cycle_time: datetime | None = None
     gfs_store_path: str | None = None
     gefs_store_path: str | None = None
 
@@ -87,12 +80,12 @@ class GcPassResult:
 
     dry_run: bool
     evaluated_at: datetime
-    would_retire: tuple[LifecycleDecision, ...]
     would_gc: tuple[GcCandidateInfo, ...]
     processed_gc: tuple[datetime, ...]
     blocked_gc: tuple[datetime, ...]
     locked_gc: tuple[datetime, ...]
     failed_gc: tuple[datetime, ...]
+    would_retire: tuple[Any, ...] = ()
 
 
 def _delete_store_prefix(store_path: str) -> None:
@@ -189,7 +182,7 @@ def recheck_gc_eligibility(
       The cycle was ALREADY authorized and claimed by a prior GC pass.
       It is valid for deletion resume even if historical successor runs were later cleaned up.
     - If deletion_started_at IS NULL:
-      Requires retired_at IS NOT NULL and cycle_time < cutoff (T - C).
+      Requires cycle_time < cutoff (T - C).
 
     Returns:
         (is_eligible, reason, latest_ready_T)
@@ -203,11 +196,13 @@ def recheck_gc_eligibility(
 
         # Monotonic recovery: if deletion fence was already committed, deletion is authorized to resume
         if lc.deletion_started_at is not None:
-            return True, "gc_claimed_resumable", lc.retired_by_cycle_time
+            return True, "gc_claimed_resumable", None
 
     ready_cycles = list_model_ready_cycle_times(session, m_id, version_string=version_string)
     cadence = canonical_cycle_cadence(m_id)
-    t_ready, cutoff = compute_lifecycle_cutoff(ready_cycles, cadence)
+    sorted_ready = sorted(_ensure_utc_datetime(t) for t in ready_cycles)
+    t_ready = sorted_ready[-1] if sorted_ready else None
+    cutoff = (t_ready - cadence) if t_ready is not None else None
 
     if cutoff is None or c_utc >= cutoff:
         return False, "retained_at_or_above_cutoff", None
@@ -444,55 +439,56 @@ def run_gc_pass(
             if z_path:
                 store_paths_by_cycle[(str(m_id), _ensure_utc_datetime(c_time))] = str(z_path)
 
-        all_would_retire: list[LifecycleDecision] = []
         all_would_gc_candidates: list[GcCandidateInfo] = []
         all_blocked: list[datetime] = []
 
         for m_id in models:
             ready = list_model_ready_cycle_times(session, m_id, version_string=version_string)
-            snapshots = list_cycle_lifecycle_snapshots(session, model_id=m_id, version_string=version_string)
-            plan = plan_model_lifecycle(m_id, snapshots, ready)
+            cadence = canonical_cycle_cadence(m_id)
+            sorted_ready = sorted(_ensure_utc_datetime(t) for t in ready)
+            t_ready = sorted_ready[-1] if sorted_ready else None
+            cutoff = (t_ready - cadence) if t_ready is not None else None
 
-            all_would_retire.extend(plan.would_retire)
-            for g in plan.would_gc:
-                store_path = store_paths_by_cycle.get(
-                    (m_id, g.cycle_time),
-                    canonical_cycle_store_path(m_id, g.cycle_time, base_bucket=base_bucket),
-                )
-                all_would_gc_candidates.append(
-                    GcCandidateInfo(
-                        model_id=m_id,
-                        cycle_time=g.cycle_time,
-                        retired_by_cycle_time=g.retired_by_cycle_time,
-                        cutoff=g.cutoff,
-                        store_path=store_path,
-                        gc_eligible_by_cycle_time=g.retired_by_cycle_time,
-                        gfs_store_path=store_path if m_id == "gfs" else None,
-                        gefs_store_path=store_path if m_id == "gefs" else None,
+            snapshots = list_cycle_lifecycle_snapshots(session, model_id=m_id, version_string=version_string)
+            for snap in snapshots:
+                if snap.is_deleted:
+                    continue
+                if cutoff is not None and snap.cycle_time < cutoff:
+                    store_path = store_paths_by_cycle.get(
+                        (m_id, snap.cycle_time),
+                        canonical_cycle_store_path(m_id, snap.cycle_time, base_bucket=base_bucket),
                     )
-                )
-            all_blocked.extend(b.cycle_time for b in plan.blocked)
+                    all_would_gc_candidates.append(
+                        GcCandidateInfo(
+                            model_id=m_id,
+                            cycle_time=snap.cycle_time,
+                            cutoff=cutoff,
+                            store_path=store_path,
+                            gfs_store_path=store_path if m_id == "gfs" else None,
+                            gefs_store_path=store_path if m_id == "gefs" else None,
+                        )
+                    )
+                else:
+                    all_blocked.append(snap.cycle_time)
 
     if dry_run:
         logger.info(
-            "gc_dry_run_plan: would_retire=%d would_gc=%d",
-            len(all_would_retire),
+            "gc_dry_run_plan: would_gc=%d",
             len(all_would_gc_candidates),
             extra={
                 "event": "gc_dry_run_plan",
-                "would_retire": [f"{r.model_id}:{r.cycle_time.isoformat()}" for r in all_would_retire],
                 "would_gc": [f"{g.model_id}:{g.cycle_time.isoformat()}" for g in all_would_gc_candidates],
             },
         )
         return GcPassResult(
             dry_run=True,
             evaluated_at=now_utc,
-            would_retire=tuple(all_would_retire),
             would_gc=tuple(all_would_gc_candidates),
             processed_gc=(),
             blocked_gc=(),
             locked_gc=(),
             failed_gc=(),
+            would_retire=(),
         )
 
     # Real execution mode: process GC candidates oldest-first
@@ -540,7 +536,7 @@ def run_gc_pass(
     return GcPassResult(
         dry_run=False,
         evaluated_at=now_utc,
-        would_retire=tuple(all_would_retire),
+        would_retire=(),
         would_gc=tuple(all_would_gc_candidates),
         processed_gc=tuple(processed),
         blocked_gc=tuple(all_blocked),

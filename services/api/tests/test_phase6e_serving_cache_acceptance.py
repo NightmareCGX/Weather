@@ -240,7 +240,6 @@ def _seed_gefs_run(
 def test_adversarial_cache_bypass_immunity(client, migrated_db, tmp_path):
     """Prove that cached responses in Redis and in-memory caches cannot bypass retirement."""
     c_ret = _dt(2026, 9, 1, 6)
-    c_vis = _dt(2026, 9, 2, 6)
 
     gfs_path = str(tmp_path / "gfs_c1.zarr")
     gefs_path = str(tmp_path / "gefs_c1.zarr")
@@ -283,27 +282,23 @@ def test_adversarial_cache_bypass_immunity(client, migrated_db, tmp_path):
     )
     assert res_vec.status_code == 200
 
-    # 2. Retire cycle c_ret in PostgreSQL (retired_at alone) -> in V3, has zero effect
+    # 2. Unfenced cycle c_ret in PostgreSQL -> has zero effect on cache hit
     with Session(migrated_db) as session:
         session.add(
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c_ret,
-                retired_at=_dt(2026, 9, 2, 6, 30),
-                retired_by_cycle_time=c_vis,
             )
         )
         session.add(
             ForecastCycleLifecycle(
                 model_id="gefs",
                 cycle_time=c_ret,
-                retired_at=_dt(2026, 9, 2, 6, 30),
-                retired_by_cycle_time=c_vis,
             )
         )
         session.commit()
 
-    # V3: retired_at alone does NOT invalidate or 404 cached responses
+    # Unfenced cycle does NOT invalidate or 404 cached responses
     assert client.get(
         f"/v1/ensembles?lat=38.19&lon=-106.82&variable=temperature_2m&model=gefs&initial_time={c_ret_iso}"
     ).status_code == 200
@@ -350,7 +345,6 @@ def test_in_flight_reader_safe_during_concurrent_retirement(client, migrated_db,
         "postgresql://weather_user:weather_password@localhost:5432/weather_db",
     )
     c0 = _dt(2026, 9, 1, 6)
-    c1 = _dt(2026, 9, 2, 6)
     c0_iso = c0.isoformat().replace("+00:00", "Z")
 
     gfs_path = str(tmp_path / "gfs_in_flight.zarr")
@@ -372,8 +366,6 @@ def test_in_flight_reader_safe_during_concurrent_retirement(client, migrated_db,
                 ForecastCycleLifecycle(
                     model_id="gfs",
                     cycle_time=c0,
-                    retired_at=_dt(2026, 9, 2, 6, 30),
-                    retired_by_cycle_time=c1,
                     deletion_started_at=_dt(2026, 9, 2, 6, 30),
                 )
             )
@@ -422,13 +414,11 @@ def test_progressive_serving_blends_visible_runs_and_excludes_retired(client, mi
         _seed_gfs_run(session, c_ready, p_ready, [0, 6, 12, 18], "ready")
         _seed_gfs_run(session, c_part, p_part, [0], "partial")
 
-        # Mark c_ret retired and fenced
+        # Mark c_ret fenced and deleted
         session.add(
             ForecastCycleLifecycle(
                 model_id="gfs",
                 cycle_time=c_ret,
-                retired_at=_dt(2026, 9, 2, 0),
-                retired_by_cycle_time=c_part,
                 deleted_at=_dt(2026, 9, 2, 0),
             )
         )

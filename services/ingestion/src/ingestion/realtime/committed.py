@@ -197,7 +197,7 @@ def is_cycle_fenced_or_deleted(
     """Return whether cycle_time is claimed or tombstoned for deletion.
 
     A cycle with deletion_started_at IS NOT NULL or deleted_at IS NOT NULL is
-    excluded from scheduling recovery. Legacy retired_at has zero effect (Lifecycle V3).
+    excluded from scheduling recovery (Lifecycle V3).
     """
     c_utc = (
         cycle_time.replace(tzinfo=timezone.utc)
@@ -223,10 +223,6 @@ def is_cycle_fenced_or_deleted(
     return any(
         s is not None or d is not None for s, d in rows
     )
-
-
-# Backward-compatible alias
-is_cycle_retired_or_deleted = is_cycle_fenced_or_deleted
 
 
 def _discover_incomplete_historical_cycles_db(

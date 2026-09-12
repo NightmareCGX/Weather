@@ -52,9 +52,10 @@ def test_model_attributes_and_relationships():
     assert hasattr(Station, "observations")
 
     from api.models.entities import ForecastCycleLifecycle
+    assert hasattr(ForecastCycleLifecycle, "model_id")
     assert hasattr(ForecastCycleLifecycle, "cycle_time")
-    assert hasattr(ForecastCycleLifecycle, "retired_at")
-    assert hasattr(ForecastCycleLifecycle, "retired_by_cycle_time")
+    assert not hasattr(ForecastCycleLifecycle, "retired_at")
+    assert not hasattr(ForecastCycleLifecycle, "retired_by_cycle_time")
     assert hasattr(ForecastCycleLifecycle, "deletion_started_at")
     assert hasattr(ForecastCycleLifecycle, "deleted_at")
     assert hasattr(ForecastCycleLifecycle, "created_at")

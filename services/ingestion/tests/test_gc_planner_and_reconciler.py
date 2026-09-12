@@ -19,7 +19,6 @@ from ingestion.core.catalog import (
     _ensure_utc_datetime,
     ensure_lifecycle_row,
     is_cycle_tombstoned,
-    mark_cycle_retired,
     record_run,
     RunCatalogSpec,
 )
@@ -141,7 +140,6 @@ def test_gc_planner_identifies_eligible_candidates(catalog_engine):
 
 def test_recheck_gc_eligibility_safely_rejects_unready_state(catalog_engine):
     c = _dt(2026, 9, 1, 6)
-    r1 = _dt(2026, 9, 2, 6)
 
     with Session(catalog_engine) as session:
         # 1. Without ready cycles, cutoff is None -> retained
@@ -156,14 +154,7 @@ def test_recheck_gc_eligibility_safely_rejects_unready_state(catalog_engine):
         assert is_el2 is False
         assert reason2 == "retained_at_or_above_cutoff"
 
-        # 3. Legacy retired_at has zero effect on eligibility; still retained until ready cycle advances cutoff
-        mark_cycle_retired(session, "gfs", c, r1, r1)
-        session.commit()
-        is_el3, reason3, _ = recheck_gc_eligibility(session, "gfs", c)
-        assert is_el3 is False
-        assert reason3 == "retained_at_or_above_cutoff"
-
-        # 4. Ready cycle advances cutoff past c (e.g. 09-01 18Z is ready -> cutoff 09-01 12Z > c)
+        # 3. Ready cycle advances cutoff past c (e.g. 09-01 18Z is ready -> cutoff 09-01 12Z > c)
         t_ready = _dt(2026, 9, 1, 18)
         _seed_run(catalog_engine, "gfs", t_ready, "ready")
 
@@ -206,7 +197,7 @@ def test_delete_store_prefix_local(tmp_path: Path):
 def test_cleanup_cycle_catalog_and_tombstone(catalog_engine):
     c = _dt(2026, 9, 1, 6)
     with Session(catalog_engine) as session:
-        mark_cycle_retired(session, "gfs", c, _dt(2026, 9, 2, 6), _dt(2026, 9, 2, 6))
+        ensure_lifecycle_row(session, "gfs", c)
         session.commit()
 
         gfs_run = _seed_run(catalog_engine, "gfs", c, "ready")
@@ -247,7 +238,6 @@ def test_cleanup_cycle_catalog_and_tombstone(catalog_engine):
         lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c))
         assert lc is not None
         assert _ensure_utc_datetime(lc.deleted_at) == del_time
-        assert _ensure_utc_datetime(lc.retired_by_cycle_time) == _dt(2026, 9, 2, 6)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +248,6 @@ def test_cleanup_cycle_catalog_and_tombstone(catalog_engine):
 def test_stale_ingestion_resurrection_rejected(catalog_engine):
     c = _dt(2026, 9, 1, 6)
     with Session(catalog_engine) as session:
-        mark_cycle_retired(session, "gfs", c, _dt(2026, 9, 2, 6), _dt(2026, 9, 2, 6))
         cleanup_cycle_catalog_and_tombstone(session, "gfs", c, now=_dt(2026, 9, 2, 13, 0))
         assert is_cycle_tombstoned(session, c, model_id="gfs") is True
 

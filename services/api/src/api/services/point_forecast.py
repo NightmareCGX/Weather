@@ -1387,13 +1387,6 @@ def resolve_latest_run_store_path(
     return str(path) if path is not None else None
 
 
-def resolve_latest_run_store_path_and_retirement(
-    db: Session, model: str, initial_time: str | None = None
-) -> tuple[str | None, str | None]:
-    """Backward-compatible wrapper returning ``(store_path, None)`` (Lifecycle V3)."""
-    return resolve_latest_run_store_path(db, model, initial_time), None
-
-
 def resolve_serving_generation_for_store(
     store_path: str | None, *args: Any, **kwargs: Any
 ) -> str | None:
@@ -1401,8 +1394,7 @@ def resolve_serving_generation_for_store(
 
     Performs the storage-backed committed manifest read with ZERO database
     connections held. Derives generation exclusively from the committed physical
-    store manifest (Lifecycle V3). Legacy retired_at discriminators are completely
-    omitted.
+    store manifest (Lifecycle V3).
 
     Returns:
         The serving generation discriminator string, or ``None``.

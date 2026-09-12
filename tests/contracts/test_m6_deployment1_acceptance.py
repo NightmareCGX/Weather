@@ -10,7 +10,7 @@ Authoritative verification for the integrated Data Lifecycle V3 system:
 - Task 8: Crash / Restart Acceptance (monotonic recovery from claim, multi-store resumption)
 - Task 9: M3 Retention Acceptance (before/exact/after 14-day boundary, tombstone preservation, batch forward progress, DB-only)
 - Task 10: Tombstone-Only Anti-Resurrection (post-M3 state rejects re-entry across all paths)
-- Task 11: Cache Acceptance (deletion_started_at & deleted_at invalidate cache, retired_at has zero effect)
+- Task 11: Cache Acceptance (deletion_started_at & deleted_at invalidate cache)
 - Task 12: API Contract Separation (deleted run in /v1/runs but not /v1/forecast/availability before M3; absent after M3)
 """
 
@@ -668,7 +668,7 @@ def test_task10_tombstone_only_anti_resurrection(m6_db) -> None:
 # ==============================================================================
 
 def test_task11_cache_acceptance(m6_db) -> None:
-    """Pre-warmed cache cannot bypass deletion_started_at or deleted_at fences; retired_at ignored."""
+    """Pre-warmed cache cannot bypass deletion_started_at or deleted_at fences."""
     db, client, _ = m6_db
 
     c_time = _dt(2026, 9, 8, 0, 0)
@@ -679,10 +679,8 @@ def test_task11_cache_acceptance(m6_db) -> None:
     cache_key = ("gfs", "temperature_2m", "surface", 0, 0, 0, 0, init_str, "gen_acceptance")
     _tile_cache[cache_key] = (1000000000.0, b"\x89PNG\r\n\x1a\nFakeTileBytes")
 
-    # 1. Setting legacy retired_at has ZERO effect on serving visibility
+    # 1. Unfenced cycle is visible
     lc = db.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
-    lc.retired_at = _dt(2026, 9, 8, 6, 0)
-    db.commit()
     assert is_cycle_visible(db, c_time, model_id="gfs") is True
 
     # 2. Setting deletion_started_at immediately fences cycle visibility

@@ -345,8 +345,6 @@ class ForecastCycleLifecycleRecord(CatalogBase):
         String, ForeignKey("models.model_id", ondelete="CASCADE"), primary_key=True
     )
     cycle_time: Any = Column(DateTime(timezone=True), primary_key=True)
-    retired_at: Any = Column(DateTime(timezone=True), nullable=True)
-    retired_by_cycle_time: Any = Column(DateTime(timezone=True), nullable=True)
     deletion_started_at: Any = Column(DateTime(timezone=True), nullable=True)
     deleted_at: Any = Column(DateTime(timezone=True), nullable=True)
     created_at: Any = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
@@ -1419,8 +1417,6 @@ def list_cycle_lifecycle_snapshots(
                 model_id=m_str,
                 cycle_time=c_utc,
                 status=model_statuses.get((m_str, c_utc)),
-                retired_at=cast(datetime | None, lc.retired_at) if lc else None,
-                retired_by_cycle_time=cast(datetime | None, lc.retired_by_cycle_time) if lc else None,
                 deletion_started_at=cast(datetime | None, lc.deletion_started_at) if lc else None,
                 deleted_at=cast(datetime | None, lc.deleted_at) if lc else None,
             )
@@ -1450,8 +1446,6 @@ def ensure_lifecycle_row(
             .values(
                 model_id=m_id,
                 cycle_time=c_utc,
-                retired_at=None,
-                retired_by_cycle_time=None,
                 deletion_started_at=None,
                 deleted_at=None,
                 created_at=now,
@@ -1468,8 +1462,6 @@ def ensure_lifecycle_row(
             .values(
                 model_id=m_id,
                 cycle_time=c_utc,
-                retired_at=None,
-                retired_by_cycle_time=None,
                 deletion_started_at=None,
                 deleted_at=None,
                 created_at=now,
@@ -1482,8 +1474,6 @@ def ensure_lifecycle_row(
         row = ForecastCycleLifecycleRecord(
             model_id=m_id,
             cycle_time=c_utc,
-            retired_at=None,
-            retired_by_cycle_time=None,
             deletion_started_at=None,
             deleted_at=None,
             created_at=now,
@@ -1625,110 +1615,4 @@ def reserve_run(
             db.flush()
 
     return run
-
-
-
-def mark_cycle_retired(
-    db: Session,
-    model_id: str,
-    cycle_time: datetime,
-    retired_at: datetime,
-    retired_by_cycle_time: datetime,
-) -> bool:
-    """Mark a forecast cycle as retired by anchor T.
-
-    Idempotent: if already retired with identical retired_by_cycle_time, returns False.
-    """
-    import logging
-
-    m_id = model_id.lower().strip()
-    c_utc = _ensure_utc_datetime(cycle_time)
-    r_at_utc = _ensure_utc_datetime(retired_at)
-    r_by_utc = _ensure_utc_datetime(retired_by_cycle_time)
-
-    row = ensure_lifecycle_row(db, m_id, c_utc)
-    if row.retired_at is not None:
-        if row.retired_by_cycle_time is not None:
-            existing_r1 = _ensure_utc_datetime(cast(datetime, row.retired_by_cycle_time))
-            if existing_r1 != r_by_utc:
-                logging.getLogger(__name__).error(
-                    "Model %s cycle %s already retired by %s; refusing to overwrite with %s",
-                    m_id,
-                    c_utc.isoformat(),
-                    existing_r1.isoformat(),
-                    r_by_utc.isoformat(),
-                )
-                raise ValueError(
-                    f"Model {m_id} cycle {c_utc.isoformat()} already retired by {existing_r1.isoformat()}; "
-                    f"cannot overwrite with {r_by_utc.isoformat()}"
-                )
-        return False
-
-    setattr(row, "retired_at", r_at_utc)
-    setattr(row, "retired_by_cycle_time", r_by_utc)
-    setattr(row, "updated_at", _utcnow())
-    db.flush()
-    return True
-
-
-def reconcile_cycle_lifecycle(
-    db: Session,
-    *,
-    model_id: str | None = None,
-    models: tuple[str, ...] = ("gfs", "gefs"),
-    now: datetime | None = None,
-    version_string: str = "v1.0",
-) -> Any:
-    """Evaluate lifecycle transitions and persist new retirements to PostgreSQL per model.
-
-    Args:
-        db: Database session.
-        model_id: Optional model identifier. When provided, reconciles only that model.
-        models: Tuple of models to reconcile when model_id is None.
-        now: Optional current timestamp override for retired_at (defaults to UTC now).
-        version_string: Model version string (defaults to 'v1.0').
-
-    Returns:
-        The evaluated ModelLifecyclePlan (if single model) or dict of plans per model.
-    """
-    import logging
-    from domain.lifecycle import plan_model_lifecycle
-
-    log = logging.getLogger(__name__)
-    now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
-    target_models = (model_id.lower().strip(),) if model_id is not None else models
-
-    plans: dict[str, Any] = {}
-    for m_id in target_models:
-        ready_cycles = list_model_ready_cycle_times(db, m_id, version_string=version_string)
-        snapshots = list_cycle_lifecycle_snapshots(db, model_id=m_id, version_string=version_string)
-        plan = plan_model_lifecycle(m_id, snapshots, ready_cycles)
-        plans[m_id] = plan
-
-        for decision in plan.would_retire:
-            if decision.retired_by_cycle_time is not None:
-                mark_cycle_retired(
-                    db,
-                    m_id,
-                    decision.cycle_time,
-                    retired_at=now_utc,
-                    retired_by_cycle_time=decision.retired_by_cycle_time,
-                )
-                log.info(
-                    "cycle_retired: model=%s cycle_time=%s retired_by=%s reason=%s",
-                    m_id,
-                    decision.cycle_time.isoformat(),
-                    decision.retired_by_cycle_time.isoformat(),
-                    decision.reason,
-                    extra={
-                        "event": "cycle_retired",
-                        "model": m_id,
-                        "cycle_time": decision.cycle_time.isoformat(),
-                        "retired_by": decision.retired_by_cycle_time.isoformat(),
-                    },
-                )
-    db.commit()
-    if model_id is not None:
-        return plans[model_id.lower().strip()]
-    return plans
 
