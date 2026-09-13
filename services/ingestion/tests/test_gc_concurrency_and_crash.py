@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from datetime import datetime, timezone
 
 import numpy as np
@@ -14,7 +13,6 @@ from alembic.config import Config
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
-from api.core.reader_gate import _ReaderGateSession, ReaderLockPool
 from ingestion.core.base import CycleTombstonedError
 from ingestion.core.catalog import (
     CommittedState,
@@ -23,11 +21,9 @@ from ingestion.core.catalog import (
     ModelVersionRecord,
     RunCatalogSpec,
     VariableSpec,
-    _ensure_utc_datetime,
     ensure_lifecycle_row,
     record_run,
 )
-from ingestion.core.locks import StoreLockCoordinator
 from ingestion.core.zarr_writer import write_dataset
 from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
 from ingestion.gc.planner import plan_reclamation_pass

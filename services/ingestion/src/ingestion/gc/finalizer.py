@@ -46,11 +46,9 @@ from domain.horizon import model_max_lead_hours
 from domain.lifecycle import is_cycle_horizon_expired
 from domain.temporal import serving_start_valid_time
 from ingestion.core.catalog import (
-    EnsembleMemberProductRecord,
     ForecastCycleLifecycleRecord,
     ModelRunRecord,
     ModelVersionRecord,
-    ProductRecord,
     ReclamationQueueRecord,
     _ensure_utc_datetime,
     _utcnow,

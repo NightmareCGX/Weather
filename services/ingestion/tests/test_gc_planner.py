@@ -14,22 +14,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 import xarray as xr
 
 from ingestion.core.base import CycleTombstonedError
 from ingestion.core.catalog import (
-    CatalogBase,
     CenterRecord,
     ForecastCycleLifecycleRecord,
     ModelRecord,
     ModelRunRecord,
     ModelVersionRecord,
     ProductRecord,
-    ReclamationQueueRecord,
-    _ensure_utc_datetime,
     is_cycle_tombstoned,
     record_run,
     RunCatalogSpec,

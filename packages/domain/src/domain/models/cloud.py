@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, overload
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -72,30 +72,6 @@ class CloudCeilingEnsembleSummary:
     conditional_median_m: float | None
     conditional_spread_m: float | None
     conditional_percentiles_m: dict[str, float] | None
-
-
-@overload
-def reconstruct_cloud_cover_3h(
-    current_6h_avg: float,
-    prev_3h_avg: float,
-    tolerance: float = ...,
-) -> float: ...
-
-
-@overload
-def reconstruct_cloud_cover_3h(
-    current_6h_avg: NDArray[np.floating[Any]],
-    prev_3h_avg: NDArray[np.floating[Any]],
-    tolerance: float = ...,
-) -> NDArray[np.floating[Any]]: ...
-
-
-@overload
-def reconstruct_cloud_cover_3h(
-    current_6h_avg: float | NDArray[np.floating[Any]],
-    prev_3h_avg: float | NDArray[np.floating[Any]],
-    tolerance: float = ...,
-) -> float | NDArray[np.floating[Any]]: ...
 
 
 def reconstruct_running_average_interval(
