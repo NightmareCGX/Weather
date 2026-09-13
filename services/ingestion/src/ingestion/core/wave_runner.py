@@ -1240,8 +1240,9 @@ async def _run_wave_impl(
                             # Retrieve and consume predecessor raw state if this is a 6h reset lead
                             pred_precip = None
                             pred_cloud = None
-                            pred_item: tuple[int | None, int, bool] | None = None
-                            pred_state: PredecessorState | None = None
+                            consumed_pred: tuple[
+                                tuple[int | None, int, bool], PredecessorState
+                            ] | None = None
                             if lead % 6 == 0 and lead > 0:
                                 pred_item = (member, lead - 3, is_mean)
                                 with predecessor_lock:
@@ -1249,6 +1250,7 @@ async def _run_wave_impl(
                                 if pred_state is not None:
                                     pred_precip = pred_state.precip_raw
                                     pred_cloud = pred_state.cloud_raw
+                                    consumed_pred = (pred_item, pred_state)
 
                             # Decode off the event loop: _decode_and_normalize blocks on the
                             # worker's future.result() and runs numpy normalization, which
@@ -1270,9 +1272,10 @@ async def _run_wave_impl(
                                 # The worker has fully settled (helper guarantee), so no
                                 # orphan thread can still be reading the arrays. Restore
                                 # the consumed predecessor state before re-raising.
-                                if pred_state is not None and pred_item is not None:
+                                if consumed_pred is not None:
+                                    restored_item, restored_state = consumed_pred
                                     with predecessor_lock:
-                                        predecessor_states.setdefault(pred_item, pred_state)
+                                        predecessor_states.setdefault(restored_item, restored_state)
                                 raise
                             del decode_fut
                             _validate_requested_lead(ds, lead)
