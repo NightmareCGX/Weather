@@ -321,6 +321,32 @@ export function resolveValidTime(
 }
 
 /**
+ * Substitute valid-time placeholders into a backend tile URL template.
+ *
+ * Templates may pin the serving cycle via ``initial_time={source_cycle}``
+ * (Lifecycle V2 immutable tile URLs): the pinned cycle is the per-valid-time
+ * source cycle carried by the availability payload, so the same URL keeps
+ * resolving to the same tile content and the browser can cache it long-term.
+ * When the cycle is unknown, the pinned parameter is stripped so the URL still
+ * resolves (unpinned, revalidation-only caching) instead of sending a literal
+ * placeholder to the API.
+ */
+export function buildPinnedTileUrl(
+  template: string,
+  encodedValidTime: string,
+  sourceCycle: string | null
+): string {
+  const withValidTime = template.replace("{valid_time}", encodedValidTime);
+  if (!withValidTime.includes("{source_cycle}")) {
+    return withValidTime;
+  }
+  if (sourceCycle === null) {
+    return withValidTime.replace("&initial_time={source_cycle}", "");
+  }
+  return withValidTime.replace("{source_cycle}", encodeURIComponent(sourceCycle));
+}
+
+/**
  * Synchronously construct the authoritative SpatialLayer for a valid selection
  * under Lifecycle V2 using the backend-provided layer descriptor.
  */
@@ -377,11 +403,14 @@ export function resolveSpatialLayer(
   if (selection.validTime) {
     const encodedVt = encodeURIComponent(selection.validTime);
     if (valid_time_tile_url_template) {
-      tileUrl = valid_time_tile_url_template.replace("{valid_time}", encodedVt);
+      tileUrl = buildPinnedTileUrl(valid_time_tile_url_template, encodedVt, sourceCycle);
     } else if (tile_url_template.includes("{valid_time}")) {
-      tileUrl = tile_url_template.replace("{valid_time}", encodedVt);
+      tileUrl = buildPinnedTileUrl(tile_url_template, encodedVt, sourceCycle);
     } else {
       tileUrl = `/v1/maps/${selection.model}/${selection.variable}/surface/{z}/{x}/{y}.png?valid_time=${encodedVt}`;
+      if (sourceCycle !== null) {
+        tileUrl += `&initial_time=${encodeURIComponent(sourceCycle)}`;
+      }
     }
     if (valid_time_vector_field_url_template) {
       vectorFieldUrl = valid_time_vector_field_url_template.replace("{valid_time}", encodedVt);

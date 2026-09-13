@@ -1,0 +1,11 @@
+# Weather platform edge gateway image.
+#
+# Stock nginx:alpine links OpenSSL but does not ship the openssl CLI, which
+# the first-start self-signed certificate generator
+# (docker-entrypoint.d/20-generate-self-signed.sh) needs. This adds it; the
+# rest of the image is untouched stock nginx.
+#
+# Build context: repository root (docker build -f docker/nginx/Dockerfile.gateway .)
+
+FROM nginx:1.27-alpine
+RUN apk add --no-cache openssl

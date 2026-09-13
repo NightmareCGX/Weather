@@ -90,10 +90,13 @@ from typing import Callable
 
 import xarray as xr
 
-#: Maximum number of cached (store_path, generation) entries. Small by
-#: design: the working set is the handful of newest GFS/GEFS cycle stores;
-#: decoded fields are never retained, so entries cost kilobytes.
-MAX_ENTRIES = 8
+#: Maximum number of cached (store_path, generation) entries. Sized for the
+#: working set of the newest GFS/GEFS cycle stores across concurrent viewer
+#: patterns: entries hold lazy datasets (metadata + coordinate arrays) plus
+#: their S3 filesystem/mapper clients, so doubling the capacity trades a small
+#: bounded memory increase for far fewer re-opens when access alternates
+#: between model/variable stores.
+MAX_ENTRIES = 16
 
 
 class _Flight:

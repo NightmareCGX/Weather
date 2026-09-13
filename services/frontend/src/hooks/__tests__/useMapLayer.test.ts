@@ -386,7 +386,7 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
     const first = result.current.layer;
     expect(first?.source_cycle).toBe("2026-08-13T00:00:00Z");
 
-    // Same valid time, same tile URL, but a newer initial time now serves it
+    // Same valid time, but a newer initial time now serves it
     const newerAvailability = JSON.parse(JSON.stringify(mockAvailability));
     newerAvailability.models[0].variables[0].valid_times[0].source_cycle = "2026-08-13T06:00:00Z";
     mockUseForecastSelection.mockReturnValue(
@@ -396,6 +396,13 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
 
     expect(result.current.layer).not.toBe(first);
     expect(result.current.layer?.source_cycle).toBe("2026-08-13T06:00:00Z");
-    expect(result.current.layer?.tile_url_template).toBe(first?.tile_url_template);
+    // The tile URL is cycle-pinned (immutable tile URLs): the newer cycle
+    // changes the URL itself, so MapLibre refetches tiles for the new cycle
+    // rather than revalidating the old cycle's tiles.
+    expect(first?.tile_url_template).toContain("initial_time=2026-08-13T00%3A00%3A00Z");
+    expect(result.current.layer?.tile_url_template).toContain(
+      "initial_time=2026-08-13T06%3A00%3A00Z"
+    );
+    expect(result.current.layer?.tile_url_template).not.toBe(first?.tile_url_template);
   });
 });

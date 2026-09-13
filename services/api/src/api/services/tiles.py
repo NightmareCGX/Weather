@@ -331,12 +331,19 @@ def resolve_tile_read_context(
     resolved_lead: int = 0
 
     if valid_time is not None:
-        if initial_time is not None:
-            raise HTTPException(
-                status_code=422,
-                detail="Provide either valid_time or initial_time, not both.",
-            )
-        source = resolve_valid_time_source(db, model, valid_time, variable=variable, now=now)
+        # ``initial_time`` alongside ``valid_time`` pins the newest-cycle
+        # preference to that cycle (Lifecycle V2 immutable tile URLs). The
+        # resolver falls back to unpinned newest-cycle selection when the
+        # pinned cycle no longer serves the valid time, so pinned URLs survive
+        # cycle transitions and reclamation instead of hard-failing.
+        source = resolve_valid_time_source(
+            db,
+            model,
+            valid_time,
+            variable=variable,
+            initial_time=initial_time,
+            now=now,
+        )
         store_path = source.store_path
         resolved_lead = source.lead_time_hours
         resolved_initial = source.cycle_time.isoformat().replace("+00:00", "Z")
@@ -468,23 +475,29 @@ def render_tile_png(
             continue
         break
 
-    # Post-read validation: verify physical shard did not transition to deleting/deleted during read
+    # Post-read validation: verify physical shard did not transition to deleting/deleted during read.
+    # Unfenced results are TTL-cached (``_FENCING_CHECK_TTL_SECONDS``) to spare
+    # one DB roundtrip per cache-miss render; the physical read itself still
+    # fails closed when a shard is actually gone, and fenced states are never
+    # cached, so the TTL only widens the race window this check narrows.
     try:
         from api.models.entities import ReclamationQueue
         from domain.reclamation import make_shard_relative_key
 
         t_kind = "mean" if context.expected_members > 1 else "det"
         rel_key = make_shard_relative_key(variable, t_kind, context.lead_time_hours)
-        with SessionLocal() as check_session:
-            fenced_shards = check_session.execute(
-                select(ReclamationQueue.id).where(
-                    ReclamationQueue.store_path == context.store_path,
-                    ReclamationQueue.physical_key == rel_key,
-                    ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
-                )
-            ).scalars().all()
-            if fenced_shards:
-                raise HTTPException(status_code=404, detail="Forecast shard became unavailable during read.")
+        if not _fencing_recently_verified(context.store_path, rel_key):
+            with SessionLocal() as check_session:
+                fenced_shards = check_session.execute(
+                    select(ReclamationQueue.id).where(
+                        ReclamationQueue.store_path == context.store_path,
+                        ReclamationQueue.physical_key == rel_key,
+                        ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                    )
+                ).scalars().all()
+                if fenced_shards:
+                    raise HTTPException(status_code=404, detail="Forecast shard became unavailable during read.")
+            _fencing_mark_verified(context.store_path, rel_key)
     except HTTPException:
         raise
     except Exception:
@@ -740,6 +753,38 @@ def _tile_cache_set(key: tuple[object, ...], png: bytes) -> None:
         try:
             oldest = next(iter(_tile_cache))
             _tile_cache.pop(oldest, None)
+        except StopIteration:
+            pass
+
+
+#: Post-read reclamation-fencing verification cache: ``(store_path, rel_key)``
+#: -> monotonic time of the last DB-confirmed "not fenced" result. Fenced
+#: results are never cached; the TTL only bounds how long a shard verified as
+#: unfenced is trusted before the check re-queries the reclamation queue.
+_FENCING_CHECK_TTL_SECONDS = 30
+_FENCING_CHECK_MAX_ENTRIES = 4096
+_fencing_check_cache: dict[tuple[str, str], float] = {}
+
+
+def _fencing_recently_verified(store_path: str, rel_key: str) -> bool:
+    """Return True when the shard was DB-verified unfenced within the TTL."""
+    verified_at = _fencing_check_cache.get((store_path, rel_key))
+    if verified_at is None:
+        return False
+    if time.monotonic() - verified_at > _FENCING_CHECK_TTL_SECONDS:
+        _fencing_check_cache.pop((store_path, rel_key), None)
+        return False
+    return True
+
+
+def _fencing_mark_verified(store_path: str, rel_key: str) -> None:
+    """Record a DB-confirmed unfenced result for the shard."""
+    _fencing_check_cache[(store_path, rel_key)] = time.monotonic()
+    if len(_fencing_check_cache) > _FENCING_CHECK_MAX_ENTRIES:
+        # Evict the oldest-inserted entry (bounded module growth).
+        try:
+            oldest = next(iter(_fencing_check_cache))
+            _fencing_check_cache.pop(oldest, None)
         except StopIteration:
             pass
 

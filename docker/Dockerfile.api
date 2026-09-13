@@ -59,4 +59,11 @@ WORKDIR /app/services/api
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=5).status==200 else 1)"
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Two uvicorn workers: tile rendering is CPU-bound (NumPy sampling + PNG
+# encode) and the GIL serializes it within one process, so a second worker
+# roughly doubles serving throughput. Worker count is env-overridable so
+# memory-constrained deployments can scale it down. Per-worker process caches
+# (tile LRU, store handles) are intentionally process-local; the shared
+# PostgreSQL advisory-lock reader gate and Redis L2 cache remain correct
+# across workers.
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2}"]

@@ -23,6 +23,7 @@ calculations live in the handler.
 from __future__ import annotations
 
 import gzip
+import hashlib
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -60,10 +61,20 @@ CURRENT_TIME = Depends(get_current_time)
 #: when initial_time is omitted, so revalidation (no-cache) ensures new cycles
 #: are resolved immediately.
 CACHE_CONTROL_MAPS = "no-cache"
-#: Cache policy for rendered tile images: mutable under same URL when new
-#: cycles or same-cycle replacements arrive, so revalidation (no-cache) prevents
-#: the browser from reusing stale tiles while backend caches accelerate computation.
+#: Cache policy for rendered tile images whose URL does not pin the serving
+#: cycle (valid_time-only or lead-time-only URLs): the content can change when
+#: a newer cycle begins serving the same valid time, so the browser must
+#: revalidate. The ETag makes that revalidation a cheap 304 whenever the
+#: rendered tile is unchanged.
 CACHE_CONTROL_TILE = "no-cache"
+#: Cache policy for rendered tile images whose URL pins the serving cycle via
+#: ``initial_time``: the URL fully identifies the content (model, variable,
+#: level, tile, valid time, cycle), so the browser may reuse it without
+#: revalidation while fresh. max-age bounds staleness only for the rare
+#: same-cycle re-ingestion (repair) path, where the content behind an
+#: unchanged URL is replaced; a new cycle changes the URL itself, so it never
+#: needs a shorter freshness window to stay correct.
+CACHE_CONTROL_TILE_PINNED = "public, max-age=3600, immutable"
 #: Cache policy for the wind vector field binary: the payload only changes when
 #: a newer cycle serves the same valid time (every ~6h), so a short browser
 #: freshness window (60s) makes reloads and back/forward navigations hit the
@@ -166,9 +177,13 @@ def get_spatial_layer(
         # (normalized ISO 8601 Z), not the raw request string, so equivalent
         # spellings of the same instant produce identical template URLs.
         resolved_valid_iso = format_datetime_utc(resolved_valid)
+        # ``initial_time={source_cycle}`` pins tile URLs to the serving cycle
+        # so they are immutable (see CACHE_CONTROL_TILE_PINNED). Clients
+        # substitute the placeholder with the per-valid-time source cycle from
+        # the availability payload.
         template_path = (
             f"/v1/maps/{model}/{variable}/{level}/{{z}}/{{x}}/{{y}}.png"
-            f"?valid_time={resolved_valid_iso}"
+            f"?valid_time={resolved_valid_iso}&initial_time={{source_cycle}}"
         )
         vector_field_template = (
             f"/v1/maps/{model}/wind_10m/vector-field?valid_time={resolved_valid_iso}"
@@ -276,6 +291,7 @@ def get_wind_vector_field(
     summary="Render a forecast raster tile",
 )
 def get_map_tile(
+    request: Request,  # injected by FastAPI
     model: str,
     variable: str,
     level: str,
@@ -289,7 +305,8 @@ def get_map_tile(
         str | None,
         Query(
             description=(
-                "Optional ISO 8601 UTC valid time (Lifecycle V2)."
+                "Optional ISO 8601 UTC valid time (Lifecycle V2). May be combined "
+                "with initial_time to pin the serving cycle for cacheable URLs."
             )
         ),
     ] = None,
@@ -297,7 +314,9 @@ def get_map_tile(
         str | None,
         Query(
             description=(
-                "Optional ISO 8601 UTC cycle time pinning the model run."
+                "Optional ISO 8601 UTC cycle time pinning the model run. When "
+                "combined with valid_time it pins the serving cycle, making the "
+                "tile URL immutable and long-lived browser caching possible."
             )
         ),
     ] = None,
@@ -321,12 +340,28 @@ def get_map_tile(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    response = StarletteResponse(
+
+    # Strong ETag over the exact bytes: rendering is deterministic per URL
+    # identity, so the tag is stable across processes and restarts, enabling
+    # cheap 304 revalidation for no-cache (unpinned) URLs.
+    etag = f'"{hashlib.sha1(png).hexdigest()}"'
+    if initial_time is not None:
+        cache_control = CACHE_CONTROL_TILE_PINNED
+    else:
+        cache_control = CACHE_CONTROL_TILE
+
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match is not None and etag in if_none_match:
+        return Response(
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": cache_control},
+        )
+
+    return StarletteResponse(
         content=png,
         media_type="image/png",
-        headers={"Cache-Control": CACHE_CONTROL_TILE},
+        headers={"ETag": etag, "Cache-Control": cache_control},
     )
-    return response
 
 
 def _require_model(db: Session, model: str) -> None:

@@ -95,6 +95,48 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _parse_pinned_cycle(initial_time: datetime | str | None) -> datetime | None:
+    """Normalize an optional pinned initial (cycle) time to an aware UTC datetime."""
+    if initial_time is None:
+        return None
+    if isinstance(initial_time, str):
+        return _ensure_utc(parse_cycle_time(initial_time))
+    return _ensure_utc(initial_time)
+
+
+def _filter_pinned_candidates(
+    candidates: list[_CandidateRecord],
+    pinned_cycle: datetime | None,
+) -> list[_CandidateRecord] | None:
+    """Restrict candidates to those from the pinned cycle, or ``None`` if unpinned.
+
+    Cycle pinning (Lifecycle V2 tile URLs carrying ``initial_time``) lets an
+    immutable URL keep resolving to the same representation it was built for.
+    An empty pinned subset (cycle no longer serving, reclaimed, or never
+    applicable) returns an empty list so callers can fall back to newest-cycle
+    selection instead of failing the request.
+    """
+    if pinned_cycle is None:
+        return None
+    return [cand for cand in candidates if cand.cycle_time == pinned_cycle]
+
+
+def _resolved_source(
+    model: str, valid_time: datetime, cand: _CandidateRecord
+) -> ResolvedForecastSource:
+    """Build a :class:`ResolvedForecastSource` from a winning candidate."""
+    return ResolvedForecastSource(
+        model=model.lower().strip(),
+        valid_time=valid_time,
+        cycle_time=cand.cycle_time,
+        lead_time_hours=cand.lead_time_hours,
+        run_id=cand.run_id,
+        store_path=cand.store_path,
+        serving_generation=_resolve_store_generation(cand.store_path),
+        member_indices=cand.member_indices,
+    )
+
+
 def _resolve_store_generation(store_path: str | None) -> str | None:
     """Resolve the store's committed manifest generation without holding DB locks."""
     if not store_path:
@@ -435,6 +477,7 @@ def resolve_canonical_source(
     model: str,
     valid_time: datetime | str,
     *,
+    initial_time: datetime | str | None = None,
     require_members: bool = False,
     now: datetime | None = None,
 ) -> ResolvedForecastSource:
@@ -445,6 +488,10 @@ def resolve_canonical_source(
     - Selects the newest committed representation covering valid_time.
     - Strictly excludes deletion fences.
     - Strictly enforces GEFS coherent vintage (both geavg and >=85% members).
+    - When ``initial_time`` is provided, the newest-cycle preference is pinned to
+      that cycle: if it covers valid_time, it wins even when a newer cycle also
+      covers it; otherwise selection falls back to the unpinned newest-cycle rule
+      so serving survives cycle transitions and reclamation.
     """
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
     now_utc = now if now is not None else get_current_time()
@@ -464,24 +511,24 @@ def resolve_canonical_source(
             detail=f"No forecast data is available for model '{model}' at valid time '{v_utc.isoformat()}'.",
         )
 
+    pinned_cands = _filter_pinned_candidates(
+        cands, _parse_pinned_cycle(initial_time)
+    )
+    if pinned_cands is not None:
+        winner = select_canonical_anchor(pinned_cands)
+        if winner is not None:
+            return _resolved_source(model, v_utc, winner)
+        # Pinned cycle does not cover this valid time (or no longer exists):
+        # fall through to the unpinned newest-cycle selection below.
+
     winner = select_canonical_anchor(cands)
     if winner is None:
         raise HTTPException(
             status_code=404,
             detail=f"No forecast data is available for model '{model}' at valid time '{v_utc.isoformat()}'.",
         )
-    gen = _resolve_store_generation(winner.store_path)
 
-    return ResolvedForecastSource(
-        model=model.lower().strip(),
-        valid_time=v_utc,
-        cycle_time=winner.cycle_time,
-        lead_time_hours=winner.lead_time_hours,
-        run_id=winner.run_id,
-        store_path=winner.store_path,
-        serving_generation=gen,
-        member_indices=winner.member_indices,
-    )
+    return _resolved_source(model, v_utc, winner)
 
 
 def resolve_variable_source(
@@ -490,12 +537,19 @@ def resolve_variable_source(
     variable: str,
     valid_time: datetime | str,
     *,
+    initial_time: datetime | str | None = None,
     now: datetime | None = None,
 ) -> ResolvedForecastSource | None:
     """Resolve the authoritative source for a specific variable at valid_time.
 
     Supports graceful absence (returning None) for interval variables at lead 0
     when no older positive-lead fallback representation exists.
+
+    When ``initial_time`` is provided, the newest-cycle preference is pinned to
+    that cycle for this valid time; if the pinned subset yields no winner
+    (e.g. the cycle does not serve the variable at this valid time, or its
+    store was reclaimed), selection falls back to the unpinned newest-cycle
+    rule so serving survives cycle transitions.
     """
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
     now_utc = now if now is not None else get_current_time()
@@ -510,7 +564,7 @@ def resolve_variable_source(
     # 1. Strict companion coupling: crain, csnow, cfrzr, cicep delegate to precipitation_amount_3h
     if is_precipitation_companion(variable):
         return resolve_variable_source(
-            db, model, "precipitation_amount_3h", v_utc, now=now_utc
+            db, model, "precipitation_amount_3h", v_utc, initial_time=initial_time, now=now_utc
         )
 
     candidates_map = _discover_candidates_bulk(db, model, now=now_utc)
@@ -520,6 +574,16 @@ def resolve_variable_source(
             status_code=404,
             detail=f"No forecast data is available for model '{model}' and variable '{variable}' at valid time '{v_utc.isoformat()}'.",
         )
+
+    pinned_cands = _filter_pinned_candidates(
+        cands, _parse_pinned_cycle(initial_time)
+    )
+    if pinned_cands is not None:
+        cand = select_variable_source(pinned_cands, variable)
+        if cand is not None:
+            return _resolved_source(model, v_utc, cand)
+        # Pinned cycle does not serve this variable/valid time (or no longer
+        # exists): fall through to the unpinned selection below.
 
     cand = select_variable_source(cands, variable)
     if cand is None:
@@ -535,17 +599,7 @@ def resolve_variable_source(
             detail=f"Variable '{variable}' is not available for model '{model}' at valid time '{v_utc.isoformat()}'.",
         )
 
-    gen = _resolve_store_generation(cand.store_path)
-    return ResolvedForecastSource(
-        model=model.lower().strip(),
-        valid_time=v_utc,
-        cycle_time=cand.cycle_time,
-        lead_time_hours=cand.lead_time_hours,
-        run_id=cand.run_id,
-        store_path=cand.store_path,
-        serving_generation=gen,
-        member_indices=cand.member_indices,
-    )
+    return _resolved_source(model, v_utc, cand)
 
 
 def resolve_valid_time_source(
@@ -554,15 +608,20 @@ def resolve_valid_time_source(
     valid_time: datetime | str,
     *,
     variable: str | None = None,
+    initial_time: datetime | str | None = None,
     require_members: bool = False,
     now: datetime | None = None,
 ) -> ResolvedForecastSource:
     """Wrapper resolving the single winning source, raising HTTP 404 if unavailable.
 
-    Preserves existing signature for backward compatibility.
+    Preserves existing signature for backward compatibility. ``initial_time``
+    optionally pins the newest-cycle preference to that cycle (see
+    :func:`resolve_canonical_source`).
     """
     if variable is not None:
-        src = resolve_variable_source(db, model, variable, valid_time, now=now)
+        src = resolve_variable_source(
+            db, model, variable, valid_time, initial_time=initial_time, now=now
+        )
         if src is None:
             v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
             raise HTTPException(
@@ -570,7 +629,10 @@ def resolve_valid_time_source(
                 detail=f"No positive-lead interval forecast is available for model '{model}' and variable '{variable}' at valid time '{v_utc.isoformat()}'.",
             )
         return src
-    return resolve_canonical_source(db, model, valid_time, require_members=require_members, now=now)
+    return resolve_canonical_source(
+        db, model, valid_time, initial_time=initial_time,
+        require_members=require_members, now=now,
+    )
 
 
 def resolve_canonical_sources_bulk(

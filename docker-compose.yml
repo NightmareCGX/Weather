@@ -83,7 +83,42 @@ services:
       "
     restart: "no"
 
+  # Edge gateway (HTTP/2 over TLS, single origin): terminates TLS, routes
+  # /v1/* straight to the FastAPI tier (tiles skip the Next.js proxy hop) and
+  # everything else to the Next.js frontend. Optional profile so the default
+  # `docker compose up` (data services only) is unaffected:
+  #   docker compose --profile gateway up -d weather_gateway
+  # Upstreams default to the host-run API/frontend; when they are
+  # containerized, override GATEWAY_API_UPSTREAM / GATEWAY_FRONTEND_UPSTREAM
+  # with service DNS names. Browsers only negotiate HTTP/2 over TLS, so the
+  # gateway serves https://localhost with a self-signed certificate generated
+  # on first start (mount real certs at /etc/nginx/certs for production).
+  weather_gateway:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile.gateway
+    image: weather-platform-gateway:latest
+    container_name: weather_gateway
+    restart: unless-stopped
+    profiles:
+      - gateway
+    environment:
+      API_UPSTREAM: ${GATEWAY_API_UPSTREAM:-host.docker.internal:8000}
+      FRONTEND_UPSTREAM: ${GATEWAY_FRONTEND_UPSTREAM:-host.docker.internal:3000}
+    ports:
+      - "${GATEWAY_HTTP_PORT:-80}:80"
+      - "${GATEWAY_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./docker/nginx/gateway.conf.template:/etc/nginx/templates/gateway.conf.template:ro
+      - ./docker/nginx/20-generate-self-signed.sh:/docker-entrypoint.d/20-generate-self-signed.sh:ro
+      - gateway_certs:/etc/nginx/certs
+    extra_hosts:
+      # Linux compatibility: host.docker.internal exists natively on Docker
+      # Desktop (Windows/macOS); host-gateway maps it on Linux hosts.
+      - "host.docker.internal:host-gateway"
+
 volumes:
   postgres18_data:
   redis_data:
   minio_data:
+  gateway_certs:

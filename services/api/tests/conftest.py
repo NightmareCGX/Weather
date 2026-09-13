@@ -85,6 +85,16 @@ def migrated_db(db_engine):
     """
     api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     alembic_cfg = Config(os.path.join(api_dir, "alembic.ini"))
+    # ``alembic/env.py`` resolves the migration URL from the DATABASE_URL env
+    # var (defaulting to the live compose database) and overrides whatever
+    # ``sqlalchemy.url`` the Config carries. Pin the process env to the
+    # ISOLATED test database for the duration of the module so
+    # ``command.upgrade``/``command.downgrade`` can never touch the live
+    # database (lifecycle doc §11 item 10 pollution rule). CI sets
+    # DATABASE_URL to its service container globally, so this replicates the
+    # CI behavior exactly. Use the raw configured URL: ``str(engine.url)``
+    # would render a masked ``***`` password placeholder.
+    os.environ["DATABASE_URL"] = integration_db_url()
     alembic_cfg.set_main_option("sqlalchemy.url", str(db_engine.url))
     alembic_cfg.set_main_option("script_location", os.path.join(api_dir, "alembic"))
 

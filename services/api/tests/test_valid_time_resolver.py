@@ -798,3 +798,109 @@ def test_resolver_gefs_interval_fallback_respects_member_coverage(
             assert source.run_id == "run_gefs_12z_cov"
     finally:
         register_expected_members("gefs", old_expected)
+
+
+def test_resolver_pinned_cycle_prefers_pinned_representation(resolver_test_db):
+    """Cycle pinning (immutable tile URLs): when initial_time is provided, the
+    pinned cycle wins for its valid times even when a newer cycle also covers
+    them, so a pinned URL keeps resolving to the representation it was built
+    for."""
+    c_00z = _dt(2026, 9, 2, 0)
+    c_06z = _dt(2026, 9, 2, 6)
+
+    with Session(resolver_test_db) as session:
+        r_00z = ModelRun(
+            id="run_gfs_pin_00z",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_00z,
+            status="ready",
+            zarr_store_path="/stores/gfs/pin-00z",
+            created_at=c_00z,
+        )
+        r_06z = ModelRun(
+            id="run_gfs_pin_06z",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_06z,
+            status="ready",
+            zarr_store_path="/stores/gfs/pin-06z",
+            created_at=c_06z,
+        )
+        session.add_all([r_00z, r_06z])
+
+        p_00z_12 = ForecastProduct(
+            id="prod_pin_00z_12",
+            run_id="run_gfs_pin_00z",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=12,
+        )
+        p_06z_06 = ForecastProduct(
+            id="prod_pin_06z_06",
+            run_id="run_gfs_pin_06z",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=6,
+        )
+        session.add_all([p_00z_12, p_06z_06])
+        session.commit()
+
+        target_v = _dt(2026, 9, 2, 12)
+
+        # Unpinned: newest cycle wins.
+        unpinned = resolve_valid_time_source(
+            session, "gfs", target_v, variable="temperature_2m"
+        )
+        assert unpinned.cycle_time == c_06z
+
+        # Pinned to the older 00Z cycle: the pinned representation wins.
+        pinned = resolve_valid_time_source(
+            session,
+            "gfs",
+            target_v,
+            variable="temperature_2m",
+            initial_time="2026-09-02T00:00:00Z",
+        )
+        assert pinned.cycle_time == c_00z
+        assert pinned.lead_time_hours == 12
+        assert pinned.store_path == "/stores/gfs/pin-00z"
+
+
+def test_resolver_pinned_unknown_cycle_falls_back_to_newest(resolver_test_db):
+    """Pinning a cycle that does not serve the valid time (never existed or was
+    reclaimed) falls back to the unpinned newest-cycle resolution instead of
+    failing the request."""
+    c_00z = _dt(2026, 9, 2, 0)
+
+    with Session(resolver_test_db) as session:
+        r_00z = ModelRun(
+            id="run_gfs_pinfb_00z",
+            model_version_id="version_gfs_v1.0",
+            cycle_time=c_00z,
+            status="ready",
+            zarr_store_path="/stores/gfs/pinfb-00z",
+            created_at=c_00z,
+        )
+        session.add_all([r_00z])
+        p_00z_06 = ForecastProduct(
+            id="prod_pinfb_00z_06",
+            run_id="run_gfs_pinfb_00z",
+            variable_id="temperature_2m",
+            grid_id="global_025deg",
+            product_type="surface",
+            lead_time_hours=6,
+        )
+        session.add_all([p_00z_06])
+        session.commit()
+
+        target_v = _dt(2026, 9, 2, 6)
+        source = resolve_valid_time_source(
+            session,
+            "gfs",
+            target_v,
+            variable="temperature_2m",
+            initial_time="2020-01-01T00:00:00Z",
+        )
+        assert source.cycle_time == c_00z
+        assert source.lead_time_hours == 6

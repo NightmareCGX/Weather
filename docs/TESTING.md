@@ -68,3 +68,31 @@ cd services/frontend && npm test
 cd services/frontend && npm run e2e
 ```
 
+### 3.1 Local integration-test database isolation (API)
+
+DB-backed API tests never guess a database: they run against
+`TEST_DATABASE_URL` (preferred) or `DATABASE_URL` (see
+`tests/_integration_db.py`). Because the serving tier's engine and the
+Alembic migration runner both resolve `DATABASE_URL` at process start, a local
+run must point **the whole process** at an ISOLATED test database — the same
+way CI sets `DATABASE_URL` to its service container:
+
+```bash
+# One-time: create an isolated test database (never reuse the live `weather_db`)
+docker exec weather_postgres psql -U weather_user -d weather_db \
+  -c "CREATE DATABASE weather_test_db"
+
+# Run the API suite against it
+cd services/api
+DATABASE_URL="postgresql://weather_user:weather_password@localhost:5432/weather_test_db" \
+TEST_DATABASE_URL="postgresql://weather_user:weather_password@localhost:5432/weather_test_db" \
+poetry run pytest
+```
+
+Running with `TEST_DATABASE_URL` alone is NOT sufficient for the serving-tier
+suites: components that open their own sessions/engines (`SessionLocal`, the
+reader-gate pool, `alembic/env.py`) would bind to the default live database at
+import time while the fixtures seed the isolated one, cross-wiring the test.
+The `migrated_db` fixture additionally re-pins `DATABASE_URL` to the isolated
+database around Alembic `upgrade`/`downgrade` as defense in depth.
+

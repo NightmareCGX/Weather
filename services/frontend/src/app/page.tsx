@@ -131,6 +131,7 @@ export default function HomePage() {
               approximateLocation={startupLocation}
               validTime={validTime}
               availableLeads={options.leadTimes}
+              availableValidTimes={options.variable?.valid_times ?? []}
               onSelect={handleSelectLocation}
               onCenterChange={handleCenterChange}
               onLocate={locateMe}

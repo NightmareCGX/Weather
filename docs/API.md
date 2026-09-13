@@ -355,8 +355,25 @@ Errors return standard HTTP status codes along with a structured machine-readabl
     "next_cursor": null
   }
   ```
-- **HTTP Status Codes**: `200 OK`, `404 Not Found` (unknown model/variable, no ready run, location outside grid), `422 Unprocessable Entity` (validation, non-ensemble model, unsupported `level`). *`400 Bad Request` / `401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
-- **Cache Policy**: `public, max-age=3600`.
+- **HTTP Status Codes**: `200 OK`, `404 Not Found` (unknown model/variable, no ready run, location outside grid), `422 Unprocessable Entity` (validation, non-ensemble model, unsupported `level`; providing both `valid_time` and `initial_time`). *`400 Bad Request` / `401 Unauthorized` / `429 Too Many Requests` apply once authentication and rate limiting are enabled (see section 2.2).*
+- **Cache Policy**: `no-cache` — the metadata endpoint resolves to the newest ready run when `initial_time` is omitted, so every client must revalidate to pick up new cycles immediately.
+- **Lifecycle V2 valid-time templates**: when queried by `valid_time`, the returned `tile_url_template` carries `valid_time={valid_time}&initial_time={source_cycle}`. Clients substitute `{source_cycle}` with the per-valid-time serving cycle from the availability payload; the resulting tile URLs pin the serving cycle and are immutable (see 4.2).
+
+#### 4.2 Render Map Raster Tile
+- **HTTP Method**: `GET`
+- **Endpoint**: `/v1/maps/{model}/{variable}/{level}/{z}/{x}/{y}.png`
+- **Purpose**: Render a 256×256 PNG raster tile of the forecast field for map layers (the URL template from 4.1 points here). Served from bounded Zarr window reads via the serving tier's process caches.
+- **Required Parameters**: `model`, `variable`, `level`, `z`, `x`, `y` (Web-Mercator tile coordinates, `0 ≤ z ≤ 9`).
+- **Optional Parameters**:
+  - `lead_time_hours` (legacy mode) with optional `initial_time` pinning the run.
+  - `valid_time` (Lifecycle V2) resolving the authoritative source for that instant.
+  - `valid_time` **combined with** `initial_time` (pinned mode): the newest-cycle preference is pinned to that cycle, and the resolver falls back to the authoritative unpinned resolution if the pinned cycle no longer serves the valid time (e.g. after reclamation). The pair is accepted on this endpoint only; the metadata endpoint (4.1) still rejects it.
+- **Cache Policy & ETag**:
+  - **Pinned URLs** (`initial_time` present): `Cache-Control: public, max-age=3600, immutable`. The URL fully identifies the content (model, variable, level, tile, valid time, cycle), so browsers may reuse tiles without revalidation while fresh. A new serving cycle changes the URL itself, so no shorter window is needed for cycle transitions; `max-age` only bounds staleness for the rare same-cycle re-ingestion (repair) path.
+  - **Unpinned URLs**: `Cache-Control: no-cache` — content may move to a newer cycle under the same URL, so revalidation is required.
+  - Every response carries a strong `ETag` (SHA-1 over the exact PNG bytes). Revalidation with `If-None-Match` returns `304 Not Modified` (empty body) whenever the rendered tile is unchanged, making unpinned revalidation and post-`max-age` refreshes cheap.
+- **Example Request**: `GET /v1/maps/gfs/temperature_2m/surface/8/51/98.png?valid_time=2026-07-21T06:00:00Z&initial_time=2026-07-21T00:00:00Z`
+- **HTTP Status Codes**: `200 OK`, `304 Not Modified` (matching `If-None-Match`), `404 Not Found` (unknown model/variable, no serving run, shard reclaimed mid-read), `422 Unprocessable Entity` (validation, out-of-range tile coordinates).
 
 ---
 

@@ -612,3 +612,80 @@ def test_sharded_v1_periodic_wrap():
         assert field[0, -1] == 70.0
         # Penultimate column must carry data from stored lon 359.75 (chunk 74 = 84.0)
         assert field[0, -2] == 84.0
+
+
+# --- Tile HTTP caching semantics (ETag / 304 / cycle-pinned immutable URLs) ---
+
+
+def test_tile_pinned_url_cache_headers_and_etag(client):
+    """A cycle-pinned tile URL (valid_time + initial_time) is immutable: long-lived
+    browser caching plus a strong ETag over the exact response bytes."""
+    resp = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png"
+        "?valid_time=2026-07-21T06:00:00Z&initial_time=2026-07-21T00:00:00Z"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Cache-Control"] == "public, max-age=3600, immutable"
+    assert resp.headers["ETag"].startswith('"') and resp.headers["ETag"].endswith('"')
+
+
+def test_tile_unpinned_url_revalidates_with_etag(client):
+    """An unpinned tile URL stays no-cache (content may move to a newer cycle),
+    but the ETag turns revalidation into a cheap 304 instead of a re-download."""
+    resp = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png?valid_time=2026-07-21T06:00:00Z"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Cache-Control"] == "no-cache"
+    etag = resp.headers["ETag"]
+    assert etag.startswith('"')
+
+    revalidate = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png?valid_time=2026-07-21T06:00:00Z",
+        headers={"If-None-Match": etag},
+    )
+    assert revalidate.status_code == 304
+    assert revalidate.headers["ETag"] == etag
+    assert revalidate.headers["Cache-Control"] == "no-cache"
+    assert revalidate.content == b""
+
+
+def test_tile_etag_changes_when_content_differs(client):
+    """Different tiles must never share an ETag."""
+    first = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png?lead_time_hours=6"
+    )
+    second = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png?lead_time_hours=12"
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.headers["ETag"] != second.headers["ETag"]
+
+
+def test_tile_pinned_and_unpinned_urls_resolve_identically(client):
+    """Pinning the cycle must not change the resolved representation: the pinned
+    URL and the unpinned URL render byte-identical tiles for the same valid time
+    while the pinned cycle is the authoritative one."""
+    pinned = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png"
+        "?valid_time=2026-07-21T06:00:00Z&initial_time=2026-07-21T00:00:00Z"
+    )
+    unpinned = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png?valid_time=2026-07-21T06:00:00Z"
+    )
+    assert pinned.status_code == 200
+    assert unpinned.status_code == 200
+    assert pinned.content == unpinned.content
+
+
+def test_tile_pinned_cycle_falls_back_when_cycle_does_not_serve(client):
+    """A pinned cycle that does not (or no longer) serve the valid time falls
+    back to the authoritative newest-cycle resolution instead of failing."""
+    resp = client.get(
+        "/v1/maps/gfs/temperature_2m/surface/8/51/98.png"
+        "?valid_time=2026-07-21T06:00:00Z&initial_time=2020-01-01T00:00:00Z"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"] == "image/png"
+    assert _png_has_opaque_pixels(resp.content)

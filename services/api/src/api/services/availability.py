@@ -354,7 +354,7 @@ def build_forecast_availability(
                     ),
                     valid_time_tile_url_template=(
                         f"/v1/maps/{model_id}/wind_10m/surface/{{z}}/{{x}}/{{y}}.png"
-                        f"?valid_time={{valid_time}}"
+                        f"?valid_time={{valid_time}}&initial_time={{source_cycle}}"
                     ),
                     valid_time_vector_field_url_template=(
                         f"/v1/maps/{model_id}/wind_10m/vector-field"
@@ -433,7 +433,7 @@ def build_forecast_availability(
                 legend=SpatialLayerLegend(unit=variable_acc.unit, stops=stops),
                 valid_time_tile_url_template=(
                     f"/v1/maps/{model_id}/{variable_code}/surface/{{z}}/{{x}}/{{y}}.png"
-                    f"?valid_time={{valid_time}}"
+                    f"?valid_time={{valid_time}}&initial_time={{source_cycle}}"
                 ),
             )
             variables.append(
