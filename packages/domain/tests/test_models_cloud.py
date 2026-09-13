@@ -298,3 +298,13 @@ class TestReconstructRunningAverageInterval:
             cur, pred, reset_period_hours=12, interval_width_hours=3
         )
         np.testing.assert_allclose(out, [70.0, 20.0])
+
+    def test_non_finite_reconstruction_yields_nan(self) -> None:
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        # inf - inf evaluates to NaN inside the guardrail -> NaN (not inf/-inf)
+        assert math.isnan(
+            reconstruct_running_average_interval(
+                float("inf"), float("inf"), reset_period_hours=12, interval_width_hours=3
+            )
+        )
