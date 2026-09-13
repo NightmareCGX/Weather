@@ -269,19 +269,48 @@ poetry run weather-ingest realtime
    ```bash
    poetry run weather-ingest gc --interval-seconds 1800 --bucket <OBJECT_STORAGE_BUCKET>
    ```
+   Each daemon pass runs the full Lifecycle V3 pipeline: bookkeeping ->
+   planner -> worker -> sweeper, gated by two-level authorization flags (see
+   below). The daemon holds the GC advisory lock; no cron wiring is required.
 2. **Single-Pass Mode (Cron / Manual Execution):**
    ```bash
    poetry run weather-ingest gc --once --bucket <OBJECT_STORAGE_BUCKET>
    ```
+   Runs one full pipeline pass (with the same authorization flags) and exits.
 3. **Dry-Run Inspection Mode:**
    ```bash
    poetry run weather-ingest gc --once --dry-run
    ```
 
+### Pipeline Wiring (V3 planner -> worker -> bookkeeping mainline):
+Without authorization flags the daemon only runs lifecycle bookkeeping (zero
+physical storage operations). The reclamation mainline is staged in two
+levels so deletion is always an explicit operator decision:
+
+| Stage | Flag | Env fallback | Effect |
+|---|---|---|---|
+| Planner | `--enable-planner` | `RECLAMATION_PLANNER_ENABLED=true` | Enqueue reclaimable shard targets into `reclamation_queue` each pass (queue writes only, no physical side effects). |
+| Worker | `--enable-delete` | `RECLAMATION_DELETE_ENABLED=true` | Physically delete enqueued shard targets each pass. **DANGEROUS.** |
+| Sweeper | `--enable-sweeper` | `RECLAMATION_SWEEPER_ENABLED=true` | Include the M3 14-day metadata retention pass each pass. |
+
+Recommended rollout: enable planner only, observe
+`GC pass: ... planner enqueued=N ...` summaries for at least one full
+interval, then enable `--enable-delete`. Each pass prints a structured
+summary (`bookkeeping ...; planner ...; worker ...; sweeper ...`); stages are
+failure-isolated so a transient DB/S3 fault never kills the daemon.
+
 ### Operational Invariants:
-* **Lifecycle V2 Cadence Retention:** For each model M with cadence C_M (e.g. 6h for GFS/GEFS), let T be the latest run with status == 'ready'. Cycles >= T - C_M are retained (T and T - C_M); cycles < T - C_M are deletion eligible. Models advance retention and GC independently.
-* **Deletion Fencing:** GC sets `deletion_started_at = NOW()` on `forecast_cycle_lifecycle` for `(model_id, cycle_time)` **before** deleting physical S3 keys.
-* **Crash Safety:** If GC crashes mid-deletion, the durable fence prevents new ingestion writers from resurrecting the cycle; the next GC run detects the incomplete deletion and purges remaining objects.
+* **V3 Granular Reclamation:** physical deletion happens exclusively through
+  the reclamation planner + worker at (variable, valid_time) granularity; the
+  bookkeeping pass itself never deletes storage. Whole-cycle prefix deletion
+  is retired.
+* **Deletion Fencing:** the planner/worker honour the serving fence
+  (`deletion_started_at`) on `forecast_cycle_lifecycle`; claimed cycles
+  contribute no canonical candidates and are fully reclaimable.
+* **Crash Safety:** worker claims use leases; a crashed worker's stale claims
+  are recoverable via `weather-ingest reclamation requeue` (which now also
+  recovers stuck `queued`/`deleting` rows over already-deleted physical
+  objects, unblocking tombstone terminality).
 
 ---
 
@@ -677,17 +706,23 @@ Verify that JSON serialization, Redis caching, and coordinate projections execut
 ### 19.8 Granular Reclamation Failures & Lease Expiry (`#reclamation-failures`, `#reclamation-stuck`)
 * **Symptom:** Alert `reclamation_failed_shards` or `reclamation_deleting_stuck` triggers.
 * **Diagnostic Procedure:**
-  1. Inspect failed reclamation records:
+  1. Inspect non-terminal reclamation records (including stale-lease
+     `deleting` claims and legacy stuck `queued` rows):
      ```sql
-     SELECT id, model_id, cycle_time, variable_code, lead_time_hours, last_error
+     SELECT id, model_id, cycle_time, variable_code, lead_time_hours, status, last_error
      FROM reclamation_queue
-     WHERE status = 'failed';
+     WHERE status IN ('failed', 'deleting', 'queued');
      ```
 * **Remediation:**
-  - If failures were caused by transient S3 reachability, requeue the failed targets:
+  - If failures were caused by transient S3 reachability — or rows are stuck
+    in `queued`/`deleting` over already-deleted physical objects (blocking the
+    cycle tombstone) — recover them:
     ```bash
     weather-ingest reclamation requeue
     ```
+    Rows holding an active worker lease are skipped automatically; rows whose
+    physical object is confirmed absent are promoted to terminal `deleted`,
+    rows still present are reset to `queued` for worker retry.
   - Re-run the reclamation worker pass:
     ```bash
     weather-ingest reclamation work --delete --batch-size 100
