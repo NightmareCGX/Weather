@@ -1,7 +1,7 @@
 """Background warm-up of the wind vector-field serving cache.
 
-The vector field payload is expensive to compute cold (GEFS: 30 members ×
-u/v full-globe Zarr reads per valid time), and the serving cache
+The vector field payload is expensive to compute cold (full-globe u/v shard
+reads per valid time), and the serving cache
 (:mod:`api.services.vector_field`: process-local L1 + shared Redis L2) is
 filled passively — so after each forecast-cycle publication the first real
 user of every valid time paid the full computation. This module closes that

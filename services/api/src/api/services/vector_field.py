@@ -8,7 +8,11 @@ grid (default 0.50°), and encodes to quantized Int16 binary format.
 For GEFS:
   Flow represents the ensemble consensus mean vector (mean(u_i), mean(v_i))
   across all members, while the background scalar raster represents expected
-  member wind speed magnitude mean(hypot(u_i, v_i)).
+  member wind speed magnitude mean(hypot(u_i, v_i)). On sharded_v1 stores the
+  official precomputed geavg mean shards (``shard.mean_L####``) are read
+  directly — 2 full-globe shard reads, same cost as GFS — instead of reading
+  30 member shards per component and averaging; the member-wise mean is only
+  a fallback for stores without official mean shards.
 """
 
 from __future__ import annotations
@@ -207,7 +211,8 @@ def _select_and_encode_vector_field(
     """Gate-time selector: extract and encode U/V components under the SHARED lock.
 
     For GFS: encodes canonical (u, v) for the requested lead.
-    For GEFS: computes consensus mean vector (mean(u_i), mean(v_i)) across members.
+    For GEFS: reads the official precomputed mean shards (geavg) when present,
+    falling back to the member-wise consensus mean (mean(u_i), mean(v_i)).
     """
     from api.core.manifest_reader import manifest_generation, manifest_storage_format
     from api.core.zarr import get_sharded_reader
@@ -230,42 +235,75 @@ def _select_and_encode_vector_field(
         generation = manifest_generation(store_path)
         is_ensemble = "member" in dataset.coords or "member" in field_u.dims
         if is_ensemble:
-            members_to_read = (
-                [int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)]
-                if "member" in dataset.coords
-                else list(range(1, 31))
-            )
-            u_members = [
-                reader.read_window(
+            if reader.has_mean_shard(
+                "wind_u_10m", lead, generation=generation
+            ) and reader.has_mean_shard("wind_v_10m", lead, generation=generation):
+                # Official precomputed geavg mean shards: the consensus flow
+                # vector is served directly — 2 full-globe reads, same cost as
+                # the GFS deterministic path. Matches the raster tile path.
+                u_win = reader.read_window(
                     "wind_u_10m",
-                    member=m,
+                    member=None,
                     lead_time_hours=lead,
                     lat_min=0,
                     lat_max=len(lat_raw) - 1,
                     lon_min=0,
                     lon_max=len(lon_raw) - 1,
                     generation=generation,
+                    is_mean=True,
                 )[::stride, ::stride]
-                for m in members_to_read
-            ]
-            v_members = [
-                reader.read_window(
+                v_win = reader.read_window(
                     "wind_v_10m",
-                    member=m,
+                    member=None,
                     lead_time_hours=lead,
                     lat_min=0,
                     lat_max=len(lat_raw) - 1,
                     lon_min=0,
                     lon_max=len(lon_raw) - 1,
                     generation=generation,
+                    is_mean=True,
                 )[::stride, ::stride]
-                for m in members_to_read
-            ]
-            with np.errstate(all="ignore"):
-                u_val = np.nanmean(u_members, axis=0)
-                v_val = np.nanmean(v_members, axis=0)
-            u_val = np.where(np.isfinite(u_val), u_val, 0.0)
-            v_val = np.where(np.isfinite(v_val), v_val, 0.0)
+                u_val = np.where(np.isfinite(u_win), u_win, 0.0)
+                v_val = np.where(np.isfinite(v_win), v_win, 0.0)
+            else:
+                # Store without official mean shards: compute the member-wise
+                # consensus mean from the per-member shards.
+                members_to_read = (
+                    [int(v) for v in np.atleast_1d(dataset.coords["member"].values).reshape(-1)]
+                    if "member" in dataset.coords
+                    else list(range(1, 31))
+                )
+                u_members = [
+                    reader.read_window(
+                        "wind_u_10m",
+                        member=m,
+                        lead_time_hours=lead,
+                        lat_min=0,
+                        lat_max=len(lat_raw) - 1,
+                        lon_min=0,
+                        lon_max=len(lon_raw) - 1,
+                        generation=generation,
+                    )[::stride, ::stride]
+                    for m in members_to_read
+                ]
+                v_members = [
+                    reader.read_window(
+                        "wind_v_10m",
+                        member=m,
+                        lead_time_hours=lead,
+                        lat_min=0,
+                        lat_max=len(lat_raw) - 1,
+                        lon_min=0,
+                        lon_max=len(lon_raw) - 1,
+                        generation=generation,
+                    )[::stride, ::stride]
+                    for m in members_to_read
+                ]
+                with np.errstate(all="ignore"):
+                    u_val = np.nanmean(u_members, axis=0)
+                    v_val = np.nanmean(v_members, axis=0)
+                u_val = np.where(np.isfinite(u_val), u_val, 0.0)
+                v_val = np.where(np.isfinite(v_val), v_val, 0.0)
         else:
             u_win = reader.read_window(
                 "wind_u_10m",
