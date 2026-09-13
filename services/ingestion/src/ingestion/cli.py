@@ -714,6 +714,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=50,
         help="Maximum number of cycles to process per sweeper pass (default 50).",
     )
+    gc.add_argument(
+        "--inventory",
+        action="store_true",
+        help="Run one store-catalog orphan inventory pass (architecture doc section 9) "
+        "and exit. Reports physical cycle stores without catalog identity; "
+        "orphans beyond the recoverability frontier are marked reapable.",
+    )
+    gc.add_argument(
+        "--inventory-reap",
+        action="store_true",
+        help="With --inventory: delete orphan store prefixes beyond the recoverability "
+        "frontier under an exclusive store gate (fail-closed sanity guards).",
+    )
+    gc.add_argument(
+        "--inventory-store-root",
+        default=None,
+        help="Store root for --inventory (default 's3://<--bucket>').",
+    )
 
     reclamation = subparsers.add_parser(
         "reclamation",
@@ -1098,6 +1116,31 @@ def _run_gc(args: argparse.Namespace) -> int:
     from ingestion.core.db import engine as catalog_engine
     from ingestion.gc.leadership import GcLeadership
     from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
+
+    if getattr(args, "inventory", False):
+        from ingestion.gc.inventory import run_orphan_inventory
+
+        bucket = str(args.bucket)
+        store_root = getattr(args, "inventory_store_root", None) or f"s3://{bucket}"
+        inv = run_orphan_inventory(
+            catalog_engine,
+            store_root=store_root,
+            reap=bool(args.inventory_reap),
+            timeout_seconds=float(args.lock_timeout_seconds),
+        )
+        print(
+            f"Orphan Inventory: stores={inv.discovered_stores} "
+            f"cataloged_cycles={inv.cataloged_cycles} "
+            f"orphans={len(inv.orphan_stores)} "
+            f"beyond_frontier={sum(1 for o in inv.orphan_stores if o.beyond_frontier)} "
+            f"reaped={len(inv.reaped_stores)} blocked={len(inv.reap_blocked)}"
+        )
+        for orphan in inv.orphan_stores:
+            flag = "REAPABLE" if orphan.beyond_frontier else "recoverable-frontier"
+            print(f"  ORPHAN [{flag}] {orphan.store_path} cycle={orphan.cycle_time.isoformat()}")
+        for path in inv.reap_blocked:
+            print(f"  REAP-BLOCKED {path}")
+        return 0
 
     if getattr(args, "sweep_metadata", False):
         from ingestion.gc.sweeper import run_metadata_sweeper_pass
