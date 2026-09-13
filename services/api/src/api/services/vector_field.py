@@ -36,9 +36,12 @@ if TYPE_CHECKING:
     pass
 
 #: Server-side vector field in-memory LRU cache.
-#: Bounded so the API process memory remains strictly controlled.
-_VECTOR_CACHE_MAX_ENTRIES = 128
-_VECTOR_CACHE_TTL_SECONDS = 300
+#: Entries are keyed by full forecast + serving-generation identity, so entries
+#: from superseded generations simply expire unused. The TTL is long (30 min)
+#: because a cache hit skips an expensive full-globe (GEFS: 30 members × u/v)
+#: Zarr read; the entry budget bounds process memory (~64 × ~1 MB payloads).
+_VECTOR_CACHE_MAX_ENTRIES = 64
+_VECTOR_CACHE_TTL_SECONDS = 1800
 _vector_cache: dict[tuple[object, ...], tuple[float, bytes]] = {}
 
 

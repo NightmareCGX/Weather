@@ -4,6 +4,18 @@ import type { VectorFieldData } from "@/lib/api/types";
 export const CALM_WIND_THRESHOLD_MPS = 0.5;
 export const EARTH_RADIUS_METERS = 6371000.0;
 export const DEFAULT_LAT_CLAMP = 85.0;
+export const MAPLIBRE_TILE_SIZE_PX = 512;
+/**
+ * Screen-space flow speed model: a wind of `BASE_FLOW_SPEED_MPS` m/s moves a
+ * particle at `BASE_FLOW_SPEED_PX_PER_SEC` px/s (scaled by `spd^FLOW_SPEED_EXPONENT`
+ * for wind-speed-proportional trail length, compressed so light winds stay visible).
+ * Defined in screen pixels so motion is consistent at every zoom level.
+ */
+export const BASE_FLOW_SPEED_MPS = 10.0;
+export const BASE_FLOW_SPEED_PX_PER_SEC = 90.0;
+export const FLOW_SPEED_EXPONENT = 0.65;
+/** Upper bound on per-frame particle travel so low-fps frames never streak. */
+export const MAX_FLOW_STEP_PX_PER_FRAME = 14.0;
 
 /**
  * Bilinear interpolation of U and V velocity components at (lat, lon).
@@ -140,9 +152,9 @@ export class WindParticleAnimation {
     this.ctx = canvas.getContext("2d", { willReadFrequently: false });
     this.map = map;
     this.options = {
-      maxParticles: options.maxParticles ?? 3000,
+      maxParticles: options.maxParticles ?? 4000,
       speedScale: options.speedScale ?? 1.0,
-      fadeOpacity: options.fadeOpacity ?? 0.94,
+      fadeOpacity: options.fadeOpacity ?? 0.96,
       color: options.color ?? "rgba(255, 255, 255, 0.75)",
       lineWidth: options.lineWidth ?? 1.2,
     };
@@ -162,7 +174,6 @@ export class WindParticleAnimation {
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", this.handleVisibilityChange);
     }
-    this.map.on("move", this.handleMapMove);
     this.map.on("resize", this.handleMapResize);
   }
 
@@ -170,7 +181,6 @@ export class WindParticleAnimation {
     if (typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", this.handleVisibilityChange);
     }
-    this.map.off("move", this.handleMapMove);
     this.map.off("resize", this.handleMapResize);
   }
 
@@ -181,14 +191,6 @@ export class WindParticleAnimation {
       this.stop();
     } else if (this.field !== null && !this.isReducedMotion) {
       this.start();
-    }
-  };
-
-  private handleMapMove = (): void => {
-    // Reset particle trail continuity on map movement to prevent long streaks across screen
-    for (const p of this.particles) {
-      p.prevX = null;
-      p.prevY = null;
     }
   };
 
@@ -230,7 +232,7 @@ export class WindParticleAnimation {
     const rect = this.canvas.getBoundingClientRect();
     const area = rect.width * rect.height;
     // Adaptive particle density based on screen area
-    const targetCount = Math.min(this.options.maxParticles, Math.max(500, Math.round(area / 350)));
+    const targetCount = Math.min(this.options.maxParticles, Math.max(500, Math.round(area / 300)));
 
     this.particles = [];
     for (let i = 0; i < targetCount; i++) {
@@ -320,10 +322,17 @@ export class WindParticleAnimation {
     ctx.lineCap = "round";
     ctx.beginPath();
 
-    const dt = Math.max(0.016, dtSec);
+    const dt = Math.min(0.1, Math.max(0.001, dtSec));
     const bounds = this.map.getBounds();
     const south = Math.max(-85, bounds.getSouth());
     const north = Math.min(85, bounds.getNorth());
+
+    // Web Mercator is conformal: at latitude φ, one meter of ground maps to
+    // k = worldSize / (2π·R·cosφ) screen pixels in BOTH axes, so a pixel-space
+    // speed target can be converted to a ground displacement per particle.
+    const worldSizePx = MAPLIBRE_TILE_SIZE_PX * Math.pow(2.0, this.map.getZoom());
+    const pxPerMeterDenom = 2.0 * Math.PI * EARTH_RADIUS_METERS;
+    const minCosLat = Math.cos(85.0 * (Math.PI / 180.0));
 
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
@@ -362,15 +371,26 @@ export class WindParticleAnimation {
         ctx.lineTo(currX, currY);
       }
 
-      // Advection step with visual speed mapping
-      // Visual speed compression: spd^0.65 ensures light winds are visible while high winds are smooth
-      const visualSpeedScale = (Math.pow(spd, 0.65) / spd) * 75.0 * this.options.speedScale;
+      // Screen-space flow speed: trail length grows with wind speed, with a
+      // power-law compression so light winds remain visible and gales stay smooth.
+      const speedPxPerSec =
+        BASE_FLOW_SPEED_PX_PER_SEC *
+        Math.pow(spd / BASE_FLOW_SPEED_MPS, FLOW_SPEED_EXPONENT) *
+        this.options.speedScale;
+      const radLat = p.lat * (Math.PI / 180.0);
+      const cosLat = Math.max(Math.cos(radLat), minCosLat);
+      const pxPerMeter = worldSizePx / (pxPerMeterDenom * cosLat);
+      const stepPx = Math.min(speedPxPerSec * dt, MAX_FLOW_STEP_PX_PER_FRAME);
+      const stepMeters = stepPx / pxPerMeter;
+
+      // Advection: unit wind direction × ground step; dtSeconds=1 bakes the
+      // frame's displacement into the "velocity" magnitude.
       const [nextLat, nextLon] = advectParticle(
         p.lat,
         p.lon,
-        u * visualSpeedScale,
-        v * visualSpeedScale,
-        dt
+        (u / spd) * stepMeters,
+        (v / spd) * stepMeters,
+        1.0
       );
 
       p.lat = nextLat;
