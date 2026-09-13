@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from domain.canonical import (
@@ -38,6 +39,7 @@ from domain.reclamation import (
     make_region_marker_relative_key,
 )
 from domain.temporal import (
+    get_variable_temporal_metadata,
     is_precipitation_companion,
     requires_lead0_display_fallback,
     serving_start_valid_time,
@@ -201,20 +203,25 @@ def run_reclamation_worker_pass(
 
     # 2. Process each store under its SHARED store gate
     for store_path, targets in claimed_by_store.items():
-        # Advisory lock coordinator if postgres
+        # Advisory lock coordinator if postgres. The gate is held on a DEDICATED
+        # connection: the session's own connection may already carry an open
+        # transaction (autobegin) and cannot host the advisory-lock transaction.
         coord: StoreLockCoordinator | None = None
-        if is_postgres and session.bind:
-            conn = session.connection()
+        gate_conn = None
+        catalog_bind = session.bind if isinstance(session.bind, Engine) else None
+        if is_postgres and catalog_bind is not None:
+            gate_conn = catalog_bind.connect()
             coord = StoreLockCoordinator(
-                conn,
+                gate_conn,
                 store_path=store_path,
                 timeout_seconds=5.0,
             )
             try:
                 coord.acquire_shared_gate()
             except LockTimeoutError:
-                # Store gate blocked (e.g. V2 whole-cycle GC or writer holding exclusive gate)
+                # Store gate blocked (e.g. writer holding exclusive gate)
                 logger.warning("Reclamation worker store gate blocked on %s, skipping batch", store_path)
+                gate_conn.close()
                 for t in targets:
                     t.status = RECLAMATION_STATUS_QUEUED
                     t.lease_expires_at = None
@@ -223,18 +230,25 @@ def run_reclamation_worker_pass(
                 continue
 
         try:
-            # Re-read whole-cycle lifecycle under the gate
+            # Re-read whole-cycle lifecycle under the gate.
+            # A claimed cycle (deletion_started_at) is the serving & mutation
+            # fence: the resolver no longer selects it, so granular reclamation
+            # of its remaining units proceeds — the V3 bookkeeping pass never
+            # deletes store prefixes, so there is nothing to coordinate against.
             first_target = targets[0]
             m_id = first_target.model_id
             c_utc = _ensure_utc_datetime(first_target.cycle_time)
             lc = session.get(ForecastCycleLifecycleRecord, (m_id, c_utc))
-            if lc is not None and (lc.deletion_started_at is not None or lc.deleted_at is not None):
-                # V2 whole-cycle GC claimed or deleted this cycle: abort granular reclamation
-                logger.info("Cycle %s %s claimed by whole-cycle GC, aborting granular GC", m_id, c_utc)
+            if lc is not None and lc.deleted_at is not None:
+                # Tombstoned: all queue rows are terminal by construction —
+                # nothing left to reclaim for this cycle.
+                logger.info(
+                    "Cycle %s %s already tombstoned, skipping granular GC", m_id, c_utc
+                )
                 for t in targets:
                     t.status = RECLAMATION_STATUS_QUEUED
                     t.lease_expires_at = None
-                    t.last_error = "cycle_claimed_by_whole_cycle_gc"
+                    t.last_error = "cycle_already_tombstoned"
                 session.commit()
                 continue
 
@@ -369,7 +383,6 @@ def run_reclamation_worker_pass(
                 variables=distinct_vars,
                 start_valid_time=serving_start,
             )
-
             # Build set of counterfactually necessary target tuples
             necessary_tuples: dict[tuple[str, int, str, str, int], str] = {}
 
@@ -403,25 +416,89 @@ def run_reclamation_worker_pass(
                     else:
                         necessary_tuples[(src_cand.run_id, src_cand.lead_time_hours, v, TARGET_KIND_DET, 0)] = "variable_source"
 
-            # Predecessors
+            # Predecessors (per-variable (W, R) metadata, architecture doc I19)
             for r_id_str, (c_utc_r, st_r, p_r) in eligible_runs.items():
                 if c_utc_r >= min_recovery_cycle and st_r != "ready":
                     committed_leads = {ld for (r, ld) in by_rl.keys() if r == r_id_str}
-                    for r_lead in range(6, m_max_lead + 1, 6):
-                        if r_lead not in committed_leads:
-                            p_lead = get_predecessor_lead(r_lead)
+                    for p_var in PREDECESSOR_VARIABLES:
+                        var_meta = get_variable_temporal_metadata(p_var)
+                        reset_period = var_meta.reset_period_hours
+                        if var_meta.interval_width_hours >= reset_period:
+                            # W == R: no predecessor dependency exists.
+                            continue
+                        for r_lead in range(reset_period, m_max_lead + 1, reset_period):
+                            if r_lead in committed_leads:
+                                continue
+                            p_lead = get_predecessor_lead(
+                                r_lead,
+                                interval_width_hours=var_meta.interval_width_hours,
+                                reset_period_hours=reset_period,
+                            )
                             if p_lead in committed_leads:
-                                for p_var in PREDECESSOR_VARIABLES:
-                                    if is_ensemble:
-                                        necessary_tuples[(r_id_str, p_lead, p_var, TARGET_KIND_MEAN, -1)] = "predecessor"
-                                        for m in range(1, expected_members + 1):
-                                            necessary_tuples[(r_id_str, p_lead, p_var, TARGET_KIND_MEM, m)] = "predecessor"
-                                    else:
-                                        necessary_tuples[(r_id_str, p_lead, p_var, TARGET_KIND_DET, 0)] = "predecessor"
+                                if is_ensemble:
+                                    necessary_tuples[(r_id_str, p_lead, p_var, TARGET_KIND_MEAN, -1)] = "predecessor"
+                                    for m in range(1, expected_members + 1):
+                                        necessary_tuples[(r_id_str, p_lead, p_var, TARGET_KIND_MEM, m)] = "predecessor"
+                                else:
+                                    necessary_tuples[(r_id_str, p_lead, p_var, TARGET_KIND_DET, 0)] = "predecessor"
+
+            # 4a. Wind U/V semantic atomicity (architecture doc I8):
+            # eligibility atomic — the pair must be jointly judged unnecessary
+            # before either component may enter deletion. Serving atomicity is
+            # provided by the physical fence (a fenced component makes the pair
+            # unselectable for wind_10m); physical DeleteObjects may proceed
+            # sequentially and crash-induced one-deleted states remain fenced.
+            deferred_pair_ids: set[str] = set()
+            pair_groups: dict[
+                tuple[str, int, str, int], dict[str, ReclamationQueueRecord]
+            ] = {}
+            for t in targets:
+                if t.variable_code in ("wind_u_10m", "wind_v_10m"):
+                    pair_groups.setdefault(
+                        (t.run_id, t.lead_time_hours, t.target_kind, t.member_index),
+                        {},
+                    )[t.variable_code] = t
+            for (r_id, lead, kind, mem), comps in pair_groups.items():
+                # Any claimed component counterfactually necessary → revert both.
+                if any(
+                    (t.run_id, t.lead_time_hours, t.variable_code, t.target_kind, t.member_index)
+                    in necessary_tuples
+                    for t in comps.values()
+                ):
+                    deferred_pair_ids.update(t.id for t in comps.values())
+                    continue
+                counterpart_var = {
+                    "wind_u_10m": "wind_v_10m",
+                    "wind_v_10m": "wind_u_10m",
+                }
+                for var_code, target in comps.items():
+                    other_var = counterpart_var[var_code]
+                    if other_var in comps:
+                        continue  # both in batch: evaluated jointly above
+                    other_status = session.execute(
+                        select(ReclamationQueueRecord.status).where(
+                            ReclamationQueueRecord.run_id == r_id,
+                            ReclamationQueueRecord.lead_time_hours == lead,
+                            ReclamationQueueRecord.variable_code == other_var,
+                            ReclamationQueueRecord.target_kind == kind,
+                            ReclamationQueueRecord.member_index == mem,
+                        )
+                    ).scalar_one_or_none()
+                    if other_status != RECLAMATION_STATUS_DELETED:
+                        # Counterpart not terminal → pair not jointly evaluated yet.
+                        deferred_pair_ids.add(target.id)
 
             # 4. Process each target in the store's claimed batch
             deleted_targets_for_store: list[ReclamationQueueRecord] = []
             for target in targets:
+                if target.id in deferred_pair_ids:
+                    target.status = RECLAMATION_STATUS_QUEUED
+                    target.lease_expires_at = None
+                    target.last_error = "wind_pair_eligibility_atomicity_deferred"
+                    target.updated_at = now_utc
+                    total_revalidated += 1
+                    continue
+
                 t_tuple = (
                     target.run_id,
                     target.lead_time_hours,
@@ -526,6 +603,8 @@ def run_reclamation_worker_pass(
         finally:
             if coord is not None:
                 coord.release_shared_gate()
+            if gate_conn is not None:
+                gate_conn.close()
 
     return ReclamationWorkerResult(
         claimed_count=len(claimed_rows),

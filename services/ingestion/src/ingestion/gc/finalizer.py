@@ -1,26 +1,33 @@
-"""V3 Whole-Cycle End-of-Life Physical Finalizer (Data Lifecycle V3 Milestone 2).
+"""Lifecycle bookkeeping / metadata reconciliation (Data Lifecycle V3, converged).
 
-This module implements the authoritative whole-cycle physical end-of-life
-finalizer for Data Lifecycle V3. It manages the two candidate classes
-(recovery vs fresh), enforces conservative multi-version horizon eligibility,
-guarantees atomic PostgreSQL finalization, and normalizes reclamation_queue
-rows while preserving detailed catalog metadata for Milestone 3.
+This module owns the **derived** cycle-level bookkeeping of the V3 GC model.
+There is no cycle-level GC authority: physical deletion happens exclusively
+through the Reclamation Planner + Reclamation Worker at (variable, valid_time)
+granularity. This module only:
 
-Invariants:
------------
-1. Fresh candidate eligibility is strictly conservative across all versions:
-   cycle_time + max(model_max_lead_hours(model_id, version)) < serving_start_valid_time(now).
-   Exact equality means NOT expired.
-2. Recovery candidates (deletion_started_at != NULL and deleted_at IS NULL)
-   resume monotonically without re-evaluating fresh horizon eligibility.
-3. Every distinct physical store belonging to (model_id, cycle_time) across all
-   versions/runs must be absent before deleted_at can commit.
-4. Physical deletion runs sequentially under individual EXCLUSIVE store gates
-   without holding any open database transactions.
-5. Queue normalization (status='deleted') and deleted_at tombstone commit
-   atomically in the same transaction.
-6. Detailed catalog metadata (model_runs, forecast_products, etc.) is retained
-   intact for the 14-day retention window (owned by Milestone 3).
+1. Claims retirement (``deletion_started_at`` serving & mutation fence) for
+   horizon-expired cycles — a conservative derived fast-path; claiming is what
+   guarantees no *new* canonical holds can form on the cycle while its remaining
+   units are reclaimed.
+2. Observes whether all committed reclamation units of a cycle are terminal
+   (every committed unit has a ``reclamation_queue`` row in status ``deleted``
+   and no in-flight rows remain).
+3. Derives ``deleted_at`` (permanent tombstone) once all units are terminal and
+   starts the 14-day metadata retention clock (owned by the sweeper).
+
+Invariants (architecture doc §7/§8, I7/I14/I16):
+------------------------------------------------
+- Zero physical storage operations: no DeleteObject, no store prefix deletion,
+  no store gates. ``deleted_at`` is a derived bookkeeping fact, never a
+  deletion authorization.
+- Once a cycle is claimed (serving fence), the planner treats all of its
+  remaining units as unprotected and the worker reclaims them; this pass never
+  blocks granular reclamation.
+- Tombstone is only committed when every committed unit is terminal. Units with
+  no catalog evidence (orphans) are the store-catalog reconciler's concern.
+- Models are independent: everything is keyed by (model_id, cycle_time).
+- Detailed catalog metadata (model_runs, forecast_products, ...) is retained
+  intact for the 14-day retention window (owned by the sweeper).
 """
 
 from __future__ import annotations
@@ -34,8 +41,9 @@ from sqlalchemy import func, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from domain.coverage import get_expected_members
 from domain.horizon import model_max_lead_hours
-from domain.lifecycle import canonical_cycle_store_path, is_cycle_horizon_expired
+from domain.lifecycle import is_cycle_horizon_expired
 from domain.temporal import serving_start_valid_time
 from ingestion.core.catalog import (
     ForecastCycleLifecycleRecord,
@@ -46,14 +54,18 @@ from ingestion.core.catalog import (
     _utcnow,
     ensure_lifecycle_row,
 )
-from ingestion.gc.reconciler import delete_physical_store_gated
+from ingestion.gc.planner import enumerate_committed_unit_tuples
 
 logger = logging.getLogger(__name__)
+
+#: Queue statuses that mean a unit still needs physical work (or failed and
+#: needs operator requeue). Any of these blocks the derived tombstone.
+NON_TERMINAL_QUEUE_STATUSES: tuple[str, ...] = ("queued", "deleting", "failed")
 
 
 @dataclass(frozen=True)
 class FinalizerCandidate:
-    """A candidate cycle evaluated by the whole-cycle finalizer."""
+    """A candidate cycle evaluated by the lifecycle bookkeeping pass."""
 
     model_id: str
     cycle_time: datetime
@@ -62,7 +74,7 @@ class FinalizerCandidate:
 
 @dataclass(frozen=True)
 class FinalizerPassResult:
-    """Authoritative structured diagnostic result of one finalizer pass."""
+    """Structured diagnostic result of one lifecycle bookkeeping pass."""
 
     dry_run: bool
     evaluated_at: datetime
@@ -80,14 +92,14 @@ def discover_finalizer_candidates(
     models: Sequence[str] = ("gfs", "gefs"),
     batch_size: int = 50,
 ) -> tuple[list[FinalizerCandidate], list[FinalizerCandidate]]:
-    """Discover recovery and fresh candidate cycles for whole-cycle finalization.
+    """Discover recovery and fresh candidate cycles for lifecycle bookkeeping.
 
     Returns:
         (recovery_candidates, fresh_candidates)
     """
     target_models = tuple(m.lower().strip() for m in models)
 
-    # 1. Recovery candidates: claimed for deletion but not yet finalized
+    # 1. Recovery candidates: claimed for retirement but not yet tombstoned
     rec_stmt = (
         select(
             ForecastCycleLifecycleRecord.model_id,
@@ -171,7 +183,12 @@ def claim_fresh_candidate(
 ) -> bool:
     """Atomically evaluate fresh horizon eligibility and commit deletion_started_at claim.
 
-    Guarantee B implementation:
+    The claim is the serving & mutation fence (Guarantee B): once committed, the
+    API stops selecting the cycle, the planner treats its remaining units as
+    unprotected, and no new canonical holds can form. The horizon check is a
+    conservative derived fast-path (architecture doc §7.1) — it never
+    authorizes physical deletion by itself.
+
     1. Ensures lifecycle row exists via race-safe upsert.
     2. Locks row with SELECT ... FOR UPDATE.
     3. Resolves all distinct model versions attached to ModelRuns for this cycle.
@@ -246,13 +263,13 @@ def claim_fresh_candidate(
     setattr(lc, "updated_at", now_utc)
     session.commit()
     logger.info(
-        "finalizer_cycle_claimed: model=%s cycle_time=%s versions=%s max_lead=%dh",
+        "bookkeeping_cycle_claimed: model=%s cycle_time=%s versions=%s max_lead=%dh",
         m_id,
         c_utc.isoformat(),
         versions,
         max_lead,
         extra={
-            "event": "finalizer_cycle_claimed",
+            "event": "bookkeeping_cycle_claimed",
             "model": m_id,
             "cycle_time": c_utc.isoformat(),
             "versions": versions,
@@ -272,7 +289,8 @@ def enumerate_cycle_store_paths(
     """Enumerate all distinct physical Zarr store paths for a lifecycle cycle.
 
     Queries all recorded non-null zarr_store_path values from model_runs for this
-    (model_id, cycle_time) and includes the canonical template fallback.
+    (model_id, cycle_time) and includes the canonical template fallback. Used by
+    the store-catalog reconciliation (orphan inventory), NOT by this module.
     """
     m_id = model_id.lower().strip()
     c_utc = _ensure_utc_datetime(cycle_time)
@@ -292,11 +310,78 @@ def enumerate_cycle_store_paths(
     )
     recorded_paths = set(session.execute(stmt).scalars().all())
 
-    # Include canonical fallback (guarantees orphaned canonical storage is deleted)
+    # Include canonical fallback (guarantees orphaned canonical storage is detected)
+    from domain.lifecycle import canonical_cycle_store_path
+
     canonical = canonical_cycle_store_path(m_id, c_utc, base_bucket=base_bucket)
     recorded_paths.add(canonical)
 
     return sorted(p for p in recorded_paths if p)
+
+
+def cycle_reclamation_units_terminal(
+    session: Session,
+    model_id: str,
+    cycle_time: datetime,
+) -> bool:
+    """Return True if every committed reclamation unit of the cycle is terminal.
+
+    Terminal means (architecture doc §0 invariant, I7/I16):
+    - every committed unit (from forecast_products / ensemble_member_products,
+      enumerated with the same construction the planner uses) has a
+      ``reclamation_queue`` row in status ``deleted``;
+    - no queue row for the cycle remains in a non-terminal status
+      (queued / deleting / failed).
+
+    Cycles with no committed catalog units are trivially terminal; physical
+    stores without catalog evidence are the store-catalog reconciler's concern.
+    """
+    m_id = model_id.lower().strip()
+    c_utc = _ensure_utc_datetime(cycle_time)
+
+    run_ids = list(
+        session.execute(
+            select(ModelRunRecord.id)
+            .join(
+                ModelVersionRecord,
+                ModelRunRecord.model_version_id == ModelVersionRecord.id,
+            )
+            .where(
+                ModelVersionRecord.model_id == m_id,
+                ModelRunRecord.cycle_time == c_utc,
+            )
+        ).scalars().all()
+    )
+    if not run_ids:
+        return True
+
+    status_by_unit: dict[tuple[str, int, str, str, int], str] = {
+        (str(r), int(ld), str(v), str(k), int(m)): str(st)
+        for r, ld, v, k, m, st in session.execute(
+            select(
+                ReclamationQueueRecord.run_id,
+                ReclamationQueueRecord.lead_time_hours,
+                ReclamationQueueRecord.variable_code,
+                ReclamationQueueRecord.target_kind,
+                ReclamationQueueRecord.member_index,
+                ReclamationQueueRecord.status,
+            ).where(ReclamationQueueRecord.run_id.in_(run_ids))
+        ).all()
+    }
+
+    # Any in-flight or failed unit blocks the derived tombstone.
+    for status in status_by_unit.values():
+        if status in NON_TERMINAL_QUEUE_STATUSES:
+            return False
+
+    is_ensemble = get_expected_members(m_id, default_if_unknown=1) > 1
+    units = enumerate_committed_unit_tuples(
+        session, run_ids=run_ids, is_ensemble=is_ensemble
+    )
+    for unit in units:
+        if status_by_unit.get(unit) != "deleted":
+            return False
+    return True
 
 
 def finalize_cycle_physical_and_queue(
@@ -307,6 +392,10 @@ def finalize_cycle_physical_and_queue(
     finalization_time: datetime | None = None,
 ) -> None:
     """Atomically commit deleted_at tombstone and normalize all queue rows to 'deleted'.
+
+    Only callable once :func:`cycle_reclamation_units_terminal` holds — the
+    tombstone is a derived bookkeeping fact (architecture doc §8). Callers must
+    not use this to authorize deletion.
 
     Invariants:
     1. Both mutations commit in the SAME database transaction.
@@ -357,12 +446,12 @@ def finalize_cycle_physical_and_queue(
         session.commit()
 
     logger.info(
-        "finalizer_cycle_completed: model=%s cycle_time=%s deleted_at=%s",
+        "bookkeeping_cycle_tombstoned: model=%s cycle_time=%s deleted_at=%s",
         m_id,
         c_utc.isoformat(),
         now_utc.isoformat(),
         extra={
-            "event": "finalizer_cycle_completed",
+            "event": "bookkeeping_cycle_tombstoned",
             "model": m_id,
             "cycle_time": c_utc.isoformat(),
             "deleted_at": now_utc.isoformat(),
@@ -370,20 +459,24 @@ def finalize_cycle_physical_and_queue(
     )
 
 
-def finalize_cycle_eol(
+def finalize_cycle_bookkeeping(
     engine: Engine,
     model_id: str,
     cycle_time: datetime,
     *,
     is_recovery: bool,
     serving_start: datetime,
-    base_bucket: str = "weather-data",
-    timeout_seconds: float = 5.0,
     now: datetime | None = None,
 ) -> bool:
-    """Execute the full whole-cycle physical end-of-life finalizer for one candidate.
+    """Execute the lifecycle bookkeeping flow for one candidate cycle.
 
-    Returns True if successfully finalized (or already deleted), False if skipped/blocked.
+    1. Fresh eligibility claim (skipped for recovery candidates) — the serving
+       & mutation fence.
+    2. Verify all committed reclamation units are terminal.
+    3. Derive ``deleted_at`` (tombstone) atomically.
+
+    Returns True if tombstoned (or already deleted), False if blocked.
+    Performs ZERO physical storage operations.
     """
     m_id = model_id.lower().strip()
     c_utc = _ensure_utc_datetime(cycle_time)
@@ -402,49 +495,41 @@ def finalize_cycle_eol(
             if not claimed:
                 return False
 
-    # Step 2: Enumerate all distinct physical stores belonging to the cycle
+    # Step 2: Derived tombstone requires all units terminal (I7/I16)
     with Session(engine) as session:
-        store_paths = enumerate_cycle_store_paths(
-            session, m_id, c_utc, base_bucket=base_bucket
-        )
-
-    # Step 3: Sequentially delete every physical store prefix under EXCLUSIVE gate
-    for store_path in store_paths:
-        deleted = delete_physical_store_gated(
-            engine, store_path, timeout_seconds=timeout_seconds
-        )
-        if not deleted:
-            logger.warning(
-                "finalizer_store_gate_blocked: model=%s cycle_time=%s store_path=%s; deferring",
+        if not cycle_reclamation_units_terminal(session, m_id, c_utc):
+            logger.info(
+                "bookkeeping_units_not_terminal: model=%s cycle_time=%s; deferring",
                 m_id,
                 c_utc.isoformat(),
-                store_path,
             )
             return False
 
-    # Step 4: Atomic DB finalization (deleted_at + queue normalization)
+    # Step 3: Atomic DB tombstone (deleted_at + queue normalization)
     finalize_cycle_physical_and_queue(
         engine, m_id, c_utc, finalization_time=now_utc
     )
     return True
 
 
-def run_finalizer_pass(
+def run_lifecycle_bookkeeping_pass(
     engine: Engine,
     *,
     models: Sequence[str] = ("gfs", "gefs"),
     dry_run: bool = False,
-    base_bucket: str = "weather-data",
-    timeout_seconds: float = 5.0,
     batch_size: int = 50,
     now: datetime | None = None,
 ) -> FinalizerPassResult:
-    """Execute a single bounded V3 whole-cycle finalizer pass across specified models."""
+    """Execute a single bounded lifecycle bookkeeping pass across specified models.
+
+    Performs ZERO physical storage operations: claims retirement fences and
+    derives tombstones for cycles whose reclamation units are all terminal.
+    """
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
     serving_start = serving_start_valid_time(now_utc)
 
     logger.info(
-        "finalizer_pass_started: dry_run=%s now=%s serving_start=%s models=%s",
+        "bookkeeping_pass_started: dry_run=%s now=%s serving_start=%s models=%s",
         dry_run,
         now_utc.isoformat(),
         serving_start.isoformat(),
@@ -458,7 +543,7 @@ def run_finalizer_pass(
 
     if dry_run:
         logger.info(
-            "finalizer_dry_run: recovery_candidates=%d fresh_candidates=%d",
+            "bookkeeping_dry_run: recovery_candidates=%d fresh_candidates=%d",
             len(rec_cands),
             len(fresh_cands),
         )
@@ -481,14 +566,12 @@ def run_finalizer_pass(
     # 1. Process recovery candidates first (monotonicity priority)
     for cand in rec_cands:
         try:
-            ok = finalize_cycle_eol(
+            ok = finalize_cycle_bookkeeping(
                 engine,
                 cand.model_id,
                 cand.cycle_time,
                 is_recovery=True,
                 serving_start=serving_start,
-                base_bucket=base_bucket,
-                timeout_seconds=timeout_seconds,
                 now=now_utc,
             )
             if ok:
@@ -497,7 +580,7 @@ def run_finalizer_pass(
                 blocked.append((cand.model_id, cand.cycle_time))
         except Exception as exc:
             logger.error(
-                "finalizer_candidate_failed: model=%s cycle_time=%s error=%s",
+                "bookkeeping_candidate_failed: model=%s cycle_time=%s error=%s",
                 cand.model_id,
                 cand.cycle_time.isoformat(),
                 exc,
@@ -507,14 +590,12 @@ def run_finalizer_pass(
     # 2. Process fresh candidates
     for cand in fresh_cands:
         try:
-            ok = finalize_cycle_eol(
+            ok = finalize_cycle_bookkeeping(
                 engine,
                 cand.model_id,
                 cand.cycle_time,
                 is_recovery=False,
                 serving_start=serving_start,
-                base_bucket=base_bucket,
-                timeout_seconds=timeout_seconds,
                 now=now_utc,
             )
             if ok:
@@ -524,7 +605,7 @@ def run_finalizer_pass(
                 blocked.append((cand.model_id, cand.cycle_time))
         except Exception as exc:
             logger.error(
-                "finalizer_candidate_failed: model=%s cycle_time=%s error=%s",
+                "bookkeeping_candidate_failed: model=%s cycle_time=%s error=%s",
                 cand.model_id,
                 cand.cycle_time.isoformat(),
                 exc,

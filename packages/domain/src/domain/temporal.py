@@ -7,6 +7,7 @@ Data Lifecycle V2, and their source-coupled companion variables.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from domain.horizon import CANONICAL_LEAD_CADENCE_HOURS
@@ -48,6 +49,50 @@ def is_precipitation_companion(variable: str | None) -> bool:
     if variable is None:
         return False
     return variable.strip().lower() in PRECIPITATION_COMPANION_VARIABLES
+
+
+@dataclass(frozen=True)
+class VariableTemporalMetadata:
+    """Independent temporal semantics metadata for one interval variable (I19).
+
+    ``interval_width_hours`` (W) and ``reset_period_hours`` (R) are deliberately
+    independent registered values. Reconstruction and predecessor-hold logic must
+    be expressed only in terms of (W, R); the historically coincident pairing
+    ``W == R / 2`` (3h interval in a 6h reset period) is a configuration fact,
+    never a formula assumption.
+    """
+
+    interval_width_hours: int
+    reset_period_hours: int
+
+
+#: Authoritative temporal metadata per interval variable. New interval products
+#: must register here; unregistered variables have no reset/reconstruction semantics.
+VARIABLE_TEMPORAL_METADATA: dict[str, VariableTemporalMetadata] = {
+    "precipitation_amount_3h": VariableTemporalMetadata(
+        interval_width_hours=3, reset_period_hours=6
+    ),
+    "cloud_cover_3h": VariableTemporalMetadata(
+        interval_width_hours=3, reset_period_hours=6
+    ),
+}
+
+
+def get_variable_temporal_metadata(variable: str) -> VariableTemporalMetadata:
+    """Return the registered temporal metadata for an interval variable.
+
+    Raises:
+        ValueError: If the variable is unknown or carries no interval semantics.
+    """
+    if variable is None:
+        raise ValueError("variable must not be None")
+    key = variable.strip().lower()
+    if key not in VARIABLE_TEMPORAL_METADATA:
+        raise ValueError(
+            f"No temporal metadata registered for {variable!r}; registered: "
+            f"{sorted(VARIABLE_TEMPORAL_METADATA)}"
+        )
+    return VARIABLE_TEMPORAL_METADATA[key]
 
 
 def serving_start_valid_time(
@@ -101,3 +146,33 @@ def serving_start_valid_time(
         0,
         tzinfo=timezone.utc,
     )
+
+
+def is_valid_time_protected(
+    valid_time: datetime,
+    now_utc: datetime,
+    *,
+    cadence_hours: int = CANONICAL_LEAD_CADENCE_HOURS,
+) -> bool:
+    """Return whether a valid_time is inside the active serving window (I3/I20).
+
+    This is the membership test of the authoritative
+    ``protected_valid_times(model, now)`` primitive:
+
+        protected = {vt on the model horizon grid : vt >= serving_start_valid_time(now)}
+
+    UI visibility, API serving eligibility, and GC canonical protection must all
+    consume this primitive (directly or via the serving boundary it exposes);
+    none of them may compute an independent boundary.
+
+    The boundary is a deterministic, monotonically non-decreasing function of
+    UTC, so an exit from the protected set is permanent — this is what makes
+    window-exit GC possible without any replacement publication (architecture
+    doc §7.5 class B).
+    """
+    if valid_time.tzinfo is None:
+        raise ValueError(
+            f"valid_time must be timezone-aware, got naive datetime: {valid_time!r}"
+        )
+    vt_utc = valid_time.astimezone(timezone.utc)
+    return vt_utc >= serving_start_valid_time(now_utc, cadence_hours)

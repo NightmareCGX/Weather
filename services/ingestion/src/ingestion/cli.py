@@ -714,6 +714,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=50,
         help="Maximum number of cycles to process per sweeper pass (default 50).",
     )
+    gc.add_argument(
+        "--inventory",
+        action="store_true",
+        help="Run one store-catalog orphan inventory pass (architecture doc section 9) "
+        "and exit. Reports physical cycle stores without catalog identity; "
+        "orphans beyond the recoverability frontier are marked reapable.",
+    )
+    gc.add_argument(
+        "--inventory-reap",
+        action="store_true",
+        help="With --inventory: delete orphan store prefixes beyond the recoverability "
+        "frontier under an exclusive store gate (fail-closed sanity guards).",
+    )
+    gc.add_argument(
+        "--inventory-store-root",
+        default=None,
+        help="Store root for --inventory (default 's3://<--bucket>').",
+    )
 
     reclamation = subparsers.add_parser(
         "reclamation",
@@ -1078,13 +1096,14 @@ def _run_realtime(args: argparse.Namespace) -> int:
 def _run_gc(args: argparse.Namespace) -> int:
     """Run the garbage collection (GC) and storage reclamation engine (Phase 6D).
 
-    Supported modes:
+    Supported modes (Lifecycle V3 converged model: physical deletion happens
+    exclusively through the reclamation planner + worker at
+    (variable, valid_time) granularity; this command runs lifecycle bookkeeping
+    and performs zero physical storage operations):
     * ``--sweep-metadata``: Execute M3 14-day detailed metadata retention sweeper pass.
-    * ``--once --dry-run``: Plan and log diagnostics without acquiring exclusive
-      locks or mutating S3/PostgreSQL.
-    * ``--once``: Acquire GC leadership, execute one reconciliation/deletion pass,
-      and exit.
-    * Daemon (default): Acquire GC leadership and loop: reconcile -> sleep -> reconcile.
+    * ``--once --dry-run``: Plan and log diagnostics without mutating PostgreSQL.
+    * ``--once``: Acquire GC leadership, execute one bookkeeping pass, and exit.
+    * Daemon (default): Acquire GC leadership and loop: bookkeeping -> sleep -> bookkeeping.
 
     Args:
         args: Parsed CLI arguments.
@@ -1096,7 +1115,32 @@ def _run_gc(args: argparse.Namespace) -> int:
     import time
     from ingestion.core.db import engine as catalog_engine
     from ingestion.gc.leadership import GcLeadership
-    from ingestion.gc.finalizer import run_finalizer_pass
+    from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
+
+    if getattr(args, "inventory", False):
+        from ingestion.gc.inventory import run_orphan_inventory
+
+        bucket = str(args.bucket)
+        store_root = getattr(args, "inventory_store_root", None) or f"s3://{bucket}"
+        inv = run_orphan_inventory(
+            catalog_engine,
+            store_root=store_root,
+            reap=bool(args.inventory_reap),
+            timeout_seconds=float(args.lock_timeout_seconds),
+        )
+        print(
+            f"Orphan Inventory: stores={inv.discovered_stores} "
+            f"cataloged_cycles={inv.cataloged_cycles} "
+            f"orphans={len(inv.orphan_stores)} "
+            f"beyond_frontier={sum(1 for o in inv.orphan_stores if o.beyond_frontier)} "
+            f"reaped={len(inv.reaped_stores)} blocked={len(inv.reap_blocked)}"
+        )
+        for orphan in inv.orphan_stores:
+            flag = "REAPABLE" if orphan.beyond_frontier else "recoverable-frontier"
+            print(f"  ORPHAN [{flag}] {orphan.store_path} cycle={orphan.cycle_time.isoformat()}")
+        for path in inv.reap_blocked:
+            print(f"  REAP-BLOCKED {path}")
+        return 0
 
     if getattr(args, "sweep_metadata", False):
         from ingestion.gc.sweeper import run_metadata_sweeper_pass
@@ -1118,16 +1162,12 @@ def _run_gc(args: argparse.Namespace) -> int:
 
     dry_run = bool(args.dry_run)
     interval = max(1.0, float(args.interval_seconds))
-    bucket = str(args.bucket)
-    timeout_seconds = float(args.lock_timeout_seconds)
 
     if dry_run:
         # Dry-run performs zero mutations and does not acquire destructive leadership
-        run_finalizer_pass(
+        run_lifecycle_bookkeeping_pass(
             catalog_engine,
             dry_run=True,
-            base_bucket=bucket,
-            timeout_seconds=timeout_seconds,
         )
         return 0
 
@@ -1160,12 +1200,10 @@ def _run_gc(args: argparse.Namespace) -> int:
                     logger.error("Failed to reacquire GC leadership; exiting.")
                     return 1
 
-            run_finalizer_pass(
+            run_lifecycle_bookkeeping_pass(
                 catalog_engine,
                 dry_run=False,
-                base_bucket=bucket,
-                timeout_seconds=timeout_seconds,
-            )
+            )  # zero physical storage operations (V3 bookkeeping)
 
             if args.once or stop_requested:
                 break

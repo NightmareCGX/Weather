@@ -410,7 +410,16 @@ def build_point_forecast(
                 for p_cycle, p_lead in pairs:
                     if p_lead > 0:
                         p_meta = _open_cycle(p_cycle)
-                        if p_meta is not None and p_lead in p_meta.lead_times:
+                        if (
+                            p_meta is not None
+                            and p_lead in p_meta.lead_times
+                            # The fallback store must carry EVERY requested
+                            # precipitation-family variable (amount + companions
+                            # are strictly same-source, R4): sampling a missing
+                            # variable would raise and 404 the whole request
+                            # instead of degrading gracefully (R8).
+                            and all(pv in p_meta.var_names for pv in precip_vars)
+                        ):
                             p_store = cycle_store_paths.get(p_cycle)
                             if p_store is not None:
                                 precip_source = (p_store, p_lead)
@@ -422,7 +431,11 @@ def build_point_forecast(
                 for c_cycle, c_lead in pairs:
                     if c_lead > 0:
                         c_meta = _open_cycle(c_cycle)
-                        if c_meta is not None and c_lead in c_meta.lead_times:
+                        if (
+                            c_meta is not None
+                            and c_lead in c_meta.lead_times
+                            and "cloud_cover_3h" in c_meta.var_names
+                        ):
                             c_store = cycle_store_paths.get(c_cycle)
                             if c_store is not None:
                                 cloud_source = (c_store, c_lead)
@@ -459,14 +472,19 @@ def build_point_forecast(
         if lead == 0 and precip_vars:
             if precip_source is not None:
                 p_store, p_lead = precip_source
-                p_vals = gated_point_interpolations(
-                    p_store,
-                    var_codes=precip_vars,
-                    lead=p_lead,
-                    latitude=location.latitude,
-                    longitude=location.longitude,
-                    precip_history=precip_history,
-                )
+                try:
+                    p_vals = gated_point_interpolations(
+                        p_store,
+                        var_codes=precip_vars,
+                        lead=p_lead,
+                        latitude=location.latitude,
+                        longitude=location.longitude,
+                        precip_history=precip_history,
+                    )
+                except HTTPException:
+                    # R8 graceful null: a failing *fallback* read must not 404
+                    # the whole point forecast; the interval family degrades.
+                    p_vals = None
                 if p_vals is not None:
                     for v in precip_vars:
                         values_by_var[v] = p_vals.get(v)
@@ -491,13 +509,16 @@ def build_point_forecast(
         if lead == 0 and "cloud_cover_3h" in var_codes:
             if cloud_source is not None:
                 c_store, c_lead = cloud_source
-                c_vals = gated_point_interpolations(
-                    c_store,
-                    var_codes=("cloud_cover_3h",),
-                    lead=c_lead,
-                    latitude=location.latitude,
-                    longitude=location.longitude,
-                )
+                try:
+                    c_vals = gated_point_interpolations(
+                        c_store,
+                        var_codes=("cloud_cover_3h",),
+                        lead=c_lead,
+                        latitude=location.latitude,
+                        longitude=location.longitude,
+                    )
+                except HTTPException:
+                    c_vals = None
                 if c_vals is not None and "cloud_cover_3h" in c_vals:
                     values_by_var["cloud_cover_3h"] = c_vals["cloud_cover_3h"]
                 else:

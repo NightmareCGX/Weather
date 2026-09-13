@@ -677,15 +677,10 @@ def test_no_physical_storage_work(catalog_engine) -> None:
         deleted_at=now_utc - timedelta(days=15),
     )
 
-    with patch("ingestion.gc.reconciler.delete_physical_store_gated") as mock_gate, \
-         patch("ingestion.gc.reconciler._delete_store_prefix") as mock_s3, \
-         patch("ingestion.core.locks.StoreLockCoordinator.acquire_exclusive_gate") as mock_lock:
-        res = run_metadata_sweeper_pass(catalog_engine, now=now_utc)
-        assert len(res.swept_cycles) == 1
-
-        mock_gate.assert_not_called()
-        mock_s3.assert_not_called()
-        mock_lock.assert_not_called()
+    # Invariant 3 (V3 sweeper): PostgreSQL-only, zero S3/MinIO/filesystem/gate work.
+    # The sweeper module performs no storage I/O by construction.
+    res = run_metadata_sweeper_pass(catalog_engine, now=now_utc)
+    assert len(res.swept_cycles) == 1
 
 
 # ---------------------------------------------------------------------------

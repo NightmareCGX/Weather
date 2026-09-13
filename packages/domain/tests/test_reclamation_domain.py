@@ -160,14 +160,26 @@ def test_predecessor_rules():
     assert is_predecessor_dependent_lead(9) is False
     assert is_predecessor_dependent_lead(21) is False
 
-    # Predecessor leads
+    # Predecessor leads (defaults: W=3, R=6 — the historical GFS/GEFS configuration)
     assert get_predecessor_lead(6) == 3
     assert get_predecessor_lead(24) == 21
     assert get_predecessor_lead(30) == 27
     assert get_predecessor_lead(36) == 33
 
-    with pytest.raises(ValueError, match="not a 6-hour reset lead"):
+    with pytest.raises(ValueError, match="not a reset lead for R=6"):
         get_predecessor_lead(3)
+
+    # (W, R) generalization (architecture doc I19): predecessor is L - W and the
+    # reset-lead gate is L % R == 0, both from per-variable metadata.
+    assert is_predecessor_dependent_lead(12, reset_period_hours=12) is True
+    assert is_predecessor_dependent_lead(6, reset_period_hours=12) is False
+    assert get_predecessor_lead(12, interval_width_hours=3, reset_period_hours=6) == 9
+    assert get_predecessor_lead(12, interval_width_hours=3, reset_period_hours=12) == 9
+    assert get_predecessor_lead(12, interval_width_hours=12, reset_period_hours=12) == 0
+    with pytest.raises(ValueError, match="must not exceed reset period"):
+        get_predecessor_lead(12, interval_width_hours=6, reset_period_hours=3)
+    with pytest.raises(ValueError, match="must be positive"):
+        get_predecessor_lead(12, interval_width_hours=0, reset_period_hours=6)
 
     # Predecessor variables
     assert is_predecessor_variable("precipitation_amount_3h") is True

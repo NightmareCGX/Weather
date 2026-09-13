@@ -726,7 +726,16 @@ def test_43_44_non_destructive_defaults_and_quarantine_requeue(catalog_engine, t
 # ===========================================================================
 # 30. V2 whole-cycle and V3 granular mutation serialize on store gate
 # ===========================================================================
-def test_30_v2_whole_cycle_and_v3_granular_serialization_aborts_on_whole_cycle_claim(catalog_engine, tmp_path):
+def test_30_claimed_cycle_is_serving_fence_only_granular_reclamation_proceeds(
+    catalog_engine, tmp_path
+):
+    """V3: a retirement claim (deletion_started_at) is a serving & mutation fence.
+
+    It must NOT block granular reclamation: the resolver stops selecting the
+    cycle, the planner treats its units as unprotected, and the worker deletes
+    them. There is no whole-cycle GC to coordinate against (architecture doc
+    section 7.2).
+    """
     c0 = _dt(2026, 9, 2, 0)
     store_dir = tmp_path / "c0"
     r0 = _seed_run(catalog_engine, "gfs", c0, "ready", store_dir)
@@ -734,10 +743,8 @@ def test_30_v2_whole_cycle_and_v3_granular_serialization_aborts_on_whole_cycle_c
 
     now = _dt(2026, 9, 2, 12)
     with Session(catalog_engine) as session:
-        # Enqueue target
-        plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
-
-        # Whole-cycle V2 GC claims cycle
+        # Claim the cycle BEFORE planning: the serving fence makes all of its
+        # units unprotected, so the planner enqueues them directly.
         lc = ForecastCycleLifecycleRecord(
             model_id="gfs",
             cycle_time=c0,
@@ -748,13 +755,14 @@ def test_30_v2_whole_cycle_and_v3_granular_serialization_aborts_on_whole_cycle_c
         session.add(lc)
         session.commit()
 
-        # V3 granular worker runs: re-reads lifecycle under gate, detects whole-cycle GC claim,
-        # aborts granular deletion, and reverts target to 'queued'!
+        plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        assert plan.reclaimable_shards > 0
+
+        # V3 granular worker deletes the claimed cycle's units normally.
         w_res = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
-        assert w_res.deleted_count == 0
+        assert w_res.deleted_count > 0
         rec = session.execute(select(ReclamationQueueRecord)).scalars().first()
-        assert rec.status == RECLAMATION_STATUS_QUEUED
-        assert "cycle_claimed_by_whole_cycle_gc" in rec.last_error
+        assert rec.status == RECLAMATION_STATUS_DELETED
 
 
 # ===========================================================================

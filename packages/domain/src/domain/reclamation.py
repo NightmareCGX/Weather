@@ -226,20 +226,55 @@ def make_region_marker_physical_key(
     return f"{clean_store}/{rel}"
 
 
-def is_predecessor_dependent_lead(lead_time_hours: int) -> bool:
-    """Return True if lead_time_hours is a 6-hour reset lead requiring predecessor L - 3."""
-    return lead_time_hours > 0 and lead_time_hours % 6 == 0
+def is_predecessor_dependent_lead(
+    lead_time_hours: int,
+    *,
+    reset_period_hours: int = 6,
+) -> bool:
+    """Return True if lead L is a variable-reset lead requiring a predecessor hold.
+
+    Reset leads are ``L > 0 and L % R == 0`` with ``R = variable.reset_period_hours``.
+    The reset period is per-variable metadata (architecture doc I19) — it is NOT
+    the model cycle cadence and must never be hardcoded to 6 in new call sites.
+    """
+    return lead_time_hours > 0 and lead_time_hours % reset_period_hours == 0
 
 
-def get_predecessor_lead(lead_time_hours: int) -> int:
-    """Return the required predecessor lead time for a 6-hour reset lead.
+def get_predecessor_lead(
+    lead_time_hours: int,
+    *,
+    interval_width_hours: int = 3,
+    reset_period_hours: int = 6,
+) -> int:
+    """Return the required predecessor lead ``L - W`` for a reset lead.
+
+    ``W = variable.interval_width_hours``: at a reset lead L the upstream
+    quantity is running-since-reset over R hours, so the trailing W-width
+    interval is reconstructed from the samples at L and L - W. The historically
+    hardcoded ``L - 3`` was the W=3 special case; assuming ``W == R / 2`` in
+    generic logic is forbidden (architecture doc I19).
 
     Raises:
-        ValueError: If lead_time_hours is not a 6-hour reset lead.
+        ValueError: If lead_time_hours is not a reset lead for the given R, or
+            the metadata combination is invalid (W <= 0, R <= 0, or W > R).
     """
-    if not is_predecessor_dependent_lead(lead_time_hours):
-        raise ValueError(f"Lead {lead_time_hours} is not a 6-hour reset lead.")
-    return lead_time_hours - 3
+    if reset_period_hours <= 0 or interval_width_hours <= 0:
+        raise ValueError(
+            "reset_period_hours and interval_width_hours must be positive, got "
+            f"W={interval_width_hours}, R={reset_period_hours}"
+        )
+    if interval_width_hours > reset_period_hours:
+        raise ValueError(
+            f"interval width W={interval_width_hours} must not exceed reset "
+            f"period R={reset_period_hours}"
+        )
+    if not is_predecessor_dependent_lead(
+        lead_time_hours, reset_period_hours=reset_period_hours
+    ):
+        raise ValueError(
+            f"Lead {lead_time_hours} is not a reset lead for R={reset_period_hours}."
+        )
+    return lead_time_hours - interval_width_hours
 
 
 def is_predecessor_variable(variable: str | None) -> bool:

@@ -21,7 +21,7 @@ from domain.coverage import (
     get_expected_members,
     is_lead_servable,
 )
-from domain.temporal import serving_start_valid_time
+from domain.temporal import requires_lead0_display_fallback, serving_start_valid_time
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -384,6 +384,11 @@ def build_forecast_availability(
             ):
                 servable_leads = []
                 rich_leads = []
+                # Interval variables carry no valid data at lead 0 (R3/R10): the
+                # store holds NaN there and serving falls back to a positive
+                # lead. The legacy cycle-centric view must not advertise
+                # interval lead 0 as servable either.
+                interval_var = requires_lead0_display_fallback(variable_code)
                 for lead in sorted(cycle_info.leads):
                     if model_acc.is_ensemble:
                         avail_count = emp_counts.get((cycle_info.run_id, lead), 0)
@@ -391,6 +396,8 @@ def build_forecast_availability(
                         avail_count = 1
                     ratio = compute_coverage_ratio(avail_count, expected_members)
                     servable = is_lead_servable(avail_count, expected_members)
+                    if servable and interval_var and lead == 0:
+                        servable = False
                     if servable:
                         servable_leads.append(lead)
                     rich_leads.append(

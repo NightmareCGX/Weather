@@ -563,3 +563,91 @@ def test_ensemble_and_probability_cache_key_reflects_fallback():
     assert len(key_ens) == 9 + 64
     assert key_prob.startswith("probability:")
     assert len(key_prob) == 12 + 64
+
+
+def test_point_forecast_fallback_store_missing_variable_skips_candidate(tmp_path):
+    """R8 regression guard (architecture doc section 11.5):
+
+    A fallback candidate store that exists with a positive lead but does NOT
+    carry the precipitation variables must be SKIPPED (var_names check) instead
+    of being selected and 404-ing the whole /v1/points request from inside the
+    read. Temperature still serves from the anchor; the interval family
+    degrades to null because no usable fallback exists.
+    """
+    db_path = f"sqlite:///{tmp_path}/fallback_missing_var.db"
+    engine = create_engine(db_path, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine, tables=[
+        ForecastCenter.__table__, Model.__table__, ModelVersion.__table__, ModelRun.__table__,
+        EnsembleMember.__table__, EnsembleMemberProduct.__table__,
+        ForecastVariable.__table__, ForecastGrid.__table__, ForecastProduct.__table__,
+        ForecastCycleLifecycle.__table__,
+    ])
+
+    c_18z = _dt(2026, 9, 4, 18)
+    c_00z = _dt(2026, 9, 5, 0)
+
+    # 18Z store: has lead 6 (a positive-lead fallback candidate for VT 00Z) but
+    # carries ONLY temperature_2m — no precipitation family variables at all.
+    store_18z = str(tmp_path / "gfs_18z_notemp.zarr")
+    lat = np.asarray(LATITUDES, dtype=float)
+    lon = np.asarray(LONGITUDES, dtype=float)
+    lg, lat_g, lon_g = np.meshgrid(np.asarray([0, 6], dtype=float), lat, lon, indexing="ij")
+    ds_18z = xr.Dataset(
+        data_vars={
+            "temperature_2m": (("lead_time_hours", "latitude", "longitude"), np.full_like(lg, 10.0, dtype=np.float32)),
+        },
+        coords={
+            "lead_time_hours": [0, 6],
+            "latitude": lat,
+            "longitude": lon,
+            "time": np.datetime64(c_18z.strftime("%Y-%m-%dT%H:%M:%S")),
+        },
+        attrs={"cycle_time": c_18z.isoformat(), "model_id": "gfs"},
+    )
+    write_dataset(ds_18z, store_18z)
+
+    # 00Z store: anchor at lead 0 with the full variable set (interval NaN at lead 0)
+    store_00z = str(tmp_path / "gfs_00z_full.zarr")
+    ds_00z = _build_test_dataset(
+        leads=[0],
+        cycle_time=c_00z,
+        temperature_val=15.0,
+        precip_val=None,
+        cloud_cover_val=None,
+    )
+    write_dataset(ds_00z, store_00z)
+
+    with Session(engine) as session:
+        session.add(ForecastCenter(id="c_noaa", center_id="noaa", name="NOAA", country="US", created_at=c_18z))
+        session.add(Model(id="m_gfs", model_id="gfs", name="GFS", center_id="noaa", is_ensemble=False, resolution_km=25.0, created_at=c_18z))
+        session.add(ModelVersion(id="v_gfs", model_id="gfs", version_string="v1.0", created_at=c_18z))
+        session.add(ForecastGrid(id="g_glob", grid_code="global_025deg", name="Global", resolution_km=25.0))
+        session.add(ForecastVariable(id="v_t2m", variable_code="temperature_2m", name="2m Temperature", unit="°C"))
+        session.add(ForecastVariable(id="v_tp", variable_code="precipitation_amount_3h", name="3h Precip", unit="mm"))
+        session.add(ForecastVariable(id="v_crain", variable_code="crain", name="Rain Flag", unit="flag"))
+        session.add(ModelRun(id="run_18z", model_version_id="v_gfs", cycle_time=c_18z, status="ready", zarr_store_path=store_18z, created_at=c_18z))
+        session.add(ModelRun(id="run_00z", model_version_id="v_gfs", cycle_time=c_00z, status="ready", zarr_store_path=store_00z, created_at=c_00z))
+
+        session.add(ForecastProduct(id="p_18z_t2m_0", run_id="run_18z", variable_id="temperature_2m", grid_id="global_025deg", product_type="surface", lead_time_hours=0))
+        session.add(ForecastProduct(id="p_18z_t2m_6", run_id="run_18z", variable_id="temperature_2m", grid_id="global_025deg", product_type="surface", lead_time_hours=6))
+        for v_code in ("temperature_2m", "precipitation_amount_3h", "crain"):
+            session.add(ForecastProduct(id=f"p_00z_{v_code}_0", run_id="run_00z", variable_id=v_code, grid_id="global_025deg", product_type="surface", lead_time_hours=0))
+        session.commit()
+
+        loc = ResolvedLocation(latitude=LAT_START + 0.125, longitude=LON_START + 0.125, elevation_m=None, resolved_via="coordinates")
+        data = build_point_forecast(
+            session,
+            location=loc,
+            model="gfs",
+            variables=["temperature_2m", "precipitation_amount_3h", "crain"],
+            units="metric",
+            start_lead_time_hours=None,
+            end_lead_time_hours=None,
+        )
+
+    # No exception: the request succeeds and degrades gracefully.
+    assert len(data.forecasts) == 1
+    f0 = data.forecasts[0]
+    assert getattr(f0, "temperature_2m") == pytest.approx(15.0, abs=1e-3)
+    assert getattr(f0, "precipitation_amount_3h") is None
+    assert getattr(f0, "crain") is None
