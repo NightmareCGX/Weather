@@ -103,7 +103,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: '0.12.13'
           enable-cache: true
@@ -172,7 +172,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: '0.12.13'
           enable-cache: true
@@ -274,7 +274,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: '0.12.13'
           enable-cache: true
@@ -688,7 +688,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: '0.12.13'
           enable-cache: true
@@ -740,7 +740,7 @@ jobs:
           cache: npm
           cache-dependency-path: services/frontend/package-lock.json
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: '0.12.13'
           enable-cache: true
