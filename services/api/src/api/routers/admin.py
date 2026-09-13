@@ -9,7 +9,9 @@ Redis, and object storage). The router is thin (ENGINEERING_CONTRACT section
 ``disconnected``.
 """
 
+import asyncio
 import logging
+from dataclasses import asdict
 from typing import Any
 
 import redis as redis_lib
@@ -68,6 +70,25 @@ def get_system_health(response: Response) -> HealthCheckEnvelope:
 def _status(connected: bool) -> str:
     """Map a probe result to the documented per-dependency status string."""
     return CONNECTED if connected else DISCONNECTED
+
+
+@router.post(
+    "/admin/prewarm-vector",
+    summary="Run one wind vector-field cache prewarm pass",
+)
+async def trigger_vector_prewarm(response: Response) -> dict[str, Any]:
+    """Run one bounded prewarm pass synchronously and report its counters.
+
+    Ops/debug switch for the background prewarm loop: computes at most
+    ``API_VECTOR_PREWARM_MAX_COMPUTES_PER_PASS`` cache-missing vector fields
+    (throttled) and returns the pass counters. Cache-warm passes return
+    immediately.
+    """
+    from api.services.vector_prewarm import run_prewarm_pass
+
+    response.headers["Cache-Control"] = CACHE_CONTROL_HEALTH
+    result = await asyncio.to_thread(run_prewarm_pass)
+    return {"data": asdict(result)}
 
 
 def _app_version() -> str:

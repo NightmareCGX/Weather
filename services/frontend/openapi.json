@@ -1668,6 +1668,27 @@
         }
       }
     },
+    "/v1/admin/prewarm-vector": {
+      "post": {
+        "summary": "Run one wind vector-field cache prewarm pass",
+        "description": "Run one bounded prewarm pass synchronously and report its counters.\n\nOps/debug switch for the background prewarm loop: computes at most\n``API_VECTOR_PREWARM_MAX_COMPUTES_PER_PASS`` cache-missing vector fields\n(throttled) and returns the pass counters. Cache-warm passes return\nimmediately.",
+        "operationId": "trigger_vector_prewarm_v1_admin_prewarm_vector_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Trigger Vector Prewarm V1 Admin Prewarm Vector Post"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/metrics": {
       "get": {
         "summary": "Get Prometheus metrics for the API serving layer",
