@@ -221,7 +221,6 @@ def test_s3_instrument_records_success_and_failure():
     import asyncio
 
     from ingestion.core.s3 import IngestionS3FileSystem
-    from ingestion.monitoring.storage import STORAGE_COLLECTOR
 
     fs = object.__new__(IngestionS3FileSystem)
 
