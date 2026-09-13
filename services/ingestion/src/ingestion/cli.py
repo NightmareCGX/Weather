@@ -654,6 +654,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum concurrent finalization marker GET operations per wave (overrides WEATHER_INGEST_MARKER_GET_CONCURRENCY).",
     )
+    realtime.add_argument(
+        "--metrics-host",
+        type=str,
+        default="127.0.0.1",
+        help="Bind address for the in-process Prometheus metrics endpoint (default: 127.0.0.1; use 0.0.0.0 only so a local Docker-based Prometheus can reach it).",
+    )
+    realtime.add_argument(
+        "--metrics-port",
+        type=int,
+        default=None,
+        help="Serve this process's live pipeline metrics (stage latencies, throughput, storage operations) on the given port, e.g. 9113. Disabled by default.",
+    )
 
     gc = subparsers.add_parser(
         "gc",
@@ -804,14 +816,31 @@ def _build_parser() -> argparse.ArgumentParser:
 
     metrics_parser = subparsers.add_parser(
         "metrics",
-        help="export Prometheus metrics in text format",
-        description="Generates Prometheus exposition text format (version 0.0.4) for scraping.",
+        help="run the Prometheus metrics exporter (scrape-time collection)",
+        description=(
+            "Runs the ingestion Prometheus exporter. On every HTTP scrape the "
+            "platform collectors re-execute (probe-style, fail-open per "
+            "collector) and a fresh exposition is returned. Binds 127.0.0.1 by "
+            "default; use --host 0.0.0.0 only so a local Docker-based "
+            "Prometheus can reach this host exporter."
+        ),
+    )
+    metrics_parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1; keep metrics off public interfaces)",
     )
     metrics_parser.add_argument(
         "--port",
         type=int,
-        default=None,
-        help="Optional HTTP port to run Prometheus scraper server daemon",
+        default=9112,
+        help="HTTP port for the Prometheus scraper server daemon (default: 9112)",
+    )
+    metrics_parser.add_argument(
+        "--print",
+        action="store_true",
+        help="collect once, print the exposition to stdout, and exit without starting the HTTP server",
     )
 
     return parser
@@ -1026,6 +1055,23 @@ def _run_realtime(args: argparse.Namespace) -> int:
                 signal.signal(sig, _handle_signal)
             except (ValueError, OSError):  # not the main thread / unsupported
                 pass
+
+    metrics_port = getattr(args, "metrics_port", None)
+    if metrics_port:
+        # Serve THIS process's live pipeline counters (stage latencies,
+        # throughput, storage operations) from a background HTTP thread.
+        # The registry is already maintained by the wave runner; the server
+        # adds no probing and no persistent state.
+        import threading
+
+        from ingestion.monitoring.exporter import serve_live_registry
+
+        threading.Thread(
+            target=serve_live_registry,
+            kwargs={"host": getattr(args, "metrics_host", "127.0.0.1"), "port": metrics_port},
+            daemon=True,
+        ).start()
+
     return scheduler.run(once=args.once, dry_run=args.dry_run)
 
 
@@ -1419,59 +1465,13 @@ def _run_alert_check(args: argparse.Namespace) -> int:
 
 
 def _run_metrics(args: argparse.Namespace) -> int:
-    from ingestion.core.config import settings
-    from ingestion.core.db import engine
-    from ingestion.monitoring import (
-        INGESTION_COLLECTOR,
-        LifecycleHealthCollector,
-        PostgresHealthCollector,
-        REGISTRY,
-        RESOURCE_COLLECTOR,
-        StorageHealthCollector,
-    )
+    from ingestion.monitoring.exporter import _collect_and_render, serve_metrics
 
-    RESOURCE_COLLECTOR.collect_and_export()
-    PostgresHealthCollector(engine).collect()
-    StorageHealthCollector(
-        endpoint_url=getattr(settings, "MINIO_ENDPOINT", "http://localhost:9000"),
-        bucket=getattr(settings, "MINIO_BUCKET_NAME", "weather-data"),
-        access_key=getattr(settings, "MINIO_ACCESS_KEY", "minio_admin"),
-        secret_key=getattr(settings, "MINIO_SECRET_KEY", "minio_password"),
-    ).probe()
-    LifecycleHealthCollector(engine).collect()
-    INGESTION_COLLECTOR.evaluate_lag("gfs")
-    INGESTION_COLLECTOR.evaluate_lag("gefs")
-
-    port = getattr(args, "port", None)
-    if port is not None:
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
-        class MetricsHandler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                if self.path in ("/metrics", "/"):
-                    content = REGISTRY.generate_latest().encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain; version=0.0.4")
-                    self.send_header("Content-Length", str(len(content)))
-                    self.end_headers()
-                    self.wfile.write(content)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def log_message(self, format: str, *args: Any) -> None:
-                pass
-
-        server = HTTPServer(("0.0.0.0", port), MetricsHandler)
-        print(f"Prometheus exporter running on http://0.0.0.0:{port}/metrics (Press Ctrl+C to stop)")
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            server.server_close()
+    if args.print:
+        print(_collect_and_render().decode("utf-8"), end="")
         return 0
 
-    print(REGISTRY.generate_latest(), end="")
-    return 0
+    return serve_metrics(host=args.host, port=args.port)
 
 
 def main(argv: list[str] | None = None) -> int:

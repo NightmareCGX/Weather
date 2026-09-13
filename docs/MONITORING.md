@@ -26,9 +26,9 @@ The monitoring system provides continuous, non-intrusive observability across th
 ┌──────────────────────────────┐       ┌──────────────────────────────────────┐
 │  OPERATOR STATUS CLI         │       │    PROMETHEUS SCRAPING / EXPORTER    │
 │  • weather-ingest status     │       │  • curl http://<API>/v1/metrics      │
-│  • weather-ingest diagnostics│       │  • weather-ingest metrics [--port P] │
-│  • weather-ingest audit      │       └──────────────────┬───────────────────┘
-│  • weather-ingest alert-check│                          │
+│  • weather-ingest diagnostics│       │  • weather-ingest metrics            │
+│  • weather-ingest audit      │       │    [--host H] [--port P] [--print]   │
+│  • weather-ingest alert-check│       └──────────────────┬───────────────────┘
 └──────────────┬───────────────┘                          ▼
                │                       ┌──────────────────────────────────────┐
                ▼                       │          GRAFANA DASHBOARD           │
@@ -59,11 +59,12 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
    - **Topology Rule:** The API process **never** claims to aggregate or proxy process-local ingestion worker metrics.
 
 2. **Ingestion Worker & Daemon Processes (`services/ingestion`):**
-   - **Endpoint:** `GET http://<INGESTION_HOST>:<PORT>/metrics` (via `weather-ingest metrics --port <PORT>`).
+   - **Endpoint:** `GET http://<INGESTION_HOST>:9112/metrics` (via `weather-ingest metrics`, which binds `127.0.0.1:9112` by default; see §3.5 for the `--host` / `--port` contract).
+   - **Collection Semantics:** The exporter is **probe-style**: every scrape re-executes the platform collectors and returns a fresh exposition. It holds no durable business state and may be stopped/started at any time without data loss (Prometheus gaps during downtime are expected and accepted).
    - **Exposed Data:** Ingestion pipeline stage counters, throughput, stuck warnings, model completeness, cycle durations, and multi-cycle baseline memory leak indicators. Also observes shared PostgreSQL capacity and MinIO latency.
    - **Multi-Worker Scrapes:** In deployments with multiple independent ingestion workers, Prometheus scrapes each worker instance endpoint directly (adding standard Prometheus `instance` labels).
 
-> **Deployment Boundary Note:** Prometheus server collection, Alertmanager routing, and Grafana hosting are external infrastructure components. The platform provides standard exposition endpoints and an authoritative dashboard specification (`monitoring/grafana/weather_platform_dashboard.json`), rather than bundling containerized Prometheus/Grafana servers.
+> **Deployment Boundary Note:** Prometheus server collection, Alertmanager routing, and Grafana hosting are external infrastructure components. The platform provides standard exposition endpoints and an authoritative dashboard specification (`monitoring/grafana/weather_platform_dashboard.json`), rather than bundling containerized Prometheus/Grafana servers. A ready-to-run **local** Prometheus/Grafana development stack is maintained as a sibling folder outside this repository (`monitoring-local/`, see §7); production deployments provide their own Prometheus/Grafana infrastructure.
 
 ---
 
@@ -161,6 +162,20 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
 | `weather_lifecycle_invariant_violations_count` | Gauge | Number of detected lifecycle state transition violations | - | Deep |
 | `weather_anti_resurrection_violations_count` | Gauge | Number of active or recreated runs under permanent tombstones | - | Deep |
 
+### 2.6 Exporter Self-Observability Metrics (Ingestion Exporter)
+
+Because the ingestion exporter collects at scrape time, its own health must be distinguishable from the platform values it reports. `metric = 0` means "the exporter answered and the system is at 0"; `weather_exporter_collector_success = 0` means "the exporter never managed to observe the system at all." These two states must never be conflated in dashboards.
+
+| Metric Name | Type | Description | Labels | Cost Class |
+| :--- | :--- | :--- | :--- | :--- |
+| `weather_exporter_collector_success` | Gauge | 1 = the named collector completed successfully during the latest scrape; 0 = it raised and was swallowed (fail-open) | `collector` (`resources`, `postgres`, `storage`, `lifecycle`, `ingestion` (lag + member completeness/servability)) | Fast |
+| `weather_exporter_collector_duration_seconds` | Gauge | Wall-clock duration of the latest collector execution; recorded for **both** successful and failed runs so degradation remains visible | `collector` | Fast |
+
+Guarantees per scrape:
+* Each collector runs independently — one failing collector never blocks its siblings.
+* A failing collector never terminates the exporter process nor turns `/metrics` into an HTTP 5xx response.
+* Collector failures are logged (warning level, with traceback) and surfaced via the two metrics above.
+
 ---
 
 ## 3. Operator CLI Reference
@@ -250,12 +265,30 @@ weather-ingest alert-check
 * `2`: One or more `CRITICAL` alerts active.
 
 ### 3.5 `weather-ingest metrics`
-Outputs the complete Prometheus metric catalog in standard exposition format (`text/plain; version=0.0.4`) to stdout:
+Runs the ingestion Prometheus exporter for the ingestion-side metrics catalog (§2.1–§2.6).
 ```bash
+# Daemon mode (default): binds http://127.0.0.1:9112/metrics
 weather-ingest metrics
-# Or start a lightweight standalone Prometheus HTTP scraper on a port:
-weather-ingest metrics --port 9100
+
+# Production-safe bind (the default; metrics never leave the loopback):
+weather-ingest metrics --host 127.0.0.1 --port 9112
+
+# Local development only: let a Docker-based Prometheus reach the host
+# exporter via host.docker.internal (requires a non-loopback bind):
+weather-ingest metrics --host 0.0.0.0 --port 9112
+
+# One-shot: collect once, print the exposition to stdout, and exit:
+weather-ingest metrics --print
 ```
+
+**Collection semantics (scrape-time, probe-style):**
+* Every `GET /metrics` (or `/`) **re-executes all platform collectors** and returns a fresh exposition. There is no startup snapshot and no background scheduler.
+* The HTTP server is multi-threaded (`ThreadingHTTPServer`); a slow collector probe does not block concurrent scrapes.
+* Per-collector execution is **fail-open**: each collector is independent, failures are logged, and each is self-reported via `weather_exporter_collector_success` / `weather_exporter_collector_duration_seconds` (§2.6). A failing collector never crashes the exporter and never yields an HTTP 5xx response.
+
+**Security contract:**
+* The bind address defaults to `127.0.0.1` (production-safe by default). Metrics endpoints must never be exposed to public networks.
+* `--host 0.0.0.0` (or any non-loopback bind) is a **local development concession** so that the containerized Prometheus of the local monitoring stack (§7) can reach the host exporter through `host.docker.internal`. Do not use non-loopback binds on production servers; production exporters bind the loopback and are consumed via SSH tunnel (§7.2).
 
 ---
 
@@ -329,3 +362,71 @@ Monitoring state is deliberately designed with clean, process-local restart sema
    Dispatches JSON payloads containing event type, severity, summary, value, threshold, and runbook URL. The webhook sink executes with a 2-second timeout and fails open on any connection or transport error.
 3. **In-Memory Event Ledger:**
    Stores the last 100 alert events for immediate inspection via `weather-ingest diagnostics`.
+
+---
+
+## 7. Local Prometheus / Grafana Monitoring Stack
+
+The platform's contract is to expose metrics; Prometheus performs collection and storage; Grafana performs visualization only. The data path is always:
+
+```text
+Weather Platform  -->  Prometheus  -->  Grafana  -->  Browser
+```
+
+Grafana never talks to the Weather Platform directly, and never reaches a remote server over SSH itself.
+
+### 7.1 Authoritative Port Table
+
+| Component | Host Port | Meaning |
+| :-------- | :-------- | :------ |
+| Weather API | `8000` | Actual API service (serves `GET /v1/metrics`) |
+| Ingestion metrics exporter | `9112` | Actual ingestion exporter (serves `GET /metrics`) |
+| Realtime daemon pipeline metrics | `9113` | Optional in-process metrics of `weather-ingest realtime --metrics-port 9113` (live stage latencies, throughput, storage operations) |
+| SSH forwarded remote API | `18000` | Local listener tunneling to remote `127.0.0.1:8000` |
+| SSH forwarded remote ingestion | `18112` | Local listener tunneling to remote `127.0.0.1:9112` |
+| Prometheus | `9090` | Local Prometheus UI/API |
+| Grafana | `3000` | Local Grafana UI |
+
+The former `19100` convention is deprecated and must not appear in new documentation or tooling. Note the distinction: `9112` is the port the exporter **listens on** (local and remote alike); `18112` is the local SSH-forward receiver for the remote `9112`.
+
+**Ingestion pipeline metrics topology:** stage-latency, throughput, storage-operation, and member-completeness counters are strictly **process-local to the ingestion worker that executes the waves**. The standalone exporter (9112) is a separate probe process and never holds them. To make pipeline metrics scrapable, the long-running `weather-ingest realtime` daemon can serve its own live registry via `--metrics-port` (bound to `--metrics-host`, loopback by default); Prometheus then scrapes this process directly (target `:9113`). Short-lived `weather-ingest ingest` batch processes cannot be scraped this way — their counters live and die with the process.
+
+### 7.2 Local vs Remote Mode
+
+Local development stack layout (maintained **outside this repository** as a sibling folder `monitoring-local/` next to the repo root; it is local tooling, not platform code):
+
+```text
+monitoring-local/
+├── docker-compose.yml        # Prometheus (7d retention, persistent volume) + Grafana
+├── prometheus.yml            # scrape_interval 15s; jobs weather-api / weather-ingestion
+├── .env.example              # Grafana admin credentials
+├── README.md
+└── grafana/provisioning/
+    ├── datasources/prometheus.yml    # datasource: http://prometheus:9090
+    └── dashboards/weather-platform.yml
+```
+
+The dashboard JSON (`monitoring/grafana/weather_platform_dashboard.json` in this repository) is **mounted directly** into the Grafana container — never copy a second version.
+
+**Local mode** (platform running on the same Windows/macOS/Linux host):
+
+```bash
+# Host exporter (non-loopback bind so the container can reach it):
+weather-ingest metrics --host 0.0.0.0 --port 9112
+
+# monitoring-local/
+docker compose up -d
+```
+
+Prometheus scrape targets: `host.docker.internal:8000/v1/metrics` and `host.docker.internal:9112/metrics`.
+
+**Remote mode** (platform on a remote server; metrics endpoints bound to remote loopback, never exposed publicly):
+
+```bash
+# On the local machine — tunnel remote loopback ports to local forward ports:
+ssh -N -L 18000:127.0.0.1:8000 -L 18112:127.0.0.1:9112 user@weather-server
+```
+
+Then switch the Prometheus scrape targets to `host.docker.internal:18000` and `host.docker.internal:18112` and restart the Prometheus container. Grafana, dashboards, and datasource configuration are unchanged — local vs remote mode differs **only** in scrape targets.
+
+**Dashboard hygiene rule:** `up{job="weather-api"}` / `up{job="weather-ingestion"}` (target health) and metric values must be displayed as distinct concepts. `up = 0` means Prometheus could not scrape the target at all; `metric = 0` means the exporter answered successfully with a real zero. Avoid `... or vector(0)` fallbacks in dashboard queries — they mask dead targets as healthy zeros.

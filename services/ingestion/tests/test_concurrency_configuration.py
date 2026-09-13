@@ -23,9 +23,17 @@ from ingestion.core.coordinator import RunCoordinator, WaveRegion
 from ingestion.core.wave_runner import _resolve_concurrency_plan
 
 
-def test_default_concurrency_resolution() -> None:
+def test_default_concurrency_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify clean code defaults when neither CLI nor ENV is supplied."""
-    settings = IngestionSettings(DB_POOL_SIZE=10)
+    # Isolate from developer-machine environment: the repository-root .env and
+    # any exported WEATHER_INGEST_*/CONCURRENCY variables must not leak into
+    # the "clean code default" assertions.
+    monkeypatch.delenv("WEATHER_INGEST_DOWNLOAD_CONCURRENCY", raising=False)
+    monkeypatch.delenv("WEATHER_INGEST_DECODE_CONCURRENCY", raising=False)
+    monkeypatch.delenv("WEATHER_INGEST_WRITE_CONCURRENCY", raising=False)
+    monkeypatch.delenv("WEATHER_INGEST_MARKER_PUT_CONCURRENCY", raising=False)
+    monkeypatch.delenv("WEATHER_INGEST_MARKER_GET_CONCURRENCY", raising=False)
+    settings = IngestionSettings(_env_file=None, DB_POOL_SIZE=10)
     plan = _resolve_concurrency_plan(settings=settings)
 
     assert plan.download_concurrency == 8
@@ -187,8 +195,13 @@ def test_max_env_does_not_override_operational_default(monkeypatch: pytest.Monke
     # Operator configures MAX ceiling via legacy or WEATHER_INGEST_MAX_* ENV name
     monkeypatch.setenv("WEATHER_INGEST_MAX_DOWNLOAD_CONCURRENCY", "24")
     monkeypatch.setenv("MAX_DECODE_CONCURRENCY", "16")
+    # Isolate from developer-machine environment (repository-root .env) so the
+    # operational-default assertions actually test code defaults.
+    monkeypatch.delenv("WEATHER_INGEST_DOWNLOAD_CONCURRENCY", raising=False)
+    monkeypatch.delenv("WEATHER_INGEST_DECODE_CONCURRENCY", raising=False)
+    monkeypatch.delenv("WEATHER_INGEST_WRITE_CONCURRENCY", raising=False)
 
-    settings = IngestionSettings(DB_POOL_SIZE=10)
+    settings = IngestionSettings(_env_file=None, DB_POOL_SIZE=10)
     # Operational concurrency must remain at code default 8 and 4!
     assert settings.DOWNLOAD_CONCURRENCY == 8
     assert settings.DECODE_CONCURRENCY == 4

@@ -1505,6 +1505,20 @@ async def _run_wave_impl(
             duration_s=tracker.elapsed,
             timeline_breakdown=timeline_breakdown,
         )
+        try:
+            from ingestion.monitoring.storage import STORAGE_COLLECTOR
+
+            STORAGE_COLLECTOR.record_phase_duration(
+                "prepare_run_store", timeline_breakdown["prepare_run_store"]
+            )
+            STORAGE_COLLECTOR.record_phase_duration(
+                "marker_put", timeline_breakdown["pre_update"]
+            )
+            STORAGE_COLLECTOR.record_phase_duration(
+                "finalize", timeline_breakdown["finalize"]
+            )
+        except Exception as exc:
+            logger.debug("Storage phase duration registration failed: %s", exc)
         post_mem = RESOURCE_COLLECTOR.get_memory_info()
         LEAK_DETECTOR.record_cycle(
             cycle_key=f"{spec.model}_{spec.cycle_time.strftime('%Y%m%d_%H%M')}",
