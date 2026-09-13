@@ -168,7 +168,7 @@ Because the ingestion exporter collects at scrape time, its own health must be d
 
 | Metric Name | Type | Description | Labels | Cost Class |
 | :--- | :--- | :--- | :--- | :--- |
-| `weather_exporter_collector_success` | Gauge | 1 = the named collector completed successfully during the latest scrape; 0 = it raised and was swallowed (fail-open) | `collector` (`resources`, `postgres`, `storage`, `lifecycle`, `ingestion_lag`) | Fast |
+| `weather_exporter_collector_success` | Gauge | 1 = the named collector completed successfully during the latest scrape; 0 = it raised and was swallowed (fail-open) | `collector` (`resources`, `postgres`, `storage`, `lifecycle`, `ingestion` (lag + member completeness/servability)) | Fast |
 | `weather_exporter_collector_duration_seconds` | Gauge | Wall-clock duration of the latest collector execution; recorded for **both** successful and failed runs so degradation remains visible | `collector` | Fast |
 
 Guarantees per scrape:

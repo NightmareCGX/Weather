@@ -88,6 +88,12 @@ def collect_platform_metrics() -> None:
         StorageHealthCollector,
     )
 
+    # The INGESTION_COLLECTOR module singleton is constructed without an
+    # engine; without wiring one here, evaluate_lag/evaluate_*_completeness
+    # silently skip the PostgreSQL catalog and publish degraded, clock-derived
+    # values (and no weather_gefs_*/weather_model_* gauges at all).
+    INGESTION_COLLECTOR.engine = engine
+
     run_collector("resources", RESOURCE_COLLECTOR.collect_and_export)
     run_collector("postgres", PostgresHealthCollector(engine).collect)
     run_collector(
@@ -101,11 +107,17 @@ def collect_platform_metrics() -> None:
     )
     run_collector("lifecycle", LifecycleHealthCollector(engine).collect)
 
-    def _evaluate_model_lag() -> None:
+    def _evaluate_ingestion_state() -> None:
         INGESTION_COLLECTOR.evaluate_lag("gfs")
         INGESTION_COLLECTOR.evaluate_lag("gefs")
+        # Feed the member-completeness/servability gauges
+        # (weather_gefs_* and weather_model_* families) that the dashboard's
+        # GEFS Member Completeness panel renders; evaluate_lag alone does not
+        # populate them.
+        INGESTION_COLLECTOR.evaluate_gefs_completeness()
+        INGESTION_COLLECTOR.evaluate_gfs_completeness()
 
-    run_collector("ingestion_lag", _evaluate_model_lag)
+    run_collector("ingestion", _evaluate_ingestion_state)
 
 
 def _collect_and_render() -> bytes:
