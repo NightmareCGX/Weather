@@ -32,6 +32,26 @@ const mockAvailability: ForecastAvailability = {
               lead_time_hours: [0, 6, 12],
             },
           ],
+          valid_times: [
+            {
+              valid_time: "2026-08-13T06:00:00Z",
+              source_cycle: "2026-08-13T00:00:00Z",
+              lead_time_hours: 6,
+              servable: true,
+              available_members: 1,
+              expected_members: 1,
+              coverage_ratio: 1,
+            },
+            {
+              valid_time: "2026-08-13T12:00:00Z",
+              source_cycle: "2026-08-13T00:00:00Z",
+              lead_time_hours: 12,
+              servable: true,
+              available_members: 1,
+              expected_members: 1,
+              coverage_ratio: 1,
+            },
+          ],
           layer: {
             tile_url_template:
               "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
@@ -332,5 +352,51 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
     const { result } = renderHook(() => useMapLayer());
 
     expect(result.current.layer).toBeNull();
+  });
+
+  it("keeps a stable layer identity across availability heartbeat refreshes with unchanged content", () => {
+    const validTimeSelection: ForecastSelection = {
+      model: "gfs",
+      variable: "temperature_2m",
+      validTime: "2026-08-13T06:00:00Z",
+    };
+    mockUseForecastSelection.mockReturnValue(mockContextValue(validTimeSelection));
+    const { result, rerender } = renderHook(() => useMapLayer());
+    const first = result.current.layer;
+    expect(first).not.toBeNull();
+
+    // Simulate the 60-second heartbeat: fresh availability object, identical content
+    const heartbeatAvailability = JSON.parse(JSON.stringify(mockAvailability));
+    mockUseForecastSelection.mockReturnValue(
+      mockContextValue(validTimeSelection, { availability: heartbeatAvailability })
+    );
+    rerender();
+
+    expect(result.current.layer).toBe(first);
+  });
+
+  it("re-identifies the layer when a newer cycle begins serving the same valid time", () => {
+    const validTimeSelection: ForecastSelection = {
+      model: "gfs",
+      variable: "temperature_2m",
+      validTime: "2026-08-13T06:00:00Z",
+    };
+    mockUseForecastSelection.mockReturnValue(mockContextValue(validTimeSelection));
+    const { result, rerender } = renderHook(() => useMapLayer());
+    const first = result.current.layer;
+    expect(first?.source_cycle).toBe("2026-08-13T00:00:00Z");
+
+    // Same valid time, same tile URL, but a newer initial time now serves it
+    const newerAvailability = JSON.parse(JSON.stringify(mockAvailability));
+    newerAvailability.models[0].variables[0].valid_times[0].source_cycle =
+      "2026-08-13T06:00:00Z";
+    mockUseForecastSelection.mockReturnValue(
+      mockContextValue(validTimeSelection, { availability: newerAvailability })
+    );
+    rerender();
+
+    expect(result.current.layer).not.toBe(first);
+    expect(result.current.layer?.source_cycle).toBe("2026-08-13T06:00:00Z");
+    expect(result.current.layer?.tile_url_template).toBe(first?.tile_url_template);
   });
 });

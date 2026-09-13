@@ -338,12 +338,21 @@ export function resolveSpatialLayer(
   }
 
   // Validate availability before constructing layer
+  let sourceCycle: string | null = null;
   if (selection.validTime) {
     const selMs = new Date(selection.validTime).getTime();
-    const validTimes = extractVariableValidTimes(variable);
-    const hasValid = validTimes.some((vt) => new Date(vt).getTime() === selMs);
-    if (!hasValid) {
-      return null;
+    const validTimeEntries = variable.valid_times ?? [];
+    const servingEntry = validTimeEntries.find(
+      (vt) => new Date(vt.valid_time).getTime() === selMs
+    );
+    if (servingEntry) {
+      sourceCycle = servingEntry.source_cycle;
+    } else {
+      const validTimes = extractVariableValidTimes(variable);
+      const hasValid = validTimes.some((vt) => new Date(vt).getTime() === selMs);
+      if (!hasValid) {
+        return null;
+      }
     }
   } else if (selection.initialTime && selection.leadTimeHours !== undefined) {
     const initial = findInitialTime(variable, selection.initialTime);
@@ -402,6 +411,9 @@ export function resolveSpatialLayer(
   };
   if (selection.validTime) {
     layerResult.valid_time = selection.validTime;
+  }
+  if (sourceCycle !== null) {
+    layerResult.source_cycle = sourceCycle;
   }
   if (vectorFieldUrl !== null) {
     layerResult.vector_field_url_template = vectorFieldUrl;

@@ -89,6 +89,9 @@ export function WeatherMap({
     availableLeads,
     currentLead: layer?.lead_time_hours ?? undefined,
     enabled: layer !== null && Boolean(layer.vector_field_url_template),
+    // A newer forecast cycle serving the same valid time must refetch the
+    // vector field even though the URL template is unchanged.
+    dataVersion: layer?.source_cycle ?? undefined,
   });
 
   useEffect(() => {
