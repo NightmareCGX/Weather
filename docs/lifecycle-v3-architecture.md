@@ -422,6 +422,16 @@ anti-resurrection 子系统，采用简单规则：
 永久 lifecycle tombstone 可作为额外 sanity guard，但不围绕 resurrection 单独建立
 新机制。
 
+**调度语义（已实装）：** 对账是 GC daemon 的内置低频阶段，不再是纯手动单轮命令。
+daemon 默认每 24h（`--inventory-interval-hours`，`0` 禁用，env 回退
+`GC_INVENTORY_INTERVAL_HOURS`）在某轮 pass 末尾执行一次 `run_orphan_inventory(reap=False)`，
+摘要追加进当轮 `GC pass:` 输出；`--once` 模式不触发。调度路径**只发现与上报，绝不
+reap**——物理删除 orphan 前缀仍只能通过手动一次性命令
+`weather-ingest gc --inventory --inventory-reap`（fail-closed sanity guards 不变）。
+对账结果经 `ingestion/monitoring/gc_metrics.py` 暴露为进程内指标
+（`weather_gc_inventory_orphans{beyond_frontier=...}` 等，`gc --metrics-port` 开放端点），
+frontier 内 orphan 数 > 0 触发 `gc_orphan_stores_detected` 告警。
+
 ---
 
 ## 10. 不变式清单

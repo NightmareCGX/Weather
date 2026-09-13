@@ -65,6 +65,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -756,9 +757,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "frontier under an exclusive store gate (fail-closed sanity guards).",
     )
     gc.add_argument(
-        "--inventory-store-root",
+        "--inventory_store_root",
         default=None,
         help="Store root for --inventory (default 's3://<--bucket>').",
+    )
+    gc.add_argument(
+        "--inventory-interval-hours",
+        type=float,
+        default=None,
+        help="Run the store-catalog orphan inventory pass automatically at this "
+        "interval in DAEMON mode (default 24.0; 0 disables the scheduled stage, "
+        "env fallback GC_INVENTORY_INTERVAL_HOURS). The scheduled stage only "
+        "DISCOVERS and reports orphans — it never reaps; physical orphan "
+        "deletion stays a manual 'gc --inventory --inventory-reap' action.",
+    )
+    gc.add_argument(
+        "--metrics-host",
+        type=str,
+        default="127.0.0.1",
+        help="Bind address for the in-process Prometheus metrics endpoint (default: 127.0.0.1; use 0.0.0.0 only so a local Docker-based Prometheus can reach it).",
+    )
+    gc.add_argument(
+        "--metrics-port",
+        type=int,
+        default=None,
+        help="Serve this process's live GC metrics (stage durations, pass "
+        "success, planner/worker/sweeper/inventory counters) on the given "
+        "port, e.g. 9114. Only meaningful for daemon mode. Disabled by default.",
     )
 
     reclamation = subparsers.add_parser(
@@ -1150,7 +1175,9 @@ def _gc_pipeline_pass(
 
     Each stage is failure-isolated: a stage error is logged and the pass
     continues with the next stage so a transient DB/S3 fault cannot kill the
-    daemon loop.
+    daemon loop. Every stage is also instrumented with in-process Prometheus
+    metrics (``ingestion.monitoring.gc_metrics``): stage duration, per-stage
+    success, and result counters — the printed summary format is unchanged.
 
     Returns a one-line structured summary of all stage outcomes.
     """
@@ -1159,11 +1186,18 @@ def _gc_pipeline_pass(
     from ingestion.gc.planner import plan_reclamation_pass
     from ingestion.gc.sweeper import run_metadata_sweeper_pass
     from ingestion.gc.worker import run_reclamation_worker_pass
+    from ingestion.monitoring.gc_metrics import (
+        gc_stage_timer,
+        record_planner_pass,
+        record_sweeper_pass,
+        record_worker_pass,
+    )
 
     parts: list[str] = []
 
     try:
-        bk = run_lifecycle_bookkeeping_pass(catalog_engine, dry_run=dry_run)
+        with gc_stage_timer("bookkeeping"):
+            bk = run_lifecycle_bookkeeping_pass(catalog_engine, dry_run=dry_run)
         parts.append(
             f"bookkeeping claimed={len(bk.claimed_cycles)} "
             f"finalized={len(bk.finalized_cycles)} "
@@ -1175,8 +1209,13 @@ def _gc_pipeline_pass(
 
     if enable_planner:
         try:
-            with SessionLocal() as session:
-                plan = plan_reclamation_pass(session, models=models, dry_run=dry_run)
+            with gc_stage_timer("planner"):
+                with SessionLocal() as session:
+                    plan = plan_reclamation_pass(session, models=models, dry_run=dry_run)
+            record_planner_pass(
+                enqueued_count=plan.enqueued_count,
+                reclaimable_shards=plan.reclaimable_shards,
+            )
             parts.append(
                 f"planner enqueued={plan.enqueued_count} "
                 f"reclaimable={plan.reclaimable_shards}"
@@ -1187,8 +1226,15 @@ def _gc_pipeline_pass(
 
     if enable_delete and not dry_run:
         try:
-            with SessionLocal() as session:
-                w = run_reclamation_worker_pass(session, delete_enabled=True, batch_size=batch_size)
+            with gc_stage_timer("worker"):
+                with SessionLocal() as session:
+                    w = run_reclamation_worker_pass(session, delete_enabled=True, batch_size=batch_size)
+            record_worker_pass(
+                claimed_count=w.claimed_count,
+                deleted_count=w.deleted_count,
+                failed_count=w.failed_count,
+                markers_cleaned_count=w.markers_cleaned_count,
+            )
             parts.append(
                 f"worker claimed={w.claimed_count} deleted={w.deleted_count} "
                 f"revalidated={w.revalidated_held_count} failed={w.failed_count} "
@@ -1200,7 +1246,12 @@ def _gc_pipeline_pass(
 
     if enable_sweeper:
         try:
-            sw = run_metadata_sweeper_pass(catalog_engine, dry_run=dry_run, batch_size=batch_size)
+            with gc_stage_timer("sweeper"):
+                sw = run_metadata_sweeper_pass(catalog_engine, dry_run=dry_run, batch_size=batch_size)
+            record_sweeper_pass(
+                swept_cycles=len(sw.swept_cycles),
+                failed_cycles=len(sw.failed_cycles),
+            )
             parts.append(
                 f"sweeper swept={len(sw.swept_cycles)} "
                 f"failed={len(sw.failed_cycles)} runs_deleted={sw.total_model_runs_deleted}"
@@ -1210,6 +1261,93 @@ def _gc_pipeline_pass(
             parts.append(f"sweeper=ERROR({type(exc).__name__})")
 
     return "; ".join(parts)
+
+
+def _gc_inventory_stage(
+    catalog_engine: Engine,
+    *,
+    store_root: str,
+    timeout_seconds: float,
+) -> str:
+    """Run one scheduled orphan inventory pass and return its summary fragment.
+
+    SCHEDULING-PATH INVARIANT: the daemon's inventory stage DISCOVERS and
+    REPORTS orphans only — ``run_orphan_inventory`` is always invoked with
+    ``reap=False`` here, and no scheduled code path may pass ``reap=True``.
+    Physical orphan-prefix deletion (``reap_orphan_store``) stays an explicit
+    operator action via the one-shot ``gc --inventory --inventory-reap``
+    command. The stage is fail-open: an inventory error is counted in
+    ``weather_gc_inventory_errors_total`` and never kills the GC pass loop.
+    """
+    from ingestion.gc.inventory import run_orphan_inventory
+    from ingestion.monitoring.gc_metrics import (
+        gc_stage_timer,
+        record_inventory_failure,
+        record_inventory_pass,
+    )
+
+    try:
+        with gc_stage_timer("inventory"):
+            inv = run_orphan_inventory(
+                catalog_engine,
+                store_root=store_root,
+                # Scheduled path NEVER reaps (see invariant above).
+                reap=False,
+                timeout_seconds=timeout_seconds,
+            )
+    except Exception as exc:
+        logger.exception("GC inventory stage failed")
+        record_inventory_failure()
+        return f"inventory=ERROR({type(exc).__name__})"
+
+    beyond = sum(1 for o in inv.orphan_stores if o.beyond_frontier)
+    record_inventory_pass(
+        orphan_stores_beyond_frontier=beyond,
+        orphan_stores_within_frontier=len(inv.orphan_stores) - beyond,
+        errors=len(inv.errors),
+    )
+    return (
+        f"inventory discovered={inv.discovered_stores} "
+        f"orphans={len(inv.orphan_stores)} "
+        f"beyond_frontier={beyond} "
+        f"errors={len(inv.errors)}"
+    )
+
+
+def _resolve_inventory_interval_hours(args: argparse.Namespace) -> float:
+    """Resolve the scheduled inventory interval in hours.
+
+    Precedence: explicit ``--inventory-interval-hours`` flag >
+    ``GC_INVENTORY_INTERVAL_HOURS`` env fallback > default 24.0. A value of 0
+    (or negative) disables the scheduled inventory stage entirely.
+    """
+    raw = getattr(args, "inventory_interval_hours", None)
+    if raw is None:
+        raw = os.environ.get("GC_INVENTORY_INTERVAL_HOURS")
+    try:
+        return float(raw) if raw is not None else 24.0
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid GC inventory interval %r; falling back to 24 hours", raw
+        )
+        return 24.0
+
+
+def _dispatch_gc_alerts() -> None:
+    """Hand the latest GC pass snapshot to the alert engine (fail-open).
+
+    Evaluates the gc stage rules (worker/sweeper pass failures, within-frontier
+    orphan stores) through the shared alert engine — its deduplication keeps
+    repeat notifications within the cooldown window and emits recovery events
+    when a value returns to zero. Never raises into the GC loop.
+    """
+    try:
+        from ingestion.monitoring import ALERT_ENGINE
+        from ingestion.monitoring.gc_metrics import snapshot_alert_state
+
+        ALERT_ENGINE.evaluate_and_dispatch(gc_data=snapshot_alert_state())
+    except Exception:  # noqa: BLE001 - alerting must never kill the GC loop
+        logger.debug("GC alert dispatch failed", exc_info=True)
 
 
 def _run_gc(args: argparse.Namespace) -> int:
@@ -1223,7 +1361,15 @@ def _run_gc(args: argparse.Namespace) -> int:
     * ``--inventory``: Run one store-catalog orphan inventory pass and exit.
     * ``--once --dry-run``: Plan and log diagnostics without mutating PostgreSQL.
     * ``--once``: Acquire GC leadership, execute one pipeline pass, and exit.
+      The scheduled orphan inventory stage never runs in ``--once`` mode
+      (one-shot semantics stay minimal).
     * Daemon (default): Acquire GC leadership and loop: pipeline pass -> sleep -> pipeline pass.
+      Every ``--inventory-interval-hours`` (default 24; 0 disables; env fallback
+      ``GC_INVENTORY_INTERVAL_HOURS``) a daemon pass additionally ends with a
+      scheduled orphan inventory stage appended to the pass summary. The
+      scheduled stage only discovers and reports orphans — it never reaps;
+      physical orphan deletion stays a manual ``--inventory --inventory-reap``
+      action.
 
     The pipeline pass is bookkeeping plus the automatically-wired V3 mainline
     (staged by two-level authorization):
@@ -1292,6 +1438,29 @@ def _run_gc(args: argparse.Namespace) -> int:
     dry_run = bool(args.dry_run)
     interval = max(1.0, float(args.interval_seconds))
 
+    # Scheduled store<->catalog reconciliation (architecture doc §9). Only the
+    # daemon loop runs it; --inventory / --once / dry-run keep one-shot semantics.
+    inventory_hours = _resolve_inventory_interval_hours(args)
+    inventory_enabled = inventory_hours > 0
+    inventory_store_root = getattr(args, "inventory_store_root", None) or f"s3://{args.bucket}"
+    next_inventory_due = time.monotonic() + inventory_hours * 3600.0
+
+    metrics_port = getattr(args, "metrics_port", None)
+    if metrics_port:
+        # Serve THIS process's live GC registry (stage durations, pass success,
+        # planner/worker/sweeper/inventory counters) from a background HTTP
+        # thread. Only meaningful for daemon mode; adds no probing and no
+        # persistent state (same pattern as the realtime daemon, port 9113).
+        import threading
+
+        from ingestion.monitoring.exporter import serve_live_registry
+
+        threading.Thread(
+            target=serve_live_registry,
+            kwargs={"host": getattr(args, "metrics_host", "127.0.0.1"), "port": int(metrics_port)},
+            daemon=True,
+        ).start()
+
     from ingestion.core.config import settings as ingest_settings
 
     enable_planner = bool(args.enable_planner) or bool(ingest_settings.RECLAMATION_PLANNER_ENABLED)
@@ -1324,12 +1493,14 @@ def _run_gc(args: argparse.Namespace) -> int:
         return 0
 
     logger.info(
-        "GC daemon mode: planner=%s delete=%s sweeper=%s interval=%ss models=%s",
+        "GC daemon mode: planner=%s delete=%s sweeper=%s interval=%ss models=%s "
+        "inventory_interval_hours=%s",
         enable_planner,
         enable_delete,
         enable_sweeper,
         interval,
         models,
+        inventory_hours,
     )
     if enable_delete:
         logger.warning(
@@ -1375,7 +1546,25 @@ def _run_gc(args: argparse.Namespace) -> int:
                 batch_size=int(getattr(args, "batch_size", 50)),
                 dry_run=False,
             )
+            # Scheduled orphan inventory: appended to the pass summary at the
+            # END of the due pass (never in --once mode). Discovery/reporting
+            # only — the scheduled path never reaps (see _gc_inventory_stage).
+            if (
+                inventory_enabled
+                and not args.once
+                and time.monotonic() >= next_inventory_due
+            ):
+                summary += (
+                    "; "
+                    + _gc_inventory_stage(
+                        catalog_engine,
+                        store_root=inventory_store_root,
+                        timeout_seconds=float(args.lock_timeout_seconds),
+                    )
+                )
+                next_inventory_due = time.monotonic() + inventory_hours * 3600.0
             print(f"GC pass: {summary}", flush=True)
+            _dispatch_gc_alerts()
 
             if args.once or stop_requested:
                 break

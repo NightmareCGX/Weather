@@ -382,6 +382,7 @@ Grafana never talks to the Weather Platform directly, and never reaches a remote
 | Weather API | `8000` | Actual API service (serves `GET /v1/metrics`) |
 | Ingestion metrics exporter | `9112` | Actual ingestion exporter (serves `GET /metrics`) |
 | Realtime daemon pipeline metrics | `9113` | Optional in-process metrics of `weather-ingest realtime --metrics-port 9113` (live stage latencies, throughput, storage operations) |
+| GC daemon pipeline metrics | `9114` | Optional in-process metrics of `weather-ingest gc --metrics-port 9114` (GC stage durations, pass success, planner/worker/sweeper/inventory counters) |
 | SSH forwarded remote API | `18000` | Local listener tunneling to remote `127.0.0.1:8000` |
 | SSH forwarded remote ingestion | `18112` | Local listener tunneling to remote `127.0.0.1:9112` |
 | Prometheus | `9090` | Local Prometheus UI/API |
@@ -390,6 +391,8 @@ Grafana never talks to the Weather Platform directly, and never reaches a remote
 The former `19100` convention is deprecated and must not appear in new documentation or tooling. Note the distinction: `9112` is the port the exporter **listens on** (local and remote alike); `18112` is the local SSH-forward receiver for the remote `9112`.
 
 **Ingestion pipeline metrics topology:** stage-latency, throughput, storage-operation, and member-completeness counters are strictly **process-local to the ingestion worker that executes the waves**. The standalone exporter (9112) is a separate probe process and never holds them. To make pipeline metrics scrapable, the long-running `weather-ingest realtime` daemon can serve its own live registry via `--metrics-port` (bound to `--metrics-host`, loopback by default); Prometheus then scrapes this process directly (target `:9113`). Short-lived `weather-ingest ingest` batch processes cannot be scraped this way — their counters live and die with the process.
+
+**GC pipeline metrics topology (same pattern):** the GC pass metrics (`weather_gc_pass_duration_seconds`, `weather_gc_pass_success`, `weather_gc_planner_*`, `weather_gc_worker_*`, `weather_gc_sweeper_*`, `weather_gc_inventory_*` — defined in `ingestion/monitoring/gc_metrics.py`) are strictly **process-local to the GC daemon**. The standalone exporter (9112) never holds them. Serve them with `weather-ingest gc --metrics-port 9114` (daemon mode only) so Prometheus can scrape the GC process directly (target `:9114`).
 
 ### 7.2 Local vs Remote Mode
 
