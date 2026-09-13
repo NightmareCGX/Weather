@@ -140,6 +140,37 @@ def _redis_connected() -> bool:
         return False
 
 
+def _redis_memory_stats() -> tuple[float, float, float]:
+    """Probe Redis memory usage, configured cap, and cumulative evictions.
+
+    All values are best-effort: ``(0, 0, 0)`` is returned when Redis is
+    unreachable or answers with an unexpected payload, so the metrics
+    endpoint itself never fails. ``max_bytes`` of ``0`` means "no cap
+    configured" (Redis ``maxmemory 0``).
+
+    Returns:
+        ``(used_bytes, max_bytes, evicted_keys_total)``.
+    """
+    try:
+        client = redis_lib.from_url(  # type: ignore[no-untyped-call]
+            settings.REDIS_URL,
+            socket_connect_timeout=REDIS_PROBE_TIMEOUT_SECONDS,
+            socket_timeout=REDIS_PROBE_TIMEOUT_SECONDS,
+        )
+        memory = client.info("memory")
+        stats = client.info("stats")
+        return (
+            float(memory.get("used_memory", 0)),
+            float(memory.get("maxmemory", 0)),
+            float(stats.get("evicted_keys", 0)),
+        )
+    except redis_lib.RedisError as exc:
+        logger.warning("Redis memory stats probe failed: %s", exc)
+        return (0.0, 0.0, 0.0)
+    except Exception:  # noqa: BLE001 - metrics must never fail the endpoint
+        return (0.0, 0.0, 0.0)
+
+
 def _object_storage_connected() -> bool:
     """Probe object storage (MinIO/S3) connectivity by listing the root.
 
@@ -236,6 +267,7 @@ def get_api_metrics() -> Response:
     object_storage = _object_storage_connected()
     rss, vms = _process_memory()
     threads = threading.active_count()
+    redis_used_bytes, redis_max_bytes, redis_evicted = _redis_memory_stats()
 
     reader_checked_out = 0
     reader_pool_size = 0
@@ -274,6 +306,15 @@ def get_api_metrics() -> Response:
         "# HELP weather_api_reader_pool_size Reader lock pool configured size",
         "# TYPE weather_api_reader_pool_size gauge",
         f"weather_api_reader_pool_size {float(reader_pool_size)}",
+        "# HELP weather_api_redis_memory_used_bytes Redis memory used by all caches (bytes)",
+        "# TYPE weather_api_redis_memory_used_bytes gauge",
+        f"weather_api_redis_memory_used_bytes {redis_used_bytes}",
+        "# HELP weather_api_redis_memory_max_bytes Redis maxmemory cap (bytes; 0 = uncapped)",
+        "# TYPE weather_api_redis_memory_max_bytes gauge",
+        f"weather_api_redis_memory_max_bytes {redis_max_bytes}",
+        "# HELP weather_api_redis_evicted_keys_total Redis keys evicted under memory pressure since start",
+        "# TYPE weather_api_redis_evicted_keys_total counter",
+        f"weather_api_redis_evicted_keys_total {redis_evicted}",
     ]
     content = "\n".join(lines) + "\n"
     return Response(

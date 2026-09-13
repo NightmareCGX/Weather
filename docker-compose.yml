@@ -21,6 +21,20 @@ services:
     image: redis:7-alpine
     container_name: weather_redis
     restart: unless-stopped
+    # Cache-only workload (point forecasts + wind vector fields, both TTL-bound
+    # and recomputable): cap memory and evict LRU instead of growing unbounded,
+    # and skip RDB/AOF persistence entirely.
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    mem_limit: 768m
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
