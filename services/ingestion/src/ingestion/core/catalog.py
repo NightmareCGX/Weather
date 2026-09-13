@@ -247,7 +247,7 @@ def is_cycle_tombstoned(
 
 
 
-class CenterRecord(CatalogBase):
+class CenterRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "forecast_centers"
 
     id = Column(String, primary_key=True)
@@ -257,7 +257,7 @@ class CenterRecord(CatalogBase):
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
-class ModelRecord(CatalogBase):
+class ModelRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "models"
 
     id = Column(String, primary_key=True)
@@ -269,7 +269,7 @@ class ModelRecord(CatalogBase):
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
-class ModelVersionRecord(CatalogBase):
+class ModelVersionRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "model_versions"
 
     id = Column(String, primary_key=True)
@@ -282,7 +282,7 @@ class ModelVersionRecord(CatalogBase):
     )
 
 
-class ModelRunRecord(CatalogBase):
+class ModelRunRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "model_runs"
 
     id = Column(String, primary_key=True)
@@ -297,7 +297,7 @@ class ModelRunRecord(CatalogBase):
     )
 
 
-class EnsembleMemberRecord(CatalogBase):
+class EnsembleMemberRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "ensemble_members"
 
     id = Column(String, primary_key=True)
@@ -310,7 +310,7 @@ class EnsembleMemberRecord(CatalogBase):
     )
 
 
-class EnsembleMemberProductRecord(CatalogBase):
+class EnsembleMemberProductRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     """One committed ``(member, lead)`` pair of an ensemble run.
 
     The catalog's ``forecast_products`` rows record lead completion *without*
@@ -338,7 +338,7 @@ class EnsembleMemberProductRecord(CatalogBase):
     )
 
 
-class ForecastCycleLifecycleRecord(CatalogBase):
+class ForecastCycleLifecycleRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "forecast_cycle_lifecycle"
 
     model_id: Any = Column(
@@ -351,7 +351,7 @@ class ForecastCycleLifecycleRecord(CatalogBase):
     updated_at: Any = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
-class ReclamationQueueRecord(CatalogBase):
+class ReclamationQueueRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "reclamation_queue"
 
     id: Any = Column(String(length=64), primary_key=True)
@@ -417,7 +417,7 @@ class ReclamationQueueRecord(CatalogBase):
 
 
 
-class VariableRecord(CatalogBase):
+class VariableRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "forecast_variables"
 
     id = Column(String, primary_key=True)
@@ -426,7 +426,7 @@ class VariableRecord(CatalogBase):
     unit = Column(String, nullable=False)
 
 
-class GridRecord(CatalogBase):
+class GridRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "forecast_grids"
 
     id = Column(String, primary_key=True)
@@ -435,7 +435,7 @@ class GridRecord(CatalogBase):
     resolution_km = Column(Float, nullable=False)
 
 
-class ProductRecord(CatalogBase):
+class ProductRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "forecast_products"
 
     id = Column(String, primary_key=True)

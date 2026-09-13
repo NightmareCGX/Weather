@@ -8,7 +8,11 @@ packages = [
     { include = "domain", from = "packages/domain/src" },
     { include = "contracts", from = "packages/contracts/src" },
     { include = "config", from = "packages/config/src" },
-    { include = "ingestion", from = "services/ingestion/src" }
+    { include = "ingestion", from = "services/ingestion/src" },
+    # The serving tier is a workspace package too: root-level tests
+    # (tests/contracts) import api.* directly, so a root `poetry install`
+    # must provide it like the other workspace packages.
+    { include = "api", from = "services/api/src" }
 ]
 
 [tool.poetry.dependencies]

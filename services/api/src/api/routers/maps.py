@@ -23,7 +23,7 @@ calculations live in the handler.
 from __future__ import annotations
 
 import gzip
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -39,14 +39,15 @@ from api.schemas import (
     SpatialLayerData,
     SpatialLayerEnvelope,
     SpatialLayerLegend,
+    format_datetime_utc,
 )
+from api.services.lifecycle import assert_valid_time_in_serving_window
 from api.services.tiles import (
     MAX_ZOOM,
     MIN_ZOOM,
     _color_stops,
     render_tile_png,
 )
-from domain.temporal import serving_start_valid_time
 
 router = APIRouter()
 
@@ -161,12 +162,16 @@ def get_spatial_layer(
         source = resolve_valid_time_source(db, model, valid_time, variable=variable, now=now)
         resolved_lead = source.lead_time_hours
         resolved_valid = source.valid_time
+        # R11: bind the template URLs to the resolver's actual valid_time
+        # (normalized ISO 8601 Z), not the raw request string, so equivalent
+        # spellings of the same instant produce identical template URLs.
+        resolved_valid_iso = format_datetime_utc(resolved_valid)
         template_path = (
             f"/v1/maps/{model}/{variable}/{level}/{{z}}/{{x}}/{{y}}.png"
-            f"?valid_time={valid_time}"
+            f"?valid_time={resolved_valid_iso}"
         )
         vector_field_template = (
-            f"/v1/maps/{model}/wind_10m/vector-field?valid_time={valid_time}"
+            f"/v1/maps/{model}/wind_10m/vector-field?valid_time={resolved_valid_iso}"
             if variable in ("wind_10m", "wind_speed_10m")
             else None
         )
@@ -175,16 +180,7 @@ def get_spatial_layer(
         resolved_lead = lead_time_hours
         _require_available(db, model, variable, level, resolved_lead, initial_time)
         if initial_time is not None:
-            from api.services.lifecycle import parse_cycle_time
-
-            c_time = parse_cycle_time(initial_time)
-            v_time = c_time + timedelta(hours=resolved_lead)
-            start_vt = serving_start_valid_time(now)
-            if v_time < start_vt:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Valid time '{v_time.isoformat()}' is before the active serving window ({start_vt.isoformat()}).",
-                )
+            assert_valid_time_in_serving_window(initial_time, resolved_lead, now=now)
 
         template_path = (
             f"/v1/maps/{model}/{variable}/{level}/{{z}}/{{x}}/{{y}}.png"

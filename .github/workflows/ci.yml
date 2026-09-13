@@ -196,7 +196,9 @@ jobs:
 
       - name: Run API tests
         working-directory: services/api
-        run: poetry run pytest --junitxml=api-junit.xml
+        # Coverage floor enforced here only (not in pytest addopts) so partial
+        # runs such as the openapi-export job are not spuriously failed.
+        run: poetry run pytest --junitxml=api-junit.xml --cov=api --cov-report=term-missing --cov-fail-under=50
 
       - name: Upload API test results on failure
         if: failure()
@@ -322,7 +324,9 @@ jobs:
 
       - name: Run Ingestion tests (with JUnit report)
         working-directory: services/ingestion
-        run: poetry run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml
+        # Coverage floor enforced here only (not in pytest addopts) so partial
+        # runs such as the cross-package contract tests are not spuriously failed.
+        run: poetry run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml --cov=ingestion --cov-report=term-missing --cov-fail-under=50
 
       - name: Verify MinIO round-trip ran and passed (not skipped)
         run: |
