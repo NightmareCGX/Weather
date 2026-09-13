@@ -33,6 +33,7 @@ from api.models.entities import ForecastVariable, ModelRun
 from fastapi.testclient import TestClient
 from ingestion.core.catalog import RunCatalogSpec, VariableSpec, record_run
 from ingestion.core.zarr_writer import write_dataset
+from tests._integration_db import integration_db_url
 
 CYCLE = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
 #: A point inside the fixture grid (38.0..38.75 lat, -107.0..-106.25 lon).
@@ -105,10 +106,7 @@ def _build_dataset() -> xr.Dataset:
 @pytest.fixture(scope="module")
 def catalog_db(tmp_path_factory):
     """A migrated PostGIS schema and a TestClient bound to it."""
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     try:
         with engine.connect() as conn:

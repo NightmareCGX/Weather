@@ -51,11 +51,9 @@ from api.models.entities import (
 )
 from api.services.tiles import _tile_cache, render_tile_png
 from domain.locks import store_gate_key
+from tests._integration_db import integration_db_url_or_skip_module
 
-DB_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-)
+DB_URL = integration_db_url_or_skip_module()
 
 
 def _build_test_dataset() -> xr.Dataset:

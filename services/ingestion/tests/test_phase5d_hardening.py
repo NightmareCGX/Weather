@@ -16,7 +16,6 @@ Covers all required scenarios from the Phase 5D matrix:
 
 from __future__ import annotations
 
-import os
 import random
 import threading
 from datetime import date
@@ -40,6 +39,7 @@ from ingestion.realtime.leadership import (
 )
 from ingestion.realtime.planner import ModelCommittedState
 from ingestion.realtime.polling import PollState
+from tests._integration_db import integration_db_url
 from ingestion.realtime.scheduler import (
     CycleIdentity,
     RealtimeScheduler,
@@ -371,10 +371,7 @@ def test_scenario_e_big_batch_commit_ahead_of_realtime_reconciles() -> None:
 
 
 def _get_postgres_engine() -> sa.engine.Engine | None:
-    dsn = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    dsn = integration_db_url()
     try:
         engine = create_engine(dsn, pool_pre_ping=False)
         with engine.connect() as conn:

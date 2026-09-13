@@ -14,13 +14,13 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from ingestion.gc.leadership import GcLeadership
+from tests._integration_db import integration_db_url
 
 
 def _pg_reachable() -> bool:
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = os.getenv("TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
+    if not db_url:
+        return False
     try:
         eng = create_engine(db_url, pool_pre_ping=True)
         with eng.connect() as conn:
@@ -33,10 +33,7 @@ def _pg_reachable() -> bool:
 
 @pytest.fixture(scope="function")
 def postgres_leader_env():
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url, pool_pre_ping=True)
     try:
         with engine.connect() as conn:

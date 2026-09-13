@@ -965,6 +965,106 @@ def test_acceptance_3_ambiguous_delete_failed_state_fenced_and_safe_requeue(cata
 
 
 # ===========================================================================
+# Legacy V2→V3 migration: stuck queued/deleting rows over missing physical
+# objects must be recoverable via requeue, else they block the tombstone
+# (NON_TERMINAL_QUEUE_STATUSES) forever. Active-lease rows are skipped.
+# ===========================================================================
+def test_requeue_recovers_stuck_queued_and_stale_deleting_rows(catalog_engine, tmp_path):
+    c0 = _dt(2026, 9, 2, 0)
+    store_dir = tmp_path / "c0_stuck"
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", store_dir)
+    _seed_gfs_products(catalog_engine, r0, [6], ["temperature_2m"], store_dir)
+
+    present_rel = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 6)
+    absent_rel_12 = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 12)
+    absent_rel_18 = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 18)
+    absent_rel_24 = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 24)
+    assert (store_dir / present_rel).exists()
+    for absent in (absent_rel_12, absent_rel_18, absent_rel_24):
+        assert not (store_dir / absent).exists()
+
+    now = _dt(2026, 9, 2, 12)
+    with Session(catalog_engine) as session:
+        def _mk(id_: str, status: str, lead: int, physical_key: str, **kw) -> ReclamationQueueRecord:
+            return ReclamationQueueRecord(
+                id=id_,
+                run_id=r0,
+                model_id="gfs",
+                cycle_time=c0,
+                lead_time_hours=lead,
+                variable_code="temperature_2m",
+                target_kind=TARGET_KIND_DET,
+                member_index=0,
+                valid_time=c0 + timedelta(hours=lead),
+                store_path=str(store_dir),
+                physical_key=physical_key,
+                status=status,
+                created_at=now,
+                updated_at=now,
+                **kw,
+            )
+
+        session.add_all(
+            [
+                # Legacy stuck: queued but physical object already gone (V2 finalizer removed it)
+                _mk("stuck_queued_absent", RECLAMATION_STATUS_QUEUED, 12, absent_rel_12,
+                    attempt_count=1, last_error="legacy_v2_finalizer"),
+                # Stale claim: deleting with an EXPIRED lease (worker crash mid-deletion)
+                _mk("stale_deleting_absent", RECLAMATION_STATUS_DELETING, 18, absent_rel_18,
+                    attempt_count=2, last_error="worker_crash",
+                    lease_expires_at=now - timedelta(seconds=1)),
+                # Active claim: deleting with a live lease -> must be skipped
+                _mk("active_deleting_absent", RECLAMATION_STATUS_DELETING, 24, absent_rel_24,
+                    attempt_count=1, last_error=None,
+                    lease_expires_at=now + timedelta(seconds=60)),
+                # Present object: reset for worker retry
+                _mk("queued_present", RECLAMATION_STATUS_QUEUED, 6, present_rel,
+                    attempt_count=3, last_error="prior_failure"),
+            ]
+        )
+        session.commit()
+
+        recovered = requeue_failed_reclamation_targets(session, model_id="gfs", now=now)
+        # 3 recovered; the active-lease row is skipped and not counted
+        assert recovered == 3
+
+        stuck_absent = session.get(ReclamationQueueRecord, "stuck_queued_absent")
+        assert stuck_absent.status == RECLAMATION_STATUS_DELETED
+        assert stuck_absent.reclaimed_at is not None
+        assert stuck_absent.last_error is None
+
+        stale = session.get(ReclamationQueueRecord, "stale_deleting_absent")
+        assert stale.status == RECLAMATION_STATUS_DELETED
+        assert stale.reclaimed_at is not None
+        assert stale.lease_expires_at is None
+
+        active = session.get(ReclamationQueueRecord, "active_deleting_absent")
+        assert active.status == RECLAMATION_STATUS_DELETING
+        assert active.reclaimed_at is None
+        assert active.lease_expires_at is not None
+
+        present = session.get(ReclamationQueueRecord, "queued_present")
+        assert present.status == RECLAMATION_STATUS_QUEUED
+        assert present.attempt_count == 0
+        assert present.last_error is None
+        assert present.next_retry_at is None
+
+        # Terminality unblocked: the only non-terminal rows left are the
+        # actively-leased claim (still owned by a live worker) and the
+        # present-object row (reset to queued for normal worker retry).
+        remaining = set(
+            session.execute(
+                select(ReclamationQueueRecord.status).where(
+                    ReclamationQueueRecord.status.in_(
+                        [RECLAMATION_STATUS_QUEUED, RECLAMATION_STATUS_DELETING, RECLAMATION_STATUS_FAILED]
+                    )
+                )
+            ).scalars().all()
+        )
+        assert remaining == {RECLAMATION_STATUS_QUEUED, RECLAMATION_STATUS_DELETING}
+
+
+# ===========================================================================
 # Final Acceptance Audit Point 2 (Part B): Mixed-Store Worker Gate Coverage
 # ===========================================================================
 def test_acceptance_mixed_store_worker_gate_coverage(catalog_engine, tmp_path):

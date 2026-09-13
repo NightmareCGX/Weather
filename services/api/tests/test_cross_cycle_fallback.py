@@ -46,6 +46,7 @@ from api.models.entities import (
     ModelVersion,
 )
 from api.services.point_forecast import _select_min_lead_winners
+from tests._integration_db import integration_db_url
 
 
 @pytest.fixture(autouse=True)
@@ -88,10 +89,7 @@ def client(tmp_path_factory):
     * ``run_old`` (2026-07-20): READY, readable store, NO forecast_products.
     * ``run_new`` (2026-07-21): READY, broken store, NO forecast_products.
     """
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     try:
         with engine.connect() as conn:
@@ -198,10 +196,7 @@ def test_broken_newest_falls_back_to_older_readable(client):
 
 def test_selection_discoveries_readable_store_lead_coord(tmp_path):
     """_select_min_lead_winners discovers leads from the store when no products."""
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     store = _write_store(str(tmp_path / "s.zarr"))
     with Session(engine) as session:
@@ -260,10 +255,7 @@ def stale_lead_client(tmp_path_factory):
     the stale candidate and fall back to the older READY run that actually has
     the lead, never raising KeyError/500.
     """
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     try:
         with engine.connect() as conn:

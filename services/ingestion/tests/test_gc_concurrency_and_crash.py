@@ -28,6 +28,7 @@ from ingestion.core.zarr_writer import write_dataset
 from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
 from ingestion.gc.planner import plan_reclamation_pass
 from ingestion.gc.worker import run_reclamation_worker_pass
+from tests._integration_db import integration_db_url
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -54,10 +55,7 @@ def _make_dataset(cycle_time: datetime, lead: int = 0) -> xr.Dataset:
 
 @pytest.fixture(scope="function")
 def postgres_gc_env(tmp_path):
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url, pool_pre_ping=True)
     try:
         with engine.connect() as conn:
