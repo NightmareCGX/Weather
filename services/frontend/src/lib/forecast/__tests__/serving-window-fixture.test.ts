@@ -16,10 +16,7 @@
 import { readFileSync } from "fs";
 import path from "path";
 
-import {
-  computeServingStartValidTime,
-  isServableValidTime,
-} from "@/lib/forecast/availability";
+import { computeServingStartValidTime, isServableValidTime } from "@/lib/forecast/availability";
 
 const fixturePath = path.join(
   __dirname,
@@ -57,9 +54,7 @@ describe("Serving-window fixture consistency with domain/temporal.py (I20)", () 
     for (const c of fixture.serving_start_cases) {
       it(`now=${c.now} -> ${c.expected_serving_start}`, () => {
         const actual = computeServingStartValidTime(new Date(c.now));
-        expect(new Date(actual).getTime()).toBe(
-          new Date(c.expected_serving_start).getTime()
-        );
+        expect(new Date(actual).getTime()).toBe(new Date(c.expected_serving_start).getTime());
       });
     }
   });
@@ -68,9 +63,7 @@ describe("Serving-window fixture consistency with domain/temporal.py (I20)", () 
     for (const c of fixture.protection_cases) {
       it(`valid_time=${c.valid_time} at now=${c.now} -> ${c.expected_protected}`, () => {
         const servingStart = computeServingStartValidTime(new Date(c.now));
-        expect(isServableValidTime(c.valid_time, servingStart)).toBe(
-          c.expected_protected
-        );
+        expect(isServableValidTime(c.valid_time, servingStart)).toBe(c.expected_protected);
       });
     }
   });

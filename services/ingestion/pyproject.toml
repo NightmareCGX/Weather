@@ -61,10 +61,9 @@ weather-ingest = "ingestion.cli:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# Deliberately conservative coverage floor (current suite measures ~83%; the
-# 50% gate only catches gross regressions such as whole test modules being
-# skipped or removed).
-addopts = "--cov=ingestion --cov-report=term-missing --cov-fail-under=50"
+# No coverage gate here: the 50% floor is enforced only by the CI full-suite
+# step (ci.yml "Run ingestion tests") so partial runs (single-file jobs,
+# contract tests running from the root tests/ tree) are not spuriously failed.
 # ``domain`` is a production dependency (imported by ingestion.core.locks).
 # In the workspace dev/test environment, point pytest at the package source so
 # the new domain.locks module is found without requiring a reinstall. CI uses
