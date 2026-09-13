@@ -453,8 +453,9 @@ anti-resurrection 子系统，采用简单规则：
 
 ## 11. 当前实现与目标态差距
 
-> 2026-09-13 复核重写：原 11 项差距逐项对照代码核实后，9 项已落地（§11.1），
-> 剩余工作收敛为 §11.2 的遗留清单。本节以代码现状为准，条目附证据位置。
+> 2026-09-13 复核重写：原 11 项差距逐项对照代码核实后，10 项已落地（§11.1，
+> 其中第 7 项工具已建、调度与历史孤儿清理仍待办），剩余工作收敛为 §11.2 的
+> 7 条遗留。本节以代码现状为准，条目附证据位置。
 
 ### 11.1 已落地（原清单 → 现状）
 
@@ -470,38 +471,30 @@ anti-resurrection 子系统，采用简单规则：
 | 9 | availability legacy `initial_times` 视图 | 完成。legacy 视图对 interval 变量显式剔除 lead 0（`api/services/availability.py:387-406`）。 |
 | 10 | 测试污染生产 catalog | 完成。集成测试强制显式 `TEST_DATABASE_URL`，否则跳过（`services/*/tests/_integration_db.py`）；一次性清理工具 `scripts/cleanup_test_pollution.py`（commit `87b8207`）。 |
 | 11 | 提取 `protected_valid_times` primitive（I20） | 大部分完成。primitive 已升级为 per-model horizon 网格并提供 `is_valid_time_protected(model_id=...)` / `protected_valid_times(model, now)`（`domain/temporal.py:154-295`，PR #87）；planner 与 API 均已采纳。前端 TS 仍重复实现边界计算，见遗留项 6。 |
-| 7 | store↔catalog 对账（§9） | 部分完成。对账工具已建并接线 CLI：`gc/inventory.py` + `--inventory` / `--inventory-reap`（PR #88）；调度化与历史孤儿（gefs 2026-09-12/00、06 等 ≈57GB）清理仍待办，见遗留项 3/4。 |
+| 7 | store↔catalog 对账（§9） | 部分完成。对账工具已建并接线 CLI：`gc/inventory.py` + `--inventory` / `--inventory-reap`（PR #88）；调度化与历史孤儿（gefs 2026-09-12/00、06 等 ≈57GB）清理仍待办，见遗留项 1/2。 |
+| — | GC 复验边界切换到 per-model primitive | 完成。新增 `domain.temporal.model_serving_start_valid_time(model_id, now)`（按模型注册 horizon cadence 派生边界，与 `is_valid_time_protected(model_id=...)` 的边界分量一致）；planner / worker / finalizer / inventory 已全部切换，inventory 对未注册模型保留全局 cadence 回退。 |
+| — | I14 generation 机械化校验 | 完成。方向定为"未变才可删"（fail-closed）：planner 入队时快照 store 的 committed-manifest generation（迁移 009 `reclamation_queue.store_generation`，每次 EXCLUSIVE commit 必 bump，含同集合同周期替换），worker 在 store 闸内比对——generation 变化或消失则重置基线并回队一轮，不删除；无基线的存量行在首次 claim 回填。重复被替换的 store 永远不会被删除，稳定 store 下一轮即恢复删除（无 livelock）。 |
 
 ### 11.2 仍然有效的遗留清单（按建议优先序）
 
-1. **GC 复验边界切换到 per-model primitive**：PR #87 已将 `is_valid_time_protected`
-   升级为 per-model horizon 网格且 planner 已传 `model_id`（`gc/planner.py:454`），
-   但 `gc/worker.py:279`、`gc/finalizer.py:529`、`gc/inventory.py:131` 仍裸调
-   `serving_start_valid_time(now_utc)`（全局默认 cadence）。对 horizon cadence
-   ≠ 3h 的模型，worker 复验边界与 planner 语义漂移——约一天工作量。
-2. **I14 generation 机械化校验**：`grep "generation"` 在 `gc/` 包零命中；
-   worker 反事实复验（`gc/worker.py:255-283`）的安全性完全依赖 serving fence +
-   窗口单调自证（I14 论据已写入 `domain/temporal.py:228-231` docstring），无
-   replacement-generation bump 的机械证据。主要风险在设计方向（未变才可删 vs
-   变了要重评），应在 `--enable-delete` 灰度上线前完成，约一周。
-3. **§9 对账进入调度**：`gc --inventory` 仍是一次性手动命令（`cli.py:746-748`
+1. **§9 对账进入调度**：`gc --inventory` 仍是一次性手动命令（`cli.py:746-748`
    跑完即退），daemon 循环不含对账阶段，compose/cron 均未调度。应作为 daemon
    低频阶段（reap 保持手动）。
-4. **历史孤儿清理**：gefs 2026-09-12/00、06 等 ≈57GB 孤儿 store 需运维用
+2. **历史孤儿清理**：gefs 2026-09-12/00、06 等 ≈57GB 孤儿 store 需运维用
    `gc --inventory --inventory-reap` 显式清理（工具已备，动作未执行）。
-5. **GC 管线内阶段指标**：planner/worker/sweeper 每轮结果只有 stdout 摘要
+3. **GC 管线内阶段指标**：planner/worker/sweeper 每轮结果只有 stdout 摘要
    （`cli.py:1378`），`gc/` 内无 Prometheus 计数/耗时指标。状态级覆盖已存在
    （`monitoring/lifecycle_collector.py:65-79` + Grafana 7/8/9 节 + webhook 告警
    `alerts.py:456-466`），缺的是 per-pass 过程指标与对应面板。
-6. **前端 TS serving 窗口重复实现**：`frontend/src/lib/forecast/availability.ts`
+4. **前端 TS serving 窗口重复实现**：`frontend/src/lib/forecast/availability.ts`
    重新实现了 `serving_start_valid_time` 的地板逻辑（I20 的"全栈单一实现"尚未
    完全达成）；当前语义一致，属维护漂移风险。
-7. **守护进程部署载体**：`docker-compose.yml` 无 ingestion/GC 服务，仓库无
+5. **守护进程部署载体**：`docker-compose.yml` 无 ingestion/GC 服务，仓库无
    systemd unit/crontab；`--enable-planner` → `--enable-delete` 灰度启用仍是
    操作动作（`RUNBOOKS.md` GC 节）。按 DEPLOYMENT.md 约定留待 Stage 8。
-8. **per-variable provenance 客户端暴露**：provenance digest 已进入缓存键
+6. **per-variable provenance 客户端暴露**：provenance digest 已进入缓存键
    （`resolver.py:709-779`），但响应 schema 仅暴露 per-series `cycle_time`
    （`api/schemas.py:287-294`），客户端仍看不到每个变量来自哪个 cycle/run。
-9. **T−2C claim 时机**：纯剪枝效率优化，正确性由 canonical necessity 覆盖；
+7. **T−2C claim 时机**：纯剪枝效率优化，正确性由 canonical necessity 覆盖；
    tombstone/最后批 unit 最晚释放推迟 10 天。等 GC 跑稳、有存储回收曲线数据
    后再评估。

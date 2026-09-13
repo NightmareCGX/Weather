@@ -44,7 +44,7 @@ from sqlalchemy.orm import Session
 from domain.coverage import get_expected_members
 from domain.horizon import model_max_lead_hours
 from domain.lifecycle import is_cycle_horizon_expired
-from domain.temporal import serving_start_valid_time
+from domain.temporal import model_serving_start_valid_time
 from ingestion.core.catalog import (
     ForecastCycleLifecycleRecord,
     ModelRunRecord,
@@ -526,13 +526,11 @@ def run_lifecycle_bookkeeping_pass(
     derives tombstones for cycles whose reclamation units are all terminal.
     """
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
-    serving_start = serving_start_valid_time(now_utc)
 
     logger.info(
-        "bookkeeping_pass_started: dry_run=%s now=%s serving_start=%s models=%s",
+        "bookkeeping_pass_started: dry_run=%s now=%s models=%s",
         dry_run,
         now_utc.isoformat(),
-        serving_start.isoformat(),
         models,
     )
 
@@ -571,7 +569,7 @@ def run_lifecycle_bookkeeping_pass(
                 cand.model_id,
                 cand.cycle_time,
                 is_recovery=True,
-                serving_start=serving_start,
+                serving_start=model_serving_start_valid_time(cand.model_id, now_utc),
                 now=now_utc,
             )
             if ok:
@@ -595,7 +593,7 @@ def run_lifecycle_bookkeeping_pass(
                 cand.model_id,
                 cand.cycle_time,
                 is_recovery=False,
-                serving_start=serving_start,
+                serving_start=model_serving_start_valid_time(cand.model_id, now_utc),
                 now=now_utc,
             )
             if ok:

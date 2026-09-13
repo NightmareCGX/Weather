@@ -51,6 +51,9 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 * `forecast_cycle_lifecycle`: Drops legacy columns `retired_at` and `retired_by_cycle_time`, and drops index `idx_cycle_lifecycle_retired`. Lifecycle authority is fully transitioned to physical fences (`deletion_started_at`, `deleted_at`) and granular reclamation (`reclamation_queue`).
 * **Rollback Caveat**: Downgrade recreates `retired_at` and `retired_by_cycle_time` as nullable `TIMESTAMPTZ` with `NULL` defaults and restores `idx_cycle_lifecycle_retired` for schema compatibility only. Downgrade does **NOT** restore legacy V2 runtime semantics, historical timestamps, deleted physical stores, or purged metadata. Schema rollback != data rollback.
 
+### Migration 009: Reclamation Generation Evidence (`009_reclamation_queue_store_generation.py`)
+* `reclamation_queue.store_generation`: Adds nullable `String` column snapshotting the cycle store's committed-manifest generation at enqueue time (I14 replacement-evidence gate). The worker refuses physical deletion while this baseline disagrees with the store's current generation — every EXCLUSIVE finalizer commit bumps the generation, including same-set same-cycle replacements. Rows enqueued before this migration carry no baseline and are backfilled by the worker at first claim. Schema-only migration; no data backfill.
+
 ---
 
 ## 3. Table Ownership & Mutability Matrix

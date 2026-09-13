@@ -151,6 +151,35 @@ def serving_start_valid_time(
     )
 
 
+def model_serving_start_valid_time(model_id: str, now_utc: datetime) -> datetime:
+    """Serving-window left boundary taken on the model's own horizon grid.
+
+    This is the boundary component of the model's protected set — exactly the
+    boundary :func:`is_valid_time_protected` applies when given ``model_id``:
+    the UTC wall-clock floor is computed on the cadence of the model's
+    registered canonical horizon, never on a caller-chosen default. GC
+    consumers (planner / worker / finalizer / inventory) must derive their
+    boundary through this helper: a bare global-cadence
+    ``serving_start_valid_time(now)`` call silently diverges from the
+    per-model membership test the moment a model's horizon cadence differs
+    from the canonical 3h grid.
+
+    Args:
+        model_id: Platform model identifier (e.g. ``gfs``, ``gefs``).
+        now_utc: The reference current UTC datetime. Must be timezone-aware.
+
+    Returns:
+        The floored UTC datetime boundary (with tzinfo=timezone.utc).
+
+    Raises:
+        ValueError: If ``now_utc`` is naive or the model is unknown (same
+            registry as :func:`domain.horizon.canonical_lead_time_hours`).
+    """
+    leads = canonical_lead_time_hours(model_id)
+    cadence = leads[1] - leads[0] if len(leads) > 1 else CANONICAL_LEAD_CADENCE_HOURS
+    return serving_start_valid_time(now_utc, cadence)
+
+
 def is_valid_time_on_horizon_grid(
     valid_time: datetime,
     *,
