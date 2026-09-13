@@ -15,29 +15,31 @@ Specification notes:
   rejected when ``operator`` is ``gt`` or ``lt``.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.exceptions import RequestValidationError
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.core.database import get_db
 from api.core.time import get_current_time
-from api.schemas import ProbabilityForecastEnvelope
+from api.schemas import ProbabilityForecastEnvelope, format_datetime_utc
 from api.services.cache import (
     PointCache,
     build_probability_cache_key,
 )
 from api.services.ensemble_data import build_probability_forecast
-from api.services.lifecycle import parse_cycle_time, require_cycle_visible
+from api.services.lifecycle import (
+    assert_pinned_lead_available,
+    assert_valid_time_in_serving_window,
+    require_cycle_visible,
+)
 from api.services.point_forecast import (
     resolve_latest_run_cycle_time,
     resolve_latest_run_store_path,
     resolve_serving_generation_for_store,
 )
-from domain.temporal import serving_start_valid_time
 
 router = APIRouter()
 
@@ -183,14 +185,7 @@ def get_probability(
 
         cycle_time = resolve_latest_run_cycle_time(db, model, target_initial)
         if cycle_time is not None:
-            c_utc = parse_cycle_time(cycle_time)
-            computed_valid_time = c_utc + timedelta(hours=resolved_lead)
-            start_vt = serving_start_valid_time(now)
-            if computed_valid_time < start_vt:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Valid time '{computed_valid_time.isoformat()}' is before the active serving window ({start_vt.isoformat()}).",
-                )
+            assert_valid_time_in_serving_window(cycle_time, resolved_lead, now=now)
         store_path = resolve_latest_run_store_path(
             db, model, target_initial
         )
@@ -198,28 +193,7 @@ def get_probability(
         if target_initial is not None:
             # Pinned path: validate physical availability BEFORE cache lookup
             try:
-                from api.models.entities import ReclamationQueue
-                from domain.coverage import get_expected_members, is_lead_servable
-
-                exp_m = get_expected_members(model, default_if_unknown=30)
-                c_p = parse_cycle_time(target_initial)
-                fenced_cnt = (
-                    db.execute(
-                        select(func.count(ReclamationQueue.id)).where(
-                            ReclamationQueue.model_id == model.lower().strip(),
-                            ReclamationQueue.cycle_time == c_p,
-                            ReclamationQueue.lead_time_hours == resolved_lead,
-                            ReclamationQueue.target_kind == "mem",
-                            ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
-                        )
-                    ).scalar()
-                    or 0
-                )
-                if not is_lead_servable(exp_m - fenced_cnt, exp_m):
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Forecast lead {resolved_lead}h for model '{model}' at cycle '{target_initial}' is not available.",
-                    )
+                assert_pinned_lead_available(db, model, target_initial, resolved_lead)
             except HTTPException:
                 raise
             except Exception:
@@ -242,7 +216,12 @@ def get_probability(
         phase=phase,
         cycle_time=cycle_time,
         serving_generation=serving_generation,
-        valid_time=valid_time,
+        # Lifecycle V3 R11: the key binds the resolver's actual valid_time, not
+        # the raw request string, so two ISO 8601 spellings of the same instant
+        # ("...Z" vs "...+00:00") resolve to one source and share one cache entry.
+        valid_time=format_datetime_utc(resolved_valid_time)
+        if resolved_valid_time is not None
+        else None,
         member_fingerprint=member_fingerprint,
     )
     query_params = (

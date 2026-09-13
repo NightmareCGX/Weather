@@ -33,14 +33,15 @@ inaccessible across all user-facing serving paths for that model:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 
 from fastapi import HTTPException
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 
 from api.models.entities import ForecastCycleLifecycle, ModelRun, ModelVersion
+from domain.temporal import serving_start_valid_time
 
 logger = logging.getLogger(__name__)
 
@@ -234,3 +235,87 @@ def require_cycle_visible(
             + (f" for model '{model_id}'." if model_id else "."),
         )
     return dt_utc
+
+
+def assert_valid_time_in_serving_window(
+    cycle_time: datetime | str,
+    lead_time_hours: int,
+    *,
+    now: datetime,
+) -> None:
+    """Enforce the API serving-window left boundary for a (cycle, lead) pair.
+
+    Consumer of the shared ``serving_start_valid_time`` primitive (Lifecycle V3
+    §5): the valid time implied by ``cycle_time + lead_time_hours`` must lie in
+    the active serving window; a pinned request below the boundary targets a
+    valid time no serving path can guarantee.
+
+    Args:
+        cycle_time: The resolved run's cycle time (datetime or ISO 8601 string).
+        lead_time_hours: The forecast lead offset hours.
+        now: The current UTC time anchoring the serving window.
+
+    Raises:
+        HTTPException: 404 when the implied valid time is before the window start.
+    """
+    c_utc = parse_cycle_time(cycle_time)
+    computed_valid_time = c_utc + timedelta(hours=lead_time_hours)
+    start_vt = serving_start_valid_time(now)
+    if computed_valid_time < start_vt:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Valid time '{computed_valid_time.isoformat()}' is before the "
+                f"active serving window ({start_vt.isoformat()})."
+            ),
+        )
+
+
+def assert_pinned_lead_available(
+    db: Session,
+    model: str,
+    cycle_time: datetime | str,
+    lead_time_hours: int,
+) -> None:
+    """Validate physical availability of a pinned (cycle, lead) BEFORE cache lookup.
+
+    The lead is servable when, after fencing out units queued for reclamation
+    (``deleting``/``deleted``/``failed`` member rows), the committed member
+    count still passes the model's coverage threshold. This is a pre-cache fast
+    rejection only: callers wrap it in a best-effort ``except Exception: pass``
+    guard and the serving path re-validates physical availability authoritatively.
+
+    Args:
+        db: Database session.
+        model: The model identifier.
+        cycle_time: The pinned cycle time (datetime or ISO 8601 string).
+        lead_time_hours: The pinned forecast lead offset hours.
+
+    Raises:
+        HTTPException: 404 when the lead fails the servability threshold.
+    """
+    from api.models.entities import ReclamationQueue
+    from domain.coverage import get_expected_members, is_lead_servable
+
+    expected_members = get_expected_members(model, default_if_unknown=30)
+    c_p = parse_cycle_time(cycle_time)
+    fenced_count = (
+        db.execute(
+            select(func.count(ReclamationQueue.id)).where(
+                ReclamationQueue.model_id == model.lower().strip(),
+                ReclamationQueue.cycle_time == c_p,
+                ReclamationQueue.lead_time_hours == lead_time_hours,
+                ReclamationQueue.target_kind == "mem",
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+            )
+        ).scalar()
+        or 0
+    )
+    if not is_lead_servable(expected_members - fenced_count, expected_members):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Forecast lead {lead_time_hours}h for model '{model}' at cycle "
+                f"'{cycle_time}' is not available."
+            ),
+        )
