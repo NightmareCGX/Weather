@@ -151,9 +151,18 @@ cd services/ingestion
 # Single-pass execution (e.g. from cron):
 poetry run weather-ingest gc --once
 
-# Continuous daemon mode:
-poetry run weather-ingest gc --interval-seconds 1800
+# Continuous daemon mode (includes the scheduled store<->catalog orphan
+# inventory stage, default every 24h; 0 disables; never reaps automatically):
+poetry run weather-ingest gc --interval-seconds 1800 --enable-planner --enable-sweeper
+
+# Daemon with an in-process GC metrics endpoint (stage durations, pass
+# success, planner/worker/sweeper/inventory counters) for Prometheus:
+poetry run weather-ingest gc --metrics-host 127.0.0.1 --metrics-port 9114
 ```
+The scheduled orphan inventory (`--inventory-interval-hours`, env fallback
+`GC_INVENTORY_INTERVAL_HOURS`) only discovers and reports orphan stores; physical
+orphan deletion stays the manual `weather-ingest gc --inventory --inventory-reap`
+one-shot command. See `docs/RUNBOOKS.md` section 8 for the operational runbook.
 
 ### 4.5 Running the Ingestion Metrics Exporter
 Run the ingestion Prometheus exporter bound to the loopback interface only. Metrics endpoints must never be exposed to public networks; they are consumed locally or transported via SSH tunnel:

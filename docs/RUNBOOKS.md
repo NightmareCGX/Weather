@@ -271,12 +271,15 @@ poetry run weather-ingest realtime
    ```
    Each daemon pass runs the full Lifecycle V3 pipeline: bookkeeping ->
    planner -> worker -> sweeper, gated by two-level authorization flags (see
-   below). The daemon holds the GC advisory lock; no cron wiring is required.
+   below), and — by default every 24 hours — ends with the scheduled
+   store<->catalog orphan inventory stage (see below). The daemon holds the
+   GC advisory lock; no cron wiring is required.
 2. **Single-Pass Mode (Cron / Manual Execution):**
    ```bash
    poetry run weather-ingest gc --once --bucket <OBJECT_STORAGE_BUCKET>
    ```
    Runs one full pipeline pass (with the same authorization flags) and exits.
+   The scheduled inventory stage never runs in `--once` mode.
 3. **Dry-Run Inspection Mode:**
    ```bash
    poetry run weather-ingest gc --once --dry-run
@@ -298,6 +301,39 @@ Recommended rollout: enable planner only, observe
 interval, then enable `--enable-delete`. Each pass prints a structured
 summary (`bookkeeping ...; planner ...; worker ...; sweeper ...`); stages are
 failure-isolated so a transient DB/S3 fault never kills the daemon.
+
+### Scheduled Orphan Inventory (store <-> catalog reconciliation, architecture doc §9):
+In daemon mode the GC automatically runs one orphan inventory pass every
+`--inventory-interval-hours` (default 24; `0` disables; env fallback
+`GC_INVENTORY_INTERVAL_HOURS`). The first scheduled inventory runs one full
+interval after daemon start. When a pass is due, the inventory summary is
+appended to that pass's stdout summary:
+
+```
+GC pass: bookkeeping ...; sweeper ...; inventory discovered=42 orphans=1 beyond_frontier=0 errors=0
+```
+
+* **Reconciliation is discovery and reporting only.** The scheduled stage
+  invokes `run_orphan_inventory(reap=False)` — no scheduled code path may
+  physically delete orphan prefixes. Physical orphan cleanup remains a
+  deliberate operator decision via the one-shot
+  `weather-ingest gc --inventory [--inventory-reap]` command (unchanged).
+* **Reading results:** `orphans=N` is the number of physical cycle stores
+  with no catalog identity; `beyond_frontier=K` counts those whose whole
+  serving horizon has expired (catalog recovery impossible, reap-eligible).
+  Orphans *within* the frontier should be investigated for catalog recovery
+  from COMPLETE marker evidence — never auto-reaped.
+* **Metrics & alerts:** the scheduled stage publishes
+  `weather_gc_inventory_orphans{beyond_frontier="true|false"}`,
+  `weather_gc_inventory_last_success_timestamp`, and
+  `weather_gc_inventory_errors_total` on the GC daemon's `--metrics-port`
+  endpoint (default off, e.g. `9114`). A within-frontier orphan count > 0
+  raises the `gc_orphan_stores_detected` webhook/log alert.
+* **Manual reap procedure (unchanged):** run `weather-ingest gc --inventory`
+  to list orphans with their `REAPABLE` / `recoverable-frontier` classification,
+  review each path, then `weather-ingest gc --inventory --inventory-reap`
+  to delete beyond-frontier prefixes under the exclusive store gate (fail-closed
+  sanity guards refuse when a lifecycle row or a raced catalog run exists).
 
 ### Operational Invariants:
 * **V3 Granular Reclamation:** physical deletion happens exclusively through

@@ -1006,7 +1006,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 92
       },
       "id": 31,
       "title": "9. Metadata Retention Sweeper",
@@ -1021,7 +1021,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 93
       },
       "id": 32,
       "title": "14-Day Retention Backlog",
@@ -1052,7 +1052,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 69
+        "y": 93
       },
       "id": 33,
       "title": "Oldest Overdue Metadata Past 14-Day Window",
@@ -1081,7 +1081,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 77
+        "y": 101
       },
       "id": 34,
       "title": "10. Invariants, Errors & Alerts",
@@ -1096,7 +1096,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 102
       },
       "id": 35,
       "title": "Active Invariant & Anti-Resurrection Violations",
@@ -1192,6 +1192,234 @@
           "refId": "B"
         }
       ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 68
+      },
+      "id": 37,
+      "title": "GC Pass Stage Duration (P95, per stage)",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (stage, le) (rate(weather_gc_pass_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{stage}} P95"
+        },
+        {
+          "expr": "sum by (stage) (rate(weather_gc_pass_duration_seconds_sum[$__rate_interval])) / clamp_min(sum by (stage) (rate(weather_gc_pass_duration_seconds_count[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{stage}} avg"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 68
+      },
+      "id": 38,
+      "title": "GC Pass Stage Success (latest pass)",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "weather_gc_pass_success",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 76
+      },
+      "id": 39,
+      "title": "GC Planner / Worker Progress (rate)",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(weather_gc_planner_enqueued_total[$__rate_interval])",
+          "legendFormat": "planner enqueued/s"
+        },
+        {
+          "expr": "rate(weather_gc_planner_reclaimable_total[$__rate_interval])",
+          "legendFormat": "planner reclaimable/s"
+        },
+        {
+          "expr": "rate(weather_gc_worker_claimed_total[$__rate_interval])",
+          "legendFormat": "worker claimed/s"
+        },
+        {
+          "expr": "rate(weather_gc_worker_deleted_total[$__rate_interval])",
+          "legendFormat": "worker deleted/s"
+        },
+        {
+          "expr": "rate(weather_gc_worker_markers_cleaned_total[$__rate_interval])",
+          "legendFormat": "worker markers cleaned/s"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 76
+      },
+      "id": 40,
+      "title": "GC Worker / Sweeper Failures (rate)",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(weather_gc_worker_failed_total[$__rate_interval])",
+          "legendFormat": "worker failed/s"
+        },
+        {
+          "expr": "rate(weather_gc_sweeper_failed_total[$__rate_interval])",
+          "legendFormat": "sweeper failed/s"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
+      "id": 41,
+      "title": "GC Orphan Inventory (store <-> catalog reconciliation)",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "weather_gc_inventory_orphans{beyond_frontier=\"false\"}",
+          "legendFormat": "within frontier"
+        },
+        {
+          "expr": "weather_gc_inventory_orphans{beyond_frontier=\"true\"}",
+          "legendFormat": "beyond frontier (reapable)"
+        },
+        {
+          "expr": "weather_gc_inventory_errors_total",
+          "legendFormat": "inventory errors (cumulative)"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 84
+      },
+      "id": 42,
+      "title": "GC Stage Last Success Age",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h"
+        }
+      },
+      "targets": [
+        {
+          "expr": "(time() - weather_gc_pass_last_success_timestamp) / 3600",
+          "legendFormat": "{{stage}} hours since last success"
+        },
+        {
+          "expr": "(time() - weather_gc_inventory_last_success_timestamp) / 3600",
+          "legendFormat": "inventory hours since last success"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ],
   "refresh": "10s",
