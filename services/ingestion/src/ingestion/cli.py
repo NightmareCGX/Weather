@@ -69,6 +69,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy.engine import Engine
+
 from ingestion.core.base import (
     CycleStoreMismatchError,
     LeadTimeMismatchError,
@@ -704,6 +706,32 @@ def _build_parser() -> argparse.ArgumentParser:
         help="S3/MinIO bucket name holding forecast cycle stores (default 'weather-data').",
     )
     gc.add_argument(
+        "--models",
+        default="gfs,gefs",
+        help="Comma-separated model identifiers for the planner pass (default 'gfs,gefs').",
+    )
+    gc.add_argument(
+        "--enable-planner",
+        action="store_true",
+        help="Run the reclamation planner pass (enqueue reclaimable shard targets) after "
+        "each bookkeeping pass. Queue writes only — no physical side effects. Also "
+        "enabled via RECLAMATION_PLANNER_ENABLED=true.",
+    )
+    gc.add_argument(
+        "--enable-delete",
+        action="store_true",
+        help="Authorize the reclamation worker pass to physically delete enqueued shard "
+        "targets each pass (V3 planner -> worker -> bookkeeping mainline). Dangerous: "
+        "also enabled via RECLAMATION_DELETE_ENABLED=true. Deleting requires explicit "
+        "authorization; planner-only operation is the safe staging mode.",
+    )
+    gc.add_argument(
+        "--enable-sweeper",
+        action="store_true",
+        help="Run the M3 14-day detailed metadata retention sweeper pass after each "
+        "bookkeeping pass (daemon mode). Also enabled via RECLAMATION_SWEEPER_ENABLED=true.",
+    )
+    gc.add_argument(
         "--sweep-metadata",
         action="store_true",
         help="Execute M3 14-day detailed metadata retention sweeper pass.",
@@ -778,7 +806,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Lease duration in seconds (default 60.0)",
     )
 
-    rec_requeue = rec_sub.add_parser("requeue", help="Requeue failed quarantined reclamation targets")
+    rec_requeue = rec_sub.add_parser(
+        "requeue",
+        help="Recover stuck non-terminal reclamation targets (failed quarantine, "
+        "stale-lease deleting, legacy stuck queued rows over missing objects)",
+    )
     rec_requeue.add_argument(
         "--model-id",
         default=None,
@@ -1093,17 +1125,114 @@ def _run_realtime(args: argparse.Namespace) -> int:
     return scheduler.run(once=args.once, dry_run=args.dry_run)
 
 
+def _gc_pipeline_pass(
+    catalog_engine: Engine,
+    *,
+    models: list[str],
+    enable_planner: bool,
+    enable_delete: bool,
+    enable_sweeper: bool,
+    batch_size: int,
+    dry_run: bool = False,
+) -> str:
+    """Execute one full V3 GC pipeline pass: bookkeeping -> planner -> worker -> sweeper.
+
+    This is the automated wiring of the ``planner -> worker -> bookkeeping``
+    mainline: the gc daemon (or a cron-invoked ``--once`` run) drives every
+    stage, so expired units are actually reclaimed without an operator running
+    ``reclamation plan --write`` / ``reclamation work --delete`` by hand.
+
+    Staging model (two-level authorization):
+    * ``enable_planner`` — queue writes only, no physical side effects. Safe
+      staging mode.
+    * ``enable_delete`` — authorizes the worker stage to physically delete
+      enqueued shard targets.
+
+    Each stage is failure-isolated: a stage error is logged and the pass
+    continues with the next stage so a transient DB/S3 fault cannot kill the
+    daemon loop.
+
+    Returns a one-line structured summary of all stage outcomes.
+    """
+    from ingestion.core.db import SessionLocal
+    from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
+    from ingestion.gc.planner import plan_reclamation_pass
+    from ingestion.gc.sweeper import run_metadata_sweeper_pass
+    from ingestion.gc.worker import run_reclamation_worker_pass
+
+    parts: list[str] = []
+
+    try:
+        bk = run_lifecycle_bookkeeping_pass(catalog_engine, dry_run=dry_run)
+        parts.append(
+            f"bookkeeping claimed={len(bk.claimed_cycles)} "
+            f"finalized={len(bk.finalized_cycles)} "
+            f"blocked={len(bk.blocked_cycles)} failed={len(bk.failed_cycles)}"
+        )
+    except Exception as exc:
+        logger.exception("GC bookkeeping stage failed")
+        parts.append(f"bookkeeping=ERROR({type(exc).__name__})")
+
+    if enable_planner:
+        try:
+            with SessionLocal() as session:
+                plan = plan_reclamation_pass(session, models=models, dry_run=dry_run)
+            parts.append(
+                f"planner enqueued={plan.enqueued_count} "
+                f"reclaimable={plan.reclaimable_shards}"
+            )
+        except Exception as exc:
+            logger.exception("GC planner stage failed")
+            parts.append(f"planner=ERROR({type(exc).__name__})")
+
+    if enable_delete and not dry_run:
+        try:
+            with SessionLocal() as session:
+                w = run_reclamation_worker_pass(session, delete_enabled=True, batch_size=batch_size)
+            parts.append(
+                f"worker claimed={w.claimed_count} deleted={w.deleted_count} "
+                f"revalidated={w.revalidated_held_count} failed={w.failed_count} "
+                f"markers={w.markers_cleaned_count}"
+            )
+        except Exception as exc:
+            logger.exception("GC worker stage failed")
+            parts.append(f"worker=ERROR({type(exc).__name__})")
+
+    if enable_sweeper:
+        try:
+            sw = run_metadata_sweeper_pass(catalog_engine, dry_run=dry_run, batch_size=batch_size)
+            parts.append(
+                f"sweeper swept={len(sw.swept_cycles)} "
+                f"failed={len(sw.failed_cycles)} runs_deleted={sw.total_model_runs_deleted}"
+            )
+        except Exception as exc:
+            logger.exception("GC sweeper stage failed")
+            parts.append(f"sweeper=ERROR({type(exc).__name__})")
+
+    return "; ".join(parts)
+
+
 def _run_gc(args: argparse.Namespace) -> int:
     """Run the garbage collection (GC) and storage reclamation engine (Phase 6D).
 
     Supported modes (Lifecycle V3 converged model: physical deletion happens
     exclusively through the reclamation planner + worker at
-    (variable, valid_time) granularity; this command runs lifecycle bookkeeping
-    and performs zero physical storage operations):
+    (variable, valid_time) granularity; bookkeeping itself performs zero
+    physical storage operations):
     * ``--sweep-metadata``: Execute M3 14-day detailed metadata retention sweeper pass.
+    * ``--inventory``: Run one store-catalog orphan inventory pass and exit.
     * ``--once --dry-run``: Plan and log diagnostics without mutating PostgreSQL.
-    * ``--once``: Acquire GC leadership, execute one bookkeeping pass, and exit.
-    * Daemon (default): Acquire GC leadership and loop: bookkeeping -> sleep -> bookkeeping.
+    * ``--once``: Acquire GC leadership, execute one pipeline pass, and exit.
+    * Daemon (default): Acquire GC leadership and loop: pipeline pass -> sleep -> pipeline pass.
+
+    The pipeline pass is bookkeeping plus the automatically-wired V3 mainline
+    (staged by two-level authorization):
+    * ``--enable-planner`` (or RECLAMATION_PLANNER_ENABLED): enqueue reclaimable
+      shard targets after each bookkeeping pass (queue writes only).
+    * ``--enable-delete`` (or RECLAMATION_DELETE_ENABLED): authorize the worker
+      stage to physically delete enqueued shard targets.
+    * ``--enable-sweeper`` (or RECLAMATION_SWEEPER_ENABLED): include the 14-day
+      metadata sweeper pass in each pipeline pass.
 
     Args:
         args: Parsed CLI arguments.
@@ -1163,13 +1292,50 @@ def _run_gc(args: argparse.Namespace) -> int:
     dry_run = bool(args.dry_run)
     interval = max(1.0, float(args.interval_seconds))
 
+    from ingestion.core.config import settings as ingest_settings
+
+    enable_planner = bool(args.enable_planner) or bool(ingest_settings.RECLAMATION_PLANNER_ENABLED)
+    enable_delete = bool(args.enable_delete) or bool(ingest_settings.RECLAMATION_DELETE_ENABLED)
+    enable_sweeper = bool(args.enable_sweeper) or bool(ingest_settings.RECLAMATION_SWEEPER_ENABLED)
+    models = [m.strip().lower() for m in str(args.models).split(",") if m.strip()]
+
     if dry_run:
         # Dry-run performs zero mutations and does not acquire destructive leadership
-        run_lifecycle_bookkeeping_pass(
-            catalog_engine,
-            dry_run=True,
-        )
+        if enable_planner:
+            # The planner supports a true dry-run (log-only candidate discovery);
+            # the worker stage is skipped entirely in dry-run mode.
+            print(
+                "GC dry-run pass: "
+                + _gc_pipeline_pass(
+                    catalog_engine,
+                    models=models,
+                    enable_planner=True,
+                    enable_delete=False,
+                    enable_sweeper=enable_sweeper,
+                    batch_size=int(getattr(args, "batch_size", 50)),
+                    dry_run=True,
+                )
+            )
+        else:
+            run_lifecycle_bookkeeping_pass(
+                catalog_engine,
+                dry_run=True,
+            )
         return 0
+
+    logger.info(
+        "GC daemon mode: planner=%s delete=%s sweeper=%s interval=%ss models=%s",
+        enable_planner,
+        enable_delete,
+        enable_sweeper,
+        interval,
+        models,
+    )
+    if enable_delete:
+        logger.warning(
+            "GC PHYSICAL DELETION IS AUTHORIZED (planner -> worker mainline active); "
+            "shard targets enqueued by the planner will be permanently deleted."
+        )
 
     leadership = GcLeadership(catalog_engine)
     if not leadership.acquire():
@@ -1200,10 +1366,16 @@ def _run_gc(args: argparse.Namespace) -> int:
                     logger.error("Failed to reacquire GC leadership; exiting.")
                     return 1
 
-            run_lifecycle_bookkeeping_pass(
+            summary = _gc_pipeline_pass(
                 catalog_engine,
+                models=models,
+                enable_planner=enable_planner,
+                enable_delete=enable_delete,
+                enable_sweeper=enable_sweeper,
+                batch_size=int(getattr(args, "batch_size", 50)),
                 dry_run=False,
-            )  # zero physical storage operations (V3 bookkeeping)
+            )
+            print(f"GC pass: {summary}", flush=True)
 
             if args.once or stop_requested:
                 break
@@ -1262,7 +1434,7 @@ def _run_reclamation(args: argparse.Namespace) -> int:
             m_id = getattr(args, "model_id", None)
             r_id = getattr(args, "run_id", None)
             count = requeue_failed_reclamation_targets(session, model_id=m_id, run_id=r_id)
-            print(f"Requeued {count} failed reclamation targets.")
+            print(f"Recovered {count} stuck non-terminal reclamation targets.")
             return 0
     print(f"Unknown reclamation action: {action}")
     return 2
