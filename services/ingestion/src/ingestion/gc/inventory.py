@@ -119,15 +119,12 @@ def discover_orphan_cycles(
     orphan; ``beyond_frontier`` marks orphans whose entire possible serving
     horizon is past (never re-activatable, catalog recovery pointless).
     """
-    cataloged: set[tuple[str, datetime]] = set(
-        session.execute(
+    cataloged: set[tuple[str, datetime]] = {
+        (str(m).lower().strip(), _ensure_utc(c))
+        for m, c in session.execute(
             select(ModelVersionRecord.model_id, ModelRunRecord.cycle_time)
             .join(ModelVersionRecord, ModelRunRecord.model_version_id == ModelVersionRecord.id)
         ).all()
-    )
-    cataloged = {
-        (str(m).lower().strip(), _ensure_utc(c))
-        for m, c in cataloged
     }
 
     now_utc = _ensure_utc(now)

@@ -572,8 +572,8 @@ def plan_reclamation_pass(
                 total_reclaimable += 1
                 r_str, lead_num, v_code, kind, mem = t_tuple
                 store_path = store_by_run.get(r_str, "")
-                c_utc = cycle_by_run.get(r_str)
-                if not store_path or c_utc is None:
+                c_utc_opt: datetime | None = cycle_by_run.get(r_str)
+                if not store_path or c_utc_opt is None:
                     continue
                 all_would_enqueue.append(
                     PhysicalShardTarget(
@@ -584,7 +584,7 @@ def plan_reclamation_pass(
                         variable_code=v_code,
                         target_kind=kind,
                         member_index=mem,
-                        valid_time=c_utc + timedelta(hours=lead_num),
+                        valid_time=c_utc_opt + timedelta(hours=lead_num),
                         store_path=store_path,
                         physical_key=make_shard_relative_key(v_code, kind, lead_num, mem),
                     )

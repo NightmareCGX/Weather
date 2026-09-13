@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from domain.canonical import (
@@ -207,8 +208,9 @@ def run_reclamation_worker_pass(
         # transaction (autobegin) and cannot host the advisory-lock transaction.
         coord: StoreLockCoordinator | None = None
         gate_conn = None
-        if is_postgres and session.bind:
-            gate_conn = session.bind.connect()
+        catalog_bind = session.bind if isinstance(session.bind, Engine) else None
+        if is_postgres and catalog_bind is not None:
+            gate_conn = catalog_bind.connect()
             coord = StoreLockCoordinator(
                 gate_conn,
                 store_path=store_path,
