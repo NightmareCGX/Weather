@@ -13,11 +13,16 @@ For GEFS:
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import threading
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
+import redis as redis_lib
 import xarray as xr
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -33,16 +38,77 @@ from api.services.tiles import (
 from domain.models.wind import encode_vector_field_int16
 
 if TYPE_CHECKING:
-    pass
+    from redis import Redis
 
-#: Server-side vector field in-memory LRU cache.
-#: Entries are keyed by full forecast + serving-generation identity, so entries
-#: from superseded generations simply expire unused. The TTL is long (30 min)
-#: because a cache hit skips an expensive full-globe (GEFS: 30 members × u/v)
-#: Zarr read; the entry budget bounds process memory (~64 × ~1 MB payloads).
-_VECTOR_CACHE_MAX_ENTRIES = 64
+logger = logging.getLogger(__name__)
+
+#: L1 process-local cache: a small read-through front for the shared Redis
+#: cache so warm entries avoid a network round trip and serving degrades to
+#: today's behavior when Redis is unavailable. Bounded so API process memory
+#: stays controlled (~16 x ~1 MB payloads).
+_VECTOR_CACHE_MAX_ENTRIES = 16
 _VECTOR_CACHE_TTL_SECONDS = 1800
 _vector_cache: dict[tuple[object, ...], tuple[float, bytes]] = {}
+
+#: L2 shared Redis cache: entries written by any worker are visible to all,
+#: so the background prewarm (api/services/vector_prewarm.py) computes each
+#: valid time once fleet-wide instead of once per worker. Keys are namespaced
+#: by payload format; values are the raw quantized bytes with a TTL matching
+#: the L1 freshness window.
+_VECTOR_REDIS_KEY_PREFIX = "vectorfield:v1_i16:"
+
+#: Best-effort Redis client (lazy singleton). A Redis outage must never fail
+#: serving: reads miss and recompute, writes are dropped, and the state
+#: transition is logged once rather than per request.
+_redis_client: Redis | None = None
+_redis_client_lock = threading.Lock()
+_redis_degraded = False
+
+
+def _get_redis_client() -> Redis | None:
+    """Return the shared Redis client, or None when Redis caching is disabled."""
+    global _redis_client
+    from api.core.config import settings
+
+    if not settings.API_VECTOR_CACHE_REDIS_ENABLED:
+        return None
+    if _redis_client is None:
+        with _redis_client_lock:
+            if _redis_client is None:
+                # ``redis_lib.from_url`` is untyped in the redis stubs (see
+                # api/services/cache.py for the same boundary treatment).
+                _redis_client = redis_lib.from_url(  # type: ignore[no-untyped-call]
+                    settings.REDIS_URL,
+                    decode_responses=False,
+                    socket_connect_timeout=2.0,
+                    socket_timeout=2.0,
+                )
+    return _redis_client
+
+
+def _note_redis_error(operation: str) -> None:
+    """Log the degraded-state transition once per Redis outage period."""
+    global _redis_degraded
+    if not _redis_degraded:
+        logger.warning(
+            "vector-field Redis cache degraded on %s; entries recompute per process",
+            operation,
+        )
+        _redis_degraded = True
+
+
+def _note_redis_success() -> None:
+    """Log recovery when a Redis operation succeeds after a degraded period."""
+    global _redis_degraded
+    if _redis_degraded:
+        logger.info("vector-field Redis cache recovered")
+        _redis_degraded = False
+
+
+def _vector_redis_key(key: tuple[object, ...]) -> str:
+    """Serialize a cache-key tuple into a stable namespaced Redis string key."""
+    canonical = json.dumps(key, default=str, separators=(",", ":"))
+    return _VECTOR_REDIS_KEY_PREFIX + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _vector_cache_key(
@@ -69,27 +135,66 @@ def _vector_cache_key(
     )
 
 
-def _vector_cache_get(key: tuple[object, ...]) -> bytes | None:
-    """Return a live cached vector field payload, evicting stale entries."""
-    entry = _vector_cache.get(key)
-    if entry is None:
-        return None
-    created, payload = entry
-    if time.monotonic() - created > _VECTOR_CACHE_TTL_SECONDS:
-        _vector_cache.pop(key, None)
-        return None
-    return payload
-
-
-def _vector_cache_set(key: tuple[object, ...], payload: bytes) -> None:
-    """Store a vector field payload, evicting the oldest entry when full."""
-    _vector_cache[key] = (time.monotonic(), payload)
-    if len(_vector_cache) > _VECTOR_CACHE_MAX_ENTRIES:
+def _evict_l1() -> None:
+    """Evict the oldest L1 entry when the process-local budget is exceeded."""
+    while len(_vector_cache) > _VECTOR_CACHE_MAX_ENTRIES:
         try:
             oldest = next(iter(_vector_cache))
             _vector_cache.pop(oldest, None)
         except StopIteration:
-            pass
+            break
+
+
+def _vector_cache_get(key: tuple[object, ...]) -> bytes | None:
+    """Return a live cached vector field payload (L1, then shared Redis L2).
+
+    Stale L1 entries are evicted. Redis errors are treated as a miss so an
+    outage degrades to per-process recomputation instead of failing requests.
+    """
+    entry = _vector_cache.get(key)
+    if entry is not None:
+        created, payload = entry
+        if time.monotonic() - created <= _VECTOR_CACHE_TTL_SECONDS:
+            return payload
+        _vector_cache.pop(key, None)
+
+    client = _get_redis_client()
+    if client is None:
+        return None
+    try:
+        # The redis stub types ``.get`` as ``Awaitable[Any] | Any`` even for a
+        # synchronous client (see api/services/cache.py); with
+        # ``decode_responses=False`` the value is ``bytes | None`` at runtime.
+        raw = cast("bytes | None", client.get(_vector_redis_key(key)))
+    except redis_lib.RedisError:
+        _note_redis_error("read")
+        return None
+    if raw is None:
+        return None
+    _note_redis_success()
+    payload = bytes(raw)
+    _vector_cache[key] = (time.monotonic(), payload)
+    _evict_l1()
+    return payload
+
+
+def _vector_cache_set(key: tuple[object, ...], payload: bytes) -> None:
+    """Store a payload in the L1 cache and, best-effort, the shared Redis L2.
+
+    The L2 write uses the shared TTL so entries expire uniformly across
+    workers; a Redis outage drops the write without failing the request.
+    """
+    _vector_cache[key] = (time.monotonic(), payload)
+    _evict_l1()
+
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        client.setex(_vector_redis_key(key), _VECTOR_CACHE_TTL_SECONDS, payload)
+        _note_redis_success()
+    except redis_lib.RedisError:
+        _note_redis_error("write")
 
 
 def _select_and_encode_vector_field(

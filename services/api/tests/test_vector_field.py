@@ -17,6 +17,7 @@ from domain.models.wind import (
     decode_vector_field_int16,
 )
 
+from api.services import vector_field
 from api.services.vector_field import (
     _select_and_encode_vector_field,
     _vector_cache,
@@ -24,6 +25,16 @@ from api.services.vector_field import (
     _vector_cache_key,
     _vector_cache_set,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_shared_redis(monkeypatch):
+    """Keep cache tests on the process-local layer: no writes to a live Redis.
+
+    A local/CI Redis would otherwise receive setex writes and leak entries
+    across tests via the shared L2 read path.
+    """
+    monkeypatch.setattr(vector_field, "_get_redis_client", lambda: None)
 
 
 def test_select_and_encode_vector_field_gfs_deterministic():
