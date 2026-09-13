@@ -215,3 +215,86 @@ class TestCloudEnsembleSummaries:
             [500.0] * 10 + [float("nan")] * 20, 1000.0
         )
         assert prob_invalid is None
+
+
+class TestReconstructRunningAverageInterval:
+    """I19: general (R, W) reconstruction; legacy 2*C6-C3 is the (6, 3) special case."""
+
+    def test_legacy_case_matches_reconstruct_cloud_cover_3h(self) -> None:
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        for c6, c3 in [(60.0, 30.0), (10.0, 20.0), (95.0, 100.0), (0.0, 0.0)]:
+            assert reconstruct_running_average_interval(
+                c6, c3, reset_period_hours=6, interval_width_hours=3
+            ) == reconstruct_cloud_cover_3h(c6, c3)
+
+    def test_general_form_w_divides_r(self) -> None:
+        # R=12, W=3: X = (12*C12 - 9*C9) / 3
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        # 12h avg 40 over [0,12]; 9h running avg 30 over [0,9]:
+        # interval [9,12] integral = 12*40 - 9*30 = 210 -> avg 70
+        assert (
+            reconstruct_running_average_interval(
+                40.0, 30.0, reset_period_hours=12, interval_width_hours=3
+            )
+            == 70.0
+        )
+
+    def test_w_equals_r_passthrough(self) -> None:
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        # W == R: upstream already provides the W-width quantity; predecessor unused.
+        assert (
+            reconstruct_running_average_interval(
+                55.0, 999.0, reset_period_hours=6, interval_width_hours=6
+            )
+            == 55.0
+        )
+
+    def test_guardrails_applied_to_general_form(self) -> None:
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        # (R=12, W=3): slight undershoot -> 0.0; gross invalid -> NaN
+        assert (
+            reconstruct_running_average_interval(
+                7.25, 10.0, reset_period_hours=12, interval_width_hours=3
+            )
+            == 0.0
+        )  # (12*7.25 - 9*10)/3 = -1.0 -> clipped
+        assert math.isnan(
+            reconstruct_running_average_interval(
+                0.0, 100.0, reset_period_hours=12, interval_width_hours=3
+            )
+        )  # (0 - 900)/3 = -300 -> NaN
+
+    def test_nan_inputs_propagate(self) -> None:
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        assert math.isnan(
+            reconstruct_running_average_interval(
+                float("nan"), 30.0, reset_period_hours=6, interval_width_hours=3
+            )
+        )
+
+    def test_invalid_metadata_combinations_rejected(self) -> None:
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        with pytest.raises(ValueError, match="must be positive"):
+            reconstruct_running_average_interval(
+                1.0, 1.0, reset_period_hours=0, interval_width_hours=3
+            )
+        with pytest.raises(ValueError, match="must not exceed reset period"):
+            reconstruct_running_average_interval(
+                1.0, 1.0, reset_period_hours=3, interval_width_hours=6
+            )
+
+    def test_numpy_array_path_general_form(self) -> None:
+        from domain.models.cloud import reconstruct_running_average_interval
+
+        cur = np.array([40.0, 20.0])
+        pred = np.array([30.0, 20.0])
+        out = reconstruct_running_average_interval(
+            cur, pred, reset_period_hours=12, interval_width_hours=3
+        )
+        np.testing.assert_allclose(out, [70.0, 20.0])

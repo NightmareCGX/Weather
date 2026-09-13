@@ -98,6 +98,109 @@ def reconstruct_cloud_cover_3h(
 ) -> float | NDArray[np.floating[Any]]: ...
 
 
+def reconstruct_running_average_interval(
+    current_reset_avg: float | NDArray[np.floating[Any]],
+    predecessor_avg: float | NDArray[np.floating[Any]],
+    *,
+    reset_period_hours: int,
+    interval_width_hours: int,
+    tolerance: float = CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT,
+) -> float | NDArray[np.floating[Any]]:
+    r"""Reconstruct a W-width interval average at a reset lead from running averages.
+
+    General form for a variable whose upstream fields are running-since-reset
+    averages over ``R = reset_period_hours`` (architecture doc I19; W =
+    ``interval_width_hours``, requires ``0 < W <= R``):
+
+    $$X_W = \frac{R \cdot C_{R}(L) - (R - W) \cdot C(L - W)}{W}$$
+
+    where ``C(L)`` is the running-since-reset average at the reset lead L and
+    ``C(L - W)`` the running average at the predecessor lead. The historically
+    hardcoded cloud formula ``x = 2 * C6 - C3`` is exactly the (R=6, W=3) special
+    case: ``(6*C6 - 3*C3)/3``. The pairing ``W == R / 2`` is a configuration
+    coincidence and must never be assumed by generic logic.
+
+    Guardrail application:
+    * $[0.0, 100.0]$: Valid physical range, retained unchanged.
+    * $[-tolerance, 0.0)$: Minor numerical undershoot, clipped to $0.0$.
+    * $(100.0, 100.0 + tolerance]$: Minor numerical overshoot, clipped to $100.0$.
+    * $< -tolerance$ or $> 100.0 + tolerance$: Invalid reconstruction, set to NaN.
+
+    Args:
+        current_reset_avg: Running-since-reset average at the reset lead L.
+        predecessor_avg: Running average at the predecessor lead L - W.
+        reset_period_hours: R, the upstream reset period in hours.
+        interval_width_hours: W, the target interval width in hours.
+        tolerance: Reconstruction guardrail tolerance (percentage points, default 5.0).
+
+    Returns:
+        Reconstructed W-width interval average (scalar float or NumPy array).
+    """
+    r_hours = int(reset_period_hours)
+    w_hours = int(interval_width_hours)
+    if r_hours <= 0 or w_hours <= 0:
+        raise ValueError(
+            f"reset_period_hours and interval_width_hours must be positive, got "
+            f"W={w_hours}, R={r_hours}"
+        )
+    if w_hours > r_hours:
+        raise ValueError(
+            f"interval width W={w_hours} must not exceed reset period R={r_hours}"
+        )
+
+    if w_hours == r_hours:
+        # Upstream already provides the W-width quantity at the reset lead.
+        return _apply_reconstruction_guardrails(current_reset_avg, current_reset_avg, tolerance)
+
+    if isinstance(current_reset_avg, np.ndarray) or isinstance(
+        predecessor_avg, np.ndarray
+    ):
+        cur = np.asarray(current_reset_avg, dtype=np.float64)
+        pred = np.asarray(predecessor_avg, dtype=np.float64)
+        x = (r_hours * cur - (r_hours - w_hours) * pred) / float(w_hours)
+        return _apply_reconstruction_guardrails(x, current_reset_avg, tolerance)
+
+    if math.isnan(current_reset_avg) or math.isnan(predecessor_avg):
+        return float("nan")
+
+    x_val = (
+        r_hours * float(current_reset_avg) - (r_hours - w_hours) * float(predecessor_avg)
+    ) / float(w_hours)
+    return _apply_reconstruction_guardrails_scalar(x_val, tolerance)
+
+
+def _apply_reconstruction_guardrails(
+    x: float | NDArray[np.floating[Any]],
+    template: float | NDArray[np.floating[Any]],
+    tolerance: float,
+) -> float | NDArray[np.floating[Any]]:
+    """Apply the reconstruction guardrails to a pre-computed reconstruction."""
+    if isinstance(x, np.ndarray):
+        result = np.full_like(x, np.nan, dtype=np.float64)
+        valid_mask = (x >= 0.0) & (x <= 100.0)
+        result[valid_mask] = x[valid_mask]
+        undershoot_mask = (x >= -tolerance) & (x < 0.0)
+        result[undershoot_mask] = 0.0
+        overshoot_mask = (x > 100.0) & (x <= 100.0 + tolerance)
+        result[overshoot_mask] = 100.0
+        if isinstance(template, np.ndarray) and template.dtype == np.float32:
+            return result.astype(np.float32)
+        return result
+    return _apply_reconstruction_guardrails_scalar(float(x), tolerance)
+
+
+def _apply_reconstruction_guardrails_scalar(x_val: float, tolerance: float) -> float:
+    if math.isnan(x_val):
+        return float("nan")
+    if 0.0 <= x_val <= 100.0:
+        return x_val
+    if -tolerance <= x_val < 0.0:
+        return 0.0
+    if 100.0 < x_val <= (100.0 + tolerance):
+        return 100.0
+    return float("nan")
+
+
 def reconstruct_cloud_cover_3h(
     current_6h_avg: float | NDArray[np.floating[Any]],
     prev_3h_avg: float | NDArray[np.floating[Any]],
@@ -105,15 +208,13 @@ def reconstruct_cloud_cover_3h(
 ) -> float | NDArray[np.floating[Any]]:
     r"""Reconstruct 3-hour interval-averaged cloud cover at 6-hour reset leads.
 
-    At reset leads ($f006, f012, \dots$), upstream GRIB provides the 6-hour average
-    $\bar{C}_{t-6, t}$. The second 3-hour mean $\bar{C}_{t-3, t}$ is reconstructed as:
+    Legacy (R=6, W=3) special case of :func:`reconstruct_running_average_interval`:
+    at reset leads ($f006, f012, \dots$), upstream GRIB provides the 6-hour average
+    $\bar{C}_{t-6, t}$ and the second 3-hour mean $\bar{C}_{t-3, t}$ is reconstructed as
     $$x = 2 \cdot C_{6\text{h}} - C_{3\text{h}}(t-3)$$
 
-    Guardrail application:
-    * $[0.0, 100.0]$: Valid physical range, retained unchanged.
-    * $[-tolerance, 0.0)$: Minor numerical undershoot, clipped to $0.0$.
-    * $(100.0, 100.0 + tolerance]$: Minor numerical overshoot, clipped to $100.0$.
-    * $< -tolerance$ or $> 100.0 + tolerance$: Invalid reconstruction, set to NaN.
+    New call sites must use :func:`reconstruct_running_average_interval` with
+    explicit (R, W) from :data:`domain.temporal.VARIABLE_TEMPORAL_METADATA`.
 
     Args:
         current_6h_avg: 6-hour interval-average cloud cover at current reset lead.
@@ -123,44 +224,13 @@ def reconstruct_cloud_cover_3h(
     Returns:
         Reconstructed 3-hour cloud cover (scalar float or NumPy array).
     """
-    if isinstance(current_6h_avg, np.ndarray) or isinstance(prev_3h_avg, np.ndarray):
-        c6 = np.asarray(current_6h_avg, dtype=np.float64)
-        c3 = np.asarray(prev_3h_avg, dtype=np.float64)
-        x = 2.0 * c6 - c3
-
-        result = np.full_like(x, np.nan, dtype=np.float64)
-
-        # Valid physical range
-        valid_mask = (x >= 0.0) & (x <= 100.0)
-        result[valid_mask] = x[valid_mask]
-
-        # Minor undershoot: [-tolerance, 0) -> 0.0
-        undershoot_mask = (x >= -tolerance) & (x < 0.0)
-        result[undershoot_mask] = 0.0
-
-        # Minor overshoot: (100, 100 + tolerance] -> 100.0
-        overshoot_mask = (x > 100.0) & (x <= 100.0 + tolerance)
-        result[overshoot_mask] = 100.0
-
-        # Values < -tolerance or > 100 + tolerance remain NaN
-
-        if isinstance(current_6h_avg, np.ndarray) and current_6h_avg.dtype == np.float32:
-            return result.astype(np.float32)
-        return result
-
-    # Scalar branch
-    if math.isnan(current_6h_avg) or math.isnan(prev_3h_avg):
-        return float("nan")
-
-    x_val = 2.0 * float(current_6h_avg) - float(prev_3h_avg)
-
-    if 0.0 <= x_val <= 100.0:
-        return x_val
-    if -tolerance <= x_val < 0.0:
-        return 0.0
-    if 100.0 < x_val <= (100.0 + tolerance):
-        return 100.0
-    return float("nan")
+    return reconstruct_running_average_interval(
+        current_6h_avg,
+        prev_3h_avg,
+        reset_period_hours=6,
+        interval_width_hours=3,
+        tolerance=tolerance,
+    )
 
 
 def classify_cloud_ceiling(

@@ -126,3 +126,62 @@ def test_serving_start_valid_time_validation_errors() -> None:
         serving_start_valid_time(aware_dt, cadence_hours=0)
     with pytest.raises(ValueError, match="strictly positive"):
         serving_start_valid_time(aware_dt, cadence_hours=-3)
+
+
+def test_variable_temporal_metadata_registry() -> None:
+    """I19: interval width and reset period are independent per-variable metadata."""
+    from domain.temporal import (
+        VARIABLE_TEMPORAL_METADATA,
+        VariableTemporalMetadata,
+        get_variable_temporal_metadata,
+    )
+
+    precip = get_variable_temporal_metadata("precipitation_amount_3h")
+    cloud = get_variable_temporal_metadata("cloud_cover_3h")
+    assert precip == VariableTemporalMetadata(
+        interval_width_hours=3, reset_period_hours=6
+    )
+    assert cloud == VariableTemporalMetadata(
+        interval_width_hours=3, reset_period_hours=6
+    )
+    # Case/whitespace normalization
+    assert get_variable_temporal_metadata("  Cloud_Cover_3H ") == cloud
+    # Unknown / non-interval variables are rejected loudly
+    with pytest.raises(ValueError, match="No temporal metadata registered"):
+        get_variable_temporal_metadata("temperature_2m")
+    with pytest.raises(ValueError, match="must not be None"):
+        get_variable_temporal_metadata(None)  # type: ignore[arg-type]
+    assert "precipitation_amount_3h" in VARIABLE_TEMPORAL_METADATA
+
+
+def test_is_valid_time_protected_boundary_semantics() -> None:
+    """I3/I20: protected = {vt >= serving_start(now)}; boundary exit is permanent."""
+    from domain.temporal import is_valid_time_protected
+
+    # 07:00Z -> serving_start 06Z: 06Z protected, 03Z exited
+    now = datetime(2026, 9, 10, 7, 0, 0, tzinfo=timezone.utc)
+    assert is_valid_time_protected(datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc), now)
+    assert not is_valid_time_protected(
+        datetime(2026, 9, 10, 3, 0, 0, tzinfo=timezone.utc), now
+    )
+
+    # Exact cadence boundary advance: at 09:00Z the anchor is 09Z, so 06Z and 03Z
+    # have both exited the window. The boundary is monotonically non-decreasing —
+    # once a valid_time exits, it never re-enters (permanent exit).
+    now_9 = datetime(2026, 9, 10, 9, 0, 0, tzinfo=timezone.utc)
+    assert is_valid_time_protected(datetime(2026, 9, 10, 9, 0, 0, tzinfo=timezone.utc), now_9)
+    assert not is_valid_time_protected(
+        datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc), now_9
+    )
+    assert not is_valid_time_protected(
+        datetime(2026, 9, 10, 3, 0, 0, tzinfo=timezone.utc), now_9
+    )
+
+    # Future valid times are protected
+    assert is_valid_time_protected(
+        datetime(2026, 9, 11, 0, 0, 0, tzinfo=timezone.utc), now
+    )
+
+    # Naive valid_time is rejected
+    with pytest.raises(ValueError, match="timezone-aware"):
+        is_valid_time_protected(datetime(2026, 9, 10, 6, 0, 0), now)
