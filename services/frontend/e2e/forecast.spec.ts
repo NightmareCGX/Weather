@@ -586,9 +586,13 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   await expect(page.getByTestId("phase-badge-unknown")).toBeVisible();
   await expect(page.locator('[data-testid="phase-badge-mixed"]')).toHaveCount(0);
 
-  // Verify prominent segment percentages rendered on the chart bars
-  await expect(page.getByText("52%").first()).toBeVisible(); // Rain
-  await expect(page.getByText("26%").first()).toBeVisible(); // Snow
+  // Exact percentages are tooltip-only: bars render no in-bar labels, and
+  // hovering the chart surfaces the per-phase breakdown for the hovered time.
+  await expect(phaseChart.locator(".recharts-label-list")).toHaveCount(0);
+  await phaseChart.hover();
+  await expect(phaseChart.locator(".recharts-tooltip-wrapper")).toBeVisible();
+  await expect(page.getByText("52%", { exact: true }).first()).toBeVisible(); // Rain
+  await expect(page.getByText("26%", { exact: true }).first()).toBeVisible(); // Snow
 
   // Verify secondary transition frequency
   await expect(page.getByText(/Member Phase Transitions/)).toBeVisible();
