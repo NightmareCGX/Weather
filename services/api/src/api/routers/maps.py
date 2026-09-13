@@ -221,6 +221,7 @@ def get_spatial_layer(
     summary="Get 10-meter wind vector field for flow animation",
 )
 def get_wind_vector_field(
+    request: Request,  # injected by FastAPI
     model: str,
     lead_time_hours: Annotated[
         int | None, Query(ge=0, description="Forecast offset hours from cycle time.")
@@ -243,7 +244,6 @@ def get_wind_vector_field(
     ] = None,
     db: Session = DB,
     now: datetime = CURRENT_TIME,
-    request: Request = None,  # injected by FastAPI; default None keeps direct calls working
 ) -> StarletteResponse:
     """Return the quantized Int16 binary wind vector field for particle flow animation."""
     from api.services.vector_field import render_vector_field_binary
@@ -261,7 +261,7 @@ def get_wind_vector_field(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     headers = {"Cache-Control": CACHE_CONTROL_VECTOR_FIELD}
-    accept_encoding = request.headers.get("accept-encoding", "") if request is not None else ""
+    accept_encoding = request.headers.get("accept-encoding", "")
     if "gzip" in accept_encoding:
         payload = gzip.compress(payload, compresslevel=VECTOR_FIELD_GZIP_LEVEL)
         headers["Content-Encoding"] = "gzip"
