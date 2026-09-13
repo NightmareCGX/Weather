@@ -274,8 +274,9 @@ class AlertEngine:
         ingestion_data: dict[str, Any] | None = None,
         storage_data: Any | None = None,
         leak_data: Any | None = None,
+        gc_data: dict[str, Any] | None = None,
     ) -> list[Alert]:
-        """Evaluate all system, resource, database, and lifecycle rules against snapshots."""
+        """Evaluate all system, resource, database, lifecycle, and gc rules against snapshots."""
         alerts: list[Alert] = []
 
         # 1. Disk & Memory rules
@@ -542,6 +543,69 @@ class AlertEngine:
                             )
                         )
 
+        # 6. GC pipeline pass rules (in-process stage snapshot from the GC
+        # daemon; see ingestion.monitoring.gc_metrics.snapshot_alert_state).
+        # Complements the queue-state rules above: reclamation_failed_shards
+        # watches the persisted quarantine backlog, these watch what actually
+        # happened during the latest pass.
+        if gc_data is not None:
+            worker_failed = int(gc_data.get("worker_failed_total", 0))
+            if worker_failed > 0:
+                alerts.append(
+                    Alert(
+                        name="gc_worker_failed_shards",
+                        severity=AlertSeverity.WARNING,
+                        summary=f"Reclamation worker failed {worker_failed} shard targets in latest pass",
+                        description=(
+                            f"The GC reclamation worker moved {worker_failed} shard target(s) into failed "
+                            "quarantine during its latest pass. Inspect reclamation_queue and consider "
+                            "`weather-ingest reclamation requeue`."
+                        ),
+                        scope="reclamation",
+                        value=worker_failed,
+                        threshold=0,
+                        runbook_anchor="#gc-worker-failures",
+                    )
+                )
+
+            sweeper_failed = int(gc_data.get("sweeper_failed_total", 0))
+            if sweeper_failed > 0:
+                alerts.append(
+                    Alert(
+                        name="gc_sweeper_failed_cycles",
+                        severity=AlertSeverity.WARNING,
+                        summary=f"Metadata sweeper failed {sweeper_failed} cycles in latest pass",
+                        description=(
+                            f"{sweeper_failed} cycle(s) failed the 14-day metadata retention sweeper pass. "
+                            "The cycles stay tombstoned with detailed metadata retained; the next pass retries."
+                        ),
+                        scope="sweeper",
+                        value=sweeper_failed,
+                        threshold=0,
+                        runbook_anchor="#gc-sweeper-failures",
+                    )
+                )
+
+            orphans_within_frontier = int(gc_data.get("inventory_orphans_within_frontier", 0))
+            if orphans_within_frontier > 0:
+                alerts.append(
+                    Alert(
+                        name="gc_orphan_stores_detected",
+                        severity=AlertSeverity.WARNING,
+                        summary=f"{orphans_within_frontier} orphan cycle store(s) within recoverability frontier",
+                        description=(
+                            f"Store<->catalog reconciliation found {orphans_within_frontier} physical cycle store(s) "
+                            "with no catalog identity whose serving horizon has not expired. Catalog recovery from "
+                            "COMPLETE marker evidence is possible but deliberately not automated — run "
+                            "`weather-ingest gc --inventory` for the detailed listing."
+                        ),
+                        scope="inventory",
+                        value=orphans_within_frontier,
+                        threshold=0,
+                        runbook_anchor="#orphan-inventory",
+                    )
+                )
+
         return alerts
 
     def evaluate_and_dispatch(
@@ -552,6 +616,7 @@ class AlertEngine:
         ingestion_data: dict[str, Any] | None = None,
         storage_data: Any | None = None,
         leak_data: Any | None = None,
+        gc_data: dict[str, Any] | None = None,
     ) -> list[AlertEvent]:
         """Evaluate rules and dispatch new, escalated, and recovered alert events."""
         current_alerts = self.evaluate_rules(
@@ -561,6 +626,7 @@ class AlertEngine:
             ingestion_data=ingestion_data,
             storage_data=storage_data,
             leak_data=leak_data,
+            gc_data=gc_data,
         )
         events = self.deduplicator.process_alerts(current_alerts)
         for event in events:
