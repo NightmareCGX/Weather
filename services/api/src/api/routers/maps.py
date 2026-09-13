@@ -22,10 +22,11 @@ calculations live in the handler.
 
 from __future__ import annotations
 
+import gzip
 from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response as StarletteResponse
 from sqlalchemy import select
@@ -62,6 +63,14 @@ CACHE_CONTROL_MAPS = "no-cache"
 #: cycles or same-cycle replacements arrive, so revalidation (no-cache) prevents
 #: the browser from reusing stale tiles while backend caches accelerate computation.
 CACHE_CONTROL_TILE = "no-cache"
+#: Cache policy for the wind vector field binary: the payload only changes when
+#: a newer cycle serves the same valid time (every ~6h), so a short browser
+#: freshness window (60s) makes reloads and back/forward navigations hit the
+#: HTTP cache while keeping cycle-switch staleness negligible.
+CACHE_CONTROL_VECTOR_FIELD = "public, max-age=60"
+#: gzip compression level for the vector field payload (~1 MB raw Int16;
+#: level 6 halves transfer size at modest CPU cost).
+VECTOR_FIELD_GZIP_LEVEL = 6
 
 
 def _legend_stops(variable: str) -> list[list[float | str]]:
@@ -234,6 +243,7 @@ def get_wind_vector_field(
     ] = None,
     db: Session = DB,
     now: datetime = CURRENT_TIME,
+    request: Request = None,  # injected by FastAPI; default None keeps direct calls working
 ) -> StarletteResponse:
     """Return the quantized Int16 binary wind vector field for particle flow animation."""
     from api.services.vector_field import render_vector_field_binary
@@ -250,10 +260,17 @@ def get_wind_vector_field(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    headers = {"Cache-Control": CACHE_CONTROL_VECTOR_FIELD}
+    accept_encoding = request.headers.get("accept-encoding", "") if request is not None else ""
+    if "gzip" in accept_encoding:
+        payload = gzip.compress(payload, compresslevel=VECTOR_FIELD_GZIP_LEVEL)
+        headers["Content-Encoding"] = "gzip"
+    headers["Vary"] = "Accept-Encoding"
+
     return StarletteResponse(
         content=payload,
         media_type="application/octet-stream",
-        headers={"Cache-Control": CACHE_CONTROL_TILE},
+        headers=headers,
     )
 
 

@@ -3,7 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
-import type { ApproximateStartupLocation, SelectedLocation, SpatialLayer } from "@/lib/api/types";
+import type {
+  ApproximateStartupLocation,
+  SelectedLocation,
+  SpatialLayer,
+  VectorFieldData,
+} from "@/lib/api/types";
 import { buildBaseStyle } from "@/lib/map/baseStyle";
 import { applyWeatherLayer, removeWeatherLayer } from "@/lib/map/layers";
 import { canonicalizeLongitude, coordinatesToSelectedLocation } from "@/lib/forecast/selection";
@@ -62,6 +67,7 @@ export function WeatherMap({
   const isStyleReadyRef = useRef<boolean>(false);
   const markerRef = useRef<maplibregl.Marker | null>(null);
   const animRef = useRef<WindParticleAnimation | null>(null);
+  const fieldRef = useRef<VectorFieldData | null>(null);
   const layerRef = useRef<SpatialLayer | null>(layer);
   const appliedLayerRef = useRef<SpatialLayer | null>(null);
   const isMapClickSelectionRef = useRef<boolean>(false);
@@ -172,6 +178,10 @@ export function WeatherMap({
 
       if (canvasRef.current !== null && animRef.current === null) {
         animRef.current = new WindParticleAnimation(canvasRef.current, map);
+        // The vector field may arrive before the map finishes loading (e.g. a
+        // warm server cache); feed it immediately so particles never stall
+        // waiting for the next field/layer change.
+        animRef.current.setField(fieldRef.current);
       }
 
       if (layerRef.current !== null) {
@@ -235,6 +245,7 @@ export function WeatherMap({
 
   // Synchronize vector field with particle animation engine
   useEffect(() => {
+    fieldRef.current = field;
     if (animRef.current === null) {
       return;
     }
