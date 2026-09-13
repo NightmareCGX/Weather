@@ -185,3 +185,123 @@ def test_is_valid_time_protected_boundary_semantics() -> None:
     # Naive valid_time is rejected
     with pytest.raises(ValueError, match="timezone-aware"):
         is_valid_time_protected(datetime(2026, 9, 10, 6, 0, 0), now)
+
+
+def test_is_valid_time_on_horizon_grid() -> None:
+    """I20: grid membership is derived from the model's canonical horizon."""
+    from domain.horizon import (
+        MODEL_CANONICAL_HORIZONS,
+        register_canonical_lead_horizon,
+    )
+    from domain.temporal import is_valid_time_on_horizon_grid
+
+    # Canonical gfs registry: 3h grid -> 06:00Z aligned; 05:00Z / 06:30Z not.
+    assert is_valid_time_on_horizon_grid(
+        datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc), model_id="gfs"
+    )
+    assert not is_valid_time_on_horizon_grid(
+        datetime(2026, 9, 10, 5, 0, 0, tzinfo=timezone.utc), model_id="gfs"
+    )
+    assert not is_valid_time_on_horizon_grid(
+        datetime(2026, 9, 10, 6, 30, 0, tzinfo=timezone.utc), model_id="gfs"
+    )
+
+    # Unknown model is rejected loudly.
+    with pytest.raises(ValueError, match="Unknown model"):
+        is_valid_time_on_horizon_grid(
+            datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc), model_id="nope"
+        )
+
+    # Naive valid_time is rejected.
+    with pytest.raises(ValueError, match="timezone-aware"):
+        is_valid_time_on_horizon_grid(datetime(2026, 9, 10, 6, 0, 0))
+
+    # Explicit cadence override (no model).
+    assert is_valid_time_on_horizon_grid(
+        datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc), cadence_hours=6
+    )
+    assert not is_valid_time_on_horizon_grid(
+        datetime(2026, 9, 10, 3, 0, 0, tzinfo=timezone.utc), cadence_hours=6
+    )
+
+    # Default canonical cadence (no model, no override).
+    assert is_valid_time_on_horizon_grid(
+        datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc)
+    )
+    assert not is_valid_time_on_horizon_grid(
+        datetime(2026, 9, 10, 4, 0, 0, tzinfo=timezone.utc)
+    )
+
+    # Single-lead horizon falls back to the canonical cadence.
+    register_canonical_lead_horizon("test_single_lead", (0,))
+    try:
+        assert is_valid_time_on_horizon_grid(
+            datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc),
+            model_id="test_single_lead",
+        )
+    finally:
+        MODEL_CANONICAL_HORIZONS.pop("test_single_lead", None)
+
+
+def test_is_valid_time_protected_model_grid_membership() -> None:
+    """I20: with a model, protection = boundary AND horizon-grid membership."""
+    from domain.horizon import (
+        MODEL_CANONICAL_HORIZONS,
+        register_canonical_lead_horizon,
+    )
+    from domain.temporal import is_valid_time_protected
+
+    # Hypothetical 6h-grid-only model (leads 0/6/12): 03:00Z is off-grid.
+    register_canonical_lead_horizon("test_model_6h", (0, 6, 12))
+    try:
+        # now = 05:00Z -> serving_start 03Z, so 03:00Z passes the boundary ...
+        now = datetime(2026, 9, 10, 5, 0, 0, tzinfo=timezone.utc)
+        # ... but is rejected by the model's horizon grid.
+        assert not is_valid_time_protected(
+            datetime(2026, 9, 10, 3, 0, 0, tzinfo=timezone.utc),
+            now,
+            model_id="test_model_6h",
+        )
+        # 06:00Z is inside the window and on the grid -> protected.
+        assert is_valid_time_protected(
+            datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc),
+            now,
+            model_id="test_model_6h",
+        )
+        # Unknown model propagates the registry error.
+        with pytest.raises(ValueError, match="Unknown model"):
+            is_valid_time_protected(
+                datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc),
+                now,
+                model_id="nope",
+            )
+    finally:
+        MODEL_CANONICAL_HORIZONS.pop("test_model_6h", None)
+
+    # Without a model, legacy boundary-only semantics are preserved: 03:00Z
+    # passes the same boundary even though no model grid was consulted.
+    assert is_valid_time_protected(
+        datetime(2026, 9, 10, 3, 0, 0, tzinfo=timezone.utc), now
+    )
+
+
+def test_protected_valid_times_enumeration() -> None:
+    """I20: the enumerable protected window is [serving_start, +max_lead]."""
+    from domain.horizon import MODEL_VERSION_HORIZONS, register_canonical_lead_horizon
+    from domain.temporal import protected_valid_times
+
+    now = datetime(2026, 9, 10, 7, 0, 0, tzinfo=timezone.utc)
+    vts = protected_valid_times("gfs", now)
+    # 07:00Z -> serving_start 06Z; gfs max lead 240h at 3h cadence -> 81 instants.
+    assert vts[0] == datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc)
+    assert len(vts) == 81
+    assert vts[-1] == datetime(2026, 9, 20, 6, 0, 0, tzinfo=timezone.utc)
+    assert all((b - a) == timedelta(hours=3) for a, b in zip(vts, vts[1:]))
+
+    # Version-scoped horizon selection.
+    register_canonical_lead_horizon("gfs", (0,), version_string="v9.9")
+    try:
+        vts_v = protected_valid_times("gfs", now, version_string="v9.9")
+        assert vts_v == (datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc),)
+    finally:
+        MODEL_VERSION_HORIZONS.pop(("gfs", "v9.9"), None)

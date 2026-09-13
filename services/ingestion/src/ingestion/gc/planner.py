@@ -451,7 +451,7 @@ def plan_reclamation_pass(
         protected_candidates: dict[datetime, list[CanonicalCandidate]] = {
             vt: cands
             for vt, cands in candidates_by_valid.items()
-            if is_valid_time_protected(vt, now_utc)
+            if is_valid_time_protected(vt, now_utc, model_id=m_id)
         }
 
         # 8. Evaluate shared canonical resolution across the active serving window

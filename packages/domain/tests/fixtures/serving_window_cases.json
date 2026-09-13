@@ -1,0 +1,36 @@
+{
+  "_meta": {
+    "description": "Shared Python/TS case table for the serving-window boundary primitive (Lifecycle V3 section 5 / I20). Single source of truth consumed by BOTH packages/domain/tests/test_temporal_serving_window_fixture.py and services/frontend/src/lib/forecast/__tests__/serving-window-fixture.test.ts to lock the Python primitive and the TS fallback implementation against drift. Add or change cases here and keep both consumers in sync.",
+    "semantics": "serving_start = latest 3h-grid model valid time <= now (exact boundary advances immediately). protection = valid_time >= serving_start."
+  },
+  "serving_start_cases": [
+    { "now": "2026-09-10T05:59:59Z", "expected_serving_start": "2026-09-10T03:00:00Z" },
+    { "now": "2026-09-10T06:00:00Z", "expected_serving_start": "2026-09-10T06:00:00Z" },
+    { "now": "2026-09-10T06:00:01Z", "expected_serving_start": "2026-09-10T06:00:00Z" },
+    { "now": "2026-09-10T07:00:00Z", "expected_serving_start": "2026-09-10T06:00:00Z" },
+    { "now": "2026-09-10T08:59:59Z", "expected_serving_start": "2026-09-10T06:00:00Z" },
+    { "now": "2026-09-10T09:00:00Z", "expected_serving_start": "2026-09-10T09:00:00Z" }
+  ],
+  "protection_cases": [
+    {
+      "now": "2026-09-10T07:00:00Z",
+      "valid_time": "2026-09-10T06:00:00Z",
+      "expected_protected": true
+    },
+    {
+      "now": "2026-09-10T07:00:00Z",
+      "valid_time": "2026-09-10T03:00:00Z",
+      "expected_protected": false
+    },
+    {
+      "now": "2026-09-10T09:00:00Z",
+      "valid_time": "2026-09-10T06:00:00Z",
+      "expected_protected": false
+    },
+    {
+      "now": "2026-09-10T05:59:59Z",
+      "valid_time": "2026-09-10T03:00:00Z",
+      "expected_protected": true
+    }
+  ]
+}
