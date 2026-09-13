@@ -644,7 +644,10 @@ async def _run_wave_impl(
     import uuid
     from concurrent.futures import ThreadPoolExecutor
 
-    from ingestion.core.cancel import await_all_workers_non_abandoning
+    from ingestion.core.cancel import (
+        await_all_workers_non_abandoning,
+        await_blocking_settled,
+    )
     import ingestion.core.config as config_mod
     settings = config_mod.settings
     from ingestion.core.coordinator import (
@@ -901,7 +904,8 @@ async def _run_wave_impl(
             t_dec_start = time.monotonic()
             try:
                 seed_future = decode_pool.submit(seed_dest)
-                seed_dataset = _decode_and_normalize(
+                seed_dataset = await await_blocking_settled(
+                    _decode_and_normalize,
                     seed_future,
                     catalog_spec,
                     store_path=store_path,
@@ -1236,6 +1240,8 @@ async def _run_wave_impl(
                             # Retrieve and consume predecessor raw state if this is a 6h reset lead
                             pred_precip = None
                             pred_cloud = None
+                            pred_item: tuple[int | None, int, bool] | None = None
+                            pred_state: PredecessorState | None = None
                             if lead % 6 == 0 and lead > 0:
                                 pred_item = (member, lead - 3, is_mean)
                                 with predecessor_lock:
@@ -1244,15 +1250,30 @@ async def _run_wave_impl(
                                     pred_precip = pred_state.precip_raw
                                     pred_cloud = pred_state.cloud_raw
 
-                            ds = _decode_and_normalize(
-                                decode_fut,
-                                catalog_spec,
-                                store_path=store_path,
-                                predecessor_array=pred_precip,
-                                predecessor_cloud_array=pred_cloud,
-                                member=member,
-                                is_mean=is_mean,
-                            )
+                            # Decode off the event loop: _decode_and_normalize blocks on the
+                            # worker's future.result() and runs numpy normalization, which
+                            # would otherwise freeze the loop and stall all in-flight
+                            # downloads. On cancellation the worker settles before the
+                            # decode/staging slots are released (await_blocking_settled).
+                            try:
+                                ds = await await_blocking_settled(
+                                    _decode_and_normalize,
+                                    decode_fut,
+                                    catalog_spec,
+                                    store_path=store_path,
+                                    predecessor_array=pred_precip,
+                                    predecessor_cloud_array=pred_cloud,
+                                    member=member,
+                                    is_mean=is_mean,
+                                )
+                            except asyncio.CancelledError:
+                                # The worker has fully settled (helper guarantee), so no
+                                # orphan thread can still be reading the arrays. Restore
+                                # the consumed predecessor state before re-raising.
+                                if pred_state is not None and pred_item is not None:
+                                    with predecessor_lock:
+                                        predecessor_states.setdefault(pred_item, pred_state)
+                                raise
                             del decode_fut
                             _validate_requested_lead(ds, lead)
                             _validate_requested_member(ds, member)

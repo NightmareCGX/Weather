@@ -19,9 +19,10 @@ finished, released its locks, and stopped using its resources.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -93,3 +94,42 @@ async def await_all_workers_non_abandoning(
     # used) BEFORE calling cleanup_source_files/executor.shutdown.
 
     return results, cancellation_requested
+
+
+async def await_blocking_settled(
+    fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    """Run a blocking callable off the event loop, settling it on cancellation.
+
+    The callable executes in a worker thread (``asyncio.to_thread``). If the
+    awaiting task is cancelled, the worker is shielded from the initial
+    cancellation and the caller keeps waiting — non-abandoningly, tolerating
+    repeated cancellation — until the worker thread has actually finished,
+    before :class:`asyncio.CancelledError` is re-raised.
+
+    This guarantees that callers holding bounded resources across the call
+    (semaphore slots, staging/residency ownership) never release them while
+    the blocking work is still running: a replacement worker cannot start
+    until this one has settled.
+
+    On the normal path the worker's return value is returned and worker
+    exceptions propagate unchanged. On the cancellation path the worker's
+    result/exception is retrieved and discarded (debug-logged on failure) so
+    no "exception never retrieved" warning is deferred.
+    """
+    task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        # Shield: cancelling the outer task must not cancel the worker Task.
+        # A bare ``await task`` propagates cancellation into it, and the
+        # asyncio side would report done/cancelled while the thread runs.
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        if not task.cancelled():
+            with contextlib.suppress(Exception):
+                task.result()
+        raise
