@@ -342,9 +342,7 @@ export function resolveSpatialLayer(
   if (selection.validTime) {
     const selMs = new Date(selection.validTime).getTime();
     const validTimeEntries = variable.valid_times ?? [];
-    const servingEntry = validTimeEntries.find(
-      (vt) => new Date(vt.valid_time).getTime() === selMs
-    );
+    const servingEntry = validTimeEntries.find((vt) => new Date(vt.valid_time).getTime() === selMs);
     if (servingEntry) {
       sourceCycle = servingEntry.source_cycle;
     } else {

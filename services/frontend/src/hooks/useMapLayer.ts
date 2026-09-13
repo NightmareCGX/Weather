@@ -67,10 +67,7 @@ export function useMapLayer(): UseMapLayerResult {
   const fingerprint = resolved === null ? "" : layerFingerprint(resolved);
 
   const layer = useMemo(() => {
-    if (
-      stableRef.current.layer !== null &&
-      stableRef.current.fingerprint === fingerprint
-    ) {
+    if (stableRef.current.layer !== null && stableRef.current.fingerprint === fingerprint) {
       // Same semantic content, new object identity (e.g. heartbeat refresh):
       // keep the previously applied layer object.
       return stableRef.current.layer;

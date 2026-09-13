@@ -388,8 +388,7 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
 
     // Same valid time, same tile URL, but a newer initial time now serves it
     const newerAvailability = JSON.parse(JSON.stringify(mockAvailability));
-    newerAvailability.models[0].variables[0].valid_times[0].source_cycle =
-      "2026-08-13T06:00:00Z";
+    newerAvailability.models[0].variables[0].valid_times[0].source_cycle = "2026-08-13T06:00:00Z";
     mockUseForecastSelection.mockReturnValue(
       mockContextValue(validTimeSelection, { availability: newerAvailability })
     );
