@@ -136,7 +136,7 @@ def _perform_safe_creator_close(loop: Any, s3creator: Any, timeout: float = 5.0)
     return False
 
 
-class IngestionS3FileSystem(s3fs.S3FileSystem):
+class IngestionS3FileSystem(s3fs.S3FileSystem):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     """Loop-safe S3FileSystem with deterministic session lifecycle and state tracking.
 
     Eliminates upstream s3fs cross-event-loop cleanup defects by:

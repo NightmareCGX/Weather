@@ -17,7 +17,7 @@ from sqlalchemy.orm import relationship
 from api.core.database import Base
 
 
-class ForecastCenter(Base):
+class ForecastCenter(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "forecast_centers"
 
     id = Column(String, primary_key=True)
@@ -35,7 +35,7 @@ class ForecastCenter(Base):
     )
 
 
-class Model(Base):
+class Model(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "models"
 
     id = Column(String, primary_key=True)
@@ -56,7 +56,7 @@ class Model(Base):
     )
 
 
-class ModelVersion(Base):
+class ModelVersion(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "model_versions"
 
     id = Column(String, primary_key=True)
@@ -78,7 +78,7 @@ class ModelVersion(Base):
     )
 
 
-class ModelRun(Base):
+class ModelRun(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "model_runs"
 
     id = Column(String, primary_key=True)
@@ -109,7 +109,7 @@ class ModelRun(Base):
     )
 
 
-class EnsembleMember(Base):
+class EnsembleMember(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "ensemble_members"
 
     id = Column(String, primary_key=True)
@@ -124,7 +124,7 @@ class EnsembleMember(Base):
     run = relationship("ModelRun", back_populates="ensemble_members")
 
 
-class EnsembleMemberProduct(Base):
+class EnsembleMemberProduct(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "ensemble_member_products"
 
     id = Column(String, primary_key=True)
@@ -144,7 +144,7 @@ class EnsembleMemberProduct(Base):
     run = relationship("ModelRun", back_populates="ensemble_member_products")
 
 
-class ForecastVariable(Base):
+class ForecastVariable(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "forecast_variables"
 
     id = Column(String, primary_key=True)
@@ -153,7 +153,7 @@ class ForecastVariable(Base):
     unit = Column(String, nullable=False)
 
 
-class ForecastGrid(Base):
+class ForecastGrid(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "forecast_grids"
 
     id = Column(String, primary_key=True)
@@ -162,7 +162,7 @@ class ForecastGrid(Base):
     resolution_km = Column(Float, nullable=False)
 
 
-class ForecastProduct(Base):
+class ForecastProduct(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "forecast_products"
 
     id = Column(String, primary_key=True)
@@ -192,7 +192,7 @@ class ForecastProduct(Base):
     grid = relationship("ForecastGrid")
 
 
-class Station(Base):
+class Station(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "stations"
 
     id = Column(String, primary_key=True)
@@ -212,7 +212,7 @@ class Station(Base):
     )
 
 
-class City(Base):
+class City(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "cities"
 
     id = Column(String, primary_key=True)
@@ -228,7 +228,7 @@ class City(Base):
     __table_args__ = (Index("idx_cities_geom", "geom", postgresql_using="gist"),)
 
 
-class SkiResort(Base):
+class SkiResort(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "ski_resorts"
 
     id = Column(String, primary_key=True)
@@ -244,7 +244,7 @@ class SkiResort(Base):
     __table_args__ = (Index("idx_ski_resorts_geom", "geom", postgresql_using="gist"),)
 
 
-class VerificationObservation(Base):
+class VerificationObservation(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "verification_observations"
 
     id = Column(String, primary_key=True)
@@ -263,7 +263,7 @@ class VerificationObservation(Base):
     station = relationship("Station", back_populates="observations")
 
 
-class PointQueryFallbackAudit(Base):
+class PointQueryFallbackAudit(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "point_query_fallback_audit"
 
     cache_key = Column(String, primary_key=True)
@@ -279,7 +279,7 @@ class PointQueryFallbackAudit(Base):
     __table_args__ = (Index("idx_point_query_fallback_expires", "expires_at"),)
 
 
-class ForecastCycleLifecycle(Base):
+class ForecastCycleLifecycle(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "forecast_cycle_lifecycle"
 
     model_id = Column(
@@ -306,7 +306,7 @@ class ForecastCycleLifecycle(Base):
     )
 
 
-class ReclamationQueue(Base):
+class ReclamationQueue(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
     __tablename__ = "reclamation_queue"
 
     id = Column(String(length=64), primary_key=True)
