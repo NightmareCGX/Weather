@@ -256,6 +256,7 @@ def build_probability_forecast(
         )
         store_path_str = str(source.store_path)
         lead_time_hours = source.lead_time_hours
+        provenance_run_id = str(source.run_id)
         metadata = gated_cycle_metadata(store_path_str)
     else:
         run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
@@ -263,6 +264,7 @@ def build_probability_forecast(
         )
         assert run.zarr_store_path is not None
         store_path_str = str(run.zarr_store_path)
+        provenance_run_id = str(run.id)
     _resolve_variables(db, metadata, [variable])
     # Release ORM DB connection before storage reads.
     db.close()
@@ -373,7 +375,7 @@ def build_probability_forecast(
 
         fenced_during_read = db.execute(
             select(ReclamationQueue.id).where(
-                ReclamationQueue.run_id == run.id,
+                ReclamationQueue.run_id == provenance_run_id,
                 ReclamationQueue.lead_time_hours == lead_time_hours,
                 ReclamationQueue.target_kind == "mem",
                 ReclamationQueue.member_index.in_(avail_members),
@@ -384,8 +386,13 @@ def build_probability_forecast(
             raise HTTPException(status_code=404, detail="Ensemble member shards became unavailable during read.")
     except HTTPException:
         raise
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - revalidation must never break serving
+        logger.error(
+            "ensemble_post_read_fence_revalidation_failed: run_id=%s lead=%s error=%s",
+            provenance_run_id,
+            lead_time_hours,
+            exc,
+        )
 
     data: dict[str, Any] = {
         "location": ProbabilityLocation(latitude=latitude, longitude=longitude),
@@ -429,6 +436,7 @@ def build_ensemble_statistics(
         )
         store_path_str = str(source.store_path)
         lead_time_hours = source.lead_time_hours
+        provenance_run_id = str(source.run_id)
         metadata = gated_cycle_metadata(store_path_str)
     else:
         run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
@@ -436,6 +444,7 @@ def build_ensemble_statistics(
         )
         assert run.zarr_store_path is not None
         store_path_str = str(run.zarr_store_path)
+        provenance_run_id = str(run.id)
     _resolve_variables(db, metadata, [variable])
     # Release ORM DB connection before storage reads.
     db.close()
@@ -633,7 +642,7 @@ def build_ensemble_statistics(
 
         fenced_during_read = db.execute(
             select(ReclamationQueue.id).where(
-                ReclamationQueue.run_id == run.id,
+                ReclamationQueue.run_id == provenance_run_id,
                 ReclamationQueue.lead_time_hours == lead_time_hours,
                 ReclamationQueue.target_kind == "mem",
                 ReclamationQueue.member_index.in_(avail_members),
@@ -644,8 +653,13 @@ def build_ensemble_statistics(
             raise HTTPException(status_code=404, detail="Ensemble member shards became unavailable during read.")
     except HTTPException:
         raise
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - revalidation must never break serving
+        logger.error(
+            "ensemble_post_read_fence_revalidation_failed: run_id=%s lead=%s error=%s",
+            provenance_run_id,
+            lead_time_hours,
+            exc,
+        )
 
     return EnsembleStatisticsData(
         model=model,
