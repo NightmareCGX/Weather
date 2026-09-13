@@ -375,6 +375,8 @@ export interface SpatialLayer {
   max_zoom: number;
   lead_time_hours?: number | null;
   valid_time?: string | null;
+  /** The initial time (cycle) currently serving `valid_time`; changes when a newer cycle takes over. */
+  source_cycle?: string | null;
   legend: SpatialLayerLegend;
   vector_field_url_template?: string | null;
 }

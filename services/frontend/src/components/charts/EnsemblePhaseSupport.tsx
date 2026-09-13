@@ -1,16 +1,7 @@
 "use client";
 
 import React, { useMemo } from "react";
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  LabelList,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 import {
   GEFS_PHYSICAL_PHASES,
@@ -35,27 +26,6 @@ export interface EnsemblePhaseSupportProps {
   selectedLead?: number | string;
   validTime?: string | null;
   memberCount?: number;
-}
-
-function renderBarLabel(props: any) {
-  const { x, y, width, height, value } = props;
-  if (value == null || typeof value !== "number" || value < 12 || height < 14) {
-    return null;
-  }
-  return (
-    <text
-      x={x + width / 2}
-      y={y + height / 2}
-      fill="#ffffff"
-      textAnchor="middle"
-      dominantBaseline="central"
-      fontSize={10}
-      fontWeight={600}
-      style={{ pointerEvents: "none", textShadow: "0 1px 2px rgba(0,0,0,0.5)" }}
-    >
-      {Math.round(value)}%
-    </text>
-  );
 }
 
 export function EnsemblePhaseSupportTooltip({ active, payload, label, timezone }: any) {
@@ -124,6 +94,8 @@ export function EnsemblePhaseSupportTooltip({ active, payload, label, timezone }
  * 3. Each valid-time stack normalizes to 100% using available members.
  * 4. Missing/unusable phase data at t[n] does not truncate later times t[n+1].
  * 5. Timezone localization aligns with display timezone without secondary implementations.
+ * 6. Exact percentages are NOT drawn on bar segments (too dense at hourly
+ *    resolution); the hover tooltip is the single surface for exact values.
  */
 export function EnsemblePhaseSupport({
   byLead,
@@ -254,9 +226,7 @@ export function EnsemblePhaseSupport({
                 fill={PRECIPITATION_PHASE_TOKENS[phase]?.color ?? "#64748b"}
                 isAnimationActive={false}
                 name={GEFS_PHASE_LABELS[phase]}
-              >
-                <LabelList dataKey={phase} content={renderBarLabel} />
-              </Bar>
+              />
             ))}
           </BarChart>
         </ResponsiveContainer>

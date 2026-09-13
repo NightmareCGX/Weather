@@ -131,7 +131,9 @@ describe("EnsemblePhaseSupport (Time-Varying)", () => {
   ]);
 
   it("renders time-varying 100% stacked bar chart with phase taxonomy badges", () => {
-    render(<EnsemblePhaseSupport byLead={multiLeadData} validTimesByLead={validTimes} />);
+    const { container } = render(
+      <EnsemblePhaseSupport byLead={multiLeadData} validTimesByLead={validTimes} />
+    );
 
     expect(
       screen.getByRole("img", {
@@ -141,6 +143,9 @@ describe("EnsemblePhaseSupport (Time-Varying)", () => {
     expect(
       screen.getByText(/Ensemble Phase Support — time-varying support \(0–100%\)/)
     ).toBeInTheDocument();
+
+    // Exact percentages are hover-tooltip-only; bars carry no LabelList labels
+    expect(container.querySelector(".recharts-label-list")).toBeNull();
 
     // Check that taxonomy badges exist for all 6 physical phases
     expect(screen.getByTestId("phase-badge-dry")).toBeInTheDocument();

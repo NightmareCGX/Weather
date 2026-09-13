@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getVectorField, RequestAbortedError } from "@/lib/api/client";
 import type { VectorFieldData } from "@/lib/api/types";
 import { getCachedVectorField, setCachedVectorField } from "@/lib/map/vectorFieldCache";
@@ -10,6 +10,13 @@ export interface UseVectorFieldOptions {
   availableLeads?: number[];
   currentLead?: number;
   enabled?: boolean;
+  /**
+   * Opaque data version (e.g. the serving source cycle for the valid time).
+   * When it changes, the in-memory cache is bypassed and the field is
+   * refetched even though the URL is unchanged — a newer forecast cycle now
+   * serves the same valid time.
+   */
+  dataVersion?: string | null;
 }
 
 export interface UseVectorFieldResult {
@@ -42,10 +49,12 @@ export function useVectorField({
   availableLeads = [],
   currentLead,
   enabled = true,
+  dataVersion,
 }: UseVectorFieldOptions): UseVectorFieldResult {
   const [field, setField] = useState<VectorFieldData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const prevDataVersionRef = useRef<string | null | undefined>(dataVersion);
 
   // 1. Foreground fetch effect
   useEffect(() => {
@@ -56,7 +65,11 @@ export function useVectorField({
       return;
     }
 
-    const cached = getCachedVectorField(vectorFieldUrl);
+    // A data-version change means a newer forecast cycle now serves the same
+    // URL; bypass the in-memory cache so stale decoded data is not displayed.
+    const versionChanged = prevDataVersionRef.current !== dataVersion;
+    prevDataVersionRef.current = dataVersion;
+    const cached = versionChanged ? undefined : getCachedVectorField(vectorFieldUrl);
     if (cached !== undefined) {
       setField(cached);
       setLoading(false);
@@ -89,7 +102,7 @@ export function useVectorField({
     return () => {
       controller.abort();
     };
-  }, [vectorFieldUrl, enabled]);
+  }, [vectorFieldUrl, enabled, dataVersion]);
 
   // 2. Adjacent lead prefetch effect
   useEffect(() => {
