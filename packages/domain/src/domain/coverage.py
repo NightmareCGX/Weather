@@ -194,7 +194,7 @@ def is_cell_statistically_valid(
         else get_min_coverage_ratio()
     )
     threshold_scaled = int(round(threshold * 10000))
-    if isinstance(finite_cell_count, (int, float)):
+    if isinstance(finite_cell_count, int | float):
         if finite_cell_count < 0:
             return False
         return (int(finite_cell_count) * 10000) >= (expected_members * threshold_scaled)

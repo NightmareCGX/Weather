@@ -40,7 +40,7 @@ The repository provides multi-stage production Dockerfiles:
 
 ### 2.1 API Image (`docker/Dockerfile.api`)
 * **Base:** `python:3.12-slim` (non-root `appuser`, UID 1001).
-* **Builder Stage:** Installs Poetry 2.4.1, resolves path dependencies (`packages/domain`), and builds a self-contained in-project virtual environment (`--only main`).
+* **Builder Stage:** Uses `uv 0.12.13`, installs dependencies from the single root `uv.lock` (including the `packages/domain` workspace member, non-editable), and builds a self-contained in-project virtual environment (`uv sync --frozen --no-dev --no-editable`).
 * **Runtime:** Copies venv, API source, Alembic migrations, and configuration. Runs `uvicorn api.main:app --host 0.0.0.0 --port 8000`.
 * **Healthcheck:** Probes `http://127.0.0.1:8000/docs` (or `/v1/health`).
 * **Build Command:**
@@ -51,7 +51,7 @@ The repository provides multi-stage production Dockerfiles:
 ### 2.2 Ingestion Image (`docker/Dockerfile.ingestion`)
 * **Base:** `python:3.12-slim` (non-root `appuser`, UID 1001).
 * **System Packages:** Installs `libeccodes-dev` (required for GRIB2 decoding on Linux).
-* **Runtime:** Self-contained Poetry venv + `packages/domain` source + `services/ingestion` source.
+* **Runtime:** Self-contained uv venv + `packages/domain` source + `services/ingestion` source.
 * **Entrypoint:** `weather-ingest` CLI.
 * **Build Command:**
   ```bash
@@ -128,20 +128,20 @@ The platform enforces a deterministic configuration precedence hierarchy across 
 Run database migrations before starting application services:
 ```bash
 cd services/api
-poetry run alembic upgrade head
+uv run --no-sync alembic upgrade head
 ```
 
 ### 4.2 Starting the Serving Tier
 ```bash
 cd services/api
-poetry run uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+uv run --no-sync uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
 ### 4.3 Starting the Realtime Ingestion Daemon
 The realtime scheduler automatically probes upstream NOAA publication, coordinates leadership via PostgreSQL advisory locks, and dispatches lead waves:
 ```bash
 cd services/ingestion
-poetry run weather-ingest realtime
+uv run --no-sync weather-ingest realtime
 ```
 
 ### 4.4 Running Retention Garbage Collection (GC)
@@ -149,15 +149,15 @@ Execute the GC reconciler to reclaim expired S3 stores and set deletion tombston
 ```bash
 cd services/ingestion
 # Single-pass execution (e.g. from cron):
-poetry run weather-ingest gc --once
+uv run --no-sync weather-ingest gc --once
 
 # Continuous daemon mode (includes the scheduled store<->catalog orphan
 # inventory stage, default every 24h; 0 disables; never reaps automatically):
-poetry run weather-ingest gc --interval-seconds 1800 --enable-planner --enable-sweeper
+uv run --no-sync weather-ingest gc --interval-seconds 1800 --enable-planner --enable-sweeper
 
 # Daemon with an in-process GC metrics endpoint (stage durations, pass
 # success, planner/worker/sweeper/inventory counters) for Prometheus:
-poetry run weather-ingest gc --metrics-host 127.0.0.1 --metrics-port 9114
+uv run --no-sync weather-ingest gc --metrics-host 127.0.0.1 --metrics-port 9114
 ```
 The scheduled orphan inventory (`--inventory-interval-hours`, env fallback
 `GC_INVENTORY_INTERVAL_HOURS`) only discovers and reports orphan stores; physical
@@ -168,7 +168,7 @@ one-shot command. See `docs/RUNBOOKS.md` section 8 for the operational runbook.
 Run the ingestion Prometheus exporter bound to the loopback interface only. Metrics endpoints must never be exposed to public networks; they are consumed locally or transported via SSH tunnel:
 ```bash
 cd services/ingestion
-poetry run weather-ingest metrics --host 127.0.0.1 --port 9112
+uv run --no-sync weather-ingest metrics --host 127.0.0.1 --port 9112
 ```
 The exporter collects at scrape time (probe-style, fail-open per collector) and holds no durable state. For the authoritative monitoring architecture, metric semantics, port table, and the local/remote Prometheus/Grafana setup, see [`docs/MONITORING.md`](MONITORING.md).
 

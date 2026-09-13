@@ -73,7 +73,7 @@ Weather/
 ├── docker/              # Production multi-stage Dockerfiles (API, Ingestion, Frontend)
 ├── docs/                # Architecture, API specifications, database design, runbooks
 ├── docker-compose.yml   # Local development infrastructure (PostgreSQL, Redis, MinIO)
-└── pyproject.toml       # Root Poetry workspace definition
+└── pyproject.toml       # Root uv workspace definition (single uv.lock for all packages)
 ```
 
 > **Note on Shared Packages:** `packages/contracts` and `packages/config` currently exist as placeholder packages reserved for future contract extraction. At present, `services/api` and `services/ingestion` maintain their own internal configuration modules (`api.core.config` and `ingestion.core.config`), and both import `packages/domain` for pure domain models and locking identity derivation.
@@ -84,7 +84,7 @@ Weather/
 
 ### Prerequisites
 * **Python:** 3.12+
-* **Poetry:** 2.4.1+
+* **uv:** 0.12.13+ ([installation](https://docs.astral.sh/uv/getting-started/installation/); the single root `uv.lock` pins every dependency across all workspace packages)
 * **Node.js:** 20+ (with `npm`)
 * **Docker & Docker Compose**
 * **System Library (Linux only):** `libeccodes-dev` (GRIB2 decoding; on Windows the Python `eccodes` wheel bundles the native library)
@@ -123,17 +123,19 @@ Services are exposed at:
 ### Step 3: Install Python & Frontend Dependencies
 
 ```bash
-# Install domain package
-cd packages/domain && poetry install && cd ../..
-
-# Install API service
-cd services/api && poetry install && cd ../..
-
-# Install Ingestion service
-cd services/ingestion && poetry install && cd ../..
+# One command installs every workspace package (domain, contracts, config,
+# api, ingestion) plus its dependencies from the single root uv.lock.
+# It creates the root .venv and installs workspace members editable.
+uv sync --all-packages
 
 # Install Frontend dependencies
 cd services/frontend && npm ci && cd ../..
+```
+
+To work inside a single package with an isolated environment (mirrors CI):
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-api uv sync --project services/api
+cd services/api && uv run pytest
 ```
 
 ---
@@ -141,7 +143,7 @@ cd services/frontend && npm ci && cd ../..
 ### Step 4: Run Database Migrations
 Apply schema migrations (001–004) to PostgreSQL:
 ```bash
-cd services/api && poetry run alembic upgrade head && cd ../..
+cd services/api && uv run alembic upgrade head && cd ../..
 ```
 
 ---
@@ -151,7 +153,7 @@ cd services/api && poetry run alembic upgrade head && cd ../..
 #### Start FastAPI Serving Tier (Port 8000)
 ```bash
 cd services/api
-poetry run uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uv run --no-sync uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 API Documentation is available at `http://localhost:8000/docs`.
 
@@ -175,10 +177,10 @@ Download, parse, and commit specific forecast cycles and leads into object stora
 ```bash
 # Ingest GFS deterministic leads 0, 3, 6, 9, 12 for 00Z cycle:
 cd services/ingestion
-poetry run weather-ingest ingest --model gfs --cycle-date 2026-09-03 --cycle-hour 0 --lead-time-hours 0 3 6 9 12
+uv run --no-sync weather-ingest ingest --model gfs --cycle-date 2026-09-03 --cycle-hour 0 --lead-time-hours 0 3 6 9 12
 
 # Ingest GEFS ensemble perturbation members 1, 2, 3 for leads 0, 3, 6:
-poetry run weather-ingest ingest --model gefs --cycle-date 2026-09-03 --cycle-hour 0 --lead-time-hours 0 3 6 --member 1 2 3
+uv run --no-sync weather-ingest ingest --model gefs --cycle-date 2026-09-03 --cycle-hour 0 --lead-time-hours 0 3 6 --member 1 2 3
 ```
 
 ### Realtime Lead-Wave Scheduler
@@ -187,10 +189,10 @@ Polls upstream NOAA for new publication activity and dispatches wave ingestion u
 ```bash
 cd services/ingestion
 # Run a single discovery and wave iteration:
-poetry run weather-ingest realtime --once
+uv run --no-sync weather-ingest realtime --once
 
 # Run continuous realtime scheduling daemon:
-poetry run weather-ingest realtime
+uv run --no-sync weather-ingest realtime
 ```
 
 ### Retention Garbage Collection (GC)
@@ -199,7 +201,7 @@ Reconciles retired cycles, sets durable deletion fences, and deletes expired S3 
 ```bash
 cd services/ingestion
 # Run a single GC reconciliation pass:
-poetry run weather-ingest gc --once
+uv run --no-sync weather-ingest gc --once
 ```
 
 ---
@@ -208,21 +210,21 @@ poetry run weather-ingest gc --once
 
 ```bash
 # Domain tests (100% coverage gate required)
-cd packages/domain && poetry run pytest && cd ../..
+cd packages/domain && uv run --no-sync pytest && cd ../..
 
 # API integration tests (requires PostgreSQL + Redis)
-cd services/api && poetry run pytest && cd ../..
+cd services/api && uv run --no-sync pytest && cd ../..
 
 # Ingestion integration tests (requires PostgreSQL + Redis + MinIO)
-cd services/ingestion && poetry run pytest && cd ../..
+cd services/ingestion && uv run --no-sync pytest && cd ../..
 
 # Frontend unit tests
 cd services/frontend && npm test && cd ../..
 
 # Code style and type checking
-cd packages/domain && poetry run ruff check . && poetry run mypy && cd ../..
-cd services/api && poetry run ruff check . && poetry run mypy && cd ../..
-cd services/ingestion && poetry run ruff check . && poetry run mypy && cd ../..
+cd packages/domain && uv run --no-sync ruff check . && uv run --no-sync mypy && cd ../..
+cd services/api && uv run --no-sync ruff check . && uv run --no-sync mypy && cd ../..
+cd services/ingestion && uv run --no-sync ruff check . && uv run --no-sync mypy && cd ../..
 cd services/frontend && npm run lint && npm run typecheck && npm run format:check && cd ../..
 ```
 

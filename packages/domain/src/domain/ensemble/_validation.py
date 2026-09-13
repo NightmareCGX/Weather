@@ -32,7 +32,7 @@ def _coerce_members(
             sequence, or contains non-finite values.
     """
     if not isinstance(members, np.ndarray) and (
-        not isinstance(members, Sequence) or isinstance(members, (str, bytes, bytearray))
+        not isinstance(members, Sequence) or isinstance(members, str | bytes | bytearray)
     ):
         raise InvalidEnsembleError(
             "ensemble members must be a sequence of numeric values, "

@@ -52,14 +52,14 @@ The ingestion suite includes tests that prove the catalog↔actual-Zarr-committe
 
 ```bash
 # Domain tests (offline, 100% coverage gate required)
-cd packages/domain && poetry run pytest
+cd packages/domain && uv run --no-sync pytest
 
 # API tests (PostgreSQL + Redis integration tests)
-cd services/api && poetry run pytest
+cd services/api && uv run --no-sync pytest
 
 # Ingestion tests (PostgreSQL + Redis + MinIO integration tests)
 # Set WEATHER_TEST_MINIO=1 to execute live S3/MinIO Zarr round-trip tests
-cd services/ingestion && WEATHER_TEST_MINIO=1 poetry run pytest
+cd services/ingestion && WEATHER_TEST_MINIO=1 uv run --no-sync pytest
 
 # Frontend unit tests (Jest)
 cd services/frontend && npm test

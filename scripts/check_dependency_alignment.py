@@ -3,11 +3,14 @@
 
 Verifies that any third-party runtime package declared in two or more active
 workspace packages shares the exact same version constraint expression across
-all projects.
+all PEP 621 manifests. This guards constraint *ranges*; resolved-version
+consistency is guaranteed structurally by the single root ``uv.lock`` and
+enforced in CI via ``uv lock --check``.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -23,7 +26,29 @@ MANIFESTS = [
     WORKSPACE_ROOT / "services" / "ingestion" / "pyproject.toml",
 ]
 
-EXEMPT_DEPS = {"python", "weather-platform-domain"}
+# python is implicit (requires-python); the weather-platform-* names are
+# intra-workspace edges (resolved via [tool.uv.sources] workspace = true),
+# not third-party constraints.
+EXEMPT_DEPS = {
+    "weather-platform-domain",
+    "weather-platform-contracts",
+    "weather-platform-config",
+    "weather-platform-ingestion",
+    "weather-platform-api",
+}
+
+# PEP 508 requirement: name (with optional extras) followed by the constraint
+# expression and/or environment marker, e.g. "numpy>=2.0.0,<3.0.0".
+_REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(.*)$")
+
+
+def _split_requirement(req: str) -> tuple[str, str] | None:
+    match = _REQ_NAME_RE.match(req)
+    if not match:
+        return None
+    name = match.group(1).lower().replace("_", "-")
+    constraint = match.group(3).strip()
+    return name, constraint
 
 
 def check_alignment() -> int:
@@ -36,21 +61,24 @@ def check_alignment() -> int:
         with open(manifest_path, "rb") as fh:
             data = tomllib.load(fh)
 
-        main_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+        requirements = data.get("project", {}).get("dependencies", [])
         normalized: dict[str, str] = {}
-        for dep, spec in main_deps.items():
-            if isinstance(spec, str):
-                normalized[dep.lower()] = spec
-            elif isinstance(spec, dict) and "version" in spec:
-                normalized[dep.lower()] = str(spec["version"])
+        for req in requirements:
+            if not isinstance(req, str):
+                continue
+            parsed = _split_requirement(req)
+            if parsed is None:
+                continue
+            dep, constraint = parsed
+            if dep in EXEMPT_DEPS:
+                continue
+            normalized[dep] = constraint
         manifest_deps[rel_path] = normalized
 
     # Map each dependency to {project_path: constraint}
     occurrences: dict[str, dict[str, str]] = {}
     for proj, deps in manifest_deps.items():
         for dep, constraint in deps.items():
-            if dep in EXEMPT_DEPS:
-                continue
             occurrences.setdefault(dep, {})[proj] = constraint
 
     drift_errors: list[str] = []
@@ -69,7 +97,7 @@ def check_alignment() -> int:
     if drift_errors:
         print("ERROR: Shared dependency version drift detected!\n", file=sys.stderr)
         print("\n".join(drift_errors), file=sys.stderr)
-        print("\nExpected identical repository-wide constraints for all shared dependencies.", file=sys.stderr)
+        print("Expected identical repository-wide constraints for all shared dependencies.", file=sys.stderr)
         return 1
 
     print(f"PASS: {aligned_count} shared runtime dependencies are aligned across {len(manifest_deps)} packages.")

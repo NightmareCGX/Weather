@@ -156,7 +156,7 @@ def derive_wind_speed(
         Scalar wind speed in m/s (sqrt(u^2 + v^2)). Returns NaN if either
         component is NaN.
     """
-    if isinstance(u, (int, float)) and isinstance(v, (int, float)):
+    if isinstance(u, int | float) and isinstance(v, int | float):
         if math.isnan(u) or math.isnan(v):
             return float("nan")
         return float(math.hypot(u, v))

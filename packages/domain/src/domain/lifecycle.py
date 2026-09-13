@@ -27,7 +27,7 @@ Lifecycle V3 Policy (Locked Contract):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 #: Locked product policy: detailed metadata is retained for 14 days after physical deletion.
 METADATA_RETENTION_DAYS: int = 14
@@ -72,8 +72,8 @@ def is_metadata_purge_eligible(
 def _ensure_utc(dt: datetime) -> datetime:
     """Normalize a datetime to UTC timezone-aware."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def canonical_cycle_store_path(

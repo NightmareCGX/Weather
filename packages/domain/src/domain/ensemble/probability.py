@@ -188,7 +188,7 @@ def _validate_threshold(threshold: float) -> float:
         InvalidThresholdError: If the threshold is not a finite number.
     """
     if isinstance(threshold, bool) or not isinstance(
-        threshold, (int, float, np.integer, np.floating)
+        threshold, int | float | np.integer | np.floating
     ):
         raise InvalidThresholdError(
             f"threshold must be a numeric value, got {type(threshold).__name__}"

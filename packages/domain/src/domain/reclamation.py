@@ -11,9 +11,9 @@ It defines:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Iterable
+from datetime import UTC, datetime
 
 #: Target kind identifiers.
 TARGET_KIND_DET = "det"
@@ -49,8 +49,8 @@ PREDECESSOR_VARIABLES: frozenset[str] = frozenset(
 def _ensure_utc(dt: datetime) -> datetime:
     """Normalize a datetime to UTC timezone-aware."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def normalize_member_index(target_kind: str, member_index: int | None = None) -> int:

@@ -10,10 +10,10 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 - **Out of Scope**: Database migrations, API routers, ingestion workers, and frontend code.
 - **Deliverables**: 
   - Monorepo directory structure matching REPOSITORY.md.
-  - Root `pyproject.toml` with Poetry workspace configuration.
+  - Root `pyproject.toml` with uv workspace configuration (single root `uv.lock`).
   - Initial stub packages and modules.
 - **Dependencies**: None.
-- **Acceptance Criteria**: `poetry lock` and `poetry install` succeed cleanly without resolution errors across all packages.
+- **Acceptance Criteria**: `uv lock` and `uv sync --all-packages` succeed cleanly without resolution errors across all packages.
 - **Testing Requirements**: Workspace configuration dry-run test.
 - **Estimated Complexity**: Low
 

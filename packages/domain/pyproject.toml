@@ -1,20 +1,30 @@
-[tool.poetry]
+[project]
 name = "weather-platform-domain"
 version = "0.1.0"
 description = "Core domain logic for weather forecasting platform"
-authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
-packages = [{ include = "domain", from = "src" }]
+authors = [{ name = "Lead Implementation Engineer", email = "engineer@weatherplatform.com" }]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0.0,<3.0.0",
+    "xarray>=2026.7.0,<2027.0.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.12"
-numpy = "^2.0.0"
-xarray = "^2026.7.0"
+[dependency-groups]
+dev = [
+    "pytest>=8.1.1,<9.0.0",
+    "pytest-cov>=5.0.0,<6.0.0",
+    "ruff>=0.3.4,<0.4.0",
+    "mypy>=1.20.0,<2.0.0",
+]
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.1.1"
-pytest-cov = "^5.0.0"
-ruff = "^0.3.4"
-mypy = "^1.20.0"
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+# src/domain layout; uv_build derives the module from module-name, not the
+# hyphenated project name.
+[tool.uv.build-backend]
+module-name = "domain"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -41,7 +51,3 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "C4"]
 python_version = "3.12"
 strict = true
 files = ["src/domain"]
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"

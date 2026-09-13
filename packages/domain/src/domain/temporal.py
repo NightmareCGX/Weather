@@ -8,7 +8,7 @@ Data Lifecycle V2, and their source-coupled companion variables.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from domain.horizon import (
     CANONICAL_LEAD_CADENCE_HOURS,
@@ -138,7 +138,7 @@ def serving_start_valid_time(
             f"cadence_hours must be strictly positive, got {cadence_hours}"
         )
 
-    utc_dt = now_utc.astimezone(timezone.utc)
+    utc_dt = now_utc.astimezone(UTC)
     floored_hour = (utc_dt.hour // cadence_hours) * cadence_hours
     return datetime(
         utc_dt.year,
@@ -147,7 +147,7 @@ def serving_start_valid_time(
         floored_hour,
         0,
         0,
-        tzinfo=timezone.utc,
+        tzinfo=UTC,
     )
 
 
@@ -222,7 +222,7 @@ def is_valid_time_on_horizon_grid(
             )
         else:
             cadence_hours = CANONICAL_LEAD_CADENCE_HOURS
-    vt_utc = valid_time.astimezone(timezone.utc)
+    vt_utc = valid_time.astimezone(UTC)
     return (
         vt_utc.minute == 0
         and vt_utc.second == 0
@@ -282,7 +282,7 @@ def is_valid_time_protected(
         valid_time, model_id=model_id
     ):
         return False
-    vt_utc = valid_time.astimezone(timezone.utc)
+    vt_utc = valid_time.astimezone(UTC)
     return vt_utc >= serving_start_valid_time(now_utc, cadence_hours)
 
 

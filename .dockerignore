@@ -34,9 +34,13 @@ node_modules
 **/*.tsbuildinfo
 services/frontend
 
-# Placeholder shared packages (no runtime value in these images)
-packages/contracts
-packages/config
+# Placeholder shared packages (no runtime value in these images) — but their
+# manifests must enter the build context: the uv workspace definition in the
+# root pyproject.toml requires all member pyprojects for `uv sync --frozen`.
+packages/contracts/**
+!packages/contracts/pyproject.toml
+packages/config/**
+!packages/config/pyproject.toml
 
 # Tests and fixtures (not shipped in runtime images)
 **/tests

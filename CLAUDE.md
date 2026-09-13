@@ -65,7 +65,7 @@ Where practical, Claude MUST reproduce Linux behavior using the environment that
 1. which CI jobs can be affected;
 2. which commands those jobs execute;
 3. which operating system they run on (all CI jobs here are `ubuntu-latest`);
-4. which runtime/tool versions they use (Python `3.12`, Poetry `2.4.1`, `ruff 0.3.4`, `mypy 1.20.2`, Node `20`, `npm ci`);
+4. which runtime/tool versions they use (Python `3.12`, `uv 0.12.13`, Node `20`, `npm ci`; per-package tool versions come from the single root `uv.lock`);
 5. which services/dependencies they require (PostgreSQL `nickblah/postgis:18.6-trixie-postgis-3.6.4`, Redis `redis:7-alpine`, MinIO, Linux `libeccodes-dev`);
 6. which checks can be reproduced locally;
 7. which checks require Linux/container validation.
@@ -78,7 +78,7 @@ Grounding the general matrix in the actual CI (`.github/workflows/ci.yml`, all j
 
 | CI job | What CI runs | Reproducible on Windows | Linux/CI-equivalent reproduction |
 |---|---|---|---|
-| `python-quality` | `poetry install` + `ruff check` + `mypy` per package (domain/api/ingestion) + contracts/config import | yes (`ruff`/`mypy` from the active venv, Poetry 2.4.1) | Docker `python:3.12-slim` / WSL |
+| `python-quality` | `uv sync --project <pkg>` + `ruff check` + `mypy` per package (domain/api/ingestion) + contracts/config import | yes (`ruff`/`mypy` from the synced uv venv, `uv 0.12.13`) | Docker `python:3.12-slim` / WSL |
 | `domain-tests` | `pytest` offline, **100% coverage gate** | yes | Docker / WSL |
 | `api-tests` | `pytest` + PostgreSQL (PostGIS 3.6 / PG 18) + Redis service containers | only if local services run | Docker Compose / CI-like service containers |
 | `ingestion-tests` | `pytest` + PostgreSQL + Redis + MinIO, `WEATHER_TEST_MINIO=1`, real S3 Zarr round-trip (JUnit-verified not-skipped), `libeccodes-dev` | partial — Windows `eccodes` wheel bundles the native lib; services still required | Docker / WSL with `libeccodes-dev` + service containers |
@@ -135,7 +135,7 @@ For dependency changes, Claude MUST verify where applicable:
 - **Windows**: dependency installation, lockfile resolution, runtime imports, package availability, CLI/runtime execution.
 - **Linux**: dependency installation, lockfile resolution, runtime imports, native-library requirements, Linux wheel availability, Docker/runtime compatibility, and the exact CI installation path.
 
-Pay particular attention to packages whose behavior differs between Windows and Linux — native C/C++ libraries, compiled extensions, filesystem interfaces, subprocesses, scientific/geospatial libraries, GRIB/ecCodes tooling (`cfgrib`/`eccodes`/`libeccodes-dev`), and database drivers. Prefer reproducing the CI install path (Poetry `2.4.1`, Python `3.12`, `poetry install` from each package cwd).
+Pay particular attention to packages whose behavior differs between Windows and Linux — native C/C++ libraries, compiled extensions, filesystem interfaces, subprocesses, scientific/geospatial libraries, GRIB/ecCodes tooling (`cfgrib`/`eccodes`/`libeccodes-dev`), and database drivers. Prefer reproducing the CI install path (`uv 0.12.13`, Python `3.12`, `uv sync --project <pkg>` from the repository root; the single root `uv.lock` is the authoritative version source for all packages).
 
 ### 10. Docker changes require Linux-oriented validation
 
@@ -154,7 +154,7 @@ Avoid relying only on an already-mutated local database.
 
 ### 12. Clean-environment principle
 
-The current Windows developer environment may hide dependency problems (packages installed that are not declared by the repository). For changes involving dependencies, packaging, Docker, native libraries, installation, or build tooling, prefer a **clean environment** when practical: a fresh virtual environment, a clean Poetry install, a Docker build, or a Linux container / CI-like image.
+The current Windows developer environment may hide dependency problems (packages installed that are not declared by the repository). For changes involving dependencies, packaging, Docker, native libraries, installation, or build tooling, prefer a **clean environment** when practical: a fresh virtual environment (`uv sync --project <pkg>` into a clean venv), a Docker build, or a Linux container / CI-like image.
 
 ### 13. Final Pre-Commit Engineering Gate
 
