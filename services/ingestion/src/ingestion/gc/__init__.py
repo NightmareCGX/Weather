@@ -1,16 +1,22 @@
-"""Garbage collection (GC) and physical forecast store reclamation package."""
+"""Garbage collection (GC) and physical forecast store reclamation package.
+
+V3 converged model: the reclamation planner + worker are the only physical
+deletion authorities at (variable, valid_time) granularity; the finalizer
+module is lifecycle bookkeeping only (derived tombstones, zero physical
+deletion). The legacy V2 whole-cycle GC engine has been retired.
+"""
 
 from ingestion.gc.finalizer import (
     FinalizerCandidate,
     FinalizerPassResult,
     claim_fresh_candidate,
+    cycle_reclamation_units_terminal,
     enumerate_cycle_store_paths,
-    finalize_cycle_eol,
+    finalize_cycle_bookkeeping,
     finalize_cycle_physical_and_queue,
-    run_finalizer_pass,
+    run_lifecycle_bookkeeping_pass,
 )
 from ingestion.gc.planner import ReclamationPlanResult, plan_reclamation_pass
-from ingestion.gc.reconciler import GcCandidateInfo, GcPassResult, run_gc_pass
 from ingestion.gc.sweeper import (
     DEFAULT_SWEEPER_BATCH_SIZE,
     CyclePurgeResult,
@@ -31,23 +37,20 @@ __all__ = [
     "CyclePurgeResult",
     "FinalizerCandidate",
     "FinalizerPassResult",
-    "GcCandidateInfo",
-    "GcPassResult",
     "ReclamationPlanResult",
     "ReclamationWorkerResult",
     "SweeperCandidate",
     "SweeperPassResult",
     "claim_fresh_candidate",
+    "cycle_reclamation_units_terminal",
     "discover_sweeper_candidates",
     "enumerate_cycle_store_paths",
-    "finalize_cycle_eol",
+    "finalize_cycle_bookkeeping",
     "finalize_cycle_physical_and_queue",
     "plan_reclamation_pass",
     "purge_cycle_metadata",
     "requeue_failed_reclamation_targets",
-    "run_finalizer_pass",
-    "run_gc_pass",
+    "run_lifecycle_bookkeeping_pass",
     "run_metadata_sweeper_pass",
     "run_reclamation_worker_pass",
 ]
-

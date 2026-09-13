@@ -37,8 +37,7 @@ from ingestion.core.catalog import (
     reserve_run,
 )
 from ingestion.core.wave_runner import RunSpec, _run_wave
-from ingestion.gc.finalizer import run_finalizer_pass
-from ingestion.gc.reconciler import recheck_gc_eligibility
+from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
 from ingestion.gc.sweeper import run_metadata_sweeper_pass
 from ingestion.realtime.committed import (
     discover_incomplete_historical_cycles,
@@ -277,39 +276,6 @@ def test_unfenced_cycle_admitted_to_recovery(catalog_engine):
 # ---------------------------------------------------------------------------
 
 
-def test_recheck_gc_eligibility_unfenced_cycle(catalog_engine):
-    """recheck_gc_eligibility evaluates cutoff without requiring legacy fields."""
-    c_old = _dt(2026, 9, 1, 0)
-    c_ready = _dt(2026, 9, 1, 12)
-
-    with Session(catalog_engine) as session:
-        session.add(ModelVersionRecord(id="ver_gfs", model_id="gfs", version_string="v1.0"))
-        session.add(
-            ModelRunRecord(
-                id="r_ready",
-                model_version_id="ver_gfs",
-                cycle_time=c_ready,
-                status="ready",
-            )
-        )
-        # c_old is unfenced, lifecycle row exists
-        session.add(
-            ForecastCycleLifecycleRecord(
-                model_id="gfs",
-                cycle_time=c_old,
-                deletion_started_at=None,
-                deleted_at=None,
-            )
-        )
-        session.commit()
-
-        # Cadence is 6h -> cutoff is 12Z - 6h = 06Z. c_old (00Z) < 06Z is GC eligible!
-        eligible, reason, t_ready = recheck_gc_eligibility(session, "gfs", c_old)
-        assert eligible is True
-        assert reason == "gc_eligible"
-        assert t_ready == c_ready
-
-
 def test_finalizer_and_sweeper_preserve_contracted_lifecycle(catalog_engine):
     """Production finalizer and sweeper passes work cleanly against contracted lifecycle schema."""
     c = _dt(2026, 8, 1, 0)
@@ -327,7 +293,7 @@ def test_finalizer_and_sweeper_preserve_contracted_lifecycle(catalog_engine):
         session.commit()
 
     # 1. Run finalizer pass
-    run_finalizer_pass(catalog_engine, dry_run=False, now=now)
+    run_lifecycle_bookkeeping_pass(catalog_engine, dry_run=False, now=now)
 
     # 2. Run metadata sweeper pass
     run_metadata_sweeper_pass(catalog_engine, dry_run=False, now=now)

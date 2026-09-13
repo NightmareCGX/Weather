@@ -1,8 +1,17 @@
-"""Bounded bulk reclamation planner for Data Lifecycle V3 Phase 4.
+"""Bounded bulk reclamation planner for Data Lifecycle V3 (converged model).
+
+Canonical source resolution is the **sole deletion authority**: a physical
+reclamation unit is reclaimable iff canonical serving no longer selects it for
+any protected valid_time and no dependency hold (interval fallback, companion
+coupling, wind U/V atomicity, predecessor/recovery, member integrity) applies.
+The cycle cutoffs (``T - C`` / ``T - 2C`` / horizon) are only derived
+consequences used here as batch-pruning fast-paths — never as a parallel
+deletion authority.
 
 Identifies physically reclaimable variable shards across model runs based on
-shared canonical reachability, serving-fallback holds, and ingestion-predecessor holds.
-Enqueues reclaimable shards into PostgreSQL ``reclamation_queue`` idempotently.
+shared canonical reachability, serving-fallback holds, and ingestion-predecessor
+holds. Enqueues reclaimable shards into PostgreSQL ``reclamation_queue``
+idempotently.
 """
 
 from __future__ import annotations
@@ -33,7 +42,9 @@ from domain.reclamation import (
     make_shard_relative_key,
 )
 from domain.temporal import (
+    get_variable_temporal_metadata,
     is_precipitation_companion,
+    is_valid_time_protected,
     requires_lead0_display_fallback,
     serving_start_valid_time,
 )
@@ -66,16 +77,74 @@ class ReclamationPlanResult:
     would_enqueue: tuple[PhysicalShardTarget, ...]
 
 
-def _is_cycle_fenced_or_deleted(
+def enumerate_committed_unit_tuples(
+    session: Session,
+    *,
+    run_ids: Sequence[str],
+    is_ensemble: bool,
+) -> set[tuple[str, int, str, str, int]]:
+    """Enumerate the committed reclamation unit tuples for the given runs.
+
+    Uses exactly the same shard construction as the planner pass (one unit per
+    deterministic/mean product row, one unit per ensemble member product), so
+    the lifecycle bookkeeping pass can verify terminality 1:1 against
+    ``reclamation_queue`` rows.
+    """
+    if not run_ids:
+        return set()
+
+    emp_members: dict[tuple[str, int], list[int]] = {}
+    if is_ensemble:
+        emp_stmt = (
+            select(
+                EnsembleMemberProductRecord.run_id,
+                EnsembleMemberProductRecord.lead_time_hours,
+                EnsembleMemberProductRecord.member_index,
+            ).where(EnsembleMemberProductRecord.run_id.in_(list(run_ids)))
+        )
+        for r_id, lead, mem_idx in session.execute(emp_stmt).all():
+            emp_members.setdefault((str(r_id), int(lead)), []).append(int(mem_idx))
+
+    prod_stmt = select(
+        ProductRecord.run_id,
+        ProductRecord.lead_time_hours,
+        ProductRecord.variable_id,
+        ProductRecord.product_type,
+    ).where(ProductRecord.run_id.in_(list(run_ids)))
+
+    units: set[tuple[str, int, str, str, int]] = set()
+    for r_id, lead, var, p_type in session.execute(prod_stmt).all():
+        r_str = str(r_id)
+        lead_num = int(lead)
+        v_code = str(var)
+        if is_ensemble:
+            if str(p_type) == "ensemble_mean":
+                units.add((r_str, lead_num, v_code, TARGET_KIND_MEAN, -1))
+            for mem in emp_members.get((r_str, lead_num), []):
+                units.add((r_str, lead_num, v_code, TARGET_KIND_MEM, int(mem)))
+        else:
+            units.add((r_str, lead_num, v_code, TARGET_KIND_DET, 0))
+    return units
+
+
+def _is_cycle_tombstoned(
     lc_map: dict[tuple[str, datetime], ForecastCycleLifecycleRecord],
     model_id: str,
     cycle_time: datetime,
 ) -> bool:
-    """Return True if cycle has whole-cycle deletion fence or tombstone."""
+    """Return True if the cycle tombstone (deleted_at) is committed."""
     lc = lc_map.get((model_id.lower().strip(), cycle_time))
-    if lc is None:
-        return False
-    return lc.deletion_started_at is not None or lc.deleted_at is not None
+    return lc is not None and lc.deleted_at is not None
+
+
+def _is_cycle_claimed(
+    lc_map: dict[tuple[str, datetime], ForecastCycleLifecycleRecord],
+    model_id: str,
+    cycle_time: datetime,
+) -> bool:
+    """Return True if the cycle is claimed (deletion_started_at serving fence)."""
+    lc = lc_map.get((model_id.lower().strip(), cycle_time))
+    return lc is not None and lc.deletion_started_at is not None
 
 
 def plan_reclamation_pass(
@@ -96,7 +165,9 @@ def plan_reclamation_pass(
        canonical reachability for serving truth, and writes physical availability truth.
     4. Safe against newer partial cycles: older cycles continue serving farther valid times.
     5. Retains active serving fallbacks (precipitation_amount_3h, cloud_cover_3h, companions).
-    6. Retains active ingestion predecessors (L - 3 for uncommitted reset leads L % 6 == 0).
+    6. Retains active ingestion predecessors (L - W for uncommitted reset leads L % R == 0).
+    7. Claimed cycles (deletion_started_at serving fence) contribute no canonical
+       candidates and have ALL remaining units directly reclaimable.
     """
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
     serving_start = serving_start_valid_time(now_utc)
@@ -107,7 +178,7 @@ def plan_reclamation_pass(
     total_reclaimable = 0
     total_enqueued = 0
 
-    # 1. Pre-query lifecycle records for whole-cycle deletion fences
+    # 1. Pre-query lifecycle records for whole-cycle fences
     lc_rows = session.execute(select(ForecastCycleLifecycleRecord)).scalars().all()
     lc_map: dict[tuple[str, datetime], ForecastCycleLifecycleRecord] = {
         (row.model_id.lower().strip(), _ensure_utc_datetime(row.cycle_time)): row
@@ -140,10 +211,17 @@ def plan_reclamation_pass(
             continue
 
         runs_by_id: dict[str, dict[str, Any]] = {}
+        retired_run_ids: list[str] = []
         for r_id, c_time, status, store_path, ver_str in run_rows:
             c_utc = _ensure_utc_datetime(c_time)
-            # Exclude whole-cycle fenced runs (V2 GC owns those)
-            if _is_cycle_fenced_or_deleted(lc_map, m_id, c_utc):
+            if _is_cycle_tombstoned(lc_map, m_id, c_utc):
+                # Tombstoned: all units terminal by construction — nothing to plan.
+                continue
+            if _is_cycle_claimed(lc_map, m_id, c_utc):
+                # Claimed = serving & mutation fence: the resolver no longer
+                # selects this cycle, so NONE of its units can be protected.
+                # They are directly reclaimable (architecture doc §7.1/§7.5).
+                retired_run_ids.append(str(r_id))
                 continue
             runs_by_id[str(r_id)] = {
                 "cycle_time": c_utc,
@@ -152,17 +230,18 @@ def plan_reclamation_pass(
                 "version_string": str(ver_str),
             }
 
-        eligible_run_ids = list(runs_by_id.keys())
-        if not eligible_run_ids:
+        planable_run_ids = list(runs_by_id.keys())
+        catalog_run_ids = planable_run_ids + retired_run_ids
+        if not catalog_run_ids:
             continue
 
-        # 3. Bulk query 2: forecast_products for eligible runs
+        # 3. Bulk query 2: forecast_products for all cataloged runs
         prod_stmt = select(
             ProductRecord.run_id,
             ProductRecord.lead_time_hours,
             ProductRecord.variable_id,
             ProductRecord.product_type,
-        ).where(ProductRecord.run_id.in_(eligible_run_ids))
+        ).where(ProductRecord.run_id.in_(catalog_run_ids))
         prod_rows = session.execute(prod_stmt).all()
 
         # 4. Bulk query 3: ensemble_member_products if ensemble
@@ -172,7 +251,7 @@ def plan_reclamation_pass(
                 EnsembleMemberProductRecord.run_id,
                 EnsembleMemberProductRecord.lead_time_hours,
                 EnsembleMemberProductRecord.member_index,
-            ).where(EnsembleMemberProductRecord.run_id.in_(eligible_run_ids))
+            ).where(EnsembleMemberProductRecord.run_id.in_(catalog_run_ids))
             for r_id, lead, mem_idx in session.execute(emp_stmt).all():
                 emp_members.setdefault((str(r_id), int(lead)), []).append(int(mem_idx))
 
@@ -184,7 +263,7 @@ def plan_reclamation_pass(
             ReclamationQueueRecord.target_kind,
             ReclamationQueueRecord.member_index,
             ReclamationQueueRecord.status,
-        ).where(ReclamationQueueRecord.run_id.in_(eligible_run_ids))
+        ).where(ReclamationQueueRecord.run_id.in_(catalog_run_ids))
         queue_rows = session.execute(queue_stmt).all()
         existing_queue_targets = {
             (str(r_id), int(lead), str(var), str(kind), int(mem)): str(status)
@@ -197,6 +276,8 @@ def plan_reclamation_pass(
 
         for r_id, lead, var_id, prod_type in prod_rows:
             r_str = str(r_id)
+            if r_str in retired_run_ids:
+                continue  # retired units handled directly below
             lead_num = int(lead)
             v_code = str(var_id)
             p_type = str(prod_type)
@@ -304,15 +385,81 @@ def plan_reclamation_pass(
         if "wind_u_10m" in distinct_vars and "wind_v_10m" in distinct_vars:
             distinct_vars.append("wind_10m")
 
-        # 6. Evaluate shared canonical resolution across active serving window
+        # Active canonical held targets:
+        held_target_tuples: set[tuple[str, int, str, str, int]] = set()
+
+        # 6. Ingestion-predecessor holds (evaluated BEFORE canonical resolution so
+        #    the window-exit fast-path below can run: predecessor shards may carry
+        #    valid times that have already exited the active serving window while
+        #    still being required to reconstruct uncommitted reset leads).
+        # For incomplete recovery-eligible cycles (cycle_time >= min_recovery_cycle),
+        # if reset lead L (L > 0, L % R == 0) is uncommitted, hold predecessor L - W
+        # for predecessor variables (precipitation_amount_3h, cloud_cover_3h).
+        committed_leads_by_run: dict[str, set[int]] = {}
+        for (r_str, lead_num) in by_run_lead.keys():
+            committed_leads_by_run.setdefault(r_str, set()).add(lead_num)
+
+        for r_id, meta in runs_by_id.items():
+            run_version = meta["version_string"]
+            run_max_lead = model_max_lead_hours(m_id, version_string=run_version)
+            run_min_recovery = serving_start - timedelta(hours=run_max_lead)
+            c_utc = meta["cycle_time"]
+            if c_utc < run_min_recovery:
+                continue
+            # If run is already 'ready' or has no uncommitted reset leads, no predecessor hold needed
+            if meta["status"] == "ready":
+                continue
+
+            committed_leads = committed_leads_by_run.get(r_id, set())
+            # Check all possible reset leads up to run's authoritative max lead,
+            # gated per-variable by (W, R) metadata (architecture doc I19).
+            for pred_var in PREDECESSOR_VARIABLES:
+                var_meta = get_variable_temporal_metadata(pred_var)
+                reset_period = var_meta.reset_period_hours
+                if var_meta.interval_width_hours >= reset_period:
+                    # W == R: the reset-lead sample already covers the interval;
+                    # no predecessor dependency exists for this variable.
+                    continue
+                for reset_lead in range(reset_period, run_max_lead + 1, reset_period):
+                    if reset_lead in committed_leads:
+                        continue
+                    pred_lead = get_predecessor_lead(
+                        reset_lead,
+                        interval_width_hours=var_meta.interval_width_hours,
+                        reset_period_hours=reset_period,
+                    )
+                    if pred_lead in committed_leads:
+                        if is_ensemble:
+                            held_target_tuples.add(
+                                (r_id, pred_lead, pred_var, TARGET_KIND_MEAN, -1)
+                            )
+                            for m in range(1, expected_members + 1):
+                                held_target_tuples.add(
+                                    (r_id, pred_lead, pred_var, TARGET_KIND_MEM, m)
+                                )
+                        else:
+                            held_target_tuples.add(
+                                (r_id, pred_lead, pred_var, TARGET_KIND_DET, 0)
+                            )
+
+        # 7. Window-exit fast-path (derived cutoff, architecture doc §7.5 class B):
+        #    units whose valid_time has exited the active serving window can never
+        #    be canonical-selected again (is_valid_time_protected is the shared
+        #    boundary primitive); only the predecessor holds above may still
+        #    protect them. Canonical resolution below therefore runs exclusively
+        #    over protected valid times.
+        protected_candidates: dict[datetime, list[CanonicalCandidate]] = {
+            vt: cands
+            for vt, cands in candidates_by_valid.items()
+            if is_valid_time_protected(vt, now_utc)
+        }
+
+        # 8. Evaluate shared canonical resolution across the active serving window
         canon_res = select_canonical_sources_bulk(
-            candidates_by_valid,
+            protected_candidates,
             variables=distinct_vars,
             start_valid_time=serving_start,
         )
-
-        # Active canonical held targets:
-        held_target_tuples: set[tuple[str, int, str, str, int]] = set()
 
         # Anchors hold all their ordinary committed variables (unless lead 0)
         for vt, anchor_cand in canon_res.anchors.items():
@@ -323,7 +470,9 @@ def plan_reclamation_pass(
                         held_target_tuples.add(
                             (anchor_cand.run_id, anchor_cand.lead_time_hours, var_code, TARGET_KIND_MEAN, -1)
                         )
-                        # Member shards
+                        # Member shards — ALL committed members of the canonical
+                        # source are retained: the coverage threshold is a
+                        # candidate-eligibility bound, never a retention target.
                         for m in anchor_cand.member_indices or ():
                             held_target_tuples.add(
                                 (anchor_cand.run_id, anchor_cand.lead_time_hours, var_code, TARGET_KIND_MEM, m)
@@ -386,46 +535,7 @@ def plan_reclamation_pass(
                             (src_cand.run_id, src_cand.lead_time_hours, w_comp, TARGET_KIND_DET, 0)
                         )
 
-        # 7. Ingestion-predecessor holds:
-        # For incomplete recovery-eligible cycles (cycle_time >= min_recovery_cycle),
-        # if reset lead L (L > 0, L % 6 == 0) is uncommitted, hold predecessor L - 3
-        # for predecessor variables (precipitation_amount_3h, cloud_cover_3h).
-        committed_leads_by_run: dict[str, set[int]] = {}
-        for (r_str, lead_num) in by_run_lead.keys():
-            committed_leads_by_run.setdefault(r_str, set()).add(lead_num)
-
-        for r_id, meta in runs_by_id.items():
-            run_version = meta["version_string"]
-            run_max_lead = model_max_lead_hours(m_id, version_string=run_version)
-            run_min_recovery = serving_start - timedelta(hours=run_max_lead)
-            c_utc = meta["cycle_time"]
-            if c_utc < run_min_recovery:
-                continue
-            # If run is already 'ready' or has no uncommitted reset leads, no predecessor hold needed
-            if meta["status"] == "ready":
-                continue
-
-            committed_leads = committed_leads_by_run.get(r_id, set())
-            # Check all possible reset leads up to run's authoritative max lead
-            for reset_lead in range(6, run_max_lead + 1, 6):
-                if reset_lead not in committed_leads:
-                    pred_lead = get_predecessor_lead(reset_lead)
-                    if pred_lead in committed_leads:
-                        for pred_var in PREDECESSOR_VARIABLES:
-                            if is_ensemble:
-                                held_target_tuples.add(
-                                    (r_id, pred_lead, pred_var, TARGET_KIND_MEAN, -1)
-                                )
-                                for m in range(1, expected_members + 1):
-                                    held_target_tuples.add(
-                                        (r_id, pred_lead, pred_var, TARGET_KIND_MEM, m)
-                                    )
-                            else:
-                                held_target_tuples.add(
-                                    (r_id, pred_lead, pred_var, TARGET_KIND_DET, 0)
-                                )
-
-        # 8. Reconcile all physical shards against held targets
+        # 9. Reconcile all physical shards against held targets
         dedup_shards = {s.target_tuple: s for s in all_shards_for_model}
         for t_tuple, shard_target in dedup_shards.items():
             total_committed += 1
@@ -437,7 +547,50 @@ def plan_reclamation_pass(
                 if t_tuple not in existing_queue_targets:
                     all_would_enqueue.append(shard_target)
 
-    # 9. Idempotent enqueue if not dry-run
+        # 10. Claimed (retired) runs: every committed unit is directly reclaimable.
+        if retired_run_ids:
+            retired_units = enumerate_committed_unit_tuples(
+                session, run_ids=retired_run_ids, is_ensemble=is_ensemble
+            )
+            store_by_run: dict[str, str] = {}
+            cycle_by_run: dict[str, datetime] = {}
+            for r_id, c_time, z_path in session.execute(
+                select(
+                    ModelRunRecord.id,
+                    ModelRunRecord.cycle_time,
+                    ModelRunRecord.zarr_store_path,
+                ).where(ModelRunRecord.id.in_(retired_run_ids))
+            ).all():
+                cycle_by_run[str(r_id)] = _ensure_utc_datetime(c_time)
+                if z_path:
+                    store_by_run[str(r_id)] = str(z_path)
+
+            for t_tuple in sorted(retired_units):
+                total_committed += 1
+                if t_tuple in existing_queue_targets:
+                    continue
+                total_reclaimable += 1
+                r_str, lead_num, v_code, kind, mem = t_tuple
+                store_path = store_by_run.get(r_str, "")
+                c_utc = cycle_by_run.get(r_str)
+                if not store_path or c_utc is None:
+                    continue
+                all_would_enqueue.append(
+                    PhysicalShardTarget(
+                        run_id=r_str,
+                        model_id=m_id,
+                        cycle_time=c_utc,
+                        lead_time_hours=lead_num,
+                        variable_code=v_code,
+                        target_kind=kind,
+                        member_index=mem,
+                        valid_time=c_utc + timedelta(hours=lead_num),
+                        store_path=store_path,
+                        physical_key=make_shard_relative_key(v_code, kind, lead_num, mem),
+                    )
+                )
+
+    # 11. Idempotent enqueue if not dry-run
     if not dry_run and all_would_enqueue:
         # Enqueue in bounded batches
         for i in range(0, len(all_would_enqueue), batch_size):

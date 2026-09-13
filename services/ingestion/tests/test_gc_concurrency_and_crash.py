@@ -20,22 +20,18 @@ from ingestion.core.catalog import (
     CommittedState,
     ForecastCycleLifecycleRecord,
     ModelRunRecord,
+    ModelVersionRecord,
     RunCatalogSpec,
     VariableSpec,
     _ensure_utc_datetime,
+    ensure_lifecycle_row,
     record_run,
 )
 from ingestion.core.locks import StoreLockCoordinator
 from ingestion.core.zarr_writer import write_dataset
-from ingestion.gc.reconciler import (
-    GcCandidateInfo,
-    claim_cycle_for_deletion,
-    cleanup_cycle_catalog_and_tombstone,
-    delete_physical_store_gated,
-    process_gc_candidate,
-    recheck_gc_eligibility,
-    run_gc_pass,
-)
+from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
+from ingestion.gc.planner import plan_reclamation_pass
+from ingestion.gc.worker import run_reclamation_worker_pass
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -170,223 +166,15 @@ def _seed_cycle(
 
 # ---------------------------------------------------------------------------
 # Reader & Writer Advisory Lock Race Tests
-# ---------------------------------------------------------------------------
+def test_claimed_cycle_blocks_stale_ingestion_and_reclaims_granularly(postgres_gc_env):
+    """V3 main line: claim (serving fence) -> plan -> work -> bookkeeping tombstone.
 
-
-def test_active_reader_gate_blocks_physical_gc(postgres_gc_env):
-    """Prove that an active reader holding SHARED store gate blocks GC EXCLUSIVE gate."""
-    engine, tmp_path = postgres_gc_env
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
-
-    c0 = _dt(2026, 9, 1, 6)   # To delete
-    c1 = _dt(2026, 9, 2, 6)   # R1
-    c2 = _dt(2026, 9, 2, 12)  # R2
-
-    gfs_path, gefs_path = _seed_cycle(engine, tmp_path, c0, "ready")
-    _seed_cycle(engine, tmp_path, c1, "ready")
-    _seed_cycle(engine, tmp_path, c2, "ready")
-
-    # Start a reader session holding SHARED store gate on gfs_path
-    reader_pool = ReaderLockPool(db_url, pool_size=2, max_overflow=0, pool_timeout=5.0)
-    reader_session = _ReaderGateSession(reader_pool, gfs_path)
-    reader_session.acquire(timeout_seconds=5.0)
-
-    try:
-        candidate = GcCandidateInfo(
-            model_id="gfs",
-            cycle_time=c0,
-            cutoff=c1,
-            store_path=gfs_path,
-            gfs_store_path=gfs_path,
-            gefs_store_path=gefs_path,
-        )
-
-        # GC pass attempts to delete with bounded 1.0s timeout -> must be BLOCKED
-        success = process_gc_candidate(
-            engine, candidate, timeout_seconds=1.0, now=_dt(2026, 9, 2, 13)
-        )
-        assert success is False
-
-        # Store and catalog remain intact
-        assert os.path.exists(gfs_path)
-        with Session(engine) as session:
-            assert session.get(ForecastCycleLifecycleRecord, ("gfs", c0)).deleted_at is None
-    finally:
-        reader_session.release()
-        reader_pool.dispose()
-
-    # Now that reader released SHARED gate, retry GC -> succeeds!
-    success_after = process_gc_candidate(
-        engine, candidate, timeout_seconds=5.0, now=_dt(2026, 9, 2, 13)
-    )
-    assert success_after is True
-    assert not os.path.exists(gfs_path)
-    with Session(engine) as session:
-        assert session.get(ForecastCycleLifecycleRecord, ("gfs", c0)).deleted_at is not None
-
-
-def test_active_writer_gate_blocks_physical_gc(postgres_gc_env):
-    """Prove that an active writer holding SHARED store gate blocks GC EXCLUSIVE gate."""
-    engine, tmp_path = postgres_gc_env
-
-    c0 = _dt(2026, 9, 1, 6)
-    c1 = _dt(2026, 9, 2, 6)
-    c2 = _dt(2026, 9, 2, 12)
-
-    gfs_path, gefs_path = _seed_cycle(engine, tmp_path, c0, "ready")
-    _seed_cycle(engine, tmp_path, c1, "ready")
-    _seed_cycle(engine, tmp_path, c2, "ready")
-
-    candidate = GcCandidateInfo(
-        model_id="gfs",
-        cycle_time=c0,
-        cutoff=c1,
-        store_path=gfs_path,
-        gfs_store_path=gfs_path,
-        gefs_store_path=gefs_path,
-    )
-
-    # Acquire SHARED gate simulating an in-progress writer wave
-    with engine.connect() as writer_conn:
-        writer_coord = StoreLockCoordinator(writer_conn, store_path=gfs_path, timeout_seconds=5.0)
-        writer_coord.acquire_shared_gate()
-
-        try:
-            # GC attempt is blocked by writer
-            success = process_gc_candidate(
-                engine, candidate, timeout_seconds=1.0, now=_dt(2026, 9, 2, 13)
-            )
-            assert success is False
-            assert os.path.exists(gfs_path)
-        finally:
-            writer_coord.release_shared_gate()
-
-    # Retry after writer release -> succeeds
-    success2 = process_gc_candidate(
-        engine, candidate, timeout_seconds=5.0, now=_dt(2026, 9, 2, 13)
-    )
-    assert success2 is True
-    assert not os.path.exists(gfs_path)
-
-
-# ---------------------------------------------------------------------------
-# Crash Recovery & Restart Tests
-# ---------------------------------------------------------------------------
-
-
-def test_crash_recovery_after_partial_store_deletion(postgres_gc_env):
-    """Simulate crash where GFS was deleted but process died before GEFS was deleted."""
-    engine, tmp_path = postgres_gc_env
-
-    c0 = _dt(2026, 9, 1, 6)
-    c1 = _dt(2026, 9, 2, 6)
-    c2 = _dt(2026, 9, 2, 12)
-
-    gfs_path, gefs_path = _seed_cycle(engine, tmp_path, c0, "ready")
-    _seed_cycle(engine, tmp_path, c1, "ready")
-    _seed_cycle(engine, tmp_path, c2, "ready")
-
-    # Manually delete GFS to simulate crash midway
-    shutil.rmtree(gfs_path)
-    assert not os.path.exists(gfs_path)
-    assert os.path.exists(gefs_path)
-
-    # Next GC pass runs from scratch
-    candidate = GcCandidateInfo(
-        model_id="gfs",
-        cycle_time=c0,
-        cutoff=c1,
-        store_path=gfs_path,
-        gfs_store_path=gfs_path,
-        gefs_store_path=gefs_path,
-    )
-    success = process_gc_candidate(
-        engine, candidate, timeout_seconds=5.0, now=_dt(2026, 9, 2, 13)
-    )
-    assert success is True
-    with Session(engine) as session:
-        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
-        assert lc is not None
-        assert lc.deleted_at is not None
-
-
-# ---------------------------------------------------------------------------
-# Full E2E Lifecycle Acceptance Test
-# ---------------------------------------------------------------------------
-
-
-def test_full_e2e_lifecycle_retirement_dryrun_gc_tombstone(postgres_gc_env):
-    """Execute the full end-to-end Phase 6 lifecycle pipeline."""
-    engine, tmp_path = postgres_gc_env
-
-    c0 = _dt(2026, 9, 1, 6)
-    c1 = _dt(2026, 9, 2, 6)   # R1
-    c2 = _dt(2026, 9, 2, 12)  # R2
-
-    gfs_path, gefs_path = _seed_cycle(engine, tmp_path, c0, "ready")
-    _seed_cycle(engine, tmp_path, c1, "ready")
-    _seed_cycle(engine, tmp_path, c2, "ready")
-
-    # 1. Run GC pass in DRY RUN mode -> shows would_gc
-    res_dry = run_gc_pass(engine, dry_run=True, now=_dt(2026, 9, 2, 12, 30))
-    assert res_dry.dry_run is True
-    assert len(res_dry.would_gc) >= 1
-    assert c0 in [g.cycle_time for g in res_dry.would_gc]
-
-    # Dry run did not delete anything
-    assert os.path.exists(gfs_path)
-    assert os.path.exists(gefs_path)
-    with Session(engine) as session:
-        assert session.get(ForecastCycleLifecycleRecord, ("gfs", c0)) is None
-
-    # 2. Run REAL GC pass
-    res_real = run_gc_pass(engine, dry_run=False, now=_dt(2026, 9, 2, 12, 30))
-    assert res_real.dry_run is False
-    assert c0 in res_real.processed_gc
-
-    # 3. Stores are physically removed
-    assert not os.path.exists(gfs_path)
-    assert not os.path.exists(gefs_path)
-
-    # 4. Catalog rows for c0 are deleted
-    with Session(engine) as session:
-        runs_c0 = session.execute(
-            select(ModelRunRecord).where(ModelRunRecord.cycle_time == c0)
-        ).scalars().all()
-        assert runs_c0 == []
-
-        # 5. Tombstone in forecast_cycle_lifecycle is retained
-        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
-        assert lc is not None
-        assert _ensure_utc_datetime(lc.deleted_at) == _dt(2026, 9, 2, 12, 30)
-
-    # 6. Successor cycles c1 and c2 remain completely intact!
-    with Session(engine) as session:
-        runs_c1 = session.execute(
-            select(ModelRunRecord).where(ModelRunRecord.cycle_time == c1)
-        ).scalars().all()
-        assert len(runs_c1) == 2  # GFS + GEFS
-
-
-# ---------------------------------------------------------------------------
-# Deletion Fence Race Closure & Monotonicity Tests
-# ---------------------------------------------------------------------------
-
-
-def test_reingestion_race_closure_after_gfs_release(postgres_gc_env):
-    """Prove that after GFS deletion gate release, new ingestion is blocked by deletion_started_at.
-
-    Scenario:
-    1. GC claims cycle c0 (deletion_started_at set).
-    2. GFS is deleted and GFS store gate is released.
-    3. GC pauses before deleting GEFS.
-    4. Stale/manual ingestion for c0 attempts to start via wave runner / admission check.
-    5. Stale ingestion is rejected with CycleTombstonedError before touching storage.
-    6. GFS store is NOT recreated.
-    7. GC resumes, deletes GEFS, cleans catalog, and sets deleted_at.
+    1. The claim (deletion_started_at) blocks stale ingestion writers with
+       CycleTombstonedError before touching storage.
+    2. The planner enqueues the claimed cycle's units (fence = unprotected).
+    3. The worker deletes them at (variable, valid_time) granularity.
+    4. The bookkeeping pass derives deleted_at — with zero cycle-prefix deletion.
+    5. Catalog metadata is retained for the sweeper.
     """
     engine, tmp_path = postgres_gc_env
 
@@ -398,21 +186,14 @@ def test_reingestion_race_closure_after_gfs_release(postgres_gc_env):
     _seed_cycle(engine, tmp_path, c1, "ready")
     _seed_cycle(engine, tmp_path, c2, "ready")
 
-    # Step 1: Claim deletion fence
+    # Step 1: Claim the retirement fence (no physical deletion anywhere)
     with Session(engine) as session:
-        assert claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30)) is True
-
-    # Step 2: Delete GFS and release GFS gate
-    assert delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0) is True
-    assert not os.path.exists(gfs_path)
-
-    # Step 3: GC is paused before cleanup. deleted_at is still NULL!
-    with Session(engine) as session:
+        ensure_lifecycle_row(session, "gfs", c0)
         lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
-        assert lc.deletion_started_at is not None
-        assert lc.deleted_at is None
+        lc.deletion_started_at = _dt(2026, 9, 2, 12, 30)
+        session.commit()
 
-    # Step 4: Stale ingestion attempts to write to GFS store
+    # Step 2: Stale ingestion for the claimed cycle is rejected before storage
     spec = RunCatalogSpec(
         center_id="noaa",
         center_name="NOAA",
@@ -433,105 +214,41 @@ def test_reingestion_race_closure_after_gfs_release(postgres_gc_env):
         ),
         expected_lead_time_hours=(0,),
     )
-    dummy_ds = _make_dataset(c0, 0)
-
-    # Step 5: Ingestion admission guard must reject before creating store
     with Session(engine) as session:
         with pytest.raises(CycleTombstonedError, match="claimed for deletion or already tombstoned"):
-            record_run(session, spec, dummy_ds)
+            record_run(session, spec, _make_dataset(c0, 0))
 
-    # Step 6: Verify GFS store was NOT recreated
-    assert not os.path.exists(gfs_path)
-
-    # Step 7: GC cleans catalog, stamps deleted_at
+    # Step 3: Planner enqueues the claimed cycle's remaining units
     with Session(engine) as session:
-        cleanup_cycle_catalog_and_tombstone(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 35))
+        plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=_dt(2026, 9, 2, 12, 30))
+        assert plan.enqueued_count > 0
 
-    assert not os.path.exists(gfs_path)
+    # Step 4: Worker reclaims them granularly
+    with Session(engine) as session:
+        w_res = run_reclamation_worker_pass(session, delete_enabled=True, now=_dt(2026, 9, 2, 12, 35))
+        assert w_res.deleted_count > 0
+
+    # Step 5: Bookkeeping derives the tombstone (zero physical storage operations)
+    res_pass = run_lifecycle_bookkeeping_pass(engine, dry_run=False, now=_dt(2026, 9, 2, 13, 0))
+    assert ("gfs", c0) in res_pass.finalized_cycles
+
     with Session(engine) as session:
         lc_final = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
         assert lc_final is not None
         assert lc_final.deletion_started_at is not None
         assert lc_final.deleted_at is not None
 
-
-def test_crash_fence_persists_across_process_restart(postgres_gc_env):
-    """Simulate process crash after deletion_started_at is stamped; verify fence blocks writers while offline."""
-    engine, tmp_path = postgres_gc_env
-
-    c0 = _dt(2026, 9, 1, 6)
-    c1 = _dt(2026, 9, 2, 6)
-    c2 = _dt(2026, 9, 2, 12)
-
-    gfs_path, gefs_path = _seed_cycle(engine, tmp_path, c0, "ready")
-    _seed_cycle(engine, tmp_path, c1, "ready")
-    _seed_cycle(engine, tmp_path, c2, "ready")
-
-    with Session(engine) as session:
-        # Process 1 claims cycle and deletes GFS, then crashes
-        claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
-        session.commit()
-
-    delete_physical_store_gated(engine, gfs_path, timeout_seconds=5.0)
-    assert not os.path.exists(gfs_path)
-
-    # While GC is down, a manual ingestion tries to run
-    spec = RunCatalogSpec(
-        center_id="noaa",
-        center_name="NOAA",
-        center_country="US",
-        model_id="gfs",
-        model_name="GFS",
-        is_ensemble=False,
-        resolution_km=25.0,
-        version_string="v1.0",
-        cycle_time=c0,
-        grid_id="global_025deg",
-        grid_name="Global",
-        grid_resolution_km=25.0,
-        zarr_store_path=gfs_path,
-        variables=(
-            VariableSpec("temperature_2m", "2-Meter Temperature", "°C"),
-            VariableSpec("precipitation_rate", "Precipitation Rate", "mm/h"),
-        ),
-        expected_lead_time_hours=(0,),
-    )
-    with Session(engine) as session:
-        with pytest.raises(CycleTombstonedError):
-            record_run(session, spec, _make_dataset(c0, 0))
-
-    # Process 2 (new GC leader) restarts and completes the pass
-    res_pass = run_gc_pass(engine, dry_run=False, now=_dt(2026, 9, 2, 13, 0))
-    assert c0 in res_pass.processed_gc
-
-    assert not os.path.exists(gfs_path)
-    with Session(engine) as session:
-        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c0))
-        assert lc.deleted_at is not None
-
-
-def test_claimed_deletion_monotonic_recovery_without_historical_r2(postgres_gc_env):
-    """Prove that an already-claimed deletion resumes even if historical successor runs were removed."""
-    engine, tmp_path = postgres_gc_env
-
-    c0 = _dt(2026, 9, 1, 6)
-    c1 = _dt(2026, 9, 2, 6)
-    c2 = _dt(2026, 9, 2, 12)
-
-    gfs_path, gefs_path = _seed_cycle(engine, tmp_path, c0, "ready")
-    _seed_cycle(engine, tmp_path, c1, "ready")
-    _seed_cycle(engine, tmp_path, c2, "ready")
-
-    with Session(engine) as session:
-        claim_cycle_for_deletion(session, "gfs", c0, now=_dt(2026, 9, 2, 12, 30))
-        session.commit()
-
-        # Delete successor runs for c1 and c2 simulating prior historical cleanup
-        cleanup_cycle_catalog_and_tombstone(session, "gfs", c1, now=_dt(2026, 9, 2, 12, 35))
-        cleanup_cycle_catalog_and_tombstone(session, "gfs", c2, now=_dt(2026, 9, 2, 12, 35))
-
-        # Recheck eligibility must still return True (monotonic recovery)
-        is_el, reason, _ = recheck_gc_eligibility(session, "gfs", c0)
-        assert is_el is True
-        assert reason == "gc_claimed_resumable"
-
+        # Catalog metadata is retained (14-day sweeper owns purging)
+        runs_c0 = (
+            session.execute(
+                select(ModelRunRecord)
+                .join(ModelVersionRecord, ModelRunRecord.model_version_id == ModelVersionRecord.id)
+                .where(
+                    ModelVersionRecord.model_id == "gfs",
+                    ModelRunRecord.cycle_time == c0,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(runs_c0) == 1

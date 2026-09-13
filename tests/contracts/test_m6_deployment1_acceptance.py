@@ -79,7 +79,7 @@ from ingestion.core.catalog import (
 from ingestion.gc.finalizer import (
     claim_fresh_candidate,
     enumerate_cycle_store_paths,
-    finalize_cycle_eol,
+    finalize_cycle_bookkeeping,
     finalize_cycle_physical_and_queue,
 )
 from ingestion.gc.sweeper import run_metadata_sweeper_pass
@@ -572,12 +572,12 @@ def test_task8_crash_restart_acceptance(m6_db) -> None:
     # Fresh eligibility would say NOT expired at now = Sep 8 07Z
     assert not is_cycle_horizon_expired(c_crash, max_lead_hours=240, serving_start=_dt(2026, 9, 8, 6, 0))
 
-    # Recovery finalization must succeed WITHOUT re-checking fresh horizon
+    # Recovery bookkeeping must succeed WITHOUT re-checking fresh horizon and
+    # WITHOUT any physical storage operation (V3: tombstone is derived).
     now_rec = _dt(2026, 9, 8, 7, 0)
     serving_start = serving_start_valid_time(now_rec)
-    with patch("ingestion.gc.finalizer.delete_physical_store_gated", return_value=True):
-        res = finalize_cycle_eol(engine, "gfs", c_crash, is_recovery=True, serving_start=serving_start, now=now_rec)
-        assert res is True
+    res = finalize_cycle_bookkeeping(engine, "gfs", c_crash, is_recovery=True, serving_start=serving_start, now=now_rec)
+    assert res is True
 
     refreshed = db.get(ForecastCycleLifecycleRecord, ("gfs", c_crash))
     assert _ensure_utc_datetime(refreshed.deleted_at) == now_rec

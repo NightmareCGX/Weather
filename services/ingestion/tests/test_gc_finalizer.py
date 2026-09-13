@@ -1,4 +1,9 @@
-"""Focused tests for V3 Whole-Cycle End-of-Life Finalizer and M2 Concurrency Hardening."""
+"""Focused tests for V3 lifecycle bookkeeping and M2 concurrency hardening.
+
+The bookkeeping pass performs ZERO physical storage operations: retirement
+claims are serving fences, tombstones are derived once every committed
+reclamation unit is terminal (architecture doc section 7/8).
+"""
 
 from __future__ import annotations
 
@@ -35,10 +40,11 @@ from ingestion.core.catalog import (
 from ingestion.core.coordinator import RunCoordinator
 from ingestion.gc.finalizer import (
     claim_fresh_candidate,
+    cycle_reclamation_units_terminal,
     enumerate_cycle_store_paths,
-    finalize_cycle_eol,
+    finalize_cycle_bookkeeping,
     finalize_cycle_physical_and_queue,
-    run_finalizer_pass,
+    run_lifecycle_bookkeeping_pass,
 )
 
 
@@ -425,9 +431,14 @@ def test_under_gate_recheck_blocks_mutations_after_claim(
 # ---------------------------------------------------------------------------
 
 
-def test_finalize_cycle_deletes_multiple_stores_sequentially(
+def test_finalize_cycle_bookkeeping_never_deletes_physical_stores(
     catalog_engine, tmp_path
 ) -> None:
+    """I7/I16: the bookkeeping pass derives the tombstone but NEVER deletes stores.
+
+    Physical deletion belongs exclusively to the reclamation worker at
+    (variable, valid_time) granularity; there is no cycle-prefix deletion stage.
+    """
     store1 = tmp_path / "store1.zarr"
     store2 = tmp_path / "store2.zarr"
     store1.mkdir(parents=True, exist_ok=True)
@@ -451,8 +462,8 @@ def test_finalize_cycle_deletes_multiple_stores_sequentially(
     now_utc = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
     serving_start = serving_start_valid_time(now_utc)
 
-    # Finalize cycle
-    ok = finalize_cycle_eol(
+    # Finalize bookkeeping (no committed units -> trivially terminal)
+    ok = finalize_cycle_bookkeeping(
         catalog_engine,
         "gfs",
         c_time,
@@ -462,9 +473,9 @@ def test_finalize_cycle_deletes_multiple_stores_sequentially(
     )
     assert ok is True
 
-    # Both physical stores must be deleted!
-    assert not store1.exists()
-    assert not store2.exists()
+    # Physical stores MUST remain untouched (no cycle-level deletion authority)
+    assert store1.exists()
+    assert store2.exists()
 
     # deleted_at must be committed
     with Session(catalog_engine) as session:
@@ -472,6 +483,104 @@ def test_finalize_cycle_deletes_multiple_stores_sequentially(
         assert lc is not None
         assert _ensure_utc_datetime(lc.deleted_at) == now_utc
         assert _ensure_utc_datetime(lc.deletion_started_at) == now_utc
+
+
+def test_finalize_cycle_bookkeeping_blocks_until_units_terminal(catalog_engine) -> None:
+    """A cycle with committed units lacking terminal queue rows must NOT tombstone."""
+    c_time = datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
+    spec = _make_spec(cycle_time=c_time)
+
+    with Session(catalog_engine) as session:
+        reserve_run(session, spec)
+        session.commit()
+
+    now_utc = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    serving_start = serving_start_valid_time(now_utc)
+
+    # A committed product exists but its reclamation queue row is 'queued'
+    with Session(catalog_engine) as session:
+        run = session.execute(
+            select(ModelRunRecord).where(ModelRunRecord.cycle_time == c_time)
+        ).scalar_one()
+        session.add(
+            ProductRecord(
+                id=f"prod_{run.id}_0_temperature_2m",
+                run_id=run.id,
+                lead_time_hours=0,
+                variable_id="temperature_2m",
+                grid_id="global_025deg",
+                product_type="surface",
+                zarr_chunk_path="/fake",
+            )
+        )
+        session.add(
+            ReclamationQueueRecord(
+                id="q_pending",
+                run_id=run.id,
+                model_id="gfs",
+                cycle_time=c_time,
+                lead_time_hours=0,
+                variable_code="temperature_2m",
+                target_kind="det",
+                member_index=0,
+                valid_time=c_time,
+                store_path=spec.zarr_store_path,
+                physical_key="temperature_2m/shard.det_L0000.shard",
+                status="queued",
+                attempt_count=0,
+                last_error=None,
+                reclaimed_at=None,
+                created_at=now_utc,
+                updated_at=now_utc,
+            )
+        )
+        session.commit()
+
+    with Session(catalog_engine) as session:
+        assert (
+            cycle_reclamation_units_terminal(session, "gfs", c_time) is False
+        )
+
+    ok = finalize_cycle_bookkeeping(
+        catalog_engine,
+        "gfs",
+        c_time,
+        is_recovery=False,
+        serving_start=serving_start,
+        now=now_utc,
+    )
+    assert ok is False  # blocked: units not terminal
+
+    with Session(catalog_engine) as session:
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
+        assert lc is not None
+        assert lc.deleted_at is None  # claim may exist, tombstone must not
+
+    # Worker marks the unit deleted -> terminal -> bookkeeping proceeds
+    with Session(catalog_engine) as session:
+        row = session.get(ReclamationQueueRecord, "q_pending")
+        row.status = "deleted"
+        row.reclaimed_at = now_utc
+        session.commit()
+
+    with Session(catalog_engine) as session:
+        assert (
+            cycle_reclamation_units_terminal(session, "gfs", c_time) is True
+        )
+
+    ok2 = finalize_cycle_bookkeeping(
+        catalog_engine,
+        "gfs",
+        c_time,
+        is_recovery=True,
+        serving_start=serving_start,
+        now=now_utc,
+    )
+    assert ok2 is True
+
+    with Session(catalog_engine) as session:
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
+        assert _ensure_utc_datetime(lc.deleted_at) == now_utc
 
 
 # ---------------------------------------------------------------------------
@@ -628,12 +737,8 @@ def test_queue_normalization_all_existing_rows_atomic(catalog_engine) -> None:
 def test_crash_recovery_resumes_without_fresh_horizon_recheck(
     catalog_engine, tmp_path
 ) -> None:
-    store_dir = tmp_path / "recovery_store.zarr"
-    store_dir.mkdir(parents=True, exist_ok=True)
-    (store_dir / "chunk.bin").write_text("chunk")
-
     c_time = datetime(2026, 7, 20, 0, 0, tzinfo=timezone.utc)
-    spec = _make_spec(cycle_time=c_time, store_path=str(store_dir))
+    spec = _make_spec(cycle_time=c_time, store_path=str(tmp_path / "recovery_store.zarr"))
 
     with Session(catalog_engine) as session:
         reserve_run(session, spec)
@@ -650,8 +755,8 @@ def test_crash_recovery_resumes_without_fresh_horizon_recheck(
     now_utc = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
     serving_start = serving_start_valid_time(now_utc)
 
-    # Resume finalization as recovery candidate
-    ok = finalize_cycle_eol(
+    # Resume bookkeeping as recovery candidate
+    ok = finalize_cycle_bookkeeping(
         catalog_engine,
         "gfs",
         c_time,
@@ -661,9 +766,6 @@ def test_crash_recovery_resumes_without_fresh_horizon_recheck(
     )
     assert ok is True
 
-    # Store deleted
-    assert not store_dir.exists()
-
     # deleted_at committed, deletion_started_at preserved
     with Session(catalog_engine) as session:
         lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
@@ -671,7 +773,7 @@ def test_crash_recovery_resumes_without_fresh_horizon_recheck(
         assert _ensure_utc_datetime(lc.deleted_at) == now_utc
         assert _ensure_utc_datetime(lc.deletion_started_at) == claim_t
 
-        # Catalog metadata is RETAINED (M3 owns purging it, M2 must not!)
+        # Catalog metadata is RETAINED (M3 owns purging it, bookkeeping must not!)
         runs = (
             session.execute(
                 select(ModelRunRecord).where(
@@ -684,19 +786,18 @@ def test_crash_recovery_resumes_without_fresh_horizon_recheck(
         assert len(runs) == 1
 
 
-def test_finalizer_discovers_and_finalizes_legacy_cycle_without_lifecycle_row(
+def test_finalizer_discovers_and_tombstones_legacy_cycle_without_lifecycle_row(
     catalog_engine, tmp_path
 ) -> None:
-    """Historical legacy cycle with model_runs/model_versions but NO forecast_cycle_lifecycle row.
+    """Historical legacy cycle with model_runs/model_versions but NO lifecycle row.
 
     Proves:
-    1. run_finalizer_pass discovers the cycle directly from catalog evidence (model_runs outerjoin).
-    2. Lifecycle row is race-safely created and locked via ensure_lifecycle_row.
-    3. Fresh horizon check passes, deletion_started_at is claimed.
-    4. Physical store is deleted.
-    5. deleted_at is committed atomically.
+    1. The bookkeeping pass discovers the cycle directly from catalog evidence.
+    2. The lifecycle row is race-safely created via ensure_lifecycle_row.
+    3. The fresh horizon check passes and deletion_started_at is claimed.
+    4. deleted_at is committed (no committed units -> trivially terminal).
+    5. ZERO physical storage operations: the store must remain untouched.
     6. ModelRunRecord remains retained in the catalog.
-    7. Clean execution against contracted lifecycle schema.
     """
     legacy_store = tmp_path / "legacy_gfs.zarr"
     legacy_store.mkdir(parents=True, exist_ok=True)
@@ -732,7 +833,7 @@ def test_finalizer_discovers_and_finalizes_legacy_cycle_without_lifecycle_row(
         session.add_all([center, model, version, run])
         session.commit()
 
-    # 2. Assert lifecycle row explicitly does NOT exist before finalizer pass
+    # 2. Assert lifecycle row explicitly does NOT exist before the pass
     with Session(catalog_engine) as session:
         assert (
             session.get(ForecastCycleLifecycleRecord, ("gfs", c_time)) is None
@@ -740,23 +841,21 @@ def test_finalizer_discovers_and_finalizes_legacy_cycle_without_lifecycle_row(
 
     assert legacy_store.exists()
 
-    # 3. Execute normal production entry point: run_finalizer_pass
-    pass_result = run_finalizer_pass(
+    # 3. Execute normal production entry point
+    pass_result = run_lifecycle_bookkeeping_pass(
         catalog_engine,
         models=("gfs",),
         dry_run=False,
-        base_bucket="weather-data",
-        timeout_seconds=5.0,
         now=now_utc,
     )
 
-    # 4. Verify candidate discovery & finalization
+    # 4. Verify candidate discovery & tombstone
     assert ("gfs", c_time) in pass_result.claimed_cycles
     assert ("gfs", c_time) in pass_result.finalized_cycles
     assert pass_result.failed_cycles == ()
 
-    # 5. Verify physical store is absent
-    assert not legacy_store.exists()
+    # 5. Verify ZERO physical storage operations
+    assert legacy_store.exists()
 
     # 6. Verify lifecycle row created and stamped with both claim and tombstone
     with Session(catalog_engine) as session:
@@ -765,9 +864,8 @@ def test_finalizer_discovers_and_finalizes_legacy_cycle_without_lifecycle_row(
         assert _ensure_utc_datetime(lc.deletion_started_at) == now_utc
         assert _ensure_utc_datetime(lc.deleted_at) == now_utc
 
-        # 7. Verify ModelRunRecord is RETAINED (M2 does not purge catalog metadata)
+        # 7. ModelRunRecord is RETAINED (sweeper owns metadata purging)
         legacy_run = session.get(ModelRunRecord, "run_legacy_gfs_2026070200")
         assert legacy_run is not None
         assert legacy_run.status == "ready"
         assert legacy_run.zarr_store_path == str(legacy_store)
-

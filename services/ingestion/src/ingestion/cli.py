@@ -1078,13 +1078,14 @@ def _run_realtime(args: argparse.Namespace) -> int:
 def _run_gc(args: argparse.Namespace) -> int:
     """Run the garbage collection (GC) and storage reclamation engine (Phase 6D).
 
-    Supported modes:
+    Supported modes (Lifecycle V3 converged model: physical deletion happens
+    exclusively through the reclamation planner + worker at
+    (variable, valid_time) granularity; this command runs lifecycle bookkeeping
+    and performs zero physical storage operations):
     * ``--sweep-metadata``: Execute M3 14-day detailed metadata retention sweeper pass.
-    * ``--once --dry-run``: Plan and log diagnostics without acquiring exclusive
-      locks or mutating S3/PostgreSQL.
-    * ``--once``: Acquire GC leadership, execute one reconciliation/deletion pass,
-      and exit.
-    * Daemon (default): Acquire GC leadership and loop: reconcile -> sleep -> reconcile.
+    * ``--once --dry-run``: Plan and log diagnostics without mutating PostgreSQL.
+    * ``--once``: Acquire GC leadership, execute one bookkeeping pass, and exit.
+    * Daemon (default): Acquire GC leadership and loop: bookkeeping -> sleep -> bookkeeping.
 
     Args:
         args: Parsed CLI arguments.
@@ -1096,7 +1097,7 @@ def _run_gc(args: argparse.Namespace) -> int:
     import time
     from ingestion.core.db import engine as catalog_engine
     from ingestion.gc.leadership import GcLeadership
-    from ingestion.gc.finalizer import run_finalizer_pass
+    from ingestion.gc.finalizer import run_lifecycle_bookkeeping_pass
 
     if getattr(args, "sweep_metadata", False):
         from ingestion.gc.sweeper import run_metadata_sweeper_pass
@@ -1118,16 +1119,12 @@ def _run_gc(args: argparse.Namespace) -> int:
 
     dry_run = bool(args.dry_run)
     interval = max(1.0, float(args.interval_seconds))
-    bucket = str(args.bucket)
-    timeout_seconds = float(args.lock_timeout_seconds)
 
     if dry_run:
         # Dry-run performs zero mutations and does not acquire destructive leadership
-        run_finalizer_pass(
+        run_lifecycle_bookkeeping_pass(
             catalog_engine,
             dry_run=True,
-            base_bucket=bucket,
-            timeout_seconds=timeout_seconds,
         )
         return 0
 
@@ -1160,12 +1157,10 @@ def _run_gc(args: argparse.Namespace) -> int:
                     logger.error("Failed to reacquire GC leadership; exiting.")
                     return 1
 
-            run_finalizer_pass(
+            run_lifecycle_bookkeeping_pass(
                 catalog_engine,
                 dry_run=False,
-                base_bucket=bucket,
-                timeout_seconds=timeout_seconds,
-            )
+            )  # zero physical storage operations (V3 bookkeeping)
 
             if args.once or stop_requested:
                 break
