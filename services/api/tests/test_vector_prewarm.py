@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import HTTPException
 
+from api.services import vector_field
 from api.services import vector_prewarm
 from api.services.resolver import ResolvedForecastSource
 from api.services.vector_field import (
@@ -58,8 +59,14 @@ class _FakeSession:
 
 
 @pytest.fixture(autouse=True)
-def _clean_vector_cache():
+def _clean_vector_cache(monkeypatch):
+    """Isolate each test from the L1 dict and the (possibly live) shared Redis L2.
+
+    These tests exercise pass logic against the process-local layer only; the
+    Redis tier has its own tests in test_vector_cache_redis.py.
+    """
     _vector_cache.clear()
+    monkeypatch.setattr(vector_field, "_get_redis_client", lambda: None)
     yield
     _vector_cache.clear()
 

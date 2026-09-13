@@ -1,11 +1,13 @@
 """Background warm-up of the wind vector-field serving cache.
 
 The vector field payload is expensive to compute cold (GEFS: 30 members ×
-u/v full-globe Zarr reads per valid time), and the in-process cache
-(:mod:`api.services.vector_field`) is filled passively — so after each
-forecast-cycle publication the first real user of every valid time paid the
-full computation. This module closes that gap with a best-effort background
-scan that keeps the serving window warm proactively.
+u/v full-globe Zarr reads per valid time), and the serving cache
+(:mod:`api.services.vector_field`: process-local L1 + shared Redis L2) is
+filled passively — so after each forecast-cycle publication the first real
+user of every valid time paid the full computation. This module closes that
+gap with a best-effort background scan that keeps the serving window warm
+proactively. The shared Redis L2 makes the warm-up fleet-wide: a payload
+computed by any worker (or this loop) is immediately visible to all others.
 
 Design:
 

@@ -142,6 +142,12 @@ class Settings(BaseSettings):
     API_VECTOR_PREWARM_MAX_COMPUTES_PER_PASS: int = 6
     API_VECTOR_PREWARM_COMPUTE_THROTTLE_SECONDS: float = 2.0
 
+    # Wind vector-field cache layering. The shared Redis L2 lets every worker
+    # (and the prewarm loop) see one another's computed payloads so each valid
+    # time is computed once fleet-wide; the small per-process L1 keeps serving
+    # fast and unaffected when Redis is unavailable.
+    API_VECTOR_CACHE_REDIS_ENABLED: bool = True
+
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
         env_file_encoding="utf-8",
