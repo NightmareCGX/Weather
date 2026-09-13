@@ -155,6 +155,14 @@ poetry run weather-ingest gc --once
 poetry run weather-ingest gc --interval-seconds 1800
 ```
 
+### 4.5 Running the Ingestion Metrics Exporter
+Run the ingestion Prometheus exporter bound to the loopback interface only. Metrics endpoints must never be exposed to public networks; they are consumed locally or transported via SSH tunnel:
+```bash
+cd services/ingestion
+poetry run weather-ingest metrics --host 127.0.0.1 --port 9112
+```
+The exporter collects at scrape time (probe-style, fail-open per collector) and holds no durable state. For the authoritative monitoring architecture, metric semantics, port table, and the local/remote Prometheus/Grafana setup, see [`docs/MONITORING.md`](MONITORING.md).
+
 ---
 
 ## 5. Production Orchestration Status

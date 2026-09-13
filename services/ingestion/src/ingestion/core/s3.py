@@ -33,6 +33,7 @@ import atexit
 import enum
 import logging
 import threading
+import time
 import weakref
 from collections.abc import MutableMapping
 from typing import Any
@@ -158,6 +159,49 @@ class IngestionS3FileSystem(s3fs.S3FileSystem):
         if self.is_data_plane:
             with _data_registry_lock:
                 _active_data_filesystems[id(self)] = self
+
+    async def _instrument(self, operation: str, coro: Any) -> Any:
+        """Time one S3 operation and record it in the bounded storage metrics.
+
+        Overhead per call is two clock reads plus a counter increment and a
+        histogram observation (fixed cardinality over the operation enum), so
+        it is negligible against the network round-trip being measured.
+        """
+        from ingestion.monitoring.storage import STORAGE_COLLECTOR
+
+        started = time.monotonic()
+        try:
+            result = await coro
+        except BaseException:
+            STORAGE_COLLECTOR.record_operation(
+                operation, time.monotonic() - started, success=False
+            )
+            raise
+        STORAGE_COLLECTOR.record_operation(operation, time.monotonic() - started)
+        return result
+
+    # Operation primitives of the s3fs async filesystem. Passing through
+    # *args/**kwargs keeps the wrappers signature-compatible with the pinned
+    # s3fs version; the mapping to the bounded operation enum is:
+    # get (byte-range / object read), put (write), delete, list (directory
+    # listing), head (metadata / existence via info).
+    async def _cat_file(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._instrument("get", super()._cat_file(*args, **kwargs))
+
+    async def _pipe_file(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._instrument("put", super()._pipe_file(*args, **kwargs))
+
+    async def _put_file(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._instrument("put", super()._put_file(*args, **kwargs))
+
+    async def _rm_file(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._instrument("delete", super()._rm_file(*args, **kwargs))
+
+    async def _ls(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._instrument("list", super()._ls(*args, **kwargs))
+
+    async def _info(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._instrument("head", super()._info(*args, **kwargs))
 
     async def set_session(self, refresh: bool = False, kwargs: dict[str, Any] = {}) -> Any:
         res = await super().set_session(refresh=refresh, kwargs=kwargs)
