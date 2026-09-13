@@ -41,6 +41,14 @@ def _chunk(chunk_type: bytes, data: bytes) -> bytes:
     )
 
 
+#: zlib compression level for tile IDAT payloads. Level 6 is the zlib default
+#: and renders roughly twice as fast as level 9 while producing only a few
+#: percent more bytes on smooth RGBA weather ramps; tiles are served from the
+#: process LRU after the first render, so encode speed dominates miss latency
+#: while size only marginally affects one-shot transfer.
+_PNG_COMPRESS_LEVEL = 6
+
+
 def encode_rgba_png(pixels: bytes, width: int, height: int) -> bytes:
     """Encode an RGBA pixel buffer as a PNG.
 
@@ -85,6 +93,6 @@ def encode_rgba_png(pixels: bytes, width: int, height: int) -> bytes:
         scanlines.append(0)
         scanlines += pixels[row * stride : (row + 1) * stride]
 
-    idat = _chunk(b"IDAT", zlib.compress(bytes(scanlines), 9))
+    idat = _chunk(b"IDAT", zlib.compress(bytes(scanlines), _PNG_COMPRESS_LEVEL))
     iend = _chunk(b"IEND", b"")
     return _PNG_SIGNATURE + ihdr + idat + iend

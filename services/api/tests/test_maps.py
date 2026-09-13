@@ -159,7 +159,7 @@ def test_maps_valid_time(client):
     data = body["data"]
     assert data["tile_url_template"] == (
         "/v1/maps/gfs/temperature_2m/surface/"
-        "{z}/{x}/{y}.png?valid_time=2026-07-21T06:00:00Z"
+        "{z}/{x}/{y}.png?valid_time=2026-07-21T06:00:00Z&initial_time={source_cycle}"
     )
     assert data["valid_time"] == "2026-07-21T06:00:00Z"
     assert data["lead_time_hours"] == 6

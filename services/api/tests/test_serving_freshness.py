@@ -163,7 +163,9 @@ def test_long_lived_api_observes_new_lead_and_cycle_without_restart(
 
         resp_tile_2 = client.get("/v1/maps/gfs/temperature_2m/surface/0/0/0.png?lead_time_hours=6&initial_time=2026-07-25T00:00:00Z")
         assert resp_tile_2.status_code == 200
-        assert resp_tile_2.headers["Cache-Control"] == "no-cache"
+        # The URL pins the serving cycle (initial_time), so it is immutable and
+        # long-lived browser caching applies (cycle transitions change the URL).
+        assert resp_tile_2.headers["Cache-Control"] == "public, max-age=3600, immutable"
 
         # 5. Mid-process Ingestion Event 2: Ingest a brand-new cycle 2026-07-25 06Z.
         write_dataset(_make_forecast_dataset([0], base_temp=20.0), store_dir_06)

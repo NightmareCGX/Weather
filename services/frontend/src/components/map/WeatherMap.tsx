@@ -7,6 +7,7 @@ import type {
   ApproximateStartupLocation,
   SelectedLocation,
   SpatialLayer,
+  ValidTimeAvailability,
   VectorFieldData,
 } from "@/lib/api/types";
 import { buildBaseStyle } from "@/lib/map/baseStyle";
@@ -15,6 +16,7 @@ import { canonicalizeLongitude, coordinatesToSelectedLocation } from "@/lib/fore
 import { LocateMeButton } from "@/components/map/LocateMeButton";
 import { WindParticleAnimation } from "@/lib/map/windParticles";
 import { useVectorField } from "@/hooks/useVectorField";
+import { useAdjacentTilePrefetch } from "@/hooks/useTilePrefetch";
 
 interface WeatherMapProps {
   /** `/v1/maps` metadata for the weather layer, or null while loading/erroring. */
@@ -27,6 +29,8 @@ interface WeatherMapProps {
   validTime: string | null;
   /** Available forecast lead hours for prefetch (optional). */
   availableLeads?: number[];
+  /** Per-valid-time availability entries (with serving cycles) for raster tile prefetch. */
+  availableValidTimes?: ValidTimeAvailability[];
   /** Fired with a coordinate location when the user clicks the map. */
   onSelect: (location: SelectedLocation) => void;
   /** Optional callback fired when the map finishes moving (moveend) with canonical center coordinates. */
@@ -56,6 +60,7 @@ export function WeatherMap({
   approximateLocation,
   validTime,
   availableLeads,
+  availableValidTimes,
   onSelect,
   onCenterChange,
   onLocate,
@@ -224,6 +229,15 @@ export function WeatherMap({
       }
     };
   }, []);
+
+  // Warm the browser HTTP cache with the adjacent valid times' tiles for the
+  // current viewport (valid-time mode). Declared after the map-creation
+  // effect so its effects observe the created map instance.
+  useAdjacentTilePrefetch({
+    mapRef,
+    layer,
+    validTimes: availableValidTimes ?? [],
+  });
 
   // Update scalar raster layer
   useEffect(() => {

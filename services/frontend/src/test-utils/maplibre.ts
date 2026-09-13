@@ -38,7 +38,8 @@ export class MockMap {
   static defaultIsLoaded = true;
 
   options: Record<string, unknown>;
-  handlers = new Map<string, (payload?: unknown) => void>();
+  /** Multiple real MapLibre listeners can subscribe to the same event. */
+  handlers = new Map<string, Array<(payload?: unknown) => void>>();
   sources = new Set<string>();
   layers = new Set<string>();
   removed = false;
@@ -46,10 +47,28 @@ export class MockMap {
   _isStyleLoaded = MockMap.defaultIsStyleLoaded;
 
   on = jest.fn((event: string, handler: (payload?: unknown) => void) => {
-    this.handlers.set(event, handler);
+    const list = this.handlers.get(event) ?? [];
+    // Idempotent per handler reference, mirroring real event-target semantics.
+    if (!list.includes(handler)) {
+      list.push(handler);
+    }
+    this.handlers.set(event, list);
   });
-  off = jest.fn((event: string) => {
-    this.handlers.delete(event);
+  off = jest.fn((event: string, handler?: (payload?: unknown) => void) => {
+    if (handler === undefined) {
+      this.handlers.delete(event);
+      return;
+    }
+    const list = this.handlers.get(event);
+    if (list === undefined) {
+      return;
+    }
+    const next = list.filter((entry) => entry !== handler);
+    if (next.length === 0) {
+      this.handlers.delete(event);
+    } else {
+      this.handlers.set(event, next);
+    }
   });
   addControl = jest.fn();
   addSource = jest.fn((id: string) => {
@@ -92,12 +111,13 @@ export class MockMap {
   }
 
   /**
-   * Invoke a registered event handler with an optional payload (e.g. a click
-   * event carrying `lngLat`).
+   * Invoke every registered event handler with an optional payload (e.g. a
+   * click event carrying `lngLat`).
    */
   fire(event: string, payload?: unknown): void {
-    const handler = this.handlers.get(event);
-    handler?.(payload);
+    for (const handler of [...(this.handlers.get(event) ?? [])]) {
+      handler(payload);
+    }
   }
 }
 

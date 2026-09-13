@@ -1,0 +1,74 @@
+# Weather platform edge gateway (HTTP/2 + TLS termination, single origin).
+#
+# Rendered at container startup from this template by the nginx image's
+# envsubst mechanism: only ${...} references that name a *defined* environment
+# variable are substituted (API_UPSTREAM / FRONTEND_UPSTREAM), so nginx
+# runtime variables such as $host or $remote_addr pass through untouched.
+#
+# Routing:
+#   /v1/*  -> FastAPI serving tier directly (single hop: tile/point/vector
+#             requests skip the Next.js proxy entirely)
+#   /*     -> Next.js frontend (SSR pages, static assets, dev HMR websocket)
+#
+# Browsers only negotiate HTTP/2 over TLS, so the gateway terminates TLS on
+# :443 and HTTP on :80 redirects to it. Upstream keepalive pools reuse
+# connections instead of paying TCP setup per tile.
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+upstream weather_api {
+    server ${API_UPSTREAM};
+    keepalive 32;
+}
+
+upstream weather_frontend {
+    server ${FRONTEND_UPSTREAM};
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/certs/tls.crt;
+    ssl_certificate_key /etc/nginx/certs/tls.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1h;
+
+    # Point forecast / probability POST bodies stay small, but keep headroom.
+    client_max_body_size 10m;
+
+    location /v1/ {
+        proxy_pass http://weather_api;
+        proxy_http_version 1.1;
+        # Empty Connection header enables upstream keepalive reuse.
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location / {
+        proxy_pass http://weather_frontend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        # WebSocket upgrade (Next.js dev HMR); harmless in production.
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}

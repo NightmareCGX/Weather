@@ -41,7 +41,7 @@ The repository provides multi-stage production Dockerfiles:
 ### 2.1 API Image (`docker/Dockerfile.api`)
 * **Base:** `python:3.12-slim` (non-root `appuser`, UID 1001).
 * **Builder Stage:** Uses `uv 0.12.13`, installs dependencies from the single root `uv.lock` (including the `packages/domain` workspace member, non-editable), and builds a self-contained in-project virtual environment (`uv sync --frozen --no-dev --no-editable`).
-* **Runtime:** Copies venv, API source, Alembic migrations, and configuration. Runs `uvicorn api.main:app --host 0.0.0.0 --port 8000`.
+* **Runtime:** Copies venv, API source, Alembic migrations, and configuration. Runs `uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2}`. Two workers double CPU-bound tile-rendering throughput (the GIL serializes rendering within one process); override `UVICORN_WORKERS` for memory-constrained deployments. Per-worker process caches (tile LRU, store handles) are process-local by design; the shared PostgreSQL advisory-lock reader gate and Redis L2 cache remain correct across workers.
 * **Healthcheck:** Probes `http://127.0.0.1:8000/docs` (or `/v1/health`).
 * **Build Command:**
   ```bash
@@ -67,6 +67,16 @@ The repository provides multi-stage production Dockerfiles:
   ```bash
   docker build -f docker/Dockerfile.frontend --build-arg API_PROXY_TARGET=http://api:8000 -t weather-frontend:latest services/frontend
   ```
+
+### 2.4 Edge Gateway Image (`docker/nginx/Dockerfile.gateway`)
+* **Base:** `nginx:1.27-alpine` plus the `openssl` CLI (needed by the first-start self-signed certificate generator; the stock nginx-alpine image links OpenSSL but does not ship the binary).
+* **Purpose:** Optional HTTP/2-over-TLS single-origin entry point. Terminates TLS, routes `/v1/*` **directly to the API tier** (tile/point/vector requests skip the Next.js proxy hop entirely and gain HTTP/2 multiplexing + upstream keepalive) and everything else to the Next.js frontend.
+* **Configuration:** `docker/nginx/gateway.conf.template` is rendered at container start by the nginx envsubst mechanism with `API_UPSTREAM` / `FRONTEND_UPSTREAM` (compose env `GATEWAY_API_UPSTREAM` / `GATEWAY_FRONTEND_UPSTREAM`, defaulting to the host-run services). A self-signed certificate (`CN=weather-gateway`, SANs `localhost` / `127.0.0.1`) is generated on first start into the `gateway_certs` volume; production deployments should mount a real certificate at `/etc/nginx/certs` or terminate TLS upstream instead.
+* **Activation:** Compose profile `gateway` so the default data-services stack is unaffected:
+  ```bash
+  docker compose --profile gateway up -d weather_gateway
+  ```
+  Browsers only negotiate HTTP/2 over TLS, so the gateway serves `https://localhost` (self-signed warning on first visit is expected for local use) and redirects plain HTTP to HTTPS.
 
 ---
 
@@ -134,8 +144,9 @@ uv run --no-sync alembic upgrade head
 ### 4.2 Starting the Serving Tier
 ```bash
 cd services/api
-uv run --no-sync uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+uv run --no-sync uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 2
 ```
+The container image defaults to the same two workers (`UVICORN_WORKERS`, see section 2.1).
 
 ### 4.3 Starting the Realtime Ingestion Daemon
 The realtime scheduler automatically probes upstream NOAA publication, coordinates leadership via PostgreSQL advisory locks, and dispatches lead waves:
