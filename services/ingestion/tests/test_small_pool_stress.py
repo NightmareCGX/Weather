@@ -30,12 +30,16 @@ from ingestion.cli import (
 from ingestion.core.catalog import CatalogBase
 from ingestion.core.config import IngestionSettings
 from ingestion.providers.noaa.connector import NOAAConnector
+from tests._integration_db import integration_db_url
 
 def _pg_reachable() -> bool:
-    try:
-        from ingestion.core.config import settings
+    import os
 
-        eng = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+    db_url = os.getenv("TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
+    if not db_url:
+        return False
+    try:
+        eng = create_engine(db_url, pool_pre_ping=True)
         with eng.connect() as c:
             c.execute(text("SELECT 1"))
         eng.dispose()
@@ -70,11 +74,10 @@ def test_small_queue_pool_stress_with_high_logical_concurrency(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Run 10 regions through a real PostgreSQL QueuePool with size=2, overflow=1, timeout=5.0s."""
-    from ingestion.core.config import settings
 
     # Build a small-pool PG engine
     small_pool_engine = create_engine(
-        settings.DATABASE_URL,
+        integration_db_url(),
         pool_pre_ping=True,
         pool_size=2,
         max_overflow=1,

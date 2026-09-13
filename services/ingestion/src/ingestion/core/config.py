@@ -291,6 +291,12 @@ class IngestionSettings(BaseSettings):
     RECLAMATION_ENABLED: bool = True
     #: Dry-run mode: plans candidates and validates reachability without mutations.
     RECLAMATION_DRY_RUN: bool = True
+    #: Automatic planner wiring for the gc daemon: enqueue reclaimable shard
+    #: targets after each bookkeeping pass (no physical side effects).
+    RECLAMATION_PLANNER_ENABLED: bool = False
+    #: Automatic sweeper wiring for the gc daemon: run the 14-day metadata
+    #: retention sweeper pass after each bookkeeping pass.
+    RECLAMATION_SWEEPER_ENABLED: bool = False
     #: Physical deletion authorization switch: when False, worker never issues DeleteObject calls.
     RECLAMATION_DELETE_ENABLED: bool = False
     #: Maximum shard targets claimed per worker batch.

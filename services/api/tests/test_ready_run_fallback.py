@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from api.core.database import get_db
 from api.core.time import get_current_time
 from api.main import app
+from tests._integration_db import integration_db_url
 from api.models.entities import (
     ForecastCenter,
     ForecastVariable,
@@ -45,10 +46,7 @@ LON = -106.875
 @pytest.fixture(scope="module")
 def fallback_client(tmp_path_factory):
     """A migrated schema with a valid older run and a broken newest run."""
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     try:
         with engine.connect() as conn:

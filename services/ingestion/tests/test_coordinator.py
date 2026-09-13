@@ -13,10 +13,10 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
+from tests._integration_db import integration_db_url_or_skip_module
 
-from ingestion.core.config import settings
 
-DB_URL = settings.DATABASE_URL
+DB_URL = integration_db_url_or_skip_module()
 
 
 def _pg_reachable() -> bool:

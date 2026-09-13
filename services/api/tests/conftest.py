@@ -42,6 +42,7 @@ from api.models.entities import (
     Station,
     VerificationObservation,
 )
+from tests._integration_db import integration_db_url
 from tests.fixtures import (
     MEMBER_COUNT,
     MEMBER_INDICES,
@@ -59,10 +60,7 @@ def _default_test_simulated_time(monkeypatch):
 
 @pytest.fixture(scope="session")
 def db_engine():
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     try:
         with engine.connect() as conn:

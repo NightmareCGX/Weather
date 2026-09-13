@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -621,18 +621,52 @@ def requeue_failed_reclamation_targets(
     *,
     model_id: str | None = None,
     run_id: str | None = None,
+    now: datetime | None = None,
 ) -> int:
-    """Operator CLI helper: reset 'failed' quarantined reclamation targets.
+    """Operator CLI helper: recover stuck non-terminal reclamation targets.
 
-    Safe Requeue Semantics:
-    - If the physical object is confirmed already absent on storage (prior delete succeeded
-      remotely before network drop): promote immediately to 'deleted' with reclaimed_at timestamp!
-      Prevents accidental un-fencing or serving of missing files.
+    Covers every non-terminal queue status — not only ``failed`` quarantine:
+
+    - ``failed``: quarantined after retry exhaustion.
+    - ``deleting`` with an EXPIRED lease: a worker pass crashed or stalled
+      mid-deletion; without this path the stale claim blocks cycle terminality
+      (tombstone) forever.
+    - ``queued``: legacy V2-finalizer-era rows whose physical prefix was
+      already removed externally. A queued/deleting row over a missing object
+      otherwise blocks the tombstone permanently
+      (``NON_TERMINAL_QUEUE_STATUSES`` includes queued and deleting).
+
+    Safe Requeue Semantics (per row):
+    - Rows holding an ACTIVE lease (``lease_expires_at > now``) are skipped:
+      another worker may be mid-flight on that claim.
+    - If the physical object is confirmed already absent on storage (prior delete
+      succeeded remotely before network drop): promote immediately to 'deleted' with
+      reclaimed_at timestamp! Prevents accidental un-fencing or serving of missing
+      files and unblocks cycle terminality.
     - If the physical object is positively confirmed still present on storage:
       reset attempt_count to 0 and requeue for worker retry.
+
+    Returns the number of rows actually recovered (skipped lease-active rows are
+    not counted).
     """
-    stmt = select(ReclamationQueueRecord).where(
-        ReclamationQueueRecord.status == RECLAMATION_STATUS_FAILED
+    now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
+    stmt = (
+        select(ReclamationQueueRecord)
+        .where(
+            ReclamationQueueRecord.status.in_(
+                [
+                    RECLAMATION_STATUS_QUEUED,
+                    RECLAMATION_STATUS_DELETING,
+                    RECLAMATION_STATUS_FAILED,
+                ]
+            )
+        )
+        .where(
+            or_(
+                ReclamationQueueRecord.lease_expires_at.is_(None),
+                ReclamationQueueRecord.lease_expires_at <= now_utc,
+            )
+        )
     )
     if model_id is not None:
         stmt = stmt.where(ReclamationQueueRecord.model_id == model_id.lower().strip())
@@ -640,7 +674,6 @@ def requeue_failed_reclamation_targets(
         stmt = stmt.where(ReclamationQueueRecord.run_id == run_id)
 
     rows = list(session.execute(stmt).scalars().all())
-    now_utc = _utcnow()
     for row in rows:
         if not _physical_object_exists(str(row.store_path), str(row.physical_key)):
             # Object already absent on storage: finalize as deleted

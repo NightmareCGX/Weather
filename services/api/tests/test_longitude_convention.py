@@ -32,6 +32,7 @@ from alembic import command
 from api.core.database import get_db
 from api.core.time import get_current_time
 from api.main import app
+from tests._integration_db import integration_db_url
 from api.models.entities import (
     EnsembleMember,
     EnsembleMemberProduct,
@@ -69,10 +70,7 @@ def longitude_client(tmp_path_factory):
     a temp directory, and catalog rows are seeded pointing at them. Every test
     in this module uses these fixtures, isolated from the shared ``conftest``.
     """
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     try:
         with engine.connect() as conn:

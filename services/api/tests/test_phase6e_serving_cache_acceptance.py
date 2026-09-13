@@ -10,7 +10,6 @@ Validates under real PostgreSQL, Redis, and MinIO/Zarr:
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 
 import numpy as np
@@ -30,6 +29,7 @@ from api.models.entities import (
 from api.services.tiles import _tile_cache
 from api.services.vector_field import _vector_cache
 from tests._zarr_writer import write_dataset
+from tests._integration_db import integration_db_url
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -340,10 +340,7 @@ def test_adversarial_cache_bypass_immunity(client, migrated_db, tmp_path):
 
 def test_in_flight_reader_safe_during_concurrent_retirement(client, migrated_db, tmp_path):
     """Prove that an in-flight reader completes safely while new requests observe retirement."""
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     c0 = _dt(2026, 9, 1, 6)
     c0_iso = c0.isoformat().replace("+00:00", "Z")
 
