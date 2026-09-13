@@ -1,14 +1,18 @@
-[tool.poetry]
+[project]
 name = "weather-platform-contracts"
 version = "0.1.0"
 description = "Shared Pydantic contracts and schemas"
-authors = ["Lead Implementation Engineer <engineer@weatherplatform.com>"]
-packages = [{ include = "contracts", from = "src" }]
-
-[tool.poetry.dependencies]
-python = "^3.12"
-pydantic = "^2.6.4"
+authors = [{ name = "Lead Implementation Engineer", email = "engineer@weatherplatform.com" }]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.6.4,<3.0.0",
+]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+# src/contracts layout; uv_build derives the module from module-name, not the
+# hyphenated project name.
+[tool.uv.build-backend]
+module-name = "contracts"

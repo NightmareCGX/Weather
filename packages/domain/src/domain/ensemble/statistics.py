@@ -98,7 +98,7 @@ def ensemble_percentile(
         InvalidPercentileError: If ``q`` is not a finite number in ``[0, 100]``.
     """
     array = _coerce_members(members)
-    if isinstance(q, bool) or not isinstance(q, (int, float, np.integer, np.floating)):
+    if isinstance(q, bool) or not isinstance(q, int | float | np.integer | np.floating):
         raise InvalidPercentileError(
             f"percentile must be a numeric value, got {type(q).__name__}"
         )

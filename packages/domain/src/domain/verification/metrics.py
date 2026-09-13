@@ -105,7 +105,7 @@ def _coerce_pair_sequence(
     """
     if not isinstance(values, np.ndarray) and (
         not isinstance(values, Sequence)
-        or isinstance(values, (str, bytes, bytearray))
+        or isinstance(values, str | bytes | bytearray)
     ):
         raise VerificationError(
             f"{name} must be a sequence of numeric values, got {type(values).__name__}"

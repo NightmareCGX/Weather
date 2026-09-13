@@ -12,7 +12,7 @@
 #   6. frontend-e2e             — Playwright Chromium E2E (needs: frontend-unit-build)
 #   7. container-builds         — Multi-stage Docker image builds + runtime smoke tests (amd64)
 #   8. arm64-builds             — ARM64 container builds + dependency resolution & CLI smoke
-#   9. docs-metadata            — Poetry package manifest & metadata validation
+#   9. docs-metadata            — uv lock freshness, workspace buildability & metadata
 #  10. cross-package-contracts  — Stage 7D cross-package & OpenAPI contract suite
 #  11. ci-required              — Stable branch-protection aggregation gate (if: always())
 
@@ -75,6 +75,7 @@ jobs:
               - '.github/workflows/**'
             root_python:
               - 'pyproject.toml'
+              - 'uv.lock'
               - 'packages/contracts/**'
               - 'packages/config/**'
 
@@ -91,6 +92,10 @@ jobs:
       needs.change-detection.outputs.domain == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Pin uv's project environment (uv otherwise discovers/creates the
+      # workspace-root .venv for member syncs); one fresh env per job.
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
     steps:
       - uses: actions/checkout@v4
 
@@ -98,31 +103,25 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Poetry, Ruff, MyPy
-        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.20.2
-
-      - name: Cache Poetry
-        uses: actions/cache@v4
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
-          path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-domain-${{ hashFiles('packages/domain/pyproject.toml') }}
-          restore-keys: poetry-${{ runner.os }}-domain-
+          version: '0.12.13'
+          enable-cache: true
 
       - name: Install domain dependencies
-        working-directory: packages/domain
-        run: poetry install --no-interaction
+        run: uv sync --project packages/domain
 
       - name: Ruff check (domain)
         working-directory: packages/domain
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: MyPy (domain)
         working-directory: packages/domain
-        run: mypy --python-executable "$(poetry env info --path)/bin/python"
+        run: uv run mypy
 
       - name: Run domain tests (100% coverage gate)
         working-directory: packages/domain
-        run: poetry run pytest
+        run: uv run pytest
 
   # ===========================================================================
   # 3. API PIPELINE (Serving Tier Integration)
@@ -161,6 +160,9 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
+      # Pin uv's project environment (uv otherwise discovers/creates the
+      # workspace-root .venv for member syncs); one fresh env per job.
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
       DATABASE_URL: postgresql://weather_user:weather_password@localhost:5432/weather_db
       REDIS_URL: redis://localhost:6379/0
     steps:
@@ -170,35 +172,27 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Poetry, Ruff, MyPy
-        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.20.2
-
-      - name: Cache Poetry
-        uses: actions/cache@v4
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
-          path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-api-${{ hashFiles('packages/domain/**', 'services/api/poetry.lock') }}
-          restore-keys: poetry-${{ runner.os }}-api-
+          version: '0.12.13'
+          enable-cache: true
 
       - name: Install API dependencies
-        working-directory: services/api
-        run: |
-          poetry install --no-interaction
-          poetry run pip install --no-deps --force-reinstall -e ../../packages/domain
+        run: uv sync --project services/api
 
       - name: Ruff check (api)
         working-directory: services/api
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: MyPy (api)
         working-directory: services/api
-        run: mypy --python-executable "$(poetry env info --path)/bin/python"
+        run: uv run mypy
 
       - name: Run API tests
         working-directory: services/api
         # Coverage floor enforced here only (not in pytest addopts) so partial
         # runs such as the openapi-export job are not spuriously failed.
-        run: poetry run pytest --junitxml=api-junit.xml --cov=api --cov-report=term-missing --cov-fail-under=50
+        run: uv run pytest --junitxml=api-junit.xml --cov=api --cov-report=term-missing --cov-fail-under=50
 
       - name: Upload API test results on failure
         if: failure()
@@ -259,6 +253,9 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
+      # Pin uv's project environment (uv otherwise discovers/creates the
+      # workspace-root .venv for member syncs); one fresh env per job.
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
       DATABASE_URL: postgresql://weather_user:weather_password@localhost:5432/weather_db
       REDIS_URL: redis://localhost:6379/0
       MINIO_ENDPOINT: localhost:9000
@@ -277,33 +274,26 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Poetry, Ruff, MyPy
-        run: python -m pip install poetry==2.4.1 ruff==0.3.4 mypy==1.20.2
-
-      - name: Cache Poetry
-        uses: actions/cache@v4
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
-          path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-ingestion-${{ hashFiles('packages/domain/**', 'services/ingestion/poetry.lock') }}
-          restore-keys: poetry-${{ runner.os }}-ingestion-
+          version: '0.12.13'
+          enable-cache: true
 
       - name: Install Ingestion dependencies
-        working-directory: services/ingestion
-        run: |
-          poetry install --no-interaction
-          poetry run pip install --no-deps --force-reinstall -e ../../packages/domain
+        run: uv sync --project services/ingestion
 
       - name: Ruff check (ingestion)
         working-directory: services/ingestion
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: MyPy (ingestion)
         working-directory: services/ingestion
-        run: mypy --python-executable "$(poetry env info --path)/bin/python"
+        run: uv run mypy
 
       - name: Create MinIO bucket
+        working-directory: services/ingestion
         run: |
-          cd services/ingestion && poetry run python - <<'PY'
+          uv run python - <<'PY'
           import time, boto3
           for _ in range(30):
               try:
@@ -326,7 +316,7 @@ jobs:
         working-directory: services/ingestion
         # Coverage floor enforced here only (not in pytest addopts) so partial
         # runs such as the cross-package contract tests are not spuriously failed.
-        run: poetry run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml --cov=ingestion --cov-report=term-missing --cov-fail-under=50
+        run: uv run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml --cov=ingestion --cov-report=term-missing --cov-fail-under=50
 
       - name: Verify MinIO round-trip ran and passed (not skipped)
         run: |
@@ -698,19 +688,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Poetry
-        run: python -m pip install poetry==2.4.1
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: '0.12.13'
+          enable-cache: true
 
-      - name: Validate root package metadata & README
-        run: poetry check
+      - name: Validate lockfile freshness (uv.lock must be up to date)
+        run: uv lock --check
 
-      - name: Validate workspace packages metadata
-        run: |
-          poetry check -C packages/domain
-          poetry check -C packages/contracts
-          poetry check -C packages/config
-          poetry check -C services/api
-          poetry check -C services/ingestion
+      - name: Validate workspace member buildability & metadata
+        run: uv build --all-packages
 
       - name: Validate shared runtime dependency alignment
         run: python scripts/check_dependency_alignment.py
@@ -736,6 +723,10 @@ jobs:
       needs.change-detection.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # One shared workspace environment for all member packages: the root
+      # project aggregates every workspace member from the single uv.lock.
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
     steps:
       - uses: actions/checkout@v4
 
@@ -749,32 +740,27 @@ jobs:
           cache: npm
           cache-dependency-path: services/frontend/package-lock.json
 
-      - name: Install Poetry
-        run: python -m pip install poetry==2.4.1
-
-      - name: Cache Poetry
-        uses: actions/cache@v4
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
-          path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-contracts-${{ hashFiles('packages/domain/pyproject.toml', 'services/api/poetry.lock', 'services/ingestion/poetry.lock') }}
-          restore-keys: poetry-${{ runner.os }}-contracts-
+          version: '0.12.13'
+          enable-cache: true
 
+      # One shared workspace environment: the root project aggregates every
+      # workspace member plus their dependency trees from the single uv.lock.
+      # Test steps below run with --no-sync so this environment is reused
+      # as-is (per-package pytest config still applies via --directory).
       - name: Install Python workspace dependencies
-        run: |
-          poetry install --no-interaction -C packages/domain
-          poetry install --no-interaction -C services/api
-          poetry install --no-interaction -C services/ingestion
+        run: uv sync --all-packages
 
       - name: Install Frontend dependencies
         working-directory: services/frontend
         run: npm ci
 
       - name: Verify OpenAPI schema export
-        working-directory: services/api
-        run: poetry run pytest tests/test_openapi_export.py
+        run: uv run --directory services/api --no-sync pytest tests/test_openapi_export.py
 
       - name: Run Python cross-package contract tests
-        run: poetry run --directory services/ingestion pytest ../../tests/contracts
+        run: uv run --directory services/ingestion --no-sync pytest ../../tests/contracts
 
       - name: Run Frontend OpenAPI contract suite
         working-directory: services/frontend

@@ -101,7 +101,7 @@ def register_canonical_lead_horizon(
         raise ValueError("canonical lead horizon must not be empty")
     if any(lead < 0 for lead in leads):
         raise ValueError(f"canonical lead horizon must be non-negative: {leads!r}")
-    if any(b <= a for a, b in zip(leads, leads[1:])):
+    if any(b <= a for a, b in zip(leads, leads[1:], strict=False)):
         raise ValueError(
             f"canonical lead horizon must be strictly increasing: {leads!r}"
         )

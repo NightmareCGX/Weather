@@ -569,7 +569,7 @@ The FastAPI serving service dynamically generates the OpenAPI 3.1 schema from Py
 When backend endpoint models or parameters are modified, update the committed OpenAPI schema artifact:
 ```bash
 cd services/api
-poetry run python -c "import json, sys; sys.path.insert(0, 'src'); from api.main import app; open('../../services/frontend/openapi.json', 'w', encoding='utf-8').write(json.dumps(app.openapi(), indent=2) + '\n')"
+uv run --no-sync python -c "import json, sys; sys.path.insert(0, 'src'); from api.main import app; open('../../services/frontend/openapi.json', 'w', encoding='utf-8').write(json.dumps(app.openapi(), indent=2) + '\n')"
 ```
 
 ### Contract Verification:

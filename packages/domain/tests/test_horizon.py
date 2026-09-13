@@ -35,7 +35,8 @@ def test_canonical_horizon_is_81_leads_0_to_240_at_3h() -> None:
         assert leads[0] == 0
         assert leads[-1] == CANONICAL_MAX_LEAD_HOURS == 240
         assert all(
-            b - a == CANONICAL_LEAD_CADENCE_HOURS == 3 for a, b in zip(leads, leads[1:])
+            b - a == CANONICAL_LEAD_CADENCE_HOURS == 3
+            for a, b in zip(leads, leads[1:], strict=False)
         )
         assert leads == tuple(range(0, 241, 3))
 

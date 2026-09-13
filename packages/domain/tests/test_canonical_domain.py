@@ -5,7 +5,7 @@ Enforces 100% test coverage across all branches, helpers, and perspectives.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from domain.canonical import (
     CanonicalCandidate,
@@ -18,7 +18,7 @@ from domain.canonical import (
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
-    return datetime(year, month, day, hour, minute, 0, tzinfo=timezone.utc)
+    return datetime(year, month, day, hour, minute, 0, tzinfo=UTC)
 
 
 def test_ensure_utc_normalizes_naive_and_aware():

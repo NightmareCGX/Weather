@@ -5,7 +5,7 @@ Enforces 100% test coverage across all branches, helpers, and invariants.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from domain.reclamation import (
@@ -27,7 +27,7 @@ from domain.reclamation import (
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
-    return datetime(year, month, day, hour, minute, 0, tzinfo=timezone.utc)
+    return datetime(year, month, day, hour, minute, 0, tzinfo=UTC)
 
 
 def test_ensure_utc():
@@ -64,8 +64,8 @@ def test_physical_shard_target_invariants():
     assert pst.model_id == "gfs"
     assert pst.target_kind == "det"
     assert pst.member_index == 0
-    assert pst.cycle_time.tzinfo == timezone.utc
-    assert pst.valid_time.tzinfo == timezone.utc
+    assert pst.cycle_time.tzinfo == UTC
+    assert pst.valid_time.tzinfo == UTC
     assert pst.target_tuple == ("run_1", 0, "temperature_2m", "det", 0)
 
     with pytest.raises(ValueError, match="Invalid target_kind"):

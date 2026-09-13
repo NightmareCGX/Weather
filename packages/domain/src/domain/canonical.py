@@ -30,9 +30,9 @@ Canonical V3 Principles:
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Iterable, Sequence
+from datetime import UTC, datetime, timedelta
 
 from domain.coverage import is_lead_servable
 from domain.temporal import (
@@ -44,8 +44,8 @@ from domain.temporal import (
 def _ensure_utc(dt: datetime) -> datetime:
     """Normalize a datetime to UTC timezone-aware."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 @dataclass(frozen=True)

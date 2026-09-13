@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from domain.lifecycle import (
     METADATA_RETENTION_DAYS,
@@ -15,7 +15,7 @@ from domain.lifecycle import (
 
 def _dt(year: int, month: int, day: int, hour: int, tz: bool = True) -> datetime:
     """Helper to build UTC datetime for tests."""
-    return datetime(year, month, day, hour, 0, 0, tzinfo=timezone.utc if tz else None)
+    return datetime(year, month, day, hour, 0, 0, tzinfo=UTC if tz else None)
 
 
 # ---------------------------------------------------------------------------
