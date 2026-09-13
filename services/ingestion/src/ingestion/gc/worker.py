@@ -41,8 +41,8 @@ from domain.reclamation import (
 from domain.temporal import (
     get_variable_temporal_metadata,
     is_precipitation_companion,
+    model_serving_start_valid_time,
     requires_lead0_display_fallback,
-    serving_start_valid_time,
 )
 from ingestion.core.catalog import (
     EnsembleMemberProductRecord,
@@ -56,6 +56,7 @@ from ingestion.core.catalog import (
 )
 from ingestion.core.config import settings
 from ingestion.core.locks import LockTimeoutError, StoreLockCoordinator
+from ingestion.core.markers import read_store_generation
 from ingestion.core.s3 import get_control_s3_fs
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,72 @@ def _physical_object_exists(store_path: str, physical_key: str) -> bool:
     return os.path.exists(full_path)
 
 
+def _apply_generation_evidence_gate(
+    targets: list[ReclamationQueueRecord],
+    store_path: str,
+    now_utc: datetime,
+) -> set[str]:
+    """I14 mechanical replacement-evidence gate for one store's claimed batch.
+
+    A committed-manifest generation change since the last observation is
+    physical evidence that the store was rewritten (every EXCLUSIVE finalizer
+    commit bumps the generation, including same-set same-cycle replacements),
+    which invalidates the enqueue-time necessity judgement. Protocol:
+
+    * no baseline on the row (legacy / pre-migration) -> backfill the
+      baseline from the current read and proceed (first observation);
+    * baseline == current -> proceed (no replacement since observation);
+    * baseline set, current missing -> defer, keep the baseline (evidence
+      disappeared; fail closed);
+    * baseline != current -> re-baseline and defer (fail closed, but not
+      sticky: a store that is not replaced again deletes on the next pass,
+      while a store under repeated replacement never deletes).
+
+    Must be called under the store's SHARED gate so the manifest read is
+    consistent with the physical deletes that follow (writers need the
+    EXCLUSIVE gate to commit a new generation).
+
+    Returns the set of deferred target ids (reverted to QUEUED).
+    """
+    current = read_store_generation(store_path)
+    deferred: set[str] = set()
+    for t in targets:
+        if t.store_generation is None:
+            # No baseline yet (pre-migration row): start observing now.
+            t.store_generation = current
+            t.updated_at = now_utc
+            continue
+        if current is None:
+            logger.warning(
+                "generation_gate_defer: store manifest unavailable for %s "
+                "(previously observed generation); target %s deferred",
+                store_path,
+                t.id,
+            )
+            t.last_error = "generation_gate_manifest_unavailable"
+            t.status = RECLAMATION_STATUS_QUEUED
+            t.lease_expires_at = None
+            t.updated_at = now_utc
+            deferred.add(t.id)
+            continue
+        if t.store_generation != current:
+            logger.info(
+                "generation_gate_defer: store %s replaced since observation "
+                "(observed=%s current=%s); target %s deferred for re-evaluation",
+                store_path,
+                t.store_generation,
+                current,
+                t.id,
+            )
+            t.store_generation = current
+            t.last_error = "generation_gate_replaced_since_observation"
+            t.status = RECLAMATION_STATUS_QUEUED
+            t.lease_expires_at = None
+            t.updated_at = now_utc
+            deferred.add(t.id)
+    return deferred
+
+
 def run_reclamation_worker_pass(
     session: Session,
     *,
@@ -133,6 +200,9 @@ def run_reclamation_worker_pass(
     Step 2: Group claimed targets by store_path.
     Step 3: For each store, acquire SHARED store gate.
     Step 4: Under store gate, re-read whole-cycle lifecycle: abort if whole-cycle GC claimed cycle.
+    Step 4.5: I14 replacement-evidence gate: defer (re-baseline + revert to
+    'queued') any target whose store's committed-manifest generation changed
+    since the recorded baseline — physical evidence of replacement.
     Step 5: Perform Counterfactual Semantic Revalidation (claimed batch evaluated as physically present).
     Step 6: If target required, revert to 'queued' and clear lease.
     Step 7: If DeleteObject authorized (delete_enabled=True), delete physical shard and mark 'deleted'.
@@ -252,6 +322,21 @@ def run_reclamation_worker_pass(
                 session.commit()
                 continue
 
+            # 2.5 I14 mechanical replacement-evidence gate: a committed-manifest
+            # generation change since the last observation proves the store was
+            # replaced, invalidating the enqueue-time necessity judgement.
+            # Deferred targets revert to QUEUED (re-baselined) and are excluded
+            # from this pass's revalidation and deletion.
+            generation_deferred = _apply_generation_evidence_gate(
+                targets, store_path, now_utc
+            )
+            if generation_deferred:
+                targets = [t for t in targets if t.id not in generation_deferred]
+                total_revalidated += len(generation_deferred)
+                session.commit()
+                if not targets:
+                    continue
+
             # 3. Counterfactual Semantic Revalidation
             # Evaluate reachability where targets in current claimed batch are NOT fenced
             fenced_query = select(
@@ -276,7 +361,7 @@ def run_reclamation_worker_pass(
             }
 
             # Discover candidates for this model
-            serving_start = serving_start_valid_time(now_utc)
+            serving_start = model_serving_start_valid_time(m_id, now_utc)
             m_max_lead = model_max_lead_hours(m_id)
             min_recovery_cycle = serving_start - timedelta(hours=m_max_lead)
             expected_members = get_expected_members(m_id, default_if_unknown=1)

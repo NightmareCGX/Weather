@@ -45,8 +45,8 @@ from domain.temporal import (
     get_variable_temporal_metadata,
     is_precipitation_companion,
     is_valid_time_protected,
+    model_serving_start_valid_time,
     requires_lead0_display_fallback,
-    serving_start_valid_time,
 )
 from ingestion.core.catalog import (
     EnsembleMemberProductRecord,
@@ -58,6 +58,7 @@ from ingestion.core.catalog import (
     _ensure_utc_datetime,
     _utcnow,
 )
+from ingestion.core.markers import read_store_generation
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,8 @@ def plan_reclamation_pass(
 
     Invariants:
     1. Bounded SQL queries independent of shard count (no N+1 per shard).
-    2. Zero S3 ListObjects calls.
+    2. Zero S3 ListObjects calls (the only object reads are bounded fail-open
+       committed-manifest generation reads, one per distinct store at enqueue).
     3. Respects three truth layers: preserves catalog commit evidence, uses shared
        canonical reachability for serving truth, and writes physical availability truth.
     4. Safe against newer partial cycles: older cycles continue serving farther valid times.
@@ -170,7 +172,6 @@ def plan_reclamation_pass(
        candidates and have ALL remaining units directly reclaimable.
     """
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
-    serving_start = serving_start_valid_time(now_utc)
 
     all_would_enqueue: list[PhysicalShardTarget] = []
     total_committed = 0
@@ -189,6 +190,11 @@ def plan_reclamation_pass(
         m_id = model.lower().strip()
         expected_members = get_expected_members(m_id, default_if_unknown=1)
         is_ensemble = expected_members > 1
+        # Per-model serving boundary (I20): derived from this model's
+        # registered canonical horizon cadence — never a caller-chosen
+        # global default that could diverge from the per-model
+        # is_valid_time_protected membership test below.
+        serving_start = model_serving_start_valid_time(m_id, now_utc)
 
         # 2. Bulk query 1: eligible runs for model
         runs_stmt = (
@@ -592,6 +598,18 @@ def plan_reclamation_pass(
 
     # 11. Idempotent enqueue if not dry-run
     if not dry_run and all_would_enqueue:
+        # I14 replacement-evidence baseline: snapshot each store's
+        # committed-manifest generation at enqueue time so the worker can
+        # detect a replacement between enqueue and deletion. One fail-open
+        # manifest read per distinct store (cached across the pass) — this
+        # is a bounded single-object read, not a listing.
+        store_generation_cache: dict[str, str | None] = {}
+
+        def _snapshot_generation(store_path: str) -> str | None:
+            if store_path not in store_generation_cache:
+                store_generation_cache[store_path] = read_store_generation(store_path)
+            return store_generation_cache[store_path]
+
         # Enqueue in bounded batches
         for i in range(0, len(all_would_enqueue), batch_size):
             chunk = all_would_enqueue[i : i + batch_size]
@@ -608,6 +626,7 @@ def plan_reclamation_pass(
                     "valid_time": target.valid_time,
                     "store_path": target.store_path,
                     "physical_key": target.physical_key,
+                    "store_generation": _snapshot_generation(target.store_path),
                     "status": "queued",
                     "attempt_count": 0,
                     "lease_expires_at": None,

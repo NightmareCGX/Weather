@@ -340,6 +340,31 @@ def write_manifest(store_path: str, payload: Mapping[str, object]) -> None:
     _write_object_atomic(store_path, _MANIFEST_PATH, manifest_canonical_json(dict(payload)))
 
 
+def read_store_generation(store_path: str) -> str | None:
+    """Return the committed manifest's serving generation, or None.
+
+    The generation string bumps on every EXCLUSIVE finalizer commit — including
+    a same-set same-cycle data replacement — so it is the physical evidence
+    the GC reclamation path uses for the I14 replacement check: a generation
+    change since the last observation proves the store was rewritten.
+
+    Returns None ("no mechanical generation evidence") when the manifest is
+    confirmed absent (legacy / unfinalized store) or unreadable. Callers must
+    distinguish "no baseline" (backfill and proceed) from "baseline lost or
+    changed" (fail closed) — see the generation gate in ``gc/worker.py``.
+    """
+    try:
+        payload = read_manifest(store_path)
+    except Exception:  # noqa: BLE001 - unreadable manifest = no evidence
+        return None
+    if not isinstance(payload, dict):
+        return None
+    generation = payload.get("generation")
+    if not isinstance(generation, str) or not generation:
+        return None
+    return generation
+
+
 def region_evidence_fingerprint(store_path: str, region_keys: list[str]) -> str:
     """Fingerprint the persisted legacy-region evidence for a hybrid store.
 

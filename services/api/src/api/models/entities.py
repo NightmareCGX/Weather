@@ -324,6 +324,10 @@ class ReclamationQueue(Base):  # type: ignore[misc]  # declarative_base() is Any
     valid_time = Column(DateTime(timezone=True), nullable=False)
     store_path = Column(String, nullable=False)
     physical_key = Column(String, nullable=False)
+    # I14 replacement-evidence baseline written by the ingestion GC planner
+    # (migration 009). The API only reads it; the writer lives in
+    # ingestion.core.catalog.ReclamationQueueRecord.
+    store_generation = Column(String, nullable=True)
     status = Column(String(length=16), nullable=False, default="queued")
     attempt_count = Column(Integer, nullable=False, default=0)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)

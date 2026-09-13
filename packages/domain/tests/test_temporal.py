@@ -287,7 +287,11 @@ def test_is_valid_time_protected_model_grid_membership() -> None:
 
 def test_protected_valid_times_enumeration() -> None:
     """I20: the enumerable protected window is [serving_start, +max_lead]."""
-    from domain.horizon import MODEL_VERSION_HORIZONS, register_canonical_lead_horizon
+    from domain.horizon import (
+        MODEL_CANONICAL_HORIZONS,
+        MODEL_VERSION_HORIZONS,
+        register_canonical_lead_horizon,
+    )
     from domain.temporal import protected_valid_times
 
     now = datetime(2026, 9, 10, 7, 0, 0, tzinfo=timezone.utc)
@@ -298,10 +302,69 @@ def test_protected_valid_times_enumeration() -> None:
     assert vts[-1] == datetime(2026, 9, 20, 6, 0, 0, tzinfo=timezone.utc)
     assert all((b - a) == timedelta(hours=3) for a, b in zip(vts, vts[1:]))
 
-    # Version-scoped horizon selection.
+    # Version-scoped horizon selection. NOTE: register_canonical_lead_horizon
+    # also overwrites the model-level horizon, so the finally block must
+    # restore both tables or every test file running after this one sees a
+    # corrupted gfs registry.
     register_canonical_lead_horizon("gfs", (0,), version_string="v9.9")
     try:
         vts_v = protected_valid_times("gfs", now, version_string="v9.9")
         assert vts_v == (datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc),)
     finally:
         MODEL_VERSION_HORIZONS.pop(("gfs", "v9.9"), None)
+        MODEL_CANONICAL_HORIZONS["gfs"] = tuple(range(0, 241, 3))
+
+
+def test_model_serving_start_valid_time_per_model_grid() -> None:
+    """I20: the boundary is taken on the model's own horizon cadence.
+
+    A model whose registered canonical horizon carries a cadence other than
+    the canonical 3h must get its own grid-aligned boundary — a bare
+    global-cadence floor would silently diverge from the per-model
+    ``is_valid_time_protected`` membership test.
+    """
+    from domain.horizon import MODEL_CANONICAL_HORIZONS, register_canonical_lead_horizon
+    from domain.temporal import (
+        is_valid_time_protected,
+        model_serving_start_valid_time,
+    )
+
+    # Canonical model: 3h cadence -> floor 07:30Z and 08:00Z to 06:00Z.
+    now_0730 = datetime(2026, 9, 10, 7, 30, 0, tzinfo=timezone.utc)
+    now_0800 = datetime(2026, 9, 10, 8, 0, 0, tzinfo=timezone.utc)
+    assert model_serving_start_valid_time("gfs", now_0730) == datetime(
+        2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc
+    )
+    assert model_serving_start_valid_time("gfs", now_0800) == datetime(
+        2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc
+    )
+
+    # 6h-cadence model: 08:00Z is NOT a boundary instant on its grid.
+    register_canonical_lead_horizon("test_model_6h", (0, 6, 12, 18, 24))
+    try:
+        assert model_serving_start_valid_time("test_model_6h", now_0730) == datetime(
+            2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc
+        )
+        assert model_serving_start_valid_time("test_model_6h", now_0800) == datetime(
+            2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc
+        )
+        now_0900 = datetime(2026, 9, 10, 9, 0, 0, tzinfo=timezone.utc)
+        assert model_serving_start_valid_time("test_model_6h", now_0900) == datetime(
+            2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc
+        )
+        now_1200 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        assert model_serving_start_valid_time("test_model_6h", now_1200) == datetime(
+            2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc
+        )
+        # Boundary agrees with the per-model membership test on grid instants.
+        vt = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        boundary = model_serving_start_valid_time("test_model_6h", now_0900)
+        assert is_valid_time_protected(vt, now_0900, model_id="test_model_6h") == (
+            vt >= boundary
+        )
+    finally:
+        MODEL_CANONICAL_HORIZONS.pop("test_model_6h", None)
+
+    # Unknown model fails loudly (same registry as canonical_lead_time_hours).
+    with pytest.raises(ValueError):
+        model_serving_start_valid_time("unregistered_model", now_0730)

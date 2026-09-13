@@ -463,32 +463,48 @@ frontier 内 orphan 数 > 0 触发 `gc_orphan_stores_detected` 告警。
 
 ## 11. 当前实现与目标态差距
 
-1. **退役 horizon-based whole-cycle 删除路径**：现行 `run_finalizer_pass` 基于
-   `cycle_time+240h < serving_start` 执行整 prefix DeleteObject——这正是被废除的
-   "cycle-level GC authority"。改造方向：删除动作全部收敛到 planner+worker；
-   finalizer 降级为 §8 的 Lifecycle bookkeeping（只观察 terminality、写 `deleted_at`、
-   启动 14 天时钟，不做任何物理删除）。
-2. **V2 reconciler 残留下线**：其 `T − cadence` cutoff + 立即删明细元数据的行为与
-   I6/I16 冲突。
-3. **Planner 快路径落地**：以 canonical 解析为权威，cutoff 作为批处理剪枝/审计口径
-   实装（避免全历史扫描）；配合 batch_size 分批入队。
-4. **worker 复验的 wind 连带成对化**：按 R-WIND/I8 成对评估 u/v，显式化原子性。
-5. **/v1/points fallback 实现**：与 canonical 引擎平行的第二套实现；fallback store
-   缺 precipitation 变量时 404 击穿整个请求（违反 R8）——收敛到同一引擎或在选择时
-   校验变量集并继续尝试下一候选。
-6. **ensemble_data valid_time 路径读后 fence 复核静默失效**（`run` 未定义 + `db`
-   已关闭 + `except: pass`）。
-7. **store↔catalog 对账任务（§9）待建**：recoverability frontier 规则 + 历史孤儿
-   （gefs 2026-09-12/00、06 等 ≈57GB）清理。
-8. **时间元数据拆分（I19）与重建公式一般化**：`domain/reclamation.py` 的
-   `is_predecessor_dependent_lead`（硬编码 `% 6`）与 `get_predecessor_lead`
-   （硬编码 `L − 3`）按 `(W, R)` 参数化为 `L % R == 0` / 前驱 `L − W`；
-   `reconstruct_cloud_cover_3h`（硬编码 `2·C6 − C3`）改为
-   `[R·C(L) − (R−W)·C(L−W)] / W`。
-9. **availability legacy `initial_times` 视图**仍将 interval lead0 列为 servable
-   （权威 `valid_times` 正确）。
-10. **测试污染生产 catalog**：pytest 写入真实 DB（`pytest-of-Ezrai` 临时路径出现在
-    `model_runs`）——测试需隔离实例。
-11. **提取 `protected_valid_times` primitive（I20）**：将 `serving_start_valid_time`
-    升级为 per-model 的 protected set 权威实现；API 在 availability/响应元数据中
-    暴露 serving window，前端消费同一策略结果，删除各处对边界的重复计算。
+> 2026-09-13 复核重写：原 11 项差距逐项对照代码核实后，10 项已落地（§11.1，
+> 其中第 7 项工具已建、调度与历史孤儿清理仍待办），剩余工作收敛为 §11.2 的
+> 7 条遗留。本节以代码现状为准，条目附证据位置。
+
+### 11.1 已落地（原清单 → 现状）
+
+| # | 原差距项 | 现状 |
+|---|---|---|
+| 1 | 退役 horizon-based whole-cycle 删除路径 | 完成。finalizer 已降级为 §8 Lifecycle bookkeeping：零物理存储操作、无 DeleteObject，`deleted_at` 是 derived 事实（`gc/finalizer.py` 模块 docstring）。 |
+| 2 | V2 reconciler 残留下线 | 完成。全仓无 reconciler 类/残留路径；store↔catalog 差异统一归 §9 inventory 处理。 |
+| 3 | Planner 快路径落地 | 完成。canonical 解析为唯一权威，cutoff 仅作批剪枝 fast-path（`gc/planner.py` 模块 docstring）；`batch_size` 分批入队（`planner.py:157,595-597`）。 |
+| 4 | worker 复验 wind 连带成对化 | 完成。u/v 按 `(run, lead, kind, member)` 成对联合评估，任一分量被反事实判定 necessary 或 counterpart 未终态则整对回队（`gc/worker.py:446-497`）。 |
+| 5 | /v1/points fallback 实现 | 完成。`/v1/points` 收敛为单一实现（`routers/points.py`）；fallback 在 resolver 内按 `(variable, valid_time)` 解析并携带 provenance digest（`api/services/resolver.py:589,709-779`），无平行第二套引擎。 |
+| 6 | ensemble_data 读后 fence 复核静默失效 | 完成。读后显式重查 fence 并以命名日志事件上报（`api/services/ensemble_data.py:376-391,643-658`），不再 `except: pass` 静默吞掉。 |
+| 8 | 时间元数据拆分（I19）与重建公式一般化 | 完成。`is_predecessor_dependent_lead` / `get_predecessor_lead` 按 `(W, R)` 参数化（`domain/reclamation.py:229-277`）；`reconstruct_running_average_interval` 实现 `[R·C(L) − (R−W)·C(L−W)] / W`（`domain/models/cloud.py:77-161`）；`(W, R)` 元数据注册表见 `domain/temporal.py:59-79`，附跨 (R, W) 组合的一般化测试。 |
+| 9 | availability legacy `initial_times` 视图 | 完成。legacy 视图对 interval 变量显式剔除 lead 0（`api/services/availability.py:387-406`）。 |
+| 10 | 测试污染生产 catalog | 完成。集成测试强制显式 `TEST_DATABASE_URL`，否则跳过（`services/*/tests/_integration_db.py`）；一次性清理工具 `scripts/cleanup_test_pollution.py`（commit `87b8207`）。 |
+| 11 | 提取 `protected_valid_times` primitive（I20） | 大部分完成。primitive 已升级为 per-model horizon 网格并提供 `is_valid_time_protected(model_id=...)` / `protected_valid_times(model, now)`（`domain/temporal.py:154-295`，PR #87）；planner 与 API 均已采纳。前端 TS 仍重复实现边界计算，见遗留项 6。 |
+| 7 | store↔catalog 对账（§9） | 部分完成。对账工具已建并接线 CLI：`gc/inventory.py` + `--inventory` / `--inventory-reap`（PR #88）；调度化与历史孤儿（gefs 2026-09-12/00、06 等 ≈57GB）清理仍待办，见遗留项 1/2。 |
+| — | GC 复验边界切换到 per-model primitive | 完成。新增 `domain.temporal.model_serving_start_valid_time(model_id, now)`（按模型注册 horizon cadence 派生边界，与 `is_valid_time_protected(model_id=...)` 的边界分量一致）；planner / worker / finalizer / inventory 已全部切换，inventory 对未注册模型保留全局 cadence 回退。 |
+| — | I14 generation 机械化校验 | 完成。方向定为"未变才可删"（fail-closed）：planner 入队时快照 store 的 committed-manifest generation（迁移 009 `reclamation_queue.store_generation`，每次 EXCLUSIVE commit 必 bump，含同集合同周期替换），worker 在 store 闸内比对——generation 变化或消失则重置基线并回队一轮，不删除；无基线的存量行在首次 claim 回填。重复被替换的 store 永远不会被删除，稳定 store 下一轮即恢复删除（无 livelock）。 |
+
+### 11.2 仍然有效的遗留清单（按建议优先序）
+
+1. **§9 对账进入调度**：`gc --inventory` 仍是一次性手动命令（`cli.py:746-748`
+   跑完即退），daemon 循环不含对账阶段，compose/cron 均未调度。应作为 daemon
+   低频阶段（reap 保持手动）。
+2. **历史孤儿清理**：gefs 2026-09-12/00、06 等 ≈57GB 孤儿 store 需运维用
+   `gc --inventory --inventory-reap` 显式清理（工具已备，动作未执行）。
+3. **GC 管线内阶段指标**：planner/worker/sweeper 每轮结果只有 stdout 摘要
+   （`cli.py:1378`），`gc/` 内无 Prometheus 计数/耗时指标。状态级覆盖已存在
+   （`monitoring/lifecycle_collector.py:65-79` + Grafana 7/8/9 节 + webhook 告警
+   `alerts.py:456-466`），缺的是 per-pass 过程指标与对应面板。
+4. **前端 TS serving 窗口重复实现**：`frontend/src/lib/forecast/availability.ts`
+   重新实现了 `serving_start_valid_time` 的地板逻辑（I20 的"全栈单一实现"尚未
+   完全达成）；当前语义一致，属维护漂移风险。
+5. **守护进程部署载体**：`docker-compose.yml` 无 ingestion/GC 服务，仓库无
+   systemd unit/crontab；`--enable-planner` → `--enable-delete` 灰度启用仍是
+   操作动作（`RUNBOOKS.md` GC 节）。按 DEPLOYMENT.md 约定留待 Stage 8。
+6. **per-variable provenance 客户端暴露**：provenance digest 已进入缓存键
+   （`resolver.py:709-779`），但响应 schema 仅暴露 per-series `cycle_time`
+   （`api/schemas.py:287-294`），客户端仍看不到每个变量来自哪个 cycle/run。
+7. **T−2C claim 时机**：纯剪枝效率优化，正确性由 canonical necessity 覆盖；
+   tombstone/最后批 unit 最晚释放推迟 10 天。等 GC 跑稳、有存储回收曲线数据
+   后再评估。

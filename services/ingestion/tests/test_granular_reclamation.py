@@ -1337,3 +1337,167 @@ def test_acceptance_non_destructive_stage_1_2_3_execution(catalog_engine, tmp_pa
 
 
 
+
+
+# ===========================================================================
+# I14 mechanical replacement-evidence gate (architecture doc §11.2-2):
+# committed-manifest generation is the physical evidence of replacement.
+# ===========================================================================
+def _write_store_generation(store_dir: Path, generation: str) -> None:
+    from ingestion.core.markers import write_manifest
+
+    write_manifest(str(store_dir), {"generation": generation})
+
+
+def _remove_store_generation(store_dir: Path) -> None:
+    import shutil
+
+    shutil.rmtree(store_dir / "__commit__")
+
+
+def test_i14_planner_snapshots_store_generation_at_enqueue(catalog_engine, tmp_path):
+    c0 = _dt(2026, 9, 1, 0)
+    c1 = _dt(2026, 9, 1, 6)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    _seed_gfs_products(catalog_engine, r0, [6, 12], ["temperature_2m"], tmp_path / "c0")
+    r1 = _seed_run(catalog_engine, "gfs", c1, "ready", tmp_path / "c1")
+    _seed_gfs_products(catalog_engine, r1, [6, 12], ["temperature_2m"], tmp_path / "c1")
+    # Store c0 has a committed manifest; store c1 has none (legacy store).
+    _write_store_generation(tmp_path / "c0", "gen-enqueue-1")
+
+    now = _dt(2026, 9, 2, 12)
+    with Session(catalog_engine) as session:
+        plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        assert plan.enqueued_count >= 4
+
+        rows = session.execute(select(ReclamationQueueRecord)).scalars().all()
+        by_store = {r.store_path: r.store_generation for r in rows}
+        assert by_store[str(tmp_path / "c0")] == "gen-enqueue-1"
+        # Legacy store without a committed manifest: no baseline evidence.
+        assert by_store[str(tmp_path / "c1")] is None
+
+
+def test_i14_worker_defers_on_generation_bump_then_proceeds_when_stable(
+    catalog_engine, tmp_path
+):
+    c0 = _dt(2026, 9, 1, 0)
+    store = tmp_path / "c0"
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", store)
+    _seed_gfs_products(catalog_engine, r0, [6, 12], ["temperature_2m"], store)
+    _write_store_generation(store, "gen-1")
+
+    now = _dt(2026, 9, 2, 12)
+    with Session(catalog_engine) as session:
+        plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        assert plan.enqueued_count >= 2
+
+    # Replace the store after enqueue: the manifest generation bumps.
+    _write_store_generation(store, "gen-2")
+
+    with Session(catalog_engine) as session:
+        w1 = run_reclamation_worker_pass(
+            session, batch_size=10, lease_seconds=60, delete_enabled=True, now=now
+        )
+        # Fail closed: nothing deleted, everything reverted to QUEUED.
+        assert w1.deleted_count == 0
+        assert w1.revalidated_held_count >= 2
+        rows = session.execute(select(ReclamationQueueRecord)).scalars().all()
+        assert rows
+        for row in rows:
+            assert row.status == RECLAMATION_STATUS_QUEUED
+            assert row.last_error == "generation_gate_replaced_since_observation"
+            # Baseline re-observed: the next pass compares against gen-2.
+            assert row.store_generation == "gen-2"
+        # Physical shards still present.
+        for lead in (6, 12):
+            rel = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, lead, 0)
+            assert (store / rel).exists()
+
+    # No further replacement -> the next pass deletes (no livelock).
+    with Session(catalog_engine) as session:
+        w2 = run_reclamation_worker_pass(
+            session, batch_size=10, lease_seconds=60, delete_enabled=True, now=now
+        )
+        assert w2.deleted_count >= 2
+        rows = session.execute(select(ReclamationQueueRecord)).scalars().all()
+        assert all(r.status == RECLAMATION_STATUS_DELETED for r in rows)
+        for lead in (6, 12):
+            rel = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, lead, 0)
+            assert not (store / rel).exists()
+
+
+def test_i14_worker_fails_closed_when_store_generation_disappears(
+    catalog_engine, tmp_path
+):
+    c0 = _dt(2026, 9, 1, 0)
+    store = tmp_path / "c0"
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", store)
+    _seed_gfs_products(catalog_engine, r0, [6, 12], ["temperature_2m"], store)
+    _write_store_generation(store, "gen-1")
+
+    now = _dt(2026, 9, 2, 12)
+    with Session(catalog_engine) as session:
+        plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        assert plan.enqueued_count >= 2
+
+    # Evidence disappears: the committed manifest is removed after enqueue.
+    _remove_store_generation(store)
+
+    with Session(catalog_engine) as session:
+        w1 = run_reclamation_worker_pass(
+            session, batch_size=10, lease_seconds=60, delete_enabled=True, now=now
+        )
+        assert w1.deleted_count == 0
+        rows = session.execute(select(ReclamationQueueRecord)).scalars().all()
+        assert rows
+        for row in rows:
+            assert row.status == RECLAMATION_STATUS_QUEUED
+            assert row.last_error == "generation_gate_manifest_unavailable"
+            # Baseline is kept, never silently reset by the missing evidence.
+            assert row.store_generation == "gen-1"
+
+
+def test_i14_worker_backfills_baseline_for_pre_migration_row(catalog_engine, tmp_path):
+    c0 = _dt(2026, 9, 1, 0)
+    store = tmp_path / "c0"
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", store)
+    _seed_gfs_products(catalog_engine, r0, [6, 12], ["temperature_2m"], store)
+    _write_store_generation(store, "gen-legacy-9")
+
+    now = _dt(2026, 9, 2, 12)
+    # A pre-migration row carries no baseline: first claim starts observing.
+    with Session(catalog_engine) as session:
+        session.add(
+            ReclamationQueueRecord(
+                id="legacy_row",
+                run_id=r0,
+                model_id="gfs",
+                cycle_time=c0,
+                lead_time_hours=6,
+                variable_code="temperature_2m",
+                target_kind=TARGET_KIND_DET,
+                member_index=0,
+                valid_time=c0 + timedelta(hours=6),
+                store_path=str(store),
+                physical_key=make_shard_relative_key(
+                    "temperature_2m", TARGET_KIND_DET, 6, 0
+                ),
+                status=RECLAMATION_STATUS_QUEUED,
+                attempt_count=0,
+                lease_expires_at=None,
+                next_retry_at=None,
+                last_error=None,
+                store_generation=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+        w = run_reclamation_worker_pass(
+            session, batch_size=10, lease_seconds=60, delete_enabled=True, now=now
+        )
+        assert w.deleted_count == 1
+        row = session.get(ReclamationQueueRecord, "legacy_row")
+        assert row.status == RECLAMATION_STATUS_DELETED
+        assert row.store_generation == "gen-legacy-9"

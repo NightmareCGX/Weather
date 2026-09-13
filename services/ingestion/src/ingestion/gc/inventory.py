@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from domain.horizon import model_max_lead_hours
 from domain.lifecycle import is_cycle_horizon_expired
-from domain.temporal import serving_start_valid_time
+from domain.temporal import model_serving_start_valid_time, serving_start_valid_time
 from ingestion.core.catalog import ForecastCycleLifecycleRecord, ModelRunRecord, ModelVersionRecord
 from ingestion.core.locks import LockTimeoutError, StoreLockCoordinator
 
@@ -142,8 +142,14 @@ def discover_orphan_cycles(
             max_lead = model_max_lead_hours(model)
         except ValueError:
             max_lead = 240
+        try:
+            model_serving_start = model_serving_start_valid_time(model, now_utc)
+        except ValueError:
+            # Unregistered model: fall back to the canonical global boundary
+            # (same tolerance as model_max_lead_hours above).
+            model_serving_start = serving_start
         beyond = is_cycle_horizon_expired(
-            cycle_time, max_lead_hours=max_lead, serving_start=serving_start
+            cycle_time, max_lead_hours=max_lead, serving_start=model_serving_start
         )
         orphans.append(
             OrphanStore(

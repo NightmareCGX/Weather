@@ -369,6 +369,11 @@ class ReclamationQueueRecord(CatalogBase):  # type: ignore[misc]  # untyped base
     valid_time: Any = Column(DateTime(timezone=True), nullable=False)
     store_path: Any = Column(String, nullable=False)
     physical_key: Any = Column(String, nullable=False)
+    # I14 replacement-evidence baseline: the store's committed-manifest
+    # generation observed when the row was enqueued (or first claimed for
+    # pre-migration rows). The worker refuses physical deletion while this
+    # baseline disagrees with the store's current generation.
+    store_generation: Any = Column(String, nullable=True)
     status: Any = Column(String(length=16), nullable=False, default="queued")
     attempt_count: Any = Column(Integer, nullable=False, default=0)
     lease_expires_at: Any = Column(DateTime(timezone=True), nullable=True)
