@@ -130,6 +130,18 @@ class Settings(BaseSettings):
     # Constrained to (0.0, 1.0]; default 0.85 (85%).
     ENSEMBLE_MIN_COVERAGE_RATIO: float = 0.85
 
+    # Background wind vector-field cache prewarm (cycle publication warm-up).
+    # A lifespan-owned task periodically resolves the serving window's valid
+    # times and computes cache-missing vector fields so real users never hit
+    # the expensive cold path after a new cycle publishes. Passes are bounded
+    # and throttled; see api/services/vector_prewarm.py.
+    API_VECTOR_PREWARM_ENABLED: bool = True
+    API_VECTOR_PREWARM_INTERVAL_SECONDS: float = 300.0
+    API_VECTOR_PREWARM_HORIZON_HOURS: int = 48
+    API_VECTOR_PREWARM_MODELS: Any = ["gfs", "gefs"]
+    API_VECTOR_PREWARM_MAX_COMPUTES_PER_PASS: int = 6
+    API_VECTOR_PREWARM_COMPUTE_THROTTLE_SECONDS: float = 2.0
+
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
         env_file_encoding="utf-8",

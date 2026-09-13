@@ -3,9 +3,10 @@
 Run with ``uvicorn api.main:app`` from ``services/api``.
 """
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
@@ -55,9 +56,20 @@ def create_app() -> FastAPI:
             max_overflow=int(settings.API_READER_LOCK_MAX_OVERFLOW),
             pool_timeout=float(settings.API_READER_LOCK_POOL_TIMEOUT_SECONDS),
         )
+        prewarm_task: asyncio.Task[None] | None = None
+        if settings.API_VECTOR_PREWARM_ENABLED:
+            from api.services.vector_prewarm import vector_prewarm_loop
+
+            prewarm_task = asyncio.create_task(
+                vector_prewarm_loop(), name="vector-field-prewarm"
+            )
         try:
             yield
         finally:
+            if prewarm_task is not None:
+                prewarm_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await prewarm_task
             # Shutdown drain: reject new gated ops, wait for active handlers,
             # then dispose the reader-lock engine.
             reader_lifecycle.begin_shutdown()
