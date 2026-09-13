@@ -21,6 +21,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
+from tests._integration_db import integration_db_url
 
 from ingestion.core.catalog import (
     CenterRecord,
@@ -39,10 +40,7 @@ def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime
 
 @pytest.fixture(scope="function")
 def postgres_catalog_session():
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url)
     try:
         with engine.connect() as conn:

@@ -48,6 +48,7 @@ from ingestion.core.catalog import (
 )
 from ingestion.core.db import CatalogBase
 from ingestion.gc.finalizer import finalize_cycle_physical_and_queue
+from tests._integration_db import integration_db_url
 from ingestion.gc.sweeper import (
     DEFAULT_SWEEPER_BATCH_SIZE,
     _normalize_batch_size,
@@ -800,15 +801,11 @@ def test_multi_version_runs_same_cycle(catalog_engine) -> None:
 
 
 def test_sweeper_pass_real_postgres() -> None:
-    import os
     from alembic import command
     from alembic.config import Config
     from sqlalchemy import text
 
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     pg_engine = create_engine(db_url)
     try:
         with pg_engine.connect() as conn:

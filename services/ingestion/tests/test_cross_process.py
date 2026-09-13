@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 
 from ingestion.core.config import settings
 
+from tests._integration_db import integration_db_url_or_skip_module
+
 _WORKER = r"""
 import sys, os, threading, time
 sys.path.insert(0, %r)
@@ -137,7 +139,7 @@ def _ensure_catalog_schema() -> None:
 
     from ingestion.core.catalog import CatalogBase
 
-    engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+    engine = create_engine(integration_db_url_or_skip_module(), pool_pre_ping=True)
     try:
         CatalogBase.metadata.create_all(engine)
     finally:

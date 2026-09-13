@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pytest
 from sqlalchemy import create_engine, text
+from tests._integration_db import integration_db_url
 
 from ingestion.gc.leadership import (
     GcLeadership,
@@ -14,10 +15,9 @@ from ingestion.gc.leadership import (
 
 
 def _pg_reachable() -> bool:
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = os.getenv("TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
+    if not db_url:
+        return False
     try:
         eng = create_engine(db_url, pool_pre_ping=True)
         with eng.connect() as conn:
@@ -47,10 +47,7 @@ def test_sqlite_raises_leadership_unavailable():
 
 @pytest.mark.skipif(not _pg_reachable(), reason="PostgreSQL test database not reachable")
 def test_postgres_gc_leadership_lifecycle():
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-    )
+    db_url = integration_db_url()
     engine = create_engine(db_url, pool_pre_ping=True)
 
     leader1 = GcLeadership(engine, identity="test-gc-deployment")

@@ -36,7 +36,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
-from api.core.config import settings as api_settings
 from api.core.manifest_reader import manifest_storage_format
 from api.main import create_app
 
@@ -58,6 +57,7 @@ from ingestion.core.inventory import (
 )
 from ingestion.core.markers import marker_body, write_region_marker
 from ingestion.core.zarr_writer import commit_region, prepare_run_store
+from tests._integration_db import integration_db_url
 
 LAT = 40.0
 LON = -105.0
@@ -130,9 +130,9 @@ def clean_db():
 
     alembic_cfg = Config(os.path.abspath(os.path.join(_api_src, "../alembic.ini")))
     alembic_cfg.set_main_option("script_location", os.path.abspath(os.path.join(_api_src, "../alembic")))
-    alembic_cfg.set_main_option("sqlalchemy.url", str(api_settings.DATABASE_URL))
+    alembic_cfg.set_main_option("sqlalchemy.url", integration_db_url())
 
-    engine = create_engine(str(api_settings.DATABASE_URL))
+    engine = create_engine(integration_db_url())
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(text("DROP SCHEMA public CASCADE"))
         conn.execute(text("CREATE SCHEMA public"))
@@ -224,7 +224,7 @@ def test_serving_contract_e2e_gfs_and_gefs(clean_db) -> None:
     gfs_run_id = f"run_gfs_{unique_id}"
     gefs_run_id = f"run_gefs_{unique_id}"
 
-    db_engine = create_engine(str(api_settings.DATABASE_URL))
+    db_engine = create_engine(integration_db_url())
 
     # =========================================================================
     # 1. Ingest GFS sharded_v1 Cycle (Leads 0 and 3)

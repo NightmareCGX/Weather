@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 
 from api.core.database import get_db
 from api.main import app
+from tests._integration_db import integration_db_url_or_skip_module
 from api.models.entities import (
     ForecastCenter,
     ForecastGrid,
@@ -58,10 +59,7 @@ from api.models.entities import (
 )
 
 #: The DB URL used for the module fixtures.
-DB_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://weather_user:weather_password@localhost:5432/weather_db",
-)
+DB_URL = integration_db_url_or_skip_module()
 
 
 def _build_tiny_dataset() -> xr.Dataset:
