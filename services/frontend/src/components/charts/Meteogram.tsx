@@ -5,6 +5,7 @@ import {
   CartesianGrid,
   Cell,
   ComposedChart,
+  Customized,
   Line,
   ResponsiveContainer,
   Tooltip,
@@ -47,6 +48,132 @@ const KNOWN_TRANSITION_GRADIENTS = [
   { id: "precip-grad-rain_to_ice_pellets", start: "#0284c7", end: "#0d9488" },
   { id: "precip-grad-ice_pellets_to_rain", start: "#0d9488", end: "#0284c7" },
 ];
+
+/**
+ * Calculate adaptive sampling stride for wind direction arrowheads so adjacent
+ * arrowheads maintain at least 14px center-to-center clearance.
+ */
+export function getWindArrowStride(totalPoints: number, plotWidth: number): number {
+  if (totalPoints <= 1) return 1;
+  const deltaX = plotWidth / (totalPoints - 1);
+  const minClearance = 14;
+  return Math.max(1, Math.ceil(minClearance / Math.max(1, deltaX)));
+}
+
+interface WindTrackProps {
+  offset?: { top: number; left: number; width: number; height: number };
+  formattedGraphicalItems?: Array<{
+    props?: { points?: Array<{ x: number; y: number; payload: any }> };
+  }>;
+  data?: any[];
+  activeTooltipIndex?: number;
+}
+
+/**
+ * Independent wind direction strip rendered via Recharts `<Customized>`.
+ *
+ * Renders solid cut-tail arrowheads (Shape 2: notch arrowhead) indicating
+ * physical flow direction (blowing towards: direction + 180°), calm wind circles,
+ * and adaptive decimation dots, perfectly aligned with chart X coordinates.
+ */
+export function WindDirectionTrack({
+  offset,
+  formattedGraphicalItems,
+  data: chartData,
+  activeTooltipIndex,
+}: WindTrackProps) {
+  const points = formattedGraphicalItems?.[0]?.props?.points;
+  const rawItems =
+    points && points.length > 0
+      ? points.map((p) => ({ x: p.x, payload: p.payload }))
+      : (chartData ?? []).map((d, i) => ({
+          x:
+            offset && offset.width
+              ? offset.left + (i / Math.max(1, (chartData?.length ?? 1) - 1)) * offset.width
+              : i * 20,
+          payload: d,
+        }));
+
+  if (rawItems.length === 0) {
+    return null;
+  }
+
+  const plotWidth = offset?.width ?? 600;
+  const y = (offset?.top ?? 8) + (offset?.height ?? 140) + 10;
+  const stride = getWindArrowStride(rawItems.length, plotWidth);
+
+  return (
+    <g
+      className="recharts-wind-direction-track"
+      style={{ pointerEvents: "none" }}
+      aria-hidden="true"
+    >
+      {offset && (
+        <line
+          x1={offset.left}
+          x2={offset.left + offset.width}
+          y1={y}
+          y2={y}
+          stroke="#e2e8f0"
+          strokeDasharray="2 2"
+          className="stroke-slate-200 dark:stroke-slate-700"
+        />
+      )}
+      {rawItems.map((item, index) => {
+        const { x, payload } = item;
+        const dir = payload?.wind_direction_10m as number | null | undefined;
+        const val = payload?.rawValue ?? payload?.value;
+        const cardinal = payload?.wind_cardinal_10m as string | null | undefined;
+        const isCalm =
+          val === null ||
+          val === undefined ||
+          val < 1.8 ||
+          cardinal === "CALM" ||
+          dir === null ||
+          dir === undefined;
+        const isHovered = index === activeTooltipIndex;
+        const isVisible = index % stride === 0 || isHovered;
+
+        if (!isVisible) {
+          return <circle key={`wind-dot-${index}`} cx={x} cy={y} r={1} fill="#cbd5e1" />;
+        }
+
+        if (isCalm || dir === null || dir === undefined) {
+          return (
+            <circle
+              key={`wind-calm-${index}`}
+              data-testid="wind-calm-circle"
+              cx={x}
+              cy={y}
+              r={2.2}
+              fill="none"
+              stroke={isHovered ? "#0284c7" : "#64748b"}
+              strokeWidth={1.2}
+            />
+          );
+        }
+
+        // Flow direction (where the wind is blowing towards: wind_from + 180°)
+        const flowAngle = (dir + 180) % 360;
+
+        return (
+          <g
+            key={`wind-arrow-${index}`}
+            data-testid="wind-flow-arrow"
+            transform={`translate(${x}, ${y}) rotate(${flowAngle})`}
+          >
+            {/* Shape 2: Solid notch-arrowhead (4-point polygon) */}
+            <polygon
+              points="0,-4.5 3.5,3.5 0,1.5 -3.5,3.5"
+              fill={isHovered ? "#0284c7" : "#334155"}
+              className={isHovered ? "fill-sky-600" : "fill-slate-700 dark:fill-slate-300"}
+            />
+          </g>
+        );
+      })}
+    </g>
+  );
+}
 
 /**
  * Hourly meteogram for a single forecast variable from `/v1/points`.
@@ -180,10 +307,18 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
       <div
         role="img"
         aria-label={`${meta.name} hourly forecast over lead time`}
-        className="h-48 w-full"
+        className={variableCode === "wind_10m" ? "h-52 w-full" : "h-48 w-full"}
       >
         <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
+          <ComposedChart
+            data={data}
+            margin={{
+              top: 8,
+              right: 8,
+              bottom: variableCode === "wind_10m" ? 22 : 4,
+              left: 0,
+            }}
+          >
             <defs>
               {KNOWN_TRANSITION_GRADIENTS.map((grad) => (
                 <linearGradient key={grad.id} id={grad.id} x1="0" y1="1" x2="0" y2="0">
@@ -275,6 +410,7 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
                 name={meta.name}
               />
             )}
+            {variableCode === "wind_10m" && <Customized component={<WindDirectionTrack />} />}
           </ComposedChart>
         </ResponsiveContainer>
       </div>
