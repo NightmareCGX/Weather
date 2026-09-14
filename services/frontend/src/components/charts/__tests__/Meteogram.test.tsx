@@ -388,6 +388,10 @@ describe("Meteogram", () => {
         />
       );
 
+      // Verify container height allocates h-56 for wind track and offset XAxis
+      const chartWrapper = container.querySelector("[role='img']");
+      expect(chartWrapper).toHaveClass("h-56");
+
       // Verify the track container is rendered
       const track = container.querySelector(".recharts-wind-direction-track");
       expect(track).toBeInTheDocument();
