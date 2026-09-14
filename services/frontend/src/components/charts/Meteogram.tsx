@@ -221,7 +221,7 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
       isCloudCeiling &&
       (rawVal === null ||
         rawVal === undefined ||
-        rawVal >= 19990 ||
+        rawVal >= 19.99 ||
         Boolean(entry?.cloud_ceiling_unlimited));
     const plotValue = isCloudCeiling && isUnlimitedCeiling ? null : rawVal;
 

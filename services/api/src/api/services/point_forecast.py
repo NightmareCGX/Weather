@@ -103,16 +103,17 @@ _SI_TO_IMPERIAL: dict[str, tuple[str, Callable[[float], float]]] = {
     "mm": ("in", lambda mm: mm / 25.4),
     "km/h": ("mph", lambda kmh: kmh * 0.621371),
     "%": ("%", lambda rh: rh),
+    "km": ("mi", lambda km: km * 0.621371),
     "m": ("mi", lambda m: m / 1609.344),
 }
 
 #: Variable-specific conversions taking precedence over generic unit matching.
 _VARIABLE_IMPERIAL_CONVERSIONS: dict[str, tuple[str, Callable[[float], float]]] = {
     "snow_depth": ("in", lambda m: m * 39.3700787),
-    "visibility": ("mi", lambda m: m / 1609.344),
+    "visibility": ("mi", lambda km: km * 0.621371),
     "wind_10m": ("mph", lambda kmh: kmh * 0.621371),
     "precipitation_amount_3h": ("in", lambda mm: mm / 25.4),
-    "cloud_ceiling": ("ft", lambda m: m * 3.28084),
+    "cloud_ceiling": ("ft", lambda km: km * 3280.84),
 }
 
 
@@ -581,13 +582,13 @@ def build_point_forecast(
                     entry["cloud_ceiling"] = None
                     entry["cloud_ceiling_unlimited"] = False
                 else:
-                    val_m = float(raw_ceil)
-                    if val_m >= 19990.0:
+                    val_km = float(raw_ceil)
+                    if val_km >= 19.99:
                         entry["cloud_ceiling"] = None
                         entry["cloud_ceiling_unlimited"] = True
                     else:
                         converted = _convert_value(
-                            val_m, "m", units, var_code="cloud_ceiling"
+                            val_km, "km", units, var_code="cloud_ceiling"
                         )
                         entry["cloud_ceiling"] = round(converted, 1)
                         entry["cloud_ceiling_unlimited"] = False

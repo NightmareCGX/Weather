@@ -28,11 +28,11 @@ describe("labels", () => {
     expect(meta.precipitation_rate).toEqual({ name: "Precipitation Rate", unit: "mm/h" });
     expect(meta.relative_humidity_2m).toEqual({ name: "Relative Humidity", unit: "%" });
     expect(meta.wind_gust).toEqual({ name: "Wind Gust", unit: "km/h" });
-    expect(meta.visibility).toEqual({ name: "Visibility", unit: "m" });
+    expect(meta.visibility).toEqual({ name: "Visibility", unit: "km" });
     expect(meta.snow_depth).toEqual({ name: "Snow Depth", unit: "m" });
     expect(meta.wind_10m).toEqual({ name: "Wind (10 m)", unit: "km/h" });
     expect(meta.cloud_cover_3h).toEqual({ name: "Cloud Cover", unit: "%" });
-    expect(meta.cloud_ceiling).toEqual({ name: "Cloud Ceiling", unit: "m" });
+    expect(meta.cloud_ceiling).toEqual({ name: "Cloud Ceiling", unit: "km" });
   });
 
   it("falls back for a missing or empty catalog", () => {
@@ -55,11 +55,11 @@ describe("labels", () => {
   });
 
   it("formats cloud ceiling with unlimited handling", () => {
-    expect(formatCloudCeiling(1200, "m")).toBe("1,200 m");
+    expect(formatCloudCeiling(1.2, "km")).toBe("1.2 km");
     expect(formatCloudCeiling(3000, "ft")).toBe("3,000 ft");
-    expect(formatCloudCeiling(null, "m")).toBe("Unlimited");
-    expect(formatCloudCeiling(20000, "m")).toBe("Unlimited");
-    expect(formatCloudCeiling(1200, "m", true)).toBe("Unlimited");
+    expect(formatCloudCeiling(null, "km")).toBe("Unlimited");
+    expect(formatCloudCeiling(20.0, "km")).toBe("Unlimited");
+    expect(formatCloudCeiling(1.2, "km", true)).toBe("Unlimited");
   });
 
   it("formats wind direction and calm status", () => {

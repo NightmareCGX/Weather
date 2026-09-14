@@ -367,8 +367,8 @@ def test_convert_phase1a_variables_imperial():
     assert _convert_value(85.0, "%", "imperial", var_code="relative_humidity_2m") == 85.0
     # Wind gust: km/h -> mph
     assert _convert_value(100.0, "km/h", "imperial", var_code="wind_gust") == pytest.approx(62.1371, abs=1e-4)
-    # Visibility: m -> mi (1609.344m = 1mi)
-    assert _convert_value(16093.44, "m", "imperial", var_code="visibility") == pytest.approx(10.0, abs=1e-4)
+    # Visibility: km -> mi (1.609344 km = 1 mi, or 10 km = 6.21371 mi)
+    assert _convert_value(10.0, "km", "imperial", var_code="visibility") == pytest.approx(6.21371, abs=1e-4)
     # Snow depth: m -> in (1m = 39.3700787in)
     assert _convert_value(0.254, "m", "imperial", var_code="snow_depth") == pytest.approx(10.0, abs=1e-4)
 

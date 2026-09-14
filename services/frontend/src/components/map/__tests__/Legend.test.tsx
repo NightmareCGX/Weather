@@ -24,12 +24,15 @@ describe("Legend", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it("renders the unit and a gradient bar from the legend stops", () => {
+  it("renders the unit, a gradient bar, and ticks from the legend stops", () => {
     render(<Legend layer={layer} />);
 
     expect(screen.getByText("°C")).toBeInTheDocument();
     expect(screen.getByTestId("legend-gradient")).toHaveStyle({
       backgroundImage: expect.stringContaining("linear-gradient"),
     });
+    expect(screen.getByText("-40")).toBeInTheDocument();
+    expect(screen.getByText("0")).toBeInTheDocument();
+    expect(screen.getByText("40")).toBeInTheDocument();
   });
 });
