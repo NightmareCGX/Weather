@@ -126,13 +126,28 @@ def _collect_and_render() -> bytes:
     return REGISTRY.generate_latest().encode("utf-8")
 
 
+def _make_live_renderer(component: str = "realtime") -> Callable[[], bytes]:
+    """Build a renderer that updates component process resource metrics on scrape."""
+
+    def _render() -> bytes:
+        try:
+            from ingestion.monitoring.resources import RESOURCE_COLLECTOR
+
+            RESOURCE_COLLECTOR.sample_component_resources(component)
+        except Exception:  # noqa: BLE001 - fail open
+            pass
+        return REGISTRY.generate_latest().encode("utf-8")
+
+    return _render
+
+
 def _render_registry_only() -> bytes:
     """Render the current in-process registry without running any probes.
 
     Used by long-running ingestion processes (e.g. the realtime daemon) whose
     registries already hold live, continuously-updated pipeline counters.
     """
-    return REGISTRY.generate_latest().encode("utf-8")
+    return _make_live_renderer("realtime")()
 
 
 def _make_metrics_handler(render: Callable[[], bytes]) -> type[BaseHTTPRequestHandler]:
@@ -186,18 +201,22 @@ def serve_metrics(host: str = "127.0.0.1", port: int = 9112) -> int:
     return _serve_http(host, port, _collect_and_render)
 
 
-def serve_live_registry(host: str = "127.0.0.1", port: int = 9113) -> int:
+def serve_live_registry(
+    host: str = "127.0.0.1", port: int = 9113, component: str = "realtime"
+) -> int:
     """Serve the current process's live registry until interrupted.
 
-    For embedding in long-running ingestion processes (realtime daemon):
+    For embedding in long-running ingestion processes (realtime daemon, gc):
     the registry already contains live process-local pipeline counters, so
     serving it needs no probing and adds only one background HTTP thread.
+    On each scrape, samples the component process's CPU and RSS.
 
     Args:
         host: Bind address (loopback default, production-safe).
         port: TCP port to listen on.
+        component: Component name label ("realtime", "gc", etc.).
 
     Returns:
         Process exit code (0 after a clean Ctrl+C shutdown).
     """
-    return _serve_http(host, port, _render_registry_only)
+    return _serve_http(host, port, _make_live_renderer(component))

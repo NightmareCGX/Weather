@@ -25,6 +25,16 @@ from ingestion.monitoring.metrics import REGISTRY
 logger = logging.getLogger(__name__)
 
 # Register Prometheus metrics
+COMPONENT_CPU_PERCENT = REGISTRY.gauge(
+    "weather_component_cpu_percent",
+    "Component process CPU utilization percentage (0-100+)",
+    labelnames=("component",),
+)
+COMPONENT_MEMORY_RSS_BYTES = REGISTRY.gauge(
+    "weather_component_memory_rss_bytes",
+    "Component process resident memory size (RSS) in bytes",
+    labelnames=("component",),
+)
 PROCESS_CPU_PERCENT = REGISTRY.gauge(
     "weather_process_cpu_percent",
     "Current process CPU utilization percentage (0-100+)",
@@ -92,6 +102,10 @@ DISK_USED_PERCENT = REGISTRY.gauge(
     "weather_disk_used_percent",
     "Disk utilization percentage (0-100)",
     labelnames=("path",),
+)
+STAGING_DOWNLOADS_BYTES = REGISTRY.gauge(
+    "weather_staging_downloads_bytes",
+    "Temporary download staging directory total disk usage in bytes",
 )
 MEMORY_LEAK_WARNING = REGISTRY.gauge(
     "weather_memory_leak_warning",
@@ -514,6 +528,14 @@ class SystemResourceCollector:
             used_percent=round(pct, 2),
         )
 
+    def sample_component_resources(self, component: str) -> tuple[float, int]:
+        """Sample current process CPU % and RSS bytes, and record as component metrics."""
+        cpu = self.get_cpu_percent()
+        mem = self.get_memory_info()
+        COMPONENT_CPU_PERCENT.labels(component=component).set(cpu)
+        COMPONENT_MEMORY_RSS_BYTES.labels(component=component).set(float(mem.rss_bytes))
+        return cpu, mem.rss_bytes
+
     def collect_and_export(
         self,
         disk_paths: tuple[str | Path, ...] = (".",),
@@ -526,6 +548,10 @@ class SystemResourceCollector:
         threads = self.get_thread_count()
         tasks = self.get_asyncio_task_count()
         fds = self.get_open_file_descriptors()
+
+        # Component breakdown: exporter process itself
+        COMPONENT_CPU_PERCENT.labels(component="exporter").set(cpu)
+        COMPONENT_MEMORY_RSS_BYTES.labels(component="exporter").set(float(mem.rss_bytes))
 
         # Both system CPU and legacy process gauge are populated for compatibility
         SYSTEM_CPU_PERCENT.set(sys_cpu)
@@ -558,6 +584,18 @@ class SystemResourceCollector:
                 DISK_USED_PERCENT.labels(path=p_str).set(float(dinfo.used_percent))
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Failed disk usage collection for %s: %s", dpath, exc)
+
+        # Temporary downloads staging disk usage
+        staging_dir = Path("downloads")
+        staging_bytes = 0
+        if staging_dir.is_dir():
+            try:
+                staging_bytes = sum(
+                    f.stat().st_size for f in staging_dir.rglob("*") if f.is_file()
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        STAGING_DOWNLOADS_BYTES.set(float(staging_bytes))
 
         return {
             "cpu_percent": cpu,

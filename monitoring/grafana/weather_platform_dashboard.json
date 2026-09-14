@@ -341,32 +341,82 @@
         "y": 6
       },
       "id": 9,
-      "title": "System Memory (Used / Available / Total)",
+      "title": "Platform Memory Breakdown (RSS)",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "fillOpacity": 25,
+            "lineWidth": 2,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
           "unit": "bytes"
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Platform Total RSS"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [4, 4],
+                  "fill": "dash"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Host Used RAM (Reference)"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [2, 4],
+                  "fill": "dot"
+                }
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
-          "expr": "weather_system_memory_total_bytes",
-          "legendFormat": "Total physical RAM"
+          "expr": "weather_component_memory_rss_bytes",
+          "legendFormat": "{{component}} RSS"
+        },
+        {
+          "expr": "sum(weather_component_memory_rss_bytes)",
+          "legendFormat": "Platform Total RSS"
         },
         {
           "expr": "weather_system_memory_used_bytes",
-          "legendFormat": "Used memory"
-        },
-        {
-          "expr": "weather_system_memory_free_bytes",
-          "legendFormat": "Available memory"
-        },
-        {
-          "expr": "weather_process_memory_rss_bytes",
-          "legendFormat": "Ingestion process RSS"
+          "legendFormat": "Host Used RAM (Reference)"
         }
       ],
-      "description": "Host physical RAM usage (Total, Used, Available) alongside Ingestion process resident set size (RSS).",
+      "description": "Resident memory size (RSS) broken down by platform component (realtime, gc, api, exporter), stacked to show total platform memory footprint against host physical RAM.",
       "options": {
         "tooltip": {
           "mode": "multi",
@@ -386,19 +436,82 @@
         "y": 6
       },
       "id": 10,
-      "title": "System CPU Utilization %",
+      "title": "Platform CPU Breakdown & Total %",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "fillOpacity": 25,
+            "lineWidth": 2,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
           "unit": "percent"
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Platform Total CPU %"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [4, 4],
+                  "fill": "dash"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Host System CPU (Reference)"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [2, 4],
+                  "fill": "dot"
+                }
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
-          "expr": "weather_system_cpu_percent or weather_process_cpu_percent",
-          "legendFormat": "Host CPU %"
+          "expr": "weather_component_cpu_percent",
+          "legendFormat": "{{component}} CPU %"
+        },
+        {
+          "expr": "sum(weather_component_cpu_percent)",
+          "legendFormat": "Platform Total CPU %"
+        },
+        {
+          "expr": "weather_system_cpu_percent",
+          "legendFormat": "Host System CPU (Reference)"
         }
       ],
+      "description": "CPU utilization percentage broken down by component (realtime, gc, api, exporter), stacked to show total platform CPU consumption against host CPU.",
       "options": {
         "tooltip": {
           "mode": "multi",
@@ -418,44 +531,68 @@
         "y": 6
       },
       "id": 11,
-      "title": "Disk Space (Used / Free / Total)",
+      "title": "Platform Storage Breakdown",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "fillOpacity": 25,
+            "lineWidth": 2,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
           "unit": "bytes"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Filesystem Total Used (Reference)"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [4, 4],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "weather_disk_total_bytes",
-          "legendFormat": "Total capacity",
+          "expr": "minio_cluster_usage_total_bytes",
+          "legendFormat": "Weather Grid Data (MinIO / S3)",
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "weather_disk_used_bytes",
-          "legendFormat": "Used space",
+          "expr": "weather_postgres_total_size_bytes",
+          "legendFormat": "Metadata DB (PostgreSQL)",
           "refId": "B"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "weather_disk_free_bytes",
-          "legendFormat": "Free space",
+          "expr": "weather_staging_downloads_bytes",
+          "legendFormat": "Staging Downloads",
           "refId": "C"
+        },
+        {
+          "expr": "weather_disk_used_bytes{path=\".\"}",
+          "legendFormat": "Filesystem Total Used (Reference)",
+          "refId": "D"
         }
       ],
-      "description": "Absolute disk space in bytes. Total capacity is constant, so the distance between the Used line and the Total line is exactly the utilization percentage - no separate percent line needed.",
+      "description": "Storage footprint directly owned by the Weather Platform: MinIO object storage, PostgreSQL catalog database, and temporary staging downloads.",
       "options": {
         "tooltip": {
           "mode": "multi",
