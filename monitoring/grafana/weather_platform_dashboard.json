@@ -346,7 +346,7 @@
       "fieldConfig": {
         "defaults": {
           "custom": {
-            "fillOpacity": 25,
+            "fillOpacity": 30,
             "lineWidth": 2,
             "stacking": {
               "group": "A",
@@ -355,69 +355,24 @@
           },
           "unit": "bytes"
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Platform Total RSS"
-            },
-            "properties": [
-              {
-                "id": "custom.stacking",
-                "value": {
-                  "group": "B",
-                  "mode": "none"
-                }
-              },
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "dash": [4, 4],
-                  "fill": "dash"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Host Used RAM (Reference)"
-            },
-            "properties": [
-              {
-                "id": "custom.stacking",
-                "value": {
-                  "group": "B",
-                  "mode": "none"
-                }
-              },
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "dash": [2, 4],
-                  "fill": "dot"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "targets": [
         {
           "expr": "weather_component_memory_rss_bytes",
-          "legendFormat": "{{component}} RSS"
-        },
-        {
-          "expr": "sum(weather_component_memory_rss_bytes)",
-          "legendFormat": "Platform Total RSS"
-        },
-        {
-          "expr": "weather_system_memory_used_bytes",
-          "legendFormat": "Host Used RAM (Reference)"
+          "legendFormat": "{{component}}"
         }
       ],
-      "description": "Resident memory size (RSS) broken down by platform component (realtime, gc, api, exporter), stacked to show total platform memory footprint against host physical RAM.",
+      "description": "Physical resident memory (RSS) consumed directly by each platform component (realtime, gc, api, exporter), stacked to show total platform memory usage.",
       "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
@@ -441,7 +396,7 @@
       "fieldConfig": {
         "defaults": {
           "custom": {
-            "fillOpacity": 25,
+            "fillOpacity": 30,
             "lineWidth": 2,
             "stacking": {
               "group": "A",
@@ -450,69 +405,25 @@
           },
           "unit": "percent"
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Platform Total CPU %"
-            },
-            "properties": [
-              {
-                "id": "custom.stacking",
-                "value": {
-                  "group": "B",
-                  "mode": "none"
-                }
-              },
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "dash": [4, 4],
-                  "fill": "dash"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Host System CPU (Reference)"
-            },
-            "properties": [
-              {
-                "id": "custom.stacking",
-                "value": {
-                  "group": "B",
-                  "mode": "none"
-                }
-              },
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "dash": [2, 4],
-                  "fill": "dot"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "targets": [
         {
           "expr": "weather_component_cpu_percent",
-          "legendFormat": "{{component}} CPU %"
-        },
-        {
-          "expr": "sum(weather_component_cpu_percent)",
-          "legendFormat": "Platform Total CPU %"
-        },
-        {
-          "expr": "weather_system_cpu_percent",
-          "legendFormat": "Host System CPU (Reference)"
+          "legendFormat": "{{component}}"
         }
       ],
-      "description": "CPU utilization percentage broken down by component (realtime, gc, api, exporter), stacked to show total platform CPU consumption against host CPU.",
+      "description": "Process CPU utilization percentage consumed directly by each platform component (realtime, gc, api, exporter), stacked to show total platform CPU consumption.",
       "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
@@ -536,7 +447,7 @@
       "fieldConfig": {
         "defaults": {
           "custom": {
-            "fillOpacity": 25,
+            "fillOpacity": 30,
             "lineWidth": 2,
             "stacking": {
               "group": "A",
@@ -545,35 +456,12 @@
           },
           "unit": "bytes"
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Filesystem Total Used (Reference)"
-            },
-            "properties": [
-              {
-                "id": "custom.stacking",
-                "value": {
-                  "group": "B",
-                  "mode": "none"
-                }
-              },
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "dash": [4, 4],
-                  "fill": "dash"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "targets": [
         {
           "expr": "minio_cluster_usage_total_bytes",
-          "legendFormat": "Weather Grid Data (MinIO / S3)",
+          "legendFormat": "Grid Data (MinIO / S3)",
           "refId": "A"
         },
         {
@@ -585,15 +473,18 @@
           "expr": "weather_staging_downloads_bytes",
           "legendFormat": "Staging Downloads",
           "refId": "C"
-        },
-        {
-          "expr": "weather_disk_used_bytes{path=\".\"}",
-          "legendFormat": "Filesystem Total Used (Reference)",
-          "refId": "D"
         }
       ],
       "description": "Storage footprint directly owned by the Weather Platform: MinIO object storage, PostgreSQL catalog database, and temporary staging downloads.",
       "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
