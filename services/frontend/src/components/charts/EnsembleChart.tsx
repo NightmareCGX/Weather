@@ -21,6 +21,101 @@ interface EnsembleChartProps {
   variableLabel: string;
   timezone?: string | null;
   validTimesByLead?: ReadonlyMap<number, string>;
+  unit?: string;
+}
+
+export interface EnsembleChartTooltipProps {
+  active?: boolean;
+  payload?: any[];
+  timezone?: string | null;
+  unit?: string;
+}
+
+/**
+ * Custom tooltip for the ensemble percentile fan chart.
+ *
+ * Renders meaningful weather statistics:
+ * - Median (P50) & Mean
+ * - P25–P75 central range (50% ensemble members)
+ * - P10–P90 outer percentile range (80% ensemble members)
+ *
+ * Hides internal stacked-area base coordinates (p10Base, p25Base) entirely.
+ */
+export function EnsembleChartTooltip({
+  active,
+  payload,
+  timezone,
+  unit = "",
+}: EnsembleChartTooltipProps) {
+  if (!active || !payload || payload.length === 0) {
+    return null;
+  }
+  const point = payload[0]?.payload;
+  if (!point) {
+    return null;
+  }
+
+  const validTime = point.valid_time;
+  const timeLabel = validTime ? formatDayHourWithTimeZone(validTime, timezone) : "";
+
+  const formatVal = (v: number | null | undefined) =>
+    v !== null && v !== undefined && typeof v === "number" && Number.isFinite(v)
+      ? formatValue(v, unit)
+      : "—";
+
+  const formatRange = (low: number | null | undefined, high: number | null | undefined) => {
+    const hasLow =
+      low !== null && low !== undefined && typeof low === "number" && Number.isFinite(low);
+    const hasHigh =
+      high !== null && high !== undefined && typeof high === "number" && Number.isFinite(high);
+    if (!hasLow && !hasHigh) return "—";
+    const lowStr = hasLow ? formatValue(low as number, "") : "—";
+    const highStr = hasHigh ? formatValue(high as number, unit) : "—";
+    return `${lowStr} – ${highStr}`;
+  };
+
+  return (
+    <div
+      className="recharts-default-tooltip rounded border border-slate-200 bg-white p-2.5 text-xs shadow-sm"
+      style={{ whiteSpace: "nowrap" }}
+    >
+      {timeLabel && <p className="mb-1.5 font-medium text-slate-800">{timeLabel}</p>}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <span className="flex items-center gap-1.5 text-slate-600">
+            <span className="h-2 w-2 rounded-full bg-[#1e3a8a]" />
+            Median (P50)
+          </span>
+          <span className="font-medium text-slate-900 tabular-nums">{formatVal(point.median)}</span>
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <span className="flex items-center gap-1.5 text-slate-600">
+            <span className="h-2 w-2 rounded-full bg-[#b45309]" />
+            Mean
+          </span>
+          <span className="font-medium text-slate-900 tabular-nums">{formatVal(point.mean)}</span>
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <span className="flex items-center gap-1.5 text-slate-600">
+            <span className="h-2 w-2 rounded-sm bg-[#3b82f6]" />
+            P25–P75
+          </span>
+          <span className="font-medium text-slate-900 tabular-nums">
+            {formatRange(point.p25, point.p75)}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <span className="flex items-center gap-1.5 text-slate-600">
+            <span className="h-2 w-2 rounded-sm bg-[#93c5fd]" />
+            P10–P90
+          </span>
+          <span className="font-medium text-slate-900 tabular-nums">
+            {formatRange(point.p10, point.p90)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -37,6 +132,7 @@ export function EnsembleChart({
   variableLabel,
   timezone,
   validTimesByLead,
+  unit,
 }: EnsembleChartProps) {
   const data = toEnsembleFanData(byLead, validTimesByLead).map((point) => {
     const validTime =
@@ -54,6 +150,11 @@ export function EnsembleChart({
       p75Height: point.p75Height,
       median: point.median,
       mean: point.mean,
+      p10: point.p10,
+      p25: point.p25,
+      p50: point.p50,
+      p75: point.p75,
+      p90: point.p90,
     };
   });
 
@@ -86,6 +187,7 @@ export function EnsembleChart({
               domain={["auto", "auto"]}
             />
             <Tooltip
+              content={<EnsembleChartTooltip timezone={timezone} unit={unit} />}
               formatter={(value: any, name: string, item: any) => {
                 if (
                   name === undefined ||
@@ -102,7 +204,7 @@ export function EnsembleChart({
                 ) {
                   return ["—", name];
                 }
-                return [formatValue(value, ""), name];
+                return [formatValue(value, unit ?? ""), name];
               }}
               labelFormatter={(label: string, payload: any[]) => {
                 const validTime = payload?.[0]?.payload?.valid_time ?? label;
@@ -118,6 +220,7 @@ export function EnsembleChart({
               fill="none"
               isAnimationActive={false}
               connectNulls={false}
+              tooltipType="none"
             />
             <Area
               dataKey="p90Height"
@@ -136,6 +239,7 @@ export function EnsembleChart({
               fill="none"
               isAnimationActive={false}
               connectNulls={false}
+              tooltipType="none"
             />
             <Area
               dataKey="p75Height"

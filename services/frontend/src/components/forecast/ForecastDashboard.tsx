@@ -238,6 +238,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
               <EnsembleChart
                 byLead={ensemble.byLead}
                 variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
+                unit={meta[ensembleVariable]?.unit}
                 timezone={displayTimezone}
                 validTimesByLead={validTimesByLead}
               />
