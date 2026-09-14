@@ -341,7 +341,7 @@
         "y": 6
       },
       "id": 9,
-      "title": "Process Memory (RSS / VMS / Peak)",
+      "title": "System Memory (Used / Available / Total)",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -350,19 +350,23 @@
       },
       "targets": [
         {
+          "expr": "weather_system_memory_total_bytes",
+          "legendFormat": "Total physical RAM"
+        },
+        {
+          "expr": "weather_system_memory_used_bytes",
+          "legendFormat": "Used memory"
+        },
+        {
+          "expr": "weather_system_memory_free_bytes",
+          "legendFormat": "Available memory"
+        },
+        {
           "expr": "weather_process_memory_rss_bytes",
-          "legendFormat": "RSS, physical resident"
-        },
-        {
-          "expr": "weather_process_memory_vms_bytes",
-          "legendFormat": "VMS, virtual address space"
-        },
-        {
-          "expr": "weather_process_memory_peak_rss_bytes",
-          "legendFormat": "Peak RSS, high-water mark"
+          "legendFormat": "Ingestion process RSS"
         }
       ],
-      "description": "Process memory in bytes. RSS = physical resident memory; VMS = virtual address space reserved; Peak RSS = high-water mark of RSS. There is no percentage here by design: a process has no fixed memory limit.",
+      "description": "Host physical RAM usage (Total, Used, Available) alongside Ingestion process resident set size (RSS).",
       "options": {
         "tooltip": {
           "mode": "multi",
@@ -382,7 +386,7 @@
         "y": 6
       },
       "id": 10,
-      "title": "Process CPU Utilization %",
+      "title": "System CPU Utilization %",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -391,8 +395,8 @@
       },
       "targets": [
         {
-          "expr": "weather_process_cpu_percent",
-          "legendFormat": "CPU %"
+          "expr": "weather_system_cpu_percent or weather_process_cpu_percent",
+          "legendFormat": "Host CPU %"
         }
       ],
       "options": {

@@ -29,6 +29,10 @@ PROCESS_CPU_PERCENT = REGISTRY.gauge(
     "weather_process_cpu_percent",
     "Current process CPU utilization percentage (0-100+)",
 )
+SYSTEM_CPU_PERCENT = REGISTRY.gauge(
+    "weather_system_cpu_percent",
+    "Host system overall CPU utilization percentage (0-100)",
+)
 PROCESS_MEMORY_RSS_BYTES = REGISTRY.gauge(
     "weather_process_memory_rss_bytes",
     "Process resident set size (RSS) in bytes",
@@ -40,6 +44,22 @@ PROCESS_MEMORY_VMS_BYTES = REGISTRY.gauge(
 PROCESS_MEMORY_PEAK_RSS_BYTES = REGISTRY.gauge(
     "weather_process_memory_peak_rss_bytes",
     "Peak process resident set size in bytes",
+)
+SYSTEM_MEMORY_TOTAL_BYTES = REGISTRY.gauge(
+    "weather_system_memory_total_bytes",
+    "Host system total physical memory in bytes",
+)
+SYSTEM_MEMORY_USED_BYTES = REGISTRY.gauge(
+    "weather_system_memory_used_bytes",
+    "Host system used physical memory in bytes",
+)
+SYSTEM_MEMORY_FREE_BYTES = REGISTRY.gauge(
+    "weather_system_memory_free_bytes",
+    "Host system available/free physical memory in bytes",
+)
+SYSTEM_MEMORY_USED_PERCENT = REGISTRY.gauge(
+    "weather_system_memory_used_percent",
+    "Host system memory utilization percentage (0-100)",
 )
 PROCESS_ACTIVE_THREADS = REGISTRY.gauge(
     "weather_process_active_threads",
@@ -86,6 +106,16 @@ class MemoryInfo:
     rss_bytes: int
     vms_bytes: int
     peak_rss_bytes: int
+
+
+@dataclass(frozen=True)
+class SystemMemoryInfo:
+    """Host system physical memory statistics."""
+
+    total_bytes: int
+    used_bytes: int
+    free_bytes: int
+    used_percent: float
 
 
 @dataclass(frozen=True)
@@ -137,6 +167,9 @@ class SystemResourceCollector:
         self._lock = threading.Lock()
         self._last_cpu_time: float | None = None
         self._last_monotonic: float | None = None
+        self._last_psutil_cpu_times: Any = None
+        self._last_sys_cpu_total: float | None = None
+        self._last_sys_cpu_idle: float | None = None
         self._peak_rss: int = 0
         self._is_windows = sys.platform == "win32"
         self._init_platform()
@@ -160,7 +193,21 @@ class SystemResourceCollector:
                         ("PeakPagefileUsage", ctypes.c_size_t),
                     ]
 
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", wintypes.DWORD),
+                        ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_uint64),
+                        ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64),
+                        ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64),
+                        ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                    ]
+
                 self._pmc_cls = PROCESS_MEMORY_COUNTERS
+                self._msex_cls = MEMORYSTATUSEX
                 win_dll = getattr(ctypes, "windll", None)
                 if win_dll is not None:
                     psapi = win_dll.psapi
@@ -172,6 +219,10 @@ class SystemResourceCollector:
                     psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
                     self._psapi = psapi
                     self._kernel32 = win_dll.kernel32
+                    self._kernel32.GlobalMemoryStatusEx.argtypes = [
+                        ctypes.POINTER(MEMORYSTATUSEX),
+                    ]
+                    self._kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
                     self._has_win_api = True
                 else:
                     self._has_win_api = False
@@ -278,6 +329,136 @@ class SystemResourceCollector:
             pct = (dt_cpu / dt_mono) * 100.0
             return max(0.0, round(pct, 2))
 
+    def get_system_cpu_percent(self) -> float:
+        """Return overall system CPU utilization percentage (0-100).
+
+        Cross-platform across Windows, Linux x86_64, and Linux aarch64/ARM64.
+        Uses psutil fast path if available; falls back to Linux /proc/stat or
+        process-level CPU to maintain fail-open reliability.
+        """
+        # 1. Preferred path: psutil (cross-platform, x86_64 & aarch64)
+        try:
+            import psutil  # type: ignore[import-untyped]
+
+            c_times = psutil.cpu_times()
+            with self._lock:
+                if self._last_psutil_cpu_times is not None:
+                    d_idle = c_times.idle - self._last_psutil_cpu_times.idle
+                    d_total = sum(c_times) - sum(self._last_psutil_cpu_times)
+                    self._last_psutil_cpu_times = c_times
+                    if d_total > 0:
+                        pct = (1.0 - (d_idle / d_total)) * 100.0
+                        return max(0.0, min(100.0, round(float(pct), 2)))
+                else:
+                    self._last_psutil_cpu_times = c_times
+                    return 0.0
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2. Linux kernel fallback (/proc/stat - identical on x86_64 and aarch64)
+        if not self._is_windows:
+            try:
+                stat_path = Path("/proc/stat")
+                if stat_path.is_file():
+                    first_line = stat_path.read_text().splitlines()[0]
+                    fields = [float(x) for x in first_line.split()[1:]]
+                    idle_time = fields[3] + (fields[4] if len(fields) > 4 else 0.0)
+                    total_time = sum(fields)
+                    with self._lock:
+                        if (
+                            self._last_sys_cpu_total is not None
+                            and self._last_sys_cpu_idle is not None
+                        ):
+                            d_total = total_time - self._last_sys_cpu_total
+                            d_idle = idle_time - self._last_sys_cpu_idle
+                            self._last_sys_cpu_total = total_time
+                            self._last_sys_cpu_idle = idle_time
+                            if d_total > 0:
+                                pct = ((d_total - d_idle) / d_total) * 100.0
+                                return max(0.0, min(100.0, round(pct, 2)))
+                        else:
+                            self._last_sys_cpu_total = total_time
+                            self._last_sys_cpu_idle = idle_time
+                            return 0.0
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Linux /proc/stat CPU read failed: %s", exc)
+
+        # 3. Final fallback: process CPU percentage
+        return self.get_cpu_percent()
+
+    def get_system_memory_info(self) -> SystemMemoryInfo:
+        """Return host system physical memory statistics.
+
+        Cross-platform across Windows, Linux x86_64, and Linux aarch64/ARM64.
+        Uses psutil fast path if available; falls back to Linux /proc/meminfo or
+        Windows GlobalMemoryStatusEx to maintain fail-open reliability.
+        """
+        # 1. Preferred path: psutil (cross-platform, x86_64 & aarch64)
+        try:
+            import psutil  # type: ignore[import-untyped]
+
+            v = psutil.virtual_memory()
+            return SystemMemoryInfo(
+                total_bytes=int(v.total),
+                used_bytes=int(v.used),
+                free_bytes=int(v.available),
+                used_percent=round(float(v.percent), 2),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2. Linux kernel fallback (/proc/meminfo - identical on x86_64 and aarch64)
+        if not self._is_windows:
+            try:
+                meminfo_path = Path("/proc/meminfo")
+                if meminfo_path.is_file():
+                    data: dict[str, int] = {}
+                    for line in meminfo_path.read_text().splitlines():
+                        parts = line.split(":")
+                        if len(parts) == 2:
+                            key = parts[0].strip()
+                            val_str = parts[1].strip().split()[0]
+                            if val_str.isdigit():
+                                data[key] = int(val_str) * 1024
+                    total = data.get("MemTotal", 0)
+                    avail = data.get("MemAvailable", data.get("MemFree", 0))
+                    used = max(0, total - avail)
+                    pct = (used / total * 100.0) if total > 0 else 0.0
+                    return SystemMemoryInfo(
+                        total_bytes=total,
+                        used_bytes=used,
+                        free_bytes=avail,
+                        used_percent=round(pct, 2),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Linux /proc/meminfo read failed: %s", exc)
+
+        # 3. Windows native API fallback (GlobalMemoryStatusEx)
+        if self._is_windows and self._has_win_api:
+            try:
+                stat = self._msex_cls()
+                stat.dwLength = ctypes.sizeof(self._msex_cls)
+                if self._kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    total = int(stat.ullTotalPhys)
+                    avail = int(stat.ullAvailPhys)
+                    used = max(0, total - avail)
+                    pct = float(stat.dwMemoryLoad)
+                    return SystemMemoryInfo(
+                        total_bytes=total,
+                        used_bytes=used,
+                        free_bytes=avail,
+                        used_percent=round(pct, 2),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Windows GlobalMemoryStatusEx failed: %s", exc)
+
+        return SystemMemoryInfo(
+            total_bytes=0,
+            used_bytes=0,
+            free_bytes=0,
+            used_percent=0.0,
+        )
+
     def get_thread_count(self) -> int:
         """Return number of active Python threads."""
         return threading.active_count()
@@ -340,11 +521,23 @@ class SystemResourceCollector:
         """Collect all resource statistics, update Prometheus metrics, and return dict."""
         mem = self.get_memory_info()
         cpu = self.get_cpu_percent()
+        sys_cpu = self.get_system_cpu_percent()
+        sys_mem = self.get_system_memory_info()
         threads = self.get_thread_count()
         tasks = self.get_asyncio_task_count()
         fds = self.get_open_file_descriptors()
 
-        PROCESS_CPU_PERCENT.set(cpu)
+        # Both system CPU and legacy process gauge are populated for compatibility
+        SYSTEM_CPU_PERCENT.set(sys_cpu)
+        PROCESS_CPU_PERCENT.set(sys_cpu)
+
+        # Host system physical memory metrics
+        SYSTEM_MEMORY_TOTAL_BYTES.set(float(sys_mem.total_bytes))
+        SYSTEM_MEMORY_USED_BYTES.set(float(sys_mem.used_bytes))
+        SYSTEM_MEMORY_FREE_BYTES.set(float(sys_mem.free_bytes))
+        SYSTEM_MEMORY_USED_PERCENT.set(float(sys_mem.used_percent))
+
+        # Process-level memory metrics
         PROCESS_MEMORY_RSS_BYTES.set(float(mem.rss_bytes))
         PROCESS_MEMORY_VMS_BYTES.set(float(mem.vms_bytes))
         PROCESS_MEMORY_PEAK_RSS_BYTES.set(float(mem.peak_rss_bytes))
@@ -368,7 +561,9 @@ class SystemResourceCollector:
 
         return {
             "cpu_percent": cpu,
+            "system_cpu_percent": sys_cpu,
             "memory": mem,
+            "system_memory": sys_mem,
             "threads": threads,
             "asyncio_tasks": tasks,
             "open_fds": fds,
