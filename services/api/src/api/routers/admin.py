@@ -11,6 +11,7 @@ Redis, and object storage). The router is thin (ENGINEERING_CONTRACT section
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -283,8 +284,9 @@ def _process_cpu_percent() -> float:
 
         if dt_mono <= 0:
             return 0.0
-        pct = (dt_cpu / dt_mono) * 100.0
-        return max(0.0, round(pct, 2))
+        cores = os.cpu_count() or 1
+        pct = ((dt_cpu / dt_mono) / cores) * 100.0
+        return max(0.0, min(100.0, round(pct, 2)))
 
 
 @router.get(

@@ -74,9 +74,10 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
 
 | Metric Name | Type | Description | Labels | Cost Class |
 | :--- | :--- | :--- | :--- | :--- |
-| `weather_component_cpu_percent` | Gauge | Component process CPU utilization percentage (0–100+) | `component` (`realtime`, `gc`, `api`, `exporter`) | Fast |
+| `weather_component_cpu_percent` | Gauge | Component process CPU utilization percentage (normalized across all logical CPU cores, 0–100) | `component` (`realtime`, `gc`, `api`, `exporter`) | Fast |
 | `weather_component_memory_rss_bytes` | Gauge | Component process resident set size (RSS) in bytes | `component` (`realtime`, `gc`, `api`, `exporter`) | Fast |
 | `weather_staging_downloads_bytes` | Gauge | Temporary download staging directory disk usage in bytes | - | Fast |
+| `weather_system_cpu_cores` | Gauge | Host system total logical CPU cores count | - | Fast |
 | `weather_system_cpu_percent` | Gauge | Host system overall CPU utilization percentage (0–100, cross-platform Windows/Linux amd64/arm64) | - | Fast |
 | `weather_system_memory_total_bytes` | Gauge | Host system total physical memory in bytes | - | Fast |
 | `weather_system_memory_used_bytes` | Gauge | Host system used physical memory in bytes | - | Fast |

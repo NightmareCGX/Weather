@@ -413,7 +413,7 @@
           "legendFormat": "{{component}}"
         }
       ],
-      "description": "Process CPU utilization percentage consumed directly by each platform component (realtime, gc, api, exporter), stacked to show total platform CPU consumption.",
+      "description": "Process CPU utilization percentage consumed directly by each platform component (realtime, gc, api, exporter), normalized across all logical CPU cores (0-100%), stacked to show total platform CPU share.",
       "options": {
         "legend": {
           "calcs": [

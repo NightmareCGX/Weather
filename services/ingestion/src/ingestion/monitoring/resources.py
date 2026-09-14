@@ -12,6 +12,7 @@ import asyncio
 import ctypes
 import gc
 import logging
+import os
 import shutil
 import sys
 import threading
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Register Prometheus metrics
 COMPONENT_CPU_PERCENT = REGISTRY.gauge(
     "weather_component_cpu_percent",
-    "Component process CPU utilization percentage (0-100+)",
+    "Component process CPU utilization percentage normalized across all cores (0-100)",
     labelnames=("component",),
 )
 COMPONENT_MEMORY_RSS_BYTES = REGISTRY.gauge(
@@ -42,6 +43,10 @@ PROCESS_CPU_PERCENT = REGISTRY.gauge(
 SYSTEM_CPU_PERCENT = REGISTRY.gauge(
     "weather_system_cpu_percent",
     "Host system overall CPU utilization percentage (0-100)",
+)
+SYSTEM_CPU_CORES = REGISTRY.gauge(
+    "weather_system_cpu_cores",
+    "Host system total logical CPU cores count",
 )
 PROCESS_MEMORY_RSS_BYTES = REGISTRY.gauge(
     "weather_process_memory_rss_bytes",
@@ -339,9 +344,10 @@ class SystemResourceCollector:
             if dt_mono <= 0:
                 return 0.0
 
-            # Percentage across all cores
-            pct = (dt_cpu / dt_mono) * 100.0
-            return max(0.0, round(pct, 2))
+            # Percentage normalized across all logical cores (0-100%)
+            cores = os.cpu_count() or 1
+            pct = ((dt_cpu / dt_mono) / cores) * 100.0
+            return max(0.0, min(100.0, round(pct, 2)))
 
     def get_system_cpu_percent(self) -> float:
         """Return overall system CPU utilization percentage (0-100).
@@ -556,6 +562,7 @@ class SystemResourceCollector:
         # Both system CPU and legacy process gauge are populated for compatibility
         SYSTEM_CPU_PERCENT.set(sys_cpu)
         PROCESS_CPU_PERCENT.set(sys_cpu)
+        SYSTEM_CPU_CORES.set(float(os.cpu_count() or 1))
 
         # Host system physical memory metrics
         SYSTEM_MEMORY_TOTAL_BYTES.set(float(sys_mem.total_bytes))
