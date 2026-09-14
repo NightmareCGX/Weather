@@ -69,11 +69,21 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
 
   const elevation = useElevation(location);
 
+  // The Hourly Forecast requests and displays only the variable selected in the dropdown.
+  const activeVariable = selection?.variable ?? options.variable?.id ?? null;
+  const requestedVariables = useMemo(
+    () => (activeVariable ? [activeVariable] : undefined),
+    [activeVariable]
+  );
+
   const {
     forecast,
     status: pointStatus,
     error: pointError,
-  } = usePointForecast(location, { model: pointModel });
+  } = usePointForecast(location, {
+    model: pointModel,
+    variables: requestedVariables,
+  });
 
   const variableMeta = useVariablesCatalog();
   const meta = useMemo(() => buildVariableMeta(variableMeta.variables), [variableMeta.variables]);
@@ -82,6 +92,11 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
     () => (forecast !== null ? forecastVariableCodes(forecast.forecasts) : []),
     [forecast]
   );
+
+  const displayedVariableCodes = useMemo(() => {
+    if (!activeVariable) return [];
+    return variableCodes.filter((code) => code === activeVariable);
+  }, [variableCodes, activeVariable]);
 
   // The ensemble view derives its variable and lead parameters from the
   // authoritative normalized forecast selection (and availability options),
@@ -195,15 +210,21 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
         )}
         {pointStatus === "success" && forecast !== null && (
           <>
-            {variableCodes.map((code) => (
-              <Meteogram
-                key={code}
-                forecasts={forecast.forecasts}
-                variableCode={code}
-                meta={meta[code] ?? { name: code, unit: "" }}
-                timezone={displayTimezone}
-              />
-            ))}
+            {displayedVariableCodes.length > 0 ? (
+              displayedVariableCodes.map((code) => (
+                <Meteogram
+                  key={code}
+                  forecasts={forecast.forecasts}
+                  variableCode={code}
+                  meta={meta[code] ?? { name: code, unit: "" }}
+                  timezone={displayTimezone}
+                />
+              ))
+            ) : (
+              <p className="text-sm text-slate-500">
+                No hourly forecast available for the selected variable.
+              </p>
+            )}
           </>
         )}
       </section>

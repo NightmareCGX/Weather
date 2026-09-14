@@ -171,12 +171,43 @@ export function findModel(
   return availability.models.find((model) => model.id === modelId) ?? null;
 }
 
-/** Pick the first variable of a model that has available data. */
+/** Canonical variable display order matching meteorological information hierarchy. */
+export const PREFERRED_VARIABLE_ORDER: readonly string[] = [
+  "temperature_2m",
+  "relative_humidity_2m",
+  "wind_10m",
+  "wind_gust",
+  "precipitation_amount_3h",
+  "precipitation_rate",
+  "visibility",
+  "cloud_cover_3h",
+  "cloud_ceiling",
+  "snow_depth",
+];
+
+/** Sort an array of variables by canonical meteorological priority. */
+export function sortVariablesByCanonicalOrder(
+  variables: readonly VariableAvailability[]
+): VariableAvailability[] {
+  return [...variables].sort((a, b) => {
+    const idxA = PREFERRED_VARIABLE_ORDER.indexOf(a.id);
+    const idxB = PREFERRED_VARIABLE_ORDER.indexOf(b.id);
+    const orderA = idxA !== -1 ? idxA : Number.MAX_SAFE_INTEGER;
+    const orderB = idxB !== -1 ? idxB : Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) {
+      return orderA - orderB;
+    }
+    return a.name.localeCompare(b.name);
+  });
+}
+
+/** Pick the default variable for a model, prioritizing canonical order (e.g. temperature_2m). */
 export function defaultVariable(model: ModelAvailability | null): string | null {
   if (model === null || model.variables.length === 0) {
     return null;
   }
-  return model.variables[0].id;
+  const sorted = sortVariablesByCanonicalOrder(model.variables);
+  return sorted[0].id;
 }
 
 /** Resolve a variable code within a model to its availability entry (or null). */
@@ -280,7 +311,7 @@ export function buildForecastOptions(
   return {
     models: availability.models,
     model,
-    variables: model?.variables ?? [],
+    variables: model ? sortVariablesByCanonicalOrder(model.variables) : [],
     variable,
     validTimes: selectableValidTimes.length > 0 ? selectableValidTimes : allValidTimes,
     initialTimes: variable?.initial_times ?? [],
