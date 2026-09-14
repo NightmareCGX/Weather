@@ -20,8 +20,8 @@ Lifecycle V3 Policy (Locked Contract):
 
 3. Detailed Metadata Retention:
    Detailed catalog metadata (model_runs, forecast_products, etc.) is retained
-   for 14 days after physical deletion (deleted_at) before being purged by the
-   metadata sweeper.
+   for a configurable retention window (default 1 day) after physical deletion
+   (deleted_at) before being purged by the metadata sweeper.
 """
 
 from __future__ import annotations
@@ -29,8 +29,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-#: Locked product policy: detailed metadata is retained for 14 days after physical deletion.
-METADATA_RETENTION_DAYS: int = 14
+#: Default metadata retention days after physical deletion (1 day).
+DEFAULT_METADATA_RETENTION_DAYS: int = 1
+#: Canonical default metadata retention days (1 day; overridable via settings/flags).
+METADATA_RETENTION_DAYS: int = DEFAULT_METADATA_RETENTION_DAYS
 
 
 def is_cycle_horizon_expired(
@@ -54,19 +56,20 @@ def is_metadata_purge_eligible(
     deleted_at: datetime | None,
     *,
     now_utc: datetime,
+    retention_days: int = METADATA_RETENTION_DAYS,
 ) -> bool:
     """Return True if detailed metadata for a cycle is eligible for retention purge.
 
-    Locked policy contract:
+    Policy contract:
     - deleted_at is None -> False (cycle not yet physically deleted)
-    - deleted_at <= now_utc - 14 days -> True (eligible)
-    - deleted_at > now_utc - 14 days -> False (must be retained)
+    - deleted_at <= now_utc - retention_days -> True (eligible)
+    - deleted_at > now_utc - retention_days -> False (must be retained)
     """
     if deleted_at is None:
         return False
     d_utc = _ensure_utc(deleted_at)
     n_utc = _ensure_utc(now_utc)
-    return d_utc <= n_utc - timedelta(days=METADATA_RETENTION_DAYS)
+    return d_utc <= n_utc - timedelta(days=retention_days)
 
 
 def _ensure_utc(dt: datetime) -> datetime:

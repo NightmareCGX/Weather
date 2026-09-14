@@ -1,18 +1,18 @@
-"""14-Day Detailed Metadata Retention Sweeper (Data Lifecycle V3 Milestone 3).
+"""Detailed Metadata Retention Sweeper (Data Lifecycle V3 Milestone 3).
 
 This module implements the bounded PostgreSQL-only detailed metadata retention
 sweeper for Data Lifecycle V3. It removes detailed catalog and reclamation
 history (model_runs, forecast_products, ensemble_members,
 ensemble_member_products, reclamation_queue) for forecast cycles whose physical
-storage was finalized at least 14 days ago.
+storage was finalized at least retention_days (default 1 day) ago.
 
 Invariants:
 -----------
 1. Retention Policy:
    A cycle is eligible for detailed metadata sweep if and only if:
-       deleted_at <= now_utc - 14 days (inclusive)
+       deleted_at <= now_utc - retention_days (inclusive)
    Comparison is strictly inclusive: exact equality means eligible.
-   Retention period is 14 days (METADATA_RETENTION_DAYS), locked product policy.
+   Default retention period is METADATA_RETENTION_DAYS (1 day), configurable.
 2. Permanent Tombstone Preservation:
    The `forecast_cycle_lifecycle` row is the permanent anti-resurrection
    tombstone and is NEVER modified or deleted by the sweeper.
@@ -345,28 +345,35 @@ def run_metadata_sweeper_pass(
     batch_size: int = DEFAULT_SWEEPER_BATCH_SIZE,
     now: datetime | None = None,
     cutoff: datetime | None = None,
+    retention_days: int | None = None,
 ) -> SweeperPassResult:
     """Execute a single bounded metadata retention sweeper pass.
 
-    Evaluates eligible cycles where deleted_at <= cutoff (14 days ago) and
-    detailed metadata still exists, then purges detailed metadata per cycle
+    Evaluates eligible cycles where deleted_at <= cutoff (retention_days ago, default 1 day)
+    and detailed metadata still exists, then purges detailed metadata per cycle
     in isolated transactions.
     """
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
+    effective_days = (
+        int(retention_days)
+        if retention_days is not None
+        else METADATA_RETENTION_DAYS
+    )
     effective_cutoff = (
         _ensure_utc_datetime(cutoff)
         if cutoff is not None
-        else now_utc - timedelta(days=METADATA_RETENTION_DAYS)
+        else now_utc - timedelta(days=effective_days)
     )
     effective_batch_size = _normalize_batch_size(batch_size)
 
     logger.info(
-        "sweeper_pass_started: dry_run=%s now=%s cutoff=%s models=%s batch_size=%d",
+        "sweeper_pass_started: dry_run=%s now=%s cutoff=%s models=%s batch_size=%d retention_days=%d",
         dry_run,
         now_utc.isoformat(),
         effective_cutoff.isoformat(),
         models,
         effective_batch_size,
+        effective_days,
     )
 
     with Session(engine) as session:
@@ -377,10 +384,12 @@ def run_metadata_sweeper_pass(
             batch_size=effective_batch_size,
         )
 
-    # Cross-check candidates against M1 domain eligibility primitive when using default policy
+    # Cross-check candidates against M1 domain eligibility primitive when using retention_days policy
     if cutoff is None:
         for cand in candidates:
-            if not is_metadata_purge_eligible(cand.deleted_at, now_utc=now_utc):
+            if not is_metadata_purge_eligible(
+                cand.deleted_at, now_utc=now_utc, retention_days=effective_days
+            ):
                 logger.warning(
                     "candidate_ineligible_under_domain_contract: model=%s cycle=%s deleted_at=%s",
                     cand.model_id,
