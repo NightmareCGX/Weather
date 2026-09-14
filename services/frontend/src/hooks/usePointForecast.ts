@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { getPointForecast, RequestAbortedError } from "@/lib/api/client";
 import { toPointSpecifier } from "@/lib/forecast/selection";
@@ -14,31 +14,61 @@ export interface UsePointForecastResult {
   error: string | null;
 }
 
+export interface UsePointForecastOptions {
+  model: string | null;
+  units?: "metric" | "imperial";
+  variables?: string[];
+}
+
 /**
- * Fetch the `/v1/points` forecast for the shared selected location.
+ * Fetch the `/v1/points` forecast for the shared selected location and optional variable filter.
  *
  * The request is cancelled when the selection changes, and stale responses are
- * guarded by a sequence token, so a slow response for a previous selection can
- * never render over a newer one. ``model`` is the deterministic model to
- * request (database-driven — never hard-coded); `/v1/points` serves a single
- * model and rejects ensemble models (API.md section 2.1), so the dashboard
- * only passes deterministic models here. When ``model`` is null the hook stays
- * idle so the caller can render a "no deterministic forecast model" empty
- * state instead of requesting a non-existent model.
+ * guarded by active tokens, so a slow response for a previous selection can
+ * never render over a newer one. Requesting only specific variables reduces backend
+ * array slicing, bilinear interpolation, and serialization from O(N_variables * N_leads)
+ * down to O(1 * N_leads).
+ *
+ * An in-memory cache preserves fetched variables per location/model/unit session so
+ * navigating back and forth across variables produces instant (0ms) switches.
  */
 export function usePointForecast(
   location: SelectedLocation | null,
-  options: { model: string | null; units?: "metric" | "imperial" }
+  options: UsePointForecastOptions
 ): UsePointForecastResult {
-  const { model, units = "metric" } = options;
+  const { model, units = "metric", variables } = options;
   const [forecast, setForecast] = useState<PointForecast | null>(null);
   const [status, setStatus] = useState<FetchStatus>("idle");
   const [error, setError] = useState<string | null>(null);
+
+  const variablesKey = variables && variables.length > 0 ? [...variables].sort().join(",") : "";
+  const locationKey = location
+    ? `${location.resolvedVia}:${location.id ?? `${location.latitude},${location.longitude}`}`
+    : null;
+  const scopeKey = locationKey && model ? `${locationKey}:${model}:${units}` : null;
+
+  // Cache fetched forecasts per variable under the active location+model scope
+  const cacheRef = useRef<Map<string, PointForecast>>(new Map());
+  const activeScopeRef = useRef<string | null>(null);
+
+  // Invalidate cache when location, model, or units change
+  if (activeScopeRef.current !== scopeKey) {
+    cacheRef.current.clear();
+    activeScopeRef.current = scopeKey;
+  }
 
   useEffect(() => {
     if (location === null || model === null) {
       setForecast(null);
       setStatus("idle");
+      setError(null);
+      return;
+    }
+
+    const cached = cacheRef.current.get(variablesKey);
+    if (cached) {
+      setForecast(cached);
+      setStatus("success");
       setError(null);
       return;
     }
@@ -49,14 +79,18 @@ export function usePointForecast(
     setStatus("loading");
     setError(null);
 
+    const targetVariables = variablesKey ? variablesKey.split(",") : undefined;
+
     getPointForecast({
       location: toPointSpecifier(location),
       model,
       units,
+      variables: targetVariables,
       signal: controller.signal,
     })
       .then((next) => {
         if (!active) return;
+        cacheRef.current.set(variablesKey, next);
         setForecast(next);
         setStatus("success");
       })
@@ -71,7 +105,7 @@ export function usePointForecast(
       active = false;
       controller.abort();
     };
-  }, [location, model, units]);
+  }, [location, model, units, variablesKey]);
 
   return { forecast, status, error };
 }

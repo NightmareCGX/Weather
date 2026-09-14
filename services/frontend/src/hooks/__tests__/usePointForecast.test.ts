@@ -147,4 +147,43 @@ describe("usePointForecast", () => {
     await waitFor(() => expect(result.current.status).toBe("success"));
     expect(result.current.forecast).not.toBeNull();
   });
+
+  it("passes variables parameter to the API request when specified", async () => {
+    mockFetch.mockResolvedValueOnce(forecastResponse(38.19, -106.82));
+    const { result } = renderHook(() =>
+      usePointForecast(aspen, { model: "gfs", variables: ["temperature_2m"] })
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/v1/points?models=gfs&units=metric&city_id=city_aspen&variables=temperature_2m",
+      expect.any(Object)
+    );
+  });
+
+  it("hits the in-memory cache when switching back to a previously fetched variable", async () => {
+    mockFetch.mockResolvedValueOnce(forecastResponse(38.19, -106.82));
+    mockFetch.mockResolvedValueOnce(forecastResponse(38.19, -106.82));
+
+    const { result, rerender } = renderHook(
+      ({ vars }) => usePointForecast(aspen, { model: "gfs", variables: vars }),
+      {
+        initialProps: { vars: ["temperature_2m"] },
+      }
+    );
+
+    // 1. Fetch temperature_2m
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    // 2. Switch to precipitation_rate (fresh fetch)
+    rerender({ vars: ["precipitation_rate"] });
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    // 3. Switch back to temperature_2m (should hit cache immediately without fetch call)
+    rerender({ vars: ["temperature_2m"] });
+    expect(result.current.status).toBe("success");
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
 });

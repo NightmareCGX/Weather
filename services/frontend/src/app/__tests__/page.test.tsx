@@ -431,7 +431,7 @@ describe("HomePage", () => {
 
     await waitFor(() => {
       expect(mockFetch).toHaveBeenCalledWith(
-        "/v1/points?models=gfs&units=metric&city_id=city_aspen",
+        "/v1/points?models=gfs&units=metric&city_id=city_aspen&variables=temperature_2m",
         expect.any(Object)
       );
     });
