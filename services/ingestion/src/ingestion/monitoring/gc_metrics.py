@@ -118,7 +118,7 @@ GC_WORKER_MARKERS_CLEANED_TOTAL: Counter = REGISTRY.counter(
 
 GC_SWEEPER_SWEPT_TOTAL: Counter = REGISTRY.counter(
     "weather_gc_sweeper_swept_total",
-    "Cumulative cycles swept by the 14-day metadata retention sweeper "
+    "Cumulative cycles swept by the metadata retention sweeper "
     "(SweeperPassResult.swept_cycles)",
 )
 

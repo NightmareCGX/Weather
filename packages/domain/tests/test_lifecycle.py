@@ -152,36 +152,46 @@ def test_is_cycle_horizon_expired_strict_boundary() -> None:
 
 
 def test_is_metadata_purge_eligible_inclusive_boundary() -> None:
-    """Verify inclusive <= comparison and locked 14-day policy for metadata purge.
+    """Verify inclusive <= comparison and default 1-day policy for metadata purge.
 
     deleted_at is None                 -> False
-    deleted_at == now_utc - 14 days    -> True (inclusive <= boundary)
-    deleted_at < now_utc - 14 days     -> True
-    deleted_at > now_utc - 14 days     -> False (must be retained)
+    deleted_at == now_utc - 1 day      -> True (inclusive <= boundary)
+    deleted_at < now_utc - 1 day       -> True
+    deleted_at > now_utc - 1 day       -> False (must be retained)
     """
-    assert METADATA_RETENTION_DAYS == 14
+    assert METADATA_RETENTION_DAYS == 1
 
     now_utc = _dt(2026, 9, 25, 12)
-    boundary_14d = now_utc - timedelta(days=14)
+    boundary_1d = now_utc - timedelta(days=1)
 
     # deleted_at is None
     assert is_metadata_purge_eligible(None, now_utc=now_utc) is False
 
-    # Exact 14-day boundary: eligible (inclusive <=)
-    assert is_metadata_purge_eligible(boundary_14d, now_utc=now_utc) is True
+    # Exact 1-day boundary: eligible (inclusive <=)
+    assert is_metadata_purge_eligible(boundary_1d, now_utc=now_utc) is True
 
-    # Older than 14 days (e.g. 15 days, or 14d + 1s ago): eligible
-    assert is_metadata_purge_eligible(boundary_14d - timedelta(seconds=1), now_utc=now_utc) is True
-    assert is_metadata_purge_eligible(boundary_14d - timedelta(days=1), now_utc=now_utc) is True
+    # Older than 1 day (e.g. 2 days, or 1d + 1s ago): eligible
+    assert is_metadata_purge_eligible(boundary_1d - timedelta(seconds=1), now_utc=now_utc) is True
+    assert is_metadata_purge_eligible(boundary_1d - timedelta(days=1), now_utc=now_utc) is True
 
-    # Younger than 14 days (e.g. 14d - 1s ago): NOT eligible
-    assert is_metadata_purge_eligible(boundary_14d + timedelta(seconds=1), now_utc=now_utc) is False
-    assert is_metadata_purge_eligible(now_utc - timedelta(days=7), now_utc=now_utc) is False
+    # Younger than 1 day (e.g. 1d - 1s ago): NOT eligible
+    assert is_metadata_purge_eligible(boundary_1d + timedelta(seconds=1), now_utc=now_utc) is False
+    assert is_metadata_purge_eligible(now_utc - timedelta(hours=12), now_utc=now_utc) is False
 
     # Naive datetime handling
     assert (
         is_metadata_purge_eligible(
-            boundary_14d.replace(tzinfo=None), now_utc=now_utc.replace(tzinfo=None)
+            boundary_1d.replace(tzinfo=None), now_utc=now_utc.replace(tzinfo=None)
         )
         is True
+    )
+
+    # Configurable retention_days parameter verification (e.g. 14 days)
+    boundary_14d = now_utc - timedelta(days=14)
+    assert is_metadata_purge_eligible(boundary_14d, now_utc=now_utc, retention_days=14) is True
+    assert (
+        is_metadata_purge_eligible(
+            boundary_14d + timedelta(seconds=1), now_utc=now_utc, retention_days=14
+        )
+        is False
     )

@@ -744,6 +744,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum number of cycles to process per sweeper pass (default 50).",
     )
     gc.add_argument(
+        "--metadata-retention-days",
+        type=int,
+        default=None,
+        help="Retention period in days for detailed cycle metadata before sweeping "
+        "(default 1 or $METADATA_RETENTION_DAYS).",
+    )
+    gc.add_argument(
         "--inventory",
         action="store_true",
         help="Run one store-catalog orphan inventory pass (architecture doc section 9) "
@@ -1162,6 +1169,7 @@ def _gc_pipeline_pass(
     enable_delete: bool,
     enable_sweeper: bool,
     batch_size: int,
+    retention_days: int | None = None,
     dry_run: bool = False,
 ) -> str:
     """Execute one full V3 GC pipeline pass: bookkeeping -> planner -> worker -> sweeper.
@@ -1251,7 +1259,12 @@ def _gc_pipeline_pass(
     if enable_sweeper:
         try:
             with gc_stage_timer("sweeper"):
-                sw = run_metadata_sweeper_pass(catalog_engine, dry_run=dry_run, batch_size=batch_size)
+                sw = run_metadata_sweeper_pass(
+                    catalog_engine,
+                    dry_run=dry_run,
+                    batch_size=batch_size,
+                    retention_days=retention_days,
+                )
             record_sweeper_pass(
                 swept_cycles=len(sw.swept_cycles),
                 failed_cycles=len(sw.failed_cycles),
@@ -1422,13 +1435,20 @@ def _run_gc(args: argparse.Namespace) -> int:
         return 0
 
     if getattr(args, "sweep_metadata", False):
+        from ingestion.core.config import settings as ingest_settings
         from ingestion.gc.sweeper import run_metadata_sweeper_pass
 
         b_size = int(getattr(args, "batch_size", 50))
+        retention_days = (
+            int(args.metadata_retention_days)
+            if getattr(args, "metadata_retention_days", None) is not None
+            else int(ingest_settings.METADATA_RETENTION_DAYS)
+        )
         res = run_metadata_sweeper_pass(
             catalog_engine,
             dry_run=bool(args.dry_run),
             batch_size=b_size,
+            retention_days=retention_days,
         )
         print(
             f"Metadata Sweeper Pass: dry_run={res.dry_run}, "
@@ -1474,6 +1494,11 @@ def _run_gc(args: argparse.Namespace) -> int:
     enable_planner = bool(args.enable_planner) or bool(ingest_settings.RECLAMATION_PLANNER_ENABLED)
     enable_delete = bool(args.enable_delete) or bool(ingest_settings.RECLAMATION_DELETE_ENABLED)
     enable_sweeper = bool(args.enable_sweeper) or bool(ingest_settings.RECLAMATION_SWEEPER_ENABLED)
+    retention_days = (
+        int(args.metadata_retention_days)
+        if getattr(args, "metadata_retention_days", None) is not None
+        else int(ingest_settings.METADATA_RETENTION_DAYS)
+    )
     models = [m.strip().lower() for m in str(args.models).split(",") if m.strip()]
 
     if dry_run:
@@ -1490,6 +1515,7 @@ def _run_gc(args: argparse.Namespace) -> int:
                     enable_delete=False,
                     enable_sweeper=enable_sweeper,
                     batch_size=int(getattr(args, "batch_size", 50)),
+                    retention_days=retention_days,
                     dry_run=True,
                 )
             )
@@ -1502,13 +1528,14 @@ def _run_gc(args: argparse.Namespace) -> int:
 
     logger.info(
         "GC daemon mode: planner=%s delete=%s sweeper=%s interval=%ss models=%s "
-        "inventory_interval_hours=%s",
+        "inventory_interval_hours=%s retention_days=%d",
         enable_planner,
         enable_delete,
         enable_sweeper,
         interval,
         models,
         inventory_hours,
+        retention_days,
     )
     if enable_delete:
         logger.warning(
@@ -1552,6 +1579,7 @@ def _run_gc(args: argparse.Namespace) -> int:
                 enable_delete=enable_delete,
                 enable_sweeper=enable_sweeper,
                 batch_size=int(getattr(args, "batch_size", 50)),
+                retention_days=retention_days,
                 dry_run=False,
             )
             # Scheduled orphan inventory: appended to the pass summary at the

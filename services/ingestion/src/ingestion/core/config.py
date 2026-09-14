@@ -6,6 +6,8 @@ from typing import Any
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from domain.lifecycle import DEFAULT_METADATA_RETENTION_DAYS
+
 #: LAYER 3: Code-only absolute emergency ceilings for ingestion stage concurrency.
 #: These protect against accidental operator configuration (e.g. MAX=100000).
 #: These are NOT ordinary deployment tuning knobs.
@@ -307,6 +309,8 @@ class IngestionSettings(BaseSettings):
     RECLAMATION_MAX_RETRIES: int = 5
     #: Base exponential backoff (seconds) for failed reclamation attempts.
     RECLAMATION_BASE_BACKOFF_SECONDS: float = 2.0
+    #: Detailed metadata retention window in days before sweeping (default: 1 day).
+    METADATA_RETENTION_DAYS: int = DEFAULT_METADATA_RETENTION_DAYS
 
     @model_validator(mode="after")
     def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
@@ -504,6 +508,11 @@ class IngestionSettings(BaseSettings):
         if reclamation_backoff <= 0.0:
             raise ValueError(
                 f"RECLAMATION_BASE_BACKOFF_SECONDS must be > 0.0, got {reclamation_backoff}"
+            )
+        retention_days = int(self.METADATA_RETENTION_DAYS)
+        if retention_days < 0:
+            raise ValueError(
+                f"METADATA_RETENTION_DAYS must be >= 0, got {retention_days}"
             )
         return self
 

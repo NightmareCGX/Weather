@@ -147,11 +147,13 @@ def test_gc_subcommand_parser_pipeline_flags():
         "--enable-planner",
         "--enable-delete",
         "--enable-sweeper",
+        "--metadata-retention-days", "3",
         "--models", "gfs",
     ])
     assert args2.enable_planner is True
     assert args2.enable_delete is True
     assert args2.enable_sweeper is True
+    assert args2.metadata_retention_days == 3
     assert args2.models == "gfs"
 
 
@@ -233,7 +235,8 @@ def test_gc_pipeline_pass_delete_authorized_runs_worker(monkeypatch):
     """With delete authorization the worker stage runs with delete_enabled=True."""
 
     worker_mock = MagicMock(return_value=_worker_result())
-    _patch_pipeline_stages(monkeypatch, worker=worker_mock)
+    sweeper_mock = MagicMock(return_value=_sweeper_result())
+    _patch_pipeline_stages(monkeypatch, worker=worker_mock, sweeper=sweeper_mock)
 
     summary = _gc_pipeline_pass(
         "engine://fake",
@@ -242,11 +245,13 @@ def test_gc_pipeline_pass_delete_authorized_runs_worker(monkeypatch):
         enable_delete=True,
         enable_sweeper=True,
         batch_size=50,
+        retention_days=2,
     )
 
     assert "worker claimed=7 deleted=5" in summary
     assert "sweeper swept=1" in summary
     assert worker_mock.call_args.kwargs["delete_enabled"] is True
+    assert sweeper_mock.call_args.kwargs["retention_days"] == 2
 
 
 def test_gc_pipeline_pass_stage_failure_isolation(monkeypatch):

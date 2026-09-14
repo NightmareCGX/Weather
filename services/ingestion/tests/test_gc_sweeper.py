@@ -401,8 +401,8 @@ def test_detailed_metadata_purge_all_tables(catalog_engine) -> None:
 def test_younger_than_14_day_retention(catalog_engine) -> None:
     now_utc = datetime(2026, 8, 20, 0, 0, 0, tzinfo=timezone.utc)
     c_time = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
-    # Physically finalized 5 days ago (less than 14 days)
-    d_at = now_utc - timedelta(days=5)
+    # Physically finalized 12 hours ago (less than default 1 day retention)
+    d_at = now_utc - timedelta(hours=12)
 
     run_id = _seed_cycle(
         catalog_engine,
@@ -420,6 +420,17 @@ def test_younger_than_14_day_retention(catalog_engine) -> None:
         assert session.get(ModelRunRecord, run_id) is not None
         assert session.execute(select(ProductRecord).where(ProductRecord.run_id == run_id)).first() is not None
         assert session.execute(select(ReclamationQueueRecord).where(ReclamationQueueRecord.run_id == run_id)).first() is not None
+
+    # When explicit retention_days=14 is passed, finalized 5 days ago is also retained
+    d_at_5d = now_utc - timedelta(days=5)
+    _seed_cycle(
+        catalog_engine,
+        model_id="gefs",
+        cycle_time=c_time,
+        deleted_at=d_at_5d,
+    )
+    res_14d = run_metadata_sweeper_pass(catalog_engine, now=now_utc, retention_days=14)
+    assert len(res_14d.candidates) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -707,8 +718,8 @@ def test_m2_metadata_retention_compatibility(catalog_engine) -> None:
         catalog_engine, "gfs", c_time, finalization_time=t0_finalized
     )
 
-    # 3. Before 14 days (t0 + 5 days): metadata retained
-    t_early = t0_finalized + timedelta(days=5)
+    # 3. Before retention window (t0 + 12 hours): metadata retained
+    t_early = t0_finalized + timedelta(hours=12)
     res_early = run_metadata_sweeper_pass(catalog_engine, now=t_early)
     assert len(res_early.candidates) == 0
     assert len(res_early.swept_cycles) == 0
@@ -716,8 +727,8 @@ def test_m2_metadata_retention_compatibility(catalog_engine) -> None:
     with Session(catalog_engine) as session:
         assert session.get(ModelRunRecord, run_id) is not None
 
-    # 4. At 14 days (t0 + 14 days): M3 sweeps detailed metadata
-    t_eligible = t0_finalized + timedelta(days=14)
+    # 4. At retention window (t0 + 1 day): M3 sweeps detailed metadata
+    t_eligible = t0_finalized + timedelta(days=1)
     res_eligible = run_metadata_sweeper_pass(catalog_engine, now=t_eligible)
     assert len(res_eligible.candidates) == 1
     assert len(res_eligible.swept_cycles) == 1

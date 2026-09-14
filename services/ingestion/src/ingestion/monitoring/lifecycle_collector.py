@@ -18,6 +18,7 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
+from domain.lifecycle import METADATA_RETENTION_DAYS
 from ingestion.monitoring.metrics import REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -50,15 +51,15 @@ LIFECYCLE_STUCK_CLAIMS_CRITICAL = REGISTRY.gauge(
 
 METADATA_SWEEPER_ELIGIBLE = REGISTRY.gauge(
     "weather_metadata_sweeper_eligible_tombstones",
-    "Number of tombstones older than 14-day retention window",
+    "Number of tombstones older than metadata retention window",
 )
 METADATA_SWEEPER_UNPURGED = REGISTRY.gauge(
     "weather_metadata_sweeper_unpurged_metadata_count",
-    "Tombstones older than 14 days that still retain detailed model_runs metadata",
+    "Tombstones older than retention window that still retain detailed model_runs metadata",
 )
 METADATA_SWEEPER_OLDEST_OVERDUE_SECONDS = REGISTRY.gauge(
     "weather_metadata_sweeper_oldest_overdue_seconds",
-    "Age in seconds of the oldest unpurged metadata past the 14-day deadline",
+    "Age in seconds of the oldest unpurged metadata past the retention deadline",
 )
 
 RECLAMATION_QUEUE_COUNT = REGISTRY.gauge(
@@ -143,8 +144,17 @@ class LifecycleHealthCollector:
     CLAIM_CRITICAL_THRESHOLD_S = 14400.0  # 4 hours
     DELETING_LEASE_WARNING_S = 600.0  # 10 minutes
 
-    def __init__(self, engine: Engine | Connection) -> None:
+    def __init__(self, engine: Engine | Connection, retention_days: int | None = None) -> None:
         self.engine = engine
+        if retention_days is not None:
+            self.retention_days = int(retention_days)
+        else:
+            try:
+                from ingestion.core.config import settings as ingest_settings
+
+                self.retention_days = int(ingest_settings.METADATA_RETENTION_DAYS)
+            except Exception:
+                self.retention_days = METADATA_RETENTION_DAYS
 
     def collect(self) -> LifecycleHealthReport:
         """Run bounded SQL aggregates across lifecycle tables."""
@@ -190,23 +200,26 @@ class LifecycleHealthCollector:
                 stuck_warn_cnt = int(row_cycle.stuck_warn_cnt or 0) if row_cycle else 0
                 stuck_crit_cnt = int(row_cycle.stuck_crit_cnt or 0) if row_cycle else 0
 
-                # 2. 14-day Metadata sweeper stats
+                # 2. Metadata sweeper stats
                 q_sweeper = text(
                     """
                     SELECT
                         COUNT(*) AS eligible_cnt,
                         COUNT(r.id) AS unpurged_cnt,
                         COALESCE(
-                            EXTRACT(EPOCH FROM (NOW() - (MIN(l.deleted_at) + INTERVAL '14 days'))),
+                            EXTRACT(EPOCH FROM (NOW() - (MIN(l.deleted_at) + make_interval(days => :retention_days)))),
                             0
                         ) AS oldest_overdue_s
                     FROM forecast_cycle_lifecycle l
                     LEFT JOIN model_runs r ON r.cycle_time = l.cycle_time
                     WHERE l.deleted_at IS NOT NULL
-                      AND l.deleted_at <= NOW() - INTERVAL '14 days'
+                      AND l.deleted_at <= NOW() - make_interval(days => :retention_days)
                     """
                 )
-                row_sweep = conn.execute(q_sweeper).fetchone()
+                row_sweep = conn.execute(
+                    q_sweeper,
+                    {"retention_days": self.retention_days},
+                ).fetchone()
                 sweep_eligible = int(row_sweep.eligible_cnt or 0) if row_sweep else 0
                 sweep_unpurged = int(row_sweep.unpurged_cnt or 0) if row_sweep else 0
                 sweep_oldest_overdue = (

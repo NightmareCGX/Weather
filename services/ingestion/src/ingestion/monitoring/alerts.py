@@ -441,9 +441,9 @@ class AlertEngine:
                     Alert(
                         name="metadata_sweeper_backlog_overdue",
                         severity=AlertSeverity.WARNING,
-                        summary=f"14-day metadata sweeper backlog overdue ({lifecycle_data.sweeper_unpurged_count} cycles)",
+                        summary=f"Metadata sweeper backlog overdue ({lifecycle_data.sweeper_unpurged_count} cycles)",
                         description=(
-                            f"{lifecycle_data.sweeper_unpurged_count} tombstones retain detailed metadata past 14 days "
+                            f"{lifecycle_data.sweeper_unpurged_count} tombstones retain detailed metadata past retention deadline "
                             f"(oldest overdue by {lifecycle_data.sweeper_oldest_overdue_s / 86400.0:.1f} days)."
                         ),
                         scope="sweeper",
@@ -576,7 +576,7 @@ class AlertEngine:
                         severity=AlertSeverity.WARNING,
                         summary=f"Metadata sweeper failed {sweeper_failed} cycles in latest pass",
                         description=(
-                            f"{sweeper_failed} cycle(s) failed the 14-day metadata retention sweeper pass. "
+                            f"{sweeper_failed} cycle(s) failed the metadata retention sweeper pass. "
                             "The cycles stay tombstoned with detailed metadata retained; the next pass retries."
                         ),
                         scope="sweeper",

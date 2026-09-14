@@ -100,7 +100,7 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 * `failed`: Wave unrecoverably failed or aborted.
 * `deletion_started_at`: Established by GC finalizer before acquiring exclusive store gates. Serves as a durable physical deletion claim and serving/mutation fence. Stale writers and public requests are rejected with 404/CycleTombstonedError.
 * `deleted_at`: Committed atomically after all physical stores for the cycle are deleted. Serves as a permanent anti-resurrection tombstone.
-* `14-Day Detailed Metadata Retention`: Child records (`model_runs`, `forecast_products`, `ensemble_members`, `ensemble_member_products`) are retained intact for 14 days after `deleted_at` (`METADATA_RETENTION_DAYS = 14`), after which the metadata sweeper purges child records while preserving the `forecast_cycle_lifecycle` tombstone row.
+* `Detailed Metadata Retention`: Child records (`model_runs`, `forecast_products`, `ensemble_members`, `ensemble_member_products`, `reclamation_queue`) are retained intact for a configurable retention window (default 1 day, `METADATA_RETENTION_DAYS = 1`) after `deleted_at`, after which the metadata sweeper purges child records while preserving the `forecast_cycle_lifecycle` tombstone row.
 
 ### 4.2 Same-Cycle Re-Ingestion (PATCH Semantics)
 * Ingestion of a lead or member wave acts as a **PATCH** on the cycle store.
