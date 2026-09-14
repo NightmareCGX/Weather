@@ -608,18 +608,33 @@ def build_point_forecast(
             detail=f"No readable forecast data was found for model '{model}'.",
         )
 
-    # Post-read validation: verify used targets did not enter deleting/deleted
+    # Post-read validation: verify used targets did not enter deleting/deleted.
+    # Targets are grouped by store_path to enforce pairwise (store_path, physical_key)
+    # matching, avoiding cross-cycle Cartesian product false positives.
     if used_targets:
         try:
+            from collections import defaultdict
+            from sqlalchemy import and_, or_
             from api.core.database import SessionLocal
             from api.models.entities import ReclamationQueue
+
+            targets_by_store: dict[str, list[str]] = defaultdict(list)
+            for s, k in used_targets:
+                targets_by_store[s].append(k)
+
+            store_conditions = [
+                and_(
+                    ReclamationQueue.store_path == s,
+                    ReclamationQueue.physical_key.in_(keys),
+                )
+                for s, keys in targets_by_store.items()
+            ]
 
             with SessionLocal() as post_read_session:
                 fenced = post_read_session.execute(
                     select(ReclamationQueue.id).where(
                         ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
-                        ReclamationQueue.store_path.in_([s for s, _ in used_targets]),
-                        ReclamationQueue.physical_key.in_([k for _, k in used_targets]),
+                        or_(*store_conditions),
                     )
                 ).scalars().all()
                 if fenced:

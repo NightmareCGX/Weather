@@ -430,4 +430,71 @@ def test_pinned_initial_time_cache_invalidation_on_ensembles(client, seed_data, 
     assert res2.status_code == 404
 
 
+def test_point_forecast_post_read_validation_cross_cycle_no_false_positive(
+    seed_data, migrated_db, tmp_path
+):
+    """Post-read validation does not falsely flag shards deleted in a different store.
+
+    Cross-cycle point forecast reads may use key K from Store 2 while Store 1
+    has key K in 'deleted' status. The check must group by store_path and verify
+    pairwise so Store 1's deleted key does not fail Store 2's active read.
+    """
+    from api.services.point_forecast import build_point_forecast, resolve_location
+
+    c1 = _dt(2026, 9, 6, 0)
+    c2 = _dt(2026, 9, 6, 6)
+    store1 = str(tmp_path / "store1.zarr")
+    store2 = str(tmp_path / "store2.zarr")
+
+    ds1 = _make_surface_dataset(c1, 0)
+    write_dataset(ds1, store1)
+    ds2 = _make_surface_dataset(c2, 0)
+    write_dataset(ds2, store2)
+
+    with Session(migrated_db) as session:
+        run1 = _seed_gfs_run(session, c1, store1, "ready")
+        _seed_gfs_run(session, c2, store2, "ready")
+
+        # Mark key in store1 as 'deleted' (reclaimed by GC)
+        p_key = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 0)
+        session.add(
+            ReclamationQueue(
+                id="rec_store1_del",
+                run_id=run1.id,
+                model_id="gfs",
+                cycle_time=c1,
+                lead_time_hours=0,
+                variable_code="temperature_2m",
+                target_kind=TARGET_KIND_DET,
+                member_index=0,
+                valid_time=c1,
+                store_path=store1,
+                physical_key=p_key,
+                status="deleted",
+                attempt_count=1,
+                created_at=c1,
+                updated_at=_dt(2026, 9, 6, 7),
+            )
+        )
+        session.commit()
+
+        loc = resolve_location(session, lat=38.5, lon=-106.5)
+        # Build point forecast using store2 for the valid time, with now=c2:
+        # must succeed because store1's deleted key is for a different store.
+        pf = build_point_forecast(
+            session,
+            location=loc,
+            model="gfs",
+            variables=["temperature_2m"],
+            units="metric",
+            start_lead_time_hours=0,
+            end_lead_time_hours=0,
+            now=c2,
+        )
+        assert len(pf.forecasts) == 1
+        assert pf.forecasts[0].lead_time_hours == 0
+
+
+
+
 
