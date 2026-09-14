@@ -9,9 +9,12 @@ Tests:
 * Error cases (404 missing model/lead, 422 validation error)
 """
 
+from typing import Any
+
 import numpy as np
 import pytest
 import xarray as xr
+
 from domain.models.wind import (
     VECTOR_FIELD_MAGIC,
     decode_vector_field_int16,
@@ -125,6 +128,117 @@ def test_select_and_encode_vector_field_missing_component_raises():
     )
     with pytest.raises(ValueError, match="Variables 'wind_u_10m' and 'wind_v_10m' must be in the dataset"):
         _select_and_encode_vector_field(ds_bad, lead=6)
+
+
+class _RecordingShardedReader:
+    """Minimal sharded-reader test double recording read_window calls."""
+
+    def __init__(self, has_mean: bool, member_u: dict[int, float], member_v: dict[int, float]):
+        self.has_mean = has_mean
+        self.member_u = member_u
+        self.member_v = member_v
+        self.calls: list[dict[str, object]] = []
+
+    def has_mean_shard(self, variable: str, lead: int, *, generation: str | None = None) -> bool:
+        return self.has_mean
+
+    def read_window(
+        self,
+        variable: str,
+        *,
+        member: int | None,
+        lead_time_hours: int,
+        lat_min: int,
+        lat_max: int,
+        lon_min: int,
+        lon_max: int,
+        generation: str | None = None,
+        is_mean: bool = False,
+    ) -> np.ndarray[Any, Any]:
+        self.calls.append({"variable": variable, "member": member, "is_mean": is_mean})
+        window = np.full((lat_max - lat_min + 1, lon_max - lon_min + 1), np.nan, dtype=np.float32)
+        if is_mean:
+            window[:] = 15.0 if variable == "wind_u_10m" else -5.0
+        else:
+            assert member is not None
+            window[:] = self.member_u[member] if variable == "wind_u_10m" else self.member_v[member]
+        return window
+
+
+@pytest.fixture()
+def _sharded_store(monkeypatch):
+    """Route the selector onto the sharded_v1 path with an injectable reader."""
+    from api.core import manifest_reader as manifest_module
+    from api.core import zarr as zarr_module
+
+    holder: dict[str, object] = {}
+
+    monkeypatch.setattr(manifest_module, "manifest_storage_format", lambda store_path: "sharded_v1")
+    monkeypatch.setattr(manifest_module, "manifest_generation", lambda store_path: "gen-test")
+    monkeypatch.setattr(
+        zarr_module,
+        "get_sharded_reader",
+        lambda store_path: holder["reader"],
+    )
+    return holder
+
+
+def _gefs_sharded_dataset() -> xr.Dataset:
+    return xr.Dataset(
+        data_vars={
+            "wind_u_10m": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((2, 1, 4, 4), dtype=np.float32)),
+            "wind_v_10m": (("member", "lead_time_hours", "latitude", "longitude"), np.zeros((2, 1, 4, 4), dtype=np.float32)),
+        },
+        coords={
+            "member": [1, 2],
+            "lead_time_hours": [6],
+            "latitude": [38.75, 38.5, 38.25, 38.0],
+            "longitude": [-107.0, -106.75, -106.5, -106.25],
+        },
+    )
+
+
+def test_select_and_encode_gefs_reads_official_mean_shard(_sharded_store):
+    """Sharded GEFS vector field reads the 2 official mean shards directly."""
+    reader = _RecordingShardedReader(
+        has_mean=True, member_u={1: 10.0, 2: 20.0}, member_v={1: -10.0, 2: 0.0}
+    )
+    _sharded_store["reader"] = reader
+
+    payload = _select_and_encode_vector_field(_gefs_sharded_dataset(), lead=6, stride=2, store_path="s3://bucket/store")
+    u_dec, v_dec, meta = decode_vector_field_int16(payload)
+
+    assert meta.lat_count == 2
+    assert meta.lon_count == 2
+    np.testing.assert_allclose(u_dec, 15.0, atol=0.0051)
+    np.testing.assert_allclose(v_dec, -5.0, atol=0.0051)
+
+    # Exactly one full-globe read per component from the official mean shard —
+    # no per-member reads.
+    assert reader.calls == [
+        {"variable": "wind_u_10m", "member": None, "is_mean": True},
+        {"variable": "wind_v_10m", "member": None, "is_mean": True},
+    ]
+
+
+def test_select_and_encode_gefs_falls_back_to_members_without_mean_shard(_sharded_store):
+    """Without official mean shards the member-wise consensus mean is computed."""
+    reader = _RecordingShardedReader(
+        has_mean=False, member_u={1: 10.0, 2: 20.0}, member_v={1: -10.0, 2: 0.0}
+    )
+    _sharded_store["reader"] = reader
+
+    payload = _select_and_encode_vector_field(_gefs_sharded_dataset(), lead=6, stride=2, store_path="s3://bucket/store")
+    u_dec, v_dec, meta = decode_vector_field_int16(payload)
+
+    assert meta.lat_count == 2
+    assert meta.lon_count == 2
+    np.testing.assert_allclose(u_dec, 15.0, atol=0.0051)
+    np.testing.assert_allclose(v_dec, -5.0, atol=0.0051)
+
+    assert len(reader.calls) == 4
+    assert all(call["is_mean"] is False for call in reader.calls)
+    assert {call["member"] for call in reader.calls} == {1, 2}
 
 
 def test_vector_field_cache_serves_warm_hit():
