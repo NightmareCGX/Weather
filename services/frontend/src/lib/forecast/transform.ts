@@ -155,6 +155,11 @@ export interface EnsembleFanPoint {
   median: number | null;
   mean: number | null;
   spread: number | null;
+  p10: number | null;
+  p25: number | null;
+  p50: number | null;
+  p75: number | null;
+  p90: number | null;
 }
 
 /** Build the stacked fan-band points for one `/v1/ensembles` response per lead. */
@@ -177,6 +182,11 @@ export function toEnsembleFanData(
       median: point.median,
       mean: point.mean,
       spread: point.spread,
+      p10,
+      p25,
+      p50: point.p50,
+      p75,
+      p90,
     };
   });
 }

@@ -316,6 +316,11 @@ describe("toEnsembleFanData", () => {
       p75Height: 11 - 9,
       median: 10,
       mean: 10,
+      p10: 7,
+      p25: 9,
+      p50: 10,
+      p75: 11,
+      p90: 13,
     });
     expect(fan[1].valid_time).toBe("2026-09-10T06:00:00Z");
     expect(fan[1].p90Height).toBeCloseTo(16 - 10, 6);

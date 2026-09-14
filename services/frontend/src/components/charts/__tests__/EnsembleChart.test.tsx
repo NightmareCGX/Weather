@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 
-import { EnsembleChart } from "@/components/charts/EnsembleChart";
+import { EnsembleChart, EnsembleChartTooltip } from "@/components/charts/EnsembleChart";
 import type { EnsembleStatisticsData } from "@/lib/api/types";
 
 let lastChartData: any[] = [];
@@ -310,6 +310,88 @@ describe("EnsembleChart", () => {
       expect(lastTooltipProps.formatter(null, "Median (P50)", {})).toEqual(["—", "Median (P50)"]);
       expect(lastTooltipProps.formatter(Number.NaN, "Mean", {})).toEqual(["—", "Mean"]);
       expect(lastTooltipProps.formatter(15, "Mean", {})).toEqual(["15", "Mean"]);
+    });
+  });
+
+  describe("EnsembleChartTooltip", () => {
+    const samplePayload = [
+      {
+        payload: {
+          lead_time_hours: 6,
+          valid_time: "2026-09-10T06:00:00Z",
+          median: 22.78,
+          mean: 22.66,
+          p10: 21.9,
+          p25: 22.4,
+          p75: 22.82,
+          p90: 22.77,
+          p10Base: 21.9,
+          p90Height: 0.87,
+          p25Base: 22.4,
+          p75Height: 0.42,
+        },
+      },
+    ];
+
+    it("renders actual percentile ranges, median, and mean with unit", () => {
+      render(
+        <EnsembleChartTooltip active={true} payload={samplePayload} unit="°C" timezone="UTC" />
+      );
+
+      // Shows valid time header
+      expect(screen.getByText("Sep 10, 06:00 UTC")).toBeInTheDocument();
+
+      // Shows central tendencies
+      expect(screen.getByText("Median (P50)")).toBeInTheDocument();
+      expect(screen.getByText("22.78 °C")).toBeInTheDocument();
+      expect(screen.getByText("Mean")).toBeInTheDocument();
+      expect(screen.getByText("22.66 °C")).toBeInTheDocument();
+
+      // Shows actual percentile ranges, NOT height spans
+      expect(screen.getByText("P25–P75")).toBeInTheDocument();
+      expect(screen.getByText("22.4 – 22.82 °C")).toBeInTheDocument();
+      expect(screen.getByText("P10–P90")).toBeInTheDocument();
+      expect(screen.getByText("21.9 – 22.77 °C")).toBeInTheDocument();
+
+      // Implementation details p10Base and p25Base must NOT be exposed
+      expect(screen.queryByText(/p10Base/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/p25Base/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/p90Height/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/p75Height/i)).not.toBeInTheDocument();
+    });
+
+    it("handles null and non-finite percentile values gracefully with dashes", () => {
+      const payloadWithNulls = [
+        {
+          payload: {
+            lead_time_hours: 6,
+            valid_time: "2026-09-10T06:00:00Z",
+            median: null,
+            mean: Number.NaN,
+            p10: null,
+            p25: null,
+            p75: null,
+            p90: null,
+          },
+        },
+      ];
+
+      render(<EnsembleChartTooltip active={true} payload={payloadWithNulls} unit="°C" />);
+
+      const dashes = screen.getAllByText("—");
+      expect(dashes.length).toBeGreaterThanOrEqual(4);
+    });
+
+    it("returns null when inactive or payload is empty", () => {
+      const { container: inactiveContainer } = render(
+        <EnsembleChartTooltip active={false} payload={samplePayload} />
+      );
+      expect(inactiveContainer.firstChild).toBeNull();
+
+      const { container: emptyContainer } = render(
+        <EnsembleChartTooltip active={true} payload={[]} />
+      );
+      expect(emptyContainer.firstChild).toBeNull();
     });
   });
 });
