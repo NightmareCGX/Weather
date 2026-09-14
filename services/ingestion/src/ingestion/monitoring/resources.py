@@ -358,7 +358,7 @@ class SystemResourceCollector:
         """
         # 1. Preferred path: psutil (cross-platform, x86_64 & aarch64)
         try:
-            import psutil  # type: ignore[import-untyped]
+            import psutil
 
             c_times = psutil.cpu_times()
             with self._lock:
@@ -415,7 +415,7 @@ class SystemResourceCollector:
         """
         # 1. Preferred path: psutil (cross-platform, x86_64 & aarch64)
         try:
-            import psutil  # type: ignore[import-untyped]
+            import psutil
 
             v = psutil.virtual_memory()
             return SystemMemoryInfo(
