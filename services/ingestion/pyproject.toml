@@ -27,6 +27,7 @@ dependencies = [
     # so ``weather-platform-domain`` is a genuine production dependency.
     "weather-platform-domain",
     "rich>=13.7.0,<14.0.0",
+    "psutil>=5.9.0,<8.0.0",
 ]
 
 [tool.uv.sources]

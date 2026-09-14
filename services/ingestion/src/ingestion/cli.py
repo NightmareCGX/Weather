@@ -1143,7 +1143,11 @@ def _run_realtime(args: argparse.Namespace) -> int:
 
         threading.Thread(
             target=serve_live_registry,
-            kwargs={"host": getattr(args, "metrics_host", "127.0.0.1"), "port": metrics_port},
+            kwargs={
+                "host": getattr(args, "metrics_host", "127.0.0.1"),
+                "port": metrics_port,
+                "component": "realtime",
+            },
             daemon=True,
         ).start()
 
@@ -1457,7 +1461,11 @@ def _run_gc(args: argparse.Namespace) -> int:
 
         threading.Thread(
             target=serve_live_registry,
-            kwargs={"host": getattr(args, "metrics_host", "127.0.0.1"), "port": int(metrics_port)},
+            kwargs={
+                "host": getattr(args, "metrics_host", "127.0.0.1"),
+                "port": int(metrics_port),
+                "component": "gc",
+            },
             daemon=True,
         ).start()
 

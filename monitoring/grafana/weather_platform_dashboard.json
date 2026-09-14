@@ -341,29 +341,38 @@
         "y": 6
       },
       "id": 9,
-      "title": "Process Memory (RSS / VMS / Peak)",
+      "title": "Platform Memory Breakdown (RSS)",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "fillOpacity": 30,
+            "lineWidth": 2,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
           "unit": "bytes"
-        }
+        },
+        "overrides": []
       },
       "targets": [
         {
-          "expr": "weather_process_memory_rss_bytes",
-          "legendFormat": "RSS, physical resident"
-        },
-        {
-          "expr": "weather_process_memory_vms_bytes",
-          "legendFormat": "VMS, virtual address space"
-        },
-        {
-          "expr": "weather_process_memory_peak_rss_bytes",
-          "legendFormat": "Peak RSS, high-water mark"
+          "expr": "weather_component_memory_rss_bytes",
+          "legendFormat": "{{component}}"
         }
       ],
-      "description": "Process memory in bytes. RSS = physical resident memory; VMS = virtual address space reserved; Peak RSS = high-water mark of RSS. There is no percentage here by design: a process has no fixed memory limit.",
+      "description": "Physical resident memory (RSS) consumed directly by each platform component (realtime, gc, api, exporter), stacked to show total platform memory usage.",
       "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
@@ -382,20 +391,39 @@
         "y": 6
       },
       "id": 10,
-      "title": "Process CPU Utilization %",
+      "title": "Platform CPU Breakdown & Total %",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "fillOpacity": 30,
+            "lineWidth": 2,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
           "unit": "percent"
-        }
+        },
+        "overrides": []
       },
       "targets": [
         {
-          "expr": "weather_process_cpu_percent",
-          "legendFormat": "CPU %"
+          "expr": "weather_component_cpu_percent",
+          "legendFormat": "{{component}}"
         }
       ],
+      "description": "Process CPU utilization percentage consumed directly by each platform component (realtime, gc, api, exporter), normalized across all logical CPU cores (0-100%), stacked to show total platform CPU share.",
       "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
@@ -414,45 +442,49 @@
         "y": 6
       },
       "id": 11,
-      "title": "Disk Space (Used / Free / Total)",
+      "title": "Platform Storage Breakdown",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "fillOpacity": 30,
+            "lineWidth": 2,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
           "unit": "bytes"
         },
         "overrides": []
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "weather_disk_total_bytes",
-          "legendFormat": "Total capacity",
+          "expr": "minio_cluster_usage_total_bytes",
+          "legendFormat": "Grid Data (MinIO / S3)",
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "weather_disk_used_bytes",
-          "legendFormat": "Used space",
+          "expr": "weather_postgres_total_size_bytes",
+          "legendFormat": "Metadata DB (PostgreSQL)",
           "refId": "B"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "weather_disk_free_bytes",
-          "legendFormat": "Free space",
+          "expr": "weather_staging_downloads_bytes",
+          "legendFormat": "Staging Downloads",
           "refId": "C"
         }
       ],
-      "description": "Absolute disk space in bytes. Total capacity is constant, so the distance between the Used line and the Total line is exactly the utilization percentage - no separate percent line needed.",
+      "description": "Storage footprint directly owned by the Weather Platform: MinIO object storage, PostgreSQL catalog database, and temporary staging downloads.",
       "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"

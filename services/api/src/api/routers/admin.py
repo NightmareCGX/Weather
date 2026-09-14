@@ -11,6 +11,9 @@ Redis, and object storage). The router is thin (ENGINEERING_CONTRACT section
 
 import asyncio
 import logging
+import os
+import threading
+import time
 from dataclasses import asdict
 from typing import Any
 
@@ -254,6 +257,38 @@ def _process_memory() -> tuple[int, int]:
     return 0, 0
 
 
+_api_cpu_lock = threading.Lock()
+_api_last_cpu_time: float | None = None
+_api_last_monotonic: float | None = None
+
+
+def _process_cpu_percent() -> float:
+    """Return current API process CPU % since previous invocation (non-blocking)."""
+    global _api_last_cpu_time, _api_last_monotonic
+    now_mono = time.monotonic()
+    try:
+        cpu_times = time.process_time()
+    except Exception:
+        return 0.0
+
+    with _api_cpu_lock:
+        if _api_last_cpu_time is None or _api_last_monotonic is None:
+            _api_last_cpu_time = cpu_times
+            _api_last_monotonic = now_mono
+            return 0.0
+
+        dt_mono = now_mono - _api_last_monotonic
+        dt_cpu = cpu_times - _api_last_cpu_time
+        _api_last_cpu_time = cpu_times
+        _api_last_monotonic = now_mono
+
+        if dt_mono <= 0:
+            return 0.0
+        cores = os.cpu_count() or 1
+        pct = ((dt_cpu / dt_mono) / cores) * 100.0
+        return max(0.0, min(100.0, round(pct, 2)))
+
+
 @router.get(
     "/metrics",
     summary="Get Prometheus metrics for the API serving layer",
@@ -266,6 +301,7 @@ def get_api_metrics() -> Response:
     redis_connected = _redis_connected()
     object_storage = _object_storage_connected()
     rss, vms = _process_memory()
+    cpu_pct = _process_cpu_percent()
     threads = threading.active_count()
     redis_used_bytes, redis_max_bytes, redis_evicted = _redis_memory_stats()
 
@@ -315,6 +351,15 @@ def get_api_metrics() -> Response:
         "# HELP weather_api_redis_evicted_keys_total Redis keys evicted under memory pressure since start",
         "# TYPE weather_api_redis_evicted_keys_total counter",
         f"weather_api_redis_evicted_keys_total {redis_evicted}",
+        "# HELP weather_api_process_cpu_percent Process CPU utilization percentage",
+        "# TYPE weather_api_process_cpu_percent gauge",
+        f"weather_api_process_cpu_percent {float(cpu_pct)}",
+        "# HELP weather_component_cpu_percent Component process CPU utilization percentage (0-100+)",
+        "# TYPE weather_component_cpu_percent gauge",
+        f'weather_component_cpu_percent{{component="api"}} {float(cpu_pct)}',
+        "# HELP weather_component_memory_rss_bytes Component process resident memory size (RSS) in bytes",
+        "# TYPE weather_component_memory_rss_bytes gauge",
+        f'weather_component_memory_rss_bytes{{component="api"}} {float(rss)}',
     ]
     content = "\n".join(lines) + "\n"
     return Response(
