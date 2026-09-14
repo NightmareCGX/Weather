@@ -307,7 +307,7 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
       <div
         role="img"
         aria-label={`${meta.name} hourly forecast over lead time`}
-        className={variableCode === "wind_10m" ? "h-52 w-full" : "h-48 w-full"}
+        className={variableCode === "wind_10m" ? "h-56 w-full" : "h-48 w-full"}
       >
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart
@@ -315,7 +315,7 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
             margin={{
               top: 8,
               right: 8,
-              bottom: variableCode === "wind_10m" ? 22 : 4,
+              bottom: variableCode === "wind_10m" ? 36 : 4,
               left: 0,
             }}
           >
@@ -332,6 +332,7 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
               dataKey="label"
               tick={{ fontSize: 10, fill: "#64748b" }}
               tickLine={false}
+              tickMargin={variableCode === "wind_10m" ? 22 : 0}
               interval="preserveStartEnd"
             />
             <YAxis
