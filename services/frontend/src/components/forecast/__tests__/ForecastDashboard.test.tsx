@@ -500,12 +500,13 @@ describe("ForecastDashboard", () => {
 
     render(<ForecastDashboard location={location} />);
 
-    // Exactly two meteograms render, keyed by the two real variables. No
-    // chart is titled with a coordinate/provenance field like `cycle_time`.
+    // Only the meteogram matching the selected variable (temperature_2m) renders.
+    // Metadata fields like cycle_time are never rendered as meteograms.
     const meteograms = screen.getAllByTestId("meteogram");
-    expect(meteograms).toHaveLength(2);
+    expect(meteograms).toHaveLength(1);
     const codes = meteograms.map((node) => node.textContent);
-    expect(codes).toEqual(["temperature_2m", "precipitation_rate"]);
+    expect(codes).toEqual(["temperature_2m"]);
+    expect(codes).not.toContain("precipitation_rate");
     expect(codes).not.toContain("cycle_time");
     expect(codes).not.toContain("lead_time_hours");
     expect(codes).not.toContain("valid_time");
@@ -536,8 +537,14 @@ describe("ForecastDashboard", () => {
 
     render(<ForecastDashboard location={location} />);
 
-    expect(mockUsePointForecast).toHaveBeenCalledWith(location, { model: "gefs" });
-    expect(mockUsePointForecast).not.toHaveBeenCalledWith(location, { model: "gfs" });
+    expect(mockUsePointForecast).toHaveBeenCalledWith(location, {
+      model: "gefs",
+      variables: ["temperature_2m"],
+    });
+    expect(mockUsePointForecast).not.toHaveBeenCalledWith(
+      location,
+      expect.objectContaining({ model: "gfs" })
+    );
   });
 
   it("keeps the deterministic selected model as the Hourly source", () => {
@@ -552,7 +559,10 @@ describe("ForecastDashboard", () => {
 
     render(<ForecastDashboard location={location} />);
 
-    expect(mockUsePointForecast).toHaveBeenCalledWith(location, { model: "gfs" });
+    expect(mockUsePointForecast).toHaveBeenCalledWith(location, {
+      model: "gfs",
+      variables: ["temperature_2m"],
+    });
   });
 
   it("Test A: derives ensemble variable and leads from authoritative selection when switching GFS precipitation -> GEFS", () => {
@@ -1007,6 +1017,86 @@ describe("ForecastDashboard", () => {
 
     expect(screen.getByText("3,417 m")).toBeInTheDocument();
     expect(screen.queryByText("9,999 m")).not.toBeInTheDocument();
+  });
+
+  it("displays only the selected variable in Hourly Forecast and switches dynamically", () => {
+    mockUsePointForecast.mockReturnValue({
+      forecast: {
+        location: {
+          latitude: 38.19,
+          longitude: -106.82,
+          elevation_m: null,
+          resolved_via: "city",
+        },
+        generated_at: "2026-07-21T00:00:00Z",
+        model: "gfs",
+        forecasts: [
+          {
+            lead_time_hours: 0,
+            valid_time: "2026-07-21T00:00:00Z",
+            temperature_2m: 10,
+            precipitation_rate: 0.5,
+            wind_10m: 15,
+          },
+          {
+            lead_time_hours: 6,
+            valid_time: "2026-07-21T06:00:00Z",
+            temperature_2m: 13,
+            precipitation_rate: 1.0,
+            wind_10m: 20,
+          },
+        ],
+      },
+      status: "success",
+      error: null,
+    });
+    mockUseEnsemble.mockReturnValue({
+      byLead: new Map(),
+      status: "idle",
+      error: null,
+      model: "gfs",
+    });
+
+    // 1. Initially temperature_2m is selected
+    mockSelectionContext({
+      selection: {
+        model: "gfs",
+        variable: "temperature_2m",
+      },
+    });
+
+    const { rerender } = render(<ForecastDashboard location={location} />);
+
+    let meteograms = screen.getAllByTestId("meteogram");
+    expect(meteograms).toHaveLength(1);
+    expect(meteograms[0]).toHaveTextContent("temperature_2m");
+
+    // 2. Switch selection to precipitation_rate
+    mockSelectionContext({
+      selection: {
+        model: "gfs",
+        variable: "precipitation_rate",
+      },
+    });
+    rerender(<ForecastDashboard location={location} />);
+
+    meteograms = screen.getAllByTestId("meteogram");
+    expect(meteograms).toHaveLength(1);
+    expect(meteograms[0]).toHaveTextContent("precipitation_rate");
+
+    // 3. Select a variable not present in the point forecast payload
+    mockSelectionContext({
+      selection: {
+        model: "gfs",
+        variable: "snow_depth",
+      },
+    });
+    rerender(<ForecastDashboard location={location} />);
+
+    expect(screen.queryByTestId("meteogram")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("No hourly forecast available for the selected variable.")
+    ).toBeInTheDocument();
   });
 
   describe("Ensemble valid-time provenance under Lifecycle V2", () => {

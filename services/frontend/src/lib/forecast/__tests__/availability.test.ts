@@ -8,8 +8,10 @@ import {
   findInitialTime,
   findModel,
   findVariable,
+  PREFERRED_VARIABLE_ORDER,
   resolveSpatialLayer,
   resolveValidTime,
+  sortVariablesByCanonicalOrder,
 } from "@/lib/forecast/availability";
 import type { ForecastAvailability } from "@/lib/api/types";
 
@@ -84,6 +86,66 @@ describe("availability helpers", () => {
     expect(resolveValidTime("2026-08-13T00:00:00Z", 6)).toBe("2026-08-13T06:00:00.000Z");
     expect(resolveValidTime(null, 6)).toBeNull();
     expect(resolveValidTime("2026-08-13T00:00:00Z", null)).toBeNull();
+  });
+
+  it("sorts variables by canonical meteorological priority", () => {
+    const rawVariables: any[] = [
+      { id: "snow_depth", name: "Snow Depth" },
+      { id: "cloud_ceiling", name: "Cloud Ceiling" },
+      { id: "cloud_cover_3h", name: "Cloud Cover" },
+      { id: "visibility", name: "Visibility" },
+      { id: "precipitation_rate", name: "Precipitation Rate" },
+      { id: "precipitation_amount_3h", name: "3-Hour Precipitation" },
+      { id: "wind_gust", name: "Wind Gust" },
+      { id: "wind_10m", name: "10-Meter Wind" },
+      { id: "relative_humidity_2m", name: "Relative Humidity" },
+      { id: "temperature_2m", name: "Temperature" },
+      { id: "custom_unknown_var", name: "Unknown Variable" },
+    ];
+
+    const sorted = sortVariablesByCanonicalOrder(rawVariables);
+    const sortedIds = sorted.map((v) => v.id);
+
+    expect(sortedIds).toEqual([
+      "temperature_2m",
+      "relative_humidity_2m",
+      "wind_10m",
+      "wind_gust",
+      "precipitation_amount_3h",
+      "precipitation_rate",
+      "visibility",
+      "cloud_cover_3h",
+      "cloud_ceiling",
+      "snow_depth",
+      "custom_unknown_var",
+    ]);
+  });
+
+  it("prioritizes temperature_2m in defaultVariable even if not at index 0", () => {
+    const modelWithUnsortedVars: any = {
+      id: "gfs",
+      name: "GFS",
+      variables: [
+        { id: "cloud_ceiling", name: "Cloud Ceiling" },
+        { id: "wind_10m", name: "10-Meter Wind" },
+        { id: "temperature_2m", name: "Temperature" },
+      ],
+    };
+
+    expect(defaultVariable(modelWithUnsortedVars)).toBe("temperature_2m");
+  });
+
+  it("falls back to the first sorted variable if temperature_2m is absent", () => {
+    const modelWithoutTemp: any = {
+      id: "gefs_subset",
+      name: "GEFS Subset",
+      variables: [
+        { id: "snow_depth", name: "Snow Depth" },
+        { id: "relative_humidity_2m", name: "Relative Humidity" },
+      ],
+    };
+
+    expect(defaultVariable(modelWithoutTemp)).toBe("relative_humidity_2m");
   });
 });
 

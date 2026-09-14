@@ -728,12 +728,18 @@ test("forecast panel close: Close (X) remains pinned and clickable while forecas
 }) => {
   await page.goto("/");
 
+  // Switch to GEFS so the panel renders Ensemble Statistics and Distribution alongside
+  // the filtered Hourly Forecast, ensuring content height exceeds the viewport to test scrolling.
+  const modelSelect = page.getByLabel("Model");
+  await modelSelect.selectOption("gefs");
+
   const input = page.getByLabel(/Search for a city/);
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // Location selected: Hourly Forecast is visible and marker is rendered on map
   await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 
   // Confirm Close button is initially visible
