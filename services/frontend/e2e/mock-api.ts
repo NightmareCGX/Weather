@@ -345,7 +345,7 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         unit: "km/h",
                         stops: [
                           [0, "#ffffff"],
-                          [140, "#49006a"],
+                          [120, "#49006a"],
                         ],
                       },
                       vector_field_url_template:
@@ -546,7 +546,7 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
                         unit: "km/h",
                         stops: [
                           [0, "#ffffff"],
-                          [140, "#49006a"],
+                          [120, "#49006a"],
                         ],
                       },
                       vector_field_url_template:
