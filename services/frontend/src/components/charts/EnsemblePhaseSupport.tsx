@@ -38,34 +38,34 @@ export function EnsemblePhaseSupportTooltip({ active, payload, label, timezone }
 
   if (!point || !point.has_data) {
     return (
-      <div className="rounded border border-slate-200 bg-white p-2.5 shadow-md text-xs">
-        <p className="font-semibold text-slate-800">{formattedTime}</p>
-        <p className="text-slate-500 mt-1">No ensemble phase data available</p>
+      <div className="rounded-lg border border-slate-700 bg-slate-900/95 p-2.5 shadow-2xl text-xs backdrop-blur-md">
+        <p className="font-semibold text-slate-100">{formattedTime}</p>
+        <p className="text-slate-400 mt-1">No ensemble phase data available</p>
       </div>
     );
   }
 
   return (
-    <div className="rounded border border-slate-200 bg-white p-2.5 shadow-md text-xs min-w-[190px]">
-      <div className="border-b border-slate-100 pb-1 mb-1.5 flex items-baseline justify-between gap-2">
-        <p className="font-semibold text-slate-800">{formattedTime}</p>
-        <span className="text-[10px] text-slate-500">{memberCount} members</span>
+    <div className="rounded-lg border border-slate-700 bg-slate-900/95 p-2.5 shadow-2xl text-xs backdrop-blur-md min-w-[190px]">
+      <div className="border-b border-slate-800 pb-1 mb-1.5 flex items-baseline justify-between gap-2">
+        <p className="font-semibold text-slate-100">{formattedTime}</p>
+        <span className="text-[10px] font-mono text-cyan-400">{memberCount} members</span>
       </div>
-      <div className="space-y-1">
+      <div className="space-y-1 font-mono">
         {GEFS_PHYSICAL_PHASES.map((phase) => {
           const val = point[phase];
           if (val == null || val <= 0) return null;
           const token = PRECIPITATION_PHASE_TOKENS[phase];
           return (
             <div key={phase} className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 font-sans">
                 <span
                   className="h-2 w-2 rounded-sm shrink-0"
                   style={{ backgroundColor: token?.color ?? "#64748b" }}
                 />
-                <span className="text-slate-700">{GEFS_PHASE_LABELS[phase]}</span>
+                <span className="text-slate-300">{GEFS_PHASE_LABELS[phase]}</span>
               </div>
-              <span className="font-medium text-slate-900 tabular-nums">
+              <span className="font-medium text-slate-100 tabular-nums">
                 {Math.round(val * 10) / 10}%
               </span>
             </div>
@@ -162,23 +162,23 @@ export function EnsemblePhaseSupport({
   }, [transitionFrequency, effectiveByLead]);
 
   return (
-    <div className="mt-4 rounded border border-slate-200 bg-slate-50/50 p-4">
+    <div className="mt-4 rounded-lg border border-slate-800 bg-slate-800/40 p-4 shadow-xl">
       <div className="mb-1 flex items-baseline justify-between">
-        <h4 className="text-xs font-semibold text-slate-800">
+        <h4 className="text-xs font-semibold text-slate-200">
           Ensemble Phase Support — time-varying support (0–100%)
         </h4>
-        <span className="text-[11px] text-slate-500">
+        <span className="text-[11px] text-slate-400">
           Normalized support across physical phases
         </span>
       </div>
 
-      <p className="mb-2 text-[11px] text-slate-500">
+      <p className="mb-2 text-[11px] text-slate-400">
         Per-valid-time ensemble member classification normalized to 100% across available members.
       </p>
 
       {/* Legend / Phase taxonomy badges */}
-      <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600">
-        <span className="font-medium text-slate-500">Phases:</span>
+      <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-300">
+        <span className="font-medium text-slate-400">Phases:</span>
         {GEFS_PHYSICAL_PHASES.map((phase) => {
           const token = PRECIPITATION_PHASE_TOKENS[phase];
           return (
@@ -201,17 +201,17 @@ export function EnsemblePhaseSupport({
       <div role="img" aria-label="Ensemble phase support over time" className="h-56 w-full">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
             <XAxis
               dataKey="valid_time"
               tickFormatter={(vt: string) => (vt ? formatDayHourInTimeZone(vt, timezone) : "")}
-              tick={{ fontSize: 10, fill: "#64748b" }}
+              tick={{ fontSize: 10, fill: "#94a3b8" }}
               tickLine={false}
               interval="preserveStartEnd"
             />
             <YAxis
               domain={[0, 100]}
-              tick={{ fontSize: 10, fill: "#64748b" }}
+              tick={{ fontSize: 10, fill: "#94a3b8" }}
               tickLine={false}
               axisLine={false}
               width={40}

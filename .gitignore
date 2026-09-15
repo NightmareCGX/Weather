@@ -81,3 +81,7 @@ dl_real/
 # Local acceptance staging (per-concurrency download dirs)
 accept_dl*/
 .venv-api-test/
+.zcode/
+artifacts/*.png
+artifacts/*.html
+artifacts/*.js

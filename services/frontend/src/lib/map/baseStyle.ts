@@ -13,9 +13,9 @@ export function buildBaseStyle(): StyleSpecification {
     sources: {
       osm: {
         type: "raster",
-        tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+        tiles: ["https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"],
         tileSize: 256,
-        attribution: "© OpenStreetMap contributors",
+        attribution: "© OpenStreetMap contributors, © CARTO",
       },
     },
     layers: [

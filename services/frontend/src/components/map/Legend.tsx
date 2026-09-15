@@ -37,15 +37,15 @@ export function Legend({ layer, variableName, variableCode }: LegendProps) {
   const ticks = getLegendTicks(stops, inferredCode);
 
   return (
-    <div className="pointer-events-none absolute bottom-4 left-4 z-10 rounded border border-slate-200 bg-white/95 px-3 py-2 shadow">
-      <div className="mb-1 text-xs font-medium text-slate-700">{label}</div>
+    <div className="pointer-events-none absolute bottom-4 left-4 z-10 rounded-lg border border-slate-800 bg-slate-900/90 px-3.5 py-2.5 shadow-2xl backdrop-blur-md">
+      <div className="mb-1.5 text-xs font-bold uppercase tracking-wider text-slate-300">{label}</div>
       <div
         className="h-3 w-56 rounded"
         data-testid="legend-gradient"
         style={{ backgroundImage: buildLegendGradient(stops, inferredCode) }}
       />
       {ticks.length > 0 && (
-        <div className="relative mt-1 h-3.5 w-56 text-[10px] text-slate-500 tabular-nums">
+        <div className="relative mt-1.5 h-3.5 w-56 text-[10px] font-mono text-slate-400 tabular-nums">
           {ticks.map((tick, index) => {
             const isFirst = index === 0;
             const isLast = index === ticks.length - 1;

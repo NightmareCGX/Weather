@@ -315,7 +315,7 @@ export function WeatherMap({
       return;
     }
     if (markerRef.current === null) {
-      markerRef.current = new maplibregl.Marker({ color: "#1d4ed8" })
+      markerRef.current = new maplibregl.Marker({ color: "#38bdf8" })
         .setLngLat([selectedLocation.longitude, selectedLocation.latitude])
         .addTo(map);
     } else {
