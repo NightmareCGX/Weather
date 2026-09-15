@@ -48,7 +48,7 @@ describe("SelectedLocationSummary", () => {
 
     const header = container.querySelector(".sticky");
     expect(header).toBeInTheDocument();
-    expect(header).toHaveClass("top-0", "z-10", "bg-white");
+    expect(header).toHaveClass("top-0", "z-10", "bg-slate-900");
 
     // Close button and title are inside sticky header
     expect(header).toHaveTextContent("Aspen");

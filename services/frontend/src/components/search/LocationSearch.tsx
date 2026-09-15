@@ -161,7 +161,7 @@ export function LocationSearch({
         aria-activedescendant={highlighted >= 0 ? optionId(highlighted) : undefined}
         aria-label="Search for a city, ski resort, or station"
         placeholder={placeholder ?? "Search cities, ski resorts, stations…"}
-        className="w-full rounded border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500 disabled:opacity-60"
+        className="w-full rounded-lg border border-slate-700/80 bg-slate-900/90 px-3 py-2 text-sm text-slate-100 placeholder-slate-500 shadow-xl backdrop-blur-md outline-none transition focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 disabled:opacity-60"
         onChange={(event) => {
           setQuery(event.target.value);
           setOpen(true);
@@ -176,25 +176,25 @@ export function LocationSearch({
           id={listboxId}
           role="listbox"
           aria-label="Search results"
-          className="absolute z-30 mt-1 max-h-72 w-full overflow-auto rounded border border-slate-200 bg-white shadow-lg"
+          className="absolute z-30 mt-1.5 max-h-72 w-full overflow-auto rounded-lg border border-slate-800 bg-slate-900/95 shadow-2xl backdrop-blur-md"
         >
           {status === "loading" && (
             <li
               role="option"
               aria-disabled
               aria-selected="false"
-              className="px-3 py-2 text-sm text-slate-500"
+              className="px-3 py-2 text-sm text-slate-400"
             >
               Searching…
             </li>
           )}
           {error !== null && (
-            <li role="alert" className="px-3 py-2 text-sm text-red-700">
+            <li role="alert" className="px-3 py-2 text-sm text-red-400">
               {error}
             </li>
           )}
           {status === "success" && results.length === 0 && (
-            <li className="px-3 py-2 text-sm text-slate-500">No matching locations.</li>
+            <li className="px-3 py-2 text-sm text-slate-400">No matching locations.</li>
           )}
           {results.map((result, index) => (
             <li
@@ -202,8 +202,8 @@ export function LocationSearch({
               id={optionId(index)}
               role="option"
               aria-selected={highlighted === index}
-              className={`flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-sm ${
-                highlighted === index ? "bg-slate-100" : ""
+              className={`flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-sm transition ${
+                highlighted === index ? "bg-slate-800/90" : "hover:bg-slate-800/50"
               }`}
               onMouseDown={(event) => {
                 // Keep focus on the input; use onMouseDown so it fires before blur.
@@ -213,15 +213,15 @@ export function LocationSearch({
               onMouseEnter={() => setHighlighted(index)}
             >
               <span className="truncate">
-                <span className="text-slate-900">{result.name}</span>
+                <span className="font-medium text-slate-100">{result.name}</span>
                 {result.region !== null && (
-                  <span className="ml-2 text-xs text-slate-500">
+                  <span className="ml-2 text-xs text-slate-400">
                     {result.region}
                     {result.country !== null ? `, ${result.country}` : ""}
                   </span>
                 )}
               </span>
-              <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+              <span className="shrink-0 rounded border border-slate-700/80 bg-slate-800 px-1.5 py-0.5 text-xs font-mono text-cyan-400">
                 {result.object === "city"
                   ? "City"
                   : result.object === "ski_resort"
@@ -232,14 +232,14 @@ export function LocationSearch({
           ))}
           <li
             role="presentation"
-            className="border-t border-slate-100 bg-slate-50/80 px-3 py-1.5 text-right text-[11px] text-slate-400"
+            className="border-t border-slate-800/80 bg-slate-950/60 px-3 py-1.5 text-right text-[11px] text-slate-500"
           >
             <span>Powered by </span>
             <a
               href="https://www.geoapify.com"
               target="_blank"
               rel="noopener noreferrer"
-              className="underline hover:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              className="underline hover:text-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400"
             >
               Geoapify
             </a>
@@ -248,7 +248,7 @@ export function LocationSearch({
               href="https://locationiq.com"
               target="_blank"
               rel="noopener noreferrer"
-              className="underline hover:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              className="underline hover:text-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400"
             >
               LocationIQ.com
             </a>

@@ -57,7 +57,7 @@ export function WindRose({ windRose }: WindRoseProps) {
                 cy={center}
                 r={r}
                 fill="none"
-                stroke="#e2e8f0"
+                stroke="#334155"
                 strokeDasharray="2 2"
               />
             );
@@ -69,14 +69,14 @@ export function WindRose({ windRose }: WindRoseProps) {
             y1={center - maxRadius}
             x2={center}
             y2={center + maxRadius}
-            stroke="#cbd5e1"
+            stroke="#334155"
           />
           <line
             x1={center - maxRadius}
             y1={center}
             x2={center + maxRadius}
             y2={center}
-            stroke="#cbd5e1"
+            stroke="#334155"
           />
 
           {/* Direction wedges */}
@@ -148,7 +148,7 @@ export function WindRose({ windRose }: WindRoseProps) {
                       y={ly}
                       textAnchor="middle"
                       dominantBaseline="central"
-                      className="text-[10px] font-semibold fill-slate-600"
+                      className="text-[10px] font-bold font-mono fill-slate-400"
                     >
                       {sectorData.sector}
                     </text>
@@ -163,8 +163,8 @@ export function WindRose({ windRose }: WindRoseProps) {
             cx={center}
             cy={center}
             r={centerRadius}
-            fill="#f8fafc"
-            stroke="#94a3b8"
+            fill="#0f172a"
+            stroke="#334155"
             strokeWidth={1.5}
           />
           <text
@@ -172,7 +172,7 @@ export function WindRose({ windRose }: WindRoseProps) {
             y={center - 4}
             textAnchor="middle"
             dominantBaseline="central"
-            className="text-[8px] font-bold fill-slate-500"
+            className="text-[8px] font-bold fill-slate-400 font-mono"
           >
             CALM
           </text>
@@ -181,7 +181,7 @@ export function WindRose({ windRose }: WindRoseProps) {
             y={center + 6}
             textAnchor="middle"
             dominantBaseline="central"
-            className="text-[9px] font-bold fill-slate-700"
+            className="text-[9px] font-bold fill-slate-200 font-mono"
           >
             {Math.round(windRose.calm_percentage)}%
           </text>
@@ -189,7 +189,7 @@ export function WindRose({ windRose }: WindRoseProps) {
       </div>
 
       {/* Hover Information / Summary */}
-      <div className="h-6 text-xs text-slate-600 text-center">
+      <div className="h-6 text-xs text-slate-300 text-center font-mono">
         {hoveredSector ? (
           (() => {
             const sec = windRose.sectors.find((s) => s.sector === hoveredSector);
@@ -199,20 +199,22 @@ export function WindRose({ windRose }: WindRoseProps) {
               windRose.calm_count + windRose.sectors.reduce((sum, s) => sum + s.count, 0);
             return (
               <span>
-                <strong>{sec.sector}</strong>: {formatPercent(sec.probability)} ({sec.count}/
-                {totalMembers} members)
+                <strong className="text-cyan-400">{sec.sector}</strong>:{" "}
+                {formatPercent(sec.probability)} ({sec.count}/{totalMembers} members)
               </span>
             );
           })()
         ) : (
-          <span>Hover a sector to view member probability</span>
+          <span className="text-slate-400 font-sans">
+            Hover a sector to view member probability
+          </span>
         )}
       </div>
 
       {/* Legend */}
-      <div className="mt-2 flex flex-wrap justify-center gap-3 text-[10px] text-slate-600">
+      <div className="mt-2 flex flex-wrap justify-center gap-3 text-[10px] text-slate-400">
         {BIN_KEYS.map((binKey) => (
-          <div key={binKey} className="flex items-center gap-1">
+          <div key={binKey} className="flex items-center gap-1 font-mono">
             <span
               className="inline-block h-2.5 w-2.5 rounded-sm"
               style={{ backgroundColor: BIN_COLORS[binKey].color }}

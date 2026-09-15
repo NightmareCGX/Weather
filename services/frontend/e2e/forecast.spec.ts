@@ -178,7 +178,7 @@ test("api failure: useful error state and graceful degradation", async ({ page }
 
   // The application remains usable (the map and header are still present).
   await expect(page.getByTestId("weather-map")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Weather Platform" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
 });
 
 test("forecast map transition: selecting B while A tiles are in flight immediately dispatches B", async ({
@@ -954,7 +954,7 @@ test("startup privacy invariant: page load makes best-effort /v1/locate call wit
   await page.goto("/");
 
   // Wait for map and header to be ready
-  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
   await page.waitForTimeout(1000);
 
   // Best-effort /v1/locate was invoked on startup
@@ -1007,7 +1007,7 @@ test("locate me deny privacy: denying geolocation renders non-blocking alert and
   await context.clearPermissions();
 
   await page.goto("/");
-  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
   startupCompleted = true;
 
   const locateBtn = page.getByRole("button", { name: "Locate me" });
@@ -1302,7 +1302,7 @@ test("startup coarse IP success: moves map to regional viewport and localizes va
   });
 
   await page.goto("/");
-  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
 
   // Wait for map to load and easeTo Denver region (lat ~ 39.7, lon ~ -105.0, zoom ~ 6.5)
   await page.waitForFunction(() => {
@@ -1339,7 +1339,7 @@ test("startup coarse IP failure (404): map remains at CONUS viewport and valid-t
   });
 
   await page.goto("/");
-  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
   await page.waitForTimeout(1000);
 
   // Map remains at default CONUS center (lat ~ 39.2, lng ~ -106.8, zoom 5)
@@ -1382,7 +1382,7 @@ test("late IP response after user map pan does NOT move camera", async ({ page }
   });
 
   await page.goto("/");
-  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
 
   // Wait for map style to be loaded
   await page.waitForFunction(() => {
@@ -1450,7 +1450,7 @@ test("late IP response after Locate Me attempt does NOT move camera", async ({ p
 
   await context.clearPermissions();
   await page.goto("/");
-  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
 
   const locateBtn = page.getByRole("button", { name: "Locate me" });
   await locateBtn.click();
@@ -1488,7 +1488,7 @@ test("selecting and clearing location does NOT recenter map to startup IP", asyn
   });
 
   await page.goto("/");
-  await expect(page.getByText("Weather Platform")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
 
   // Wait for initial easeTo Denver to complete
   await page.waitForFunction(() => {

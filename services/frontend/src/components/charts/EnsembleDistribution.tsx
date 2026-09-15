@@ -38,8 +38,8 @@ interface EnsembleDistributionProps {
   variableLabel: string;
 }
 
-const ACCENT = "#1d4ed8";
-const HISTOGRAM_COLORS = ["#93c5fd", "#3b82f6", "#1d4ed8"];
+const ACCENT = "#38bdf8";
+const HISTOGRAM_COLORS = ["#0284c7", "#0ea5e9", "#38bdf8"];
 
 /**
  * Ensemble Distribution View — the raw member-level distribution and canonical
@@ -177,12 +177,12 @@ export function EnsembleDistribution({
 
       <div>
         <div className="mb-1 flex items-baseline justify-between">
-          <h4 className="text-sm font-medium text-slate-800">
+          <h4 className="text-sm font-semibold text-slate-200">
             {isCeiling
               ? `Conditional finite distribution · ${timeLabel}`
               : `Member distribution · ${timeLabel}`}
           </h4>
-          <span className="text-xs text-slate-500">
+          <span className="text-xs font-mono text-cyan-400">
             {isCeiling ? `${finiteCount} finite members` : `${memberCount} members`}
           </span>
         </div>
@@ -201,19 +201,19 @@ export function EnsembleDistribution({
         >
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={binChartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
               <XAxis
                 type="number"
                 dataKey="x"
                 domain={[xMin, xMax]}
                 tickFormatter={(value: number) => value.toFixed(1)}
-                tick={{ fontSize: 10, fill: "#64748b" }}
+                tick={{ fontSize: 10, fill: "#94a3b8" }}
                 tickLine={false}
               />
               <YAxis
                 yAxisId="left"
                 allowDecimals={false}
-                tick={{ fontSize: 10, fill: "#64748b" }}
+                tick={{ fontSize: 10, fill: "#94a3b8" }}
                 tickLine={false}
                 axisLine={false}
                 width={32}
@@ -222,7 +222,7 @@ export function EnsembleDistribution({
                 yAxisId="right"
                 orientation="right"
                 allowDecimals={true}
-                tick={{ fontSize: 10, fill: "#64748b" }}
+                tick={{ fontSize: 10, fill: "#94a3b8" }}
                 tickLine={false}
                 axisLine={false}
                 width={38}
@@ -234,7 +234,13 @@ export function EnsembleDistribution({
                   name === "Probability density" ? "Probability density" : "Members",
                 ]}
                 labelFormatter={(label) => `Value ≈ ${Number(label).toFixed(2)}`}
-                contentStyle={{ fontSize: 12 }}
+                contentStyle={{
+                  fontSize: 12,
+                  backgroundColor: "#0f172a",
+                  borderColor: "#334155",
+                  color: "#f8fafc",
+                  borderRadius: 8,
+                }}
               />
               <Bar
                 yAxisId="left"
@@ -257,7 +263,7 @@ export function EnsembleDistribution({
                   data={pdfPoints}
                   dataKey="density"
                   type="linear"
-                  stroke="#d97706"
+                  stroke="#fbbf24"
                   strokeWidth={2}
                   dot={false}
                   isAnimationActive={false}
@@ -278,7 +284,7 @@ export function EnsembleDistribution({
               <XAxis
                 type="number"
                 dataKey="value"
-                tick={{ fontSize: 10, fill: "#64748b" }}
+                tick={{ fontSize: 10, fill: "#94a3b8" }}
                 tickLine={false}
                 domain={[xMin, xMax]}
               />
@@ -287,7 +293,13 @@ export function EnsembleDistribution({
                 cursor={{ strokeDasharray: "3 3" }}
                 formatter={(value: number) => [formatValue(value, ""), "Member value"]}
                 labelFormatter={() => ""}
-                contentStyle={{ fontSize: 12 }}
+                contentStyle={{
+                  fontSize: 12,
+                  backgroundColor: "#0f172a",
+                  borderColor: "#334155",
+                  color: "#f8fafc",
+                  borderRadius: 8,
+                }}
               />
               <Scatter data={dots} dataKey="value" fill={ACCENT} isAnimationActive={false} />
             </ScatterChart>
@@ -295,13 +307,13 @@ export function EnsembleDistribution({
         </div>
 
         {data.pdf === null && (
-          <p className="mt-1 text-[11px] text-amber-700">
+          <p className="mt-1 text-[11px] text-amber-400">
             Continuous probability density is unavailable for this lead time (insufficient spread
             across members).
           </p>
         )}
 
-        <p className="mt-1 text-[11px] text-slate-400">
+        <p className="mt-1 text-[11px] text-slate-500">
           Histogram bars and dots show the discrete ensemble member sample. The continuous curve
           shows the canonical Gaussian kernel density estimate (probability density).
         </p>
@@ -312,9 +324,9 @@ export function EnsembleDistribution({
 
 function StatCell({ label, value }: { label: string; value: number }) {
   return (
-    <div className="rounded bg-slate-50 px-2 py-1">
+    <div className="rounded border border-slate-700/60 bg-slate-800/80 px-2 py-1">
       <dt className="text-[10px] uppercase tracking-wide text-slate-400">{label}</dt>
-      <dd className="tabular-nums text-slate-800">
+      <dd className="font-mono tabular-nums text-slate-100 font-semibold">
         {Number.isFinite(value) ? value.toFixed(1) : "—"}
       </dd>
     </div>

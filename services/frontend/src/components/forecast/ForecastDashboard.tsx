@@ -191,20 +191,22 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
         onClose={onClose}
       />
 
-      <section aria-label="Point forecast" className="border-b border-slate-200 px-4 py-4">
-        <h3 className="mb-2 text-sm font-semibold text-slate-900">Hourly Forecast</h3>
+      <section aria-label="Point forecast" className="border-b border-slate-800 px-4 py-4">
+        <h3 className="mb-2 text-sm font-bold uppercase tracking-wider text-slate-100">
+          Hourly Forecast
+        </h3>
         {pointModel === null && (
-          <p className="text-sm text-slate-500">
+          <p className="text-sm text-slate-400">
             No forecast model is available for this selection.
           </p>
         )}
         {pointStatus === "loading" && (
-          <p role="status" className="text-sm text-slate-500">
+          <p role="status" className="text-sm text-slate-400">
             Loading forecast…
           </p>
         )}
         {pointStatus === "error" && (
-          <p role="alert" className="text-sm text-red-700">
+          <p role="alert" className="text-sm text-red-400">
             {pointError}
           </p>
         )}
@@ -221,7 +223,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
                 />
               ))
             ) : (
-              <p className="text-sm text-slate-500">
+              <p className="text-sm text-slate-400">
                 No hourly forecast available for the selected variable.
               </p>
             )}
@@ -230,8 +232,8 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
       </section>
 
       {selectedModelIsEnsemble && (
-        <section aria-label="Ensemble statistics" className="border-b border-slate-200 px-4 py-4">
-          <h3 className="mb-1 text-sm font-semibold text-slate-900">
+        <section aria-label="Ensemble statistics" className="border-b border-slate-800 px-4 py-4">
+          <h3 className="mb-1 text-sm font-bold uppercase tracking-wider text-slate-100">
             Ensemble Statistics{selectedModel !== null ? ` (${selectedModel.toUpperCase()})` : ""}
           </h3>
           {/* ensembleModel !== null here (the selected model is ensemble-capable).
@@ -239,23 +241,25 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
               request error, and never renders a misleading heading for a
               deterministic model. */}
           {(pointStatus === "loading" || ensemble.status === "loading") && (
-            <p role="status" className="text-sm text-slate-500">
+            <p role="status" className="text-sm text-slate-400">
               Loading ensemble statistics…
             </p>
           )}
           {ensemble.status === "error" && (
-            <p role="alert" className="text-sm text-red-700">
+            <p role="alert" className="text-sm text-red-400">
               {ensemble.error}
             </p>
           )}
           {ensemble.status === "success" && ensemble.byLead.size === 0 && (
-            <p className="text-sm text-slate-500">
+            <p className="text-sm text-slate-400">
               Ensemble data is not yet available for this forecast.
             </p>
           )}
           {ensemble.status === "success" && ensemble.byLead.size > 0 && (
             <>
-              <p className="mb-2 text-xs text-slate-500">{ensembleVariable} · percentile range</p>
+              <p className="mb-2 text-xs font-mono text-cyan-400">
+                {ensembleVariable} · percentile range
+              </p>
               <EnsembleChart
                 byLead={ensemble.byLead}
                 variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
@@ -277,11 +281,11 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
           />
 
           {ensembleVariable === "wind_10m" && distribution.data?.wind_rose && (
-            <div className="mt-4 rounded border border-slate-200 bg-slate-50/50 p-3">
-              <h4 className="mb-1 text-center text-xs font-semibold text-slate-700">
+            <div className="mt-4 rounded-lg border border-slate-800 bg-slate-800/40 p-3.5 shadow-lg">
+              <h4 className="mb-1 text-center text-xs font-semibold text-slate-200">
                 10m Wind Direction & Speed Distribution (Wind Rose)
               </h4>
-              <p className="mb-2 text-center text-[11px] text-slate-500">
+              <p className="mb-2 text-center text-[11px] font-mono text-slate-400">
                 {distributionValidTime
                   ? `${formatDayHourWithTimeZone(distributionValidTime, displayTimezone)} · `
                   : ""}

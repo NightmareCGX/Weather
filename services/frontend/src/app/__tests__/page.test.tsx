@@ -328,7 +328,7 @@ describe("HomePage", () => {
   it("renders the header, layer controls, and search after loading availability", async () => {
     renderPage();
 
-    expect(screen.getByRole("heading", { name: "Weather Platform" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Zeus Wx" })).toBeInTheDocument();
 
     await waitFor(() => {
       expect(screen.getByLabelText("Model")).toBeInTheDocument();

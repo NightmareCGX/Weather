@@ -76,40 +76,40 @@ export function EnsembleChartTooltip({
 
   return (
     <div
-      className="recharts-default-tooltip rounded border border-slate-200 bg-white p-2.5 text-xs shadow-sm"
+      className="recharts-default-tooltip rounded-lg border border-slate-700 bg-slate-900/95 p-2.5 text-xs text-slate-200 shadow-2xl backdrop-blur-md"
       style={{ whiteSpace: "nowrap" }}
     >
-      {timeLabel && <p className="mb-1.5 font-medium text-slate-800">{timeLabel}</p>}
-      <div className="space-y-1">
+      {timeLabel && <p className="mb-1.5 font-semibold text-slate-100">{timeLabel}</p>}
+      <div className="space-y-1 font-mono">
         <div className="flex items-center justify-between gap-4">
-          <span className="flex items-center gap-1.5 text-slate-600">
-            <span className="h-2 w-2 rounded-full bg-[#1e3a8a]" />
+          <span className="flex items-center gap-1.5 text-slate-400 font-sans">
+            <span className="h-2 w-2 rounded-full bg-[#38bdf8]" />
             Median (P50)
           </span>
-          <span className="font-medium text-slate-900 tabular-nums">{formatVal(point.median)}</span>
+          <span className="font-medium text-slate-100 tabular-nums">{formatVal(point.median)}</span>
         </div>
         <div className="flex items-center justify-between gap-4">
-          <span className="flex items-center gap-1.5 text-slate-600">
-            <span className="h-2 w-2 rounded-full bg-[#b45309]" />
+          <span className="flex items-center gap-1.5 text-slate-400 font-sans">
+            <span className="h-2 w-2 rounded-full bg-[#f59e0b]" />
             Mean
           </span>
-          <span className="font-medium text-slate-900 tabular-nums">{formatVal(point.mean)}</span>
+          <span className="font-medium text-slate-100 tabular-nums">{formatVal(point.mean)}</span>
         </div>
         <div className="flex items-center justify-between gap-4">
-          <span className="flex items-center gap-1.5 text-slate-600">
-            <span className="h-2 w-2 rounded-sm bg-[#3b82f6]" />
+          <span className="flex items-center gap-1.5 text-slate-400 font-sans">
+            <span className="h-2 w-2 rounded-sm bg-[#0284c7]" />
             P25–P75
           </span>
-          <span className="font-medium text-slate-900 tabular-nums">
+          <span className="font-medium text-slate-100 tabular-nums">
             {formatRange(point.p25, point.p75)}
           </span>
         </div>
         <div className="flex items-center justify-between gap-4">
-          <span className="flex items-center gap-1.5 text-slate-600">
-            <span className="h-2 w-2 rounded-sm bg-[#93c5fd]" />
+          <span className="flex items-center gap-1.5 text-slate-400 font-sans">
+            <span className="h-2 w-2 rounded-sm bg-[#38bdf8]" />
             P10–P90
           </span>
-          <span className="font-medium text-slate-900 tabular-nums">
+          <span className="font-medium text-slate-100 tabular-nums">
             {formatRange(point.p10, point.p90)}
           </span>
         </div>
@@ -171,16 +171,16 @@ export function EnsembleChart({
       >
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
             <XAxis
               dataKey="valid_time"
               tickFormatter={(vt: string) => (vt ? formatDayHourInTimeZone(vt, timezone) : "")}
-              tick={{ fontSize: 10, fill: "#64748b" }}
+              tick={{ fontSize: 10, fill: "#94a3b8" }}
               tickLine={false}
               interval="preserveStartEnd"
             />
             <YAxis
-              tick={{ fontSize: 10, fill: "#64748b" }}
+              tick={{ fontSize: 10, fill: "#94a3b8" }}
               tickLine={false}
               axisLine={false}
               width={46}
@@ -226,8 +226,8 @@ export function EnsembleChart({
               dataKey="p90Height"
               stackId="p10"
               stroke="none"
-              fill="#93c5fd"
-              fillOpacity={0.35}
+              fill="#38bdf8"
+              fillOpacity={0.25}
               isAnimationActive={false}
               connectNulls={false}
               name="P10–P90"
@@ -245,15 +245,15 @@ export function EnsembleChart({
               dataKey="p75Height"
               stackId="p25"
               stroke="none"
-              fill="#3b82f6"
-              fillOpacity={0.45}
+              fill="#0284c7"
+              fillOpacity={0.4}
               isAnimationActive={false}
               connectNulls={false}
               name="P25–P75"
             />
             <Line
               dataKey="median"
-              stroke="#1e3a8a"
+              stroke="#38bdf8"
               strokeWidth={2}
               dot={false}
               isAnimationActive={false}
@@ -262,7 +262,7 @@ export function EnsembleChart({
             />
             <Line
               dataKey="mean"
-              stroke="#b45309"
+              stroke="#f59e0b"
               strokeWidth={2}
               strokeDasharray="4 4"
               dot={false}

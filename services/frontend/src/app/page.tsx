@@ -78,7 +78,7 @@ export default function HomePage() {
 
           {error !== null && (
             <div
-              className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700"
+              className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-lg border border-red-900/60 bg-red-950/80 px-4 py-2 text-sm text-red-300 shadow-xl backdrop-blur-md"
               role="alert"
             >
               {error}
@@ -89,10 +89,10 @@ export default function HomePage() {
             <div
               className={`absolute left-1/2 ${
                 error !== null ? "top-16" : "top-4"
-              } z-30 flex max-w-[90vw] -translate-x-1/2 items-center gap-2 rounded border px-3 py-1.5 text-xs shadow-md ${
+              } z-30 flex max-w-[90vw] -translate-x-1/2 items-center gap-2 rounded-lg border px-3.5 py-1.5 text-xs shadow-xl backdrop-blur-md ${
                 notice.type === "alert"
-                  ? "border-amber-300 bg-amber-50 text-amber-900"
-                  : "border-blue-200 bg-blue-50 text-blue-800"
+                  ? "border-amber-500/40 bg-amber-950/90 text-amber-200"
+                  : "border-sky-500/40 bg-slate-900/90 text-sky-300"
               }`}
               role={notice.type === "alert" ? "alert" : "status"}
             >
@@ -101,7 +101,7 @@ export default function HomePage() {
                 type="button"
                 onClick={clearNotice}
                 aria-label="Dismiss notice"
-                className="ml-1 rounded p-0.5 hover:bg-black/5 focus:outline-none focus:ring-1 focus:ring-slate-400"
+                className="ml-1 rounded p-0.5 hover:bg-white/10 focus:outline-none focus:ring-1 focus:ring-slate-400"
               >
                 <svg
                   className="h-3.5 w-3.5"
@@ -121,7 +121,7 @@ export default function HomePage() {
           )}
 
           {loading && layer === null ? (
-            <div className="flex h-full items-center justify-center text-slate-500">
+            <div className="flex h-full items-center justify-center font-mono text-sm text-slate-400">
               Loading map layer…
             </div>
           ) : (
@@ -148,8 +148,8 @@ export default function HomePage() {
             aria-label="Forecast panel"
             className={
               isPanelCollapsed
-                ? "relative w-0 shrink-0 bg-white"
-                : "relative w-96 max-w-[calc(100%-2rem)] shrink-0 border-l border-slate-200 bg-white lg:w-[26rem]"
+                ? "relative w-0 shrink-0 bg-slate-900"
+                : "relative w-96 max-w-[calc(100%-2rem)] shrink-0 border-l border-slate-800 bg-slate-900/95 shadow-2xl backdrop-blur-md lg:w-[28rem]"
             }
           >
             <button
@@ -159,7 +159,7 @@ export default function HomePage() {
               aria-controls="forecast-panel-content"
               title={isPanelCollapsed ? "Expand forecast panel" : "Collapse forecast panel"}
               onClick={() => setIsPanelCollapsed((prev) => !prev)}
-              className="absolute -left-7 top-1/2 z-20 flex h-11 w-7 -translate-y-1/2 items-center justify-center rounded-l-md border border-r-0 border-slate-300 bg-white text-slate-500 shadow-sm hover:bg-slate-50 hover:text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+              className="absolute -left-7 top-1/2 z-20 flex h-11 w-7 -translate-y-1/2 items-center justify-center rounded-l-md border border-r-0 border-slate-700 bg-slate-900 text-slate-400 shadow-md hover:bg-slate-800 hover:text-cyan-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500"
             >
               <svg
                 className="h-4 w-4"

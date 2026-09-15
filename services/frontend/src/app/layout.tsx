@@ -7,7 +7,7 @@ import { ForecastSelectionProvider } from "@/context/forecast-selection";
 import { SelectedLocationProvider } from "@/context/selected-location";
 
 export const metadata: Metadata = {
-  title: "Weather Platform",
+  title: "Zeus Wx",
   description: "Global probabilistic weather forecasting",
 };
 

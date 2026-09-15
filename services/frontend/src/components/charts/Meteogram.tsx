@@ -259,8 +259,8 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
   return (
     <div className="mb-4">
       <div className="mb-1 flex items-baseline justify-between">
-        <h4 className="text-sm font-medium text-slate-800">{meta.name}</h4>
-        <span className="text-xs text-slate-500">{meta.unit}</span>
+        <h4 className="text-sm font-semibold text-slate-200">{meta.name}</h4>
+        <span className="text-xs font-mono text-cyan-400">{meta.unit}</span>
       </div>
 
       {isPrecipAmount3h && (
@@ -327,16 +327,16 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
                 </linearGradient>
               ))}
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
             <XAxis
               dataKey="label"
-              tick={{ fontSize: 10, fill: "#64748b" }}
+              tick={{ fontSize: 10, fill: "#94a3b8" }}
               tickLine={false}
               tickMargin={variableCode === "wind_10m" ? 22 : 0}
               interval="preserveStartEnd"
             />
             <YAxis
-              tick={{ fontSize: 10, fill: "#64748b" }}
+              tick={{ fontSize: 10, fill: "#94a3b8" }}
               tickLine={false}
               axisLine={false}
               width={46}
@@ -385,7 +385,14 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
                 }
                 return timezone ? formatDayHourWithTimeZone(label, timezone) : `${label} UTC`;
               }}
-              contentStyle={{ fontSize: 12 }}
+              contentStyle={{
+                fontSize: 12,
+                backgroundColor: "#0f172a",
+                borderColor: "#334155",
+                color: "#f8fafc",
+                borderRadius: 8,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+              }}
             />
             {isPrecipitation ? (
               <Bar
@@ -403,9 +410,9 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
               <Line
                 dataKey="value"
                 type="monotone"
-                stroke="#1d4ed8"
+                stroke="#38bdf8"
                 strokeWidth={2}
-                dot={{ r: 2, fill: "#1d4ed8" }}
+                dot={{ r: 2, fill: "#38bdf8" }}
                 isAnimationActive={false}
                 connectNulls
                 name={meta.name}
