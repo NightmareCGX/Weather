@@ -88,10 +88,10 @@ export class MockMap {
   loaded = jest.fn(() => this.isLoaded);
   isStyleLoaded = jest.fn(() => this._isStyleLoaded);
   getBounds = jest.fn(() => ({
-    getSouth: () => -85,
-    getNorth: () => 85,
-    getWest: () => -180,
-    getEast: () => 180,
+    getSouth: (): number => -85,
+    getNorth: (): number => 85,
+    getWest: (): number => -180,
+    getEast: (): number => 180,
   }));
   project = jest.fn(([lng, lat]: [number, number]) => ({
     x: (lng + 180) * 2,

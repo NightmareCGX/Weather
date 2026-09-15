@@ -70,6 +70,24 @@ export function sampleVectorBilinear(
 }
 
 /**
+ * Projects a latitude in degrees [-85, 85] to Web Mercator Y coordinate.
+ */
+export function latToMercatorY(lat: number): number {
+  const clamped = Math.max(-DEFAULT_LAT_CLAMP, Math.min(DEFAULT_LAT_CLAMP, lat));
+  const rad = (clamped * Math.PI) / 180.0;
+  return Math.log(Math.tan(Math.PI / 4.0 + rad / 2.0));
+}
+
+/**
+ * Inverts a Web Mercator Y coordinate back to latitude in degrees [-85, 85].
+ */
+export function mercatorYToLat(y: number): number {
+  const rad = 2.0 * Math.atan(Math.exp(y)) - Math.PI / 2.0;
+  const deg = (rad * 180.0) / Math.PI;
+  return Math.max(-DEFAULT_LAT_CLAMP, Math.min(DEFAULT_LAT_CLAMP, deg));
+}
+
+/**
  * Advect a geographic point given local (u, v) wind velocity in m/s.
  *
  * Accounts for Earth spherical geometry and latitude convergence.
@@ -81,7 +99,8 @@ export function advectParticle(
   v: number,
   dtSeconds = 60.0,
   latClamp = DEFAULT_LAT_CLAMP,
-  earthRadiusM = EARTH_RADIUS_METERS
+  earthRadiusM = EARTH_RADIUS_METERS,
+  wrapLon = false
 ): [number, number] {
   if (Number.isNaN(lat) || Number.isNaN(lon) || Number.isNaN(u) || Number.isNaN(v)) {
     return [NaN, NaN];
@@ -96,6 +115,10 @@ export function advectParticle(
 
   const newLat = Math.max(-latClamp, Math.min(latClamp, lat + dlatDeg));
   const newLon = lon + dlonDeg;
+
+  if (!wrapLon) {
+    return [newLat, newLon];
+  }
 
   let normLon = ((((newLon + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
   if (normLon === -180.0 && newLon > 0) {
@@ -242,14 +265,20 @@ export class WindParticleAnimation {
 
   private createRandomParticle(randomAge = false): Particle {
     const bounds = this.map.getBounds();
-    const south = Math.max(-85, bounds.getSouth());
-    const north = Math.min(85, bounds.getNorth());
+    const south = Math.max(-DEFAULT_LAT_CLAMP, bounds.getSouth());
+    const north = Math.min(DEFAULT_LAT_CLAMP, bounds.getNorth());
     const west = bounds.getWest();
     const east = bounds.getEast();
 
-    const lat = south + Math.random() * (north - south);
-    let lon = west + Math.random() * (east - west);
-    lon = ((((lon + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
+    // Uniform random distribution in Web Mercator Y space ensures uniform
+    // screen pixel density across latitudes without high-latitude stretching.
+    const ySouth = latToMercatorY(south);
+    const yNorth = latToMercatorY(north);
+    const randY = ySouth + Math.random() * (yNorth - ySouth);
+    const lat = mercatorYToLat(randY);
+
+    // Continuous longitude across visible world copies ensures full screen coverage
+    const lon = west + Math.random() * (east - west);
 
     const maxAge = 40 + Math.floor(Math.random() * 60);
     const age = randomAge ? Math.floor(Math.random() * maxAge) : 0;
@@ -337,7 +366,17 @@ export class WindParticleAnimation {
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
 
-      if (p.age >= p.maxAge || p.lat < south || p.lat > north || !p.visible) {
+      if (
+        p.age >= p.maxAge ||
+        p.lat < south ||
+        p.lat > north ||
+        !p.visible ||
+        (p.prevX !== null &&
+          (p.prevX < -50 * dpr ||
+            p.prevX > width + 50 * dpr ||
+            p.prevY! < -50 * dpr ||
+            p.prevY! > height + 50 * dpr))
+      ) {
         this.particles[i] = this.createRandomParticle(false);
         continue;
       }
