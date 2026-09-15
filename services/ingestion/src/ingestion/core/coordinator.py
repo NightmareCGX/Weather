@@ -850,152 +850,160 @@ class RunCoordinator:
         )
         if observer is not None and hasattr(observer, "record_milestone"):
             observer.record_milestone("finalize_start")
+
+        # Fast-fail check before pre-flight
+        self._assert_not_fenced_under_gate(conn, "run finalization")
+
+        # Phase 1: Marker Listing (Pre-flight Read-Only Inspection outside EXCLUSIVE gate)
+        mode = read_protocol_version(self.store_path)
+
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("marker_listing_start")
+        marker_keys = list_region_marker_keys(self.store_path)
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("marker_listing_complete")
+
+        # Phase 2: Marker Read & Validation (Pre-flight Read-Only Inspection outside EXCLUSIVE gate)
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("marker_read_validation_start")
+
+        data_var_paths = _store_data_var_paths(self.store_path, snapshot=self._snapshot)
+        existing_objects: set[str] | None = None
+        if verify_full_inventory:
+            from ingestion.core.inventory import build_object_inventory
+
+            existing_objects = (
+                build_object_inventory(self.store_path, data_var_paths)
+                if data_var_paths
+                else set()
+            )
+
+        # Populate the .zarray, .zattrs, and member coordinate caches once
+        # so per-marker region-key derivation avoids repeated remote reads.
+        from ingestion.core.inventory import _read_zarray, _read_zattrs
+
+        for array_path in data_var_paths:
+            if array_path not in self._zarray_cache:
+                za = _read_zarray(self.store_path, array_path)
+                if za is not None:
+                    self._zarray_cache[array_path] = za
+            if array_path not in self._zattrs_cache:
+                zat = _read_zattrs(self.store_path, array_path)
+                if zat is not None:
+                    self._zattrs_cache[array_path] = zat
+
+        if not self._member_index_cache and spec.is_ensemble:
+            if self._snapshot is not None and self._snapshot.member_index_map:
+                self._member_index_cache = dict(self._snapshot.member_index_map)
+            else:
+                try:
+                    from ingestion.core.zarr_writer import _resolve_store
+
+                    resolved = _resolve_store(self.store_path)
+                    ds = xr.open_zarr(resolved, consolidated=False)
+                    if "member" in ds.coords:
+                        member_vals = np.atleast_1d(ds.coords["member"].values).reshape(-1)
+                        self._member_index_cache = {int(v): i for i, v in enumerate(member_vals)}
+                    ds.close()
+                except Exception:
+                    pass
+
+        committed: dict[str, str] = {}  # region_id -> generation
+        updating: list[str] = []
+        marker_results = _read_marker_payloads_bounded(
+            self.store_path, marker_keys, max_concurrency=marker_concurrency
+        )
+        for key, payload in marker_results:
+            region_id = key.rsplit("/", 1)[-1].removesuffix(".json")
+            state = payload.get("state")
+            gen = payload.get("generation")
+            if state == "complete":
+                if self._marker_evidence_valid(
+                    region_id,
+                    payload,
+                    existing_objects=existing_objects,
+                    verify_physical_objects=verify_full_inventory,
+                ):
+                    committed[region_id] = str(gen)
+                else:
+                    updating.append(region_id)
+            elif state == "updating":
+                updating.append(region_id)
+
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("marker_read_validation_complete")
+
+        # Phase 3: Manifest Generation & Write
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("manifest_write_start")
+            observer.record_milestone("manifest_payload_build_start")
+
+        # Hybrid mode: marker-less regions use the legacy rule.
+        legacy_evidence: list[str] = []
+        if mode == HYBRID:
+            # Any region in the store's expected set without a marker is a
+            # legacy region (kept under the legacy committed-state rule).
+            pass
+        committed_state = self._committed_state_from_regions(
+            committed, updating, expected_leads, expected_members, mode
+        )
+        # Compute fingerprints + manifest generation.
+        run_identity = {
+            "model_version_id": spec.version_string,
+            "cycle_time": spec.cycle_time.isoformat(),
+            "is_ensemble": spec.is_ensemble,
+        }
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("manifest_fingerprint_start")
+        store_schema_fp = _store_schema_fingerprint(self.store_path, snapshot=self._snapshot)
+        legacy_fp = (
+            region_evidence_fingerprint(self.store_path, legacy_evidence)
+            if mode in (LEGACY, HYBRID)
+            else None
+        )
+        serving_fp = serving_state_fingerprint(
+            store_protocol_mode=mode,
+            run_identity=run_identity,
+            store_schema_fingerprint=store_schema_fp,
+            region_serving_states=_region_serving_states(committed, updating, mode),
+        )
+        committed_fp = sha256_hex("committed", *sorted(committed.keys()))
+        markers_fp = sha256_hex("markers", *sorted(marker_keys))
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("manifest_fingerprint_complete")
+
+        existing_manifest = read_manifest(self.store_path)
+        if (
+            existing_manifest is not None
+            and existing_manifest.get("serving_state_fingerprint") == serving_fp
+        ):
+            generation = str(existing_manifest.get("generation"))
+        else:
+            generation = _new_generation()
+
+        payload = {
+            "manifest_schema_version": 1,
+            "store_protocol_mode": mode,
+            "storage_format_version": getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
+            "generation": generation,
+            "run_identity": run_identity,
+            "canonical_store_identity_hash": _store_identity_hash(self.store_path),
+            "serving_state_fingerprint": serving_fp,
+            "committed_state_fingerprint": committed_fp,
+            "store_schema_fingerprint": store_schema_fp,
+            "region_marker_set_fingerprint": markers_fp,
+            "legacy_region_evidence_fingerprint": legacy_fp,
+        }
+        if observer is not None and hasattr(observer, "record_milestone"):
+            observer.record_milestone("manifest_payload_build_complete")
+
+        # Phase 3b & Phase 4: Atomic Commit under Narrowed EXCLUSIVE Gate
         co.acquire_admission()
         co.acquire_exclusive_gate()
         try:
             self._assert_not_fenced_under_gate(conn, "run finalization")
-            mode = read_protocol_version(self.store_path)
-
-            # Phase 1: Marker Listing
-            if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("marker_listing_start")
-            marker_keys = list_region_marker_keys(self.store_path)
-            if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("marker_listing_complete")
-
-            # Phase 2: Marker Read & Validation
-            if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("marker_read_validation_start")
-
-            data_var_paths = _store_data_var_paths(self.store_path, snapshot=self._snapshot)
-            existing_objects: set[str] | None = None
-            if verify_full_inventory:
-                from ingestion.core.inventory import build_object_inventory
-
-                existing_objects = (
-                    build_object_inventory(self.store_path, data_var_paths)
-                    if data_var_paths
-                    else set()
-                )
-
-            # Populate the .zarray, .zattrs, and member coordinate caches once
-            # so per-marker region-key derivation avoids repeated remote reads.
-            from ingestion.core.inventory import _read_zarray, _read_zattrs
-
-            for array_path in data_var_paths:
-                if array_path not in self._zarray_cache:
-                    za = _read_zarray(self.store_path, array_path)
-                    if za is not None:
-                        self._zarray_cache[array_path] = za
-                if array_path not in self._zattrs_cache:
-                    zat = _read_zattrs(self.store_path, array_path)
-                    if zat is not None:
-                        self._zattrs_cache[array_path] = zat
-
-            if not self._member_index_cache and spec.is_ensemble:
-                if self._snapshot is not None and self._snapshot.member_index_map:
-                    self._member_index_cache = dict(self._snapshot.member_index_map)
-                else:
-                    try:
-                        from ingestion.core.zarr_writer import _resolve_store
-
-                        resolved = _resolve_store(self.store_path)
-                        ds = xr.open_zarr(resolved, consolidated=False)
-                        if "member" in ds.coords:
-                            member_vals = np.atleast_1d(ds.coords["member"].values).reshape(-1)
-                            self._member_index_cache = {int(v): i for i, v in enumerate(member_vals)}
-                        ds.close()
-                    except Exception:
-                        pass
-
-            committed: dict[str, str] = {}  # region_id -> generation
-            updating: list[str] = []
-            marker_results = _read_marker_payloads_bounded(
-                self.store_path, marker_keys, max_concurrency=marker_concurrency
-            )
-            for key, payload in marker_results:
-                region_id = key.rsplit("/", 1)[-1].removesuffix(".json")
-                state = payload.get("state")
-                gen = payload.get("generation")
-                if state == "complete":
-                    if self._marker_evidence_valid(
-                        region_id,
-                        payload,
-                        existing_objects=existing_objects,
-                        verify_physical_objects=verify_full_inventory,
-                    ):
-                        committed[region_id] = str(gen)
-                    else:
-                        updating.append(region_id)
-                elif state == "updating":
-                    updating.append(region_id)
 
             if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("marker_read_validation_complete")
-
-            # Phase 3: Manifest Generation & Write
-            if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("manifest_write_start")
-                observer.record_milestone("manifest_payload_build_start")
-
-            # Hybrid mode: marker-less regions use the legacy rule.
-            legacy_evidence: list[str] = []
-            if mode == HYBRID:
-                # Any region in the store's expected set without a marker is a
-                # legacy region (kept under the legacy committed-state rule).
-                pass
-            committed_state = self._committed_state_from_regions(
-                committed, updating, expected_leads, expected_members, mode
-            )
-            # Compute fingerprints + manifest generation.
-            run_identity = {
-                "model_version_id": spec.version_string,
-                "cycle_time": spec.cycle_time.isoformat(),
-                "is_ensemble": spec.is_ensemble,
-            }
-            if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("manifest_fingerprint_start")
-            store_schema_fp = _store_schema_fingerprint(self.store_path, snapshot=self._snapshot)
-            legacy_fp = (
-                region_evidence_fingerprint(self.store_path, legacy_evidence)
-                if mode in (LEGACY, HYBRID)
-                else None
-            )
-            serving_fp = serving_state_fingerprint(
-                store_protocol_mode=mode,
-                run_identity=run_identity,
-                store_schema_fingerprint=store_schema_fp,
-                region_serving_states=_region_serving_states(committed, updating, mode),
-            )
-            committed_fp = sha256_hex("committed", *sorted(committed.keys()))
-            markers_fp = sha256_hex("markers", *sorted(marker_keys))
-            if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("manifest_fingerprint_complete")
-
-            existing_manifest = read_manifest(self.store_path)
-            if (
-                existing_manifest is not None
-                and existing_manifest.get("serving_state_fingerprint") == serving_fp
-            ):
-                generation = str(existing_manifest.get("generation"))
-            else:
-                generation = _new_generation()
-
-            payload = {
-                "manifest_schema_version": 1,
-                "store_protocol_mode": mode,
-                "storage_format_version": getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
-                "generation": generation,
-                "run_identity": run_identity,
-                "canonical_store_identity_hash": _store_identity_hash(self.store_path),
-                "serving_state_fingerprint": serving_fp,
-                "committed_state_fingerprint": committed_fp,
-                "store_schema_fingerprint": store_schema_fp,
-                "region_marker_set_fingerprint": markers_fp,
-                "legacy_region_evidence_fingerprint": legacy_fp,
-            }
-            if observer is not None and hasattr(observer, "record_milestone"):
-                observer.record_milestone("manifest_payload_build_complete")
                 observer.record_milestone("manifest_put_start")
 
             write_manifest(self.store_path, payload)

@@ -5,12 +5,12 @@ import type { Map as MapLibreMap } from "maplibre-gl";
 
 import type { SpatialLayer, ValidTimeAvailability } from "@/lib/api/types";
 
-/** Fetch budget per trigger; a z5-z6 viewport typically covers 6-48 tiles. */
-const MAX_TILES_PER_TRIGGER = 64;
-/** Concurrent prefetch requests (gentle on HTTP/1.1, irrelevant on HTTP/2). */
-const MAX_CONCURRENCY = 4;
-/** Delay after a trigger so foreground tiles settle before warming starts. */
-const PREFETCH_DELAY_MS = 400;
+/** Fetch budget per trigger; restricted to viewport core to prevent background bursts. */
+const MAX_TILES_PER_TRIGGER = 24;
+/** Concurrent prefetch requests (gentle background workers). */
+const MAX_CONCURRENCY = 2;
+/** Delay after a trigger so foreground viewport and charts settle before warming starts. */
+const PREFETCH_DELAY_MS = 2000;
 /** Move-end debounce: wait for the viewport to stop changing. */
 const MOVE_END_DEBOUNCE_MS = 500;
 /** Bounded dedup-set size; URLs are immutable so clearing only costs redundant fetches. */
