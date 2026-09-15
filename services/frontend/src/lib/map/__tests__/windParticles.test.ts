@@ -6,6 +6,8 @@ import {
   DEFAULT_LAT_CLAMP,
   EARTH_RADIUS_METERS,
   isCalmWind,
+  latToMercatorY,
+  mercatorYToLat,
   sampleVectorBilinear,
   WindParticleAnimation,
 } from "../windParticles";
@@ -74,6 +76,32 @@ describe("windParticles math", () => {
     });
   });
 
+  describe("latToMercatorY and mercatorYToLat", () => {
+    it("maps equator to zero and preserves symmetry", () => {
+      expect(latToMercatorY(0.0)).toBeCloseTo(0.0);
+      expect(mercatorYToLat(0.0)).toBeCloseTo(0.0);
+
+      const y45 = latToMercatorY(45.0);
+      const yNeg45 = latToMercatorY(-45.0);
+      expect(y45).toBeCloseTo(-yNeg45);
+    });
+
+    it("round-trips latitudes across key ranges accurately", () => {
+      for (const lat of [-80.0, -60.0, -30.0, 0.0, 30.0, 60.0, 80.0]) {
+        const y = latToMercatorY(lat);
+        const reconstructed = mercatorYToLat(y);
+        expect(reconstructed).toBeCloseTo(lat, 4);
+      }
+    });
+
+    it("clamps at DEFAULT_LAT_CLAMP boundaries", () => {
+      const yOver = latToMercatorY(89.0);
+      const yClamp = latToMercatorY(DEFAULT_LAT_CLAMP);
+      expect(yOver).toBeCloseTo(yClamp);
+      expect(mercatorYToLat(yOver)).toBeCloseTo(DEFAULT_LAT_CLAMP);
+    });
+  });
+
   describe("advectParticle", () => {
     it("advects purely northward from the equator", () => {
       const dt = 3600.0; // 1 hour
@@ -84,21 +112,42 @@ describe("windParticles math", () => {
       expect(newLon).toBeCloseTo(0.0);
     });
 
-    it("advects across the antimeridian dateline (+180)", () => {
+    it("advects continuously across the antimeridian dateline (+180) by default", () => {
       const dt = 3600.0;
       const u = 100.0;
       const [newLat, newLon] = advectParticle(0.0, 179.0, u, 0.0, dt);
       const expectedDlon = ((100.0 * 3600.0) / EARTH_RADIUS_METERS) * (180.0 / Math.PI);
       expect(newLat).toBeCloseTo(0.0);
+      // Continuous unwrapped longitude: does not jump to negative values
+      expect(newLon).toBeCloseTo(179.0 + expectedDlon);
+      expect(newLon).toBeGreaterThan(180.0);
+    });
+
+    it("supports optional longitude wrapping when wrapLon is true", () => {
+      const dt = 3600.0;
+      const u = 100.0;
+      const [newLat, newLon] = advectParticle(
+        0.0,
+        179.0,
+        u,
+        0.0,
+        dt,
+        DEFAULT_LAT_CLAMP,
+        EARTH_RADIUS_METERS,
+        true
+      );
+      const expectedDlon = ((100.0 * 3600.0) / EARTH_RADIUS_METERS) * (180.0 / Math.PI);
+      expect(newLat).toBeCloseTo(0.0);
       expect(newLon).toBeCloseTo(179.0 + expectedDlon - 360.0);
     });
 
-    it("advects across the antimeridian dateline (-180)", () => {
+    it("advects continuously across negative antimeridian dateline (-180) by default", () => {
       const dt = 3600.0;
       const u = -100.0;
       const [newLat, newLon] = advectParticle(0.0, -179.0, u, 0.0, dt);
       const expectedDlon = ((100.0 * 3600.0) / EARTH_RADIUS_METERS) * (180.0 / Math.PI);
-      expect(newLon).toBeCloseTo(-179.0 - expectedDlon + 360.0);
+      expect(newLon).toBeCloseTo(-179.0 - expectedDlon);
+      expect(newLon).toBeLessThan(-180.0);
     });
 
     it("clamps at high latitude poles", () => {
@@ -196,6 +245,35 @@ describe("WindParticleAnimation", () => {
     anim.setField(sampleField);
     anim.start();
     anim.stop();
+    anim.destroy();
+  });
+
+  it("spawns particles across unconstrained longitude bounds when crossing the antimeridian", () => {
+    map.getBounds = jest.fn(() => ({
+      getSouth: (): number => -60,
+      getNorth: (): number => 60,
+      getWest: (): number => -50,
+      getEast: (): number => 250,
+    }));
+
+    const anim = new WindParticleAnimation(canvas, map as any);
+    const particles = (anim as any).particles as Array<{ lat: number; lon: number }>;
+    expect(particles.length).toBeGreaterThan(0);
+
+    // Should include particles spanning both west (< 0) and east (> 180) across the full viewport
+    const hasEastOfAntimeridian = particles.some((p) => p.lon > 180.0);
+    const hasWestOfPrime = particles.some((p) => p.lon < 0.0);
+
+    expect(hasEastOfAntimeridian).toBe(true);
+    expect(hasWestOfPrime).toBe(true);
+
+    for (const p of particles) {
+      expect(p.lon).toBeGreaterThanOrEqual(-50.0);
+      expect(p.lon).toBeLessThanOrEqual(250.0);
+      expect(p.lat).toBeGreaterThanOrEqual(-60.0);
+      expect(p.lat).toBeLessThanOrEqual(60.0);
+    }
+
     anim.destroy();
   });
 });
