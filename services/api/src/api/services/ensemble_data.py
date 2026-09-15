@@ -696,6 +696,137 @@ def _require_ensemble_model(db: Session, model: str) -> None:
         )
 
 
+def build_ensemble_statistics_series(
+    db: Session,
+    *,
+    latitude: float,
+    longitude: float,
+    variable: str,
+    model: str,
+    leads: list[int] | None = None,
+    include_members: bool = False,
+    initial_time: str | None = None,
+    now: Any | None = None,
+) -> list[EnsembleStatisticsData]:
+    """Build ensemble statistics across multiple leads for a resolved point."""
+    from collections import defaultdict
+    from datetime import datetime, timedelta
+    from api.core.time import get_current_time
+    from domain.temporal import serving_start_valid_time
+
+    _validate_coordinates(latitude, longitude)
+    _require_ensemble_model(db, model)
+    expected_members = get_expected_members(model, default_if_unknown=30)
+
+    if initial_time is not None:
+        require_cycle_visible(db, initial_time)
+
+    stmt = (
+        select(ModelRun)
+        .join(ModelRun.model_version)
+        .join(ModelVersion.model)
+        .where(Model.model_id == model)
+        .where(ModelRun.status.in_(SERVING_ELIGIBLE_STATUSES))
+        .where(ModelRun.zarr_store_path.isnot(None))
+    )
+    if initial_time is not None:
+        stmt = stmt.where(ModelRun.cycle_time == _parse_cycle_time(initial_time))
+    stmt = filter_visible_runs(stmt).order_by(ModelRun.cycle_time.desc())
+    runs = list(db.execute(stmt).scalars().all())
+    if not runs:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No forecast run with data was found for model '{model}'"
+            + (f" and initial time '{initial_time}'." if initial_time else "."),
+        )
+    run = runs[0]
+    assert run.zarr_store_path is not None
+    store_path_str = str(run.zarr_store_path)
+    provenance_run_id = str(run.id)
+
+    metadata = gated_cycle_metadata(store_path_str)
+    _resolve_variables(db, metadata, [variable])
+
+    if leads is not None:
+        target_leads = [ld for ld in leads if ld in metadata.lead_times]
+    else:
+        target_leads = sorted(metadata.lead_times)
+
+    now_utc = now if isinstance(now, datetime) else get_current_time()
+    min_vt = serving_start_valid_time(now_utc)
+    target_leads = [
+        ld for ld in target_leads
+        if (run.cycle_time + timedelta(hours=ld)) >= min_vt
+    ]
+
+    if not target_leads:
+        return []
+
+    member_rows = db.execute(
+        select(EnsembleMemberProduct.lead_time_hours, EnsembleMemberProduct.member_index).where(
+            EnsembleMemberProduct.run_id == run.id,
+            EnsembleMemberProduct.lead_time_hours.in_(target_leads),
+        )
+    ).all()
+    members_by_lead: dict[int, list[int]] = defaultdict(list)
+    for ld, m_idx in member_rows:
+        members_by_lead[ld].append(int(m_idx))
+
+    from api.models.entities import ReclamationQueue
+
+    fenced_rows = db.execute(
+        select(ReclamationQueue.lead_time_hours, ReclamationQueue.member_index).where(
+            ReclamationQueue.run_id == run.id,
+            ReclamationQueue.lead_time_hours.in_(target_leads),
+            ReclamationQueue.target_kind == "mem",
+            ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+        )
+    ).all()
+    fenced_by_lead: dict[int, set[int]] = defaultdict(set)
+    for ld, m_idx in fenced_rows:
+        fenced_by_lead[ld].add(int(m_idx))
+
+    results: list[EnsembleStatisticsData] = []
+    for ld in target_leads:
+        avail_list = members_by_lead.get(ld, [])
+        if not avail_list and run.status == "ready":
+            avail_list = list(range(1, expected_members + 1))
+        fenced = fenced_by_lead.get(ld, set())
+        avail_members = tuple(sorted(m for m in avail_list if m not in fenced))
+
+        if not is_lead_servable(len(avail_members), expected_members):
+            continue
+
+        try:
+            source = type(
+                "Source",
+                (),
+                {
+                    "member_indices": avail_members,
+                    "store_path": store_path_str,
+                    "lead_time_hours": ld,
+                    "run_id": provenance_run_id,
+                },
+            )()
+            item = build_ensemble_statistics(
+                db,
+                latitude=latitude,
+                longitude=longitude,
+                variable=variable,
+                model=model,
+                lead_time_hours=ld,
+                include_members=include_members,
+                initial_time=initial_time,
+                source=source,
+            )
+            results.append(item)
+        except Exception as exc:
+            logger.warning("Failed computing ensemble lead %d: %s", ld, exc)
+            continue
+
+    return results
+
+
 def _probability(
     members: list[float],
     threshold: float,

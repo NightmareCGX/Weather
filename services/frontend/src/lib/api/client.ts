@@ -305,6 +305,47 @@ export async function getEnsembleStatistics({
   return request<EnsembleStatisticsData>(`/ensembles?${params.toString()}`, { signal });
 }
 
+export interface GetEnsembleStatisticsSeriesParams {
+  latitude: number;
+  longitude: number;
+  variable: string;
+  model?: string;
+  leads?: number[] | "all";
+  initialTime?: string;
+  includeMembers?: boolean;
+  signal?: AbortSignal;
+}
+
+export async function getEnsembleStatisticsSeries({
+  latitude,
+  longitude,
+  variable,
+  model = "gefs",
+  leads = "all",
+  initialTime,
+  includeMembers = false,
+  signal,
+}: GetEnsembleStatisticsSeriesParams): Promise<EnsembleStatisticsData[]> {
+  const params = new URLSearchParams({
+    lat: String(latitude),
+    lon: String(longitude),
+    variable,
+    model,
+  });
+  if (Array.isArray(leads)) {
+    params.set("leads", leads.join(","));
+  } else {
+    params.set("leads", String(leads));
+  }
+  if (initialTime !== undefined) {
+    params.set("initial_time", initialTime);
+  }
+  if (includeMembers) {
+    params.set("include_members", "true");
+  }
+  return request<EnsembleStatisticsData[]>(`/ensembles?${params.toString()}`, { signal });
+}
+
 export async function listVariables(signal?: AbortSignal): Promise<VariableResource[]> {
   return request<VariableResource[]>(`/variables`, { signal });
 }

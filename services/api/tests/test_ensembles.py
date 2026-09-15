@@ -373,3 +373,23 @@ def test_ensembles_conflicting_valid_time_and_initial_time_rejected(client):
     )
     assert resp.status_code == 422
     assert "Provide either valid_time or initial_time" in resp.json()["error"]["message"]
+
+
+def test_ensembles_batch_leads(client):
+    """P0-2: Verify batch series extraction when `leads` query param is provided."""
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=temperature_2m&leads=0,6,12"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    data = body["data"]
+    assert isinstance(data, list)
+    assert len(data) >= 1
+    leads_found = [item["lead_time_hours"] for item in data]
+    assert 6 in leads_found
+    for item in data:
+        assert item["model"] == "gefs"
+        assert item["statistics"] is not None
+
