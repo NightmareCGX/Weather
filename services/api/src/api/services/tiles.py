@@ -153,13 +153,12 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
     if variable_code in ("wind_10m", "wind_speed_10m"):
         return [
             (0.0, (255, 255, 255)),
-            (10.0, (199, 233, 192)),
-            (25.0, (116, 196, 118)),
-            (40.0, (65, 171, 93)),
-            (60.0, (66, 146, 198)),
-            (80.0, (8, 81, 156)),
-            (100.0, (122, 1, 119)),
-            (140.0, (73, 0, 106)),
+            (20.0, (199, 233, 192)),
+            (40.0, (116, 196, 118)),
+            (60.0, (65, 171, 93)),
+            (80.0, (66, 146, 198)),
+            (100.0, (8, 81, 156)),
+            (120.0, (73, 0, 106)),
         ]
     if variable_code == "visibility":
         return [
@@ -218,7 +217,7 @@ def _data_range(variable_code: str) -> tuple[float, float]:
     if variable_code == "wind_gust":
         return (0.0, 150.0)
     if variable_code in ("wind_10m", "wind_speed_10m"):
-        return (0.0, 140.0)
+        return (0.0, 120.0)
     if variable_code == "visibility":
         return (0.0, 24.0)
     if variable_code == "snow_depth":

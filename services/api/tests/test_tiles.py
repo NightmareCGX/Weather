@@ -352,6 +352,7 @@ def test_phase1a_color_stops_and_data_ranges():
         "precipitation_rate",
         "relative_humidity_2m",
         "wind_gust",
+        "wind_10m",
         "visibility",
         "snow_depth",
     ]

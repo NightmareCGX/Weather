@@ -52,6 +52,22 @@ describe("getLegendTicks", () => {
     expect(ticks[3]).toEqual({ value: 20, label: "20", positionPercent: 100 });
   });
 
+  it("retains all uniform wind_10m ticks across 0..120 km/h range without thinning", () => {
+    const windStops: [number, string][] = [
+      [0.0, "#ffffff"],
+      [20.0, "#c7e9c0"],
+      [40.0, "#74c476"],
+      [60.0, "#41ab5d"],
+      [80.0, "#4292c6"],
+      [100.0, "#08519c"],
+      [120.0, "#49006a"],
+    ];
+    const ticks = getLegendTicks(windStops, "wind_10m");
+    expect(ticks).toHaveLength(7);
+    expect(ticks.map((t) => t.value)).toEqual([0, 20, 40, 60, 80, 100, 120]);
+    expect(ticks.map((t) => t.label)).toEqual(["0", "20", "40", "60", "80", "100", "120"]);
+  });
+
   it("drops overlapping close stops and keeps minimum visual distance", () => {
     const stops: [number, string][] = [
       [0, "#1"],
