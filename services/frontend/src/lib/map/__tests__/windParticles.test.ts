@@ -248,6 +248,40 @@ describe("WindParticleAnimation", () => {
     anim.destroy();
   });
 
+  it("supports controlled enabled option and setEnabled toggling", () => {
+    const animDisabled = new WindParticleAnimation(canvas, map as any, { enabled: false });
+    expect(animDisabled.isAnimationEnabled()).toBe(false);
+
+    const sampleField: VectorFieldData = {
+      meta: {
+        lat_start: 90.0,
+        lat_step: -0.5,
+        lat_count: 361,
+        lon_start: 0.0,
+        lon_step: 0.5,
+        lon_count: 720,
+        scale: 0.01,
+      },
+      u: new Float32Array(361 * 720).fill(5.0),
+      v: new Float32Array(361 * 720).fill(2.0),
+    };
+
+    animDisabled.setField(sampleField);
+    expect((animDisabled as any).isRunning).toBe(false);
+
+    // Explicitly enable
+    animDisabled.setEnabled(true);
+    expect(animDisabled.isAnimationEnabled()).toBe(true);
+    expect((animDisabled as any).isRunning).toBe(true);
+
+    // Explicitly disable
+    animDisabled.setEnabled(false);
+    expect(animDisabled.isAnimationEnabled()).toBe(false);
+    expect((animDisabled as any).isRunning).toBe(false);
+
+    animDisabled.destroy();
+  });
+
   it("spawns particles across unconstrained longitude bounds when crossing the antimeridian", () => {
     map.getBounds = jest.fn(() => ({
       getSouth: (): number => -60,

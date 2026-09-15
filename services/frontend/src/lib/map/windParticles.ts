@@ -151,6 +151,11 @@ export interface ParticleAnimationOptions {
   fadeOpacity?: number;
   color?: string;
   lineWidth?: number;
+  /**
+   * Explicit control over whether the particle animation is active.
+   * If omitted, defaults to true unless system reduced-motion is detected.
+   */
+  enabled?: boolean;
 }
 
 /**
@@ -165,6 +170,7 @@ export class WindParticleAnimation {
   private isRunning = false;
   private isHidden = false;
   private isReducedMotion = false;
+  private enabled = true;
   private rafId: number | null = null;
   private lastTimestamp = 0;
   private dpr = 1;
@@ -174,15 +180,20 @@ export class WindParticleAnimation {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d", { willReadFrequently: false });
     this.map = map;
+    this.checkReducedMotion();
+
+    const resolvedEnabled = options.enabled !== undefined ? options.enabled : !this.isReducedMotion;
+
     this.options = {
       maxParticles: options.maxParticles ?? 4000,
       speedScale: options.speedScale ?? 1.0,
       fadeOpacity: options.fadeOpacity ?? 0.96,
       color: options.color ?? "rgba(255, 255, 255, 0.75)",
       lineWidth: options.lineWidth ?? 1.2,
+      enabled: resolvedEnabled,
     };
+    this.enabled = resolvedEnabled;
 
-    this.checkReducedMotion();
     this.resize();
     this.bindEvents();
   }
@@ -212,7 +223,7 @@ export class WindParticleAnimation {
     this.isHidden = document.hidden;
     if (this.isHidden) {
       this.stop();
-    } else if (this.field !== null && !this.isReducedMotion) {
+    } else if (this.field !== null && this.enabled) {
       this.start();
     }
   };
@@ -220,6 +231,26 @@ export class WindParticleAnimation {
   private handleMapResize = (): void => {
     this.resize();
   };
+
+  public setEnabled(enabled: boolean): void {
+    if (this.enabled === enabled) {
+      return;
+    }
+    this.enabled = enabled;
+    if (!enabled) {
+      this.stop();
+      this.clear();
+      return;
+    }
+    if (this.field !== null && !this.isHidden) {
+      this.initParticles();
+      this.start();
+    }
+  }
+
+  public isAnimationEnabled(): boolean {
+    return this.enabled;
+  }
 
   public resize(): void {
     if (!this.canvas) return;
@@ -245,7 +276,7 @@ export class WindParticleAnimation {
     }
 
     this.initParticles();
-    if (!this.isReducedMotion && !this.isHidden) {
+    if (this.enabled && !this.isHidden) {
       this.start();
     }
   }
@@ -295,7 +326,7 @@ export class WindParticleAnimation {
   }
 
   public start(): void {
-    if (this.isRunning || this.field === null || this.isReducedMotion || this.isHidden) {
+    if (this.isRunning || this.field === null || !this.enabled || this.isHidden) {
       return;
     }
     this.isRunning = true;
