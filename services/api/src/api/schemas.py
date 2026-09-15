@@ -597,7 +597,7 @@ class EnsembleStatisticsEnvelope(BaseModel):
     """The ensemble statistics response envelope (API.md sections 5.1 and 2.3)."""
 
     object: Literal["ensemble_statistics"] = "ensemble_statistics"
-    data: EnsembleStatisticsData
+    data: EnsembleStatisticsData | list[EnsembleStatisticsData]
     has_more: bool = False
     next_cursor: str | None = None
 

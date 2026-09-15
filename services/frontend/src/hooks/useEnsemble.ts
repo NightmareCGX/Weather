@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-import { getEnsembleStatistics, RequestAbortedError } from "@/lib/api/client";
+import { getEnsembleStatisticsSeries, RequestAbortedError } from "@/lib/api/client";
 import type { EnsembleStatisticsData, SelectedLocation } from "@/lib/api/types";
 
 export type EnsembleStatus = "idle" | "loading" | "success" | "error";
@@ -51,47 +51,43 @@ export function useEnsemble(
 
     const controller = new AbortController();
     let active = true;
-    const results = new Map<number, EnsembleStatisticsData>();
-    let settled = 0;
-    let firstError: string | null = null;
 
     setByLead(new Map());
     setStatus("loading");
     setError(null);
 
-    for (const lead of leads) {
-      getEnsembleStatistics({
-        latitude: location.latitude,
-        longitude: location.longitude,
-        variable,
-        model,
-        leadTimeHours: lead,
-        signal: controller.signal,
+    getEnsembleStatisticsSeries({
+      latitude: location.latitude,
+      longitude: location.longitude,
+      variable,
+      model,
+      leads,
+      signal: controller.signal,
+    })
+      .then((payload) => {
+        if (!active) return;
+        const series = Array.isArray(payload) ? payload : [payload];
+        const results = new Map<number, EnsembleStatisticsData>();
+        for (const item of series) {
+          if (item && item.lead_time_hours !== undefined) {
+            results.set(item.lead_time_hours, item);
+          }
+        }
+        if (results.size > 0) {
+          setByLead(results);
+          setStatus("success");
+        } else {
+          setByLead(new Map());
+          setError("No ensemble statistics available.");
+          setStatus("error");
+        }
       })
-        .then((data) => {
-          if (!active) return;
-          results.set(lead, data);
-        })
-        .catch((err: unknown) => {
-          if (!active || err instanceof RequestAbortedError) return;
-          if (firstError === null) {
-            firstError = err instanceof Error ? err.message : "Failed to load ensemble statistics.";
-          }
-        })
-        .finally(() => {
-          settled += 1;
-          if (active && settled === leads.length) {
-            if (results.size > 0) {
-              setByLead(new Map(results));
-              setStatus("success");
-            } else {
-              setByLead(new Map());
-              setError(firstError ?? "No ensemble statistics available.");
-              setStatus("error");
-            }
-          }
-        });
-    }
+      .catch((err: unknown) => {
+        if (!active || err instanceof RequestAbortedError) return;
+        setByLead(new Map());
+        setError(err instanceof Error ? err.message : "Failed to load ensemble statistics.");
+        setStatus("error");
+      });
 
     return () => {
       active = false;

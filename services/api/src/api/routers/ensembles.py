@@ -67,6 +67,14 @@ def get_ensemble_statistics(
     lead_time_hours: Annotated[
         int | None, Query(ge=0, description="Forecast offset hours from cycle time.")
     ] = None,
+    leads: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Optional comma-separated lead hours or 'all' to request a batch series of leads."
+            )
+        ),
+    ] = None,
     valid_time: Annotated[
         str | None,
         Query(
@@ -100,11 +108,34 @@ def get_ensemble_statistics(
     """Return ensemble dispersion statistics for a forecast variable.
 
     Under Lifecycle V2:
+    - If ``leads`` is supplied, a batch series across multiple lead times is computed and returned.
     - If ``valid_time`` is supplied, the newest committed source cycle and lead
       are dynamically resolved via the shared ValidTimeResolver.
     - If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead
       serving is preserved for backward compatibility.
     """
+    if leads is not None:
+        from api.services.ensemble_data import build_ensemble_statistics_series
+
+        target_leads = (
+            None
+            if leads.strip().lower() == "all"
+            else [int(x.strip()) for x in leads.split(",") if x.strip().isdigit()]
+        )
+        series_data = build_ensemble_statistics_series(
+            db,
+            latitude=lat,
+            longitude=lon,
+            variable=variable,
+            model=model,
+            leads=target_leads,
+            include_members=include_members,
+            initial_time=initial_time,
+            now=now,
+        )
+        response.headers["Cache-Control"] = CACHE_CONTROL_ENSEMBLE
+        return EnsembleStatisticsEnvelope(data=series_data)
+
     from api.services.resolver import resolve_valid_time_source
 
     if valid_time is not None and initial_time is not None:

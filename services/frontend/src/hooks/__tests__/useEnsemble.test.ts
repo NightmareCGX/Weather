@@ -12,13 +12,13 @@ function jsonResponse(body: unknown, status = 200): Response {
   } as Response;
 }
 
-function statsResponse(lead: number, members?: number[]) {
+function batchStatsResponse(leads: number[]) {
   return jsonResponse({
     object: "ensemble_statistics",
-    data: {
+    data: leads.map((lead) => ({
       model: "gefs",
       lead_time_hours: lead,
-      member_count: members?.length ?? 5,
+      member_count: 5,
       statistics: {
         mean: 10 + lead,
         median: 10 + lead,
@@ -29,8 +29,7 @@ function statsResponse(lead: number, members?: number[]) {
         p75: 11 + lead,
         p90: 12 + lead,
       },
-      ...(members !== undefined ? { members } : {}),
-    },
+    })),
     has_more: false,
     next_cursor: null,
   });
@@ -54,38 +53,35 @@ beforeEach(() => {
 });
 
 describe("useEnsemble", () => {
-  it("fans out one request per lead and returns statistics by lead", async () => {
-    mockFetch.mockResolvedValueOnce(statsResponse(0));
-    mockFetch.mockResolvedValueOnce(statsResponse(6));
-    mockFetch.mockResolvedValueOnce(statsResponse(12));
+  it("requests batch series for leads and returns statistics by lead", async () => {
+    mockFetch.mockResolvedValueOnce(batchStatsResponse([0, 6, 12]));
 
     const { result } = renderHook(() =>
       useEnsemble(location, [0, 6, 12], "temperature_2m", { model: "gefs" })
     );
 
     await waitFor(() => expect(result.current.status).toBe("success"));
-    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(result.current.byLead.has(0)).toBe(true);
     expect(result.current.byLead.get(6)?.statistics.mean).toBe(16);
     expect(result.current.byLead.get(12)?.statistics.mean).toBe(22);
   });
 
-  it("tolerates individual lead failures and still succeeds with the rest", async () => {
-    mockFetch.mockResolvedValueOnce(statsResponse(0));
-    mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
-    mockFetch.mockResolvedValueOnce(statsResponse(12));
+  it("tolerates individual missing leads in batch and still succeeds with the rest", async () => {
+    mockFetch.mockResolvedValueOnce(batchStatsResponse([0, 12]));
 
     const { result } = renderHook(() =>
       useEnsemble(location, [0, 6, 12], "temperature_2m", { model: "gefs" })
     );
 
     await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(result.current.byLead.has(0)).toBe(true);
     expect(result.current.byLead.has(6)).toBe(false);
     expect(result.current.byLead.has(12)).toBe(true);
   });
 
-  it("errors when every lead fails", async () => {
+  it("errors when request fails", async () => {
     mockFetch.mockRejectedValue(new TypeError("Failed to fetch"));
 
     const { result } = renderHook(() =>
@@ -108,13 +104,7 @@ describe("useEnsemble", () => {
   });
 
   it("never issues a request with a metadata/coordinate field as the variable", async () => {
-    // Regression: a metadata/coordinate field such as `cycle_time` must never
-    // reach the API as `variable=…`. A single polluted `variable` fans out
-    // invalid 404 requests across EVERY lead time, so assert the exact query
-    // string carried by every request in a multi-lead fan-out.
-    mockFetch.mockResolvedValueOnce(statsResponse(0));
-    mockFetch.mockResolvedValueOnce(statsResponse(6));
-    mockFetch.mockResolvedValueOnce(statsResponse(12));
+    mockFetch.mockResolvedValueOnce(batchStatsResponse([0, 6, 12]));
 
     const { result } = renderHook(() =>
       useEnsemble(location, [0, 6, 12], "temperature_2m", { model: "gefs" })
@@ -122,15 +112,13 @@ describe("useEnsemble", () => {
 
     await waitFor(() => expect(result.current.status).toBe("success"));
 
-    expect(mockFetch).toHaveBeenCalledTimes(3);
-    const queriedVariables = mockFetch.mock.calls.map(([input]) => {
-      const url = new URL(String(input), "http://localhost");
-      return url.searchParams.get("variable");
-    });
-    expect(queriedVariables).toEqual(["temperature_2m", "temperature_2m", "temperature_2m"]);
-    expect(queriedVariables).not.toContain("cycle_time");
-    expect(queriedVariables).not.toContain("lead_time_hours");
-    expect(queriedVariables).not.toContain("valid_time");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [input] = mockFetch.mock.calls[0];
+    const url = new URL(String(input), "http://localhost");
+    expect(url.searchParams.get("variable")).toBe("temperature_2m");
+    expect(url.searchParams.get("leads")).toBe("0,6,12");
+    expect(url.searchParams.has("cycle_time")).toBe(false);
+    expect(url.searchParams.has("valid_time")).toBe(false);
   });
 
   it("stays idle when no ensemble model is selected", async () => {
@@ -144,13 +132,10 @@ describe("useEnsemble", () => {
   });
 
   it("Test F: clears previous byLead map immediately upon variable parameter transition", async () => {
-    mockFetch.mockResolvedValueOnce(statsResponse(0));
-    mockFetch.mockResolvedValueOnce(statsResponse(6));
+    mockFetch.mockResolvedValueOnce(batchStatsResponse([0, 6]));
 
-    let resolveTemp0!: (value: Response) => void;
-    let resolveTemp6!: (value: Response) => void;
-    mockFetch.mockImplementationOnce(() => new Promise<Response>((r) => (resolveTemp0 = r)));
-    mockFetch.mockImplementationOnce(() => new Promise<Response>((r) => (resolveTemp6 = r)));
+    let resolveTemp!: (value: Response) => void;
+    mockFetch.mockImplementationOnce(() => new Promise<Response>((r) => (resolveTemp = r)));
 
     const { result, rerender } = renderHook(
       ({ variable }: { variable: string }) =>
@@ -169,8 +154,7 @@ describe("useEnsemble", () => {
     expect(result.current.byLead.size).toBe(0);
 
     // Resolve the pending temperature responses
-    resolveTemp0(statsResponse(0));
-    resolveTemp6(statsResponse(6));
+    resolveTemp(batchStatsResponse([0, 6]));
 
     await waitFor(() => expect(result.current.status).toBe("success"));
     expect(result.current.byLead.size).toBe(2);

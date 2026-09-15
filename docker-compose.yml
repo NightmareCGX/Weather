@@ -102,6 +102,8 @@ services:
     restart: unless-stopped
     profiles:
       - gateway
+    tmpfs:
+      - /var/cache/nginx/tiles:size=2147483648,mode=0777
     environment:
       API_UPSTREAM: ${GATEWAY_API_UPSTREAM:-host.docker.internal:8000}
       FRONTEND_UPSTREAM: ${GATEWAY_FRONTEND_UPSTREAM:-host.docker.internal:3000}
