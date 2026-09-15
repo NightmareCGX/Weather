@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from api.services.cache import (
     build_ensemble_cache_key,
+    build_ensemble_series_cache_key,
     build_point_cache_key,
     build_probability_cache_key,
 )
@@ -89,3 +90,45 @@ def test_ensemble_catalog_retry_preserves_generation() -> None:
 def test_legacy_null_generation_distinct_from_real() -> None:
     # A legacy token (None) must never collide with a real generation.
     assert _point_key(None) != _point_key("gen1")
+
+
+def test_ensemble_series_cache_key_behavior() -> None:
+    key1 = build_ensemble_series_cache_key(
+        model="gefs",
+        latitude=38.5,
+        longitude=-106.5,
+        variable="temperature_2m",
+        leads=(0, 3, 6),
+        cycle_time="2026-07-22T00:00:00Z",
+        serving_generation="gen1",
+    )
+    key1_repeat = build_ensemble_series_cache_key(
+        model="gefs",
+        latitude=38.5,
+        longitude=-106.5,
+        variable="temperature_2m",
+        leads=(0, 3, 6),
+        cycle_time="2026-07-22T00:00:00Z",
+        serving_generation="gen1",
+    )
+    assert key1 == key1_repeat
+    key_diff_leads = build_ensemble_series_cache_key(
+        model="gefs",
+        latitude=38.5,
+        longitude=-106.5,
+        variable="temperature_2m",
+        leads=(0, 6, 12),
+        cycle_time="2026-07-22T00:00:00Z",
+        serving_generation="gen1",
+    )
+    assert key1 != key_diff_leads
+    key_diff_gen = build_ensemble_series_cache_key(
+        model="gefs",
+        latitude=38.5,
+        longitude=-106.5,
+        variable="temperature_2m",
+        leads=(0, 3, 6),
+        cycle_time="2026-07-22T00:00:00Z",
+        serving_generation="gen2",
+    )
+    assert key1 != key_diff_gen

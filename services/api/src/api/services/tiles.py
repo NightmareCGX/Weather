@@ -702,12 +702,11 @@ def _align_longitudes(grid: _TileGrid, lons: npt.NDArray[np.float64]) -> npt.NDA
 
 #: Server-side tile LRU cache: ``model/variable/level/z/x/y/lead/initial_time``
 #: -> PNG bytes. Bounded so the API process does not grow unbounded; the TTL
-#: aligns with the tile ``Cache-Control: max-age=300`` so newly-ingested runs
-#: become visible promptly. The cache key carries the full forecast identity
-#: (including the cycle via ``initial_time``), so a tile for one forecast run
-#: can never satisfy another's request.
-_TILE_CACHE_MAX_ENTRIES = 4096
-_TILE_CACHE_TTL_SECONDS = 300
+#: aligns with the tile cache policy (1800s). The cache key carries the full
+#: forecast identity (including the cycle via ``initial_time`` and serving_generation),
+#: so a tile for one forecast run/generation can never satisfy another's request.
+_TILE_CACHE_MAX_ENTRIES = 50000
+_TILE_CACHE_TTL_SECONDS = 1800
 _tile_cache: dict[tuple[object, ...], tuple[float, bytes]] = {}
 
 

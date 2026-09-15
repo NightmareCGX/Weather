@@ -29,9 +29,9 @@ upstream weather_frontend {
     keepalive 32;
 }
 
-# Tile cache backed by tmpfs (RAM mount): 2GB max, 1h inactive eviction.
+# Tile cache backed by tmpfs (RAM mount): 4GB max, 1h inactive eviction.
 # use_temp_path=off avoids disk copies by writing directly into the cache hierarchy.
-proxy_cache_path /var/cache/nginx/tiles levels=1:2 keys_zone=tile_cache:32m max_size=2g inactive=1h use_temp_path=off;
+proxy_cache_path /var/cache/nginx/tiles levels=1:2 keys_zone=tile_cache:32m max_size=4g inactive=1h use_temp_path=off;
 
 server {
     listen 80;

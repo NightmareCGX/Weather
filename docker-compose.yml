@@ -3,6 +3,14 @@ services:
     image: nickblah/postgis:18.6-trixie-postgis-3.6.4
     container_name: weather_postgres
     restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=32MB
+      - -c
+      - max_connections=200
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-weather_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weather_password}
@@ -27,14 +35,14 @@ services:
     command:
       - redis-server
       - --maxmemory
-      - 512mb
+      - 1280mb
       - --maxmemory-policy
       - allkeys-lru
       - --save
       - ""
       - --appendonly
       - "no"
-    mem_limit: 768m
+    mem_limit: 1536m
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
@@ -83,6 +91,59 @@ services:
       "
     restart: "no"
 
+  weather_api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    image: weather-platform-api:latest
+    container_name: weather_api
+    restart: unless-stopped
+    profiles:
+      - api
+      - full
+    mem_limit: 4g
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather_user}:${POSTGRES_PASSWORD:-weather_password}@weather_postgres:5432/${POSTGRES_DB:-weather_db}
+      REDIS_URL: redis://weather_redis:6379/0
+      MINIO_ENDPOINT: weather_minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
+      MINIO_SECURE: "false"
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-4}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      weather_postgres:
+        condition: service_healthy
+      weather_redis:
+        condition: service_healthy
+      weather_minio:
+        condition: service_healthy
+
+  weather_ingest:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ingestion
+    image: weather-platform-ingestion:latest
+    container_name: weather_ingest
+    restart: unless-stopped
+    profiles:
+      - ingest
+      - full
+    cpus: "2.0"
+    mem_limit: 4g
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather_user}:${POSTGRES_PASSWORD:-weather_password}@weather_postgres:5432/${POSTGRES_DB:-weather_db}
+      MINIO_ENDPOINT: weather_minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
+      WEATHER_INGEST_DECODE_CONCURRENCY: "2"
+    depends_on:
+      weather_postgres:
+        condition: service_healthy
+      weather_minio:
+        condition: service_healthy
+
   # Edge gateway (HTTP/2 over TLS, single origin): terminates TLS, routes
   # /v1/* straight to the FastAPI tier (tiles skip the Next.js proxy hop) and
   # everything else to the Next.js frontend. Optional profile so the default
@@ -102,8 +163,9 @@ services:
     restart: unless-stopped
     profiles:
       - gateway
+      - full
     tmpfs:
-      - /var/cache/nginx/tiles:size=2147483648,mode=0777
+      - /var/cache/nginx/tiles:size=4294967296,mode=0777
     environment:
       API_UPSTREAM: ${GATEWAY_API_UPSTREAM:-host.docker.internal:8000}
       FRONTEND_UPSTREAM: ${GATEWAY_FRONTEND_UPSTREAM:-host.docker.internal:3000}

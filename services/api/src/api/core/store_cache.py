@@ -93,10 +93,10 @@ import xarray as xr
 #: Maximum number of cached (store_path, generation) entries. Sized for the
 #: working set of the newest GFS/GEFS cycle stores across concurrent viewer
 #: patterns: entries hold lazy datasets (metadata + coordinate arrays) plus
-#: their S3 filesystem/mapper clients, so doubling the capacity trades a small
-#: bounded memory increase for far fewer re-opens when access alternates
+#: their S3 filesystem/mapper clients, so expanding the capacity to 64 trades a
+#: small bounded memory increase for far fewer re-opens when access alternates
 #: between model/variable stores.
-MAX_ENTRIES = 16
+MAX_ENTRIES = 64
 
 
 class _Flight:

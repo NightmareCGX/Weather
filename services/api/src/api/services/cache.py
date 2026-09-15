@@ -414,3 +414,29 @@ def build_ensemble_cache_key(
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "ensemble:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_ensemble_series_cache_key(
+    *,
+    model: str,
+    latitude: float,
+    longitude: float,
+    variable: str,
+    leads: str | tuple[int, ...] | None = None,
+    include_members: bool = False,
+    cycle_time: str | None = None,
+    serving_generation: str | None = None,
+) -> str:
+    """Build a deterministic cache key for a batch ensemble series request."""
+    payload = {
+        "model": model,
+        "cycle_time": cycle_time,
+        "serving_generation": serving_generation,
+        "latitude": latitude,
+        "longitude": longitude,
+        "variable": variable,
+        "leads": leads,
+        "include_members": include_members,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "ensemble_series:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
