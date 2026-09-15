@@ -160,9 +160,30 @@ export function EnsembleChart({
 
   return (
     <div className="mb-4">
-      <div className="mb-1 flex items-baseline justify-between">
-        <h4 className="text-sm font-medium text-slate-800">{variableLabel} — percentile range</h4>
-        <span className="text-xs text-slate-500">P10–P90 band · P25–P75 box · median · mean</span>
+      <div className="mb-1.5 space-y-1">
+        <div className="flex items-baseline gap-1.5">
+          <h4 className="text-sm font-semibold text-slate-100">{variableLabel}</h4>
+          {unit && <span className="text-xs font-normal text-slate-400">({unit})</span>}
+          <span className="text-xs font-mono text-cyan-400">· percentile range</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1 text-xs">
+          <div className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-2.5 w-2.5 rounded-sm border border-sky-400/70 bg-sky-400/30" />
+            <span className="font-mono text-[11px] text-slate-300">P10–P90</span>
+          </div>
+          <div className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-2.5 w-2.5 rounded-sm border border-sky-400/80 bg-sky-600/70" />
+            <span className="font-mono text-[11px] text-slate-300">P25–P75</span>
+          </div>
+          <div className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-0.5 w-3.5 rounded-full bg-sky-400" />
+            <span className="font-mono text-[11px] text-slate-300">Median</span>
+          </div>
+          <div className="inline-flex items-center gap-1.5">
+            <span className="inline-block w-3.5 border-t-2 border-dashed border-amber-400" />
+            <span className="font-mono text-[11px] text-slate-300">Mean</span>
+          </div>
+        </div>
       </div>
       <div
         role="img"
