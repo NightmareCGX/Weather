@@ -10,7 +10,7 @@ describe("buildBaseStyle", () => {
     expect(osmSource).toBeDefined();
     expect(osmSource).toMatchObject({
       type: "raster",
-      tiles: ["https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"],
+      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
     });
 
     expect(style.layers).toContainEqual(
