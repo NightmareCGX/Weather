@@ -256,18 +256,13 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
             </p>
           )}
           {ensemble.status === "success" && ensemble.byLead.size > 0 && (
-            <>
-              <p className="mb-2 text-xs font-mono text-cyan-400">
-                {ensembleVariable} · percentile range
-              </p>
-              <EnsembleChart
-                byLead={ensemble.byLead}
-                variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
-                unit={meta[ensembleVariable]?.unit}
-                timezone={displayTimezone}
-                validTimesByLead={validTimesByLead}
-              />
-            </>
+            <EnsembleChart
+              byLead={ensemble.byLead}
+              variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
+              unit={meta[ensembleVariable]?.unit}
+              timezone={displayTimezone}
+              validTimesByLead={validTimesByLead}
+            />
           )}
 
           <EnsembleDistribution

@@ -136,7 +136,8 @@ test("selecting an ensemble model renders the percentile fan and member distribu
   // The ensemble statistics section renders the fan chart for the selected
   // ensemble model.
   await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(page.getByText(/temperature_2m · percentile range/)).toBeVisible();
+  await expect(page.getByText(/percentile range/)).toBeVisible();
+  await expect(page.getByText(/Temperature \(2 m\)/)).toBeVisible();
   await expect(page.getByText(/over lead time/)).toHaveCount(0);
   await expect(page.getByRole("img", { name: /ensemble percentile fan over time/ })).toBeVisible();
 

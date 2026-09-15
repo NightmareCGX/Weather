@@ -77,8 +77,19 @@ describe("EnsembleChart", () => {
         name: "Temperature (2 m) ensemble percentile fan over time",
       })
     ).toBeInTheDocument();
-    expect(screen.getByText(/Temperature \(2 m\) — percentile range/)).toBeInTheDocument();
-    expect(screen.getByText(/P10–P90 band/)).toBeInTheDocument();
+    expect(screen.getByText("Temperature (2 m)")).toBeInTheDocument();
+    expect(screen.getByText(/percentile range/)).toBeInTheDocument();
+    expect(screen.getByText("P10–P90")).toBeInTheDocument();
+    expect(screen.getByText("P25–P75")).toBeInTheDocument();
+    expect(screen.getByText("Median")).toBeInTheDocument();
+    expect(screen.getByText("Mean")).toBeInTheDocument();
+  });
+
+  it("renders unit in parentheses when provided", () => {
+    render(
+      <EnsembleChart byLead={byLeadWithValidTimes} variableLabel="Temperature (2 m)" unit="°C" />
+    );
+    expect(screen.getByText("(°C)")).toBeInTheDocument();
   });
 
   it("renders valid-time calendar timestamps in UTC on X-axis and tooltip when no timezone provided", () => {
