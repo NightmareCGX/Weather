@@ -118,7 +118,8 @@ export function getLegendTicks(
 
   const accepted: LegendTick[] = [firstTick];
   for (const cand of candidates) {
-    const distFromLastAccepted = cand.positionPercent - accepted[accepted.length - 1].positionPercent;
+    const distFromLastAccepted =
+      cand.positionPercent - accepted[accepted.length - 1].positionPercent;
     const distToEnd = 100 - cand.positionPercent;
     if (distFromLastAccepted >= minDistancePercent && distToEnd >= minDistancePercent) {
       accepted.push(cand);

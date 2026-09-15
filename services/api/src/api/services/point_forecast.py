@@ -590,7 +590,7 @@ def build_point_forecast(
                         converted = _convert_value(
                             val_km, "km", units, var_code="cloud_ceiling"
                         )
-                        entry["cloud_ceiling"] = round(converted, 1)
+                        entry["cloud_ceiling"] = converted
                         entry["cloud_ceiling_unlimited"] = False
             else:
                 raw_val = values_by_var.get(var_code)

@@ -52,8 +52,8 @@ export function Legend({ layer, variableName, variableCode }: LegendProps) {
             const alignClass = isFirst
               ? "left-0 text-left"
               : isLast
-              ? "right-0 text-right"
-              : "-translate-x-1/2 text-center";
+                ? "right-0 text-right"
+                : "-translate-x-1/2 text-center";
 
             return (
               <span
