@@ -3,9 +3,9 @@ import type { StyleSpecification } from "maplibre-gl";
 /**
  * Base map style for the weather platform.
  *
- * Raster-only: OpenStreetMap base tiles. No glyphs/sprites are required, so
- * the style stays self-contained and works offline in tests (maplibre is
- * mocked there, so no tile requests fire).
+ * Uses Esri's World Dark Gray Canvas, a high-performance, dark-themed
+ * raster basemap designed specifically for meteorological and spatial
+ * data visualization. Free, keyless, and served via AWS CloudFront CDN.
  */
 export function buildBaseStyle(): StyleSpecification {
   return {
@@ -13,9 +13,11 @@ export function buildBaseStyle(): StyleSpecification {
     sources: {
       osm: {
         type: "raster",
-        tiles: ["https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"],
+        tiles: [
+          "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        ],
         tileSize: 256,
-        attribution: "© OpenStreetMap contributors, © CARTO",
+        attribution: "Esri, HERE, Garmin, © OpenStreetMap contributors",
       },
     },
     layers: [

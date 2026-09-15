@@ -10,7 +10,9 @@ describe("buildBaseStyle", () => {
     expect(osmSource).toBeDefined();
     expect(osmSource).toMatchObject({
       type: "raster",
-      tiles: ["https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"],
+      tiles: [
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+      ],
     });
 
     expect(style.layers).toContainEqual(
