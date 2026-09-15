@@ -52,8 +52,17 @@ server {
 
     # Gzip compression for large JSON payloads (e.g. /v1/forecast/availability).
     gzip on;
-    gzip_types application/json application/javascript text/css text/plain;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types application/json application/javascript text/css text/plain application/xml text/xml application/x-font-ttf font/opentype image/svg+xml;
     gzip_min_length 1024;
+
+    # Proxy buffer tuning to prevent large JSON responses (e.g. 444KB availability)
+    # from buffering to disk temporary files (/var/cache/nginx/proxy_temp/).
+    proxy_buffers 16 64k;
+    proxy_buffer_size 64k;
+    proxy_busy_buffers_size 128k;
 
     # Point forecast / probability POST bodies stay small, but keep headroom.
     client_max_body_size 10m;
