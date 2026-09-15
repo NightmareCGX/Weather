@@ -114,9 +114,9 @@ export function WindDirectionTrack({
           x2={offset.left + offset.width}
           y1={y}
           y2={y}
-          stroke="#e2e8f0"
+          stroke="#334155"
           strokeDasharray="2 2"
-          className="stroke-slate-200 dark:stroke-slate-700"
+          className="stroke-slate-700"
         />
       )}
       {rawItems.map((item, index) => {
@@ -135,7 +135,7 @@ export function WindDirectionTrack({
         const isVisible = index % stride === 0 || isHovered;
 
         if (!isVisible) {
-          return <circle key={`wind-dot-${index}`} cx={x} cy={y} r={1} fill="#cbd5e1" />;
+          return <circle key={`wind-dot-${index}`} cx={x} cy={y} r={1} fill="#64748b" />;
         }
 
         if (isCalm || dir === null || dir === undefined) {
@@ -147,7 +147,7 @@ export function WindDirectionTrack({
               cy={y}
               r={2.2}
               fill="none"
-              stroke={isHovered ? "#0284c7" : "#64748b"}
+              stroke={isHovered ? "#fde047" : "#d97706"}
               strokeWidth={1.2}
             />
           );
@@ -165,8 +165,8 @@ export function WindDirectionTrack({
             {/* Shape 2: Solid notch-arrowhead (4-point polygon) */}
             <polygon
               points="0,-4.5 3.5,3.5 0,1.5 -3.5,3.5"
-              fill={isHovered ? "#0284c7" : "#334155"}
-              className={isHovered ? "fill-sky-600" : "fill-slate-700 dark:fill-slate-300"}
+              fill={isHovered ? "#fde047" : "#fbbf24"}
+              className={isHovered ? "fill-yellow-300" : "fill-amber-400"}
             />
           </g>
         );

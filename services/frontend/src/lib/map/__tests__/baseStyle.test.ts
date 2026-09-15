@@ -10,13 +10,20 @@ describe("buildBaseStyle", () => {
     expect(osmSource).toBeDefined();
     expect(osmSource).toMatchObject({
       type: "raster",
-      tiles: [
-        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-      ],
+      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
     });
 
     expect(style.layers).toContainEqual(
-      expect.objectContaining({ id: "osm", type: "raster", source: "osm" })
+      expect.objectContaining({
+        id: "osm",
+        type: "raster",
+        source: "osm",
+        paint: expect.objectContaining({
+          "raster-brightness-min": 1.0,
+          "raster-brightness-max": 0.0,
+          "raster-saturation": -1.0,
+        }),
+      })
     );
   });
 });
