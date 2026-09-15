@@ -199,13 +199,15 @@ export function WindRose({ windRose }: WindRoseProps) {
               windRose.calm_count + windRose.sectors.reduce((sum, s) => sum + s.count, 0);
             return (
               <span>
-                <strong className="text-cyan-400">{sec.sector}</strong>: {formatPercent(sec.probability)} ({sec.count}/
-                {totalMembers} members)
+                <strong className="text-cyan-400">{sec.sector}</strong>:{" "}
+                {formatPercent(sec.probability)} ({sec.count}/{totalMembers} members)
               </span>
             );
           })()
         ) : (
-          <span className="text-slate-400 font-sans">Hover a sector to view member probability</span>
+          <span className="text-slate-400 font-sans">
+            Hover a sector to view member probability
+          </span>
         )}
       </div>
 

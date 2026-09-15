@@ -73,11 +73,15 @@ export function SelectedLocationSummary({
         >
           <div className="flex justify-between">
             <dt className="text-slate-400">Latitude</dt>
-            <dd className="font-mono tabular-nums text-slate-200">{location.latitude.toFixed(4)}</dd>
+            <dd className="font-mono tabular-nums text-slate-200">
+              {location.latitude.toFixed(4)}
+            </dd>
           </div>
           <div className="flex justify-between">
             <dt className="text-slate-400">Longitude</dt>
-            <dd className="font-mono tabular-nums text-slate-200">{location.longitude.toFixed(4)}</dd>
+            <dd className="font-mono tabular-nums text-slate-200">
+              {location.longitude.toFixed(4)}
+            </dd>
           </div>
           <div className="flex justify-between">
             <dt className="text-slate-400">Elevation</dt>

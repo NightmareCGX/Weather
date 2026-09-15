@@ -192,7 +192,9 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
       />
 
       <section aria-label="Point forecast" className="border-b border-slate-800 px-4 py-4">
-        <h3 className="mb-2 text-sm font-bold uppercase tracking-wider text-slate-100">Hourly Forecast</h3>
+        <h3 className="mb-2 text-sm font-bold uppercase tracking-wider text-slate-100">
+          Hourly Forecast
+        </h3>
         {pointModel === null && (
           <p className="text-sm text-slate-400">
             No forecast model is available for this selection.
@@ -255,7 +257,9 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
           )}
           {ensemble.status === "success" && ensemble.byLead.size > 0 && (
             <>
-              <p className="mb-2 text-xs font-mono text-cyan-400">{ensembleVariable} · percentile range</p>
+              <p className="mb-2 text-xs font-mono text-cyan-400">
+                {ensembleVariable} · percentile range
+              </p>
               <EnsembleChart
                 byLead={ensemble.byLead}
                 variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}
