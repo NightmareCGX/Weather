@@ -1,4 +1,4 @@
-import { render } from "@testing-library/react";
+import { act, fireEvent, render } from "@testing-library/react";
 
 import {
   clearInstances,
@@ -816,6 +816,40 @@ describe("WeatherMap", () => {
 
       // Must NOT easeTo
       expect(map.easeTo).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("wind particle animation toggle button", () => {
+    it("renders ParticleToggleButton when layer has vector_field_url_template", () => {
+      const windLayer: SpatialLayer = {
+        ...layer,
+        vector_field_url_template: "/v1/maps/gfs/wind_10m/vector-field?lead_time_hours=0",
+      };
+      const { getByTestId } = renderMap({ layer: windLayer });
+      const toggleBtn = getByTestId("wind-particle-toggle");
+      expect(toggleBtn).toBeInTheDocument();
+      expect(toggleBtn).toHaveAttribute("aria-label", "Toggle wind particle animation");
+    });
+
+    it("does not render ParticleToggleButton when layer has no vector_field_url_template", () => {
+      const { queryByTestId } = renderMap({ layer });
+      expect(queryByTestId("wind-particle-toggle")).toBeNull();
+    });
+
+    it("toggles particle animation state when clicked", () => {
+      const windLayer: SpatialLayer = {
+        ...layer,
+        vector_field_url_template: "/v1/maps/gfs/wind_10m/vector-field?lead_time_hours=0",
+      };
+      const { getByTestId } = renderMap({ layer: windLayer });
+      const toggleBtn = getByTestId("wind-particle-toggle");
+      const initialPressed = toggleBtn.getAttribute("aria-pressed");
+
+      act(() => {
+        fireEvent.click(toggleBtn);
+      });
+      const updatedPressed = toggleBtn.getAttribute("aria-pressed");
+      expect(updatedPressed).not.toBe(initialPressed);
     });
   });
 });

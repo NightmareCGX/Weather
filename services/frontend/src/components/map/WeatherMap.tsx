@@ -14,9 +14,11 @@ import { buildBaseStyle } from "@/lib/map/baseStyle";
 import { applyWeatherLayer, removeWeatherLayer } from "@/lib/map/layers";
 import { canonicalizeLongitude, coordinatesToSelectedLocation } from "@/lib/forecast/selection";
 import { LocateMeButton } from "@/components/map/LocateMeButton";
+import { ParticleToggleButton } from "@/components/map/ParticleToggleButton";
 import { WindParticleAnimation } from "@/lib/map/windParticles";
 import { useVectorField } from "@/hooks/useVectorField";
 import { useAdjacentTilePrefetch } from "@/hooks/useTilePrefetch";
+import { useParticlePreference } from "@/hooks/useParticlePreference";
 
 interface WeatherMapProps {
   /** `/v1/maps` metadata for the weather layer, or null while loading/erroring. */
@@ -93,6 +95,10 @@ export function WeatherMap({
     startupAutoCenterEligibleRef.current = false;
     onLocate?.();
   }, [onLocate]);
+
+  const { particlesEnabled, toggleParticles } = useParticlePreference();
+  const particlesEnabledRef = useRef<boolean>(particlesEnabled);
+  particlesEnabledRef.current = particlesEnabled;
 
   // Progressive vector field fetching and prefetching in parallel
   const { field } = useVectorField({
@@ -182,7 +188,9 @@ export function WeatherMap({
       isStyleReadyRef.current = true;
 
       if (canvasRef.current !== null && animRef.current === null) {
-        animRef.current = new WindParticleAnimation(canvasRef.current, map);
+        animRef.current = new WindParticleAnimation(canvasRef.current, map, {
+          enabled: particlesEnabledRef.current,
+        });
         // The vector field may arrive before the map finishes loading (e.g. a
         // warm server cache); feed it immediately so particles never stall
         // waiting for the next field/layer change.
@@ -270,6 +278,13 @@ export function WeatherMap({
     animRef.current.setField(field);
   }, [field, layer]);
 
+  // Synchronize particle enabled state with animation engine
+  useEffect(() => {
+    if (animRef.current !== null) {
+      animRef.current.setEnabled(particlesEnabled);
+    }
+  }, [particlesEnabled]);
+
   // Best-effort startup coarse IP localization camera transition.
   // Applied at most once per session when eligible.
   useEffect(() => {
@@ -342,11 +357,12 @@ export function WeatherMap({
         className="pointer-events-none absolute inset-0 z-10 h-full w-full"
         data-testid="wind-particle-canvas"
       />
-      {onLocate && (
-        <div className="absolute right-2.5 top-28 z-20">
-          <LocateMeButton onClick={handleLocate} isLocating={isLocating} />
-        </div>
-      )}
+      <div className="absolute right-2.5 top-28 z-20 flex flex-col gap-2">
+        {onLocate && <LocateMeButton onClick={handleLocate} isLocating={isLocating} />}
+        {Boolean(layer?.vector_field_url_template) && (
+          <ParticleToggleButton enabled={particlesEnabled} onToggle={toggleParticles} />
+        )}
+      </div>
     </div>
   );
 }
