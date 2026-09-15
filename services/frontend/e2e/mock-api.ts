@@ -974,145 +974,169 @@ export async function installApiMocks(page: Page, options: MockOptions = {}): Pr
     const url = new URL(route.request().url());
     const lat = Number(url.searchParams.get("lat") ?? 38.19);
     const lon = Number(url.searchParams.get("lon") ?? -106.82);
-    const lead = Number(url.searchParams.get("lead_time_hours") ?? 0);
     const includeMembers = url.searchParams.get("include_members") === "true";
-    const members = GEFS_MEMBERS.map((member) => ensembleTemperatureAt(member, lat, lon, lead));
-    const sorted = [...members].sort((a, b) => a - b);
-    const stats = {
-      mean: members.reduce((s, v) => s + v, 0) / members.length,
-      median: sorted[2],
-      spread: 2,
-      p10: sorted[0],
-      p25: sorted[1],
-      p50: sorted[2],
-      p75: sorted[3],
-      p90: sorted[4],
-    };
     const variable = url.searchParams.get("variable") ?? "temperature_2m";
-    // Production-contract-faithful: `members` and `pdf` are returned only when the
-    // request opts in with `include_members=true`.
-    const payload: Record<string, unknown> = {
-      model: url.searchParams.get("model") ?? "gefs",
-      lead_time_hours: lead,
-      member_count: members.length,
-      statistics: stats,
-    };
-    if (variable === "wind_10m") {
-      payload.consensus_vector = {
-        speed: 24.5,
-        direction: 220.0,
-        cardinal: "SW",
-        coherence: 0.95,
+    const leadsParam = url.searchParams.get("leads");
+
+    function buildPayloadForLead(lead: number) {
+      const members = GEFS_MEMBERS.map((member) => ensembleTemperatureAt(member, lat, lon, lead));
+      const sorted = [...members].sort((a, b) => a - b);
+      const stats = {
+        mean: members.reduce((s, v) => s + v, 0) / members.length,
+        median: sorted[2],
+        spread: 2,
+        p10: sorted[0],
+        p25: sorted[1],
+        p50: sorted[2],
+        p75: sorted[3],
+        p90: sorted[4],
       };
-      payload.wind_rose = {
-        calm_percentage: 10.0,
-        calm_count: 3,
-        sectors: [
-          {
-            sector: "N",
-            count: 3,
-            probability: 0.1,
-            bins: { light: 0.05, moderate: 0.05, strong: 0.0, gale: 0.0 },
-          },
-          {
-            sector: "NE",
-            count: 0,
-            probability: 0.0,
-            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
-          },
-          {
-            sector: "E",
-            count: 0,
-            probability: 0.0,
-            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
-          },
-          {
-            sector: "SE",
-            count: 0,
-            probability: 0.0,
-            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
-          },
-          {
-            sector: "S",
-            count: 6,
-            probability: 0.2,
-            bins: { light: 0.05, moderate: 0.1, strong: 0.05, gale: 0.0 },
-          },
-          {
-            sector: "SW",
-            count: 18,
-            probability: 0.6,
-            bins: { light: 0.1, moderate: 0.3, strong: 0.15, gale: 0.05 },
-          },
-          {
-            sector: "W",
-            count: 0,
-            probability: 0.0,
-            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
-          },
-          {
-            sector: "NW",
-            count: 0,
-            probability: 0.0,
-            bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
-          },
-        ],
+      // Production-contract-faithful: `members` and `pdf` are returned only when the
+      // request opts in with `include_members=true`.
+      const payload: Record<string, unknown> = {
+        model: url.searchParams.get("model") ?? "gefs",
+        lead_time_hours: lead,
+        member_count: members.length,
+        statistics: stats,
       };
+      if (variable === "wind_10m") {
+        payload.consensus_vector = {
+          speed: 24.5,
+          direction: 220.0,
+          cardinal: "SW",
+          coherence: 0.95,
+        };
+        payload.wind_rose = {
+          calm_percentage: 10.0,
+          calm_count: 3,
+          sectors: [
+            {
+              sector: "N",
+              count: 3,
+              probability: 0.1,
+              bins: { light: 0.05, moderate: 0.05, strong: 0.0, gale: 0.0 },
+            },
+            {
+              sector: "NE",
+              count: 0,
+              probability: 0.0,
+              bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+            },
+            {
+              sector: "E",
+              count: 0,
+              probability: 0.0,
+              bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+            },
+            {
+              sector: "SE",
+              count: 0,
+              probability: 0.0,
+              bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+            },
+            {
+              sector: "S",
+              count: 6,
+              probability: 0.2,
+              bins: { light: 0.05, moderate: 0.1, strong: 0.05, gale: 0.0 },
+            },
+            {
+              sector: "SW",
+              count: 18,
+              probability: 0.6,
+              bins: { light: 0.1, moderate: 0.3, strong: 0.15, gale: 0.05 },
+            },
+            {
+              sector: "W",
+              count: 0,
+              probability: 0.0,
+              bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+            },
+            {
+              sector: "NW",
+              count: 0,
+              probability: 0.0,
+              bins: { light: 0.0, moderate: 0.0, strong: 0.0, gale: 0.0 },
+            },
+          ],
+        };
+      }
+      if (variable === "precipitation_amount_3h") {
+        payload.phase_support = {
+          dry: 0.1,
+          rain: 0.52,
+          snow: 0.26,
+          freezing_rain: 0.08,
+          ice_pellets: 0.03,
+          unknown: 0.01,
+        };
+        payload.transition_frequency = {
+          rain_to_snow: 0.27,
+          persistent_rain: 0.25,
+        };
+      }
+      if (variable === "cloud_cover_3h") {
+        payload.valid_member_count = 30;
+        payload.statistics = {
+          mean: 65.0,
+          median: 65.0,
+          spread: 10.0,
+          p10: 50.0,
+          p25: 58.0,
+          p50: 65.0,
+          p75: 72.0,
+          p90: 80.0,
+        };
+      }
+      if (variable === "cloud_ceiling") {
+        payload.unlimited_probability = 0.4;
+        payload.valid_member_count = 30;
+        payload.finite_member_count = 18;
+        payload.unlimited_member_count = 12;
+        payload.statistics = {
+          mean: 2100.0,
+          median: 2100.0,
+          spread: 500.0,
+          p10: 1200.0,
+          p25: 1600.0,
+          p50: 2100.0,
+          p75: 2800.0,
+          p90: 3500.0,
+        };
+      }
+      if (includeMembers) {
+        payload.members = members;
+        payload.pdf = {
+          x: [10.0, 15.0, 20.0, 25.0, 30.0],
+          density: [0.01, 0.05, 0.2, 0.05, 0.01],
+        };
+      }
+      return payload;
     }
-    if (variable === "precipitation_amount_3h") {
-      payload.phase_support = {
-        dry: 0.1,
-        rain: 0.52,
-        snow: 0.26,
-        freezing_rain: 0.08,
-        ice_pellets: 0.03,
-        unknown: 0.01,
-      };
-      payload.transition_frequency = {
-        rain_to_snow: 0.27,
-        persistent_rain: 0.25,
-      };
+
+    if (leadsParam !== null) {
+      const targetLeads =
+        leadsParam === "all"
+          ? LEAD_TIMES
+          : leadsParam
+              .split(",")
+              .map(Number)
+              .filter((n) => !Number.isNaN(n));
+      const payloads = targetLeads.map(buildPayloadForLead);
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(envelope(payloads, "ensemble_statistics")),
+      });
+      return;
     }
-    if (variable === "cloud_cover_3h") {
-      payload.valid_member_count = 30;
-      payload.statistics = {
-        mean: 65.0,
-        median: 65.0,
-        spread: 10.0,
-        p10: 50.0,
-        p25: 58.0,
-        p50: 65.0,
-        p75: 72.0,
-        p90: 80.0,
-      };
-    }
-    if (variable === "cloud_ceiling") {
-      payload.unlimited_probability = 0.4;
-      payload.valid_member_count = 30;
-      payload.finite_member_count = 18;
-      payload.unlimited_member_count = 12;
-      payload.statistics = {
-        mean: 2100.0,
-        median: 2100.0,
-        spread: 500.0,
-        p10: 1200.0,
-        p25: 1600.0,
-        p50: 2100.0,
-        p75: 2800.0,
-        p90: 3500.0,
-      };
-    }
-    if (includeMembers) {
-      payload.members = members;
-      payload.pdf = {
-        x: [10.0, 15.0, 20.0, 25.0, 30.0],
-        density: [0.01, 0.05, 0.2, 0.05, 0.01],
-      };
-    }
+
+    const lead = Number(url.searchParams.get("lead_time_hours") ?? 0);
+    const singlePayload = buildPayloadForLead(lead);
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(envelope(payload, "ensemble_statistics")),
+      body: JSON.stringify(envelope(singlePayload, "ensemble_statistics")),
     });
   });
 }
