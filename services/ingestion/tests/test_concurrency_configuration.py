@@ -37,7 +37,7 @@ def test_default_concurrency_resolution(monkeypatch: pytest.MonkeyPatch) -> None
     plan = _resolve_concurrency_plan(settings=settings)
 
     assert plan.download_concurrency == 8
-    assert plan.decode_concurrency == min(4, _get_effective_cpus())
+    assert plan.decode_concurrency == min(2, _get_effective_cpus())
     assert plan.write_concurrency == 4
     assert plan.staging_concurrency == plan.download_concurrency + plan.decode_concurrency + plan.write_concurrency
     assert plan.marker_put_concurrency == 32
@@ -202,18 +202,18 @@ def test_max_env_does_not_override_operational_default(monkeypatch: pytest.Monke
     monkeypatch.delenv("WEATHER_INGEST_WRITE_CONCURRENCY", raising=False)
 
     settings = IngestionSettings(_env_file=None, DB_POOL_SIZE=10)
-    # Operational concurrency must remain at code default 8 and 4!
+    # Operational concurrency must remain at code default 8 and 2!
     assert settings.DOWNLOAD_CONCURRENCY == 8
-    assert settings.DECODE_CONCURRENCY == 4
+    assert settings.DECODE_CONCURRENCY == 2
     # Configured MAX ceiling must reflect the setting
     assert settings.MAX_DOWNLOAD_CONCURRENCY == 24
     assert settings.MAX_DECODE_CONCURRENCY == 16
 
-    # When resolving plan without CLI overrides, effective values must equal operational defaults (8, 4)
+    # When resolving plan without CLI overrides, effective values must equal operational defaults (8, 2)
     with patch("ingestion.core.wave_runner._detect_effective_cpus", return_value=16):
         plan = _resolve_concurrency_plan(settings=settings)
         assert plan.download_concurrency == 8
-        assert plan.decode_concurrency == 4
+        assert plan.decode_concurrency == 2
 
 
 def test_combined_operational_and_max_env(monkeypatch: pytest.MonkeyPatch) -> None:

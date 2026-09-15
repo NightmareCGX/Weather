@@ -116,25 +116,67 @@ def get_ensemble_statistics(
     """
     if leads is not None:
         from api.services.ensemble_data import build_ensemble_statistics_series
+        from api.services.cache import build_ensemble_series_cache_key
 
         target_leads = (
             None
             if leads.strip().lower() == "all"
             else [int(x.strip()) for x in leads.split(",") if x.strip().isdigit()]
         )
-        series_data = build_ensemble_statistics_series(
-            db,
+        canonical_leads = tuple(sorted(target_leads)) if target_leads is not None else "all"
+
+        series_initial = initial_time
+        if series_initial is not None:
+            require_cycle_visible(db, series_initial, model_id=model)
+
+        series_cycle_time = resolve_latest_run_cycle_time(db, model, series_initial)
+        series_store_path = resolve_latest_run_store_path(db, model, series_initial)
+        series_serving_gen = resolve_serving_generation_for_store(series_store_path)
+
+        cache_key = build_ensemble_series_cache_key(
+            model=model,
             latitude=lat,
             longitude=lon,
             variable=variable,
-            model=model,
-            leads=target_leads,
+            leads=canonical_leads,
             include_members=include_members,
-            initial_time=initial_time,
-            now=now,
+            cycle_time=series_cycle_time,
+            serving_generation=series_serving_gen,
+        )
+        query_params = (
+            f"lat={lat}&lon={lon}&variable={variable}&model={model}"
+            f"&leads={leads}&include_members={include_members}"
+            f"&initial_time={series_initial}"
+        )
+
+        def _compute_series() -> EnsembleStatisticsEnvelope:
+            from api.core.database import SessionLocal
+
+            with SessionLocal() as session:
+                data = build_ensemble_statistics_series(
+                    session,
+                    latitude=lat,
+                    longitude=lon,
+                    variable=variable,
+                    model=model,
+                    leads=target_leads,
+                    include_members=include_members,
+                    initial_time=series_initial,
+                    now=now,
+                )
+                return EnsembleStatisticsEnvelope(data=data)
+
+        db.close()
+
+        envelope = _cache.compute_or_retrieve(
+            None,
+            cache_key,
+            query_params,
+            _compute_series,
+            model_type=EnsembleStatisticsEnvelope,
         )
         response.headers["Cache-Control"] = CACHE_CONTROL_ENSEMBLE
-        return EnsembleStatisticsEnvelope(data=series_data)
+        return envelope
 
     from api.services.resolver import resolve_valid_time_source
 

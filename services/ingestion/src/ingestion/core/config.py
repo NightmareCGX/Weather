@@ -129,7 +129,7 @@ class IngestionSettings(BaseSettings):
     # -------------------------------------------------------------------------
     # LAYER 1: Operational Concurrency (Normal deployment tuning)
     # -------------------------------------------------------------------------
-    #: Conservative code defaults: download=8, decode=4, write=4, marker_put=32, marker_get=32.
+    #: Conservative code defaults: download=8, decode=2, write=4, marker_put=32, marker_get=32.
     DOWNLOAD_CONCURRENCY: int = Field(
         default=8,
         validation_alias=AliasChoices(
@@ -139,7 +139,7 @@ class IngestionSettings(BaseSettings):
         description="Operational concurrency for upstream file downloads.",
     )
     DECODE_CONCURRENCY: int = Field(
-        default=4,
+        default=2,
         validation_alias=AliasChoices(
             "WEATHER_INGEST_DECODE_CONCURRENCY",
             "DECODE_CONCURRENCY",
