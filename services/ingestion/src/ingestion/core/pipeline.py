@@ -265,7 +265,13 @@ _SOURCE_TO_CANONICAL: dict[
     },
     # Relative humidity and cloud cover are %; canonical is %.
     "%": {"%": lambda array: array},
-    # Visibility, snow depth, and cloud ceiling are meters; canonical is meters.
+    # Visibility and cloud ceiling canonical is kilometers.
+    "km": {
+        "m": lambda array: array / 1000.0,
+        "gpm": lambda array: array / 1000.0,
+        "km": lambda array: array,
+    },
+    # Snow depth is meters; canonical is meters.
     "m": {
         "m": lambda array: array,
         "gpm": lambda array: array,

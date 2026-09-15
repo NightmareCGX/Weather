@@ -87,38 +87,39 @@ class TestCloudCeilingClassification:
     """Test suite for cloud ceiling height and unlimited sentinel classification."""
 
     def test_classify_finite_height(self) -> None:
-        cls = classify_cloud_ceiling(1200.0)
+        cls = classify_cloud_ceiling(1.2)
         assert not cls.is_unlimited
-        assert cls.height_m == 1200.0
+        assert cls.height_km == 1.2
+        assert cls.height_m == 1.2
 
     def test_classify_zero_height(self) -> None:
         cls = classify_cloud_ceiling(0.0)
         assert not cls.is_unlimited
-        assert cls.height_m == 0.0
+        assert cls.height_km == 0.0
 
     def test_classify_unlimited_sentinel(self) -> None:
-        cls_sentinel = classify_cloud_ceiling(20000.0)
+        cls_sentinel = classify_cloud_ceiling(20.0)
         assert cls_sentinel.is_unlimited
-        assert cls_sentinel.height_m is None
+        assert cls_sentinel.height_km is None
 
-        # Threshold boundary exactly 19990.0
-        cls_edge = classify_cloud_ceiling(19990.0)
+        # Threshold boundary exactly 19.99
+        cls_edge = classify_cloud_ceiling(19.99)
         assert cls_edge.is_unlimited
-        assert cls_edge.height_m is None
+        assert cls_edge.height_km is None
 
-        # Just below threshold 19989.0 is treated as high finite ceiling
-        cls_below = classify_cloud_ceiling(19989.0)
+        # Just below threshold 19.98 is treated as high finite ceiling
+        cls_below = classify_cloud_ceiling(19.98)
         assert not cls_below.is_unlimited
-        assert cls_below.height_m == 19989.0
+        assert cls_below.height_km == 19.98
 
     def test_classify_none_and_nan(self) -> None:
         cls_none = classify_cloud_ceiling(None)
         assert not cls_none.is_unlimited
-        assert cls_none.height_m is None
+        assert cls_none.height_km is None
 
         cls_nan = classify_cloud_ceiling(float("nan"))
         assert not cls_nan.is_unlimited
-        assert cls_nan.height_m is None
+        assert cls_nan.height_km is None
 
 
 class TestCloudEnsembleSummaries:
@@ -153,8 +154,8 @@ class TestCloudEnsembleSummaries:
         assert summary is None
 
     def test_cloud_ceiling_ensemble_mixed_state_robust(self) -> None:
-        # 18 finite members (1000m) and 12 unlimited members (20000m)
-        members = [1000.0 + (i * 10) for i in range(18)] + [20000.0] * 12
+        # 18 finite members (1.00km - 1.17km) and 12 unlimited members (20.0km)
+        members = [1.0 + (i * 0.01) for i in range(18)] + [20.0] * 12
         summary = cloud_ceiling_ensemble_summary(members)
         assert summary is not None
         assert summary.valid_member_count == 30
@@ -163,14 +164,18 @@ class TestCloudEnsembleSummaries:
         assert summary.unlimited_probability == pytest.approx(12.0 / 30.0, abs=1e-4)
 
         # Finite count 18 >= 10 -> conditional percentiles are computed
-        assert summary.conditional_median_m is not None
-        assert summary.conditional_percentiles_m is not None
-        assert summary.conditional_mean_m == pytest.approx(1085.0, abs=1e-1)
-        assert summary.conditional_percentiles_m["p50"] == pytest.approx(1085.0, abs=1e-1)
+        assert summary.conditional_median is not None
+        assert summary.conditional_median_m == summary.conditional_median
+        assert summary.conditional_percentiles is not None
+        assert summary.conditional_percentiles_m == summary.conditional_percentiles
+        assert summary.conditional_mean == pytest.approx(1.085, abs=1e-3)
+        assert summary.conditional_mean_m == summary.conditional_mean
+        assert summary.conditional_spread_m == summary.conditional_spread
+        assert summary.conditional_percentiles["p50"] == pytest.approx(1.085, abs=1e-3)
 
     def test_cloud_ceiling_ensemble_high_unlimited_suppression(self) -> None:
         # 4 finite members and 26 unlimited members
-        members = [1000.0, 1200.0, 1500.0, 1800.0] + [20000.0] * 26
+        members = [1.0, 1.2, 1.5, 1.8] + [20.0] * 26
         summary = cloud_ceiling_ensemble_summary(members)
         assert summary is not None
         assert summary.valid_member_count == 30
@@ -179,40 +184,40 @@ class TestCloudEnsembleSummaries:
         assert summary.unlimited_probability == pytest.approx(26.0 / 30.0, abs=1e-4)
 
         # Finite count 4 < 10 -> conditional percentiles suppressed
-        assert summary.conditional_median_m is None
-        assert summary.conditional_mean_m is None
-        assert summary.conditional_percentiles_m is None
+        assert summary.conditional_median is None
+        assert summary.conditional_mean is None
+        assert summary.conditional_percentiles is None
 
     def test_cloud_ceiling_ensemble_all_unlimited(self) -> None:
-        members = [20000.0] * 30
+        members = [20.0] * 30
         summary = cloud_ceiling_ensemble_summary(members)
         assert summary is not None
         assert summary.valid_member_count == 30
         assert summary.finite_member_count == 0
         assert summary.unlimited_member_count == 30
         assert summary.unlimited_probability == 1.0
-        assert summary.conditional_percentiles_m is None
+        assert summary.conditional_percentiles is None
 
     def test_cloud_ceiling_ensemble_below_validity_gate(self) -> None:
         # 15 valid members and 15 NaNs -> N_valid = 15 < 21 -> returns None
-        members = [1000.0] * 10 + [20000.0] * 5 + [float("nan")] * 15
+        members = [1.0] * 10 + [20.0] * 5 + [float("nan")] * 15
         summary = cloud_ceiling_ensemble_summary(members)
         assert summary is None
 
     def test_compute_low_ceiling_probability(self) -> None:
-        # 10 members at 500m, 10 members at 1500m, 10 members unlimited (20000m)
-        members = [500.0] * 10 + [1500.0] * 10 + [20000.0] * 10
-        # P(Ceiling <= 1000m) should be 10 / 30 = 0.3333
-        prob_1000 = compute_low_ceiling_probability(members, 1000.0)
+        # 10 members at 0.5km, 10 members at 1.5km, 10 members unlimited (20.0km)
+        members = [0.5] * 10 + [1.5] * 10 + [20.0] * 10
+        # P(Ceiling <= 1.0km) should be 10 / 30 = 0.3333
+        prob_1000 = compute_low_ceiling_probability(members, 1.0)
         assert prob_1000 == pytest.approx(10.0 / 30.0, abs=1e-4)
 
-        # P(Ceiling <= 2000m) should be 20 / 30 = 0.6667
-        prob_2000 = compute_low_ceiling_probability(members, 2000.0)
+        # P(Ceiling <= 2.0km) should be 20 / 30 = 0.6667
+        prob_2000 = compute_low_ceiling_probability(members, 2.0)
         assert prob_2000 == pytest.approx(20.0 / 30.0, abs=1e-4)
 
         # Below valid gate (<21) -> returns None
         prob_invalid = compute_low_ceiling_probability(
-            [500.0] * 10 + [float("nan")] * 20, 1000.0
+            [0.5] * 10 + [float("nan")] * 20, 1.0
         )
         assert prob_invalid is None
 

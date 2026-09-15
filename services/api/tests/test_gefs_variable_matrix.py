@@ -53,7 +53,7 @@ def _member_expected_value(variable: str, member: int, lat: float, lon: float, l
     if variable == "cloud_cover_3h":
         return 20.0 + 2.0 * lead + 1.0 * member
     if variable == "cloud_ceiling":
-        return 20000.0 if member >= 4 else 1000.0 + 50.0 * lead + 20.0 * member
+        return 20.0 if member >= 4 else 1.0 + 0.05 * lead + 0.02 * member
     raise KeyError(variable)
 
 
@@ -267,7 +267,7 @@ def test_gfs_point_unchanged(client, variable):
     elif variable == "cloud_cover_3h":
         expected = 20.0 + 2.0 * LEAD
     elif variable == "cloud_ceiling":
-        expected = 1000.0 + 50.0 * LEAD
+        expected = 1.0 + 0.05 * LEAD
     else:
         raise KeyError(variable)
     assert abs(float(entry[variable]) - expected) < 1e-9

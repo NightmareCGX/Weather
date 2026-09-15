@@ -111,7 +111,17 @@ def _pixel_lonlat(zoom: int, x: int, y: int, px: int, py: int) -> tuple[float, f
 
 def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]:
     """Return the (value, RGB) color stops for a variable's display ramp."""
-    if variable_code in ("precipitation_rate", "precipitation_amount_3h"):
+    if variable_code == "precipitation_rate":
+        return [
+            (0.0, (255, 255, 255)),
+            (0.5, (194, 230, 153)),
+            (1.5, (120, 198, 121)),
+            (3.0, (49, 163, 84)),
+            (6.0, (25, 114, 120)),
+            (10.0, (49, 76, 143)),
+            (15.0, (123, 65, 115)),
+        ]
+    if variable_code == "precipitation_amount_3h":
         return [
             (0.0, (255, 255, 255)),
             (0.5, (194, 230, 153)),
@@ -134,11 +144,9 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
     if variable_code == "wind_gust":
         return [
             (0.0, (247, 247, 247)),
-            (20.0, (204, 235, 197)),
-            (40.0, (168, 221, 181)),
+            (30.0, (204, 235, 197)),
             (60.0, (78, 179, 211)),
-            (80.0, (43, 140, 190)),
-            (100.0, (8, 88, 158)),
+            (90.0, (43, 140, 190)),
             (120.0, (122, 1, 119)),
             (150.0, (73, 0, 106)),
         ]
@@ -156,12 +164,11 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
     if variable_code == "visibility":
         return [
             (0.0, (73, 0, 106)),
-            (500.0, (174, 1, 126)),
-            (1000.0, (247, 104, 161)),
-            (3000.0, (251, 180, 185)),
-            (6000.0, (254, 235, 226)),
-            (10000.0, (240, 249, 232)),
-            (24000.0, (255, 255, 255)),
+            (1.0, (174, 1, 126)),
+            (3.0, (247, 104, 161)),
+            (6.0, (251, 180, 185)),
+            (10.0, (240, 249, 232)),
+            (24.0, (255, 255, 255)),
         ]
     if variable_code == "snow_depth":
         return [
@@ -185,27 +192,26 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
     if variable_code == "cloud_ceiling":
         return [
             (0.0, (165, 0, 38)),
-            (150.0, (215, 48, 39)),
-            (300.0, (254, 224, 144)),
-            (900.0, (145, 191, 219)),
-            (1500.0, (69, 117, 180)),
-            (3000.0, (255, 255, 255)),
+            (3.0, (254, 224, 144)),
+            (9.0, (69, 117, 180)),
+            (20.0, (255, 255, 255)),
         ]
     return [
-        (-40.0, (49, 54, 149)),
-        (-20.0, (69, 117, 180)),
-        (-5.0, (116, 173, 209)),
-        (5.0, (240, 249, 232)),
-        (15.0, (254, 217, 118)),
-        (25.0, (254, 153, 41)),
-        (35.0, (217, 72, 1)),
-        (45.0, (165, 0, 38)),
+        (-60.0, (26, 0, 64)),      # 极寒紫黑 (-60°C)
+        (-40.0, (49, 54, 149)),     # 深蓝 (-40°C)
+        (-20.0, (69, 117, 180)),    # 蔚蓝 (-20°C)
+        (0.0, (224, 243, 248)),     # 冰点极浅冰蓝/白 (0°C)
+        (20.0, (254, 217, 118)),    # 舒适温暖浅黄 (20°C)
+        (40.0, (217, 72, 1)),       # 高温橙红 (40°C)
+        (60.0, (122, 1, 119)),      # 极端酷暑深红紫 (60°C)
     ]
 
 
 def _data_range(variable_code: str) -> tuple[float, float]:
     """Return the fixed (min, max) data range used to normalize a variable."""
-    if variable_code in ("precipitation_rate", "precipitation_amount_3h"):
+    if variable_code == "precipitation_rate":
+        return (0.0, 15.0)
+    if variable_code == "precipitation_amount_3h":
         return (0.0, 40.0)
     if variable_code == "relative_humidity_2m":
         return (0.0, 100.0)
@@ -214,14 +220,14 @@ def _data_range(variable_code: str) -> tuple[float, float]:
     if variable_code in ("wind_10m", "wind_speed_10m"):
         return (0.0, 140.0)
     if variable_code == "visibility":
-        return (0.0, 24000.0)
+        return (0.0, 24.0)
     if variable_code == "snow_depth":
         return (0.0, 2.5)
     if variable_code == "cloud_cover_3h":
         return (0.0, 100.0)
     if variable_code == "cloud_ceiling":
-        return (0.0, 3000.0)
-    return (-40.0, 45.0)
+        return (0.0, 20.0)
+    return (-60.0, 60.0)
 
 
 def _derive_grid(dataset: xr.Dataset) -> _TileGrid:
@@ -640,7 +646,7 @@ def _render_window_to_png(
     # per RGB channel with ``np.interp``, and build the RGBA scanlines with
     # NumPy (no 65,536-iteration Python loop).
     if variable == "cloud_ceiling":
-        finite = np.isfinite(values) & valid & (values < 19990.0)
+        finite = np.isfinite(values) & valid & (values < 19.99)
     else:
         finite = np.isfinite(values) & valid
     rgba = np.zeros((TILE_SIZE, TILE_SIZE, 4), dtype=np.uint8)
@@ -1136,7 +1142,7 @@ def _slice_field(
                 valid_mask = np.isfinite(raw_members) & (raw_members >= 0.0)
                 valid_counts = np.sum(valid_mask, axis=0)
                 valid_cells = is_cell_statistically_valid(valid_counts, expected_members)
-                unlimited_mask = raw_members >= 19990.0
+                unlimited_mask = raw_members >= 19.99
                 finite_members = np.where(unlimited_mask, np.nan, raw_members)
                 with np.errstate(all="ignore"):
                     mean_vals = np.nanmean(finite_members, axis=0)

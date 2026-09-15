@@ -34,11 +34,11 @@ export const FALLBACK_VARIABLE_META: Record<string, VariableMeta> = {
   precipitation_amount_3h: { name: "3-Hour Precipitation", unit: "mm" },
   relative_humidity_2m: { name: "Relative Humidity", unit: "%" },
   wind_gust: { name: "Wind Gust", unit: "km/h" },
-  visibility: { name: "Visibility", unit: "m" },
+  visibility: { name: "Visibility", unit: "km" },
   snow_depth: { name: "Snow Depth", unit: "m" },
   wind_10m: { name: "Wind (10 m)", unit: "km/h" },
   cloud_cover_3h: { name: "Cloud Cover", unit: "%" },
-  cloud_ceiling: { name: "Cloud Ceiling", unit: "m" },
+  cloud_ceiling: { name: "Cloud Ceiling", unit: "km" },
 };
 
 /**
@@ -100,19 +100,23 @@ export function formatProbabilityRange(probability: number, ci: readonly [number
  * Format cloud ceiling height with unlimited sentinel handling.
  *
  * @example
- *   formatCloudCeiling(1200, "m") // "1,200 m"
- *   formatCloudCeiling(null, "m", true) // "Unlimited"
- *   formatCloudCeiling(20000, "m") // "Unlimited"
+ *   formatCloudCeiling(1.2, "km") // "1.2 km"
+ *   formatCloudCeiling(null, "km", true) // "Unlimited"
+ *   formatCloudCeiling(20.0, "km") // "Unlimited"
  */
 export function formatCloudCeiling(
   value: number | null | undefined,
-  unit: string = "m",
+  unit: string = "km",
   isUnlimited: boolean = false
 ): string {
-  if (isUnlimited || value === null || value === undefined || value >= 19990) {
+  const threshold = unit === "ft" ? 19.99 * 3280.84 : unit === "m" ? 19990 : 19.99;
+  if (isUnlimited || value === null || value === undefined || value >= threshold) {
     return "Unlimited";
   }
-  return `${Math.round(value).toLocaleString()} ${unit}`;
+  const formatted = new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: unit === "km" ? 1 : 0,
+  }).format(value);
+  return `${formatted} ${unit}`;
 }
 
 /**

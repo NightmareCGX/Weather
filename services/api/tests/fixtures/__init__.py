@@ -68,7 +68,7 @@ def build_forecast_dataset() -> xr.Dataset:
     cfrzr = np.zeros_like(temperature, dtype=np.uint8)
     cicep = np.zeros_like(temperature, dtype=np.uint8)
     cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid)
-    cloud_ceiling = np.where(lead_grid == 18, 20000.0, 1000.0 + 50.0 * lead_grid)
+    cloud_ceiling = np.where(lead_grid == 18, 20.0, 1.0 + 0.05 * lead_grid)
 
     return xr.Dataset(
         data_vars={
@@ -178,7 +178,7 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
         cfrzr = np.zeros_like(temperature, dtype=np.uint8)
         cicep = np.zeros_like(temperature, dtype=np.uint8)
         cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid + 1.0 * member_grid)
-        cloud_ceiling = np.where(member_grid >= 20, 20000.0, 1000.0 + 50.0 * lead_grid + 20.0 * member_grid)
+        cloud_ceiling = np.where(member_grid >= 20, 20.0, 1.0 + 0.05 * lead_grid + 0.02 * member_grid)
         return xr.Dataset(
             data_vars={
                 "temperature_2m": (
@@ -240,7 +240,7 @@ def _build_0_360_dataset(*, with_member: bool) -> xr.Dataset:
     cfrzr = np.zeros_like(temperature, dtype=np.uint8)
     cicep = np.zeros_like(temperature, dtype=np.uint8)
     cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid)
-    cloud_ceiling = np.where(lead_grid == 18, 20000.0, 1000.0 + 50.0 * lead_grid)
+    cloud_ceiling = np.where(lead_grid == 18, 20.0, 1.0 + 0.05 * lead_grid)
     return xr.Dataset(
         data_vars={
             "temperature_2m": (
@@ -403,7 +403,7 @@ def build_ensemble_dataset() -> xr.Dataset:
     cfrzr = np.zeros_like(temperature, dtype=np.uint8)
     cicep = np.zeros_like(temperature, dtype=np.uint8)
     cloud_cover_3h = np.where(lead_grid == 0, np.nan, 20.0 + 2.0 * lead_grid + 1.0 * member_grid)
-    cloud_ceiling = np.where(member_grid >= 4, 20000.0, 1000.0 + 50.0 * lead_grid + 20.0 * member_grid)
+    cloud_ceiling = np.where(member_grid >= 4, 20.0, 1.0 + 0.05 * lead_grid + 0.02 * member_grid)
 
     return xr.Dataset(
         data_vars={

@@ -34,8 +34,8 @@ def test_maps_contract(client):
     assert data["legend"]["unit"] == "°C"
     # The legend reflects the temperature variable's color ramp (which the tile
     # renderer uses), not a hard-coded generic ramp.
-    assert data["legend"]["stops"][0] == [-40.0, "#313695"]
-    assert data["legend"]["stops"][-1] == [45.0, "#a50026"]
+    assert data["legend"]["stops"][0] == [-60.0, "#1a0040"]
+    assert data["legend"]["stops"][-1] == [60.0, "#7a0177"]
 
 
 def test_maps_precipitation_unit(client):

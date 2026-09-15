@@ -23,10 +23,13 @@ from numpy.typing import NDArray
 #: Accounts for upstream GRIB2 packing quantization and radiation timestep averaging.
 CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT: float = 5.0
 
-#: Upstream geopotential height sentinel threshold for unlimited ceiling (meters).
-#: In NCEP GRIB2 encoding, clear sky / no qualifying ceiling is encoded near 20,000 gpm.
-CLOUD_CEILING_UNLIMITED_THRESHOLD_M: float = 19990.0
-CLOUD_CEILING_UNLIMITED_SENTINEL_M: float = 20000.0
+#: Upstream geopotential height sentinel threshold for unlimited ceiling (km).
+#: In NCEP GRIB2 encoding, clear sky / no qualifying ceiling is encoded near 20,000 gpm (20 km).
+CLOUD_CEILING_UNLIMITED_THRESHOLD_KM: float = 19.99
+CLOUD_CEILING_UNLIMITED_SENTINEL_KM: float = 20.0
+# Backward-compatibility aliases
+CLOUD_CEILING_UNLIMITED_THRESHOLD_M: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_KM
+CLOUD_CEILING_UNLIMITED_SENTINEL_M: float = CLOUD_CEILING_UNLIMITED_SENTINEL_KM
 
 #: Minimum valid ensemble members required out of 30 for ensemble statistics.
 #: If invalid_count >= 10 (N_valid <= 20), the ensemble result is marked invalid.
@@ -38,6 +41,8 @@ CLOUD_CEILING_MIN_FINITE_MEMBERS: int = 10
 
 #: Standard conversion factor from meters to feet.
 METERS_TO_FEET: float = 3.28084
+#: Standard conversion factor from kilometers to feet.
+KM_TO_FEET: float = 3280.84
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +50,12 @@ class CloudCeilingClassification:
     """Classification outcome for a single cloud ceiling measurement."""
 
     is_unlimited: bool
-    height_m: float | None
+    height_km: float | None
+
+    @property
+    def height_m(self) -> float | None:
+        """Backward compatibility property returning height."""
+        return self.height_km
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,10 +78,26 @@ class CloudCeilingEnsembleSummary:
     finite_member_count: int
     unlimited_member_count: int
     unlimited_probability: float
-    conditional_mean_m: float | None
-    conditional_median_m: float | None
-    conditional_spread_m: float | None
-    conditional_percentiles_m: dict[str, float] | None
+    conditional_mean: float | None
+    conditional_median: float | None
+    conditional_spread: float | None
+    conditional_percentiles: dict[str, float] | None
+
+    @property
+    def conditional_mean_m(self) -> float | None:
+        return self.conditional_mean
+
+    @property
+    def conditional_median_m(self) -> float | None:
+        return self.conditional_median
+
+    @property
+    def conditional_spread_m(self) -> float | None:
+        return self.conditional_spread
+
+    @property
+    def conditional_percentiles_m(self) -> dict[str, float] | None:
+        return self.conditional_percentiles
 
 
 def reconstruct_running_average_interval(
@@ -210,23 +236,23 @@ def reconstruct_cloud_cover_3h(
 
 
 def classify_cloud_ceiling(
-    value_m: float | None,
-    threshold: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_M,
+    value_km: float | None,
+    threshold: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_KM,
 ) -> CloudCeilingClassification:
     """Classify a cloud ceiling value into finite height or unlimited sky.
 
     Args:
-        value_m: Cloud ceiling height in meters (or None).
-        threshold: Height threshold in meters above which ceiling is unlimited.
+        value_km: Cloud ceiling height in kilometers (or None).
+        threshold: Height threshold in kilometers above which ceiling is unlimited.
 
     Returns:
         A :class:`CloudCeilingClassification` instance.
     """
-    if value_m is None or math.isnan(value_m):
-        return CloudCeilingClassification(is_unlimited=False, height_m=None)
-    if value_m >= threshold:
-        return CloudCeilingClassification(is_unlimited=True, height_m=None)
-    return CloudCeilingClassification(is_unlimited=False, height_m=float(value_m))
+    if value_km is None or math.isnan(value_km):
+        return CloudCeilingClassification(is_unlimited=False, height_km=None)
+    if value_km >= threshold:
+        return CloudCeilingClassification(is_unlimited=True, height_km=None)
+    return CloudCeilingClassification(is_unlimited=False, height_km=float(value_km))
 
 
 def cloud_cover_ensemble_summary(
@@ -283,7 +309,7 @@ def cloud_ceiling_ensemble_summary(
     percentiles: Sequence[float] = (10, 25, 50, 75, 90),
     min_finite: int = CLOUD_CEILING_MIN_FINITE_MEMBERS,
     min_valid: int = CLOUD_COVER_MIN_VALID_MEMBERS,
-    threshold: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_M,
+    threshold: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_KM,
 ) -> CloudCeilingEnsembleSummary | None:
     r"""Compute ensemble cloud ceiling summary separating unlimited probability from finite stats.
 
@@ -295,7 +321,7 @@ def cloud_ceiling_ensemble_summary(
     * If $N_{finite} < 10$, conditional percentiles and conditional mean/median/spread are None.
 
     Args:
-        members: Sequence of ensemble member ceiling heights in meters.
+        members: Sequence of ensemble member ceiling heights in kilometers.
         percentiles: Percentiles to compute for conditional finite distribution.
         min_finite: Minimum finite members required for finite distribution (default 10).
         min_valid: Minimum valid members required for ensemble validity (default 21).
@@ -347,29 +373,29 @@ def cloud_ceiling_ensemble_summary(
         finite_member_count=finite_count,
         unlimited_member_count=unlimited_count,
         unlimited_probability=unlimited_prob,
-        conditional_mean_m=mean_val,
-        conditional_median_m=median_val,
-        conditional_spread_m=spread_val,
-        conditional_percentiles_m=pcts,
+        conditional_mean=mean_val,
+        conditional_median=median_val,
+        conditional_spread=spread_val,
+        conditional_percentiles=pcts,
     )
 
 
 def compute_low_ceiling_probability(
     members: Sequence[float | int | None] | NDArray[np.floating[Any]],
-    threshold_m: float,
+    threshold_km: float,
     min_valid: int = CLOUD_COVER_MIN_VALID_MEMBERS,
-    sentinel_threshold: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_M,
+    sentinel_threshold: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_KM,
 ) -> float | None:
     r"""Compute probability of cloud ceiling being less than or equal to a height threshold.
 
-    Unlimited ceiling members evaluate as False (ceiling > threshold_m) and contribute to the
+    Unlimited ceiling members evaluate as False (ceiling > threshold_km) and contribute to the
     valid denominator $N_{valid}$.
 
     $$P(C \le h) = \frac{\#\{\text{finite members with } C \le h\}}{N_{valid}}$$
 
     Args:
-        members: Sequence of ensemble member ceiling heights in meters.
-        threshold_m: Ceiling height threshold in meters.
+        members: Sequence of ensemble member ceiling heights in kilometers.
+        threshold_km: Ceiling height threshold in kilometers.
         min_valid: Minimum required valid members (default 21).
         sentinel_threshold: Threshold above which ceiling is unlimited.
 
@@ -387,7 +413,7 @@ def compute_low_ceiling_probability(
             valid_count += 1
         elif val >= 0.0:
             valid_count += 1
-            if val <= threshold_m:
+            if val <= threshold_km:
                 finite_matching += 1
 
     if valid_count < min_valid:

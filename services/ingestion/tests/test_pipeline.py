@@ -266,18 +266,18 @@ def test_normalize_relative_humidity_preserves_percent() -> None:
     assert normalized["relative_humidity_2m"].attrs["units"] == "%"
 
 
-def test_normalize_visibility_preserves_meters() -> None:
-    """VIS (m) is preserved as m at ingestion."""
+def test_normalize_visibility_converts_meters_to_km() -> None:
+    """VIS (m) is converted to km at ingestion."""
     dataset = _dataset_with_units(
         "visibility",
         [[10000.0, 10000.0], [10000.0, 10000.0]],
         source_unit="m",
     )
-    variables = (VariableSpec("visibility", "Visibility", "m", "vis"),)
+    variables = (VariableSpec("visibility", "Visibility", "km", "vis"),)
     normalized = _normalize_canonical_units(dataset, variables)
     value = float(normalized["visibility"].values[0, 0])
-    assert value == pytest.approx(10000.0, abs=1e-9)
-    assert normalized["visibility"].attrs["units"] == "m"
+    assert value == pytest.approx(10.0, abs=1e-9)
+    assert normalized["visibility"].attrs["units"] == "km"
 
 
 def test_normalize_snow_depth_preserves_meters() -> None:

@@ -335,7 +335,7 @@ def build_probability_forecast(
                 status_code=404,
                 detail=f"No forecast data covers the requested location with sufficient member coverage (finite {len(finite_members)}/{expected_members} < 85%).",
             )
-        prob = compute_low_ceiling_probability(finite_members, threshold_m=threshold)
+        prob = compute_low_ceiling_probability(finite_members, threshold_km=threshold)
         if prob is None:
             raise HTTPException(
                 status_code=404,
@@ -569,16 +569,16 @@ def build_ensemble_statistics(
                 valid_member_count_payload = ceil_summary.valid_member_count
                 finite_member_count_payload = ceil_summary.finite_member_count
                 unlimited_member_count_payload = ceil_summary.unlimited_member_count
-                if ceil_summary.conditional_percentiles_m is not None:
+                if ceil_summary.conditional_percentiles is not None:
                     stats = EnsembleStatistics(
-                        mean=float(ceil_summary.conditional_mean_m) if ceil_summary.conditional_mean_m is not None else None,
-                        median=float(ceil_summary.conditional_median_m) if ceil_summary.conditional_median_m is not None else None,
-                        spread=float(ceil_summary.conditional_spread_m) if ceil_summary.conditional_spread_m is not None else None,
-                        p10=float(ceil_summary.conditional_percentiles_m["p10"]),
-                        p25=float(ceil_summary.conditional_percentiles_m["p25"]),
-                        p50=float(ceil_summary.conditional_percentiles_m["p50"]),
-                        p75=float(ceil_summary.conditional_percentiles_m["p75"]),
-                        p90=float(ceil_summary.conditional_percentiles_m["p90"]),
+                        mean=float(ceil_summary.conditional_mean) if ceil_summary.conditional_mean is not None else None,
+                        median=float(ceil_summary.conditional_median) if ceil_summary.conditional_median is not None else None,
+                        spread=float(ceil_summary.conditional_spread) if ceil_summary.conditional_spread is not None else None,
+                        p10=float(ceil_summary.conditional_percentiles["p10"]),
+                        p25=float(ceil_summary.conditional_percentiles["p25"]),
+                        p50=float(ceil_summary.conditional_percentiles["p50"]),
+                        p75=float(ceil_summary.conditional_percentiles["p75"]),
+                        p90=float(ceil_summary.conditional_percentiles["p90"]),
                     )
                 else:
                     stats = EnsembleStatistics(
@@ -605,7 +605,7 @@ def build_ensemble_statistics(
     pdf_payload: EnsemblePDF | None = None
     if include_members:
         valid_pdf_members = (
-            [m for m in participating_members if m < 19990.0]
+            [m for m in participating_members if m < 19.99]
             if variable == "cloud_ceiling"
             else participating_members
         )

@@ -101,7 +101,7 @@ export function EnsembleDistribution({
 
   const isCeiling = data.unlimited_probability !== undefined && data.unlimited_probability !== null;
   const rawMembers = data.members;
-  const members = isCeiling ? (rawMembers?.filter((m) => m < 19990) ?? []) : (rawMembers ?? []);
+  const members = isCeiling ? (rawMembers?.filter((m) => m < 19.99) ?? []) : (rawMembers ?? []);
 
   if (rawMembers === undefined || rawMembers.length === 0) {
     return (

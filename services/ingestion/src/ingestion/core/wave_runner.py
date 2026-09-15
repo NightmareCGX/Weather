@@ -125,7 +125,7 @@ DEFAULT_VARIABLES: tuple[VariableSpec, ...] = (
     VariableSpec(
         code="visibility",
         name="Visibility",
-        unit="m",
+        unit="km",
         source_code="vis",
     ),
     VariableSpec(
@@ -155,7 +155,7 @@ DEFAULT_VARIABLES: tuple[VariableSpec, ...] = (
     VariableSpec(
         code="cloud_ceiling",
         name="Cloud Ceiling Height",
-        unit="m",
+        unit="km",
         source_code="gh",
     ),
 )

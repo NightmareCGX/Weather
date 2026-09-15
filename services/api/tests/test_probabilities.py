@@ -254,12 +254,12 @@ def test_probability_service_operators_phase1a_variables():
     """_probability correctly evaluates gt, gte, lt, lte, between across Phase 1A variable ranges."""
     from api.services.ensemble_data import _probability
 
-    # Visibility members: [500, 1000, 1500, 3000, 5000] meters (fog hazard < 1000m or <= 1000m)
-    vis_members = [500.0, 1000.0, 1500.0, 3000.0, 5000.0]
-    # Low-visibility hazard probability (strict < 1000m): {500} -> 1/5 = 0.2
-    assert _probability(vis_members, 1000.0, "lt", None) == pytest.approx(0.2)
-    # Low-visibility hazard probability (inclusive <= 1000m): {500, 1000} -> 2/5 = 0.4
-    assert _probability(vis_members, 1000.0, "lte", None) == pytest.approx(0.4)
+    # Visibility members: [0.5, 1.0, 1.5, 3.0, 5.0] km (fog hazard < 1.0km or <= 1.0km)
+    vis_members = [0.5, 1.0, 1.5, 3.0, 5.0]
+    # Low-visibility hazard probability (strict < 1.0km): {0.5} -> 1/5 = 0.2
+    assert _probability(vis_members, 1.0, "lt", None) == pytest.approx(0.2)
+    # Low-visibility hazard probability (inclusive <= 1.0km): {0.5, 1.0} -> 2/5 = 0.4
+    assert _probability(vis_members, 1.0, "lte", None) == pytest.approx(0.4)
 
     # Wind gust members: [30, 45, 60, 75, 90] km/h (severe wind warning >= 60 km/h)
     gust_members = [30.0, 45.0, 60.0, 75.0, 90.0]
