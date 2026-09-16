@@ -197,11 +197,18 @@ class ShardedV1Reader:
         store: str | PathLike[str] | MutableMapping[str, bytes],
         *,
         max_cached_indices: int = 4096,
-        max_cached_chunks: int = 2048,
+        max_cached_chunks: int | None = None,
     ) -> None:
         self.store = store
         self.max_cached_indices = max_cached_indices
-        self.max_cached_chunks = max_cached_chunks
+        # Live value comes from API_READER_MAX_CACHED_CHUNKS; see that setting for
+        # the measured basis. Resolved per instance so tests and deployments can
+        # override it without rebuilding the class default.
+        self.max_cached_chunks = (
+            int(settings.API_READER_MAX_CACHED_CHUNKS)
+            if max_cached_chunks is None
+            else max_cached_chunks
+        )
         self._compressor = Zstd(level=5)
         self._index_cache: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
         self._chunk_cache: OrderedDict[str, np.ndarray[Any, Any]] = OrderedDict()

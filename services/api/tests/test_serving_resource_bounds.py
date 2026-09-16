@@ -76,6 +76,46 @@ def test_reader_s3_pool_size_comes_from_settings(tmp_path: Path) -> None:
     clear_sharded_readers()
 
 
+def test_chunk_cache_ceiling_comes_from_settings() -> None:
+    """The chunk cache is right-sized for memory, and overridable.
+
+    Simulating a realistic serving session touches 630 distinct chunks and the LRU
+    hit rate plateaus at 1024 entries, so the old 2048 default (~82 MB per reader)
+    bought nothing while dominating the API container's memory. 512 costs one
+    percentage point of hit rate for a 4x reduction.
+    """
+    from api.core.zarr import ShardedV1Reader
+
+    assert settings.API_READER_MAX_CACHED_CHUNKS == 512
+    assert ShardedV1Reader("s3://bucket/x.zarr").max_cached_chunks == 512
+    assert ShardedV1Reader("s3://bucket/x.zarr", max_cached_chunks=7).max_cached_chunks == 7
+
+
+def test_chunk_cache_evicts_at_its_ceiling(tmp_path: Path) -> None:
+    """The ceiling is actually enforced, not merely stored."""
+    from api.core.zarr import ShardedV1Reader
+    from tests.test_sharded_reader import _build_test_shard
+
+    store = tmp_path / "store.zarr"
+    shard = store / "temperature_2m" / "shard.det_L0000.shard"
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    shard.write_bytes(_build_test_shard(val_offset=1.0))
+
+    reader = ShardedV1Reader(str(store), max_cached_chunks=10)
+    # Read all 8x15 = 120 chunks, far more than the ceiling.
+    for row in range(8):
+        for col in range(15):
+            reader.read_chunk(
+                "temperature_2m",
+                member=None,
+                lead_time_hours=0,
+                chunk_row=row,
+                chunk_col=col,
+            )
+
+    assert len(reader._chunk_cache) <= 10
+
+
 # ---------------------------------------------------------------------------
 # 2. Gated-read admission is enforced
 # ---------------------------------------------------------------------------

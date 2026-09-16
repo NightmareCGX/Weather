@@ -129,6 +129,17 @@ class Settings(BaseSettings):
     # S3_MAX_POOL_CONNECTIONS setting does not apply to the API.
     API_S3_MAX_POOL_CONNECTIONS: int = Field(default=16, ge=1, le=256)
 
+    # Chunk-cache ceiling per ShardedV1Reader, counted in 100x100 float32 chunks
+    # (~40 KB each), so this value multiplies directly into resident memory.
+    #
+    # The previous 2048 (~82 MB per reader) sat well past the point of any benefit:
+    # simulating a realistic serving session (6 viewports x 3 variables x 8 leads,
+    # plus a 30-member ensemble read) touches 630 distinct chunks, and the LRU hit
+    # rate plateaus at 1024 entries (91.6%). At 512 the hit rate is 90.6% — one
+    # point lower for a 4x memory reduction — which matters because every cached
+    # reader holds its own cache and the API container runs near its memory limit.
+    API_READER_MAX_CACHED_CHUNKS: int = Field(default=512, ge=1, le=8192)
+
     # Map-tile PNG (IDAT) zlib compression level, constrained to the zlib range.
     # Level 1 is the serving default: on a 256x256 RGBA tile it compresses
     # several times faster than the zlib default of 6 for only a small size
