@@ -38,6 +38,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    PointQueryFallbackAudit,
     ReclamationQueue,
 )
 from api.services.resolver import (
@@ -273,6 +274,7 @@ def test_db_engine(tmp_path):
         ForecastProduct.__table__,
         ForecastCycleLifecycle.__table__,
         ReclamationQueue.__table__,
+        PointQueryFallbackAudit.__table__,
     ]
     Base.metadata.create_all(engine, tables=tables)
 
@@ -392,7 +394,77 @@ def test_resolver_cache_commit_invalidation(test_db_engine):
         session.add_all([run_06z, prod_06z])
         session.commit()
 
-        # Due to after_commit hook, the resolver micro-cache is immediately invalidated
+        # The catalog write invalidates the resolver micro-cache immediately
+        src_new = resolve_canonical_source(session, "gfs", target_v, now=fixed_now)
+        assert src_new.run_id == "r_06z"
+        assert src_new.lead_time_hours == 6
+
+
+def test_resolver_cache_survives_unrelated_commits(test_db_engine):
+    """Commits that cannot affect resolution must NOT clear the micro-cache.
+
+    The cache is keyed by catalog provenance, so only writes to the catalog
+    tables the resolver reads can stale it. The previous hook cleared the whole
+    cache on every commit in the process — including the point-query fallback
+    audit ledger, which commits on every request while Redis is unavailable and
+    so defeated the cache exactly when load was highest.
+    """
+    _clear_resolver_cache()
+
+    target_v = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 9, 15, 2, 0, tzinfo=timezone.utc)
+
+    with Session(test_db_engine) as session:
+        src = resolve_canonical_source(session, "gfs", target_v, now=fixed_now)
+        assert src.run_id == "r_00z"
+
+        import api.services.resolver as res_mod
+
+        cached_before = dict(res_mod._resolver_cache)
+        assert cached_before, "the resolution should have been cached"
+
+        # A write to an unrelated table (the Redis-fallback audit ledger).
+        session.add(
+            PointQueryFallbackAudit(
+                cache_key="point:unrelated-commit",
+                query_params="model=gfs",
+                created_at=fixed_now,
+                expires_at=fixed_now + timedelta(seconds=1800),
+                fallback_reason="redis_read_unavailable",
+            )
+        )
+        session.commit()
+
+        assert res_mod._resolver_cache == cached_before, (
+            "an unrelated commit must not clear the resolver micro-cache"
+        )
+
+        # Correctness is preserved: a catalog write still invalidates.
+        c_06z = datetime(2026, 9, 15, 6, 0, tzinfo=timezone.utc)
+        session.add_all(
+            [
+                ModelRun(
+                    id="r_06z",
+                    model_version_id="v_gfs",
+                    cycle_time=c_06z,
+                    status="ready",
+                    zarr_store_path="/store/06z",
+                ),
+                ForecastProduct(
+                    id="p_06_06",
+                    run_id="r_06z",
+                    variable_id="temperature_2m",
+                    grid_id="global_025deg",
+                    product_type="surface",
+                    lead_time_hours=6,
+                ),
+            ]
+        )
+        session.commit()
+
+        assert res_mod._resolver_cache == {}, (
+            "a catalog write must clear the resolver micro-cache"
+        )
         src_new = resolve_canonical_source(session, "gfs", target_v, now=fixed_now)
         assert src_new.run_id == "r_06z"
         assert src_new.lead_time_hours == 6
@@ -512,6 +584,24 @@ def test_resolver_flight_locks_released_on_http_404(test_db_engine):
 # ---------------------------------------------------------------------------
 
 
+def _best_cpu_seconds(fn, iterations: int, rounds: int = 5) -> float:
+    """Return the lowest CPU time (seconds) taken by ``rounds`` timed runs of ``fn``.
+
+    CPU time (``process_time``) excludes time the process spent descheduled, and
+    taking the best of several rounds discards rounds perturbed by other work on
+    the machine. Both matter here: this suite runs alongside container builds and
+    parallel CI jobs, and a single wall-clock measurement is routinely noisy
+    enough to invert a genuine 3-5x difference.
+    """
+    best = float("inf")
+    for _ in range(rounds):
+        start = time.process_time()
+        for _ in range(iterations):
+            fn()
+        best = min(best, time.process_time() - start)
+    return best
+
+
 def test_png_level_1_encode_performance_and_fidelity():
     """Verify level 1 encoding produces correct output and is significantly faster than level 6."""
     # Standard 256x256 RGBA tile (256KB buffer)
@@ -522,21 +612,20 @@ def test_png_level_1_encode_performance_and_fidelity():
             pixels += bytes(((x + y) % 256, (x * 2) % 256, (y * 2) % 256, 255))
     raw_tile = bytes(pixels)
 
-    # Encode with level 1 (default) vs level 6
-    iterations = 20
+    png_lvl1 = encode_rgba_png(raw_tile, width, height, compress_level=1)
+    png_lvl6 = encode_rgba_png(raw_tile, width, height, compress_level=6)
 
-    t0 = time.perf_counter()
-    for _ in range(iterations):
-        png_lvl1 = encode_rgba_png(raw_tile, width, height, compress_level=1)
-    t_lvl1 = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    for _ in range(iterations):
-        png_lvl6 = encode_rgba_png(raw_tile, width, height, compress_level=6)
-    t_lvl6 = time.perf_counter() - t0
+    t_lvl1 = _best_cpu_seconds(
+        lambda: encode_rgba_png(raw_tile, width, height, compress_level=1),
+        iterations=20,
+    )
+    t_lvl6 = _best_cpu_seconds(
+        lambda: encode_rgba_png(raw_tile, width, height, compress_level=6),
+        iterations=20,
+    )
 
     # Level 1 must be strictly faster (typically 3-5x faster)
-    assert t_lvl1 < t_lvl6
+    assert t_lvl1 < t_lvl6, f"level 1 {t_lvl1:.4f}s CPU vs level 6 {t_lvl6:.4f}s CPU"
 
     # Verify byte size difference is minimal (< 15% increase)
     size_lvl1 = len(png_lvl1)
