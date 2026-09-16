@@ -35,25 +35,32 @@ SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
 INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
 TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
 
-#: Bounded concurrency limit for member reads (tuned to match the connection pool
-#: and prevent socket starvation while eliminating serial member latency).
+#: Fallback member-read fan-out when settings are unavailable. The live value is
+#: ``API_MEMBER_FETCH_WORKERS``; see that setting for the sizing rationale.
 DEFAULT_MEMBER_WORKERS: int = 16
 _member_executor: ThreadPoolExecutor | None = None
 _member_executor_lock = threading.Lock()
 
 
-def get_member_executor(max_workers: int = DEFAULT_MEMBER_WORKERS) -> ThreadPoolExecutor:
+def get_member_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
     """Return the shared process-wide bounded member executor.
 
-    Bounded to 16 workers by default (matching API_MAX_CONCURRENT_GATED_READS)
-    to balance throughput against object-store connection pressure without
-    per-request thread churn.
+    A single GEFS point read fans out over up to 30 ensemble members, so this
+    pool is larger than the chunk-fetch pool — but it is still bounded per
+    process, because the production host is a small shared machine and member
+    reads must not monopolize it or flood the object store. Bounding it also
+    avoids per-request thread churn.
     """
     global _member_executor
     with _member_executor_lock:
         if _member_executor is None:
+            workers = (
+                int(settings.API_MEMBER_FETCH_WORKERS)
+                if max_workers is None
+                else max_workers
+            )
             _member_executor = ThreadPoolExecutor(
-                max_workers=max_workers,
+                max_workers=workers,
                 thread_name_prefix="gefs-member-",
             )
         return _member_executor
@@ -68,18 +75,24 @@ def shutdown_member_executor(wait: bool = True) -> None:
             _member_executor = None
 
 
-#: Bounded concurrency limit for shard chunk fetches. A tile window normally
-#: spans 2-4 chunks; a low-zoom tile can span the whole 8x15 chunk grid. This
-#: pool collapses those fetches from N sequential Range GETs into a single
-#: concurrent wait, bounded so a viewport burst cannot open unbounded sockets
-#: (each ``ShardedV1Reader`` already caps s3fs at ``max_pool_connections=64``).
-DEFAULT_CHUNK_WORKERS: int = 16
+#: Fallback shard-chunk fetch fan-out when settings are unavailable. The live
+#: value is ``API_CHUNK_FETCH_WORKERS``; see that setting for the sizing
+#: rationale (it is deliberately small, not a worst-case 8x15 chunk grid).
+DEFAULT_CHUNK_WORKERS: int = 4
 _chunk_executor: ThreadPoolExecutor | None = None
 _chunk_executor_lock = threading.Lock()
 
 
-def get_chunk_executor(max_workers: int = DEFAULT_CHUNK_WORKERS) -> ThreadPoolExecutor:
+def get_chunk_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
     """Return the shared process-wide bounded shard-chunk fetch executor.
+
+    The pool exists to overlap the Range GETs of *one* tile window, so it only
+    needs to cover that window's chunk span — one chunk at the zoom levels the
+    map actually uses, and at most 2-8 when zoomed out. It is deliberately kept
+    small rather than sized for the worst case (a fully zoomed-out tile spans the
+    whole 8x15 chunk grid) because every fetched chunk also costs CPU to
+    zstd-decode, and production serves four uvicorn workers on a four-core host
+    shared with the rest of the stack.
 
     Deliberately separate from the member executor so that a window read can
     never nest inside its own pool (which could exhaust it and deadlock), and
@@ -88,8 +101,13 @@ def get_chunk_executor(max_workers: int = DEFAULT_CHUNK_WORKERS) -> ThreadPoolEx
     global _chunk_executor
     with _chunk_executor_lock:
         if _chunk_executor is None:
+            workers = (
+                int(settings.API_CHUNK_FETCH_WORKERS)
+                if max_workers is None
+                else max_workers
+            )
             _chunk_executor = ThreadPoolExecutor(
-                max_workers=max_workers,
+                max_workers=workers,
                 thread_name_prefix="shard-chunk-",
             )
         return _chunk_executor

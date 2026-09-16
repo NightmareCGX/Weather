@@ -126,6 +126,28 @@ class Settings(BaseSettings):
     # failing at import time.
     API_PNG_COMPRESS_LEVEL: int = Field(default=1, ge=0, le=9)
 
+    # Shard chunk-fetch fan-out, per API process.
+    #
+    # Sized for the deployed host rather than for the worst case: production runs
+    # ``UVICORN_WORKERS=4`` on a 4-core ARM64 box shared with ~10 containers
+    # (Postgres, Redis, MinIO, three ingestion workers, gateway, frontend), so a
+    # value of N means up to 4*N fetch threads fleet-wide, each of which also
+    # needs CPU to zstd-decode its chunk.
+    #
+    # The fan-out only has to cover the chunk span of one tile, which is 1 chunk
+    # at z>=4 — the range the map actually uses (it opens at z=5 and moves to
+    # 6.5-8) — and 2-8 chunks at z=2-3. Four workers therefore already collapse
+    # the common case to a single round trip; raising it only helps the rare
+    # fully-zoomed-out view while adding contention.
+    API_CHUNK_FETCH_WORKERS: int = Field(default=4, ge=1, le=32)
+
+    # Ensemble member-read fan-out, per API process.
+    #
+    # Larger than the chunk pool because a single GEFS point read fans out over
+    # up to 30 members, but still bounded for the same host reasons: member reads
+    # must not monopolize a small shared machine or flood the object store.
+    API_MEMBER_FETCH_WORKERS: int = Field(default=16, ge=1, le=32)
+
     # Elevation resolution for dynamic coordinates (UI metadata only).
     # ``none`` (default): elevation always unavailable (safe offline default).
     # ``open_meteo``: Open-Meteo Elevation API (Copernicus GLO-90 DEM).

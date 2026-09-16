@@ -551,3 +551,51 @@ def test_tile_window_carries_pixel_geometry(tmp_path: Path) -> None:
     # Rendering consumes the carried geometry (no zoom/x/y arguments exist).
     png = tiles_mod._render_window_to_png(window, variable="temperature_2m", cache_key=())
     assert png.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+# ---------------------------------------------------------------------------
+# 4. Executor sizing is deployment-driven
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_fetch_fanout_comes_from_settings(monkeypatch) -> None:
+    """The chunk pool is sized from settings, with a small host-aware default.
+
+    The deployed host runs four uvicorn workers on a 4-core ARM64 box shared with
+    Postgres/Redis/MinIO/ingestion, and every fetched chunk also costs CPU to
+    zstd-decode. A default sized for the worst case (a fully zoomed-out tile
+    spans the whole 8x15 chunk grid) would put dozens of decoding threads on four
+    cores, so the default must stay small and the value must be tunable per
+    deployment without a code change.
+    """
+    from api.core.config import settings
+
+    assert settings.API_CHUNK_FETCH_WORKERS == 4
+
+    zarr_mod.shutdown_chunk_executor()
+    try:
+        monkeypatch.setattr(settings, "API_CHUNK_FETCH_WORKERS", 7)
+        assert zarr_mod.get_chunk_executor()._max_workers == 7
+    finally:
+        zarr_mod.shutdown_chunk_executor()
+        monkeypatch.undo()
+
+    # Restored default applies to the next process-wide pool.
+    assert zarr_mod.get_chunk_executor()._max_workers == 4
+
+
+def test_member_fetch_fanout_comes_from_settings(monkeypatch) -> None:
+    """The member pool is likewise settings-driven and bounded."""
+    from api.core.config import settings
+
+    assert settings.API_MEMBER_FETCH_WORKERS == 16
+
+    zarr_mod.shutdown_member_executor()
+    try:
+        monkeypatch.setattr(settings, "API_MEMBER_FETCH_WORKERS", 5)
+        assert zarr_mod.get_member_executor()._max_workers == 5
+    finally:
+        zarr_mod.shutdown_member_executor()
+        monkeypatch.undo()
+
+    assert zarr_mod.get_member_executor()._max_workers == 16
