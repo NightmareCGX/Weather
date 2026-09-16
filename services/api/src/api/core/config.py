@@ -210,6 +210,18 @@ class Settings(BaseSettings):
     API_VECTOR_PREWARM_MAX_COMPUTES_PER_PASS: int = 6
     API_VECTOR_PREWARM_COMPUTE_THROTTLE_SECONDS: float = 2.0
 
+    # Background low-zoom map tile cache prewarm (P3 cold-load optimization).
+    # A lifespan-owned task resolves the newest cycle for the default model/variable
+    # and pre-computes low-zoom tiles (Zoom 0..2 = 21 tiles) so first-time page
+    # loads never experience cold compute latency. Deduplicated across workers via Redis.
+    API_TILE_PREWARM_ENABLED: bool = True
+    API_TILE_PREWARM_INTERVAL_SECONDS: float = 60.0
+    API_TILE_PREWARM_THROTTLE_SECONDS: float = 0.02
+    API_TILE_PREWARM_MODELS: Any = ["gfs"]
+    API_TILE_PREWARM_VARIABLES: Any = ["temperature_2m"]
+    API_TILE_PREWARM_MAX_ZOOM: int = 2
+    API_TILE_PREWARM_GATEWAY_URL: str = ""
+
     # Wind vector-field cache layering. The shared Redis L2 lets every worker
     # (and the prewarm loop) see one another's computed payloads so each valid
     # time is computed once fleet-wide; the small per-process L1 keeps serving

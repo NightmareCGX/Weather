@@ -486,7 +486,13 @@
             "in": "query",
             "required": false,
             "schema": {
-              "enum": ["city", "resort", "station", "all", "place"],
+              "enum": [
+                "city",
+                "resort",
+                "station",
+                "all",
+                "place"
+              ],
               "type": "string",
               "description": "Location type to search.",
               "default": "all",
@@ -750,7 +756,10 @@
             "in": "query",
             "required": false,
             "schema": {
-              "enum": ["metric", "imperial"],
+              "enum": [
+                "metric",
+                "imperial"
+              ],
               "type": "string",
               "default": "metric",
               "title": "Units"
@@ -946,7 +955,13 @@
             "in": "query",
             "required": true,
             "schema": {
-              "enum": ["gt", "gte", "lt", "lte", "between"],
+              "enum": [
+                "gt",
+                "gte",
+                "lt",
+                "lte",
+                "between"
+              ],
               "type": "string",
               "description": "Threshold comparison operator.",
               "title": "Operator"
@@ -1399,10 +1414,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2).",
+              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). May be combined with initial_time to pin the serving cycle for cacheable URLs.",
               "title": "Valid Time"
             },
-            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2)."
+            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). May be combined with initial_time to pin the serving cycle for cacheable URLs."
           },
           {
             "name": "initial_time",
@@ -1417,10 +1432,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Optional ISO 8601 UTC cycle time pinning the model run.",
+              "description": "Optional ISO 8601 UTC cycle time pinning the model run. When combined with valid_time it pins the serving cycle, making the tile URL immutable and long-lived browser caching possible.",
               "title": "Initial Time"
             },
-            "description": "Optional ISO 8601 UTC cycle time pinning the model run."
+            "description": "Optional ISO 8601 UTC cycle time pinning the model run. When combined with valid_time it pins the serving cycle, making the tile URL immutable and long-lived browser caching possible."
           }
         ],
         "responses": {
@@ -1443,7 +1458,7 @@
     "/v1/ensembles": {
       "get": {
         "summary": "Get ensemble statistics and spread",
-        "description": "Return ensemble dispersion statistics for a forecast variable.\n\nUnder Lifecycle V2:\n- If ``valid_time`` is supplied, the newest committed source cycle and lead\n  are dynamically resolved via the shared ValidTimeResolver.\n- If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead\n  serving is preserved for backward compatibility.",
+        "description": "Return ensemble dispersion statistics for a forecast variable.\n\nUnder Lifecycle V2:\n- If ``leads`` is supplied, a batch series across multiple lead times is computed and returned.\n- If ``valid_time`` is supplied, the newest committed source cycle and lead\n  are dynamically resolved via the shared ValidTimeResolver.\n- If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead\n  serving is preserved for backward compatibility.",
         "operationId": "get_ensemble_statistics_v1_ensembles_get",
         "parameters": [
           {
@@ -1509,6 +1524,24 @@
               "title": "Lead Time Hours"
             },
             "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "leads",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional comma-separated lead hours or 'all' to request a batch series of leads.",
+              "title": "Leads"
+            },
+            "description": "Optional comma-separated lead hours or 'all' to request a batch series of leads."
           },
           {
             "name": "valid_time",
@@ -1689,6 +1722,27 @@
         }
       }
     },
+    "/v1/admin/prewarm-tiles": {
+      "post": {
+        "summary": "Run one low-zoom map tile cache prewarm pass",
+        "description": "Run one low-zoom map tile prewarm pass synchronously and report counters.\n\nOps/debug and ingestion-completion trigger: prewarms Zoom 0..2 raster tiles\nfor configured default models and variables (21 tiles) and returns pass\ncounters.",
+        "operationId": "trigger_tile_prewarm_v1_admin_prewarm_tiles_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Trigger Tile Prewarm V1 Admin Prewarm Tiles Post"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/metrics": {
       "get": {
         "summary": "Get Prometheus metrics for the API serving layer",
@@ -1752,7 +1806,11 @@
           }
         },
         "type": "object",
-        "required": ["id", "name", "country"],
+        "required": [
+          "id",
+          "name",
+          "country"
+        ],
         "title": "CenterOut",
         "description": "A forecast center resource (API.md section 1.1)."
       },
@@ -1779,7 +1837,10 @@
           }
         },
         "type": "object",
-        "required": ["latitude", "longitude"],
+        "required": [
+          "latitude",
+          "longitude"
+        ],
         "title": "ElevationOut",
         "description": "Terrain elevation response for geographic coordinates."
       },
@@ -1796,7 +1857,18 @@
             "default": "ensemble_statistics"
           },
           "data": {
-            "$ref": "#/components/schemas/EnsembleStatisticsData"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnsembleStatisticsData"
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/EnsembleStatisticsData"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Data"
           },
           "has_more": {
             "type": "boolean",
@@ -1816,7 +1888,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "EnsembleStatisticsEnvelope",
         "description": "The ensemble statistics response envelope (API.md sections 5.1 and 2.3)."
       },
@@ -1853,7 +1927,9 @@
           }
         },
         "type": "object",
-        "required": ["models"],
+        "required": [
+          "models"
+        ],
         "title": "ForecastAvailabilityData",
         "description": "The payload of the forecast availability endpoint.\n\nModels are ordered by model id; only models that have at least one\n``ready`` run with forecast product rows are included, so the list\nreflects exactly what the platform can serve."
       },
@@ -1886,7 +1962,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ForecastAvailabilityEnvelope",
         "description": "The forecast availability response envelope.\n\n``object`` is ``forecast_availability`` (a new resource shape that is a\nnon-breaking addition to the v1 surface per API.md section 1.3)."
       },
@@ -1917,7 +1995,11 @@
           }
         },
         "type": "object",
-        "required": ["latitude", "longitude", "resolved_via"],
+        "required": [
+          "latitude",
+          "longitude",
+          "resolved_via"
+        ],
         "title": "ForecastLocationOut",
         "description": "The resolved location of a point forecast (API.md section 2.1)."
       },
@@ -1945,7 +2027,10 @@
         },
         "additionalProperties": true,
         "type": "object",
-        "required": ["lead_time_hours", "valid_time"],
+        "required": [
+          "lead_time_hours",
+          "valid_time"
+        ],
         "title": "ForecastSeries",
         "description": "A single forecast entry indexed by lead time (API.md section 2.1).\n\nRequested forecast variables are attached as additional top-level keys\n(e.g. ``temperature_2m``), matching the dynamic keyed shape shown in\nAPI.md. Variable keys are captured through ``extra=\"allow\"``.\n\n``cycle_time`` is the source forecast run's cycle/reference time. The point\nforecast is a **cross-cycle** deterministic time series: entries may come\nfrom different cycles (the minimum-lead record for each valid_time), so the\nsource cycle is exposed to make the provenance unambiguous. It is additive\nand non-breaking."
       },
@@ -1971,7 +2056,11 @@
           }
         },
         "type": "object",
-        "required": ["id", "name", "resolution_km"],
+        "required": [
+          "id",
+          "name",
+          "resolution_km"
+        ],
         "title": "GridOut",
         "description": "A forecast grid resource (API.md section 1.5)."
       },
@@ -2012,7 +2101,13 @@
           }
         },
         "type": "object",
-        "required": ["status", "version", "database", "redis", "object_storage"],
+        "required": [
+          "status",
+          "version",
+          "database",
+          "redis",
+          "object_storage"
+        ],
         "title": "HealthCheckData",
         "description": "The payload of a system health check (API.md section 8.1).\n\n``status`` is ``healthy`` when every dependency is connected and\n``degraded`` otherwise. ``version`` is the API contract version."
       },
@@ -2045,7 +2140,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "HealthCheckEnvelope",
         "description": "The health check response envelope (API.md sections 8.1 and 2.3)."
       },
@@ -2089,7 +2186,10 @@
           }
         },
         "type": "object",
-        "required": ["value", "lead_time_hours"],
+        "required": [
+          "value",
+          "lead_time_hours"
+        ],
         "title": "InitialTimeAvailability",
         "description": "One available forecast initialization (cycle time) of a variable.\n\nAttributes:\n    value: The run's ``cycle_time`` in ISO 8601 UTC. ``valid_time`` for a\n        given lead is derived as ``value + lead_time_hours``\n        (DATABASE.md section 1).\n    lead_time_hours: The publicly servable forecast offset hours available\n        for this model/variable/initial time (coverage >= 85%), ascending.\n    status: The run lifecycle status (e.g. 'ready', 'processing', 'partial').\n    leads: Rich lead-level coverage descriptors including below-threshold leads."
       },
@@ -2145,7 +2245,12 @@
           }
         },
         "type": "object",
-        "required": ["tile_url_template", "min_zoom", "max_zoom", "legend"],
+        "required": [
+          "tile_url_template",
+          "min_zoom",
+          "max_zoom",
+          "legend"
+        ],
         "title": "LayerDescriptor",
         "description": "The spatial layer descriptor for rendering map tiles and legends."
       },
@@ -2216,7 +2321,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ListEnvelope[CenterOut]"
       },
       "ListEnvelope_GridOut_": {
@@ -2252,7 +2359,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ListEnvelope[GridOut]"
       },
       "ListEnvelope_ModelOut_": {
@@ -2288,7 +2397,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ListEnvelope[ModelOut]"
       },
       "ListEnvelope_RunOut_": {
@@ -2324,7 +2435,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ListEnvelope[RunOut]"
       },
       "ListEnvelope_SearchResultOut_": {
@@ -2360,7 +2473,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ListEnvelope[SearchResultOut]"
       },
       "ListEnvelope_VariableOut_": {
@@ -2396,7 +2511,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ListEnvelope[VariableOut]"
       },
       "LocateOut": {
@@ -2449,7 +2566,10 @@
           }
         },
         "type": "object",
-        "required": ["latitude", "longitude"],
+        "required": [
+          "latitude",
+          "longitude"
+        ],
         "title": "LocateOut",
         "description": "Approximate location resolved from trusted infrastructure IP headers."
       },
@@ -2476,7 +2596,12 @@
           }
         },
         "type": "object",
-        "required": ["id", "name", "is_ensemble", "variables"],
+        "required": [
+          "id",
+          "name",
+          "is_ensemble",
+          "variables"
+        ],
         "title": "ModelAvailability",
         "description": "A forecast model and the variables available for it.\n\nAttributes:\n    id: The ``models.model_id`` (e.g. ``gfs``).\n    name: Human-readable model name.\n    is_ensemble: Whether the model is an ensemble product.\n    variables: The variables with ready forecast data for this model,\n        ordered by variable code."
       },
@@ -2510,7 +2635,13 @@
           }
         },
         "type": "object",
-        "required": ["id", "name", "center_id", "is_ensemble", "resolution_km"],
+        "required": [
+          "id",
+          "name",
+          "center_id",
+          "is_ensemble",
+          "resolution_km"
+        ],
         "title": "ModelOut",
         "description": "A weather model resource (API.md section 1.2)."
       },
@@ -2536,7 +2667,12 @@
           }
         },
         "type": "object",
-        "required": ["location", "generated_at", "model", "forecasts"],
+        "required": [
+          "location",
+          "generated_at",
+          "model",
+          "forecasts"
+        ],
         "title": "PointForecastData",
         "description": "The payload of a point forecast (API.md section 2.1).\n\n``generated_at`` is the forecast dataset generation time -- the selected\nmodel run's ``cycle_time`` -- so that identical forecast data produces\nidentical payloads and deterministic cache behavior."
       },
@@ -2569,7 +2705,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "PointForecastEnvelope",
         "description": "The point forecast response envelope (API.md sections 2.1 and 2.3).\n\nOnly the documented single-model ``point_forecast`` envelope is\nimplemented in Milestone 9. The multi-model response format is not\ndefined by the approved design documents and is therefore a recorded\nspecification gap; multi-model requests are rejected (see the\n``/v1/points`` router)."
       },
@@ -2606,7 +2744,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "ProbabilityForecastEnvelope",
         "description": "The probability forecast response envelope (API.md sections 3.1 and 2.3)."
       },
@@ -2636,7 +2776,12 @@
           }
         },
         "type": "object",
-        "required": ["id", "model_id", "cycle_time", "status"],
+        "required": [
+          "id",
+          "model_id",
+          "cycle_time",
+          "status"
+        ],
         "title": "RunOut",
         "description": "A model run resource (API.md section 1.3)."
       },
@@ -2708,7 +2853,13 @@
           }
         },
         "type": "object",
-        "required": ["id", "object", "name", "latitude", "longitude"],
+        "required": [
+          "id",
+          "object",
+          "name",
+          "latitude",
+          "longitude"
+        ],
         "title": "SearchResultOut",
         "description": "A location search result (API.md section 6.1).\n\nThe ``object`` field distinguishes the source table: ``city``,\n``ski_resort``, or ``station``. Type-specific fields (``region``,\n``country``, ``elevation_m``) are optional because not every source\ntable defines them."
       },
@@ -2764,7 +2915,12 @@
           }
         },
         "type": "object",
-        "required": ["tile_url_template", "min_zoom", "max_zoom", "legend"],
+        "required": [
+          "tile_url_template",
+          "min_zoom",
+          "max_zoom",
+          "legend"
+        ],
         "title": "SpatialLayerData",
         "description": "The payload of a spatial layer (API.md section 4.1)."
       },
@@ -2797,7 +2953,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "SpatialLayerEnvelope",
         "description": "The spatial layer response envelope (API.md sections 4.1 and 2.3)."
       },
@@ -2826,7 +2984,10 @@
           }
         },
         "type": "object",
-        "required": ["unit", "stops"],
+        "required": [
+          "unit",
+          "stops"
+        ],
         "title": "SpatialLayerLegend",
         "description": "The legend of a spatial layer (API.md section 4.1)."
       },
@@ -2900,7 +3061,11 @@
           }
         },
         "type": "object",
-        "required": ["loc", "msg", "type"],
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
         "title": "ValidationError"
       },
       "VariableAvailability": {
@@ -2944,7 +3109,12 @@
           }
         },
         "type": "object",
-        "required": ["id", "name", "unit", "initial_times"],
+        "required": [
+          "id",
+          "name",
+          "unit",
+          "initial_times"
+        ],
         "title": "VariableAvailability",
         "description": "A forecast variable and the initial times / valid times available for it.\n\nAttributes:\n    id: The ``forecast_variables.variable_code`` (e.g.\n        ``temperature_2m``).\n    name: Human-readable variable name.\n    unit: The registered SI unit string (e.g. ``\u00b0C``).\n    initial_times: The initial times with data for this\n        model/variable, newest first (legacy compatibility).\n    valid_times: The unified, cross-cycle valid times available for this\n        model/variable under Lifecycle V2, ascending.\n    layer: Authoritative map layer descriptor for rendering tiles and\n        legends without an extra metadata roundtrip."
       },
@@ -2970,7 +3140,11 @@
           }
         },
         "type": "object",
-        "required": ["id", "name", "unit"],
+        "required": [
+          "id",
+          "name",
+          "unit"
+        ],
         "title": "VariableOut",
         "description": "A forecast variable resource (API.md section 1.4)."
       },
@@ -2988,7 +3162,10 @@
           }
         },
         "type": "object",
-        "required": ["start", "end"],
+        "required": [
+          "start",
+          "end"
+        ],
         "title": "VerificationPeriod",
         "description": "The verification date window (API.md section 7.1).\n\n``start`` and ``end`` are inclusive calendar dates (the window spans\n``[start 00:00:00Z, end + 1 day)``)."
       },
@@ -3010,7 +3187,11 @@
           }
         },
         "type": "object",
-        "required": ["model", "period", "metrics"],
+        "required": [
+          "model",
+          "period",
+          "metrics"
+        ],
         "title": "VerificationReportData",
         "description": "The payload of a verification report (API.md section 7.1).\n\n``metrics`` maps a flat per-variable key (``{variable}_rmse``,\n``{variable}_bias``, ``{variable}_mae``) to its value. A variable with no\nvalid forecast/observation pairs in the window contributes no keys, so\n``metrics`` may be empty."
       },
@@ -3043,7 +3224,9 @@
           }
         },
         "type": "object",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "title": "VerificationReportEnvelope",
         "description": "The verification report response envelope (API.md sections 7.1 and 2.3)."
       }
