@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import os
 import time
 from datetime import datetime, timezone
 
@@ -112,7 +111,6 @@ def test_manifest_cache_ttl_expiration(tmp_path, monkeypatch):
     )
 
     store_path = str(tmp_path)
-    import api.core.manifest_reader as mr
 
     # Initial read
     assert manifest_generation(store_path) == "gen-v1"
