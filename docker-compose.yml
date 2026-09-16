@@ -181,6 +181,24 @@ services:
       # Desktop (Windows/macOS); host-gateway maps it on Linux hosts.
       - "host.docker.internal:host-gateway"
 
+  # Container resource & hardware telemetry (cAdvisor)
+  # Exposes container-level RSS, working set, CPU, and tmpfs filesystem metrics
+  # for all platform containers to Prometheus.
+  weather_cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: weather_cadvisor
+    restart: unless-stopped
+    profiles:
+      - monitoring
+      - full
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "${CADVISOR_PORT:-8080}:8080"
+
 volumes:
   postgres18_data:
   redis_data:
