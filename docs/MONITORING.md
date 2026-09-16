@@ -442,3 +442,18 @@ ssh -N -L 18000:127.0.0.1:8000 -L 18112:127.0.0.1:9112 user@weather-server
 Then switch the Prometheus scrape targets to `host.docker.internal:18000` and `host.docker.internal:18112` and restart the Prometheus container. Grafana, dashboards, and datasource configuration are unchanged — local vs remote mode differs **only** in scrape targets.
 
 **Dashboard hygiene rule:** `up{job="weather-api"}` / `up{job="weather-ingestion"}` (target health) and metric values must be displayed as distinct concepts. `up = 0` means Prometheus could not scrape the target at all; `metric = 0` means the exporter answered successfully with a real zero. Avoid `... or vector(0)` fallbacks in dashboard queries — they mask dead targets as healthy zeros.
+
+### 7.3 Container Telemetry & Dashboard Conventions
+
+#### Container-Level Telemetry (cAdvisor)
+The platform integrates `google/cadvisor` via the `weather_cadvisor` service in `docker-compose.yml` (profiles `monitoring`, `full`, port 8080):
+- **Container Memory:** Exposes `container_memory_rss{name=~"weather_.*"}` across all running services (aggregating all API Uvicorn workers, PostgreSQL, Redis, MinIO, Frontend, and Gateway).
+- **Working Set & OOM Prevention:** Exposes `container_memory_working_set_bytes` reflecting Linux kernel OOM-killer criteria.
+- **tmpfs Filesystem Usage:** Exposes `container_fs_usage_bytes{name="weather_gateway", device=~".*tmpfs.*"}` tracking the Nginx tile cache memory footprint (`/var/cache/nginx/tiles`).
+
+#### Authoritative Dashboard Conventions (`weather_platform_dashboard.json`)
+- **Panel 9 (Platform & Container Memory Breakdown):** Stacks all container physical RSS usages along with the Gateway tile cache tmpfs. Falls back to in-process `weather_component_memory_rss_bytes` when running outside Docker.
+- **Panel 11 (Platform Storage Breakdown):** Enforces `min: 0` on the Y-axis to provide a true baseline scale and avoid visual exaggeration of normal storage variations.
+- **Panel 29 (Reclamation Queue Depth by State):** Focuses strictly on active queue backlog (`queued`, `deleting`, `failed`), omitting historical monotonically increasing `deleted` counts. Deletion throughput is monitored as a rate in the GC progress panel.
+- **Current & Peak Visibility:** All numeric timeseries panels configure legend tables displaying both **Current (`lastNotNull`)** and **Peak (`max`)** metrics simultaneously.
+

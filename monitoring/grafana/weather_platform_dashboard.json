@@ -341,7 +341,7 @@
         "y": 6
       },
       "id": 9,
-      "title": "Platform Memory Breakdown (RSS)",
+      "title": "Platform & Container Memory Breakdown",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -353,21 +353,34 @@
               "mode": "normal"
             }
           },
-          "unit": "bytes"
+          "unit": "bytes",
+          "min": 0
         },
         "overrides": []
       },
       "targets": [
         {
-          "expr": "weather_component_memory_rss_bytes",
-          "legendFormat": "{{component}}"
+          "expr": "container_memory_rss{name=~\"weather_.*\"}",
+          "legendFormat": "{{name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "container_fs_usage_bytes{name=\"weather_gateway\", device=~\"(/dev/)?tmpfs.*\"} or container_fs_usage_bytes{name=\"weather_gateway\"}",
+          "legendFormat": "weather_gateway (tiles tmpfs)",
+          "refId": "B"
+        },
+        {
+          "expr": "weather_component_memory_rss_bytes unless on() (count(container_memory_rss{name=~\"weather_.*\"}) > 0)",
+          "legendFormat": "{{component}} (process fallback)",
+          "refId": "C"
         }
       ],
-      "description": "Physical resident memory (RSS) consumed directly by each platform component (realtime, gc, api, exporter), stacked to show total platform memory usage.",
+      "description": "Physical resident memory (RSS) consumed by each container (API, Postgres, Redis, MinIO, Ingestion, Gateway, Frontend) plus Gateway tile cache tmpfs, stacked to show total platform memory usage.",
       "options": {
         "legend": {
           "calcs": [
-            "lastNotNull"
+            "lastNotNull",
+            "max"
           ],
           "displayMode": "table",
           "placement": "bottom",
@@ -454,7 +467,8 @@
               "mode": "normal"
             }
           },
-          "unit": "bytes"
+          "unit": "bytes",
+          "min": 0
         },
         "overrides": []
       },
@@ -479,7 +493,8 @@
       "options": {
         "legend": {
           "calcs": [
-            "lastNotNull"
+            "lastNotNull",
+            "max"
           ],
           "displayMode": "table",
           "placement": "bottom",
@@ -548,6 +563,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -579,6 +603,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -626,6 +659,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -662,6 +704,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -709,6 +760,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -745,6 +805,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -776,6 +845,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -820,6 +898,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -851,6 +938,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -898,6 +994,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -938,6 +1043,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -977,10 +1091,6 @@
           "legendFormat": "Deleting"
         },
         {
-          "expr": "weather_reclamation_queue_count{status=\"deleted\"}",
-          "legendFormat": "Deleted"
-        },
-        {
           "expr": "weather_reclamation_queue_count{status=\"failed\"}",
           "legendFormat": "Failed"
         }
@@ -989,6 +1099,21 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Active granular reclamation queue backlog by state (queued, actively deleting, failed). Historical completions are tracked separately via worker deletion throughput.",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0
         }
       }
     },
@@ -1029,6 +1154,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1072,6 +1206,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1104,6 +1247,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1151,6 +1303,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1199,9 +1360,13 @@
           "sort": "desc"
         },
         "legend": {
-          "displayMode": "list",
+          "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         }
       },
       "targets": [
@@ -1258,6 +1423,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1290,6 +1464,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1338,6 +1521,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1374,6 +1566,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1414,6 +1615,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     },
@@ -1450,6 +1660,15 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         }
       }
     }
