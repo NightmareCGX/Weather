@@ -76,7 +76,7 @@ def _try_claim_tile_prewarm(claim_key: str, ttl_seconds: int = 600) -> bool:
     try:
         import redis as redis_lib
 
-        client = redis_lib.from_url(
+        client = redis_lib.from_url(  # type: ignore[no-untyped-call]
             settings.REDIS_URL,
             socket_connect_timeout=1.0,
             socket_timeout=1.0,
