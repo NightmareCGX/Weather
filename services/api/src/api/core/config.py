@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -115,6 +116,15 @@ class Settings(BaseSettings):
     API_READER_LOCK_POOL_TIMEOUT_SECONDS: Any = 5.0
     API_READER_GATE_TIMEOUT_SECONDS: Any = 30.0
     API_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: Any = 40.0
+
+    # Map-tile PNG (IDAT) zlib compression level, constrained to the zlib range.
+    # Level 1 is the serving default: on a 256x256 RGBA tile it compresses
+    # several times faster than the zlib default of 6 for only a small size
+    # increase, which shortens the cold-tile CPU phase and reduces the number
+    # of tiles competing for the interpreter during a viewport burst. Declared
+    # through ``Field`` so a malformed value is rejected at startup instead of
+    # failing at import time.
+    API_PNG_COMPRESS_LEVEL: int = Field(default=1, ge=0, le=9)
 
     # Elevation resolution for dynamic coordinates (UI metadata only).
     # ``none`` (default): elevation always unavailable (safe offline default).

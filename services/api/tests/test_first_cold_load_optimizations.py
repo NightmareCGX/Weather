@@ -4,6 +4,9 @@ Covers:
 1. Manifest Reader in-memory TTL micro-cache (concurrent collapse, hit ratio, TTL expiration, _clear_manifest_cache).
 2. Resolver in-memory short TTL micro-cache (concurrent DB query collapse, hit ratio, commit invalidation, _clear_resolver_cache).
 3. PNG encoding level 1 vs level 6 speed and byte equivalence.
+4. Regression tests for defects found in review: per-request ``now`` defeating the
+   resolver cache key, and single-flight lock leaks on failure paths. Also guards
+   the intentional (spec-mandated) non-caching of absent manifests.
 """
 
 from __future__ import annotations
@@ -11,13 +14,15 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from api.core.manifest_reader import (
+    ManifestReadError,
     _clear_manifest_cache,
     manifest_generation,
     manifest_storage_format,
@@ -158,6 +163,92 @@ def test_manifest_clear_cache(tmp_path):
 
     # Immediate perception of new generation
     assert manifest_generation(store_path) == "gen-beta"
+
+
+# ---------------------------------------------------------------------------
+# 1b. Manifest Reader regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_absence_is_never_cached(tmp_path, monkeypatch):
+    """An absent manifest must be re-probed on every call — never cached.
+
+    This is intentional, not an oversight: the ingestion finalizer can commit a
+    manifest at any moment, and the transition from legacy (open fresh per
+    request) to generation-aware handle caching must be visible on the very next
+    lookup. A negative cache would add a staleness window to that transition.
+    This test guards against reintroducing one for the sake of lookup count.
+    """
+    _clear_manifest_cache()
+
+    import api.core.manifest_reader as mr
+
+    real_read = mr._read_manifest_uncached
+    read_count = 0
+
+    def spy_read(store_path: str):
+        nonlocal read_count
+        read_count += 1
+        return real_read(store_path)
+
+    monkeypatch.setattr(mr, "_read_manifest_uncached", spy_read)
+
+    store_path = str(tmp_path)
+    for _ in range(3):
+        assert manifest_generation(store_path) is None
+    assert read_count == 3
+
+    # Once the finalizer commits a manifest it is observed immediately...
+    manifest_dir = tmp_path / "__commit__" / "v1"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "manifest.json").write_text(
+        json.dumps(
+            {"manifest_schema_version": 1, "generation": "gen-late", "storage_format_version": "sharded_v1"}
+        ),
+        encoding="utf-8",
+    )
+    assert manifest_generation(store_path) == "gen-late"
+    assert read_count == 4
+
+    # ...and only then does the positive micro-cache take over.
+    assert manifest_generation(store_path) == "gen-late"
+    assert manifest_storage_format(store_path) == "sharded_v1"
+    assert read_count == 4
+
+
+def test_manifest_flight_locks_released_for_absent_manifest(tmp_path):
+    """Concurrent absent-manifest lookups must not leak single-flight locks."""
+    _clear_manifest_cache()
+
+    import api.core.manifest_reader as mr
+
+    store_path = str(tmp_path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(manifest_generation, store_path) for _ in range(10)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    assert len(results) == 10
+    assert all(r is None for r in results)
+    assert mr._manifest_flight_locks == {}
+
+
+def test_manifest_flight_lock_released_on_malformed_manifest(tmp_path):
+    """Regression: a raising read must not leak its single-flight lock."""
+    _clear_manifest_cache()
+
+    import api.core.manifest_reader as mr
+
+    manifest_dir = tmp_path / "__commit__" / "v1"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "manifest.json").write_text("{not valid json", encoding="utf-8")
+
+    store_path = str(tmp_path)
+    for _ in range(5):
+        with pytest.raises(ManifestReadError):
+            manifest_generation(store_path)
+
+    assert mr._manifest_flight_locks == {}
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +396,115 @@ def test_resolver_cache_commit_invalidation(test_db_engine):
         src_new = resolve_canonical_source(session, "gfs", target_v, now=fixed_now)
         assert src_new.run_id == "r_06z"
         assert src_new.lead_time_hours == 6
+
+
+# ---------------------------------------------------------------------------
+# 2b. Resolver regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_cache_hits_with_per_request_now(test_db_engine, monkeypatch):
+    """Regression: a fresh ``now`` per request must NOT defeat the micro-cache.
+
+    Production ``get_current_time()`` returns a distinct microsecond-precision
+    instant on every request, so keying the micro-cache on the raw timestamp
+    produced a unique key per request and the cache never hit outside the test
+    harness (which freezes ``now`` via ``WEATHER_SIMULATED_NOW``). Resolution
+    depends on ``now`` only through the cadence-floored serving-window
+    boundary, so the key must be derived from that boundary.
+    """
+    _clear_resolver_cache()
+
+    import api.services.resolver as res_mod
+
+    orig_discover = res_mod._discover_candidates_bulk
+    discover_calls = 0
+
+    def spy_discover(*args, **kwargs):
+        nonlocal discover_calls
+        discover_calls += 1
+        return orig_discover(*args, **kwargs)
+
+    monkeypatch.setattr(res_mod, "_discover_candidates_bulk", spy_discover)
+
+    target_v = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    base_now = datetime(2026, 9, 15, 2, 0, tzinfo=timezone.utc)
+
+    # Five requests, each carrying its own wall-clock instant, as production does.
+    for offset in range(5):
+        with Session(test_db_engine) as session:
+            src = resolve_variable_source(
+                session,
+                "gfs",
+                "temperature_2m",
+                target_v,
+                now=base_now + timedelta(microseconds=offset + 1),
+            )
+            assert src is not None
+            assert src.run_id == "r_00z"
+            assert src.lead_time_hours == 12
+
+    assert discover_calls == 1
+
+    # A request in a later serving window is a genuinely distinct resolution.
+    with Session(test_db_engine) as session:
+        resolve_variable_source(
+            session,
+            "gfs",
+            "temperature_2m",
+            target_v,
+            now=base_now + timedelta(hours=3),
+        )
+    assert discover_calls == 2
+
+
+def test_resolver_flight_locks_released_on_failure(test_db_engine, monkeypatch):
+    """Regression: a failed resolution must not leak its single-flight lock.
+
+    The leak was unbounded: the pop sat after the resolve call, so every raised
+    ``HTTPException`` (before-window / no-data valid times) left a permanent
+    entry behind.
+    """
+    _clear_resolver_cache()
+
+    import api.services.resolver as res_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated resolution failure")
+
+    monkeypatch.setattr(res_mod, "_resolve_variable_source_uncached", boom)
+
+    target_v = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 9, 15, 2, 0, tzinfo=timezone.utc)
+
+    with Session(test_db_engine) as session:
+        for index in range(25):
+            with pytest.raises(RuntimeError):
+                resolve_variable_source(
+                    session, "gfs", f"variable_{index}", target_v, now=fixed_now
+                )
+
+    assert res_mod._resolver_flight_locks == {}
+
+
+def test_resolver_flight_locks_released_on_http_404(test_db_engine):
+    """A real 404 path (valid time before the serving window) leaks no lock."""
+    _clear_resolver_cache()
+
+    import api.services.resolver as res_mod
+
+    target_v = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    # Serving window starts after this valid time, so resolution raises 404.
+    later_now = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+
+    with Session(test_db_engine) as session:
+        for _ in range(10):
+            with pytest.raises(HTTPException):
+                resolve_variable_source(
+                    session, "gfs", "temperature_2m", target_v, now=later_now
+                )
+
+    assert res_mod._resolver_flight_locks == {}
 
 
 # ---------------------------------------------------------------------------

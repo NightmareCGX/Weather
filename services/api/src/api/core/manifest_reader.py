@@ -26,6 +26,16 @@ _s3_fs_lock = threading.Lock()
 
 #: In-memory TTL micro-cache for committed manifests to collapse concurrent
 #: cold tile reads into a single MinIO/disk access.
+#:
+#: Only *positive* payloads are cached. An absent manifest is deliberately
+#: re-probed on every call: the ingestion EXCLUSIVE finalizer can commit a
+#: manifest at any moment, and the transition from legacy (uncached, opened
+#: fresh per request) to generation-aware handle caching must be visible on the
+#: very next lookup. Negative caching would introduce a staleness window on
+#: that transition, so it is intentionally not done here even though a legacy
+#: store therefore pays a storage round trip per lookup (see
+#: tests/test_store_cache.py::test_manifest_created_after_initial_no_manifest_serving
+#: and ::test_uncached_dataset_closed_after_selection).
 _MANIFEST_CACHE_TTL: float = 30.0
 _MANIFEST_CACHE_MAX_SIZE: int = 1024
 _manifest_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
@@ -106,24 +116,34 @@ def _read_manifest(store_path: str) -> dict[str, Any] | None:
             if entry is not None and entry[0] > now:
                 return entry[1]
 
-        payload = _read_manifest_uncached(store_path)
+        try:
+            payload = _read_manifest_uncached(store_path)
 
-        now = time.monotonic()
-        with _manifest_cache_lock:
-            # Only cache positive manifest payloads (or None could cause stale misses during transition)
-            if payload is not None:
-                if len(_manifest_cache) >= _MANIFEST_CACHE_MAX_SIZE:
-                    expired_keys = [k for k, (exp, _) in _manifest_cache.items() if exp <= now]
-                    for k in expired_keys:
-                        _manifest_cache.pop(k, None)
+            now = time.monotonic()
+            with _manifest_cache_lock:
+                # Only positive payloads are cached: caching an absent manifest
+                # would delay the transition to generation-aware caching after
+                # the finalizer commits one (see the note on _MANIFEST_CACHE_TTL).
+                if payload is not None:
                     if len(_manifest_cache) >= _MANIFEST_CACHE_MAX_SIZE:
-                        oldest_key = next(iter(_manifest_cache))
-                        _manifest_cache.pop(oldest_key, None)
+                        expired_keys = [
+                            k for k, (exp, _) in _manifest_cache.items() if exp <= now
+                        ]
+                        for k in expired_keys:
+                            _manifest_cache.pop(k, None)
+                        if len(_manifest_cache) >= _MANIFEST_CACHE_MAX_SIZE:
+                            oldest_key = next(iter(_manifest_cache))
+                            _manifest_cache.pop(oldest_key, None)
 
-                _manifest_cache[store_path] = (now + _MANIFEST_CACHE_TTL, payload)
-            _manifest_flight_locks.pop(store_path, None)
-
-        return payload
+                    _manifest_cache[store_path] = (now + _MANIFEST_CACHE_TTL, payload)
+            return payload
+        finally:
+            # Release the single-flight slot on every path, including when
+            # ``_read_manifest_uncached`` raises (malformed manifest, transient
+            # storage error). Leaving the entry behind leaked one Lock per
+            # distinct failing store, with no bound or eviction.
+            with _manifest_cache_lock:
+                _manifest_flight_locks.pop(store_path, None)
 
 
 def manifest_generation(store_path: str) -> str | None:
@@ -132,7 +152,8 @@ def manifest_generation(store_path: str) -> str | None:
     Returns:
         The trusted generation string if a valid committed manifest exists,
         or ``None`` when the manifest is confirmed absent (legacy or
-        unfinalized store).
+        unfinalized store). Absence is never cached, so a manifest committed
+        later is observed by the very next lookup.
 
     Raises:
         ManifestReadError: If a manifest exists but is malformed/invalid (fail closed).

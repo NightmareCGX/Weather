@@ -127,6 +127,24 @@ def _parse_pinned_cycle(initial_time: datetime | str | None) -> datetime | None:
     return _ensure_utc(initial_time)
 
 
+def _serving_window_key(now: datetime | None) -> datetime:
+    """Return the micro-cache key component derived from ``now``.
+
+    Resolution depends on ``now`` *only* through the authoritative
+    serving-window left boundary (``serving_start_valid_time``, floored to the
+    valid-time cadence). Keying on that boundary is therefore equivalent to
+    keying on the raw timestamp while being stable across requests.
+
+    Keying on the raw ``now`` instead made every request produce a distinct
+    key, because production ``get_current_time()`` returns a fresh
+    microsecond-precision instant per request — so the micro-caches below never
+    hit outside the test harness, which freezes ``now`` via
+    ``WEATHER_SIMULATED_NOW``.
+    """
+    now_utc = _ensure_utc(now) if now is not None else get_current_time()
+    return serving_start_valid_time(now_utc)
+
+
 def _filter_pinned_candidates(
     candidates: list[_CandidateRecord],
     pinned_cycle: datetime | None,
@@ -603,7 +621,7 @@ def resolve_canonical_source(
     """
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
     pinned_cycle = _parse_pinned_cycle(initial_time)
-    now_key = _ensure_utc(now) if now is not None else None
+    now_key = _serving_window_key(now)
 
     key = _canonical_cache_key(db, model, v_utc, pinned_cycle, require_members, now_key)
     now_mono = time.monotonic()
@@ -621,29 +639,37 @@ def resolve_canonical_source(
             if entry is not None and entry[0] > now_mono and entry[1] is not None:
                 return entry[1]
 
-        result = _resolve_canonical_source_uncached(
-            db,
-            model,
-            v_utc,
-            initial_time=pinned_cycle,
-            require_members=require_members,
-            now=now,
-        )
+        try:
+            result = _resolve_canonical_source_uncached(
+                db,
+                model,
+                v_utc,
+                initial_time=pinned_cycle,
+                require_members=require_members,
+                now=now,
+            )
 
-        now_mono = time.monotonic()
-        with _resolver_cache_lock:
-            if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
-                expired_keys = [k for k, (exp, _) in _resolver_cache.items() if exp <= now_mono]
-                for k in expired_keys:
-                    _resolver_cache.pop(k, None)
+            now_mono = time.monotonic()
+            with _resolver_cache_lock:
                 if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
-                    oldest_key = next(iter(_resolver_cache))
-                    _resolver_cache.pop(oldest_key, None)
+                    expired_keys = [
+                        k for k, (exp, _) in _resolver_cache.items() if exp <= now_mono
+                    ]
+                    for k in expired_keys:
+                        _resolver_cache.pop(k, None)
+                    if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
+                        oldest_key = next(iter(_resolver_cache))
+                        _resolver_cache.pop(oldest_key, None)
 
-            _resolver_cache[key] = (now_mono + _RESOLVER_CACHE_TTL, result)
-            _resolver_flight_locks.pop(key, None)
-
-        return result
+                _resolver_cache[key] = (now_mono + _RESOLVER_CACHE_TTL, result)
+            return result
+        finally:
+            # Release the single-flight slot on every path, including raised
+            # ``HTTPException``s (before-window / no-data valid times). Placing
+            # this after the store instead leaked one Lock per distinct failing
+            # key, with no bound or eviction.
+            with _resolver_cache_lock:
+                _resolver_flight_locks.pop(key, None)
 
 
 def _resolve_variable_source_uncached(
@@ -720,7 +746,7 @@ def resolve_variable_source(
     """
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
     pinned_cycle = _parse_pinned_cycle(initial_time)
-    now_key = _ensure_utc(now) if now is not None else None
+    now_key = _serving_window_key(now)
 
     key = _variable_cache_key(db, model, variable, v_utc, pinned_cycle, now_key)
     now_mono = time.monotonic()
@@ -738,29 +764,35 @@ def resolve_variable_source(
             if entry is not None and entry[0] > now_mono:
                 return entry[1]
 
-        result = _resolve_variable_source_uncached(
-            db,
-            model,
-            variable,
-            v_utc,
-            initial_time=pinned_cycle,
-            now=now,
-        )
+        try:
+            result = _resolve_variable_source_uncached(
+                db,
+                model,
+                variable,
+                v_utc,
+                initial_time=pinned_cycle,
+                now=now,
+            )
 
-        now_mono = time.monotonic()
-        with _resolver_cache_lock:
-            if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
-                expired_keys = [k for k, (exp, _) in _resolver_cache.items() if exp <= now_mono]
-                for k in expired_keys:
-                    _resolver_cache.pop(k, None)
+            now_mono = time.monotonic()
+            with _resolver_cache_lock:
                 if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
-                    oldest_key = next(iter(_resolver_cache))
-                    _resolver_cache.pop(oldest_key, None)
+                    expired_keys = [
+                        k for k, (exp, _) in _resolver_cache.items() if exp <= now_mono
+                    ]
+                    for k in expired_keys:
+                        _resolver_cache.pop(k, None)
+                    if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
+                        oldest_key = next(iter(_resolver_cache))
+                        _resolver_cache.pop(oldest_key, None)
 
-            _resolver_cache[key] = (now_mono + _RESOLVER_CACHE_TTL, result)
-            _resolver_flight_locks.pop(key, None)
-
-        return result
+                _resolver_cache[key] = (now_mono + _RESOLVER_CACHE_TTL, result)
+            return result
+        finally:
+            # See resolve_canonical_source: release the single-flight slot on
+            # every path, including raised ``HTTPException``s.
+            with _resolver_cache_lock:
+                _resolver_flight_locks.pop(key, None)
 
 
 def resolve_valid_time_source(
