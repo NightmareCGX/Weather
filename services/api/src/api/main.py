@@ -64,9 +64,20 @@ def create_app() -> FastAPI:
             prewarm_task = asyncio.create_task(
                 vector_prewarm_loop(), name="vector-field-prewarm"
             )
+        tile_prewarm_task: asyncio.Task[None] | None = None
+        if settings.API_TILE_PREWARM_ENABLED:
+            from api.services.tile_prewarm import tile_prewarm_loop
+
+            tile_prewarm_task = asyncio.create_task(
+                tile_prewarm_loop(), name="tile-cache-prewarm"
+            )
         try:
             yield
         finally:
+            if tile_prewarm_task is not None:
+                tile_prewarm_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await tile_prewarm_task
             if prewarm_task is not None:
                 prewarm_task.cancel()
                 with suppress(asyncio.CancelledError):

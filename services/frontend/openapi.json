@@ -1399,10 +1399,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2).",
+              "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). May be combined with initial_time to pin the serving cycle for cacheable URLs.",
               "title": "Valid Time"
             },
-            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2)."
+            "description": "Optional ISO 8601 UTC valid time (Lifecycle V2). May be combined with initial_time to pin the serving cycle for cacheable URLs."
           },
           {
             "name": "initial_time",
@@ -1417,10 +1417,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Optional ISO 8601 UTC cycle time pinning the model run.",
+              "description": "Optional ISO 8601 UTC cycle time pinning the model run. When combined with valid_time it pins the serving cycle, making the tile URL immutable and long-lived browser caching possible.",
               "title": "Initial Time"
             },
-            "description": "Optional ISO 8601 UTC cycle time pinning the model run."
+            "description": "Optional ISO 8601 UTC cycle time pinning the model run. When combined with valid_time it pins the serving cycle, making the tile URL immutable and long-lived browser caching possible."
           }
         ],
         "responses": {
@@ -1443,7 +1443,7 @@
     "/v1/ensembles": {
       "get": {
         "summary": "Get ensemble statistics and spread",
-        "description": "Return ensemble dispersion statistics for a forecast variable.\n\nUnder Lifecycle V2:\n- If ``valid_time`` is supplied, the newest committed source cycle and lead\n  are dynamically resolved via the shared ValidTimeResolver.\n- If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead\n  serving is preserved for backward compatibility.",
+        "description": "Return ensemble dispersion statistics for a forecast variable.\n\nUnder Lifecycle V2:\n- If ``leads`` is supplied, a batch series across multiple lead times is computed and returned.\n- If ``valid_time`` is supplied, the newest committed source cycle and lead\n  are dynamically resolved via the shared ValidTimeResolver.\n- If ``lead_time_hours`` is supplied without ``valid_time``, legacy cycle/lead\n  serving is preserved for backward compatibility.",
         "operationId": "get_ensemble_statistics_v1_ensembles_get",
         "parameters": [
           {
@@ -1509,6 +1509,24 @@
               "title": "Lead Time Hours"
             },
             "description": "Forecast offset hours from cycle time."
+          },
+          {
+            "name": "leads",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional comma-separated lead hours or 'all' to request a batch series of leads.",
+              "title": "Leads"
+            },
+            "description": "Optional comma-separated lead hours or 'all' to request a batch series of leads."
           },
           {
             "name": "valid_time",
@@ -1689,6 +1707,27 @@
         }
       }
     },
+    "/v1/admin/prewarm-tiles": {
+      "post": {
+        "summary": "Run one low-zoom map tile cache prewarm pass",
+        "description": "Run one low-zoom map tile prewarm pass synchronously and report counters.\n\nOps/debug and ingestion-completion trigger: prewarms Zoom 0..2 raster tiles\nfor configured default models and variables (21 tiles) and returns pass\ncounters.",
+        "operationId": "trigger_tile_prewarm_v1_admin_prewarm_tiles_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Trigger Tile Prewarm V1 Admin Prewarm Tiles Post"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/metrics": {
       "get": {
         "summary": "Get Prometheus metrics for the API serving layer",
@@ -1796,7 +1835,18 @@
             "default": "ensemble_statistics"
           },
           "data": {
-            "$ref": "#/components/schemas/EnsembleStatisticsData"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnsembleStatisticsData"
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/EnsembleStatisticsData"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Data"
           },
           "has_more": {
             "type": "boolean",

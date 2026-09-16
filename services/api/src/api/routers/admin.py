@@ -94,6 +94,24 @@ async def trigger_vector_prewarm(response: Response) -> dict[str, Any]:
     return {"data": asdict(result)}
 
 
+@router.post(
+    "/admin/prewarm-tiles",
+    summary="Run one low-zoom map tile cache prewarm pass",
+)
+async def trigger_tile_prewarm(response: Response) -> dict[str, Any]:
+    """Run one low-zoom map tile prewarm pass synchronously and report counters.
+
+    Ops/debug and ingestion-completion trigger: prewarms Zoom 0..2 raster tiles
+    for configured default models and variables (21 tiles) and returns pass
+    counters.
+    """
+    from api.services.tile_prewarm import run_tile_prewarm_pass
+
+    response.headers["Cache-Control"] = CACHE_CONTROL_HEALTH
+    result = await asyncio.to_thread(run_tile_prewarm_pass)
+    return {"data": asdict(result)}
+
+
 def _app_version() -> str:
     """Return the API contract version.
 
