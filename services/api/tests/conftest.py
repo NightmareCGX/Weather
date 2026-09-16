@@ -58,6 +58,18 @@ def _default_test_simulated_time(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _clear_serving_micro_caches():
+    from api.core.manifest_reader import _clear_manifest_cache
+    from api.services.resolver import _clear_resolver_cache
+
+    _clear_manifest_cache()
+    _clear_resolver_cache()
+    yield
+    _clear_manifest_cache()
+    _clear_resolver_cache()
+
+
 @pytest.fixture(scope="session")
 def db_engine():
     db_url = integration_db_url()

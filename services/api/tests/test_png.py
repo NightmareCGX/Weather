@@ -81,3 +81,26 @@ def test_png_transparent_pixels_preserved():
 def test_png_rejects_wrong_buffer_length():
     with pytest.raises(ValueError):
         encode_rgba_png(bytes(15), 2, 2)
+
+
+def test_png_compress_level_override_and_equivalence():
+    width, height = 16, 16
+    pixels = bytearray()
+    for y in range(height):
+        for x in range(width):
+            pixels += bytes(((x * 16) % 256, (y * 16) % 256, 128, 255))
+    raw_pixels = bytes(pixels)
+
+    png_default = encode_rgba_png(raw_pixels, width, height)
+    png_level_1 = encode_rgba_png(raw_pixels, width, height, compress_level=1)
+    png_level_6 = encode_rgba_png(raw_pixels, width, height, compress_level=6)
+
+    # Default should match compress_level=1
+    assert png_default == png_level_1
+
+    # Both levels must decode to identical pixel buffers
+    _, _, decoded_1 = _decode(png_level_1)
+    _, _, decoded_6 = _decode(png_level_6)
+    assert decoded_1 == raw_pixels
+    assert decoded_6 == raw_pixels
+

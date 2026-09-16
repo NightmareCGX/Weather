@@ -51,6 +51,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -68,7 +70,7 @@ from domain.temporal import (
     serving_start_valid_time,
 )
 from fastapi import HTTPException
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, event, or_, select
 from sqlalchemy.orm import Session
 
 from api.core.time import get_current_time
@@ -86,6 +88,27 @@ logger = logging.getLogger(__name__)
 
 #: ModelRun statuses eligible for serving candidate discovery.
 SERVING_ELIGIBLE_STATUSES: tuple[str, ...] = ("ready", "processing", "partial")
+
+#: Short TTL micro-cache for canonical and variable source resolution to collapse
+#: burst cold-load viewport tile queries into 1 DB query per unique (model, variable, valid_time, initial_time).
+_RESOLVER_CACHE_TTL: float = 8.0  # seconds (5~10s)
+_RESOLVER_CACHE_MAX_SIZE: int = 2048
+_resolver_cache: dict[tuple[Any, ...], tuple[float, ResolvedForecastSource | None]] = {}
+_resolver_cache_lock = threading.Lock()
+_resolver_flight_locks: dict[tuple[Any, ...], threading.Lock] = {}
+
+
+def _clear_resolver_cache() -> None:
+    """Clear in-memory resolver micro-cache and flight locks (for test isolation)."""
+    with _resolver_cache_lock:
+        _resolver_cache.clear()
+        _resolver_flight_locks.clear()
+
+
+@event.listens_for(Session, "after_commit")
+def _on_session_commit(session: Session) -> None:
+    """Automatically invalidate the resolver micro-cache whenever data is committed."""
+    _clear_resolver_cache()
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -472,7 +495,54 @@ def resolve_valid_time_candidates(
     return out
 
 
-def resolve_canonical_source(
+def _safe_bind_id(db: Session) -> Any:
+    """Extract a stable identifier for the database engine to isolate caches across engines."""
+    try:
+        bind = db.get_bind()
+        return id(bind)
+    except Exception:
+        return id(db)
+
+
+def _canonical_cache_key(
+    db: Session,
+    model: str,
+    v_utc: datetime,
+    pinned_cycle: datetime | None,
+    require_members: bool,
+    now_key: datetime | None,
+) -> tuple[Any, ...]:
+    return (
+        "canonical",
+        _safe_bind_id(db),
+        model.lower().strip(),
+        v_utc,
+        pinned_cycle,
+        require_members,
+        now_key,
+    )
+
+
+def _variable_cache_key(
+    db: Session,
+    model: str,
+    variable: str,
+    v_utc: datetime,
+    pinned_cycle: datetime | None,
+    now_key: datetime | None,
+) -> tuple[Any, ...]:
+    return (
+        "variable",
+        _safe_bind_id(db),
+        model.lower().strip(),
+        variable,
+        v_utc,
+        pinned_cycle,
+        now_key,
+    )
+
+
+def _resolve_canonical_source_uncached(
     db: Session,
     model: str,
     valid_time: datetime | str,
@@ -481,18 +551,6 @@ def resolve_canonical_source(
     require_members: bool = False,
     now: datetime | None = None,
 ) -> ResolvedForecastSource:
-    """Resolve the single authoritative generic canonical source for model + valid_time.
-
-    Invariants:
-    - Rejects valid_time strictly before serving_start_valid_time(now_utc) with HTTP 404.
-    - Selects the newest committed representation covering valid_time.
-    - Strictly excludes deletion fences.
-    - Strictly enforces GEFS coherent vintage (both geavg and >=85% members).
-    - When ``initial_time`` is provided, the newest-cycle preference is pinned to
-      that cycle: if it covers valid_time, it wins even when a newer cycle also
-      covers it; otherwise selection falls back to the unpinned newest-cycle rule
-      so serving survives cycle transitions and reclamation.
-    """
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
     now_utc = now if now is not None else get_current_time()
     start_vt = serving_start_valid_time(now_utc)
@@ -518,8 +576,6 @@ def resolve_canonical_source(
         winner = select_canonical_anchor(pinned_cands)
         if winner is not None:
             return _resolved_source(model, v_utc, winner)
-        # Pinned cycle does not cover this valid time (or no longer exists):
-        # fall through to the unpinned newest-cycle selection below.
 
     winner = select_canonical_anchor(cands)
     if winner is None:
@@ -531,7 +587,66 @@ def resolve_canonical_source(
     return _resolved_source(model, v_utc, winner)
 
 
-def resolve_variable_source(
+def resolve_canonical_source(
+    db: Session,
+    model: str,
+    valid_time: datetime | str,
+    *,
+    initial_time: datetime | str | None = None,
+    require_members: bool = False,
+    now: datetime | None = None,
+) -> ResolvedForecastSource:
+    """Resolve the single authoritative generic canonical source for model + valid_time.
+
+    Wrapped with a short-lived thread-safe micro-cache (8s TTL) to collapse
+    burst cold-load queries into a single execution.
+    """
+    v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
+    pinned_cycle = _parse_pinned_cycle(initial_time)
+    now_key = _ensure_utc(now) if now is not None else None
+
+    key = _canonical_cache_key(db, model, v_utc, pinned_cycle, require_members, now_key)
+    now_mono = time.monotonic()
+
+    with _resolver_cache_lock:
+        entry = _resolver_cache.get(key)
+        if entry is not None and entry[0] > now_mono and entry[1] is not None:
+            return entry[1]
+        flight_lock = _resolver_flight_locks.setdefault(key, threading.Lock())
+
+    with flight_lock:
+        now_mono = time.monotonic()
+        with _resolver_cache_lock:
+            entry = _resolver_cache.get(key)
+            if entry is not None and entry[0] > now_mono and entry[1] is not None:
+                return entry[1]
+
+        result = _resolve_canonical_source_uncached(
+            db,
+            model,
+            v_utc,
+            initial_time=pinned_cycle,
+            require_members=require_members,
+            now=now,
+        )
+
+        now_mono = time.monotonic()
+        with _resolver_cache_lock:
+            if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
+                expired_keys = [k for k, (exp, _) in _resolver_cache.items() if exp <= now_mono]
+                for k in expired_keys:
+                    _resolver_cache.pop(k, None)
+                if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
+                    oldest_key = next(iter(_resolver_cache))
+                    _resolver_cache.pop(oldest_key, None)
+
+            _resolver_cache[key] = (now_mono + _RESOLVER_CACHE_TTL, result)
+            _resolver_flight_locks.pop(key, None)
+
+        return result
+
+
+def _resolve_variable_source_uncached(
     db: Session,
     model: str,
     variable: str,
@@ -540,17 +655,6 @@ def resolve_variable_source(
     initial_time: datetime | str | None = None,
     now: datetime | None = None,
 ) -> ResolvedForecastSource | None:
-    """Resolve the authoritative source for a specific variable at valid_time.
-
-    Supports graceful absence (returning None) for interval variables at lead 0
-    when no older positive-lead fallback representation exists.
-
-    When ``initial_time`` is provided, the newest-cycle preference is pinned to
-    that cycle for this valid time; if the pinned subset yields no winner
-    (e.g. the cycle does not serve the variable at this valid time, or its
-    store was reclaimed), selection falls back to the unpinned newest-cycle
-    rule so serving survives cycle transitions.
-    """
     v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
     now_utc = now if now is not None else get_current_time()
     start_vt = serving_start_valid_time(now_utc)
@@ -582,8 +686,6 @@ def resolve_variable_source(
         cand = select_variable_source(pinned_cands, variable)
         if cand is not None:
             return _resolved_source(model, v_utc, cand)
-        # Pinned cycle does not serve this variable/valid time (or no longer
-        # exists): fall through to the unpinned selection below.
 
     cand = select_variable_source(cands, variable)
     if cand is None:
@@ -600,6 +702,65 @@ def resolve_variable_source(
         )
 
     return _resolved_source(model, v_utc, cand)
+
+
+def resolve_variable_source(
+    db: Session,
+    model: str,
+    variable: str,
+    valid_time: datetime | str,
+    *,
+    initial_time: datetime | str | None = None,
+    now: datetime | None = None,
+) -> ResolvedForecastSource | None:
+    """Resolve the authoritative source for a specific variable at valid_time.
+
+    Wrapped with a short-lived thread-safe micro-cache (8s TTL) to collapse
+    burst cold-load queries into a single execution.
+    """
+    v_utc = parse_cycle_time(valid_time) if isinstance(valid_time, str) else _ensure_utc(valid_time)
+    pinned_cycle = _parse_pinned_cycle(initial_time)
+    now_key = _ensure_utc(now) if now is not None else None
+
+    key = _variable_cache_key(db, model, variable, v_utc, pinned_cycle, now_key)
+    now_mono = time.monotonic()
+
+    with _resolver_cache_lock:
+        entry = _resolver_cache.get(key)
+        if entry is not None and entry[0] > now_mono:
+            return entry[1]
+        flight_lock = _resolver_flight_locks.setdefault(key, threading.Lock())
+
+    with flight_lock:
+        now_mono = time.monotonic()
+        with _resolver_cache_lock:
+            entry = _resolver_cache.get(key)
+            if entry is not None and entry[0] > now_mono:
+                return entry[1]
+
+        result = _resolve_variable_source_uncached(
+            db,
+            model,
+            variable,
+            v_utc,
+            initial_time=pinned_cycle,
+            now=now,
+        )
+
+        now_mono = time.monotonic()
+        with _resolver_cache_lock:
+            if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
+                expired_keys = [k for k, (exp, _) in _resolver_cache.items() if exp <= now_mono]
+                for k in expired_keys:
+                    _resolver_cache.pop(k, None)
+                if len(_resolver_cache) >= _RESOLVER_CACHE_MAX_SIZE:
+                    oldest_key = next(iter(_resolver_cache))
+                    _resolver_cache.pop(oldest_key, None)
+
+            _resolver_cache[key] = (now_mono + _RESOLVER_CACHE_TTL, result)
+            _resolver_flight_locks.pop(key, None)
+
+        return result
 
 
 def resolve_valid_time_source(
