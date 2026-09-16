@@ -352,8 +352,8 @@ class _InlinePool:
     def __enter__(self) -> "_InlinePool":
         return self
 
-    def __exit__(self, *exc_info) -> bool:
-        return False
+    def __exit__(self, *exc_info) -> None:
+        return None
 
     def map(self, fn, iterable):
         return [fn(item) for item in iterable]
@@ -603,3 +603,99 @@ def test_member_fetch_fanout_comes_from_settings(monkeypatch) -> None:
         monkeypatch.undo()
 
     assert zarr_mod.get_member_executor()._max_workers == 4
+
+
+def test_wind_fetch_fanout_comes_from_settings(monkeypatch) -> None:
+    """The wind U/V pool is settings-driven, process-wide, and bounded."""
+    from api.core.config import settings
+
+    assert settings.API_WIND_FETCH_WORKERS == 2
+
+    tiles_mod.shutdown_wind_executor()
+    try:
+        monkeypatch.setattr(settings, "API_WIND_FETCH_WORKERS", 3)
+        assert tiles_mod.get_wind_executor()._max_workers == 3
+    finally:
+        tiles_mod.shutdown_wind_executor()
+        monkeypatch.undo()
+
+    assert tiles_mod.get_wind_executor()._max_workers == 2
+
+
+def test_wind_executor_is_reused_across_calls() -> None:
+    """Wind component reads reuse the persistent executor instead of spinning up OS threads."""
+    pool1 = tiles_mod.get_wind_executor()
+    pool2 = tiles_mod.get_wind_executor()
+    assert pool1 is pool2
+
+    tiles_mod.shutdown_wind_executor()
+    assert tiles_mod._wind_executor is None
+
+    pool3 = tiles_mod.get_wind_executor()
+    assert pool3 is not pool1
+    tiles_mod.shutdown_wind_executor()
+
+
+def test_tile_geometry_is_memoized_across_requests() -> None:
+    """Tile geometry 1D vectors are cached and broadcast into identical 2D coordinates."""
+    tiles_mod._clear_tile_geom_cache()
+    latitudes = np.array([38.0, 38.25, 38.5], dtype=np.float64)
+    longitudes = np.array([-107.0, -106.75, -106.5], dtype=np.float64)
+    dataset = xr.Dataset(
+        data_vars={
+            "temperature_2m": (
+                ("lead_time_hours", "latitude", "longitude"),
+                np.full((1, 3, 3), 12.0, dtype=np.float32),
+            )
+        },
+        coords={"lead_time_hours": [0], "latitude": latitudes, "longitude": longitudes},
+    )
+
+    # First request: computes and caches 1D vectors
+    window1 = tiles_mod._select_tile_window(
+        dataset, variable="temperature_2m", lead=0, zoom=4, x=8, y=8
+    )
+    assert (4, 8) in tiles_mod._tile_geom_lats_cache
+    assert (4, 8, window1.grid.lon_start, window1.grid.lon_end) in tiles_mod._tile_geom_lons_cache
+
+    # Verify identical values against the reference oracle
+    expected_lats, expected_lons = _tile_geometry(window1.grid, 4, 8, 8)
+    assert window1.pixel_lats.shape == (tiles_mod.TILE_SIZE, tiles_mod.TILE_SIZE)
+    assert window1.pixel_lons_native.shape == (tiles_mod.TILE_SIZE, tiles_mod.TILE_SIZE)
+    assert np.array_equal(window1.pixel_lats, expected_lats)
+    assert np.array_equal(window1.pixel_lons_native, expected_lons)
+
+    # Second request (e.g. different variable / lead): reuses cached 1D vectors
+    window2 = tiles_mod._select_tile_window(
+        dataset, variable="temperature_2m", lead=0, zoom=4, x=8, y=8
+    )
+    assert np.array_equal(window2.pixel_lats, window1.pixel_lats)
+    assert np.array_equal(window2.pixel_lons_native, window1.pixel_lons_native)
+
+
+def test_derive_grid_cache_avoids_recomputation() -> None:
+    """Valid grids are cached across requests by shape and coordinate endpoints."""
+    tiles_mod._clear_grid_cache()
+    latitudes = np.array([38.0, 38.25, 38.5], dtype=np.float64)
+    longitudes = np.array([-107.0, -106.75, -106.5], dtype=np.float64)
+    dataset = xr.Dataset(
+        data_vars={
+            "temperature_2m": (
+                ("lead_time_hours", "latitude", "longitude"),
+                np.full((1, 3, 3), 12.0, dtype=np.float32),
+            )
+        },
+        coords={"lead_time_hours": [0], "latitude": latitudes, "longitude": longitudes},
+    )
+
+    grid1 = tiles_mod._derive_grid(dataset)
+    grid2 = tiles_mod._derive_grid(dataset)
+    assert grid1 is grid2
+
+    # Malformed / degenerate grid raises ValueError and is not cached
+    bad_dataset = xr.Dataset(
+        coords={"latitude": [38.0], "longitude": [10.0, 20.0]},
+    )
+    with pytest.raises(ValueError, match="at least two points"):
+        tiles_mod._derive_grid(bad_dataset)
+
