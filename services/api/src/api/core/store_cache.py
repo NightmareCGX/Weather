@@ -37,13 +37,24 @@ A same-cycle re-ingestion replaces the data behind the SAME ``store_path``
 and commits a new committed-manifest generation. A cache keyed only by
 ``store_path`` would serve generation-A metadata (lead axis, variable set,
 chunk layout) to generation-B readers. The key therefore includes the
-generation; :func:`read_dataset_cached` and :func:`open_serving_dataset` re-probe
-the committed manifest on every call (one small GET — far cheaper than the open it
-saves), so the moment a writer commits generation B the next reader computes a
-B-keyed identity, misses, and opens fresh. Legacy stores without a manifest
-bypass persistent Dataset handle caching entirely and open fresh per request. A
-malformed manifest fails closed (no caching, raises ManifestReadError) rather
-than risking a stale key.
+generation, and :func:`read_dataset_cached` / :func:`open_serving_dataset` read
+the committed manifest on every call to build that identity.
+
+Manifest reads are themselves micro-cached by
+:mod:`api.core.manifest_reader`, which fixes the freshness bound here:
+
+* A **present** manifest is cached for ``_MANIFEST_CACHE_TTL`` (30 s), so after a
+  writer commits generation B the next reader computes a B-keyed identity and
+  opens fresh **within that window**. The bound is deliberate: it trades up to
+  30 s of serving a superseded generation (whose entries are merely unreachable,
+  never incorrect — the key still names the generation actually read) for
+  collapsing the several manifest lookups a single cold tile performs.
+* An **absent** manifest is never cached, so a legacy store is re-probed on
+  every call and the transition to generation-aware caching is visible on the
+  very next lookup. Legacy stores therefore bypass persistent Dataset handle
+  caching entirely and open fresh per request.
+* A **malformed** manifest fails closed (no caching, raises ``ManifestReadError``)
+  rather than risking a stale key.
 
 Why lazy I/O must remain under the reader lock
 ----------------------------------------------
@@ -64,7 +75,9 @@ Lifecycle
 * **TTL:** none — generation keying is the invalidation mechanism; entries
   for superseded generations simply become unreachable and age out of the
   small LRU. A repaired/replaced newest store commits a new generation and
-  is therefore never shadowed by a stale fallback entry.
+  is therefore never shadowed by a stale fallback entry. The only bound on how
+  quickly a new generation is noticed comes from the manifest micro-cache
+  (≤30 s for a present manifest, immediate for an absent one — see above).
 * **Thread synchronization:** a module-level :class:`threading.Lock` guards
   the internal dictionary and in-flight flight table. Network I/O (``opener()``)
   runs **outside the lock**. A minimal per-key single-flight coordination

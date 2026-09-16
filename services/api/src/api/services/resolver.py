@@ -76,6 +76,7 @@ from sqlalchemy.orm import Session
 from api.core.time import get_current_time
 from api.models.entities import (
     EnsembleMemberProduct,
+    ForecastCycleLifecycle,
     ForecastProduct,
     Model,
     ModelRun,
@@ -105,10 +106,45 @@ def _clear_resolver_cache() -> None:
         _resolver_flight_locks.clear()
 
 
-@event.listens_for(Session, "after_commit")
-def _on_session_commit(session: Session) -> None:
-    """Automatically invalidate the resolver micro-cache whenever data is committed."""
-    _clear_resolver_cache()
+#: Entities whose rows feed canonical/variable source resolution: the discovery
+#: query in ``_discover_candidates_bulk`` plus the fencing and reclamation
+#: predicates it applies. Only a write to one of these can change a resolution
+#: result, so only such a write may invalidate the micro-cache.
+_RESOLUTION_ENTITIES: tuple[type[Any], ...] = (
+    Model,
+    ModelVersion,
+    ModelRun,
+    ForecastProduct,
+    EnsembleMemberProduct,
+    ForecastCycleLifecycle,
+    ReclamationQueue,
+)
+
+
+@event.listens_for(Session, "before_flush")
+def _on_session_before_flush(
+    session: Session, flush_context: Any, instances: Any
+) -> None:
+    """Invalidate the resolver micro-cache when resolution inputs change.
+
+    The cache is keyed by catalog provenance, so only writes to the catalog
+    tables the resolver reads can make an entry stale. The previous
+    ``after_commit`` hook cleared the entire cache on *every* commit in the
+    process, including writes that cannot affect resolution at all — most
+    notably the ``point_query_fallback_audit`` ledger, which commits on every
+    request while Redis is unavailable and therefore defeated the cache exactly
+    when load was highest. ``before_flush`` is used because it is the last point
+    at which the session's pending change sets are still populated.
+
+    Scope limit: this only observes writes made by *this* process. Commits by
+    the ingestion worker are invisible here, so cross-process freshness remains
+    bounded by ``_RESOLVER_CACHE_TTL`` (deliberately short) rather than by this
+    hook — the hook narrows staleness for in-process catalog writes only.
+    """
+    for pending in (session.new, session.dirty, session.deleted):
+        if any(isinstance(obj, _RESOLUTION_ENTITIES) for obj in pending):
+            _clear_resolver_cache()
+            return
 
 
 def _ensure_utc(dt: datetime) -> datetime:
