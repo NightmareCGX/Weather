@@ -553,28 +553,16 @@ def render_tile_png(
         break
 
     # Post-read validation: verify physical shard did not transition to deleting/deleted during read.
-    # Unfenced results are TTL-cached (``_FENCING_CHECK_TTL_SECONDS``) to spare
-    # one DB roundtrip per cache-miss render; the physical read itself still
-    # fails closed when a shard is actually gone, and fenced states are never
-    # cached, so the TTL only widens the race window this check narrows.
+    # Unfenced results are TTL-cached (``_FENCING_CHECK_TTL_SECONDS``) and collapsed
+    # across concurrent tile requests via Single-Flight to spare DB roundtrips per
+    # cache-miss render; the physical read itself still fails closed when a shard is
+    # actually gone, and fenced states are never cached.
     try:
-        from api.models.entities import ReclamationQueue
         from domain.reclamation import make_shard_relative_key
 
         t_kind = "mean" if context.expected_members > 1 else "det"
         rel_key = make_shard_relative_key(variable, t_kind, context.lead_time_hours)
-        if not _fencing_recently_verified(context.store_path, rel_key):
-            with SessionLocal() as check_session:
-                fenced_shards = check_session.execute(
-                    select(ReclamationQueue.id).where(
-                        ReclamationQueue.store_path == context.store_path,
-                        ReclamationQueue.physical_key == rel_key,
-                        ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
-                    )
-                ).scalars().all()
-                if fenced_shards:
-                    raise HTTPException(status_code=404, detail="Forecast shard became unavailable during read.")
-            _fencing_mark_verified(context.store_path, rel_key)
+        _verify_fencing_with_single_flight(context.store_path, rel_key)
     except HTTPException:
         raise
     except Exception:
@@ -898,29 +886,87 @@ def _tile_cache_set(key: tuple[object, ...], png: bytes) -> None:
 _FENCING_CHECK_TTL_SECONDS = 30
 _FENCING_CHECK_MAX_ENTRIES = 4096
 _fencing_check_cache: dict[tuple[str, str], float] = {}
+_fencing_cache_lock = threading.Lock()
+_fencing_flight_locks: dict[tuple[str, str], threading.Lock] = {}
+
+
+def _clear_fencing_cache() -> None:
+    """Clear in-memory fencing cache and inflight locks (tests)."""
+    global _fencing_check_cache, _fencing_flight_locks
+    with _fencing_cache_lock:
+        _fencing_check_cache.clear()
+        _fencing_flight_locks.clear()
 
 
 def _fencing_recently_verified(store_path: str, rel_key: str) -> bool:
     """Return True when the shard was DB-verified unfenced within the TTL."""
-    verified_at = _fencing_check_cache.get((store_path, rel_key))
-    if verified_at is None:
-        return False
-    if time.monotonic() - verified_at > _FENCING_CHECK_TTL_SECONDS:
-        _fencing_check_cache.pop((store_path, rel_key), None)
-        return False
-    return True
+    with _fencing_cache_lock:
+        verified_at = _fencing_check_cache.get((store_path, rel_key))
+        if verified_at is None:
+            return False
+        if time.monotonic() - verified_at > _FENCING_CHECK_TTL_SECONDS:
+            _fencing_check_cache.pop((store_path, rel_key), None)
+            return False
+        return True
 
 
 def _fencing_mark_verified(store_path: str, rel_key: str) -> None:
     """Record a DB-confirmed unfenced result for the shard."""
-    _fencing_check_cache[(store_path, rel_key)] = time.monotonic()
-    if len(_fencing_check_cache) > _FENCING_CHECK_MAX_ENTRIES:
-        # Evict the oldest-inserted entry (bounded module growth).
+    with _fencing_cache_lock:
+        _fencing_check_cache[(store_path, rel_key)] = time.monotonic()
+        if len(_fencing_check_cache) > _FENCING_CHECK_MAX_ENTRIES:
+            # Evict the oldest-inserted entry (bounded module growth).
+            try:
+                oldest = next(iter(_fencing_check_cache))
+                _fencing_check_cache.pop(oldest, None)
+            except StopIteration:
+                pass
+
+
+def _verify_fencing_with_single_flight(store_path: str, rel_key: str) -> None:
+    """Verify that a physical shard is not currently being reclaimed, using Single-Flight.
+
+    Ensures that concurrent tile requests for the exact same shard
+    collapse into a single database query to reclamation_queue, preventing
+    database connection pool stampedes during viewport cold loads.
+    """
+    from api.core.database import SessionLocal
+    from api.models.entities import ReclamationQueue
+
+    # Fast path: check in-memory TTL cache without allocating a flight lock
+    if _fencing_recently_verified(store_path, rel_key):
+        return
+
+    # In-flight lock for this specific shard
+    cache_key = (store_path, rel_key)
+    with _fencing_cache_lock:
+        flight_lock = _fencing_flight_locks.setdefault(cache_key, threading.Lock())
+
+    with flight_lock:
+        # Double-check whether another thread in flight completed verification
+        if _fencing_recently_verified(store_path, rel_key):
+            with _fencing_cache_lock:
+                _fencing_flight_locks.pop(cache_key, None)
+            return
+
         try:
-            oldest = next(iter(_fencing_check_cache))
-            _fencing_check_cache.pop(oldest, None)
-        except StopIteration:
-            pass
+            with SessionLocal() as check_session:
+                fenced_shards = check_session.execute(
+                    select(ReclamationQueue.id).where(
+                        ReclamationQueue.store_path == store_path,
+                        ReclamationQueue.physical_key == rel_key,
+                        ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+                    )
+                ).scalars().all()
+                if fenced_shards:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Forecast shard became unavailable during read.",
+                    )
+            _fencing_mark_verified(store_path, rel_key)
+        finally:
+            with _fencing_cache_lock:
+                _fencing_flight_locks.pop(cache_key, None)
 
 
 def _slice_field(

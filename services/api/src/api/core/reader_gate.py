@@ -348,6 +348,89 @@ _admission_semaphore: threading.BoundedSemaphore | None = None
 _admission_lock = threading.Lock()
 
 
+#: Maximum duration (seconds) that an in-process reader-gate lease remains open
+#: for new joining readers. Prevents a continuous influx of concurrent reads from
+#: indefinitely starving Ingestion writers waiting for EXCLUSIVE store gates.
+MAX_READER_GATE_LEASE_LIFETIME_SECONDS: float = 5.0
+
+
+class _StoreGateLease:
+    """An in-process shared reader gate lease on a single forecast store.
+
+    Allows concurrent readers within the same process to share a single
+    PostgreSQL connection and its SHARED advisory lock, avoiding database
+    connection pool exhaustion during viewport tile bursts.
+    """
+
+    def __init__(self, session: _ReaderGateSession, created_at: float) -> None:
+        self.session = session
+        self.created_at = created_at
+        self.ref_count = 1
+        self.state = "INITIALIZING"  # INITIALIZING, ACTIVE, FAILED, DRAINING, CLOSED
+        self.error: BaseException | None = None
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+
+
+_leases: dict[tuple[int, str, str], _StoreGateLease] = {}
+_leases_lock = threading.Lock()
+
+
+def _clear_reader_gate_leases() -> None:
+    """Clear and release any lingering reader gate leases (for test isolation)."""
+    with _leases_lock:
+        lingering = list(_leases.values())
+        _leases.clear()
+    for lease in lingering:
+        try:
+            lease.session.release()
+        except Exception:
+            pass
+
+
+def _acquire_or_join_lease(
+    pool: ReaderLockPool,
+    store_path: str,
+    revalidate_db_url: str,
+) -> tuple[tuple[int, str, str], _StoreGateLease, bool]:
+    key = (id(pool), store_path, revalidate_db_url)
+    now = time.monotonic()
+    with _leases_lock:
+        lease = _leases.get(key)
+        if (
+            lease is not None
+            and lease.state in ("INITIALIZING", "ACTIVE")
+            and (now - lease.created_at) < MAX_READER_GATE_LEASE_LIFETIME_SECONDS
+        ):
+            with lease.lock:
+                if lease.state in ("INITIALIZING", "ACTIVE"):
+                    lease.ref_count += 1
+                    return key, lease, False
+
+        session = _ReaderGateSession(pool, store_path)
+        lease = _StoreGateLease(session, created_at=now)
+        _leases[key] = lease
+        return key, lease, True
+
+
+def _exit_lease(key: tuple[int, str, str], lease: _StoreGateLease) -> None:
+    close_session = False
+    with lease.lock:
+        lease.ref_count -= 1
+        if lease.ref_count <= 0:
+            lease.state = "CLOSED"
+            close_session = True
+
+    if close_session:
+        with _leases_lock:
+            if _leases.get(key) is lease:
+                _leases.pop(key, None)
+        try:
+            lease.session.release()
+        except Exception:
+            logger.exception("Error releasing reader gate session on %s", key[1])
+
+
 def _get_admission_semaphore() -> threading.BoundedSemaphore:
     """Return the process-wide admission limiter for gated reads.
 
@@ -421,17 +504,61 @@ def gated_read(
     try:
         lifecycle.enter()
         try:
-            session = _ReaderGateSession(pool, store_path)
-            session.acquire(max(0.001, deadline - time.monotonic()))
+            key, lease, is_creator = _acquire_or_join_lease(
+                pool, store_path, revalidate_db_url
+            )
+            if is_creator:
+                try:
+                    rem = max(0.001, deadline - time.monotonic())
+                    lease.session.acquire(timeout_seconds=rem)
+                    ok, path = lease.session.revalidate(revalidate_db_url)
+                    if not ok:
+                        raise FileNotFoundError(
+                            f"run {store_path!r} is not a ready, readable run"
+                        )
+                    with lease.lock:
+                        lease.state = "ACTIVE"
+                        lease.condition.notify_all()
+                except BaseException as exc:
+                    with lease.lock:
+                        lease.state = "FAILED"
+                        lease.error = exc
+                        lease.condition.notify_all()
+                    with _leases_lock:
+                        if _leases.get(key) is lease:
+                            _leases.pop(key, None)
+                    try:
+                        lease.session.release()
+                    except Exception:
+                        pass
+                    with lease.lock:
+                        lease.ref_count -= 1
+                    raise
+            else:
+                with lease.lock:
+                    while lease.state == "INITIALIZING":
+                        rem = deadline - time.monotonic()
+                        if rem <= 0.001:
+                            lease.ref_count -= 1
+                            raise ReaderGateTimeout(
+                                f"reader gate timed out waiting for active lease on {store_path}"
+                            )
+                        lease.condition.wait(timeout=rem)
+
+                    if lease.state == "FAILED":
+                        lease.ref_count -= 1
+                        if isinstance(lease.error, FileNotFoundError):
+                            raise FileNotFoundError(str(lease.error))
+                        if isinstance(lease.error, ReaderGateTimeout):
+                            raise ReaderGateTimeout(str(lease.error))
+                        raise RuntimeError(
+                            f"reader gate lease on {store_path} failed during initialization: {lease.error}"
+                        ) from lease.error
+
             try:
-                ok, path = session.revalidate(revalidate_db_url)
-                if not ok:
-                    raise FileNotFoundError(
-                        f"run {store_path!r} is not a ready, readable run"
-                    )
                 return materialize()
             finally:
-                session.release()
+                _exit_lease(key, lease)
         finally:
             lifecycle.exit()
     finally:
