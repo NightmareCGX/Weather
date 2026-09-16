@@ -5,6 +5,7 @@ import zlib
 
 import pytest
 
+from api.core.config import settings
 from api.core.png import encode_rgba_png
 
 
@@ -92,10 +93,16 @@ def test_png_compress_level_override_and_equivalence():
     raw_pixels = bytes(pixels)
 
     png_default = encode_rgba_png(raw_pixels, width, height)
+    png_configured = encode_rgba_png(
+        raw_pixels, width, height, compress_level=settings.API_PNG_COMPRESS_LEVEL
+    )
     png_level_1 = encode_rgba_png(raw_pixels, width, height, compress_level=1)
     png_level_6 = encode_rgba_png(raw_pixels, width, height, compress_level=6)
 
-    # Default should match compress_level=1
+    # The encoder default is wired to the configured serving compression level.
+    assert png_default == png_configured
+    # The shipped default remains the P0 fast-encode level.
+    assert settings.API_PNG_COMPRESS_LEVEL == 1
     assert png_default == png_level_1
 
     # Both levels must decode to identical pixel buffers

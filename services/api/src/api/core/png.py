@@ -12,9 +12,10 @@ it can be unit tested without external services.
 
 from __future__ import annotations
 
-import os
 import struct
 import zlib
+
+from api.core.config import settings
 
 #: PNG signature prefix required by the format.
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -42,12 +43,12 @@ def _chunk(chunk_type: bytes, data: bytes) -> bytes:
     )
 
 
-#: zlib compression level for tile IDAT payloads.
-#: Adjusted to level 1 for map tiles (or configured via WEATHER_PNG_COMPRESS_LEVEL).
-#: For 256x256 RGBA tiles (256KB buffer), level 1 compresses 3-5x faster than
-#: level 6 with only 5-10% size increase, dramatically reducing CPU latency
-#: and GIL contention on concurrent cold tile requests.
-_PNG_COMPRESS_LEVEL = int(os.environ.get("WEATHER_PNG_COMPRESS_LEVEL", "1"))
+# The zlib compression level used when the caller does not override it comes
+# from ``settings.API_PNG_COMPRESS_LEVEL`` (default 1), read at call time rather
+# than captured at import: the settings object validates the value (0-9) and
+# overrides take effect without a module reload. Level 1 is the serving default
+# — on a 256x256 RGBA tile it compresses several times faster than the zlib
+# default of 6 for only a small size increase.
 
 
 def encode_rgba_png(
@@ -101,7 +102,7 @@ def encode_rgba_png(
         scanlines.append(0)
         scanlines += pixels[row * stride : (row + 1) * stride]
 
-    level = _PNG_COMPRESS_LEVEL if compress_level is None else compress_level
+    level = settings.API_PNG_COMPRESS_LEVEL if compress_level is None else compress_level
     idat = _chunk(b"IDAT", zlib.compress(bytes(scanlines), level))
     iend = _chunk(b"IEND", b"")
     return _PNG_SIGNATURE + ihdr + idat + iend
