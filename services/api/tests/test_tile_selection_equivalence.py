@@ -287,7 +287,7 @@ def test_gfs_window_equivalent_to_full_reference(tmp_path) -> None:
     for (zoom, x, y) in ALL_TILES:
         window = _select_tile_window(laz, variable="temperature_2m", lead=12, zoom=zoom, x=x, y=y)
         png = _render_window_to_png(
-            window, variable="temperature_2m", zoom=zoom, x=x, y=y, cache_key=()
+            window, variable="temperature_2m", cache_key=()
         )
         assert png.startswith(b"\x89PNG\r\n\x1a\n"), "expected a real PNG"
         ref = _reference_render(ds, "temperature_2m", 12, zoom, x, y)

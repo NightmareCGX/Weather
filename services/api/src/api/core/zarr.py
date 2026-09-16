@@ -21,7 +21,7 @@ from collections.abc import Generator, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from os import PathLike
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import s3fs  # type: ignore[import-untyped]
@@ -66,6 +66,103 @@ def shutdown_member_executor(wait: bool = True) -> None:
         if _member_executor is not None:
             _member_executor.shutdown(wait=wait)
             _member_executor = None
+
+
+#: Bounded concurrency limit for shard chunk fetches. A tile window normally
+#: spans 2-4 chunks; a low-zoom tile can span the whole 8x15 chunk grid. This
+#: pool collapses those fetches from N sequential Range GETs into a single
+#: concurrent wait, bounded so a viewport burst cannot open unbounded sockets
+#: (each ``ShardedV1Reader`` already caps s3fs at ``max_pool_connections=64``).
+DEFAULT_CHUNK_WORKERS: int = 16
+_chunk_executor: ThreadPoolExecutor | None = None
+_chunk_executor_lock = threading.Lock()
+
+
+def get_chunk_executor(max_workers: int = DEFAULT_CHUNK_WORKERS) -> ThreadPoolExecutor:
+    """Return the shared process-wide bounded shard-chunk fetch executor.
+
+    Deliberately separate from the member executor so that a window read can
+    never nest inside its own pool (which could exhaust it and deadlock), and
+    so chunk fan-out does not starve ensemble member reads.
+    """
+    global _chunk_executor
+    with _chunk_executor_lock:
+        if _chunk_executor is None:
+            _chunk_executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="shard-chunk-",
+            )
+        return _chunk_executor
+
+
+def shutdown_chunk_executor(wait: bool = True) -> None:
+    """Shut down and reset the shared chunk executor (for testing and teardown)."""
+    global _chunk_executor
+    with _chunk_executor_lock:
+        if _chunk_executor is not None:
+            _chunk_executor.shutdown(wait=wait)
+            _chunk_executor = None
+
+
+class _ChunkPlacement(NamedTuple):
+    """Where one shard chunk's data lands inside a destination window.
+
+    ``src_*`` indexes the 100x100 chunk array returned by ``read_chunk``;
+    ``dst_*`` indexes the caller's window array. Distinct chunks always have
+    disjoint ``dst_*`` slices, which is what makes concurrent fetching safe:
+    every result is written back to its own region of the window.
+    """
+
+    chunk_row: int
+    chunk_col: int
+    src_rows: slice
+    src_cols: slice
+    dst_rows: slice
+    dst_cols: slice
+
+
+def _chunk_placements(
+    lat_min: int, lat_max: int, lon_min: int, lon_max: int
+) -> list[_ChunkPlacement]:
+    """Enumerate the shard chunks overlapping an inclusive window.
+
+    Mirrors the canonical 100x100-chunk grid of the sharded_v1 layout: the
+    latitude axis is capped at 721 cells and the longitude axis at 1440, and
+    each chunk contributes only the sub-region that intersects the window.
+    Chunks that do not intersect the window at all are omitted (the previous
+    nested-loop implementation skipped exactly the same cases).
+    """
+    placements: list[_ChunkPlacement] = []
+    for r_chunk in range(lat_min // 100, lat_max // 100 + 1):
+        chunk_lat_start = r_chunk * 100
+        chunk_lat_end = min((r_chunk + 1) * 100, 721)
+
+        sub_lat_start = max(0, lat_min - chunk_lat_start)
+        sub_lat_end = min(chunk_lat_end - chunk_lat_start, lat_max - chunk_lat_start + 1)
+        win_lat_start = max(0, chunk_lat_start - lat_min)
+        win_lat_end = win_lat_start + (sub_lat_end - sub_lat_start)
+
+        for c_chunk in range(lon_min // 100, lon_max // 100 + 1):
+            chunk_lon_start = c_chunk * 100
+            chunk_lon_end = min((c_chunk + 1) * 100, 1440)
+
+            sub_lon_start = max(0, lon_min - chunk_lon_start)
+            sub_lon_end = min(chunk_lon_end - chunk_lon_start, lon_max - chunk_lon_start + 1)
+            win_lon_start = max(0, chunk_lon_start - lon_min)
+            win_lon_end = win_lon_start + (sub_lon_end - sub_lon_start)
+
+            if sub_lat_end > sub_lat_start and sub_lon_end > sub_lon_start:
+                placements.append(
+                    _ChunkPlacement(
+                        chunk_row=r_chunk,
+                        chunk_col=c_chunk,
+                        src_rows=slice(sub_lat_start, sub_lat_end),
+                        src_cols=slice(sub_lon_start, sub_lon_end),
+                        dst_rows=slice(win_lat_start, win_lat_end),
+                        dst_cols=slice(win_lon_start, win_lon_end),
+                    )
+                )
+    return placements
 
 
 class ShardedV1Reader:
@@ -381,47 +478,58 @@ class ShardedV1Reader:
         generation: str | None = None,
         is_mean: bool = False,
     ) -> np.ndarray[Any, Any]:
-        """Read a bounded rectangular spatial window [lat_min..lat_max, lon_min..lon_max] (inclusive)."""
+        """Read a bounded rectangular spatial window [lat_min..lat_max, lon_min..lon_max] (inclusive).
+
+        A window typically overlaps 2-4 chunks (and the entire 8x15 chunk grid
+        at low zoom). Those chunk Range GETs are mutually independent, so they
+        are fetched concurrently on a shared bounded executor instead of one
+        blocking round trip at a time, collapsing the fetch latency from
+        ``N x RTT`` to roughly ``1 x RTT``.
+
+        Equivalence with the previous strictly sequential implementation is
+        preserved: the chunk geometry, the NaN fill for absent chunks, and the
+        destination region of every chunk are unchanged, and distinct chunks own
+        disjoint destination slices. Results are written back in the calling
+        thread, so the window array is never mutated concurrently.
+        """
         lat_len = lat_max - lat_min + 1
         lon_len = lon_max - lon_min + 1
         window = np.full((lat_len, lon_len), np.nan, dtype=np.float32)
 
-        r_start = lat_min // 100
-        r_end = lat_max // 100
-        c_start = lon_min // 100
-        c_end = lon_max // 100
+        placements = _chunk_placements(lat_min, lat_max, lon_min, lon_max)
+        if not placements:
+            return window
 
-        for r_chunk in range(r_start, r_end + 1):
-            chunk_lat_start = r_chunk * 100
-            chunk_lat_end = min((r_chunk + 1) * 100, 721)
+        def _fetch(
+            placement: _ChunkPlacement,
+        ) -> tuple[_ChunkPlacement, np.ndarray[Any, Any]]:
+            arr = self.read_chunk(
+                variable,
+                member=member,
+                lead_time_hours=lead_time_hours,
+                chunk_row=placement.chunk_row,
+                chunk_col=placement.chunk_col,
+                generation=generation,
+                is_mean=is_mean,
+            )
+            return placement, arr
 
-            sub_lat_start = max(0, lat_min - chunk_lat_start)
-            sub_lat_end = min(chunk_lat_end - chunk_lat_start, lat_max - chunk_lat_start + 1)
-            win_lat_start = max(0, chunk_lat_start - lat_min)
-            win_lat_end = win_lat_start + (sub_lat_end - sub_lat_start)
+        if len(placements) == 1:
+            # Single-chunk windows are the common high-zoom case: read inline
+            # rather than handing one item to another thread.
+            placement, arr = _fetch(placements[0])
+            window[placement.dst_rows, placement.dst_cols] = arr[
+                placement.src_rows, placement.src_cols
+            ]
+            return window
 
-            for c_chunk in range(c_start, c_end + 1):
-                chunk_lon_start = c_chunk * 100
-                chunk_lon_end = min((c_chunk + 1) * 100, 1440)
-
-                sub_lon_start = max(0, lon_min - chunk_lon_start)
-                sub_lon_end = min(chunk_lon_end - chunk_lon_start, lon_max - chunk_lon_start + 1)
-                win_lon_start = max(0, chunk_lon_start - lon_min)
-                win_lon_end = win_lon_start + (sub_lon_end - sub_lon_start)
-
-                if sub_lat_end > sub_lat_start and sub_lon_end > sub_lon_start:
-                    chunk_arr = self.read_chunk(
-                        variable,
-                        member=member,
-                        lead_time_hours=lead_time_hours,
-                        chunk_row=r_chunk,
-                        chunk_col=c_chunk,
-                        generation=generation,
-                        is_mean=is_mean,
-                    )
-                    window[win_lat_start:win_lat_end, win_lon_start:win_lon_end] = chunk_arr[
-                        sub_lat_start:sub_lat_end, sub_lon_start:sub_lon_end
-                    ]
+        # ``map`` yields results in submission order and re-raises a worker
+        # exception to the caller, so a failed chunk fetch fails the request
+        # instead of silently degrading the tile to NaN.
+        for placement, arr in get_chunk_executor().map(_fetch, placements):
+            window[placement.dst_rows, placement.dst_cols] = arr[
+                placement.src_rows, placement.src_cols
+            ]
 
         return window
 

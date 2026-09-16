@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -511,9 +512,6 @@ def render_tile_png(
     return _render_window_to_png(
         windowed,
         variable=variable,
-        zoom=zoom,
-        x=x,
-        y=y,
         cache_key=cache_key,
     )
 
@@ -527,12 +525,19 @@ class _TileWindow:
         lat_axis: Ascending latitude coordinates of ``field`` rows.
         lon_axis: Ascending longitude coordinates of ``field`` columns.
         grid: The dataset's regular grid (:class:`_TileGrid`).
+        pixel_lats: Per-pixel latitudes of the tile (``TILE_SIZE`` square).
+        pixel_lons_native: Per-pixel longitudes, already aligned into the
+            dataset's native convention. Both arrays are pure functions of the
+            tile's ``(zoom, x, y)`` plus the grid, so they are computed once
+            during selection and reused by the renderer rather than rebuilt.
     """
 
     field: npt.NDArray[np.float64]
     lat_axis: npt.NDArray[np.float64]
     lon_axis: npt.NDArray[np.float64]
     grid: _TileGrid
+    pixel_lats: npt.NDArray[np.float64]
+    pixel_lons_native: npt.NDArray[np.float64]
 
 
 def _select_tile_window(
@@ -585,12 +590,16 @@ def _select_tile_window(
         store_path=store_path,
     )
     # ``_slice_field`` already materializes the bounded window. Return the
-    # window + its axes + the grid so rendering needs no store access.
+    # window + its axes + the grid so rendering needs no store access. The
+    # per-pixel geometry computed above is carried along so the renderer does
+    # not rebuild the same meshgrid and projection.
     return _TileWindow(
         field=np.asarray(field, dtype=np.float64),
         lat_axis=np.asarray(lat_axis, dtype=np.float64),
         lon_axis=np.asarray(lon_axis, dtype=np.float64),
         grid=grid,
+        pixel_lats=pixel_lats,
+        pixel_lons_native=lon_native,
     )
 
 
@@ -598,15 +607,16 @@ def _render_window_to_png(
     window: _TileWindow,
     *,
     variable: str,
-    zoom: int,
-    x: int,
-    y: int,
     cache_key: tuple[object, ...],
 ) -> bytes:
     """Rasterize an already-materialized spatial window into a tile PNG (no DB).
 
     All data access already happened under the reader gate; this function is
     pure CPU (nearest-neighbor pixel sampling + color mapping + PNG encode).
+
+    The tile's per-pixel latitudes and grid-native longitudes were computed once
+    during selection and travel on ``window``, so the 256x256 ``meshgrid`` and
+    the ``arctan(sinh(...))`` Mercator projection are not recomputed here.
     """
     field_arr = window.field
     lat_axis_arr = window.lat_axis
@@ -614,21 +624,8 @@ def _render_window_to_png(
     stops = _color_stops(variable)
     data_min, data_max = _data_range(variable)
 
-    # Compute the tile's geographic bounds (pixel centers), vectorized.
-    n = 2**zoom
-    px_idx, py_idx = np.meshgrid(
-        np.arange(TILE_SIZE, dtype=np.float64),
-        np.arange(TILE_SIZE, dtype=np.float64),
-        indexing="xy",
-    )
-    pixel_lons = ((x + (px_idx + 0.5) / TILE_SIZE) / n) * 360.0 - 180.0
-    y_merc = y + (py_idx + 0.5) / TILE_SIZE
-    lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
-    pixel_lats = np.degrees(lat_rad)
-
-    # Align pixel longitudes into the grid's native convention (the window's
-    # lon_axis already matches, so use the grid's start/stop bounds).
-    aligned_lons = _align_longitudes(window.grid, pixel_lons)
+    pixel_lats = window.pixel_lats
+    aligned_lons = window.pixel_lons_native
 
     # Nearest grid index per pixel, into the *sliced* ascending axes. Columns
     # MUST use the grid-native aligned longitudes just like the selection stage
@@ -856,11 +853,47 @@ def _slice_field(
 
         def _read_sharded_window(c_min: int, c_max: int) -> npt.NDArray[np.float64]:
             if variable in ("wind_10m", "wind_speed_10m"):
-                if is_ensemble:
-                    if not reader.has_mean_shard("wind_u_10m", lead, generation=generation) or not reader.has_mean_shard("wind_v_10m", lead, generation=generation):
-                        raise FileNotFoundError(f"Missing official mean shard for wind_10m components at lead {lead}")
-                    u_win = reader.read_window(
-                        "wind_u_10m",
+                if is_ensemble and not (
+                    reader.has_mean_shard("wind_u_10m", lead, generation=generation)
+                    and reader.has_mean_shard("wind_v_10m", lead, generation=generation)
+                ):
+                    raise FileNotFoundError(
+                        f"Missing official mean shard for wind_10m components at lead {lead}"
+                    )
+
+                def _read_component(component: str) -> npt.NDArray[np.float32]:
+                    return reader.read_window(
+                        component,
+                        member=None,
+                        lead_time_hours=lead,
+                        lat_min=lat_min_idx,
+                        lat_max=lat_max_idx,
+                        lon_min=c_min,
+                        lon_max=c_max,
+                        generation=generation,
+                        is_mean=is_ensemble,
+                    )
+
+                # The two components live in independent shard containers, so
+                # fetching them in sequence paid two full network waits for one
+                # tile. Fetch them together instead. The pool is per-call and
+                # joined on exit, so concurrent requests each get their own pair
+                # of threads rather than queueing behind one shared two-worker
+                # pool (which would re-serialize them).
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    u_win, v_win = pool.map(
+                        _read_component, ("wind_u_10m", "wind_v_10m")
+                    )
+                # Unchanged arithmetic: hypot in the components' native float32
+                # then a single cast, exactly as the sequential version did.
+                return np.asarray(np.hypot(u_win, v_win) * 3.6, dtype=np.float64)
+
+            if is_ensemble:
+                if not reader.has_mean_shard(variable, lead, generation=generation):
+                    raise FileNotFoundError(f"Missing official mean shard for {variable} at lead {lead}")
+                return np.asarray(
+                    reader.read_window(
+                        variable,
                         member=None,
                         lead_time_hours=lead,
                         lat_min=lat_min_idx,
@@ -869,73 +902,23 @@ def _slice_field(
                         lon_max=c_max,
                         generation=generation,
                         is_mean=True,
-                    )
-                    v_win = reader.read_window(
-                        "wind_v_10m",
-                        member=None,
-                        lead_time_hours=lead,
-                        lat_min=lat_min_idx,
-                        lat_max=lat_max_idx,
-                        lon_min=c_min,
-                        lon_max=c_max,
-                        generation=generation,
-                        is_mean=True,
-                    )
-                    return np.asarray(np.hypot(u_win, v_win) * 3.6, dtype=np.float64)
-                else:
-                    u_win = reader.read_window(
-                        "wind_u_10m",
-                        member=None,
-                        lead_time_hours=lead,
-                        lat_min=lat_min_idx,
-                        lat_max=lat_max_idx,
-                        lon_min=c_min,
-                        lon_max=c_max,
-                        generation=generation,
-                    )
-                    v_win = reader.read_window(
-                        "wind_v_10m",
-                        member=None,
-                        lead_time_hours=lead,
-                        lat_min=lat_min_idx,
-                        lat_max=lat_max_idx,
-                        lon_min=c_min,
-                        lon_max=c_max,
-                        generation=generation,
-                    )
-                    return np.asarray(np.hypot(u_win, v_win) * 3.6, dtype=np.float64)
-            else:
-                if is_ensemble:
-                    if not reader.has_mean_shard(variable, lead, generation=generation):
-                        raise FileNotFoundError(f"Missing official mean shard for {variable} at lead {lead}")
-                    return np.asarray(
-                        reader.read_window(
-                            variable,
-                            member=None,
-                            lead_time_hours=lead,
-                            lat_min=lat_min_idx,
-                            lat_max=lat_max_idx,
-                            lon_min=c_min,
-                            lon_max=c_max,
-                            generation=generation,
-                            is_mean=True,
-                        ),
-                        dtype=np.float64,
-                    )
-                else:
-                    return np.asarray(
-                        reader.read_window(
-                            variable,
-                            member=None,
-                            lead_time_hours=lead,
-                            lat_min=lat_min_idx,
-                            lat_max=lat_max_idx,
-                            lon_min=c_min,
-                            lon_max=c_max,
-                            generation=generation,
-                        ),
-                        dtype=np.float64,
-                    )
+                    ),
+                    dtype=np.float64,
+                )
+
+            return np.asarray(
+                reader.read_window(
+                    variable,
+                    member=None,
+                    lead_time_hours=lead,
+                    lat_min=lat_min_idx,
+                    lat_max=lat_max_idx,
+                    lon_min=c_min,
+                    lon_max=c_max,
+                    generation=generation,
+                ),
+                dtype=np.float64,
+            )
 
         values = _read_sharded_window(lon_min_idx, lon_max_idx)
 
