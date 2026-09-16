@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from typing import Any
 
 import s3fs  # type: ignore[import-untyped]
@@ -22,6 +23,21 @@ _MANIFEST_PATH = "__commit__/v1/manifest.json"
 
 _s3_fs_instance: s3fs.S3FileSystem | None = None
 _s3_fs_lock = threading.Lock()
+
+#: In-memory TTL micro-cache for committed manifests to collapse concurrent
+#: cold tile reads into a single MinIO/disk access.
+_MANIFEST_CACHE_TTL: float = 30.0
+_MANIFEST_CACHE_MAX_SIZE: int = 1024
+_manifest_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_manifest_cache_lock = threading.Lock()
+_manifest_flight_locks: dict[str, threading.Lock] = {}
+
+
+def _clear_manifest_cache() -> None:
+    """Clear the in-memory manifest TTL cache and inflight locks."""
+    with _manifest_cache_lock:
+        _manifest_cache.clear()
+        _manifest_flight_locks.clear()
 
 
 def _get_s3_fs() -> s3fs.S3FileSystem:
@@ -51,7 +67,7 @@ def _resolve_store_root(store_path: str) -> str:
     return os.path.abspath(os.path.normpath(path))
 
 
-def _read_manifest(store_path: str) -> dict[str, Any] | None:
+def _read_manifest_uncached(store_path: str) -> dict[str, Any] | None:
     root = _resolve_store_root(store_path)
     if store_path.startswith("s3://"):
         fs = _get_s3_fs()
@@ -73,6 +89,41 @@ def _read_manifest(store_path: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         raise ManifestReadError("committed manifest is not a JSON object")
     return payload
+
+
+def _read_manifest(store_path: str) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _manifest_cache_lock:
+        entry = _manifest_cache.get(store_path)
+        if entry is not None and entry[0] > now:
+            return entry[1]
+        flight_lock = _manifest_flight_locks.setdefault(store_path, threading.Lock())
+
+    with flight_lock:
+        now = time.monotonic()
+        with _manifest_cache_lock:
+            entry = _manifest_cache.get(store_path)
+            if entry is not None and entry[0] > now:
+                return entry[1]
+
+        payload = _read_manifest_uncached(store_path)
+
+        now = time.monotonic()
+        with _manifest_cache_lock:
+            # Only cache positive manifest payloads (or None could cause stale misses during transition)
+            if payload is not None:
+                if len(_manifest_cache) >= _MANIFEST_CACHE_MAX_SIZE:
+                    expired_keys = [k for k, (exp, _) in _manifest_cache.items() if exp <= now]
+                    for k in expired_keys:
+                        _manifest_cache.pop(k, None)
+                    if len(_manifest_cache) >= _MANIFEST_CACHE_MAX_SIZE:
+                        oldest_key = next(iter(_manifest_cache))
+                        _manifest_cache.pop(oldest_key, None)
+
+                _manifest_cache[store_path] = (now + _MANIFEST_CACHE_TTL, payload)
+            _manifest_flight_locks.pop(store_path, None)
+
+        return payload
 
 
 def manifest_generation(store_path: str) -> str | None:
