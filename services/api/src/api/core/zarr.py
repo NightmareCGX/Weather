@@ -21,7 +21,7 @@ from collections.abc import Generator, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from os import PathLike
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import s3fs  # type: ignore[import-untyped]
@@ -35,25 +35,32 @@ SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
 INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
 TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
 
-#: Bounded concurrency limit for member reads (tuned to match the connection pool
-#: and prevent socket starvation while eliminating serial member latency).
-DEFAULT_MEMBER_WORKERS: int = 16
+#: Fallback member-read fan-out when settings are unavailable. The live value is
+#: ``API_MEMBER_FETCH_WORKERS``; see that setting for the measured sizing basis.
+DEFAULT_MEMBER_WORKERS: int = 4
 _member_executor: ThreadPoolExecutor | None = None
 _member_executor_lock = threading.Lock()
 
 
-def get_member_executor(max_workers: int = DEFAULT_MEMBER_WORKERS) -> ThreadPoolExecutor:
+def get_member_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
     """Return the shared process-wide bounded member executor.
 
-    Bounded to 16 workers by default (matching API_MAX_CONCURRENT_GATED_READS)
-    to balance throughput against object-store connection pressure without
-    per-request thread churn.
+    A single GEFS point read fans out over up to 30 members, so a pool is worth
+    having — but the measured win saturates by four workers on the deployed
+    4-core topology (see ``API_MEMBER_FETCH_WORKERS``), so the default is small
+    rather than sized for the member count. That keeps thread and memory pressure
+    off a host that is already tight, and avoids per-request thread churn.
     """
     global _member_executor
     with _member_executor_lock:
         if _member_executor is None:
+            workers = (
+                int(settings.API_MEMBER_FETCH_WORKERS)
+                if max_workers is None
+                else max_workers
+            )
             _member_executor = ThreadPoolExecutor(
-                max_workers=max_workers,
+                max_workers=workers,
                 thread_name_prefix="gefs-member-",
             )
         return _member_executor
@@ -66,6 +73,115 @@ def shutdown_member_executor(wait: bool = True) -> None:
         if _member_executor is not None:
             _member_executor.shutdown(wait=wait)
             _member_executor = None
+
+
+#: Fallback shard-chunk fetch fan-out when settings are unavailable. The live
+#: value is ``API_CHUNK_FETCH_WORKERS``; see that setting for the measured
+#: sizing basis (the win saturates at two workers, well below the worst-case
+#: 8x15 chunk grid).
+DEFAULT_CHUNK_WORKERS: int = 2
+_chunk_executor: ThreadPoolExecutor | None = None
+_chunk_executor_lock = threading.Lock()
+
+
+def get_chunk_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
+    """Return the shared process-wide bounded shard-chunk fetch executor.
+
+    The pool exists to overlap the Range GETs of *one* tile window. Benchmarked
+    against a same-host MinIO over s3fs on a 4-CPU budget, the win saturates at
+    two workers (a chunk fetch is dominated by s3fs/Python overhead plus zstd
+    decode, not wide-area RTT), and larger pools are measurably slower. It is
+    therefore sized for that saturation point rather than for the worst-case 8x15
+    chunk grid. In normal use it is not engaged at all: a tile spans one chunk at
+    z>=4, which is the range the map actually uses.
+
+    Deliberately separate from the member executor so that a window read can
+    never nest inside its own pool (which could exhaust it and deadlock), and
+    so chunk fan-out does not starve ensemble member reads.
+    """
+    global _chunk_executor
+    with _chunk_executor_lock:
+        if _chunk_executor is None:
+            workers = (
+                int(settings.API_CHUNK_FETCH_WORKERS)
+                if max_workers is None
+                else max_workers
+            )
+            _chunk_executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="shard-chunk-",
+            )
+        return _chunk_executor
+
+
+def shutdown_chunk_executor(wait: bool = True) -> None:
+    """Shut down and reset the shared chunk executor (for testing and teardown)."""
+    global _chunk_executor
+    with _chunk_executor_lock:
+        if _chunk_executor is not None:
+            _chunk_executor.shutdown(wait=wait)
+            _chunk_executor = None
+
+
+class _ChunkPlacement(NamedTuple):
+    """Where one shard chunk's data lands inside a destination window.
+
+    ``src_*`` indexes the 100x100 chunk array returned by ``read_chunk``;
+    ``dst_*`` indexes the caller's window array. Distinct chunks always have
+    disjoint ``dst_*`` slices, which is what makes concurrent fetching safe:
+    every result is written back to its own region of the window.
+    """
+
+    chunk_row: int
+    chunk_col: int
+    src_rows: slice
+    src_cols: slice
+    dst_rows: slice
+    dst_cols: slice
+
+
+def _chunk_placements(
+    lat_min: int, lat_max: int, lon_min: int, lon_max: int
+) -> list[_ChunkPlacement]:
+    """Enumerate the shard chunks overlapping an inclusive window.
+
+    Mirrors the canonical 100x100-chunk grid of the sharded_v1 layout: the
+    latitude axis is capped at 721 cells and the longitude axis at 1440, and
+    each chunk contributes only the sub-region that intersects the window.
+    Chunks that do not intersect the window at all are omitted (the previous
+    nested-loop implementation skipped exactly the same cases).
+    """
+    placements: list[_ChunkPlacement] = []
+    for r_chunk in range(lat_min // 100, lat_max // 100 + 1):
+        chunk_lat_start = r_chunk * 100
+        chunk_lat_end = min((r_chunk + 1) * 100, 721)
+
+        sub_lat_start = max(0, lat_min - chunk_lat_start)
+        sub_lat_end = min(chunk_lat_end - chunk_lat_start, lat_max - chunk_lat_start + 1)
+        win_lat_start = max(0, chunk_lat_start - lat_min)
+        win_lat_end = win_lat_start + (sub_lat_end - sub_lat_start)
+
+        for c_chunk in range(lon_min // 100, lon_max // 100 + 1):
+            chunk_lon_start = c_chunk * 100
+            chunk_lon_end = min((c_chunk + 1) * 100, 1440)
+
+            sub_lon_start = max(0, lon_min - chunk_lon_start)
+            sub_lon_end = min(chunk_lon_end - chunk_lon_start, lon_max - chunk_lon_start + 1)
+            win_lon_start = max(0, chunk_lon_start - lon_min)
+            win_lon_end = win_lon_start + (sub_lon_end - sub_lon_start)
+
+            if sub_lat_end > sub_lat_start and sub_lon_end > sub_lon_start:
+                placements.append(
+                    _ChunkPlacement(
+                        chunk_row=r_chunk,
+                        chunk_col=c_chunk,
+                        src_rows=slice(sub_lat_start, sub_lat_end),
+                        src_cols=slice(sub_lon_start, sub_lon_end),
+                        dst_rows=slice(win_lat_start, win_lat_end),
+                        dst_cols=slice(win_lon_start, win_lon_end),
+                    )
+                )
+    return placements
 
 
 class ShardedV1Reader:
@@ -81,11 +197,18 @@ class ShardedV1Reader:
         store: str | PathLike[str] | MutableMapping[str, bytes],
         *,
         max_cached_indices: int = 4096,
-        max_cached_chunks: int = 2048,
+        max_cached_chunks: int | None = None,
     ) -> None:
         self.store = store
         self.max_cached_indices = max_cached_indices
-        self.max_cached_chunks = max_cached_chunks
+        # Live value comes from API_READER_MAX_CACHED_CHUNKS; see that setting for
+        # the measured basis. Resolved per instance so tests and deployments can
+        # override it without rebuilding the class default.
+        self.max_cached_chunks = (
+            int(settings.API_READER_MAX_CACHED_CHUNKS)
+            if max_cached_chunks is None
+            else max_cached_chunks
+        )
         self._compressor = Zstd(level=5)
         self._index_cache: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
         self._chunk_cache: OrderedDict[str, np.ndarray[Any, Any]] = OrderedDict()
@@ -103,7 +226,11 @@ class ShardedV1Reader:
                         key=settings.MINIO_ACCESS_KEY,
                         secret=settings.MINIO_SECRET_KEY,
                         client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
-                        config_kwargs={"max_pool_connections": 64},
+                        config_kwargs={
+                            "max_pool_connections": int(
+                                settings.API_S3_MAX_POOL_CONNECTIONS
+                            )
+                        },
                         use_listings_cache=False,
                     )
             return self._fs, rest
@@ -381,47 +508,58 @@ class ShardedV1Reader:
         generation: str | None = None,
         is_mean: bool = False,
     ) -> np.ndarray[Any, Any]:
-        """Read a bounded rectangular spatial window [lat_min..lat_max, lon_min..lon_max] (inclusive)."""
+        """Read a bounded rectangular spatial window [lat_min..lat_max, lon_min..lon_max] (inclusive).
+
+        A window typically overlaps 2-4 chunks (and the entire 8x15 chunk grid
+        at low zoom). Those chunk Range GETs are mutually independent, so they
+        are fetched concurrently on a shared bounded executor instead of one
+        blocking round trip at a time, collapsing the fetch latency from
+        ``N x RTT`` to roughly ``1 x RTT``.
+
+        Equivalence with the previous strictly sequential implementation is
+        preserved: the chunk geometry, the NaN fill for absent chunks, and the
+        destination region of every chunk are unchanged, and distinct chunks own
+        disjoint destination slices. Results are written back in the calling
+        thread, so the window array is never mutated concurrently.
+        """
         lat_len = lat_max - lat_min + 1
         lon_len = lon_max - lon_min + 1
         window = np.full((lat_len, lon_len), np.nan, dtype=np.float32)
 
-        r_start = lat_min // 100
-        r_end = lat_max // 100
-        c_start = lon_min // 100
-        c_end = lon_max // 100
+        placements = _chunk_placements(lat_min, lat_max, lon_min, lon_max)
+        if not placements:
+            return window
 
-        for r_chunk in range(r_start, r_end + 1):
-            chunk_lat_start = r_chunk * 100
-            chunk_lat_end = min((r_chunk + 1) * 100, 721)
+        def _fetch(
+            placement: _ChunkPlacement,
+        ) -> tuple[_ChunkPlacement, np.ndarray[Any, Any]]:
+            arr = self.read_chunk(
+                variable,
+                member=member,
+                lead_time_hours=lead_time_hours,
+                chunk_row=placement.chunk_row,
+                chunk_col=placement.chunk_col,
+                generation=generation,
+                is_mean=is_mean,
+            )
+            return placement, arr
 
-            sub_lat_start = max(0, lat_min - chunk_lat_start)
-            sub_lat_end = min(chunk_lat_end - chunk_lat_start, lat_max - chunk_lat_start + 1)
-            win_lat_start = max(0, chunk_lat_start - lat_min)
-            win_lat_end = win_lat_start + (sub_lat_end - sub_lat_start)
+        if len(placements) == 1:
+            # Single-chunk windows are the common high-zoom case: read inline
+            # rather than handing one item to another thread.
+            placement, arr = _fetch(placements[0])
+            window[placement.dst_rows, placement.dst_cols] = arr[
+                placement.src_rows, placement.src_cols
+            ]
+            return window
 
-            for c_chunk in range(c_start, c_end + 1):
-                chunk_lon_start = c_chunk * 100
-                chunk_lon_end = min((c_chunk + 1) * 100, 1440)
-
-                sub_lon_start = max(0, lon_min - chunk_lon_start)
-                sub_lon_end = min(chunk_lon_end - chunk_lon_start, lon_max - chunk_lon_start + 1)
-                win_lon_start = max(0, chunk_lon_start - lon_min)
-                win_lon_end = win_lon_start + (sub_lon_end - sub_lon_start)
-
-                if sub_lat_end > sub_lat_start and sub_lon_end > sub_lon_start:
-                    chunk_arr = self.read_chunk(
-                        variable,
-                        member=member,
-                        lead_time_hours=lead_time_hours,
-                        chunk_row=r_chunk,
-                        chunk_col=c_chunk,
-                        generation=generation,
-                        is_mean=is_mean,
-                    )
-                    window[win_lat_start:win_lat_end, win_lon_start:win_lon_end] = chunk_arr[
-                        sub_lat_start:sub_lat_end, sub_lon_start:sub_lon_end
-                    ]
+        # ``map`` yields results in submission order and re-raises a worker
+        # exception to the caller, so a failed chunk fetch fails the request
+        # instead of silently degrading the tile to NaN.
+        for placement, arr in get_chunk_executor().map(_fetch, placements):
+            window[placement.dst_rows, placement.dst_cols] = arr[
+                placement.src_rows, placement.src_cols
+            ]
 
         return window
 
@@ -466,20 +604,51 @@ class ShardedV1Reader:
             return np.where(valid_cells, mean_vals, np.nan).astype(np.float32)
 
 
-_readers: dict[str, ShardedV1Reader] = {}
+#: Maximum number of cached :class:`ShardedV1Reader` instances per process.
+#:
+#: Each reader owns its own ``s3fs`` client plus a bounded index cache (~8 MB at
+#: 4096 entries) and a bounded chunk cache (~82 MB at 2048 chunks of 100x100
+#: float32), so caching one reader per store path *forever* lets resident memory
+#: grow with the number of stores the process has ever served — and that grows by
+#: one per ingested cycle, while a deleted store's entry is never reclaimed. On
+#: the deployed host (8 live store paths, 4 uvicorn workers, a 4 GiB container
+#: limit) an unbounded map is the dominant memory consumer, so the cache is now
+#: an LRU sized to the live serving working set: a handful of cycles across the
+#: two models. Evicting an entry only discards warm caches; any in-flight reader
+#: keeps working because the caller already holds a reference.
+MAX_READERS: int = 8
+_readers: OrderedDict[str, ShardedV1Reader] = OrderedDict()
 _readers_lock = threading.Lock()
 
 
 def get_sharded_reader(
     store: str | PathLike[str] | MutableMapping[str, bytes],
 ) -> ShardedV1Reader:
-    """Return a process-cached ShardedV1Reader for the store path."""
+    """Return a process-cached ShardedV1Reader for the store path.
+
+    The cache is a bounded LRU (``MAX_READERS``) rather than an unbounded map:
+    see the note on ``MAX_READERS`` for why the difference matters on the
+    deployed host.
+    """
     path = os.fspath(store) if isinstance(store, (str, PathLike)) else id(store)
     path_key = str(path)
     with _readers_lock:
-        if path_key not in _readers:
-            _readers[path_key] = ShardedV1Reader(store)
-        return _readers[path_key]
+        reader = _readers.get(path_key)
+        if reader is not None:
+            _readers.move_to_end(path_key)
+            return reader
+
+        reader = ShardedV1Reader(store)
+        _readers[path_key] = reader
+        while len(_readers) > MAX_READERS:
+            _readers.popitem(last=False)
+        return reader
+
+
+def clear_sharded_readers() -> None:
+    """Drop every cached reader (tests and teardown)."""
+    with _readers_lock:
+        _readers.clear()
 
 
 def _resolve_store(

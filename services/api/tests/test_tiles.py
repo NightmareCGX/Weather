@@ -441,7 +441,7 @@ def test_gfs_west_of_0_seam_not_transparent():
     for z, x in [(4, 7), (8, 127)]:
         y = 2 ** (z - 1)
         win = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=z, x=x, y=y)
-        png = _render_window_to_png(win, variable="temperature_2m", zoom=z, x=x, y=y, cache_key=())
+        png = _render_window_to_png(win, variable="temperature_2m", cache_key=())
         rgba = _extract_rgba(png)
         # All columns at the seam must be 100% opaque (alpha == 255)
         assert np.all(rgba[:, -5:, 3] == 255), f"GFS z={z} x={x} right seam contains transparent pixels"
@@ -465,7 +465,7 @@ def test_gefs_west_of_0_seam_not_transparent():
     for z, x in [(4, 7), (8, 127)]:
         y = 2 ** (z - 1)
         win = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=z, x=x, y=y)
-        png = _render_window_to_png(win, variable="temperature_2m", zoom=z, x=x, y=y, cache_key=())
+        png = _render_window_to_png(win, variable="temperature_2m", cache_key=())
         rgba = _extract_rgba(png)
         assert np.all(rgba[:, -5:, 3] == 255), f"GEFS z={z} x={x} right seam contains transparent pixels"
 
@@ -513,7 +513,7 @@ def test_east_side_of_0_continuous():
     )
 
     win = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=4, x=8, y=8)
-    png = _render_window_to_png(win, variable="temperature_2m", zoom=4, x=8, y=8, cache_key=())
+    png = _render_window_to_png(win, variable="temperature_2m", cache_key=())
     rgba = _extract_rgba(png)
     assert np.all(rgba[:, :5, 3] == 255)
     assert win.field[0, 0] == 10.0
@@ -536,7 +536,7 @@ def test_plus_minus_180_interior_regression():
 
     win_180 = _select_tile_window(ds, variable="temperature_2m", lead=0, zoom=4, x=0, y=8)
     assert win_180.lon_axis[-1] <= win_180.grid.lon_end
-    png = _render_window_to_png(win_180, variable="temperature_2m", zoom=4, x=0, y=8, cache_key=())
+    png = _render_window_to_png(win_180, variable="temperature_2m", cache_key=())
     rgba = _extract_rgba(png)
     assert np.all(rgba[:, :, 3] == 255)
 
