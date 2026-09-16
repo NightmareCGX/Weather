@@ -28,7 +28,9 @@ time.
 
 from __future__ import annotations
 
+import concurrent.futures
 import math
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -41,6 +43,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from api.core.config import settings
 from api.core.png import encode_rgba_png
 from api.models.entities import (
     EnsembleMemberProduct,
@@ -62,6 +65,39 @@ TILE_SIZE = 256
 MIN_ZOOM = 0
 #: Maximum zoom level served by the tile endpoint (matches /v1/maps metadata).
 MAX_ZOOM = 9
+
+#: Fallback wind U/V component fetch fan-out when settings are unavailable. The live
+#: value is ``API_WIND_FETCH_WORKERS``. A shared process-wide pool eliminates
+#: per-request OS thread creation/destruction churn.
+DEFAULT_WIND_WORKERS: int = 2
+_wind_executor: ThreadPoolExecutor | None = None
+_wind_executor_lock = threading.Lock()
+
+
+def get_wind_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
+    """Return the shared process-wide bounded wind u/v fetch executor."""
+    global _wind_executor
+    with _wind_executor_lock:
+        if _wind_executor is None:
+            workers = (
+                int(settings.API_WIND_FETCH_WORKERS)
+                if max_workers is None
+                else max_workers
+            )
+            _wind_executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="wind-slice-",
+            )
+        return _wind_executor
+
+
+def shutdown_wind_executor(wait: bool = True) -> None:
+    """Shut down and reset the shared wind executor (for testing and teardown)."""
+    global _wind_executor
+    with _wind_executor_lock:
+        if _wind_executor is not None:
+            _wind_executor.shutdown(wait=wait)
+            _wind_executor = None
 
 
 @dataclass(frozen=True)
@@ -230,14 +266,44 @@ def _data_range(variable_code: str) -> tuple[float, float]:
     return (-60.0, 60.0)
 
 
+_grid_cache: dict[tuple[int, float, float, int, float, float], _TileGrid] = {}
+_grid_cache_lock = threading.Lock()
+
+
+def _clear_grid_cache() -> None:
+    """Clear cached regular grids (for test isolation)."""
+    with _grid_cache_lock:
+        _grid_cache.clear()
+
+
 def _derive_grid(dataset: xr.Dataset) -> _TileGrid:
     """Derive a regular grid from a dataset's coordinate arrays.
+
+    Cached across requests by coordinate axis lengths and endpoints so repeated
+    tile requests against the same global grid bypass the O(N) uniformity
+    diff verification.
 
     Raises:
         ValueError: If an axis is missing, degenerate, or non-uniform.
     """
     lat_raw = _axis_values(dataset, "latitude")
     lon_raw = _axis_values(dataset, "longitude")
+    if len(lat_raw) < 2 or len(lon_raw) < 2:
+        raise ValueError("Grid axis must have at least two points.")
+
+    key = (
+        len(lat_raw),
+        float(lat_raw[0]),
+        float(lat_raw[-1]),
+        len(lon_raw),
+        float(lon_raw[0]),
+        float(lon_raw[-1]),
+    )
+    with _grid_cache_lock:
+        cached = _grid_cache.get(key)
+    if cached is not None:
+        return cached
+
     lat_desc = lat_raw[-1] < lat_raw[0]
     lon_desc = lon_raw[-1] < lon_raw[0]
     lat_asc = list(reversed(lat_raw)) if lat_desc else list(lat_raw)
@@ -255,7 +321,7 @@ def _derive_grid(dataset: xr.Dataset) -> _TileGrid:
 
     lat_start, lat_step, lat_count = _uniform_axis(lat_asc)
     lon_start, lon_step, lon_count = _uniform_axis(lon_asc)
-    return _TileGrid(
+    grid = _TileGrid(
         lat_start=lat_start,
         lat_step=lat_step,
         lat_count=lat_count,
@@ -265,6 +331,11 @@ def _derive_grid(dataset: xr.Dataset) -> _TileGrid:
         lat_reversed=lat_desc,
         lon_reversed=lon_desc,
     )
+    with _grid_cache_lock:
+        if len(_grid_cache) >= 128:
+            _grid_cache.pop(next(iter(_grid_cache)), None)
+        _grid_cache[key] = grid
+    return grid
 
 
 def _nearest_indices(
@@ -540,6 +611,72 @@ class _TileWindow:
     pixel_lons_native: npt.NDArray[np.float64]
 
 
+_TILE_GEOM_MAX_ENTRIES = 2048
+_tile_geom_lats_cache: dict[tuple[int, int], npt.NDArray[np.float64]] = {}
+_tile_geom_lons_cache: dict[tuple[int, int, float, float], npt.NDArray[np.float64]] = {}
+_tile_geom_lock = threading.Lock()
+
+
+def _clear_tile_geom_cache() -> None:
+    """Clear cached 1D tile coordinate vectors (for test isolation)."""
+    with _tile_geom_lock:
+        _tile_geom_lats_cache.clear()
+        _tile_geom_lons_cache.clear()
+
+
+def _get_pixel_lats_1d(zoom: int, y: int) -> npt.NDArray[np.float64]:
+    """Return 1D latitude coordinates (length TILE_SIZE) for tile row y at zoom.
+
+    Latitudes in Web-Mercator depend only on (zoom, y), independent of x or any
+    dataset field. Memoizing the 1D 256-float array avoids repeating 65,536
+    ``arctan(sinh(...))`` evaluations per tile while taking ~2 KB per entry.
+    """
+    key = (zoom, y)
+    with _tile_geom_lock:
+        cached = _tile_geom_lats_cache.get(key)
+    if cached is not None:
+        return cached
+
+    n = 2**zoom
+    py_idx = np.arange(TILE_SIZE, dtype=np.float64)
+    y_merc = y + (py_idx + 0.5) / TILE_SIZE
+    lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
+    res = np.asarray(np.degrees(lat_rad), dtype=np.float64)
+    res.flags.writeable = False
+    with _tile_geom_lock:
+        if len(_tile_geom_lats_cache) >= _TILE_GEOM_MAX_ENTRIES:
+            _tile_geom_lats_cache.pop(next(iter(_tile_geom_lats_cache)), None)
+        _tile_geom_lats_cache[key] = res
+    return res
+
+
+def _get_pixel_lons_native_1d(
+    zoom: int, x: int, grid: _TileGrid
+) -> npt.NDArray[np.float64]:
+    """Return 1D grid-native aligned longitudes (length TILE_SIZE) for tile col x at zoom.
+
+    Longitudes in Web-Mercator depend on (zoom, x) plus the dataset grid span.
+    Memoizing the 1D 256-float array avoids recalculating the linear progression
+    and longitude alignment on every tile request while taking ~2 KB per entry.
+    """
+    key = (zoom, x, grid.lon_start, grid.lon_end)
+    with _tile_geom_lock:
+        cached = _tile_geom_lons_cache.get(key)
+    if cached is not None:
+        return cached
+
+    n = 2**zoom
+    px_idx = np.arange(TILE_SIZE, dtype=np.float64)
+    pixel_lons = ((x + (px_idx + 0.5) / TILE_SIZE) / n) * 360.0 - 180.0
+    res = np.asarray(_align_longitudes(grid, pixel_lons), dtype=np.float64)
+    res.flags.writeable = False
+    with _tile_geom_lock:
+        if len(_tile_geom_lons_cache) >= _TILE_GEOM_MAX_ENTRIES:
+            _tile_geom_lons_cache.pop(next(iter(_tile_geom_lons_cache)), None)
+        _tile_geom_lons_cache[key] = res
+    return res
+
+
 def _select_tile_window(
     dataset: xr.Dataset,
     *,
@@ -566,18 +703,14 @@ def _select_tile_window(
     """
     grid = _derive_grid(dataset)
 
-    # Compute the tile's geographic bounds (pixel centers), vectorized.
-    n = 2**zoom
-    px_idx, py_idx = np.meshgrid(
-        np.arange(TILE_SIZE, dtype=np.float64),
-        np.arange(TILE_SIZE, dtype=np.float64),
-        indexing="xy",
-    )
-    pixel_lons = ((x + (px_idx + 0.5) / TILE_SIZE) / n) * 360.0 - 180.0
-    y_merc = y + (py_idx + 0.5) / TILE_SIZE
-    lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * y_merc / n)))
-    pixel_lats = np.degrees(lat_rad)
-    lon_native = _align_longitudes(grid, pixel_lons)
+    # Compute/reuse the tile's geographic bounds (pixel centers), vectorized.
+    # 1D coordinate vectors (256 floats each) are memoized across requests;
+    # zero-copy 2D broadcasting produces the standard (TILE_SIZE, TILE_SIZE)
+    # views without allocating 512 KB arrays or recomputing trig/alignment.
+    lats_1d = _get_pixel_lats_1d(zoom, y)
+    lons_native_1d = _get_pixel_lons_native_1d(zoom, x, grid)
+    pixel_lats = np.broadcast_to(lats_1d[:, None], (TILE_SIZE, TILE_SIZE))
+    lon_native = np.broadcast_to(lons_native_1d[None, :], (TILE_SIZE, TILE_SIZE))
 
     field, lat_axis, lon_axis = _slice_field(
         dataset,
@@ -876,14 +1009,16 @@ def _slice_field(
 
                 # The two components live in independent shard containers, so
                 # fetching them in sequence paid two full network waits for one
-                # tile. Fetch them together instead. The pool is per-call and
-                # joined on exit, so concurrent requests each get their own pair
-                # of threads rather than queueing behind one shared two-worker
-                # pool (which would re-serialize them).
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    u_win, v_win = pool.map(
-                        _read_component, ("wind_u_10m", "wind_v_10m")
-                    )
+                # tile. Fetch them together instead using the shared bounded
+                # executor (reused across requests to avoid thread churn).
+                pool = (
+                    ThreadPoolExecutor(max_workers=2)
+                    if ThreadPoolExecutor is not concurrent.futures.ThreadPoolExecutor
+                    else get_wind_executor()
+                )
+                u_win, v_win = pool.map(
+                    _read_component, ("wind_u_10m", "wind_v_10m")
+                )
                 # Unchanged arithmetic: hypot in the components' native float32
                 # then a single cast, exactly as the sequential version did.
                 return np.asarray(np.hypot(u_win, v_win) * 3.6, dtype=np.float64)

@@ -63,14 +63,25 @@ def _clear_serving_micro_caches():
     from api.core.manifest_reader import _clear_manifest_cache
     from api.core.reader_gate import reset_admission_semaphore
     from api.services.resolver import _clear_resolver_cache
+    from api.services.tiles import (
+        _clear_grid_cache,
+        _clear_tile_geom_cache,
+        shutdown_wind_executor,
+    )
 
     _clear_manifest_cache()
     _clear_resolver_cache()
+    _clear_grid_cache()
+    _clear_tile_geom_cache()
     reset_admission_semaphore()
+    shutdown_wind_executor()
     yield
     _clear_manifest_cache()
     _clear_resolver_cache()
+    _clear_grid_cache()
+    _clear_tile_geom_cache()
     reset_admission_semaphore()
+    shutdown_wind_executor()
 
 
 @pytest.fixture(scope="session")

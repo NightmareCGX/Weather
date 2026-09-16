@@ -30,6 +30,7 @@ from api.routers.points import router as points_router
 from api.routers.probabilities import router as probabilities_router
 from api.routers.search import router as search_router
 from api.routers.verifications import router as verifications_router
+from api.services.tiles import shutdown_wind_executor
 
 #: Application title reported in the OpenAPI schema.
 APP_TITLE = "Global Probabilistic Weather Forecasting Platform API"
@@ -87,6 +88,7 @@ def create_app() -> FastAPI:
             reader_pool.dispose()
             shutdown_member_executor()
             shutdown_chunk_executor()
+            shutdown_wind_executor()
 
     app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
     app.add_middleware(RequestIDMiddleware)

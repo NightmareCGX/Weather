@@ -176,6 +176,14 @@ class Settings(BaseSettings):
     # host. Raise only if this runs on a box with more dedicated cores.
     API_MEMBER_FETCH_WORKERS: int = Field(default=4, ge=1, le=32)
 
+    # Wind U/V component fetch fan-out, per API process.
+    #
+    # Synthesized wind raster tiles (wind_10m / wind_speed_10m) read independent
+    # wind_u_10m and wind_v_10m shard components. A shared process-wide pool avoids
+    # per-request OS thread creation/destruction churn while bounding concurrent
+    # thread allocation on 4-core hosts.
+    API_WIND_FETCH_WORKERS: int = Field(default=2, ge=1, le=16)
+
     # Elevation resolution for dynamic coordinates (UI metadata only).
     # ``none`` (default): elevation always unavailable (safe offline default).
     # ``open_meteo``: Open-Meteo Elevation API (Copernicus GLO-90 DEM).
