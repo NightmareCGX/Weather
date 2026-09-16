@@ -219,7 +219,11 @@ class ShardedV1Reader:
                         key=settings.MINIO_ACCESS_KEY,
                         secret=settings.MINIO_SECRET_KEY,
                         client_kwargs={"endpoint_url": f"{scheme}://{settings.MINIO_ENDPOINT}"},
-                        config_kwargs={"max_pool_connections": 64},
+                        config_kwargs={
+                            "max_pool_connections": int(
+                                settings.API_S3_MAX_POOL_CONNECTIONS
+                            )
+                        },
                         use_listings_cache=False,
                     )
             return self._fs, rest
@@ -593,20 +597,51 @@ class ShardedV1Reader:
             return np.where(valid_cells, mean_vals, np.nan).astype(np.float32)
 
 
-_readers: dict[str, ShardedV1Reader] = {}
+#: Maximum number of cached :class:`ShardedV1Reader` instances per process.
+#:
+#: Each reader owns its own ``s3fs`` client plus a bounded index cache (~8 MB at
+#: 4096 entries) and a bounded chunk cache (~82 MB at 2048 chunks of 100x100
+#: float32), so caching one reader per store path *forever* lets resident memory
+#: grow with the number of stores the process has ever served — and that grows by
+#: one per ingested cycle, while a deleted store's entry is never reclaimed. On
+#: the deployed host (8 live store paths, 4 uvicorn workers, a 4 GiB container
+#: limit) an unbounded map is the dominant memory consumer, so the cache is now
+#: an LRU sized to the live serving working set: a handful of cycles across the
+#: two models. Evicting an entry only discards warm caches; any in-flight reader
+#: keeps working because the caller already holds a reference.
+MAX_READERS: int = 8
+_readers: OrderedDict[str, ShardedV1Reader] = OrderedDict()
 _readers_lock = threading.Lock()
 
 
 def get_sharded_reader(
     store: str | PathLike[str] | MutableMapping[str, bytes],
 ) -> ShardedV1Reader:
-    """Return a process-cached ShardedV1Reader for the store path."""
+    """Return a process-cached ShardedV1Reader for the store path.
+
+    The cache is a bounded LRU (``MAX_READERS``) rather than an unbounded map:
+    see the note on ``MAX_READERS`` for why the difference matters on the
+    deployed host.
+    """
     path = os.fspath(store) if isinstance(store, (str, PathLike)) else id(store)
     path_key = str(path)
     with _readers_lock:
-        if path_key not in _readers:
-            _readers[path_key] = ShardedV1Reader(store)
-        return _readers[path_key]
+        reader = _readers.get(path_key)
+        if reader is not None:
+            _readers.move_to_end(path_key)
+            return reader
+
+        reader = ShardedV1Reader(store)
+        _readers[path_key] = reader
+        while len(_readers) > MAX_READERS:
+            _readers.popitem(last=False)
+        return reader
+
+
+def clear_sharded_readers() -> None:
+    """Drop every cached reader (tests and teardown)."""
+    with _readers_lock:
+        _readers.clear()
 
 
 def _resolve_store(

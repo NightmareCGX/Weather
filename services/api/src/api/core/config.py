@@ -110,12 +110,24 @@ class Settings(BaseSettings):
     # Reader-gate configuration (Zarr region-write concurrency).
     # The API serving tier participates in the SHARED store gate when reading
     # forecast Zarr stores so it never observes a store mid-re-ingest.
+    #
+    # API_MAX_CONCURRENT_GATED_READS bounds concurrent gated reads per process. It
+    # is enforced by an admission semaphore in api.core.reader_gate; before that
+    # existed the setting was declared and set in production but read by nothing,
+    # so the only real limit was the reader-lock pool's connection count.
     API_MAX_CONCURRENT_GATED_READS: Any = 16
     API_READER_LOCK_POOL_SIZE: Any = 16
     API_READER_LOCK_MAX_OVERFLOW: Any = 8
     API_READER_LOCK_POOL_TIMEOUT_SECONDS: Any = 5.0
     API_READER_GATE_TIMEOUT_SECONDS: Any = 30.0
     API_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: Any = 40.0
+
+    # ``max_pool_connections`` for each reader's s3fs client. One client is built
+    # per cached ShardedV1Reader (see MAX_READERS in api.core.zarr), so this
+    # multiplies across readers and must stay modest; the previous hardcoded 64
+    # was far more than the fetch fan-out can use. Note the ingestion-only
+    # S3_MAX_POOL_CONNECTIONS setting does not apply to the API.
+    API_S3_MAX_POOL_CONNECTIONS: int = Field(default=16, ge=1, le=256)
 
     # Map-tile PNG (IDAT) zlib compression level, constrained to the zlib range.
     # Level 1 is the serving default: on a 256x256 RGBA tile it compresses

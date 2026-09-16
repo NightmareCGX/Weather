@@ -344,6 +344,38 @@ def gated_read_dataset_with_selector(
         raise FileNotFoundError(f"run {store_path!r} is not a ready, readable run")
 
 
+_admission_semaphore: threading.BoundedSemaphore | None = None
+_admission_lock = threading.Lock()
+
+
+def _get_admission_semaphore() -> threading.BoundedSemaphore:
+    """Return the process-wide admission limiter for gated reads.
+
+    ``API_MAX_CONCURRENT_GATED_READS`` has always been documented — and is set in
+    production — as the bound on concurrent gated Zarr reads, but until now no
+    code read it. The only real limit was the reader-lock pool's connection count,
+    which exists to bound *database* connections and surfaces exhaustion as a pool
+    timeout rather than as queueing. This makes the documented limit real, so a
+    viewport burst queues briefly instead of over-subscribing a small host.
+    """
+    from api.core.config import settings
+
+    global _admission_semaphore
+    with _admission_lock:
+        if _admission_semaphore is None:
+            _admission_semaphore = threading.BoundedSemaphore(
+                max(1, int(settings.API_MAX_CONCURRENT_GATED_READS))
+            )
+        return _admission_semaphore
+
+
+def reset_admission_semaphore() -> None:
+    """Drop the admission limiter so the next call rebuilds it (tests)."""
+    global _admission_semaphore
+    with _admission_lock:
+        _admission_semaphore = None
+
+
 def gated_read(
     pool: ReaderLockPool,
     lifecycle: ReaderGateLifecycle,
@@ -354,6 +386,10 @@ def gated_read(
     timeout_seconds: float = 30.0,
 ) -> T:
     """Run a fully materialized forecast read under the SHARED store gate.
+
+    Admission is bounded by ``API_MAX_CONCURRENT_GATED_READS`` before any gate or
+    pool resource is taken, so excess concurrency waits instead of consuming a
+    reader-lock connection.
 
     Args:
         pool: The reader-lock Connection pool.
@@ -369,20 +405,34 @@ def gated_read(
         The fully materialized result.
 
     Raises:
-        ReaderGateTimeout: If the gate/pool checkout exceeds the deadline.
+        ReaderGateTimeout: If admission, the gate, or the pool checkout exceeds
+            the deadline.
     """
-    lifecycle.enter()
+    from api.core.config import settings
+
+    deadline = time.monotonic() + timeout_seconds
+    semaphore = _get_admission_semaphore()
+    if not semaphore.acquire(timeout=max(0.001, deadline - time.monotonic())):
+        raise ReaderGateTimeout(
+            f"reader admission limit of "
+            f"{int(settings.API_MAX_CONCURRENT_GATED_READS)} concurrent gated "
+            f"reads was not available within {timeout_seconds}s"
+        )
     try:
-        session = _ReaderGateSession(pool, store_path)
-        session.acquire(timeout_seconds)
+        lifecycle.enter()
         try:
-            ok, path = session.revalidate(revalidate_db_url)
-            if not ok:
-                raise FileNotFoundError(
-                    f"run {store_path!r} is not a ready, readable run"
-                )
-            return materialize()
+            session = _ReaderGateSession(pool, store_path)
+            session.acquire(max(0.001, deadline - time.monotonic()))
+            try:
+                ok, path = session.revalidate(revalidate_db_url)
+                if not ok:
+                    raise FileNotFoundError(
+                        f"run {store_path!r} is not a ready, readable run"
+                    )
+                return materialize()
+            finally:
+                session.release()
         finally:
-            session.release()
+            lifecycle.exit()
     finally:
-        lifecycle.exit()
+        semaphore.release()
