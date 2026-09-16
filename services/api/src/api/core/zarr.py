@@ -36,8 +36,8 @@ INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
 TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
 
 #: Fallback member-read fan-out when settings are unavailable. The live value is
-#: ``API_MEMBER_FETCH_WORKERS``; see that setting for the sizing rationale.
-DEFAULT_MEMBER_WORKERS: int = 16
+#: ``API_MEMBER_FETCH_WORKERS``; see that setting for the measured sizing basis.
+DEFAULT_MEMBER_WORKERS: int = 4
 _member_executor: ThreadPoolExecutor | None = None
 _member_executor_lock = threading.Lock()
 
@@ -45,11 +45,11 @@ _member_executor_lock = threading.Lock()
 def get_member_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
     """Return the shared process-wide bounded member executor.
 
-    A single GEFS point read fans out over up to 30 ensemble members, so this
-    pool is larger than the chunk-fetch pool — but it is still bounded per
-    process, because the production host is a small shared machine and member
-    reads must not monopolize it or flood the object store. Bounding it also
-    avoids per-request thread churn.
+    A single GEFS point read fans out over up to 30 members, so a pool is worth
+    having — but the measured win saturates by four workers on the deployed
+    4-core topology (see ``API_MEMBER_FETCH_WORKERS``), so the default is small
+    rather than sized for the member count. That keeps thread and memory pressure
+    off a host that is already tight, and avoids per-request thread churn.
     """
     global _member_executor
     with _member_executor_lock:
@@ -76,9 +76,10 @@ def shutdown_member_executor(wait: bool = True) -> None:
 
 
 #: Fallback shard-chunk fetch fan-out when settings are unavailable. The live
-#: value is ``API_CHUNK_FETCH_WORKERS``; see that setting for the sizing
-#: rationale (it is deliberately small, not a worst-case 8x15 chunk grid).
-DEFAULT_CHUNK_WORKERS: int = 4
+#: value is ``API_CHUNK_FETCH_WORKERS``; see that setting for the measured
+#: sizing basis (the win saturates at two workers, well below the worst-case
+#: 8x15 chunk grid).
+DEFAULT_CHUNK_WORKERS: int = 2
 _chunk_executor: ThreadPoolExecutor | None = None
 _chunk_executor_lock = threading.Lock()
 
@@ -86,13 +87,13 @@ _chunk_executor_lock = threading.Lock()
 def get_chunk_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
     """Return the shared process-wide bounded shard-chunk fetch executor.
 
-    The pool exists to overlap the Range GETs of *one* tile window, so it only
-    needs to cover that window's chunk span — one chunk at the zoom levels the
-    map actually uses, and at most 2-8 when zoomed out. It is deliberately kept
-    small rather than sized for the worst case (a fully zoomed-out tile spans the
-    whole 8x15 chunk grid) because every fetched chunk also costs CPU to
-    zstd-decode, and production serves four uvicorn workers on a four-core host
-    shared with the rest of the stack.
+    The pool exists to overlap the Range GETs of *one* tile window. Benchmarked
+    against a same-host MinIO over s3fs on a 4-CPU budget, the win saturates at
+    two workers (a chunk fetch is dominated by s3fs/Python overhead plus zstd
+    decode, not wide-area RTT), and larger pools are measurably slower. It is
+    therefore sized for that saturation point rather than for the worst-case 8x15
+    chunk grid. In normal use it is not engaged at all: a tile spans one chunk at
+    z>=4, which is the range the map actually uses.
 
     Deliberately separate from the member executor so that a window read can
     never nest inside its own pool (which could exhaust it and deadlock), and

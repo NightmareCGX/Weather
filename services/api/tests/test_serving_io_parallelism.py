@@ -559,18 +559,17 @@ def test_tile_window_carries_pixel_geometry(tmp_path: Path) -> None:
 
 
 def test_chunk_fetch_fanout_comes_from_settings(monkeypatch) -> None:
-    """The chunk pool is sized from settings, with a small host-aware default.
+    """The chunk pool is sized from settings, with a small measured default.
 
-    The deployed host runs four uvicorn workers on a 4-core ARM64 box shared with
-    Postgres/Redis/MinIO/ingestion, and every fetched chunk also costs CPU to
-    zstd-decode. A default sized for the worst case (a fully zoomed-out tile
-    spans the whole 8x15 chunk grid) would put dozens of decoding threads on four
-    cores, so the default must stay small and the value must be tunable per
-    deployment without a code change.
+    Benchmarked against a same-host MinIO on a 4-CPU budget, the win from fanning
+    out chunk fetches saturates at two workers and larger pools are slower. The
+    deployed host also runs four uvicorn workers on 4 shared cores with the API
+    container near its memory limit, so the default must stay small and must be
+    tunable per deployment without a code change.
     """
     from api.core.config import settings
 
-    assert settings.API_CHUNK_FETCH_WORKERS == 4
+    assert settings.API_CHUNK_FETCH_WORKERS == 2
 
     zarr_mod.shutdown_chunk_executor()
     try:
@@ -581,14 +580,19 @@ def test_chunk_fetch_fanout_comes_from_settings(monkeypatch) -> None:
         monkeypatch.undo()
 
     # Restored default applies to the next process-wide pool.
-    assert zarr_mod.get_chunk_executor()._max_workers == 4
+    assert zarr_mod.get_chunk_executor()._max_workers == 2
 
 
 def test_member_fetch_fanout_comes_from_settings(monkeypatch) -> None:
-    """The member pool is likewise settings-driven and bounded."""
+    """The member pool is likewise settings-driven and bounded.
+
+    A 30-member read gains ~1.7x from parallelism, but the measured optimum on
+    the deployed 4-core topology is 4 workers; 16 and 30 were both slower while
+    holding far more threads.
+    """
     from api.core.config import settings
 
-    assert settings.API_MEMBER_FETCH_WORKERS == 16
+    assert settings.API_MEMBER_FETCH_WORKERS == 4
 
     zarr_mod.shutdown_member_executor()
     try:
@@ -598,4 +602,4 @@ def test_member_fetch_fanout_comes_from_settings(monkeypatch) -> None:
         zarr_mod.shutdown_member_executor()
         monkeypatch.undo()
 
-    assert zarr_mod.get_member_executor()._max_workers == 16
+    assert zarr_mod.get_member_executor()._max_workers == 4

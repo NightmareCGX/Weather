@@ -128,25 +128,30 @@ class Settings(BaseSettings):
 
     # Shard chunk-fetch fan-out, per API process.
     #
-    # Sized for the deployed host rather than for the worst case: production runs
-    # ``UVICORN_WORKERS=4`` on a 4-core ARM64 box shared with ~10 containers
-    # (Postgres, Redis, MinIO, three ingestion workers, gateway, frontend), so a
-    # value of N means up to 4*N fetch threads fleet-wide, each of which also
-    # needs CPU to zstd-decode its chunk.
+    # Sized by measurement on the deployed topology, not by the worst case.
+    # Production runs ``UVICORN_WORKERS=4`` on a 4-core ARM64 box shared with ~10
+    # containers, so a value of N means up to 4*N fetch threads fleet-wide, and the
+    # API container already sits at ~93% of its 4 GiB memory limit.
     #
-    # The fan-out only has to cover the chunk span of one tile, which is 1 chunk
-    # at z>=4 — the range the map actually uses (it opens at z=5 and moves to
-    # 6.5-8) — and 2-8 chunks at z=2-3. Four workers therefore already collapse
-    # the common case to a single round trip; raising it only helps the rare
-    # fully-zoomed-out view while adding contention.
-    API_CHUNK_FETCH_WORKERS: int = Field(default=4, ge=1, le=32)
+    # Benchmarked against a same-host MinIO over s3fs, pinned to 4 CPUs, for a
+    # 12-chunk window (the z=2 case):
+    #     serial 30.5 ms | 2 workers 20.7 ms | 4 -> 22.6 | 8 -> 23.9 | 16 -> 23.6
+    # The gain saturates at 2: a chunk fetch costs ~2.5 ms and is dominated by
+    # s3fs/Python overhead plus zstd decode rather than wide-area RTT, so extra
+    # workers only add contention. Note the pool is not even engaged in normal use
+    # — a tile spans 1 chunk at z>=4, the range the map actually uses (it opens at
+    # z=5 and moves to 6.5-8) — so this only shortens zoomed-out views.
+    API_CHUNK_FETCH_WORKERS: int = Field(default=2, ge=1, le=32)
 
     # Ensemble member-read fan-out, per API process.
     #
-    # Larger than the chunk pool because a single GEFS point read fans out over
-    # up to 30 members, but still bounded for the same host reasons: member reads
-    # must not monopolize a small shared machine or flood the object store.
-    API_MEMBER_FETCH_WORKERS: int = Field(default=16, ge=1, le=32)
+    # A single GEFS point read fans out over up to 30 members. Measured on the same
+    # 4-CPU topology against MinIO, for a 30-member point read:
+    #     serial 110.4 ms | 2 -> 67.9 | 4 -> 66.2 | 8 -> 67.4 | 16 -> 68.2 | 30 -> 70.1
+    # So the parallel win is real (~1.7x) but saturates by 4 workers, and larger
+    # pools are measurably slower while holding far more threads on a small shared
+    # host. Raise only if this runs on a box with more dedicated cores.
+    API_MEMBER_FETCH_WORKERS: int = Field(default=4, ge=1, le=32)
 
     # Elevation resolution for dynamic coordinates (UI metadata only).
     # ``none`` (default): elevation always unavailable (safe offline default).
