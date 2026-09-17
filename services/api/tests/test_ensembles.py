@@ -394,6 +394,29 @@ def test_ensembles_batch_leads(client):
         assert item["statistics"] is not None
 
 
+def test_ensembles_series_lead_order_does_not_leak_into_the_response(client):
+    """A series is computed and returned in ascending lead order, whatever order is asked.
+
+    The cache key was canonicalized with ``sorted(leads)`` while the computation used the
+    client's order, so one lead set listed two ways could share a cache entry and serve an
+    ordering produced for another caller. Ascending order is also what lets a lead
+    divisible by 6 reuse the phase state its lead-3 predecessor already resolved, so it is
+    part of the precipitation path's cost model rather than cosmetic.
+
+    The two requests use different points on purpose: identical requests would share a
+    Redis entry and the second would never exercise the ordering.
+    """
+    out_of_order = client.get(
+        f"/v1/ensembles?lat={LAT + 0.5}&lon={LON + 0.5}"
+        "&variable=temperature_2m&model=gefs&leads=18,6,12"
+    )
+
+    assert out_of_order.status_code == 200
+    leads = [item["lead_time_hours"] for item in out_of_order.json()["data"]]
+    assert leads == sorted(leads)
+    assert leads == [6, 12, 18]
+
+
 def test_require_variable_in_store_rejects_variable_absent_from_the_cycle_store():
     """The store-level guard distinguishes "in the catalog" from "in this cycle"."""
     from fastapi import HTTPException
@@ -485,8 +508,12 @@ def test_ensembles_series_variable_present_in_store_still_succeeds(monkeypatch, 
         ensemble_data, "gated_cycle_metadata", _metadata_with_precip_rate
     )
 
+    # A different point from the companion 404 test on purpose. Both requests share every
+    # cache-key component except the store metadata they monkeypatch, so asking at the
+    # same coordinates would make whichever test ran second read the first one's cached
+    # body out of Redis and never exercise its own store contents.
     resp = client.get(
-        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        f"/v1/ensembles?lat={LAT + 0.25}&lon={LON + 0.25}"
         "&variable=precipitation_rate&model=gefs&leads=6,12"
     )
 

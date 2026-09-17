@@ -91,12 +91,16 @@ def test_sharded_v1_reader_lru_cache(tmp_path: Path) -> None:
     # First fetch: cache miss
     entries1 = reader.get_shard_index(shard_key)
     assert len(entries1) == 120
+    assert entries1.shape == (120, 2)
+    assert entries1.dtype == np.dtype("<u8")
     cache_key = f"{tmp_path}::live::{shard_key}"
     assert cache_key in reader._index_cache
 
-    # Second fetch: cache hit
+    # Second fetch: cache hit. The cached index must be byte-identical, and the hit must
+    # return the cached array itself rather than re-deriving it from the tail bytes.
     entries2 = reader.get_shard_index(shard_key)
-    assert entries2 == entries1
+    assert np.array_equal(entries2, entries1)
+    assert entries2 is entries1
 
 
 def test_sharded_v1_reader_interpolate_point(tmp_path: Path) -> None:

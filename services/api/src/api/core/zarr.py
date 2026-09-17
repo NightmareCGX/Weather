@@ -14,7 +14,6 @@ uses so a store produced by the ingestion worker is readable here.
 from __future__ import annotations
 
 import os
-import struct
 import threading
 from collections import OrderedDict
 from collections.abc import Generator, MutableMapping
@@ -34,6 +33,14 @@ from api.core.config import settings
 SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
 INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
 TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
+
+#: Shard-index dtype/width: each entry is a little-endian (offset, length) uint64 pair.
+SHARD_INDEX_DTYPE: np.dtype[Any] = np.dtype("<u8")
+
+#: Shared empty shard index, returned by every miss so a failed lookup does not
+#: allocate. Marked read-only because callers only ever read from it.
+_EMPTY_SHARD_INDEX: np.ndarray[Any, Any] = np.empty((0, 2), dtype=SHARD_INDEX_DTYPE)
+_EMPTY_SHARD_INDEX.flags.writeable = False
 
 #: Fallback member-read fan-out when settings are unavailable. The live value is
 #: ``API_MEMBER_FETCH_WORKERS``; see that setting for the measured sizing basis.
@@ -123,6 +130,25 @@ def shutdown_chunk_executor(wait: bool = True) -> None:
             _chunk_executor = None
 
 
+def _bilinear(
+    val_00: float,
+    val_01: float,
+    val_10: float,
+    val_11: float,
+    *,
+    t_row: float,
+    t_col: float,
+) -> float:
+    """Blend the four corner values of a 2x2 window at fractional ``t_row``/``t_col``.
+
+    Split out of :meth:`ShardedV1Reader.interpolate_point` because the corner values are
+    cached independently of the weights: a cache hit re-blends without any storage read.
+    """
+    lower = val_00 + (val_01 - val_00) * t_col
+    upper = val_10 + (val_11 - val_10) * t_col
+    return float(lower + (upper - lower) * t_row)
+
+
 class _ChunkPlacement(NamedTuple):
     """Where one shard chunk's data lands inside a destination window.
 
@@ -196,11 +222,19 @@ class ShardedV1Reader:
         self,
         store: str | PathLike[str] | MutableMapping[str, bytes],
         *,
-        max_cached_indices: int = 4096,
+        max_cached_indices: int | None = None,
         max_cached_chunks: int | None = None,
+        max_cached_points: int | None = None,
     ) -> None:
         self.store = store
-        self.max_cached_indices = max_cached_indices
+        # Live value comes from API_READER_MAX_CACHED_INDICES; see that setting for
+        # the sizing basis. Resolved per instance so tests and deployments can
+        # override it without rebuilding the class default.
+        self.max_cached_indices = (
+            int(settings.API_READER_MAX_CACHED_INDICES)
+            if max_cached_indices is None
+            else max_cached_indices
+        )
         # Live value comes from API_READER_MAX_CACHED_CHUNKS; see that setting for
         # the measured basis. Resolved per instance so tests and deployments can
         # override it without rebuilding the class default.
@@ -209,9 +243,27 @@ class ShardedV1Reader:
             if max_cached_chunks is None
             else max_cached_chunks
         )
+        # Live value comes from API_READER_MAX_CACHED_POINTS; see that setting for
+        # the sizing basis.
+        self.max_cached_points = (
+            int(settings.API_READER_MAX_CACHED_POINTS)
+            if max_cached_points is None
+            else max_cached_points
+        )
         self._compressor = Zstd(level=5)
-        self._index_cache: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
+        # Index entries are kept as a (num_chunks, 2) uint64 array rather than a list
+        # of Python int tuples: ~2 KB per shard instead of ~14 KB, which is what makes
+        # a ceiling large enough to hold a whole ensemble series cheaper than the old
+        # 4096-entry list-of-tuples cache.
+        self._index_cache: OrderedDict[str, np.ndarray[Any, Any]] = OrderedDict()
         self._chunk_cache: OrderedDict[str, np.ndarray[Any, Any]] = OrderedDict()
+        # Interpolated 2x2 corner values, keyed by (generation, variable, member, lead,
+        # 2x2 index window). See API_READER_MAX_CACHED_POINTS for why this exists
+        # alongside the chunk cache rather than replacing it.
+        self._point_cache: OrderedDict[
+            tuple[str, bool, str, int | None, int, int, int, int, int],
+            tuple[float, float, float, float],
+        ] = OrderedDict()
         self._cache_lock = threading.Lock()
         self._fs: Any | None = None
 
@@ -267,8 +319,13 @@ class ShardedV1Reader:
         expected_num_chunks: int = 120,
         *,
         generation: str | None = None,
-    ) -> list[tuple[int, int]]:
-        """Retrieve shard index from LRU cache or fetch via tail Range GET."""
+    ) -> np.ndarray[Any, Any]:
+        """Retrieve shard index from LRU cache or fetch via tail Range GET.
+
+        Returns a ``(num_chunks, 2)`` uint64 array of ``(offset, length)`` pairs, or
+        the shared empty array when the shard is absent/unreadable. Callers must test
+        emptiness with ``len(entries)`` — an ndarray is never validly used as a bool.
+        """
         store_path = os.fspath(self.store) if isinstance(self.store, (str, PathLike)) else ""
         cache_key = f"{store_path}::{generation or 'live'}::{shard_key}"
 
@@ -284,28 +341,28 @@ class ShardedV1Reader:
             try:
                 tail_bytes = fs.cat_file(full, start=-trailer_and_index_len)
             except Exception:
-                return []
+                return _EMPTY_SHARD_INDEX
         else:
             full = os.path.join(root, *shard_key.split("/"))
             if not os.path.isfile(full):
-                return []
+                return _EMPTY_SHARD_INDEX
             try:
                 with open(full, "rb") as fh:
                     fh.seek(-trailer_and_index_len, os.SEEK_END)
                     tail_data = fh.read(trailer_and_index_len)
                 tail_bytes = tail_data
             except Exception:
-                return []
+                return _EMPTY_SHARD_INDEX
 
         if len(tail_bytes) < trailer_and_index_len:
-            return []
+            return _EMPTY_SHARD_INDEX
 
+        # The index trailer is already exactly num_chunks little-endian uint64 pairs,
+        # so reinterpret it directly instead of unpacking 120 tuples in Python.
         index_size = expected_num_chunks * INDEX_ENTRY_SIZE
-        index_bytes = tail_bytes[:index_size]
-        entries: list[tuple[int, int]] = []
-        for i in range(expected_num_chunks):
-            off, length = struct.unpack_from("<QQ", index_bytes, i * INDEX_ENTRY_SIZE)
-            entries.append((off, length))
+        entries = np.frombuffer(tail_bytes[:index_size], dtype=SHARD_INDEX_DTYPE).reshape(
+            expected_num_chunks, 2
+        )
 
         with self._cache_lock:
             self._index_cache[cache_key] = entries
@@ -340,10 +397,13 @@ class ShardedV1Reader:
                 return self._chunk_cache[chunk_cache_key]
 
         entries = self.get_shard_index(shard_key, generation=generation)
-        if not entries or chunk_idx >= len(entries):
+        # len() rather than truthiness: an ndarray's bool is ambiguous (and raises).
+        if len(entries) == 0 or chunk_idx >= len(entries):
             return np.full((100, 100), np.nan, dtype=np.float32)
 
-        off, length = entries[chunk_idx]
+        # Explicit int conversion: numpy scalars index a file but must reach s3fs as
+        # plain ints so the Range header is formatted as an integer byte range.
+        off, length = int(entries[chunk_idx][0]), int(entries[chunk_idx][1])
         if length == 0:
             arr = np.full((100, 100), np.nan, dtype=np.float32)
         else:
@@ -411,6 +471,27 @@ class ShardedV1Reader:
         lat0, lat1 = lat_idx[0], lat_idx[1]
         lon0, lon1 = lon_idx[0], lon_idx[1]
 
+        # The four corner values depend only on (generation, variable, member, lead,
+        # 2x2 window) and not on the fractional weights, so one entry serves every
+        # caller that lands on that window.
+        point_key = (
+            generation or "live",
+            is_mean,
+            variable,
+            member,
+            lead_time_hours,
+            lat0,
+            lat1,
+            lon0,
+            lon1,
+        )
+        with self._cache_lock:
+            corners = self._point_cache.get(point_key)
+            if corners is not None:
+                self._point_cache.move_to_end(point_key)
+        if corners is not None:
+            return _bilinear(*corners, t_row=t_row, t_col=t_col)
+
         r0, c0 = lat0 // 100, lon0 // 100
         r1, c1 = lat1 // 100, lon1 // 100
 
@@ -442,9 +523,13 @@ class ShardedV1Reader:
                 variable, member=member, lead_time_hours=lead_time_hours, lat_idx=lat1, lon_idx=lon1, generation=generation, is_mean=is_mean
             )
 
-        lower = val_00 + (val_01 - val_00) * t_col
-        upper = val_10 + (val_11 - val_10) * t_col
-        return float(lower + (upper - lower) * t_row)
+        corners = (val_00, val_01, val_10, val_11)
+        with self._cache_lock:
+            self._point_cache[point_key] = corners
+            if len(self._point_cache) > self.max_cached_points:
+                self._point_cache.popitem(last=False)
+
+        return _bilinear(*corners, t_row=t_row, t_col=t_col)
 
     def interpolate_members(
         self,
