@@ -118,6 +118,9 @@ def get_ensemble_statistics(
         from api.services.ensemble_data import build_ensemble_statistics_series
         from api.services.cache import build_ensemble_series_cache_key
 
+        lat_norm = round(float(lat), 3)
+        lon_norm = round(float(lon), 3)
+
         target_leads = (
             None
             if leads.strip().lower() == "all"
@@ -135,8 +138,8 @@ def get_ensemble_statistics(
 
         cache_key = build_ensemble_series_cache_key(
             model=model,
-            latitude=lat,
-            longitude=lon,
+            latitude=lat_norm,
+            longitude=lon_norm,
             variable=variable,
             leads=canonical_leads,
             include_members=include_members,
@@ -144,7 +147,7 @@ def get_ensemble_statistics(
             serving_generation=series_serving_gen,
         )
         query_params = (
-            f"lat={lat}&lon={lon}&variable={variable}&model={model}"
+            f"lat={lat_norm}&lon={lon_norm}&variable={variable}&model={model}"
             f"&leads={leads}&include_members={include_members}"
             f"&initial_time={series_initial}"
         )
@@ -155,8 +158,8 @@ def get_ensemble_statistics(
             with SessionLocal() as session:
                 data = build_ensemble_statistics_series(
                     session,
-                    latitude=lat,
-                    longitude=lon,
+                    latitude=lat_norm,
+                    longitude=lon_norm,
                     variable=variable,
                     model=model,
                     leads=target_leads,

@@ -423,6 +423,7 @@ def build_ensemble_statistics(
     include_members: bool = False,
     initial_time: str | None = None,
     source: Any | None = None,
+    series_mode: bool = False,
 ) -> EnsembleStatisticsData:
     """Build ensemble statistics for a resolved point."""
     _validate_coordinates(latitude, longitude)
@@ -474,7 +475,7 @@ def build_ensemble_statistics(
         participating_members = [math.hypot(u, v) * 3.6 for u, v in zip(u_fin, v_fin, strict=True)]
         valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
 
-        if valid_cell and u_fin:
+        if valid_cell and u_fin and not series_mode:
             consensus = compute_consensus_vector(u_fin, v_fin)
             consensus_payload = ConsensusVectorOut(
                 speed=round(consensus.speed_mps * 3.6, 2),
@@ -514,10 +515,11 @@ def build_ensemble_statistics(
         if valid_cell and finite_states:
             support_map = aggregate_ensemble_phase_support(finite_states)
             phase_support_payload = {p.value: round(v, 4) for p, v in support_map.items()}
-            freq_map = compute_transition_frequencies(finite_states)
-            transition_freq_payload = {
-                t.value: round(v, 4) for t, v in freq_map.items() if v > 0.0
-            }
+            if not series_mode:
+                freq_map = compute_transition_frequencies(finite_states)
+                transition_freq_payload = {
+                    t.value: round(v, 4) for t, v in freq_map.items() if v > 0.0
+                }
     elif variable == "cloud_cover_3h":
         members = _gated_member_values(
             store_path_str, variable, lead_time_hours, latitude, longitude, avail_members
@@ -818,6 +820,7 @@ def build_ensemble_statistics_series(
                 include_members=include_members,
                 initial_time=initial_time,
                 source=source,
+                series_mode=True,
             )
             results.append(item)
         except Exception as exc:
@@ -926,20 +929,16 @@ def _gated_member_values(
             lat_idx = [_stored(row_0, lat_size, lat_descending), _stored(row_1, lat_size, lat_descending)]
             lon_idx = [_stored(col_0, lon_size, lon_descending), _stored(col_1, lon_size, lon_descending)]
 
-            values: list[float] = []
-            for member_num in target_members:
-                val = reader.interpolate_point(
-                    var_code,
-                    member=member_num,
-                    lead_time_hours=lead,
-                    lat_idx=lat_idx,
-                    lon_idx=lon_idx,
-                    t_row=t_row,
-                    t_col=t_col,
-                    generation=generation,
-                )
-                values.append(val)
-            return values
+            return reader.interpolate_members(
+                var_code,
+                members=target_members,
+                lead_time_hours=lead,
+                lat_idx=lat_idx,
+                lon_idx=lon_idx,
+                t_row=t_row,
+                t_col=t_col,
+                generation=generation,
+            )
 
         if "lead_time_hours" in field.dims:
             field = field.sel(lead_time_hours=lead)
@@ -1050,10 +1049,12 @@ def _gated_wind_member_vectors(
             lat_idx = [_stored(row_0, lat_size, lat_descending), _stored(row_1, lat_size, lat_descending)]
             lon_idx = [_stored(col_0, lon_size, lon_descending), _stored(col_1, lon_size, lon_descending)]
 
-            u_vals_s: list[float] = []
-            v_vals_s: list[float] = []
-            for member_num in target_members:
-                u_val = reader.interpolate_point(
+            from api.core.zarr import get_member_executor
+
+            ex = get_member_executor()
+
+            def _read_uv(member_num: int) -> tuple[float, float]:
+                u = reader.interpolate_point(
                     "wind_u_10m",
                     member=member_num,
                     lead_time_hours=lead,
@@ -1063,7 +1064,7 @@ def _gated_wind_member_vectors(
                     t_col=t_col,
                     generation=generation,
                 )
-                v_val = reader.interpolate_point(
+                v = reader.interpolate_point(
                     "wind_v_10m",
                     member=member_num,
                     lead_time_hours=lead,
@@ -1073,9 +1074,10 @@ def _gated_wind_member_vectors(
                     t_col=t_col,
                     generation=generation,
                 )
-                u_vals_s.append(u_val)
-                v_vals_s.append(v_val)
-            return u_vals_s, v_vals_s
+                return u, v
+
+            pairs = list(ex.map(_read_uv, target_members))
+            return [p[0] for p in pairs], [p[1] for p in pairs]
 
         if "lead_time_hours" in field_u.dims:
             field_u = field_u.sel(lead_time_hours=lead)
@@ -1204,10 +1206,11 @@ def _gated_precipitation_member_states(
                 else []
             )
 
-            amounts_s: list[float] = []
-            states_s: list[PrecipitationPhaseState] = []
+            from api.core.zarr import get_member_executor
 
-            for member_num in target_members:
+            ex = get_member_executor()
+
+            def _read_precip_member(member_num: int) -> tuple[float, PrecipitationPhaseState]:
                 amt_val = float(
                     reader.interpolate_point(
                         "precipitation_amount_3h",
@@ -1220,7 +1223,6 @@ def _gated_precipitation_member_states(
                         generation=generation,
                     )
                 )
-                amounts_s.append(amt_val)
 
                 flags: dict[str, int] = {}
                 for c in ("crain", "csnow", "cfrzr", "cicep"):
@@ -1313,9 +1315,10 @@ def _gated_precipitation_member_states(
                     t2m_start=t_start_val,
                     t2m_end=t_val,
                 )
-                states_s.append(state)
+                return amt_val, state
 
-            return amounts_s, states_s
+            pairs_s = list(ex.map(_read_precip_member, target_members))
+            return [p[0] for p in pairs_s], [p[1] for p in pairs_s]
 
         if "lead_time_hours" in field_amt.dims:
             field_amt = field_amt.sel(lead_time_hours=lead)
