@@ -18,6 +18,41 @@ const wrapper = ({ children }: { children: ReactNode }) => (
   <ForecastSelectionProvider>{children}</ForecastSelectionProvider>
 );
 
+/** Build a single-model/single-variable availability payload for the given valid times. */
+function availabilityWith(
+  validTimes: string[],
+  options: { generatedAt?: string; servingStart?: string | null } = {}
+): ForecastAvailability {
+  return {
+    generated_at: options.generatedAt ?? null,
+    serving_start_valid_time: options.servingStart ?? null,
+    models: [
+      {
+        id: "gfs",
+        name: "Global Forecast System",
+        is_ensemble: false,
+        variables: [
+          {
+            id: "temperature_2m",
+            name: "Temperature",
+            unit: "°C",
+            initial_times: [],
+            valid_times: validTimes.map((valid_time, index) => ({
+              valid_time,
+              source_cycle: valid_time,
+              lead_time_hours: index * 3,
+              servable: true,
+              available_members: 1,
+              expected_members: 1,
+              coverage_ratio: 1.0,
+            })),
+          },
+        ],
+      },
+    ],
+  };
+}
+
 describe("Forecast Selection Cadence-Boundary Synchronization", () => {
   beforeEach(() => {
     jest.useFakeTimers();
@@ -125,7 +160,8 @@ describe("Forecast Selection Cadence-Boundary Synchronization", () => {
     mockGetForecastAvailability.mockResolvedValueOnce(availability0900);
 
     // Fast-forward by 40,150 ms (just past the 40,100ms server-calculated boundary delay)
-    // Notice: 40.15s is well before the arbitrary 60-second polling interval!
+    // Notice: 40.15s is well before the 60-second heartbeat tick, which performs no
+    // network I/O at all — the boundary timer is the only scheduled refetch.
     await act(async () => {
       jest.advanceTimersByTime(40_150);
       await Promise.resolve();
@@ -189,5 +225,135 @@ describe("Forecast Selection Cadence-Boundary Synchronization", () => {
     // The fast client clock MUST NOT hide 06Z: backend serving_start_valid_time is authoritative!
     expect(result.current.validTime).toBe("2026-09-11T06:00:00.000Z");
     expect(result.current.options.validTimes).toContain("2026-09-11T06:00:00.000Z");
+  });
+
+  it("ages out expired valid times on the 60-second heartbeat without refetching availability", async () => {
+    // 08:30Z: the floored cadence boundary is 06:00Z, so 06Z is still selectable.
+    jest.setSystemTime(new Date("2026-09-11T08:30:00.000Z").getTime());
+
+    // No serving_start_valid_time, so the client derives the boundary from nowMs: this is
+    // the one case where the heartbeat (and nothing else) moves the grace window.
+    mockGetForecastAvailability.mockResolvedValueOnce(
+      availabilityWith(
+        ["2026-09-11T06:00:00.000Z", "2026-09-11T09:00:00.000Z", "2026-09-11T12:00:00.000Z"],
+        { generatedAt: "2026-09-11T08:30:00.000Z" }
+      )
+    );
+
+    const { result } = renderHook(() => useForecastSelection(), { wrapper });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(result.current.status).toBe("success");
+    expect(mockGetForecastAvailability).toHaveBeenCalledTimes(1);
+    expect(result.current.validTime).toBe("2026-09-11T06:00:00.000Z");
+    expect(result.current.options.validTimes).toEqual([
+      "2026-09-11T06:00:00.000Z",
+      "2026-09-11T09:00:00.000Z",
+      "2026-09-11T12:00:00.000Z",
+    ]);
+
+    // Fast-forward 40 minutes across the 09:00Z cadence boundary. 40 heartbeat ticks fire.
+    await act(async () => {
+      jest.advanceTimersByTime(40 * 60 * 1000);
+      await Promise.resolve();
+    });
+
+    // The heartbeat must re-derive options from in-memory state: 06Z ages out of the grace
+    // window and the selection reconciles, with no additional request to the backend.
+    expect(result.current.options.validTimes).toEqual([
+      "2026-09-11T09:00:00.000Z",
+      "2026-09-11T12:00:00.000Z",
+    ]);
+    expect(result.current.validTime).toBe("2026-09-11T09:00:00.000Z");
+    expect(mockGetForecastAvailability).toHaveBeenCalledTimes(1);
+  });
+
+  it("revalidates availability when the tab returns to the foreground", async () => {
+    jest.setSystemTime(new Date("2026-09-11T06:30:00.000Z").getTime());
+
+    const first = availabilityWith(["2026-09-11T06:00:00.000Z", "2026-09-11T09:00:00.000Z"], {
+      generatedAt: "2026-09-11T06:30:00.000Z",
+      servingStart: "2026-09-11T06:00:00.000Z",
+    });
+    // Foreground return sees the cycle rolled to 09Z, gaining a newer valid time.
+    const second = availabilityWith(["2026-09-11T09:00:00.000Z", "2026-09-11T12:00:00.000Z"], {
+      generatedAt: "2026-09-11T09:20:00.000Z",
+      servingStart: "2026-09-11T09:00:00.000Z",
+    });
+    mockGetForecastAvailability.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+
+    const visibilityState = jest
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("visible");
+
+    try {
+      const { result } = renderHook(() => useForecastSelection(), { wrapper });
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(mockGetForecastAvailability).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await Promise.resolve();
+      });
+
+      expect(mockGetForecastAvailability).toHaveBeenCalledTimes(2);
+      expect(result.current.options.validTimes).toEqual([
+        "2026-09-11T09:00:00.000Z",
+        "2026-09-11T12:00:00.000Z",
+      ]);
+    } finally {
+      visibilityState.mockRestore();
+    }
+  });
+
+  it("retries a failed boundary revalidation instead of stranding on a stale payload", async () => {
+    jest.setSystemTime(new Date("2026-09-11T08:59:20.000Z").getTime());
+
+    mockGetForecastAvailability
+      .mockResolvedValueOnce(
+        // Boundary 40.1s away, so the first scheduled revalidation is quick to reach.
+        availabilityWith(["2026-09-11T06:00:00.000Z", "2026-09-11T09:00:00.000Z"], {
+          generatedAt: "2026-09-11T08:59:20.000Z",
+          servingStart: "2026-09-11T06:00:00.000Z",
+        })
+      )
+      .mockRejectedValueOnce(new Error("gateway timeout"))
+      .mockResolvedValueOnce(
+        availabilityWith(["2026-09-11T09:00:00.000Z", "2026-09-11T12:00:00.000Z"], {
+          generatedAt: "2026-09-11T09:00:00.100Z",
+          servingStart: "2026-09-11T09:00:00.000Z",
+        })
+      );
+
+    const { result } = renderHook(() => useForecastSelection(), { wrapper });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(mockGetForecastAvailability).toHaveBeenCalledTimes(1);
+
+    // Reach the boundary: the refresh fails, and because a failed refresh leaves
+    // `availability` unchanged the effect cannot re-arm on its own.
+    await act(async () => {
+      jest.advanceTimersByTime(40_150);
+      await Promise.resolve();
+    });
+    expect(mockGetForecastAvailability).toHaveBeenCalledTimes(2);
+    // Still on the stale payload, with 06Z not yet aged out.
+    expect(result.current.validTime).toBe("2026-09-11T06:00:00.000Z");
+
+    // The explicit retry recovers without any user action.
+    await act(async () => {
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve();
+    });
+    expect(mockGetForecastAvailability).toHaveBeenCalledTimes(3);
+    expect(result.current.validTime).toBe("2026-09-11T09:00:00.000Z");
   });
 });

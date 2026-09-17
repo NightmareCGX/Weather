@@ -393,3 +393,105 @@ def test_ensembles_batch_leads(client):
         assert item["model"] == "gefs"
         assert item["statistics"] is not None
 
+
+def test_require_variable_in_store_rejects_variable_absent_from_the_cycle_store():
+    """The store-level guard distinguishes "in the catalog" from "in this cycle"."""
+    from fastapi import HTTPException
+
+    from api.services.ensemble_data import _require_variable_in_store
+    from api.services.point_forecast import _CycleMetadata
+
+    metadata = _CycleMetadata(
+        lead_times=frozenset({0, 6, 12}),
+        var_names=frozenset({"temperature_2m", "precipitation_amount_3h"}),
+    )
+
+    # Present in the store -> accepted.
+    _require_variable_in_store(metadata, "temperature_2m", "gefs")
+
+    # Absent from the store (the real GEFS case for precipitation_rate) -> 404.
+    with pytest.raises(HTTPException) as excinfo:
+        _require_variable_in_store(metadata, "precipitation_rate", "gefs")
+    assert excinfo.value.status_code == 404
+    assert "precipitation_rate" in excinfo.value.detail
+
+
+def test_require_variable_in_store_accepts_derived_wind_when_both_components_exist():
+    """The catalog exposes wind_10m as one derived variable over two stored components."""
+    from fastapi import HTTPException
+
+    from api.services.ensemble_data import _require_variable_in_store
+    from api.services.point_forecast import _CycleMetadata
+
+    both = _CycleMetadata(
+        lead_times=frozenset({0, 6}),
+        var_names=frozenset({"wind_u_10m", "wind_v_10m"}),
+    )
+    _require_variable_in_store(both, "wind_10m", "gefs")
+
+    incomplete = _CycleMetadata(
+        lead_times=frozenset({0, 6}), var_names=frozenset({"wind_u_10m"})
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        _require_variable_in_store(incomplete, "wind_10m", "gefs")
+    assert excinfo.value.status_code == 404
+
+
+def test_ensembles_series_variable_absent_from_store_is_404_not_empty_200(monkeypatch, client):
+    """Batch series must 404 when the cycle's store lacks the requested variable.
+
+    Regression: the per-lead loop wraps each lead in a generic handler that treats the
+    store-level 404 as a recoverable transient. A variable the catalog knows but the
+    published cycle does not carry therefore produced HTTP 200 with an empty ``data``
+    array, which the UI can only render as "data is not yet available" — for a variable
+    that can never have data for that model.
+    """
+    from api.services import ensemble_data
+    from api.services.point_forecast import _CycleMetadata
+
+    def _metadata_without_precip_rate(_store_path: str) -> _CycleMetadata:
+        return _CycleMetadata(
+            lead_times=frozenset({0, 6, 12, 18}),
+            var_names=frozenset({"temperature_2m"}),
+        )
+
+    monkeypatch.setattr(
+        ensemble_data, "gated_cycle_metadata", _metadata_without_precip_rate
+    )
+
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=precipitation_rate&model=gefs&leads=6,12"
+    )
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["error"]["type"] == "not_found_error"
+    assert "precipitation_rate" in body["error"]["message"]
+
+
+def test_ensembles_series_variable_present_in_store_still_succeeds(monkeypatch, client):
+    """The guard must not reject a variable the cycle's store does carry."""
+    from api.services import ensemble_data
+    from api.services.point_forecast import _CycleMetadata
+
+    def _metadata_with_precip_rate(_store_path: str) -> _CycleMetadata:
+        return _CycleMetadata(
+            lead_times=frozenset({0, 6, 12, 18}),
+            var_names=frozenset({"temperature_2m", "precipitation_rate"}),
+        )
+
+    monkeypatch.setattr(
+        ensemble_data, "gated_cycle_metadata", _metadata_with_precip_rate
+    )
+
+    resp = client.get(
+        f"/v1/ensembles?lat={LAT}&lon={LON}"
+        "&variable=precipitation_rate&model=gefs&leads=6,12"
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    assert len(body["data"]) >= 1
+

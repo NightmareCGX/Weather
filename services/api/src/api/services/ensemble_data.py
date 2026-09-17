@@ -698,6 +698,34 @@ def _require_ensemble_model(db: Session, model: str) -> None:
         )
 
 
+def _require_variable_in_store(metadata: _CycleMetadata, variable: str, model: str) -> None:
+    """Reject a variable the resolved cycle's store does not actually carry.
+
+    :func:`_resolve_variables` validates the request against the *catalog*; this
+    validates it against the *store*. The two can disagree — ``precipitation_rate``,
+    for example, is a real catalog entry that GFS carries and GEFS does not — and the
+    series builder must reject that once, up front. Otherwise every lead raises the same
+    store-level 404 inside the per-lead loop, where the generic per-lead handler treats
+    it as a recoverable transient and the endpoint answers 200 with an empty series,
+    which the UI can only present as "data is not yet available".
+    """
+    present = set(metadata.var_names)
+    # The catalog exposes 10m wind as a single derived variable, but the store only
+    # carries its two vector components (mirrors _resolve_variables).
+    if variable == "wind_10m":
+        available = "wind_u_10m" in present and "wind_v_10m" in present
+    else:
+        available = variable in present
+    if not available:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Variable '{variable}' is not available in the forecast dataset for "
+                f"model '{model}'."
+            ),
+        )
+
+
 def build_ensemble_statistics_series(
     db: Session,
     *,
@@ -748,6 +776,7 @@ def build_ensemble_statistics_series(
 
     metadata = gated_cycle_metadata(store_path_str)
     _resolve_variables(db, metadata, [variable])
+    _require_variable_in_store(metadata, variable, model)
 
     if leads is not None:
         target_leads = [ld for ld in leads if ld in metadata.lead_times]
