@@ -950,6 +950,28 @@ def _run_ingest(args: argparse.Namespace) -> int:
             f"({args.max_runs}). Refusing to run an accidental huge job; use "
             "a --manifest or raise --max-runs."
         )
+
+    # Refuse before any download work if a model's canonical horizon is
+    # unregistered. The run-spec builder resolves the horizon without a default,
+    # so an unregistered model raises there anyway — but only once the batch is
+    # already underway, and as a bare ValueError naming no remedy. Checking here
+    # turns it into one actionable message before any object-store or upstream
+    # traffic. Cadence and member counts only degrade silently, so they are
+    # reported without blocking the run.
+    from domain.model_registration import audit_model_registration
+
+    registration = audit_model_registration(spec.model for spec in run_specs)
+    if not registration.is_clean:
+        logger.error("model registration audit: %s", registration.describe())
+        print(f"model registration audit: {registration.describe()}")
+    if registration.has_fatal:
+        raise SystemExit(
+            "Refusing to ingest: no canonical lead horizon is registered for "
+            f"{', '.join(registration.missing_horizon)}. Ingestion cannot build "
+            "a run spec for these models. Register them in domain.horizon "
+            "(MODEL_CANONICAL_HORIZONS) first."
+        )
+
     if args.dry_run:
         for spec in run_specs:
             store_path = validate_store_path(
@@ -1228,9 +1250,14 @@ def _gc_pipeline_pass(
                 enqueued_count=plan.enqueued_count,
                 reclaimable_shards=plan.reclaimable_shards,
             )
+            # Read defensively: this is a diagnostics summary inside a stage
+            # try/except, so a missing attribute on an older/duck-typed plan
+            # result must not turn a successful pass into planner=ERROR(...).
+            skipped_models = getattr(plan, "skipped_models", ())
+            skipped = f" skipped={','.join(skipped_models)}" if skipped_models else ""
             parts.append(
                 f"planner enqueued={plan.enqueued_count} "
-                f"reclaimable={plan.reclaimable_shards}"
+                f"reclaimable={plan.reclaimable_shards}{skipped}"
             )
         except Exception as exc:
             logger.exception("GC planner stage failed")

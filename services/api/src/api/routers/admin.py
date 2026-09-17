@@ -434,5 +434,41 @@ def get_detailed_system_health(response: Response) -> dict[str, Any]:
             "checked_out": reader_checked_out,
             "size": reader_pool_size,
         },
+        "model_registration": _model_registration_report(database),
+    }
+
+
+def _model_registration_report(database_connected: bool) -> dict[str, Any]:
+    """Report catalog models missing from the domain model registries.
+
+    Surfaced here (as well as logged at startup) so the gap is alertable: a
+    missing canonical horizon raises on the ingestion and reclamation paths,
+    while a missing cadence or member count degrades silently to a default that
+    distorts lag and coverage. Neither is visible to the serving tier otherwise,
+    because the API needs no registry entry to keep serving.
+
+    Best-effort and fail-open: this is a diagnostics endpoint, so an unavailable
+    database is reported as "unknown" rather than failing the whole response.
+    """
+    if not database_connected:
+        return {"status": "unknown", "detail": "database unreachable"}
+    try:
+        from api.core.database import SessionLocal
+        from api.services.model_registration import audit_catalog_model_registration
+
+        with SessionLocal() as db:
+            audit = audit_catalog_model_registration(db)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not fail the probe
+        return {"status": "unknown", "detail": type(exc).__name__}
+
+    if audit.is_clean:
+        return {"status": "ok", "unregistered": []}
+    return {
+        "status": "fatal" if audit.has_fatal else "degraded",
+        "unregistered": list(audit.audited_models),
+        "missing_horizon": list(audit.missing_horizon),
+        "missing_cadence": list(audit.missing_cadence),
+        "missing_expected_members": list(audit.missing_expected_members),
+        "detail": audit.describe(),
     }
 

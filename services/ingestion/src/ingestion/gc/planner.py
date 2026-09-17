@@ -31,7 +31,7 @@ from domain.canonical import (
     select_canonical_sources_bulk,
 )
 from domain.coverage import get_expected_members, is_lead_servable
-from domain.horizon import model_max_lead_hours
+from domain.horizon import is_canonical_lead_horizon_registered, model_max_lead_hours
 from domain.reclamation import (
     PhysicalShardTarget,
     PREDECESSOR_VARIABLES,
@@ -76,6 +76,11 @@ class ReclamationPlanResult:
     reclaimable_shards: int
     enqueued_count: int
     would_enqueue: tuple[PhysicalShardTarget, ...]
+    #: Models this pass deliberately did not plan, because their canonical
+    #: horizon is unregistered and their serving boundary is therefore
+    #: underivable. Reported rather than raised so one unregistered model cannot
+    #: stop reclamation for the rest.
+    skipped_models: tuple[str, ...] = ()
 
 
 def enumerate_committed_unit_tuples(
@@ -178,6 +183,7 @@ def plan_reclamation_pass(
     total_held = 0
     total_reclaimable = 0
     total_enqueued = 0
+    skipped_models: list[str] = []
 
     # 1. Pre-query lifecycle records for whole-cycle fences
     lc_rows = session.execute(select(ForecastCycleLifecycleRecord)).scalars().all()
@@ -188,6 +194,24 @@ def plan_reclamation_pass(
 
     for model in models:
         m_id = model.lower().strip()
+        # A model whose canonical horizon is unregistered cannot have its serving
+        # boundary derived: model_serving_start_valid_time, model_max_lead_hours
+        # and is_valid_time_protected all resolve the horizon without a default
+        # and raise. Those calls sit inside this loop, so letting the error
+        # escape aborts planning for EVERY model rather than just this one —
+        # reclamation would stop platform-wide, and only as a log line. Skip the
+        # model explicitly instead: the gap is still reported, its blast radius
+        # is not.
+        if not is_canonical_lead_horizon_registered(m_id):
+            logger.error(
+                "reclamation planning skipped model=%s: no canonical lead horizon "
+                "is registered for it, so its serving boundary cannot be derived. "
+                "Register the model in domain.horizon before it can be reclaimed; "
+                "all other models are unaffected.",
+                m_id,
+            )
+            skipped_models.append(m_id)
+            continue
         expected_members = get_expected_members(m_id, default_if_unknown=1)
         is_ensemble = expected_members > 1
         # Per-model serving boundary (I20): derived from this model's
@@ -669,4 +693,5 @@ def plan_reclamation_pass(
         reclaimable_shards=total_reclaimable,
         enqueued_count=total_enqueued if not dry_run else len(all_would_enqueue),
         would_enqueue=tuple(all_would_enqueue),
+        skipped_models=tuple(sorted(skipped_models)),
     )

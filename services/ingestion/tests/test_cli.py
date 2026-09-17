@@ -781,6 +781,115 @@ def test_cli_max_runs_guard(session: Session, tmp_path, monkeypatch) -> None:
     assert "max-runs" in str(exc.value)
 
 
+def test_cli_refuses_unregistered_model_before_ingesting(tmp_path, monkeypatch) -> None:
+    """A model that is allowed by the CLI but unregistered in the domain is refused.
+
+    Onboarding a model takes more than one step: ``SUPPORTED_MODELS`` (and the
+    provider's own set) must list it, *and* its horizon/cadence/member contract
+    must be registered in ``domain``. Only the first is enforced by argparse and
+    the manifest reader; nothing enforces the second. This test simulates the
+    half-finished state — the CLI accepts the model, the domain does not know it
+    — which is precisely when a clear refusal is worth having, because the
+    alternative is a bare ValueError raised mid-batch after downloads started.
+    """
+    import json
+
+    from ingestion import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module, "SUPPORTED_MODELS", ("gfs", "gefs", "aigfs")
+    )
+
+    manifest = tmp_path / "unregistered.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "model": "aigfs",
+                        "cycle_date": "2026-07-21",
+                        "cycle_hour": "0",
+                        "lead_time_hours": [6],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli_module.main(["ingest", "--manifest", str(manifest)])
+
+    message = str(exc.value)
+    assert "aigfs" in message
+    assert "MODEL_CANONICAL_HORIZONS" in message
+
+
+def test_cli_rejects_model_outside_supported_set_before_the_registration_check(
+    tmp_path,
+) -> None:
+    """The pre-existing CLI gate still rejects unknown models first.
+
+    Pinned so the registration preflight cannot be mistaken for the only guard:
+    ``expand_run_specs`` rejects a model outside ``SUPPORTED_MODELS`` before the
+    registration audit runs, which is why the audit only has work to do once a
+    model has been added to that set.
+    """
+    import json
+
+    from ingestion.cli import main
+
+    manifest = tmp_path / "unsupported.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "model": "aigfs",
+                        "cycle_date": "2026-07-21",
+                        "cycle_hour": "0",
+                        "lead_time_hours": [6],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not supported"):
+        main(["ingest", "--manifest", str(manifest)])
+
+
+def test_cli_registered_model_passes_the_registration_preflight(tmp_path, monkeypatch) -> None:
+    """The preflight must not block a fully registered model (gfs).
+
+    Guards against the check being wired so tightly that it rejects the normal
+    case: gfs is registered in every domain registry, so dry-run must succeed.
+    """
+    import json
+
+    from ingestion.cli import main
+
+    manifest = tmp_path / "registered.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "model": "gfs",
+                        "cycle_date": "2026-07-21",
+                        "cycle_hour": "0",
+                        "lead_time_hours": [6],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["ingest", "--manifest", str(manifest), "--dry-run"]) == 0
+
+
 # ---------------------------------------------------------------------------
 # Post-Commit Source Cleanup Regression Test Suite (P1 Technical Debt)
 # ---------------------------------------------------------------------------

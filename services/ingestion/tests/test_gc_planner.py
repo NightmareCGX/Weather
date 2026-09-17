@@ -267,3 +267,93 @@ def test_stale_ingestion_resurrection_rejected(catalog_engine):
     with Session(catalog_engine) as session:
         with pytest.raises(CycleTombstonedError, match="Refusing to ingest"):
             record_run(session, spec, dataset)
+
+
+# ---------------------------------------------------------------------------
+# Unregistered-model isolation
+# ---------------------------------------------------------------------------
+
+
+def _seed_unregistered_model(engine, model_id: str) -> None:
+    """Seed catalog rows for a model with no domain registration.
+
+    The model deliberately has a run and products, so it is indistinguishable
+    from a registered model to the planner's catalog queries — only the domain
+    horizon registry knows it is unconfigured.
+    """
+    with Session(engine) as session:
+        session.add(
+            ModelRecord(
+                id=f"model_{model_id}",
+                model_id=model_id,
+                name=model_id.upper(),
+                center_id="noaa",
+                is_ensemble=False,
+                resolution_km=25.0,
+                created_at=_dt(2026, 1, 1, 0),
+            )
+        )
+        session.add(
+            ModelVersionRecord(
+                id=f"version_{model_id}_v1.0",
+                model_id=model_id,
+                version_string="v1.0",
+                created_at=_dt(2026, 1, 1, 0),
+            )
+        )
+        session.commit()
+
+
+def test_planner_skips_unregistered_model_without_aborting_other_models(catalog_engine):
+    """An unregistered model must not stop planning for every other model.
+
+    The serving boundary for a model is derived from its canonical horizon, and
+    that lookup raises for an unregistered model. Those derivations sit inside
+    the planner's per-model loop, so letting the error escape would abort
+    reclamation planning platform-wide because of one unconfigured model — and
+    surface only as a logged stage error. The unregistered model is listed
+    before the healthy one here, so an escaping error would prevent the healthy
+    model from being planned at all.
+    """
+    _seed_unregistered_model(catalog_engine, "aigfs")
+    run_unregistered = _seed_run(catalog_engine, "aigfs", _dt(2026, 8, 1, 0), "ready")
+    _seed_product(catalog_engine, run_unregistered, 0)
+
+    # The hazard being contained: deriving the serving boundary raises.
+    from domain.temporal import model_serving_start_valid_time
+
+    with pytest.raises(ValueError):
+        model_serving_start_valid_time("aigfs", _dt(2026, 9, 2, 12, 30))
+
+    c_fresh = _dt(2026, 9, 2, 6)
+    run_gfs = _seed_run(catalog_engine, "gfs", c_fresh, "ready")
+    _seed_product(catalog_engine, run_gfs, 6)
+    _claim_cycle(catalog_engine, "gfs", c_fresh)
+
+    with Session(catalog_engine) as session:
+        res = plan_reclamation_pass(
+            session,
+            models=("aigfs", "gfs"),
+            dry_run=True,
+            now=_dt(2026, 9, 2, 12, 30),
+        )
+
+    assert res.skipped_models == ("aigfs",)
+    # The healthy model was still planned despite the unregistered one.
+    assert {(t.run_id, t.lead_time_hours) for t in res.would_enqueue} == {
+        (run_gfs.id, 6)
+    }
+    assert res.reclaimable_shards == 1
+
+
+def test_planner_reports_no_skipped_models_when_all_are_registered(catalog_engine):
+    c_fresh = _dt(2026, 9, 2, 6)
+    run_gfs = _seed_run(catalog_engine, "gfs", c_fresh, "ready")
+    _seed_product(catalog_engine, run_gfs, 6)
+
+    with Session(catalog_engine) as session:
+        res = plan_reclamation_pass(
+            session, models=("gfs",), dry_run=True, now=_dt(2026, 9, 2, 12, 30)
+        )
+
+    assert res.skipped_models == ()

@@ -44,6 +44,48 @@ reader_pool: ReaderLockPool
 reader_lifecycle: ReaderGateLifecycle
 
 
+def _log_model_registration_audit() -> None:
+    """Report catalog models that are missing from the domain registries.
+
+    A model can be ingested and served while absent from the registries that
+    describe its horizon, cadence, and member count. The horizon gap raises on
+    the ingestion and reclamation paths, but the cadence and member-count gaps
+    degrade silently to defaults that distort lag and coverage numbers — and
+    nothing in the serving path would otherwise mention it. This is the one
+    place that sees every catalog model at once, so it is where the gap becomes
+    visible.
+
+    Deliberately never raises. An unregistered model is a configuration gap, and
+    the API does not need those registries to serve (every serving call site
+    passes an explicit default), so refusing to start would convert a
+    misconfiguration into a platform outage. The report is logged at CRITICAL so
+    it cannot be mistaken for routine startup noise, and is also exposed on
+    ``/v1/health/detailed`` so monitoring can alert on it.
+    """
+    try:
+        from api.core.database import SessionLocal
+        from api.services.model_registration import audit_catalog_model_registration
+
+        with SessionLocal() as db:
+            audit = audit_catalog_model_registration(db)
+    except Exception:  # noqa: BLE001 - startup must not depend on this probe
+        logger.warning(
+            "model registration audit could not run at startup; "
+            "/v1/health/detailed reports it on demand",
+            exc_info=True,
+        )
+        return
+
+    if audit.is_clean:
+        return
+    logger.critical(
+        "model registration audit: %s. Serving continues (these gaps do not raise "
+        "on the read path), but ingestion and reclamation do for a missing "
+        "horizon, and cadence/member gaps silently distort lag and coverage.",
+        audit.describe(),
+    )
+
+
 def create_app() -> FastAPI:
     """Build the FastAPI application with middleware, error handling, and routes."""
 
@@ -57,6 +99,7 @@ def create_app() -> FastAPI:
             max_overflow=int(settings.API_READER_LOCK_MAX_OVERFLOW),
             pool_timeout=float(settings.API_READER_LOCK_POOL_TIMEOUT_SECONDS),
         )
+        _log_model_registration_audit()
         prewarm_task: asyncio.Task[None] | None = None
         if settings.API_VECTOR_PREWARM_ENABLED:
             from api.services.vector_prewarm import vector_prewarm_loop

@@ -115,3 +115,75 @@ def test_api_health_detailed_endpoint(client, monkeypatch):
     assert "rss_bytes" in body["resources"]
     assert "threads" in body["resources"]
 
+
+def test_health_detailed_reports_clean_model_registration_for_seeded_catalog(client, monkeypatch):
+    """The seeded catalog (gfs, gefs) is fully registered, so the audit is clean."""
+    monkeypatch.setattr(admin_router, "_database_connected", lambda: True)
+    monkeypatch.setattr(admin_router, "_redis_connected", lambda: True)
+    monkeypatch.setattr(admin_router, "_object_storage_connected", lambda: True)
+
+    body = client.get("/v1/health/detailed").json()
+
+    assert body["model_registration"]["status"] == "ok"
+    assert body["model_registration"]["unregistered"] == []
+
+
+def test_health_detailed_surfaces_unregistered_model(monkeypatch):
+    """A catalog model missing from the domain registries is reported, not hidden.
+
+    This is the only place that sees every catalog model at once, so it is where
+    a model ingested without its horizon/cadence/member registration becomes
+    visible — and it is alertable, unlike a line in the startup log.
+    """
+    monkeypatch.setattr(admin_router, "_database_connected", lambda: True)
+
+    class _FakeScalars:
+        def all(self) -> list[str]:
+            return ["gfs", "aigfs"]
+
+    class _FakeSession:
+        def __enter__(self) -> "_FakeSession":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def execute(self, _stmt: object) -> "_FakeSession":
+            return self
+
+        # SQLAlchemy exposes `scalars` as a method on Result, not a property.
+        def scalars(self) -> _FakeScalars:
+            return _FakeScalars()
+
+    import api.core.database as database_module
+
+    monkeypatch.setattr(database_module, "SessionLocal", lambda: _FakeSession())
+
+    report = admin_router._model_registration_report(database_connected=True)
+
+    assert report["status"] == "fatal"
+    assert report["unregistered"] == ["aigfs"]
+    assert report["missing_horizon"] == ["aigfs"]
+    assert "aigfs" in report["detail"]
+
+
+def test_health_detailed_model_registration_unknown_when_database_down():
+    """A diagnostics endpoint must not fail its whole probe on a DB outage."""
+    report = admin_router._model_registration_report(database_connected=False)
+    assert report == {"status": "unknown", "detail": "database unreachable"}
+
+
+def test_health_detailed_model_registration_unknown_on_query_error(monkeypatch):
+    """A failing audit query degrades to "unknown" rather than raising."""
+    import api.core.database as database_module
+
+    def _boom() -> None:
+        raise RuntimeError("catalog unreachable")
+
+    monkeypatch.setattr(database_module, "SessionLocal", _boom)
+
+    report = admin_router._model_registration_report(database_connected=True)
+
+    assert report["status"] == "unknown"
+    assert report["detail"] == "RuntimeError"
+

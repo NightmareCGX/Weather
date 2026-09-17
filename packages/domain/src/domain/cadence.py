@@ -97,3 +97,15 @@ def register_canonical_cycle_cadence(model_id: str, cadence_hours: int) -> None:
     if cadence_hours <= 0:
         raise ValueError(f"Cycle cadence must be strictly positive: {cadence_hours}")
     MODEL_CYCLE_CADENCE_HOURS[model_id.lower().strip()] = int(cadence_hours)
+
+
+def is_cycle_cadence_registered(model_id: str) -> bool:
+    """Return whether a model has an explicit cycle cadence in the registry.
+
+    Membership is a distinct question from the cadence value: callers that pass
+    ``default_if_unknown`` get a value either way, so only this predicate can
+    distinguish a registered cadence from a silently assumed one. Registration
+    auditing (see :mod:`domain.model_registration`) uses it to surface that
+    difference, because an unregistered cadence is otherwise invisible.
+    """
+    return model_id.lower().strip() in MODEL_CYCLE_CADENCE_HOURS
