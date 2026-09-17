@@ -183,8 +183,9 @@ class IngestionS3FileSystem(s3fs.S3FileSystem):  # type: ignore[misc]  # untyped
     # Operation primitives of the s3fs async filesystem. Passing through
     # *args/**kwargs keeps the wrappers signature-compatible with the pinned
     # s3fs version; the mapping to the bounded operation enum is:
-    # get (byte-range / object read), put (write), delete, list (directory
-    # listing), head (metadata / existence via info).
+    # get (byte-range / object read), put (write), delete (single-file and
+    # batch object removal), list (directory listing), head (metadata /
+    # existence via info).
     async def _cat_file(self, *args: Any, **kwargs: Any) -> Any:
         return await self._instrument("get", super()._cat_file(*args, **kwargs))
 
@@ -196,6 +197,12 @@ class IngestionS3FileSystem(s3fs.S3FileSystem):  # type: ignore[misc]  # untyped
 
     async def _rm_file(self, *args: Any, **kwargs: Any) -> Any:
         return await self._instrument("delete", super()._rm_file(*args, **kwargs))
+
+    async def _bulk_delete(self, *args: Any, **kwargs: Any) -> Any:
+        # ``S3FileSystem.rm`` routes every removal through ``_bulk_delete``
+        # (DeleteObjects), never through ``_rm_file`` — without this wrapper
+        # object deletions are invisible to the storage metrics entirely.
+        return await self._instrument("delete", super()._bulk_delete(*args, **kwargs))
 
     async def _ls(self, *args: Any, **kwargs: Any) -> Any:
         return await self._instrument("list", super()._ls(*args, **kwargs))

@@ -6,6 +6,7 @@ Zero live NOAA, zero production S3.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from ingestion.core.catalog import (
     _reconcile_catalog_to_store,
 )
 from ingestion.core.db import CatalogBase
+from ingestion.gc import worker as worker_mod
 from ingestion.gc.planner import plan_reclamation_pass
 from ingestion.gc.worker import (
     requeue_failed_reclamation_targets,
@@ -1501,3 +1503,97 @@ def test_i14_worker_backfills_baseline_for_pre_migration_row(catalog_engine, tmp
         row = session.get(ReclamationQueueRecord, "legacy_row")
         assert row.status == RECLAMATION_STATUS_DELETED
         assert row.store_generation == "gen-legacy-9"
+
+
+# ===========================================================================
+# 46. Physical removal is issued as bounded DeleteObjects batches
+# ===========================================================================
+
+
+class _RecordingS3Fs:
+    """Control-plane filesystem stand-in that records rm() batches."""
+
+    def __init__(self, fail_on_call: int | None = None) -> None:
+        self.calls: list[list[str]] = []
+        self._fail_on_call = fail_on_call
+
+    def exists(self, path: str) -> bool:
+        raise AssertionError(f"physical removal must not probe existence: {path}")
+
+    def rm(self, paths: list[str]) -> None:
+        self.calls.append(list(paths))
+        if self._fail_on_call is not None and len(self.calls) == self._fail_on_call:
+            raise OSError("simulated DeleteObjects failure")
+
+
+def test_46_batch_delete_chunks_requests_and_skips_existence_probes(monkeypatch):
+    fake = _RecordingS3Fs()
+    monkeypatch.setattr(worker_mod, "get_control_s3_fs", lambda *a, **k: fake)
+    store = "s3://weather-data/gfs/2026-09-17/06/cycle.zarr"
+    keys = [
+        make_shard_relative_key("temperature_2m", TARGET_KIND_DET, lead)
+        for lead in range(2500)
+    ]
+
+    submitted = worker_mod._delete_physical_objects_batch(store, keys)
+
+    assert submitted == 2500
+    assert [len(chunk) for chunk in fake.calls] == [1000, 1000, 500]
+    assert fake.calls[0][0] == f"weather-data/gfs/2026-09-17/06/cycle.zarr/{keys[0]}"
+
+
+def test_46_batch_delete_continues_past_a_failed_chunk(monkeypatch, caplog):
+    fake = _RecordingS3Fs(fail_on_call=2)
+    monkeypatch.setattr(worker_mod, "get_control_s3_fs", lambda *a, **k: fake)
+    keys = [f"temperature_2m/shard.det_L{lead:04d}.shard" for lead in range(2500)]
+
+    with caplog.at_level(logging.WARNING, logger="ingestion.gc.worker"):
+        submitted = worker_mod._delete_physical_objects_batch("s3://weather-data/s.zarr", keys)
+
+    assert submitted == 2500
+    # The failing chunk is logged and the remaining chunk is still submitted.
+    assert len(fake.calls) == 3
+    assert any("batch rm" in record.getMessage() for record in caplog.records)
+
+
+def test_46_batch_delete_is_a_noop_for_empty_input(monkeypatch):
+    fake = _RecordingS3Fs()
+    monkeypatch.setattr(worker_mod, "get_control_s3_fs", lambda *a, **k: fake)
+
+    assert worker_mod._delete_physical_objects_batch("s3://weather-data/s.zarr", []) == 0
+    assert fake.calls == []
+
+
+def test_46_worker_removes_a_store_group_in_one_batched_call(
+    catalog_engine, tmp_path, monkeypatch
+):
+    c0 = _dt(2026, 9, 1, 0)
+    store_dir = tmp_path / "c0"
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", store_dir)
+    _seed_gfs_products(
+        catalog_engine,
+        r0,
+        [6, 9, 12, 15, 18],
+        ["temperature_2m", "precipitation_rate"],
+        store_dir,
+    )
+
+    calls: list[tuple[str, list[str]]] = []
+    real = worker_mod._delete_physical_objects_batch
+
+    def _spy(store_path, physical_keys):
+        calls.append((store_path, list(physical_keys)))
+        return real(store_path, physical_keys)
+
+    monkeypatch.setattr(worker_mod, "_delete_physical_objects_batch", _spy)
+
+    now = _dt(2026, 9, 2, 12)
+    with Session(catalog_engine) as session:
+        plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        w_res = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+
+    assert w_res.deleted_count >= 1
+    assert len(calls) == 1, "one store group must issue exactly one batched removal"
+    assert w_res.deleted_count == len(calls[0][1])
+    for key in calls[0][1]:
+        assert not (store_dir / key).exists()
