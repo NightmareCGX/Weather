@@ -239,9 +239,35 @@ def filter_candidates_by_physical_fence(
     """Filter out or narrow candidates whose physical shards are fenced.
 
     fenced_keys contains (run_id, lead_time_hours, variable_code, target_kind, member_index).
+
+    The fenced set is indexed once into three projections, so each membership
+    test below is a single hash lookup. The projections are exact
+    transliterations of the per-key predicates this function used to evaluate
+    by scanning ``fenced_keys``:
+
+    * ``fenced_variable_keys`` <- ``fk[3] in ("det", "mean")`` guard on the
+      per-variable test (the member axis is deliberately absent from it);
+    * ``fenced_member_keys``   <- the per-member test, which matches on
+      ``(run_id, lead, member)`` with no variable component;
+    * ``fenced_mean_run_leads`` <- the ``fk[3] == "mean"`` guard on the
+      whole-lead mean test.
+
+    Scanning instead of indexing made the caller O(candidates x variables x
+    |fenced_keys|): with the production fenced set at ~2.8e5 entries and ~7.8e2
+    candidates that is ~1e10 Python iterations per worker revalidation pass.
     """
     if not fenced_keys:
         return candidates_by_valid
+
+    fenced_variable_keys = {
+        (fk[0], fk[1], fk[2]) for fk in fenced_keys if fk[3] in ("det", "mean")
+    }
+    fenced_member_keys = {
+        (fk[0], fk[1], fk[4]) for fk in fenced_keys if fk[3] == "mem"
+    }
+    fenced_mean_run_leads = {
+        (fk[0], fk[1]) for fk in fenced_keys if fk[3] == "mean"
+    }
 
     out: dict[datetime, list[CanonicalCandidate]] = {}
     for v_time, cands in candidates_by_valid.items():
@@ -253,34 +279,17 @@ def filter_candidates_by_physical_fence(
             active_vars = {
                 v
                 for v in cand.variables
-                if not any(
-                    fk[0] == r_id
-                    and fk[1] == lead
-                    and fk[2] == v
-                    and fk[3] in ("det", "mean")
-                    for fk in fenced_keys
-                )
+                if (r_id, lead, v) not in fenced_variable_keys
             }
 
             if is_ensemble and cand.member_indices is not None:
                 m_indices = cand.member_indices
                 avail_members = [
-                    m
-                    for m in m_indices
-                    if not any(
-                        fk[0] == r_id
-                        and fk[1] == lead
-                        and fk[3] == "mem"
-                        and fk[4] == m
-                        for fk in fenced_keys
-                    )
+                    m for m in m_indices if (r_id, lead, m) not in fenced_member_keys
                 ]
                 if not is_lead_servable(len(avail_members), expected_members):
                     continue
-                mean_fenced = any(
-                    fk[0] == r_id and fk[1] == lead and fk[3] == "mean"
-                    for fk in fenced_keys
-                )
+                mean_fenced = (r_id, lead) in fenced_mean_run_leads
                 prod_types = (
                     cand.product_types - {"ensemble_mean"}
                     if mean_fenced

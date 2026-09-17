@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import or_, select
 from sqlalchemy.engine import Engine
@@ -99,6 +99,60 @@ def _delete_physical_object(store_path: str, physical_key: str) -> None:
 def _delete_region_marker_object(store_path: str, marker_key: str) -> None:
     """Delete a region commit marker object idempotently."""
     _delete_physical_object(store_path, marker_key)
+
+
+#: DeleteObjects accepts at most 1000 keys in a single request.
+_S3_BULK_DELETE_MAX_KEYS = 1000
+
+
+def _delete_physical_objects_batch(store_path: str, physical_keys: Sequence[str]) -> int:
+    """Delete physical objects idempotently, one request per bounded batch.
+
+    S3/MinIO uses DeleteObjects (<=1000 keys per request). A key that is
+    already absent is a success for that API, so no per-object existence probe
+    is issued — the single-object path's ``exists()`` HEAD is pure request
+    overhead, and a worker pass removes thousands of objects.
+
+    A failing chunk is logged and treated as done: that is the same outcome the
+    single-object helper produced by swallowing its own error, so the caller's
+    reclaimed marking is unchanged. DeleteObjects cannot attribute failures per
+    key (s3fs issues it with ``Quiet: True`` and drops the error entries), so
+    failures are reported at chunk granularity; the S3 layer's
+    ``weather_storage_operation_failures_total{operation="delete"}`` counter
+    records each failed request.
+
+    Returns the number of keys submitted for deletion.
+    """
+    if not physical_keys:
+        return 0
+
+    if store_path.startswith("s3://"):
+        fs = get_control_s3_fs(settings)
+        clean_store = store_path[len("s3://") :].rstrip("/")
+        raw_paths = [f"{clean_store}/{key.lstrip('/')}" for key in physical_keys]
+        for start in range(0, len(raw_paths), _S3_BULK_DELETE_MAX_KEYS):
+            chunk = raw_paths[start : start + _S3_BULK_DELETE_MAX_KEYS]
+            try:
+                fs.rm(chunk)
+            except Exception as exc:
+                logger.warning(
+                    "S3 batch rm of %d objects under %s failed (ignoring error, "
+                    "matching the single-object path): %s",
+                    len(chunk),
+                    store_path,
+                    exc,
+                )
+        return len(raw_paths)
+
+    base = store_path[len("file://") :] if store_path.startswith("file://") else store_path
+    for physical_key in physical_keys:
+        full_path = os.path.join(base, physical_key)
+        try:
+            if os.path.exists(full_path):
+                os.remove(full_path)
+        except OSError:
+            pass
+    return len(physical_keys)
 
 
 def _physical_object_exists(store_path: str, physical_key: str) -> bool:
@@ -205,19 +259,22 @@ def run_reclamation_worker_pass(
     since the recorded baseline — physical evidence of replacement.
     Step 5: Perform Counterfactual Semantic Revalidation (claimed batch evaluated as physically present).
     Step 6: If target required, revert to 'queued' and clear lease.
-    Step 7: If DeleteObject authorized (delete_enabled=True), delete physical shard and mark 'deleted'.
+    Step 7: If DeleteObject authorized (delete_enabled=True), remove the store's
+    authorized shards in bounded DeleteObjects batches and mark them 'deleted'.
     Step 8: Check and delete region markers dynamically derived from catalog commit records.
     """
     now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
     b_size = batch_size if batch_size is not None else settings.RECLAMATION_BATCH_SIZE
     l_secs = lease_seconds if lease_seconds is not None else settings.RECLAMATION_LEASE_SECONDS
     del_en = delete_enabled if delete_enabled is not None else settings.RECLAMATION_DELETE_ENABLED
-    m_retries = max_retries if max_retries is not None else settings.RECLAMATION_MAX_RETRIES
-    b_backoff = (
-        base_backoff_seconds
-        if base_backoff_seconds is not None
-        else settings.RECLAMATION_BASE_BACKOFF_SECONDS
-    )
+    # ``max_retries`` / ``base_backoff_seconds`` stay in the signature for API
+    # compatibility but no longer drive this path: the previous per-target
+    # retry/quarantine branch was unreachable (the single-object delete helper
+    # swallowed every error, so a failed delete was recorded as reclaimed), and
+    # DeleteObjects cannot attribute failures per key. Chunk-level failures are
+    # reported by ``_delete_physical_objects_batch`` instead. Restoring
+    # per-target retry/quarantine changes what status a row gets on failure, so
+    # it is deliberately out of scope here.
     lease_until = now_utc + timedelta(seconds=l_secs)
 
     is_postgres = bool(session.bind and session.bind.dialect.name == "postgresql")
@@ -573,8 +630,13 @@ def run_reclamation_worker_pass(
                         # Counterpart not terminal → pair not jointly evaluated yet.
                         deferred_pair_ids.add(target.id)
 
-            # 4. Process each target in the store's claimed batch
+            # 4. Authorize every target in the store's claimed batch. Each
+            # eligibility decision below (wind-pair atomicity, counterfactual
+            # fence, delete authorization) is still evaluated per target, in
+            # the same order as before; only the physical removal is deferred
+            # to the batched pass that follows.
             deleted_targets_for_store: list[ReclamationQueueRecord] = []
+            authorized_targets: list[ReclamationQueueRecord] = []
             for target in targets:
                 if target.id in deferred_pair_ids:
                     target.status = RECLAMATION_STATUS_QUEUED
@@ -614,29 +676,24 @@ def run_reclamation_worker_pass(
                     target.updated_at = now_utc
                     continue
 
-                try:
-                    _delete_physical_object(target.store_path, target.physical_key)
-                    target.status = RECLAMATION_STATUS_DELETED
-                    target.reclaimed_at = now_utc
-                    target.lease_expires_at = None
-                    target.last_error = None
-                    target.updated_at = now_utc
-                    deleted_targets_for_store.append(target)
-                    total_deleted += 1
-                except Exception as exc:
-                    logger.error("Physical delete failed on %s: %s", target.physical_key, exc)
-                    if target.attempt_count >= m_retries:
-                        target.status = RECLAMATION_STATUS_FAILED
-                        target.lease_expires_at = None
-                        target.last_error = f"max_retries_exceeded: {exc}"
-                        total_failed += 1
-                    else:
-                        backoff = b_backoff * (2 ** target.attempt_count)
-                        target.status = RECLAMATION_STATUS_QUEUED
-                        target.lease_expires_at = None
-                        target.next_retry_at = now_utc + timedelta(seconds=backoff)
-                        target.last_error = f"delete_error: {exc}"
-                    target.updated_at = now_utc
+                authorized_targets.append(target)
+
+            # 5. Batched physical removal. Every target in this group shares the
+            # group's store_path, so the whole authorized set is removed with
+            # one DeleteObjects request per <=1000 keys instead of one
+            # exists() HEAD + one single-key request per object.
+            _delete_physical_objects_batch(
+                store_path, [t.physical_key for t in authorized_targets]
+            )
+
+            for target in authorized_targets:
+                target.status = RECLAMATION_STATUS_DELETED
+                target.reclaimed_at = now_utc
+                target.lease_expires_at = None
+                target.last_error = None
+                target.updated_at = now_utc
+                deleted_targets_for_store.append(target)
+                total_deleted += 1
 
             session.commit()
 

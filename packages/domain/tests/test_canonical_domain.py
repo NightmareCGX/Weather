@@ -5,7 +5,9 @@ Enforces 100% test coverage across all branches, helpers, and perspectives.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import random
+import time
+from datetime import UTC, datetime, timedelta
 
 from domain.canonical import (
     CanonicalCandidate,
@@ -15,6 +17,7 @@ from domain.canonical import (
     select_canonical_sources_bulk,
     select_variable_source,
 )
+from domain.coverage import is_lead_servable
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -364,3 +367,190 @@ def test_filter_candidates_by_physical_fence():
         {vt: [cand_gefs]}, fenced_mean, is_ensemble=True, expected_members=30
     )
     assert "ensemble_mean" not in filtered_mean[vt][0].product_types
+
+
+def _reference_filter_candidates_by_physical_fence(
+    candidates_by_valid: dict[datetime, list[CanonicalCandidate]],
+    fenced_keys: set[tuple[str, int, str, str, int]],
+    is_ensemble: bool = False,
+    expected_members: int = 30,
+) -> dict[datetime, list[CanonicalCandidate]]:
+    """Literal transliteration of the pre-optimisation linear-scan implementation.
+
+    This is the semantic ground truth the indexed implementation is asserted
+    against; it deliberately keeps the O(|fenced_keys|) ``any(...)`` scans.
+    """
+    if not fenced_keys:
+        return candidates_by_valid
+
+    out: dict[datetime, list[CanonicalCandidate]] = {}
+    for v_time, cands in candidates_by_valid.items():
+        filtered_cands: list[CanonicalCandidate] = []
+        for cand in cands:
+            r_id = cand.run_id
+            lead = cand.lead_time_hours
+
+            active_vars = {
+                v
+                for v in cand.variables
+                if not any(
+                    fk[0] == r_id
+                    and fk[1] == lead
+                    and fk[2] == v
+                    and fk[3] in ("det", "mean")
+                    for fk in fenced_keys
+                )
+            }
+
+            if is_ensemble and cand.member_indices is not None:
+                m_indices = cand.member_indices
+                avail_members = [
+                    m
+                    for m in m_indices
+                    if not any(
+                        fk[0] == r_id
+                        and fk[1] == lead
+                        and fk[3] == "mem"
+                        and fk[4] == m
+                        for fk in fenced_keys
+                    )
+                ]
+                if not is_lead_servable(len(avail_members), expected_members):
+                    continue
+                mean_fenced = any(
+                    fk[0] == r_id and fk[1] == lead and fk[3] == "mean"
+                    for fk in fenced_keys
+                )
+                prod_types = (
+                    cand.product_types - {"ensemble_mean"}
+                    if mean_fenced
+                    else cand.product_types
+                )
+                cand = CanonicalCandidate(
+                    cycle_time=cand.cycle_time,
+                    lead_time_hours=cand.lead_time_hours,
+                    run_id=cand.run_id,
+                    store_path=cand.store_path,
+                    product_types=prod_types,
+                    variables=frozenset(active_vars),
+                    member_indices=tuple(avail_members),
+                    status=cand.status,
+                )
+            else:
+                if cand.variables and not active_vars:
+                    continue
+                cand = CanonicalCandidate(
+                    cycle_time=cand.cycle_time,
+                    lead_time_hours=cand.lead_time_hours,
+                    run_id=cand.run_id,
+                    store_path=cand.store_path,
+                    product_types=cand.product_types,
+                    variables=frozenset(active_vars),
+                    member_indices=cand.member_indices,
+                    status=cand.status,
+                )
+            filtered_cands.append(cand)
+        if filtered_cands:
+            out[v_time] = filtered_cands
+    return out
+
+
+def test_filter_candidates_matches_reference_on_randomised_inputs():
+    """The indexed implementation must be output-identical to the scan baseline.
+
+    Randomised differential test over mixed determinstic/mean/member fences,
+    both ensemble and non-ensemble evaluation, and run/lead combinations that
+    are fenced, unfenced, and absent from the candidate set.
+    """
+    rng = random.Random(20260917)
+    all_vars = ["temperature_2m", "precipitation_rate", "wind_u_10m"]
+    kinds = ["det", "mean", "mem"]
+
+    # Guarantee every kind appears so both outcomes of each projection's
+    # filter predicate are exercised deterministically.
+    base_keys = [
+        ("run_a", 6, "temperature_2m", "det", 0),
+        ("run_a", 6, "temperature_2m", "mean", -1),
+        ("run_a", 6, "temperature_2m", "mem", 1),
+    ]
+
+    for _ in range(200):
+        fenced = set(base_keys)
+        for _ in range(rng.randrange(0, 25)):
+            fenced.add(
+                (
+                    rng.choice(["run_a", "run_b", "run_absent"]),
+                    rng.choice([0, 6, 12]),
+                    rng.choice(all_vars),
+                    rng.choice(kinds),
+                    rng.choice([-1, 0, 1, 2, 30, 31]),
+                )
+            )
+
+        cands_map: dict[datetime, list[CanonicalCandidate]] = {}
+        for idx in range(rng.randrange(1, 4)):
+            vt = _dt(2026, 9, 10, 0) + timedelta(hours=6 * idx + rng.choice([0, 3]))
+            members = tuple(range(1, rng.choice([31, 30, 5]) + 1))
+            cands_map.setdefault(vt, []).append(
+                CanonicalCandidate(
+                    cycle_time=_dt(2026, 9, 10, 0),
+                    lead_time_hours=rng.choice([0, 6, 12]),
+                    run_id=rng.choice(["run_a", "run_b"]),
+                    store_path="s3://store",
+                    product_types=frozenset(
+                        rng.choice([{"surface"}, {"surface", "ensemble_mean"}])
+                    ),
+                    variables=frozenset(
+                        rng.sample(all_vars, rng.randrange(1, len(all_vars) + 1))
+                    ),
+                    member_indices=members if rng.random() < 0.6 else None,
+                )
+            )
+
+        is_ensemble = rng.random() < 0.5
+        expected_members = rng.choice([30, 5, 31])
+
+        assert filter_candidates_by_physical_fence(
+            cands_map, fenced, is_ensemble=is_ensemble, expected_members=expected_members
+        ) == _reference_filter_candidates_by_physical_fence(
+            cands_map, fenced, is_ensemble=is_ensemble, expected_members=expected_members
+        )
+
+
+def test_filter_candidates_scales_to_production_sized_fenced_set():
+    """Guard the O(candidates x variables x |fenced_keys|) regression.
+
+    Sized like the production worker revalidation (50k fenced units, 800
+    ensemble candidates with 30 members). The linear-scan implementation needs
+    roughly a minute on this input; the indexed one is sub-second, so the
+    ceiling below fails loudly on any reintroduced scan.
+    """
+    fenced = {
+        (f"run_{i % 12}", (i % 82) * 3, "temperature_2m", "mem", 1 + (i % 30))
+        for i in range(50_000)
+    }
+    fenced |= {(f"run_{i}", 0, "temperature_2m", "mean", -1) for i in range(12)}
+
+    cands_map: dict[datetime, list[CanonicalCandidate]] = {}
+    for lead in range(0, 240, 3):
+        for run in range(12):
+            cands_map.setdefault(_dt(2026, 9, 10, 0) + timedelta(hours=lead), []).append(
+                CanonicalCandidate(
+                    cycle_time=_dt(2026, 9, 10, 0),
+                    lead_time_hours=lead,
+                    run_id=f"run_{run}",
+                    store_path="s3://store",
+                    product_types=frozenset({"surface", "ensemble_mean"}),
+                    variables=frozenset({"temperature_2m", "precipitation_rate"}),
+                    member_indices=tuple(range(1, 31)),
+                )
+            )
+
+    started = time.perf_counter()
+    filtered = filter_candidates_by_physical_fence(
+        cands_map, fenced, is_ensemble=True, expected_members=30
+    )
+    elapsed = time.perf_counter() - started
+
+    assert filtered, "expected the fenced set to retain some candidates"
+    assert elapsed < 3.0, f"fence filter regressed to {elapsed:.2f}s"
