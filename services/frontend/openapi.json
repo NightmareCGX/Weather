@@ -447,7 +447,7 @@
     "/v1/forecast/availability": {
       "get": {
         "summary": "Get available forecast combinations",
-        "description": "Return the available model/variable/initial-time/lead-time structure.\n\nThe response is generated from the database on every request, so newly\ningested runs (new models, variables, initial times, or lead times)\nbecome visible automatically without any code or configuration change.",
+        "description": "Return the available model/variable/initial-time/lead-time structure.\n\nThe response is generated from the database on every request, so newly\ningested runs (new models, variables, initial times, or lead times)\nbecome visible automatically without any code or configuration change.\n\nWhen the caller presents an ``If-None-Match`` that matches the current\npayload, a bodyless ``304`` is returned instead of the full payload.",
         "operationId": "get_forecast_availability_v1_forecast_availability_get",
         "responses": {
           "200": {
@@ -2523,12 +2523,45 @@
             },
             "type": "array",
             "title": "Variables"
+          },
+          "center_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Center Id"
+          },
+          "center_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Center Name"
+          },
+          "cycle_cadence_hours": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cycle Cadence Hours"
           }
         },
         "type": "object",
         "required": ["id", "name", "is_ensemble", "variables"],
         "title": "ModelAvailability",
-        "description": "A forecast model and the variables available for it.\n\nAttributes:\n    id: The ``models.model_id`` (e.g. ``gfs``).\n    name: Human-readable model name.\n    is_ensemble: Whether the model is an ensemble product.\n    variables: The variables with ready forecast data for this model,\n        ordered by variable code."
+        "description": "A forecast model and the variables available for it.\n\nAttributes:\n    id: The ``models.model_id`` (e.g. ``gfs``).\n    name: Human-readable model name.\n    is_ensemble: Whether the model is an ensemble product.\n    variables: The variables with ready forecast data for this model,\n        ordered by variable code.\n    center_id: The ``models.center_id`` (e.g. ``noaa``), the natural key of\n        the issuing forecast center. Lets a client group models by center\n        without a second catalog request.\n    center_name: Human-readable center name. ``None`` when the center row\n        is absent.\n    cycle_cadence_hours: The model's authoritative cycle interval in hours,\n        resolved from the ``domain.cadence`` registry with a 6-hour\n        fallback for unregistered models. Clients use it to distinguish a\n        merely old cycle from a genuinely stalled feed."
       },
       "ModelOut": {
         "properties": {

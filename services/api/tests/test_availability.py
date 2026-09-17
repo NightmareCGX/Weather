@@ -78,3 +78,50 @@ def test_availability_empty_database(client):
     for variable in gfs["variables"]:
         for initial in variable["initial_times"]:
             assert initial["value"] == "2026-07-21T00:00:00Z"
+
+
+def test_availability_exposes_issuing_center_and_cadence(client):
+    """Each model carries its issuing center and authoritative cycle cadence.
+
+    These are additive fields consumed by the header status badge to group
+    models per forecast center and to tell an old-but-healthy cycle apart from
+    a stalled feed. The center is resolved from the ``models`` row already
+    joined by the availability query, so no extra roundtrip is incurred.
+    """
+    resp = client.get("/v1/forecast/availability")
+    by_id = {m["id"]: m for m in resp.json()["data"]["models"]}
+
+    for model in by_id.values():
+        assert model["center_id"] == "noaa"
+        assert model["center_name"] == "National Oceanic and Atmospheric Administration"
+        # Both seeded models are registered in domain.cadence as 6-hourly.
+        assert model["cycle_cadence_hours"] == 6
+
+
+def test_availability_etag_revalidation_returns_304(client):
+    """A matching If-None-Match yields a bodyless 304 with the same headers.
+
+    The frontend re-polls this ~444KB payload every 60s, so revalidation is
+    what keeps that poll cheap. The tag must survive ``generated_at`` changing
+    on every request -- an ETag over the whole payload would never match.
+    """
+    first = client.get("/v1/forecast/availability")
+    assert first.status_code == 200
+    etag = first.headers["ETag"]
+    assert etag
+    assert first.headers["Cache-Control"] == "no-cache"
+
+    second = client.get("/v1/forecast/availability", headers={"If-None-Match": etag})
+    assert second.status_code == 304
+    assert second.content == b""
+    assert second.headers["ETag"] == etag
+    assert second.headers["Cache-Control"] == "no-cache"
+
+
+def test_availability_etag_differs_for_stale_if_none_match(client):
+    """A non-matching If-None-Match still returns the full payload."""
+    resp = client.get(
+        "/v1/forecast/availability", headers={"If-None-Match": '"not-the-current-tag"'}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["models"]

@@ -315,6 +315,12 @@ export interface EnsembleStatisticsData {
 export interface InitialTimeAvailability {
   value: string;
   lead_time_hours: number[];
+  /**
+   * The run's lifecycle status: `ready`, `processing`, or `partial`.
+   * The backend exposes this as optional; the header status badge reads it to
+   * tell an in-flight cycle apart from a stalled feed.
+   */
+  status?: string | null;
 }
 
 export type LegendStop = readonly [number, string];
@@ -354,12 +360,22 @@ export interface VariableAvailability {
   layer?: LayerDescriptor | null;
 }
 
-/** A forecast model and the variables available for it. */
+/**
+ * A forecast model and the variables available for it.
+ *
+ * `center_id`/`center_name` identify the issuing forecast center (e.g. NOAA),
+ * letting the header group models per center without a second catalog
+ * request. `cycle_cadence_hours` is the model's authoritative cycle interval,
+ * used to distinguish an old-but-healthy cycle from a stalled feed.
+ */
 export interface ModelAvailability {
   id: string;
   name: string;
   is_ensemble: boolean;
   variables: VariableAvailability[];
+  center_id?: string | null;
+  center_name?: string | null;
+  cycle_cadence_hours?: number | null;
 }
 
 /** The payload of the forecast availability endpoint. */
