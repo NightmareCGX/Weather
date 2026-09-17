@@ -209,12 +209,24 @@ class ModelAvailability(BaseModel):
         is_ensemble: Whether the model is an ensemble product.
         variables: The variables with ready forecast data for this model,
             ordered by variable code.
+        center_id: The ``models.center_id`` (e.g. ``noaa``), the natural key of
+            the issuing forecast center. Lets a client group models by center
+            without a second catalog request.
+        center_name: Human-readable center name. ``None`` when the center row
+            is absent.
+        cycle_cadence_hours: The model's authoritative cycle interval in hours,
+            resolved from the ``domain.cadence`` registry with a 6-hour
+            fallback for unregistered models. Clients use it to distinguish a
+            merely old cycle from a genuinely stalled feed.
     """
 
     id: str
     name: str
     is_ensemble: bool
     variables: list[VariableAvailability]
+    center_id: str | None = None
+    center_name: str | None = None
+    cycle_cadence_hours: int | None = None
 
 
 class ForecastAvailabilityData(BaseModel):

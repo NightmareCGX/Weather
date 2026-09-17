@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from domain.cadence import canonical_cycle_cadence_hours
 from domain.coverage import (
     compute_coverage_ratio,
     get_expected_members,
@@ -29,6 +30,7 @@ from api.core.time import get_current_time
 
 from api.models.entities import (
     EnsembleMemberProduct,
+    ForecastCenter,
     ForecastProduct,
     ForecastVariable,
     Model,
@@ -90,11 +92,17 @@ class _ModelAccumulator:
         name: Human-readable model name.
         is_ensemble: Whether the model is an ensemble product.
         variables: Map of variable code to its accumulator.
+        center_id: The issuing center's natural key, carried through from the
+            ``models`` row already joined by the main query.
+        center_name: Human-readable center name, or ``None`` when the center
+            row is absent.
     """
 
     name: str
     is_ensemble: bool
     variables: dict[str, _VariableAccumulator] = field(default_factory=dict)
+    center_id: str | None = None
+    center_name: str | None = None
 
 
 def build_forecast_availability(
@@ -140,6 +148,8 @@ def build_forecast_availability(
             Model.model_id,
             Model.name,
             Model.is_ensemble,
+            Model.center_id,
+            ForecastCenter.name,
             ForecastVariable.variable_code,
             ForecastVariable.name,
             ForecastVariable.unit,
@@ -151,6 +161,10 @@ def build_forecast_availability(
         .select_from(ModelRun)
         .join(ModelVersion, ModelRun.model_version_id == ModelVersion.id)
         .join(Model, ModelVersion.model_id == Model.model_id)
+        # Left-joined so a model whose center row is missing still surfaces its
+        # availability (with a null center) instead of vanishing from the
+        # response entirely.
+        .outerjoin(ForecastCenter, Model.center_id == ForecastCenter.center_id)
         .join(ForecastProduct, ForecastProduct.run_id == ModelRun.id)
         .join(
             ForecastVariable,
@@ -218,6 +232,8 @@ def build_forecast_availability(
         model_id,
         model_name,
         is_ensemble,
+        center_id,
+        center_name,
         variable_code,
         variable_name,
         variable_unit,
@@ -233,7 +249,12 @@ def build_forecast_availability(
         )
         model_acc = by_model.setdefault(
             model_id,
-            _ModelAccumulator(name=model_name, is_ensemble=is_ensemble),
+            _ModelAccumulator(
+                name=model_name,
+                is_ensemble=is_ensemble,
+                center_id=center_id,
+                center_name=center_name,
+            ),
         )
         variable_acc = model_acc.variables.setdefault(
             variable_code,
@@ -453,6 +474,15 @@ def build_forecast_availability(
                 name=model_acc.name,
                 is_ensemble=model_acc.is_ensemble,
                 variables=variables,
+                center_id=model_acc.center_id,
+                center_name=model_acc.center_name,
+                # ``default_if_unknown`` is mandatory here: an ingested model
+                # whose cycle cadence is not yet registered must degrade to the
+                # 6-hour platform default rather than raise and fail the whole
+                # availability response for every model.
+                cycle_cadence_hours=canonical_cycle_cadence_hours(
+                    model_id, default_if_unknown=6
+                ),
             )
         )
 
