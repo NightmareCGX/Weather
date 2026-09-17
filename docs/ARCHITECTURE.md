@@ -391,7 +391,7 @@ The infrastructure endpoint `GET /v1/locate` serves two distinct purposes in the
   • Automatic, best-effort on mount • Explicit user click on Locate Me
   • Ambient context only            • Invoked ONLY on POSITION_UNAVAILABLE or TIMEOUT
   • NO SelectedLocation             • Commits canonical SelectedLocation
-  • Regional easeTo (zoom 6.5)      • Point flyTo (zoom 8) + opens forecast
+  • Regional easeTo (5-9 tiles)      • Point flyTo (zoom 8) + opens forecast
   • Fails silently to CONUS/UTC     • NEVER called on PERMISSION_DENIED (Privacy Invariant)
 ```
 
@@ -419,7 +419,9 @@ The infrastructure endpoint `GET /v1/locate` serves two distinct purposes in the
 
 ### 11.4 Startup Camera Transition & Race Protection
 
-When startup coarse IP coordinates arrive, the map gently transitions from the default CONUS view (`[-106.8, 39.2]`, zoom 5) to the approximate regional viewport (`zoom: 6.5`, duration 800ms).
+When startup coarse IP coordinates arrive, the map gently transitions from the default CONUS view (`[-106.8, 39.2]`, zoom 5) to the approximate regional viewport (duration 800ms).
+
+The regional viewport is sized by a **tile budget** rather than a fixed zoom: `startupViewZoom()` (`src/lib/map/startupView.ts`) frames `STARTUP_TILE_SPAN` (3) tiles of the `STARTUP_TILE_ZOOM` (z8) Web-Mercator grid across the measured map width, which on a landscape viewport is a 3x2 region — about 6 tiles, roughly 360 km of ground across at mid-latitudes — and keeps that width on any display while the height follows the viewport aspect. Sizing the ground area rather than the zoom is deliberate: MapLibre renders the world at `512 * 2^zoom` CSS px, so one fixed zoom frames a different amount of ground on every viewport, and the number of tiles on screen is a function of viewport pixels alone. Unmeasurable viewports (hidden container, no layout) fall back to the tile grid's nominal zoom.
 
 Startup auto-centering is a **one-time opportunity** guarded by `startupAutoCenterEligibleRef`. It permanently expires when ANY of the following occurs:
 1. The startup IP camera transition (`map.easeTo`) is successfully applied.

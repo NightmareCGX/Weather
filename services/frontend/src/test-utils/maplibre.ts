@@ -101,6 +101,13 @@ export class MockMap {
   easeTo = jest.fn();
   getZoom = jest.fn(() => 5);
   getCenter = jest.fn(() => ({ lng: -106.8, lat: 39.2 }));
+  /**
+   * Viewport width reported by ``getContainer()``. jsdom performs no layout, so
+   * the faithful default is 0 (an unmeasurable viewport); tests that care about
+   * viewport-derived behavior assign a width before the code under test runs.
+   */
+  containerWidth = 0;
+  getContainer = jest.fn(() => ({ clientWidth: this.containerWidth }));
   remove = jest.fn(() => {
     this.removed = true;
   });

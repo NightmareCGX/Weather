@@ -12,6 +12,7 @@ import type {
 } from "@/lib/api/types";
 import { buildBaseStyle } from "@/lib/map/baseStyle";
 import { applyWeatherLayer, removeWeatherLayer } from "@/lib/map/layers";
+import { startupViewZoom } from "@/lib/map/startupView";
 import { canonicalizeLongitude, coordinatesToSelectedLocation } from "@/lib/forecast/selection";
 import { LocateMeButton } from "@/components/map/LocateMeButton";
 import { ParticleToggleButton } from "@/components/map/ParticleToggleButton";
@@ -309,7 +310,7 @@ export function WeatherMap({
     if (typeof map.easeTo === "function") {
       map.easeTo({
         center: [approximateLocation.longitude, approximateLocation.latitude],
-        zoom: 6.5,
+        zoom: startupViewZoom(map.getContainer?.()?.clientWidth ?? null),
         duration: 800,
         essential: false,
       });
