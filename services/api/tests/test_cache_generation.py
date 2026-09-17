@@ -132,3 +132,15 @@ def test_ensemble_series_cache_key_behavior() -> None:
         serving_generation="gen2",
     )
     assert key1 != key_diff_gen
+
+    # Contract: Coordinates are normalized to 3 decimal places (~100m grid) to prevent cache thrashing.
+    key_rounded = build_ensemble_series_cache_key(
+        model="gefs",
+        latitude=38.50012,
+        longitude=-106.50049,
+        variable="temperature_2m",
+        leads=(0, 3, 6),
+        cycle_time="2026-07-22T00:00:00Z",
+        serving_generation="gen1",
+    )
+    assert key1 == key_rounded
