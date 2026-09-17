@@ -1,8 +1,12 @@
+import logging
+import os
 from pathlib import Path
 from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 def find_repository_root(start_path: Path | None = None) -> Path | None:
@@ -140,6 +144,47 @@ class Settings(BaseSettings):
     # reader holds its own cache and the API container runs near its memory limit.
     API_READER_MAX_CACHED_CHUNKS: int = Field(default=512, ge=1, le=8192)
 
+    # Shard-index LRU ceiling per ShardedV1Reader, counted in shards: one entry is
+    # the 120-chunk ``(offset, length)`` index trailer of a single
+    # (variable, member, lead) shard.
+    #
+    # Previously hardcoded to 4096 in the reader, which was undersized for ensemble
+    # point series: a full 80-lead GEFS series resolves ~4.8k shard indexes for wind
+    # and ~14.4k for 3-hour precipitation (six variables per member), so one series
+    # already evicted itself and every repeat request re-issued every index Range GET.
+    # The index set is a property of (variable, member, lead) only — not of the
+    # requested point — so with a ceiling that holds one series, every later click on
+    # that cycle skips the index fetches entirely and pays only the chunk reads.
+    #
+    # 16384 entries is affordable because the index is stored as a (120, 2) uint64
+    # array (~2 KB) instead of a list of 120 Python tuples (~14 KB, measured 14.2 KB
+    # vs 2.0 KB): that is 4x the entries of the old hardcoded 4096 at roughly half the
+    # resident memory (measured ~32 MB vs ~57 MB per reader). Note the total multiplies
+    # by MAX_READERS (8) per process, so raising ``MAX_READERS`` or this ceiling should
+    # be paired with a container memory check.
+    API_READER_MAX_CACHED_INDICES: int = Field(default=16384, ge=1, le=262144)
+
+    # Interpolated-corner LRU ceiling per ShardedV1Reader, counted in 2x2 index
+    # windows (measured ~0.8 KB per entry, so ~25 MB at 32768).
+    #
+    # Bilinear interpolation needs only the four corner values of a 2x2 window, but
+    # the chunk cache below it is keyed by whole 100x100 chunks (~40 KB). That
+    # granularity mismatch means the 512-entry chunk cache covers 512
+    # (variable, member, lead) combinations for ~20 MB, while one 80-lead 3-hour
+    # precipitation series resolves 30 members x 6 variables x 80 leads = 14400 of
+    # them. Caching the four resulting values instead costs ~0.8 KB per combination, so
+    # this ceiling covers 64x more combinations for a comparable footprint (and a hit
+    # skips the index lookup, the chunk fetch, and the zstd decode outright). Total
+    # per-reader cache memory is therefore roughly unchanged from before this was
+    # added: index ~57 -> ~32 MB, plus this ~25 MB, against the same ~20 MB chunk
+    # cache.
+    #
+    # The corner values are independent of the fractional interpolation weights, so
+    # one entry serves every caller that lands on the same window -- including the
+    # precipitation predecessor lead (whose values this series already resolved three
+    # leads earlier) and the single-lead distribution request that follows a series.
+    API_READER_MAX_CACHED_POINTS: int = Field(default=32768, ge=1, le=1048576)
+
     # Map-tile PNG (IDAT) zlib compression level, constrained to the zlib range.
     # Level 1 is the serving default: on a 256x256 RGBA tile it compresses
     # several times faster than the zlib default of 6 for only a small size
@@ -236,6 +281,36 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def warn_about_ingestion_only_s3_pool() -> bool:
+    """Warn when the ingestion-only S3 pool setting is present but inert for the API.
+
+    Both tiers commonly share one ``.env``, so ``S3_MAX_POOL_CONNECTIONS`` (the
+    ingestion writer's pool) is often present in the API process environment.
+    ``extra="ignore"`` means it is silently discarded and the readers keep using
+    ``API_S3_MAX_POOL_CONNECTIONS``, so a deployment that tries to tune the API's s3fs
+    pool under the ingestion name sees no effect and no explanation for it.
+
+    Returns:
+        True when a warning was emitted (exposed for tests).
+    """
+    if (
+        os.environ.get("S3_MAX_POOL_CONNECTIONS") is not None
+        and os.environ.get("API_S3_MAX_POOL_CONNECTIONS") is None
+    ):
+        logger.warning(
+            "S3_MAX_POOL_CONNECTIONS=%s is the ingestion-only pool setting and is "
+            "ignored by the API tier, which uses API_S3_MAX_POOL_CONNECTIONS (currently "
+            "%s). Set API_S3_MAX_POOL_CONNECTIONS to tune the API's s3fs pool.",
+            os.environ["S3_MAX_POOL_CONNECTIONS"],
+            settings.API_S3_MAX_POOL_CONNECTIONS,
+        )
+        return True
+    return False
+
+
+warn_about_ingestion_only_s3_pool()
 
 from domain.coverage import set_min_coverage_ratio  # noqa: E402
 set_min_coverage_ratio(settings.ENSEMBLE_MIN_COVERAGE_RATIO)

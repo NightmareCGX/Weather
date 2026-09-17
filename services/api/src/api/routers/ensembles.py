@@ -121,12 +121,18 @@ def get_ensemble_statistics(
         lat_norm = round(float(lat), 3)
         lon_norm = round(float(lon), 3)
 
+        # Sort once and derive the cache key from the same object, so the key and the
+        # computation can never disagree about order. Two effects: a request that lists
+        # the same lead set in a different order cannot be served a response ordered for
+        # another caller, and the series is always computed in ascending lead order,
+        # which is what lets a lead divisible by 6 reuse the phase state its lead-3
+        # predecessor already resolved from the reader's caches.
         target_leads = (
             None
             if leads.strip().lower() == "all"
-            else [int(x.strip()) for x in leads.split(",") if x.strip().isdigit()]
+            else sorted(int(x.strip()) for x in leads.split(",") if x.strip().isdigit())
         )
-        canonical_leads = tuple(sorted(target_leads)) if target_leads is not None else "all"
+        canonical_leads = tuple(target_leads) if target_leads is not None else "all"
 
         series_initial = initial_time
         if series_initial is not None:
