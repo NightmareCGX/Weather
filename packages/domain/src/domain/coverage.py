@@ -100,6 +100,19 @@ def register_expected_members(model_id: str, count: int) -> None:
     MODEL_EXPECTED_MEMBERS[model_id.lower().strip()] = count
 
 
+def is_expected_members_registered(model_id: str) -> bool:
+    """Return whether a model has an explicit expected-member count.
+
+    Membership is a distinct question from the count: callers that pass
+    ``default_if_unknown`` get a value either way, so only this predicate can
+    distinguish a registered member contract from a silently assumed one.
+    Registration auditing (see :mod:`domain.model_registration`) uses it to
+    surface that difference, because a wrong member count silently distorts
+    every coverage ratio and servability decision derived from it.
+    """
+    return model_id.lower().strip() in MODEL_EXPECTED_MEMBERS
+
+
 def get_expected_members(
     model_id: str, default_if_unknown: int | None = None
 ) -> int:

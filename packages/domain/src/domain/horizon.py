@@ -112,6 +112,27 @@ def register_canonical_lead_horizon(
     MODEL_CANONICAL_HORIZONS[m_clean] = tuple(leads)
 
 
+def is_canonical_lead_horizon_registered(
+    model_id: str, version_string: str | None = None
+) -> bool:
+    """Return whether a model (optionally at a version) has a canonical horizon.
+
+    This is the predicate that separates the two outcomes of
+    :func:`canonical_lead_time_hours`: a registered model yields a horizon,
+    while an unregistered one raises unless the caller supplied a
+    ``default_if_unknown``. Callers that must not raise — the reclamation
+    planner, which has to keep planning for every *other* model — use this to
+    skip an unregistered model deliberately and loudly instead of letting a
+    ``ValueError`` escape.
+
+    A model reaches this registry's version map through
+    :func:`register_canonical_lead_horizon`, which always writes the model-level
+    entry too, so the model-level check alone is authoritative for "was this
+    model registered at all".
+    """
+    return model_id.lower().strip() in MODEL_CANONICAL_HORIZONS
+
+
 def canonical_lead_time_hours(
     model_id: str,
     version_string: str | None = None,

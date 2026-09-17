@@ -167,8 +167,14 @@ def _bk_result(*args, **kwargs):
     )
 
 
-def _plan_result():
-    return SimpleNamespace(dry_run=False, enqueued_count=7, reclaimable_shards=9)
+def _plan_result(skipped_models: tuple[str, ...] = ()):
+    """Stub mirroring ``ReclamationPlanResult``, including ``skipped_models``."""
+    return SimpleNamespace(
+        dry_run=False,
+        enqueued_count=7,
+        reclaimable_shards=9,
+        skipped_models=skipped_models,
+    )
 
 
 def _worker_result():
@@ -227,8 +233,68 @@ def test_gc_pipeline_pass_planner_only_staging(monkeypatch):
 
     assert "bookkeeping claimed=1 finalized=1" in summary
     assert "planner enqueued=7" in summary
+    # No models were skipped, so the summary stays quiet about them.
+    assert "skipped" not in summary
     assert "worker" not in summary
     worker_mock.assert_not_called()
+
+
+def test_gc_pipeline_pass_summary_names_skipped_models(monkeypatch):
+    """Models the planner skipped are named in the pass summary.
+
+    A skipped model means its canonical horizon is unregistered, so reclamation
+    is silently doing nothing for it. The pass summary is what an operator reads
+    from the daemon log, so the skip has to appear there rather than only in the
+    per-model error line.
+    """
+
+    _patch_pipeline_stages(
+        monkeypatch,
+        plan=MagicMock(return_value=_plan_result(skipped_models=("aigfs",))),
+    )
+
+    summary = _gc_pipeline_pass(
+        "engine://fake",
+        models=["gfs", "aigfs"],
+        enable_planner=True,
+        enable_delete=False,
+        enable_sweeper=False,
+        batch_size=50,
+    )
+
+    assert "planner enqueued=7" in summary
+    assert "skipped=aigfs" in summary
+
+
+def test_gc_pipeline_pass_tolerates_plan_result_without_skipped_models(monkeypatch):
+    """A plan result lacking ``skipped_models`` must not fail the stage.
+
+    The summary is diagnostics wrapped in the stage try/except, so reading an
+    absent attribute would report a *successful* planner pass as
+    ``planner=ERROR(AttributeError)`` — turning a reporting gap into a fake
+    failure.
+    """
+
+    _patch_pipeline_stages(
+        monkeypatch,
+        plan=MagicMock(
+            return_value=SimpleNamespace(
+                dry_run=False, enqueued_count=7, reclaimable_shards=9
+            )
+        ),
+    )
+
+    summary = _gc_pipeline_pass(
+        "engine://fake",
+        models=["gfs"],
+        enable_planner=True,
+        enable_delete=False,
+        enable_sweeper=False,
+        batch_size=50,
+    )
+
+    assert "planner enqueued=7" in summary
+    assert "ERROR" not in summary
 
 
 def test_gc_pipeline_pass_delete_authorized_runs_worker(monkeypatch):
