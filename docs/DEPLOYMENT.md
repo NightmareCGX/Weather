@@ -129,6 +129,11 @@ The platform enforces a deterministic configuration precedence hierarchy across 
 * `ELEVATION_API_KEY`: Optional API key for commercial Open-Meteo plans.
 * `ELEVATION_TIMEOUT_SECONDS`: Request socket timeout in seconds (default `2.0`).
 * `ELEVATION_CACHE_MAX`: Maximum entries in the bounded decaying coordinate cache (default `10000`).
+* `TRUST_CLOUDFLARE_LOCATION_HEADERS`: Trust Cloudflare `cf-*` visitor location headers (default `false`; only for origins firewalled to Cloudflare — see §7).
+* `LOCATE_PROVIDER`: `none` (default, `/v1/locate` answers 404) or `maxmind` (resolve the visitor address against a local GeoLite2 database — see §7).
+* `LOCATE_GEOIP_DB_PATH`: GeoLite2-City database path inside the container (default `/data/geoip/GeoLite2-City.mmdb`).
+* `LOCATE_PROXY_MODE`: `auto` (default: trust the gateway's `X-Real-IP` only when the socket peer is not routable), `always`, or `never`.
+* `GEOIP_DATA_DIR`: Host directory bind-mounted read-only at `/data/geoip` (default `./data/geoip`).
 
 ---
 
@@ -239,3 +244,63 @@ A green Buildx/QEMU build in GitHub Actions verifies cross-compilation and packa
 * PostgreSQL 18 / PostGIS 3.6 spatial query execution on ARM64.
 * Ingestion of live upstream NOAA GRIB2 byte streams with full ecCodes decoding and sharded Zarr writing.
 * Representative end-to-end point and map serving performance under load.
+
+---
+
+## 7. Coarse Visitor Location (GeoLite2)
+
+`GET /v1/locate` places the visitor's startup map viewport. On an origin with no CDN in front of it, the Cloudflare `cf-*` headers that the endpoint was originally built around can never arrive, so the visitor address is read off the request instead and resolved against a local MaxMind database.
+
+Provisioning is one host-side setup plus a recurring refresh. The endpoint degrades safely in every failure mode: with no database, an unknown address, or a non-routable peer it answers HTTP 404 and the frontend keeps its CONUS/UTC defaults. The API logs a single warning per process when the database file is missing, so a misconfigured path is visible in the logs without spamming them per request.
+
+### 7.1 One-Time Provisioning
+
+1. Create a free MaxMind account and generate a license key. GeoLite2 is free for non-commercial use, but the database file may not be redistributed — mount it, never commit it (`.gitignore` excludes `data/geoip/` and `*.mmdb`).
+2. Download `GeoLite2-City.mmdb` into the mount directory on the host:
+
+   ```bash
+   mkdir -p ./data/geoip
+   curl -sSL -o /tmp/geolite2-city.tar.gz \
+     "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+   tar -xzf /tmp/geolite2-city.tar.gz -C /tmp
+   install -m 0644 /tmp/GeoLite2-City_*/GeoLite2-City.mmdb ./data/geoip/GeoLite2-City.mmdb
+   ```
+
+3. Set `LOCATE_PROVIDER=maxmind` in the environment (see §3.3) and recreate the API container so the read-only mount and the variable are applied.
+4. Verify end-to-end. Substituting a known public address proves the lookup path without depending on your own address being present in the database:
+
+   ```bash
+   curl -s -H 'X-Real-IP: 8.8.8.8' https://<host>/v1/locate   # 200 with coordinates
+   curl -s https://<host>/v1/locate                            # 404 if your own IP is not in the DB
+   ```
+
+   Both branches answer `"message": "Location unavailable"` on failure by design, so the 404 body never reveals which source was tried.
+
+### 7.2 Recurring Refresh
+
+MaxMind republishes GeoLite2 twice a week. `geoipupdate` is the supported client; it writes the new file into `DatabaseDirectory`, which should be the same directory that is mounted into the container.
+
+```conf
+# /etc/GeoIP.conf
+AccountID 1234567
+LicenseKey YOUR_LICENSE_KEY
+EditionIDs GeoLite2-City
+DatabaseDirectory /srv/weather/data/geoip
+```
+
+```cron
+# Weekly refresh, Mondays at 03:00
+0 3 * * 1 root /usr/bin/geoipupdate
+```
+
+**No API restart is required.** The reader reopens the database automatically when the file's size or mtime changes, and the previous mapping stays valid until it does, so a refresh landing mid-request cannot yield a half-written database.
+
+### 7.3 Resource Envelope
+
+Sized for the deployed 4-core ARM64 host shared with ~10 containers:
+
+* **Resident memory: a few MB.** The database is opened with `MODE_MMAP`, so the kernel pages in only the search-tree nodes that queries actually touch, and those pages are file-backed and shared across the uvicorn workers rather than copied per worker. `MODE_MEMORY` (the whole ~70 MB file into each process heap) must never be used — the API container already runs near its 4 GiB limit. Under memory pressure the kernel reclaims these pages like any other page cache instead of OOM-killing the container.
+* **Disk: ~70 MB** for the database file on the host, plus the same in the container image layer only if it were baked in — which is why it is mounted instead.
+* **CPU: microseconds per lookup, no cache.** A lookup is faster than a Redis round trip, so results are deliberately not cached: there is no stale entry after a refresh and no per-IP key growth. `/v1/locate` is called once per page load, and only when no `SelectedLocation` already exists.
+* **No external calls.** The visitor's address never leaves the host, unlike an IP-geolocation HTTP API.
+

@@ -29,6 +29,14 @@ dependencies = [
     # numcodecs is aligned with the ingestion writer's resolved version (0.16.x).
     "zarr>=3.3.0,<4.0.0",
     "numcodecs>=0.16.5,<0.17.0",
+    # Local GeoLite2 lookup for the /v1/locate coarse-region fallback
+    # (api/core/geoip.py). This is ``maxminddb`` rather than ``geoip2`` on
+    # purpose: ``geoip2`` is a convenience wrapper over this same reader and
+    # pulls ``aiohttp`` and ``requests`` into an image that issues no HTTP
+    # request for geolocation. ``maxminddb`` declares no runtime dependencies,
+    # keeping the serving image (and its ARM64 build) free of an async HTTP
+    # stack for a synchronous, memory-mapped database read.
+    "maxminddb>=3.2.0,<4.0.0",
 ]
 
 [tool.uv.sources]
