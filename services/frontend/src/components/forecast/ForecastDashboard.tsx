@@ -239,13 +239,15 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
           {/* ensembleModel !== null here (the selected model is ensemble-capable).
               The body distinguishes "ensemble data unavailable" from a genuine
               request error, and never renders a misleading heading for a
-              deterministic model. */}
+              deterministic model. The series arrives in batches, so partial data is
+              renderable: the chart appears as soon as the first batch lands, and a
+              failure is surfaced only when there is nothing at all to show. */}
           {(pointStatus === "loading" || ensemble.status === "loading") && (
             <p role="status" className="text-sm text-slate-400">
               Loading ensemble statistics…
             </p>
           )}
-          {ensemble.status === "error" && (
+          {ensemble.status === "error" && ensemble.byLead.size === 0 && (
             <p role="alert" className="text-sm text-red-400">
               {ensemble.error}
             </p>
@@ -255,7 +257,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
               Ensemble data is not yet available for this forecast.
             </p>
           )}
-          {ensemble.status === "success" && ensemble.byLead.size > 0 && (
+          {ensemble.byLead.size > 0 && (
             <EnsembleChart
               byLead={ensemble.byLead}
               variableLabel={meta[ensembleVariable]?.name ?? ensembleVariable}

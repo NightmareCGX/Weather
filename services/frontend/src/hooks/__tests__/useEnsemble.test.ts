@@ -85,12 +85,103 @@ describe("useEnsemble", () => {
     mockFetch.mockRejectedValue(new TypeError("Failed to fetch"));
 
     const { result } = renderHook(() =>
-      useEnsemble(location, [0], "temperature_2m", { model: "gefs" })
+      useEnsemble(location, [0], "temperature_2m", { model: "gefs", retryDelaysMs: [] })
     );
 
     await waitFor(() => expect(result.current.status).toBe("error"));
     expect(result.current.byLead.size).toBe(0);
     expect(result.current.error).not.toBeNull();
+  });
+
+  it("splits the series into batches and accumulates every batch into byLead", async () => {
+    mockFetch
+      .mockResolvedValueOnce(batchStatsResponse([0, 6]))
+      .mockResolvedValueOnce(batchStatsResponse([12, 18]));
+
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6, 12, 18], "temperature_2m", { model: "gefs", batchSize: 2 })
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(Array.from(result.current.byLead.keys()).sort((a, b) => a - b)).toEqual([0, 6, 12, 18]);
+
+    // Each request must carry only its own slice of leads.
+    const firstUrl = new URL(String(mockFetch.mock.calls[0][0]), "http://localhost");
+    const secondUrl = new URL(String(mockFetch.mock.calls[1][0]), "http://localhost");
+    expect(firstUrl.searchParams.get("leads")).toBe("0,6");
+    expect(secondUrl.searchParams.get("leads")).toBe("12,18");
+  });
+
+  it("publishes the first batch while later batches are still in flight", async () => {
+    let resolveSecond!: (value: Response) => void;
+    mockFetch
+      .mockResolvedValueOnce(batchStatsResponse([0, 6]))
+      .mockImplementationOnce(() => new Promise<Response>((r) => (resolveSecond = r)));
+
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6, 12, 18], "temperature_2m", { model: "gefs", batchSize: 2 })
+    );
+
+    // The leading days become renderable before the tail finishes.
+    await waitFor(() => expect(result.current.byLead.size).toBe(2));
+    expect(result.current.status).toBe("loading");
+    expect(result.current.byLead.has(0)).toBe(true);
+    expect(result.current.byLead.has(12)).toBe(false);
+
+    resolveSecond(batchStatsResponse([12, 18]));
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(result.current.byLead.size).toBe(4);
+  });
+
+  it("retries a failed batch and keeps the recovered result", async () => {
+    mockFetch
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(batchStatsResponse([0, 6]));
+
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6], "temperature_2m", { model: "gefs", retryDelaysMs: [0] })
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(result.current.byLead.size).toBe(2);
+  });
+
+  it("keeps the partial series when a later batch fails after its retries", async () => {
+    mockFetch
+      .mockResolvedValueOnce(batchStatsResponse([0, 6]))
+      .mockRejectedValue(new TypeError("Failed to fetch"));
+
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6, 12, 18], "temperature_2m", {
+        model: "gefs",
+        batchSize: 2,
+        retryDelaysMs: [],
+      })
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(Array.from(result.current.byLead.keys()).sort((a, b) => a - b)).toEqual([0, 6]);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("stops issuing later batches when the first batch fails with nothing on screen", async () => {
+    mockFetch.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    const { result } = renderHook(() =>
+      useEnsemble(location, [0, 6, 12, 18], "temperature_2m", {
+        model: "gefs",
+        batchSize: 2,
+        retryDelaysMs: [],
+      })
+    );
+
+    await waitFor(() => expect(result.current.status).toBe("error"));
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(result.current.byLead.size).toBe(0);
   });
 
   it("stays idle and does not issue premature requests when leads array is empty", () => {

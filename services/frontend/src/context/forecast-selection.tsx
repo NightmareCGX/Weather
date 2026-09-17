@@ -29,6 +29,17 @@ import {
 
 export type AvailabilityStatus = "idle" | "loading" | "success" | "error";
 
+/** Delay before retrying a failed cadence-boundary revalidation. */
+const BOUNDARY_RETRY_DELAY_MS = 60_000;
+
+/**
+ * How many times a failed cadence-boundary revalidation is retried before the
+ * tab waits for the next boundary or a foreground event. Five attempts at
+ * {@link BOUNDARY_RETRY_DELAY_MS} keeps a transient outage covered for ~5
+ * minutes without polling the backend indefinitely.
+ */
+const BOUNDARY_MAX_RETRIES = 5;
+
 export interface ForecastSelectionContextValue {
   /** Raw availability payload (database-driven), or null before/after failure. */
   availability: ForecastAvailability | null;
@@ -57,8 +68,12 @@ const ForecastSelectionContext = createContext<ForecastSelectionContextValue | n
  * User-facing selection is model -> variable -> validTime.
  * Initial Time and Lead Time are removed as primary selectors.
  * Selectable valid times are filtered by the 3-hour UI grace window (valid_time >= now - 3h).
- * A periodic 60-second timer automatically re-evaluates the grace window so expired times
- * age out in long-lived browser sessions without a page reload.
+ * A client-side heartbeat advances `nowMs` every 60 seconds so expired valid times age out in
+ * long-lived browser sessions without a page reload. Freshness of the payload itself is the
+ * cadence-boundary timer's job: it revalidates at each server cycle roll, and the tab also
+ * revalidates when it returns to the foreground. The heartbeat deliberately performs no
+ * network I/O — see its comment for the measured cost that made that the wrong place to
+ * refetch.
  */
 export function ForecastSelectionProvider({ children }: { children: ReactNode }) {
   const [availability, setAvailability] = useState<ForecastAvailability | null>(null);
@@ -67,42 +82,78 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
   const [selection, setSelection] = useState<ForecastSelection | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
-  // 60-second periodic timer to refresh availability and advance nowMs (heartbeat resilience)
+  // 60-second heartbeat that advances nowMs only, so valid times outside the grace
+  // window age out of the selectors. Re-deriving options from state already in memory
+  // is the whole job: `buildForecastOptions` is a useMemo over (availability,
+  // selection, nowMs), so no refetch is needed to re-evaluate the window.
+  //
+  // Refreshing availability here was removed on purpose. The response is rebuilt from
+  // PostgreSQL on every request (~600 KB uncompressed, measured 1.4-2.9s of API CPU),
+  // and a 60s poll per open tab paid that cost 60x more often than the data can change
+  // (cycles roll every 3 hours) while adding no freshness the boundary timer below does
+  // not already provide.
   useEffect(() => {
     const timer = setInterval(() => {
       setNowMs(Date.now());
-      getForecastAvailability()
-        .then((next) => {
-          setAvailability(next);
-        })
-        .catch(() => {
-          // Swallow background refresh errors so active UI is not disrupted
-        });
     }, 60_000);
     return () => clearInterval(timer);
   }, []);
 
-  // Proactive cadence boundary synchronization timer:
-  // Revalidates backend availability exactly at the server-authoritative 3-hour transition
-  // without waiting for the next arbitrary 60-second polling tick.
+  // Refetch availability, reporting success so callers can decide how to recover.
+  // The last good payload is kept on failure so an active view is never disrupted.
+  const refresh = useCallback(async (): Promise<boolean> => {
+    try {
+      const next = await getForecastAvailability();
+      setAvailability(next);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  // Proactive cadence boundary synchronization timer: revalidates backend availability
+  // exactly at the server-authoritative 3-hour transition rather than at an arbitrary tick.
   useEffect(() => {
     if (!availability) return;
 
     const delayMs = calculateNextBoundaryDelayMs(availability);
     if (delayMs === null) return;
 
-    const boundaryTimer = setTimeout(() => {
-      getForecastAvailability()
-        .then((next) => {
-          setAvailability(next);
-        })
-        .catch(() => {
-          // Keep current availability on network error; fallback heartbeat will retry
-        });
-    }, delayMs);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+    let attempt = 0;
 
-    return () => clearTimeout(boundaryTimer);
-  }, [availability]);
+    const run = () => {
+      void refresh().then((ok) => {
+        if (cancelled || ok) return;
+        // A failed refresh leaves `availability` unchanged, so this effect does not
+        // re-arm. Without the retry below a transient outage would strand the tab on a
+        // stale payload until the next foreground event.
+        if (attempt >= BOUNDARY_MAX_RETRIES) return;
+        attempt += 1;
+        timer = setTimeout(run, BOUNDARY_RETRY_DELAY_MS);
+      });
+    };
+
+    timer = setTimeout(run, delayMs);
+    return () => {
+      cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [availability, refresh]);
+
+  // A long-lived tab can outlive the boundary timer (laptop sleep, timers throttled in
+  // background tabs), so revalidate whenever it returns to the foreground. This also
+  // re-syncs nowMs, which a throttled heartbeat may have missed.
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+      setNowMs(Date.now());
+      void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [refresh]);
 
   const load = useCallback((signal?: AbortSignal) => {
     setStatus("loading");
