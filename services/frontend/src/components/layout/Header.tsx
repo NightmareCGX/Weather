@@ -16,7 +16,7 @@ export function Header() {
   const isLoading = status === "loading" || status === "idle";
 
   return (
-    <header className="flex h-14 items-center justify-between border-b border-slate-800/80 bg-slate-950/85 px-4 backdrop-blur-md">
+    <header className="relative z-40 flex h-14 items-center justify-between border-b border-slate-800/80 bg-slate-950/85 px-4 backdrop-blur-md">
       <h1 className="flex items-center" aria-label="Zeus Wx">
         <ZeusWxBrand />
       </h1>

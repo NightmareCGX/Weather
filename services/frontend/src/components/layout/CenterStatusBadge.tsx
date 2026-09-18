@@ -168,7 +168,7 @@ function CenterBadge({ center }: { center: CenterHealth }) {
         className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold transition-colors duration-200 ${tone.chip} ${tone.text}`}
       >
         <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
-        <span>{center.name}</span>
+        <span>{center.id ? center.id.toUpperCase() : center.name}</span>
         <span className="font-mono text-[10px] opacity-80">
           {center.readyCount}/{center.totalCount}
         </span>
