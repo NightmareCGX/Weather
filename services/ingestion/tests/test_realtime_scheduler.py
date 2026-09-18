@@ -937,8 +937,83 @@ def test_backlog_repair_not_attempted_when_ingest_work_remains() -> None:
     assert outcome.dispatches[0].targets == (3,)
 
 
-def test_backlog_capped_retry_never_permanently_abandoned() -> None:
-    """Repeated failures on backlog candidate clamp at max_backoff without dropping candidate."""
+def _quarantine_gauge_value() -> float:
+    """Read the backlog quarantine gauge from the in-process registry."""
+    from ingestion.monitoring.ingestion_collector import (
+        INGESTION_BACKLOG_QUARANTINED_CYCLES,
+    )
+
+    for line in INGESTION_BACKLOG_QUARANTINED_CYCLES.collect():
+        if line.startswith("#"):
+            continue
+        return float(line.rsplit(" ", 1)[-1])
+    return 0.0
+
+
+def test_backlog_failure_quarantine_releases_the_slot() -> None:
+    """Failures back off up to the threshold, then quarantine the candidate.
+
+    Before this, a permanently failing cycle kept the single backlog slot
+    forever (the 2026-09-15T06Z cycle retried for days with unbounded backoff).
+    The quarantine releases the slot to the next recoverable candidate, and the
+    candidate itself stays in discovery so a horizon-relative release still
+    applies.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
+    world.committed_states[CYCLE_06.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)),
+    )
+    world.snapshots[CYCLE_06.label] = (gfs_snapshot((0, 3), CYCLE_06), gefs_snapshot((0, 3), CYCLE_06))
+    # A newer recoverable candidate that should take over once 06Z is quarantined.
+    world.committed_states[CYCLE_00.label] = (
+        ModelCommittedState(),
+        ModelCommittedState(),
+    )
+    world.snapshots[CYCLE_00.label] = (gfs_snapshot((0,), CYCLE_00), gefs_snapshot((0,), CYCLE_00))
+    world.dispatch_failures.add("gfs")
+    world.candidates = [CYCLE_06, CYCLE_00]
+
+    settings = _settings(
+        REALTIME_WAVE_MAX_LEADS=4,
+        # Keep the active cycle out of the way for the whole test: its own
+        # max-wait batching must not pre-empt the backlog under test.
+        REALTIME_WAVE_MAX_WAIT_SECONDS=86400.0,
+        REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS=10.0,
+        REALTIME_BACKLOG_MAX_BACKOFF_SECONDS=50.0,
+        REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD=5,
+    )
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    # Four failures: backoff grows but stays clamped at max_backoff.
+    for i in range(1, 5):
+        outcome = scheduler.poll_once()
+        assert outcome.cycle == CYCLE_06
+        assert scheduler._backlog_failures[CYCLE_06.label] == i
+        world.clock_time = scheduler._backlog_blocked_until[CYCLE_06.label] + 1.0
+    backoff_duration = scheduler._backlog_blocked_until[CYCLE_06.label] - world.clock_time + 1.0
+    assert backoff_duration <= 50.0
+    assert not scheduler._backlog_quarantined_until
+
+    # Fifth failure reaches the threshold -> quarantined.
+    outcome = scheduler.poll_once()
+    assert outcome.cycle == CYCLE_06
+    assert CYCLE_06.label in scheduler._backlog_quarantined_until
+    assert scheduler._backlog_quarantined_until[CYCLE_06.label] == float("inf")
+    assert _quarantine_gauge_value() == 1.0
+
+    # Past the backoff window the quarantined candidate is skipped and the
+    # other recoverable cycle gets the slot.
+    world.clock_time += 3600.0
+    outcome = scheduler.poll_once()
+    assert outcome.cycle == CYCLE_00
+    assert CYCLE_06 in world.candidates  # never dropped, only suspended
+
+
+def test_backlog_quarantine_expires_and_candidate_recovers() -> None:
+    """A finite quarantine TTL releases the candidate, which can then succeed."""
     world = FakeWorld()
     world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
     world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
@@ -955,22 +1030,65 @@ def test_backlog_capped_retry_never_permanently_abandoned() -> None:
         REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0,
         REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS=10.0,
         REALTIME_BACKLOG_MAX_BACKOFF_SECONDS=50.0,
+        REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD=2,
+        REALTIME_BACKLOG_QUARANTINE_SECONDS=600.0,
     )
     scheduler = _scheduler(world, settings=settings, cycle_override=None)
 
-    # Trigger 6 consecutive failures
-    for i in range(1, 7):
-        outcome = scheduler.poll_once()
-        assert outcome.cycle == CYCLE_06
-        assert scheduler._backlog_failures[CYCLE_06.label] == i
-        # Advance clock to after the backoff
-        world.clock_time = scheduler._backlog_blocked_until[CYCLE_06.label] + 1.0
+    scheduler.poll_once()
+    world.clock_time = scheduler._backlog_blocked_until[CYCLE_06.label] + 1.0
+    scheduler.poll_once()
+    assert CYCLE_06.label in scheduler._backlog_quarantined_until
 
-    # Backoff is clamped at max_backoff (50s), not exponentially unbounded
-    backoff_duration = scheduler._backlog_blocked_until[CYCLE_06.label] - (world.clock_time - 1.0)
-    assert backoff_duration <= 50.0
-    # Candidate remains in candidate pool (never permanently dropped)
-    assert CYCLE_06 in world.candidates
+    # Inside the TTL: skipped.
+    world.clock_time += 300.0
+    scheduler.poll_once()
+    assert scheduler._backlog_failures.get(CYCLE_06.label) == 2
+
+    # Past the TTL: the quarantine expires and the candidate is retried with a
+    # clean failure streak; with the failure cleared it succeeds.
+    world.clock_time += 400.0
+    world.dispatch_failures.clear()
+    outcome = scheduler.poll_once()
+    assert outcome.cycle == CYCLE_06
+    assert CYCLE_06.label not in scheduler._backlog_quarantined_until
+    assert CYCLE_06.label not in scheduler._backlog_failures
+    assert _quarantine_gauge_value() == 0.0
+
+
+def test_backlog_rotates_among_recoverable_candidates() -> None:
+    """Successive polls serve different recoverable candidates (no monopolization)."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (gfs_snapshot((0,), CYCLE_12), gefs_snapshot((0,), CYCLE_12))
+    for cycle in (CYCLE_06, CYCLE_00):
+        world.committed_states[cycle.label] = (
+            ModelCommittedState(leads=frozenset({0})),
+            ModelCommittedState(
+                leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)
+            ),
+        )
+        world.snapshots[cycle.label] = (
+            gfs_snapshot((0, 3), cycle),
+            gefs_snapshot((0, 3), cycle),
+        )
+    world.candidates = [CYCLE_06, CYCLE_00]
+
+    settings = _settings(
+        REALTIME_WAVE_MAX_LEADS=4,
+        REALTIME_WAVE_MAX_WAIT_SECONDS=86400.0,
+    )
+    scheduler = _scheduler(world, settings=settings, cycle_override=None)
+
+    first = scheduler.poll_once()
+    assert first.cycle == CYCLE_06
+    world.clock_time += 600.0
+    second = scheduler.poll_once()
+    # The first candidate rotated to the back, so the other cycle is served.
+    assert second.cycle == CYCLE_00
+    world.clock_time += 600.0
+    third = scheduler.poll_once()
+    assert third.cycle == CYCLE_06
 
 
 def test_active_failure_fairness_allows_backlog_progress() -> None:

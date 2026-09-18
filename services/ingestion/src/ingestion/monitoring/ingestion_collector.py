@@ -124,6 +124,10 @@ INGESTION_CYCLES_COMPLETE_NOT_READY = REGISTRY.gauge(
     "Cycles whose catalog contents are complete while their run status is not ready",
     labelnames=("model",),
 )
+INGESTION_BACKLOG_QUARANTINED_CYCLES = REGISTRY.gauge(
+    "weather_ingestion_backlog_quarantined_cycles",
+    "Backlog catch-up candidates currently quarantined after repeated failures",
+)
 
 GEFS_AVAILABLE_MEMBERS = REGISTRY.gauge(
     "weather_gefs_available_members_count",

@@ -66,6 +66,10 @@ logger = logging.getLogger(__name__)
 #: Nominal cycle hours shared by GFS and GEFS.
 _CYCLE_HOURS: tuple[int, ...] = (0, 6, 12, 18)
 
+#: Quarantine sentinel: holds until the candidate's serving horizon expires
+#: (discovery drops the cycle at that point, so no timer is needed).
+INFINITY: float = float("inf")
+
 
 @dataclass(frozen=True)
 class CycleIdentity:
@@ -244,6 +248,8 @@ class RealtimeScheduler:
         self._backlog_first_seen_complete_at: dict[int, float] = {}
         self._backlog_failures: dict[str, int] = {}
         self._backlog_blocked_until: dict[str, float] = {}
+        self._backlog_quarantined_until: dict[str, float] = {}
+        self._backlog_rotation_offset: int = 0
         self._backlog_snapshots: dict[str, tuple[CycleSnapshot | None, CycleSnapshot | None]] = {}
 
         self._cached_candidates: list[CycleIdentity] | None = None
@@ -555,6 +561,72 @@ class RealtimeScheduler:
                 return self._cached_candidates or []
         return self._cached_candidates
 
+    def _record_backlog_failure(self, label: str, now: float) -> float:
+        """Record a failed backlog attempt; return the backoff that was applied.
+
+        Backoff alone is not enough: a candidate that fails *every* time keeps
+        its place in the retry rotation forever and, because there is only one
+        backlog slot, starves every other recoverable cycle (the 2026-09-15T06Z
+        incident retried a permanently broken cycle for days). Past
+        ``REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD`` consecutive failures
+        the candidate is quarantined until
+        ``REALTIME_BACKLOG_QUARANTINE_SECONDS`` elapses, or until its serving
+        horizon expires when that setting is 0.
+
+        Args:
+            label: The candidate's diagnostics label.
+            now: Current clock reading.
+
+        Returns:
+            The backoff (seconds) applied to the candidate.
+        """
+        count = self._backlog_failures.get(label, 0) + 1
+        self._backlog_failures[label] = count
+        base_b = float(self.settings.REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS)
+        max_b = float(self.settings.REALTIME_BACKLOG_MAX_BACKOFF_SECONDS)
+        backoff: float = min(base_b * (2 ** (count - 1)), max_b)
+        self._backlog_blocked_until[label] = now + backoff
+
+        threshold = int(
+            self.settings.REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD
+        )
+        if count >= threshold:
+            ttl = float(self.settings.REALTIME_BACKLOG_QUARANTINE_SECONDS)
+            self._backlog_quarantined_until[label] = now + ttl if ttl > 0.0 else INFINITY
+            logger.warning(
+                "backlog candidate %s quarantined after %d consecutive failures (%s)",
+                label,
+                count,
+                f"{ttl:.0f}s" if ttl > 0.0 else "until its horizon expires",
+            )
+            self._sync_quarantine_gauge(now)
+        return backoff
+
+    def _clear_backlog_failure(self, label: str) -> None:
+        """Clear a candidate's failure streak and quarantine after a success."""
+        self._backlog_failures.pop(label, None)
+        self._backlog_blocked_until.pop(label, None)
+        if self._backlog_quarantined_until.pop(label, None) is not None:
+            self._sync_quarantine_gauge(self._clock())
+
+    def _sync_quarantine_gauge(self, now: float) -> None:
+        """Drop expired quarantines and publish the live quarantine count."""
+        for label, until in list(self._backlog_quarantined_until.items()):
+            if now >= until:
+                del self._backlog_quarantined_until[label]
+                # A released quarantine starts from a clean failure streak.
+                self._backlog_failures.pop(label, None)
+        try:
+            from ingestion.monitoring.ingestion_collector import (
+                INGESTION_BACKLOG_QUARANTINED_CYCLES,
+            )
+
+            INGESTION_BACKLOG_QUARANTINED_CYCLES.set(
+                float(len(self._backlog_quarantined_until))
+            )
+        except Exception as exc:  # noqa: BLE001 - metrics must never break scheduling
+            logger.debug("failed to publish backlog quarantine gauge: %s", exc)
+
     def _select_backlog_cycle(
         self,
         active_cycle: CycleIdentity,
@@ -563,14 +635,22 @@ class RealtimeScheduler:
     ) -> tuple[CycleIdentity | None, FrontierPlan | None]:
         """Select at most one historical backlog candidate with predecessor-safe ready work.
 
-        Rotates past candidates in failure backoff, already complete, or blocked upstream.
+        Skips candidates that are durably complete, in failure backoff, or
+        quarantined. The scan rotates one position per selection so a single
+        productive (or persistently failing) cycle cannot monopolize the one
+        backlog slot, and a candidate whose ingest work is exhausted but whose
+        status is stale is returned for a finalize-only repair.
         """
         if not self.settings.REALTIME_BACKLOG_ENABLED:
             return None, None
         if self._cycle_override is not None:
             return None, None
 
+        self._sync_quarantine_gauge(now)
         candidates = self._get_candidates(active_cycle, now, now_utc)
+        if candidates and self._backlog_rotation_offset:
+            offset = self._backlog_rotation_offset % len(candidates)
+            candidates = candidates[offset:] + candidates[:offset]
         serving_start = serving_start_valid_time(now_utc)
         scheduler_max_lead = max_model_lead_hours(
             ("gfs", "gefs"), version_string=self.version_string
@@ -594,8 +674,10 @@ class RealtimeScheduler:
             ):
                 continue
 
-            # 2. Failure / block backoff check
+            # 2. Failure / block / quarantine check
             if now < self._backlog_blocked_until.get(label, 0.0):
+                continue
+            if now < self._backlog_quarantined_until.get(label, 0.0):
                 continue
 
             # 3. Durable completion check
@@ -902,33 +984,17 @@ class RealtimeScheduler:
                     dispatched_cycle = backlog_cycle
                     dispatched_plan = backlog_plan
                     if any(not d.ok for d in dispatches):
-                        count = (
-                            self._backlog_failures.get(backlog_cycle.label, 0)
-                            + 1
-                        )
-                        self._backlog_failures[backlog_cycle.label] = count
-                        base_b = float(
-                            self.settings.REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS
-                        )
-                        max_b = float(
-                            self.settings.REALTIME_BACKLOG_MAX_BACKOFF_SECONDS
-                        )
-                        backoff = min(base_b * (2 ** (count - 1)), max_b)
-                        self._backlog_blocked_until[backlog_cycle.label] = (
-                            now + backoff
+                        backoff = self._record_backlog_failure(
+                            backlog_cycle.label, now
                         )
                         logger.warning(
-                            "backlog %s failed for %s (attempt %d); backing off %.1fs",
+                            "backlog %s failed for %s; backing off %.1fs",
                             "status repair" if repairing else "wave dispatch",
                             backlog_cycle.label,
-                            count,
                             backoff,
                         )
                     else:
-                        self._backlog_failures.pop(backlog_cycle.label, None)
-                        self._backlog_blocked_until.pop(
-                            backlog_cycle.label, None
-                        )
+                        self._clear_backlog_failure(backlog_cycle.label)
                         self._backlog_snapshots.pop(backlog_cycle.label, None)
                         try:
                             if self.is_complete(backlog_cycle):
@@ -938,35 +1004,22 @@ class RealtimeScheduler:
                                 )
                                 self._invalidate_candidate_cache()
                             elif repairing:
-                                # The repair did not promote the cycle. Leave the
-                                # candidate in place for the retry backoff path
-                                # rather than spinning on it every poll.
-                                count = (
-                                    self._backlog_failures.get(
-                                        backlog_cycle.label, 0
-                                    )
-                                    + 1
+                                # The repair did not promote the cycle. Back off
+                                # instead of spinning on it every poll.
+                                backoff = self._record_backlog_failure(
+                                    backlog_cycle.label, now
                                 )
-                                self._backlog_failures[backlog_cycle.label] = count
-                                backoff = min(
-                                    float(
-                                        self.settings.REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS
-                                    )
-                                    * (2 ** (count - 1)),
-                                    float(
-                                        self.settings.REALTIME_BACKLOG_MAX_BACKOFF_SECONDS
-                                    ),
-                                )
-                                self._backlog_blocked_until[
-                                    backlog_cycle.label
-                                ] = now + backoff
                                 logger.warning(
                                     "status repair for %s left it not durably "
-                                    "complete (attempt %d); backing off %.1fs",
+                                    "complete; backing off %.1fs",
                                     backlog_cycle.label,
-                                    count,
                                     backoff,
                                 )
+                            else:
+                                # A productive candidate rotates to the back of
+                                # the queue so the next poll serves another
+                                # recoverable cycle.
+                                self._backlog_rotation_offset += 1
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(
                                 "failed to check completion for backlog cycle %s: %s",
@@ -1113,6 +1166,8 @@ class RealtimeScheduler:
             "active_blocked_until": self._active_blocked_until,
             "backlog_failures": dict(self._backlog_failures),
             "backlog_blocked_until": dict(self._backlog_blocked_until),
+            "backlog_quarantined_until": dict(self._backlog_quarantined_until),
+            "backlog_rotation_offset": self._backlog_rotation_offset,
             "poll_state": self._machine.state.value,
             "poll_interval": next_interval,
             "last_poll_success": self._last_poll_success_at,

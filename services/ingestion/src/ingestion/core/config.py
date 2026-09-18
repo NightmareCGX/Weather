@@ -292,6 +292,14 @@ class IngestionSettings(BaseSettings):
     REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS: float = 300.0
     #: Maximum capped backoff (seconds) for failing backlog candidates.
     REALTIME_BACKLOG_MAX_BACKOFF_SECONDS: float = 3600.0
+    #: Consecutive failures after which a backlog candidate is quarantined
+    #: instead of retried forever. A permanently failing cycle must not keep the
+    #: single backlog slot (see the 2026-09-15T06Z incident).
+    REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD: int = 5
+    #: Quarantine duration (seconds). ``0`` holds the quarantine until the
+    #: candidate's serving horizon expires, which is the natural release: the
+    #: candidate disappears from discovery at that point anyway.
+    REALTIME_BACKLOG_QUARANTINE_SECONDS: float = 0.0
     #: Base retry backoff (seconds) for active wave failures (anti-starvation).
     REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS: float = 60.0
     #: Maximum retry backoff (seconds) for active wave failures.
@@ -502,6 +510,20 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"REALTIME_ACTIVE_MAX_BACKOFF_SECONDS ({active_max}) must be >= "
                 f"REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS ({active_retry})"
+            )
+        quarantine_threshold = int(
+            self.REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD
+        )
+        quarantine_seconds = float(self.REALTIME_BACKLOG_QUARANTINE_SECONDS)
+        if quarantine_threshold < 1:
+            raise ValueError(
+                "REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD must be >= 1, got "
+                f"{quarantine_threshold}"
+            )
+        if quarantine_seconds < 0.0:
+            raise ValueError(
+                "REALTIME_BACKLOG_QUARANTINE_SECONDS must be >= 0.0, got "
+                f"{quarantine_seconds}"
             )
         reclamation_batch = int(self.RECLAMATION_BATCH_SIZE)
         reclamation_lease = float(self.RECLAMATION_LEASE_SECONDS)
