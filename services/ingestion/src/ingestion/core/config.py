@@ -276,6 +276,15 @@ class IngestionSettings(BaseSettings):
     #: the scheduler considers it eligible for upstream probing (publication
     #: begins roughly 3-3.5h after cycle time, probed in Phase 5A).
     REALTIME_FIRST_PUBLICATION_DELAY_SECONDS: float = 10800.0
+    #: Seconds of normal fill time a cycle is granted after its f000 ingest
+    #: anchor (``model_runs.created_at``) before monitoring counts it as
+    #: lagging. Derived from the wave parameters rather than guessed: one
+    #: complete fill window is
+    #: ``ceil(81 / REALTIME_WAVE_MAX_LEADS) x REALTIME_ACTIVE_POLL_SECONDS``
+    #: = 11 x 600s ~= 1h50m, so the budget is 2h plus a 30min margin. If the
+    #: wave parameters change, recompute this instead of letting the budget
+    #: silently mismatched the schedule.
+    INGESTION_FILL_IN_GRACE_SECONDS: float = 9000.0
 
     #: Master switch for backlog recovery in realtime scheduler (Lifecycle V3 Phase 2).
     REALTIME_BACKLOG_ENABLED: bool = True
@@ -283,6 +292,14 @@ class IngestionSettings(BaseSettings):
     REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS: float = 300.0
     #: Maximum capped backoff (seconds) for failing backlog candidates.
     REALTIME_BACKLOG_MAX_BACKOFF_SECONDS: float = 3600.0
+    #: Consecutive failures after which a backlog candidate is quarantined
+    #: instead of retried forever. A permanently failing cycle must not keep the
+    #: single backlog slot (see the 2026-09-15T06Z incident).
+    REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD: int = 5
+    #: Quarantine duration (seconds). ``0`` holds the quarantine until the
+    #: candidate's serving horizon expires, which is the natural release: the
+    #: candidate disappears from discovery at that point anyway.
+    REALTIME_BACKLOG_QUARANTINE_SECONDS: float = 0.0
     #: Base retry backoff (seconds) for active wave failures (anti-starvation).
     REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS: float = 60.0
     #: Maximum retry backoff (seconds) for active wave failures.
@@ -307,6 +324,10 @@ class IngestionSettings(BaseSettings):
     RECLAMATION_LEASE_SECONDS: float = 60.0
     #: Maximum retry attempts before a target is quarantined in 'failed' status.
     RECLAMATION_MAX_RETRIES: int = 5
+    #: Rows removed per batch by the terminal reclamation-queue purge. Kept
+    #: small so every purge transaction stays short and autovacuum can absorb
+    #: the dead tuples instead of one long row-locking DELETE.
+    RECLAMATION_PURGE_BATCH_SIZE: int = 5000
     #: Base exponential backoff (seconds) for failed reclamation attempts.
     RECLAMATION_BASE_BACKOFF_SECONDS: float = 2.0
     #: Detailed metadata retention window in days before sweeping (default: 1 day).
@@ -471,6 +492,11 @@ class IngestionSettings(BaseSettings):
                 f"REALTIME_FIRST_PUBLICATION_DELAY_SECONDS must be >= 0.0, got "
                 f"{first_publication_delay}"
             )
+        fill_grace = float(self.INGESTION_FILL_IN_GRACE_SECONDS)
+        if fill_grace <= 0.0:
+            raise ValueError(
+                f"INGESTION_FILL_IN_GRACE_SECONDS must be > 0.0, got {fill_grace}"
+            )
         if backlog_retry <= 0.0:
             raise ValueError(
                 f"REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS must be > 0.0, got {backlog_retry}"
@@ -488,6 +514,20 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"REALTIME_ACTIVE_MAX_BACKOFF_SECONDS ({active_max}) must be >= "
                 f"REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS ({active_retry})"
+            )
+        quarantine_threshold = int(
+            self.REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD
+        )
+        quarantine_seconds = float(self.REALTIME_BACKLOG_QUARANTINE_SECONDS)
+        if quarantine_threshold < 1:
+            raise ValueError(
+                "REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD must be >= 1, got "
+                f"{quarantine_threshold}"
+            )
+        if quarantine_seconds < 0.0:
+            raise ValueError(
+                "REALTIME_BACKLOG_QUARANTINE_SECONDS must be >= 0.0, got "
+                f"{quarantine_seconds}"
             )
         reclamation_batch = int(self.RECLAMATION_BATCH_SIZE)
         reclamation_lease = float(self.RECLAMATION_LEASE_SECONDS)
@@ -508,6 +548,11 @@ class IngestionSettings(BaseSettings):
         if reclamation_backoff <= 0.0:
             raise ValueError(
                 f"RECLAMATION_BASE_BACKOFF_SECONDS must be > 0.0, got {reclamation_backoff}"
+            )
+        purge_batch = int(self.RECLAMATION_PURGE_BATCH_SIZE)
+        if purge_batch < 1:
+            raise ValueError(
+                f"RECLAMATION_PURGE_BATCH_SIZE must be >= 1, got {purge_batch}"
             )
         retention_days = int(self.METADATA_RETENTION_DAYS)
         if retention_days < 0:

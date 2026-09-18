@@ -180,6 +180,49 @@ The scheduled orphan inventory (`--inventory-interval-hours`, env fallback
 orphan deletion stays the manual `weather-ingest gc --inventory --inventory-reap`
 one-shot command. See `docs/RUNBOOKS.md` section 8 for the operational runbook.
 
+#### 4.4.1 `reclamation_queue` capacity maintenance
+
+The queue is append-mostly: the planner enqueues shard targets faster than the
+worker deletes them, and terminal (`deleted`) rows were previously removed only
+as a side effect of the per-cycle metadata sweeper. Left alone the table grows
+without bound, and its dead tuples are what the store-gate and claim scans then
+have to fight. Two operator actions keep it bounded:
+
+```bash
+cd services/ingestion
+# Delete terminal rows whose physical deletion succeeded more than N days ago.
+# Bounded batches (RECLAMATION_PURGE_BATCH_SIZE, default 5000) keep every
+# transaction short so autovacuum can absorb the dead tuples.
+uv run --no-sync weather-ingest reclamation purge --older-than-days 14
+
+# Add --vacuum to run VACUUM (ANALYZE) reclamation_queue on an autocommit
+# connection immediately afterwards. Prefer this over relying on autovacuum:
+# this is exactly the table whose autovacuum a long-lived open transaction
+# blocks.
+uv run --no-sync weather-ingest reclamation purge --older-than-days 14 --vacuum
+
+# Bound a single run when the backlog is large.
+uv run --no-sync weather-ingest reclamation purge --older-than-days 14 --max-batches 20
+```
+
+`failed` rows are never purged (they are operator-visible quarantine evidence —
+use `weather-ingest reclamation requeue`), and `queued`/`deleting` rows are live
+work. Watch `weather_reclamation_queue_count{status="deleted"}`: it must fall
+after the first maintenance run and stay flat once a schedule is in place.
+
+**VACUUM must not run inside a transaction.** `--vacuum` opens a fresh autocommit
+connection for exactly this reason; running
+`docker exec weather_postgres psql -c 'VACUUM (ANALYZE) reclamation_queue'`
+by hand is equally fine. Partitioning the queue (by `cycle_time`) is
+deliberately *not* implemented: it is a schema change and the observed growth
+does not require it once terminal rows are purged.
+
+If autovacuum still makes no progress, check `pg_stat_activity` for
+`idle in transaction` sessions holding the xmin horizon. Each ingestion daemon
+holds one session-level advisory-lock connection for its whole lifetime; those
+connections commit immediately after acquiring the lock so they sit `idle`
+rather than `idle in transaction`.
+
 ### 4.5 Running the Ingestion Metrics Exporter
 Run the ingestion Prometheus exporter bound to the loopback interface only. Metrics endpoints must never be exposed to public networks; they are consumed locally or transported via SSH tunnel:
 ```bash

@@ -1597,3 +1597,187 @@ def test_46_worker_removes_a_store_group_in_one_batched_call(
     assert w_res.deleted_count == len(calls[0][1])
     for key in calls[0][1]:
         assert not (store_dir / key).exists()
+
+
+# ===========================================================================
+# 25. Terminal-row purge bounds the queue (capacity policy)
+# ===========================================================================
+def test_25_purge_reclaimed_queue_rows_respects_retention_and_status(
+    catalog_engine, tmp_path
+):
+    """Only old terminal rows are removed; live work and quarantine evidence stay."""
+    from ingestion.gc.worker import (
+        RECLAMATION_STATUS_DELETING,
+        RECLAMATION_STATUS_FAILED,
+        RECLAMATION_STATUS_QUEUED,
+        purge_reclaimed_queue_rows,
+    )
+
+    c0 = _dt(2026, 9, 2, 0)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    now = _dt(2026, 9, 20, 0)
+
+    def _row(row_id: str, status: str, reclaimed_at: datetime | None, lead: int):
+        return ReclamationQueueRecord(
+            id=row_id,
+            run_id=r0,
+            model_id="gfs",
+            cycle_time=c0,
+            lead_time_hours=lead,
+            variable_code="temperature_2m",
+            target_kind=TARGET_KIND_DET,
+            member_index=0,
+            valid_time=c0 + timedelta(hours=lead),
+            store_path=str(tmp_path / "c0"),
+            physical_key=make_shard_relative_key(
+                "temperature_2m", TARGET_KIND_DET, lead
+            ),
+            status=status,
+            reclaimed_at=reclaimed_at,
+            created_at=c0,
+            updated_at=c0,
+        )
+
+    with Session(catalog_engine) as session:
+        session.add_all(
+            [
+                _row("old_deleted", RECLAMATION_STATUS_DELETED, now - timedelta(days=30), 3),
+                _row("fresh_deleted", RECLAMATION_STATUS_DELETED, now - timedelta(days=1), 6),
+                _row("failed_old", RECLAMATION_STATUS_FAILED, now - timedelta(days=30), 9),
+                _row("queued_old", RECLAMATION_STATUS_QUEUED, None, 12),
+                _row("deleting_old", RECLAMATION_STATUS_DELETING, None, 15),
+            ]
+        )
+        session.commit()
+
+        result = purge_reclaimed_queue_rows(
+            session, older_than_days=14, batch_size=1, now=now
+        )
+
+        assert result.deleted_rows == 1
+        assert result.batches == 1
+        remaining = {
+            str(r.id) for r in session.execute(select(ReclamationQueueRecord)).scalars()
+        }
+        assert remaining == {
+            "fresh_deleted",
+            "failed_old",
+            "queued_old",
+            "deleting_old",
+        }
+        # The oldest surviving terminal row is reported back to the operator.
+        assert result.oldest_remaining == now - timedelta(days=1)
+
+
+def test_25_purge_drains_multiple_batches_and_honours_cap(catalog_engine, tmp_path):
+    """A purge drains batched rows, and ``max_batches`` bounds a single run."""
+    from ingestion.gc.worker import (
+        RECLAMATION_STATUS_DELETED,
+        purge_reclaimed_queue_rows,
+    )
+
+    c0 = _dt(2026, 9, 2, 0)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    now = _dt(2026, 9, 20, 0)
+
+    with Session(catalog_engine) as session:
+        session.add_all(
+            [
+                ReclamationQueueRecord(
+                    id=f"terminal_{lead}",
+                    run_id=r0,
+                    model_id="gfs",
+                    cycle_time=c0,
+                    lead_time_hours=lead,
+                    variable_code="temperature_2m",
+                    target_kind=TARGET_KIND_DET,
+                    member_index=0,
+                    valid_time=c0 + timedelta(hours=lead),
+                    store_path=str(tmp_path / "c0"),
+                    physical_key=make_shard_relative_key(
+                        "temperature_2m", TARGET_KIND_DET, lead
+                    ),
+                    status=RECLAMATION_STATUS_DELETED,
+                    reclaimed_at=now - timedelta(days=30),
+                    created_at=c0,
+                    updated_at=c0,
+                )
+                for lead in (3, 6, 9, 12)
+            ]
+        )
+        session.commit()
+
+        capped = purge_reclaimed_queue_rows(
+            session, older_than_days=14, batch_size=2, max_batches=1, now=now
+        )
+        assert capped.deleted_rows == 2
+        assert capped.batches == 1
+
+        drained = purge_reclaimed_queue_rows(
+            session, older_than_days=14, batch_size=2, now=now
+        )
+        assert drained.deleted_rows == 2
+        assert drained.oldest_remaining is None
+
+        with pytest.raises(ValueError, match="older_than_days"):
+            purge_reclaimed_queue_rows(session, older_than_days=-1, now=now)
+        with pytest.raises(ValueError, match="max_batches"):
+            purge_reclaimed_queue_rows(
+                session, older_than_days=14, max_batches=0, now=now
+            )
+
+
+def test_25_purge_cli_action_reports_and_removes(catalog_engine, tmp_path, monkeypatch, capsys):
+    """`weather-ingest reclamation purge` is the operator entry point for capacity."""
+    import contextlib
+
+    from ingestion.cli import main
+    from ingestion.core import db as db_mod
+    from ingestion.gc.worker import RECLAMATION_STATUS_DELETED
+
+    c0 = _dt(2026, 9, 2, 0)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    now = datetime.now(timezone.utc)
+    with Session(catalog_engine) as seed_session:
+        seed_session.add(
+            ReclamationQueueRecord(
+                id="cli_terminal_row",
+                run_id=r0,
+                model_id="gfs",
+                cycle_time=c0,
+                lead_time_hours=3,
+                variable_code="temperature_2m",
+                target_kind=TARGET_KIND_DET,
+                member_index=0,
+                valid_time=c0 + timedelta(hours=3),
+                store_path=str(tmp_path / "c0"),
+                physical_key=make_shard_relative_key(
+                    "temperature_2m", TARGET_KIND_DET, 3
+                ),
+                status=RECLAMATION_STATUS_DELETED,
+                reclaimed_at=now - timedelta(days=30),
+                created_at=c0,
+                updated_at=c0,
+            )
+        )
+        seed_session.commit()
+
+    session = Session(catalog_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", lambda: contextlib.nullcontext(session))
+    try:
+        exit_code = main(
+            ["reclamation", "purge", "--older-than-days", "14", "--batch-size", "100"]
+        )
+        remaining = list(
+            session.execute(
+                select(ReclamationQueueRecord).where(
+                    ReclamationQueueRecord.id == "cli_terminal_row"
+                )
+            ).scalars()
+        )
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert "deleted=1" in capsys.readouterr().out
+    assert remaining == []

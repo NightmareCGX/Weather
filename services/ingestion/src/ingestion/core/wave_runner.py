@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -49,7 +50,11 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from domain.horizon import canonical_lead_time_hours
-from ingestion.core.base import PredecessorState
+from ingestion.core.base import (
+    DeaccumulationError,
+    MissingPredecessorLeadError,
+    PredecessorState,
+)
 from ingestion.core.catalog import RunCatalogSpec, VariableSpec
 from ingestion.core.pipeline import (
     _apply_variable_mapping,
@@ -60,6 +65,10 @@ from ingestion.core.pipeline import (
     _validate_requested_member,
 )
 from ingestion.providers.noaa.connector import NOAAConnector
+
+#: Module-level logger for helpers that run outside ``_run_wave_impl`` (which
+#: binds its own local ``logger``).
+_logger = logging.getLogger(__name__)
 
 #: Default platform surface-variable mapping for NOAA GFS/GEFS files. Each
 #: entry maps the cfgrib-emitted variable name (the GRIB ``cfVarName``, which
@@ -861,57 +870,120 @@ async def _run_wave_impl(
         async with NOAAConnector() as connector:
             # 1. Retained seed. Download the seed first, then decode it in a
             #    worker process (the native ecCodes boundary).
-            seed_dest = _destination_for(
-                spec, staging_dir, lead=seed_lead, member=seed_member, is_mean=seed_is_mean
-            )
-            Path(seed_dest).parent.mkdir(parents=True, exist_ok=True)
-            tracker.set_init_phase("seed_download")
-            tracker.record_milestone("seed_download_start")
-            tracker.on_download_start(seed_member, seed_lead, is_seed=True)
-            t_dl_start = time.monotonic()
-            try:
-                seed_dl_kwargs: dict[str, Any] = {"variables": var_codes}
-                if seed_member is not None:
-                    seed_dl_kwargs["member"] = seed_member
-                if seed_is_mean:
-                    seed_dl_kwargs["is_mean"] = True
-                await connector.download(
-                    spec.model,
-                    spec.cycle_date,
-                    spec.cycle_hour,
-                    seed_lead,
-                    seed_dest,
-                    **seed_dl_kwargs,
+            #
+            #    The seed's dataset initializes (or validates) the cycle store,
+            #    so one item must decode — but WHICH item is a choice. A 6h-reset
+            #    lead whose predecessor region is uncommitted (all NaN: a corrupt
+            #    upstream lead the catalog cannot distinguish from a healthy one)
+            #    cannot be de-accumulated, and that is only visible once its file
+            #    is decoded. Treating it as fatal aborted the whole wave, and
+            #    because the lead stays pending every retry aborted identically
+            #    (the 2026-09-15T06Z endless-retry incident). Such an item is
+            #    recorded as a single-item failure — it is never written, so its
+            #    lead stays NaN-filled and therefore unservable — and the next
+            #    item becomes the retained seed instead.
+            seed_dataset: xr.Dataset | None = None
+            for candidate_item in list(items):
+                cand_member, cand_lead, cand_is_mean = candidate_item
+                cand_dest = _destination_for(
+                    spec,
+                    staging_dir,
+                    lead=cand_lead,
+                    member=cand_member,
+                    is_mean=cand_is_mean,
                 )
-                tracker.record_milestone("seed_download_complete")
-                tracker.on_download_complete(
-                    seed_member,
-                    seed_lead,
-                    duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
-                )
-            except Exception:
-                tracker.on_download_failed(
-                    seed_member,
-                    seed_lead,
-                    duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
-                )
-                tracker.set_init_phase("failed")
-                raise
+                Path(cand_dest).parent.mkdir(parents=True, exist_ok=True)
+                tracker.set_init_phase("seed_download")
+                tracker.record_milestone("seed_download_start")
+                tracker.on_download_start(cand_member, cand_lead, is_seed=True)
+                t_dl_start = time.monotonic()
+                try:
+                    cand_dl_kwargs: dict[str, Any] = {"variables": var_codes}
+                    if cand_member is not None:
+                        cand_dl_kwargs["member"] = cand_member
+                    if cand_is_mean:
+                        cand_dl_kwargs["is_mean"] = True
+                    await connector.download(
+                        spec.model,
+                        spec.cycle_date,
+                        spec.cycle_hour,
+                        cand_lead,
+                        cand_dest,
+                        **cand_dl_kwargs,
+                    )
+                    tracker.record_milestone("seed_download_complete")
+                    tracker.on_download_complete(
+                        cand_member,
+                        cand_lead,
+                        duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
+                    )
+                except Exception:
+                    tracker.on_download_failed(
+                        cand_member,
+                        cand_lead,
+                        duration_ms=(time.monotonic() - t_dl_start) * 1000.0,
+                    )
+                    tracker.set_init_phase("failed")
+                    raise
 
-            tracker.set_init_phase("seed_decode")
-            tracker.record_milestone("seed_decode_start")
-            tracker.on_decode_start(seed_member, seed_lead)
-            t_dec_start = time.monotonic()
-            try:
-                seed_future = decode_pool.submit(seed_dest)
-                seed_dataset = await await_blocking_settled(
-                    _decode_and_normalize,
-                    seed_future,
-                    catalog_spec,
-                    store_path=store_path,
-                    member=seed_member,
-                    is_mean=seed_is_mean,
-                )
+                tracker.set_init_phase("seed_decode")
+                tracker.record_milestone("seed_decode_start")
+                tracker.on_decode_start(cand_member, cand_lead)
+                t_dec_start = time.monotonic()
+                cand_dataset: xr.Dataset | None = None
+                try:
+                    cand_future = decode_pool.submit(cand_dest)
+                    cand_dataset = await await_blocking_settled(
+                        _decode_and_normalize,
+                        cand_future,
+                        catalog_spec,
+                        store_path=store_path,
+                        member=cand_member,
+                        is_mean=cand_is_mean,
+                    )
+                    _validate_requested_lead(cand_dataset, cand_lead)
+                    _validate_requested_member(cand_dataset, cand_member)
+                except (MissingPredecessorLeadError, DeaccumulationError) as exc:
+                    # Single-item failure: settle it without committing so the
+                    # wave can continue on the remaining items. It is also
+                    # dropped from the work list — its predecessor can never
+                    # materialize in this wave, so re-running it through the
+                    # regular pipeline would only fail a second time.
+                    decode_completed_events[candidate_item].set()
+                    write_completed_events[candidate_item].set()
+                    items = [item for item in items if item != candidate_item]
+                    tracker.on_decode_failed(
+                        cand_member,
+                        cand_lead,
+                        duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
+                    )
+                    failures.append(
+                        f"{spec.model} member={cand_member} lead={cand_lead} "
+                        f"is_mean={cand_is_mean} decode: {exc}"
+                    )
+                    _logger.warning(
+                        "Seed candidate %s member=%s lead=%s is_mean=%s cannot be "
+                        "normalized; continuing with the remaining items: %s",
+                        spec.model,
+                        cand_member,
+                        cand_lead,
+                        cand_is_mean,
+                        exc,
+                    )
+                    continue
+                except Exception:
+                    decode_completed_events[candidate_item].set()
+                    tracker.on_decode_failed(
+                        cand_member,
+                        cand_lead,
+                        duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
+                    )
+                    tracker.set_init_phase("failed")
+                    raise
+
+                seed_item = candidate_item
+                seed_member, seed_lead, seed_is_mean = candidate_item
+                seed_dataset = cand_dataset
 
                 raw_precip_for_future = None
                 if "tp" in seed_dataset.data_vars:
@@ -925,9 +997,6 @@ async def _run_wave_impl(
                 elif "cloud_cover_3h" in seed_dataset.data_vars:
                     raw_cloud_for_future = np.copy(seed_dataset["cloud_cover_3h"].values)
 
-                _validate_requested_lead(seed_dataset, seed_lead)
-                _validate_requested_member(seed_dataset, seed_member)
-
                 if raw_precip_for_future is not None or raw_cloud_for_future is not None:
                     with predecessor_lock:
                         predecessor_states[seed_item] = PredecessorState(
@@ -938,19 +1007,23 @@ async def _run_wave_impl(
 
                 tracker.record_milestone("seed_decode_complete")
                 tracker.on_decode_complete(
-                    seed_member,
-                    seed_lead,
+                    cand_member,
+                    cand_lead,
                     duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
                 )
-            except Exception:
-                decode_completed_events[seed_item].set()
-                tracker.on_decode_failed(
-                    seed_member,
-                    seed_lead,
-                    duration_ms=(time.monotonic() - t_dec_start) * 1000.0,
+                break
+
+            if seed_dataset is None:
+                raise ValueError(
+                    f"No wave item for model={spec.model!r} cycle "
+                    f"{spec.cycle_time.isoformat()} can be normalized: every "
+                    "target lead is missing a readable predecessor region. "
+                    "Nothing in this wave can be committed."
                 )
-                tracker.set_init_phase("failed")
-                raise
+            # The seed runs through its own write task, so it must not also be
+            # a regular pipeline item; keep the ordering (lead-major) otherwise.
+            if items[0] != seed_item:
+                items = [seed_item, *(item for item in items if item != seed_item)]
 
             # 2. Determine run id + same-cycle and durably reserve pre-write identity (Guarantee A & B).
             run_id: str
@@ -1534,6 +1607,106 @@ async def _run_wave_impl(
         raise asyncio.CancelledError
 
     return status
+
+
+async def _repair_cycle_status(
+    spec: RunSpec,
+    args: Any,
+    catalog_spec: RunCatalogSpec,
+    store_path: str,
+) -> str:
+    """Re-derive a cycle's run status from its store without ingesting anything.
+
+    The finalizer is the only component that derives ``model_runs.status``
+    (catalog reconciliation followed by the store↔catalog readiness gate). A
+    cycle whose catalog is already complete but whose status was never promoted
+    has no remaining ingest work, so no wave will ever run for it again and the
+    finalizer would never be reached: the stale status would survive until the
+    cycle left the serving horizon. This entry point runs exactly that
+    finalizer, through the same ``RunCoordinator`` and the same canonical
+    horizon as a wave, so the promotion decision is identical — only the
+    download/decode/write stages are skipped.
+
+    Nothing is downloaded and no run row is created: a cycle with no
+    ``model_runs`` row has no status to repair and raises instead.
+
+    Args:
+        spec: The forecast-run specification (wave targets are ignored).
+        args: A CLI-compatible namespace (only ``lock_timeout`` is read, via
+            ``getattr`` with a default).
+        catalog_spec: The run's catalog metadata; its ``expected_*`` fields
+            carry the canonical cycle horizon.
+        store_path: The cycle's Zarr store path.
+
+    Returns:
+        The finalizer's derived run status (``ready``/``partial``/``processing``).
+
+    Raises:
+        ValueError: If the horizon is empty or the cycle has no run row.
+        CycleTombstonedError: If the cycle is claimed for deletion or deleted.
+    """
+    from ingestion.core.base import CycleTombstonedError
+    from ingestion.core.catalog import (
+        ModelRunRecord,
+        ModelVersionRecord,
+        is_cycle_fenced_or_deleted,
+    )
+    from ingestion.core.coordinator import RunCoordinator
+    from sqlalchemy import select
+
+    horizon_leads = tuple(catalog_spec.expected_lead_time_hours)
+    horizon_members = tuple(catalog_spec.expected_members)
+    if not horizon_leads:
+        raise ValueError(
+            "catalog_spec.expected_lead_time_hours is empty: the status repair "
+            "requires the canonical cycle horizon to evaluate readiness against."
+        )
+
+    cycle_time = spec.cycle_time
+    with _catalog_session() as session:
+        if is_cycle_fenced_or_deleted(session, cycle_time, model_id=spec.model):
+            raise CycleTombstonedError(
+                f"Refusing status repair for cycle {cycle_time.isoformat()}: "
+                "cycle is claimed for deletion or already tombstoned."
+            )
+        run_id = session.execute(
+            select(ModelRunRecord.id)
+            .join(
+                ModelVersionRecord,
+                ModelRunRecord.model_version_id == ModelVersionRecord.id,
+            )
+            .where(
+                ModelVersionRecord.model_id == catalog_spec.model_id,
+                ModelVersionRecord.version_string == catalog_spec.version_string,
+                ModelRunRecord.cycle_time == cycle_time,
+            )
+        ).scalars().first()
+    if run_id is None:
+        raise ValueError(
+            f"No model_runs row for model={spec.model!r} cycle "
+            f"{cycle_time.isoformat()}; there is no status to repair."
+        )
+
+    coordinator = RunCoordinator(
+        catalog_spec,
+        store_path,
+        timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
+    )
+    engine = _catalog_session_factory()
+    conn = engine.connect()
+    try:
+        result = coordinator.finalize_run(
+            conn,
+            run_id=str(run_id),
+            spec=catalog_spec,
+            expected_leads=horizon_leads,
+            expected_members=horizon_members,
+        )
+        return result.status
+    finally:
+        # Only the connection is returned; the catalog engine is the shared
+        # process-level pool (unlike a wave, which owns and disposes its own).
+        conn.close()
 
 
 def _decode_and_normalize(

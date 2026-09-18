@@ -854,6 +854,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional run ID to filter requeue",
     )
 
+    rec_purge = rec_sub.add_parser(
+        "purge",
+        help="Delete terminal ('deleted') reclamation_queue rows older than a "
+        "retention window, in bounded batches",
+    )
+    rec_purge.add_argument(
+        "--older-than-days",
+        type=float,
+        required=True,
+        help="Retention window for terminal rows (days); reclaimed_at older than "
+        "this is removed. Terminal rows are audit residue once the physical "
+        "object is gone.",
+    )
+    rec_purge.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(getattr(settings, "RECLAMATION_PURGE_BATCH_SIZE", 5000)),
+        help="Rows per batch (keeps each transaction short so autovacuum can "
+        "absorb the dead tuples).",
+    )
+    rec_purge.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Optional cap on batches; omit to drain every eligible row.",
+    )
+    rec_purge.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="Run VACUUM (ANALYZE) reclamation_queue after the purge (operators "
+        "should confirm this runs outside any open transaction).",
+    )
+
     # -------------------------------------------------------------------------
     # Monitoring & Operational Health Subcommands (Runtime Monitoring)
     # -------------------------------------------------------------------------
@@ -1642,10 +1675,11 @@ def _run_gc(args: argparse.Namespace) -> int:
 
 
 def _run_reclamation(args: argparse.Namespace) -> int:
-    """Execute granular reclamation CLI action (plan, work, or requeue)."""
+    """Execute granular reclamation CLI action (plan, work, requeue, or purge)."""
     from ingestion.core.db import SessionLocal
     from ingestion.gc.planner import plan_reclamation_pass
     from ingestion.gc.worker import (
+        purge_reclaimed_queue_rows,
         requeue_failed_reclamation_targets,
         run_reclamation_worker_pass,
     )
@@ -1682,6 +1716,23 @@ def _run_reclamation(args: argparse.Namespace) -> int:
                 f"markers_cleaned={w_res.markers_cleaned_count}"
             )
             return 0
+        if action == "purge":
+            p_res = purge_reclaimed_queue_rows(
+                session,
+                older_than_days=float(args.older_than_days),
+                batch_size=int(args.batch_size),
+                max_batches=(
+                    int(args.max_batches) if args.max_batches is not None else None
+                ),
+            )
+            print(
+                f"Reclamation Queue Purge: deleted={p_res.deleted_rows}, "
+                f"batches={p_res.batches}, "
+                f"oldest_remaining={p_res.oldest_remaining}"
+            )
+            if args.vacuum:
+                _vacuum_reclamation_queue(session)
+            return 0
         if action == "requeue":
             m_id = getattr(args, "model_id", None)
             r_id = getattr(args, "run_id", None)
@@ -1690,6 +1741,78 @@ def _run_reclamation(args: argparse.Namespace) -> int:
             return 0
     print(f"Unknown reclamation action: {action}")
     return 2
+
+
+def _vacuum_reclamation_queue(session: Any) -> None:
+    """VACUUM (ANALYZE) the reclamation queue after a purge pass.
+
+    autovacuum eventually reclaims the dead tuples a purge leaves behind, but
+    the table is precisely the one whose autovacuum has been blocked (by the
+    idle-in-transaction connections the leadership fix addresses) and whose
+    bloat motivated the purge. An explicit, operator-triggered VACUUM right after
+    the purge is the reliable path; PostgreSQL refuses it inside a transaction,
+    so it runs on a fresh autocommit connection.
+    """
+    from sqlalchemy import text
+
+    bind = session.get_bind()
+    try:
+        with bind.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("VACUUM (ANALYZE) reclamation_queue"))
+        print("Reclamation Queue: VACUUM (ANALYZE) complete")
+    except Exception as exc:  # noqa: BLE001 - vacuum is best-effort guidance
+        print(
+            "Reclamation Queue: VACUUM skipped "
+            f"({exc}); run it manually outside a transaction to reclaim space"
+        )
+
+
+def _ingestion_alert_data(gfs_lag: Any, gefs_lag: Any) -> dict[str, Any]:
+    """Assemble the per-model ingestion payload the alert rules consume.
+
+    Alert rules only see this mapping, so everything they need is collected
+    here: the lag/readiness report, the formal completeness verdict (which also
+    republishes the ``weather_model_*`` gauges), the fill budget that decides
+    whether a condition has persisted, and the complete-but-not-ready probe.
+    ``status`` and ``alert-check`` both build their view through this helper so
+    the two cannot disagree.
+
+    Args:
+        gfs_lag: The GFS lag report.
+        gefs_lag: The GEFS lag report.
+
+    Returns:
+        ``{"gfs": {...}, "gefs": {...}}``.
+    """
+    from ingestion.monitoring import INGESTION_COLLECTOR
+
+    fill_grace = float(INGESTION_COLLECTOR.fill_grace_seconds)
+    completeness = {
+        "gfs": INGESTION_COLLECTOR.evaluate_gfs_completeness(),
+        "gefs": INGESTION_COLLECTOR.evaluate_gefs_completeness(),
+    }
+    return {
+        "gfs": {
+            "lag": gfs_lag,
+            "stuck": INGESTION_COLLECTOR.check_stuck("gfs"),
+            "readiness": completeness["gfs"],
+            "cycles_complete_not_ready": gfs_lag.complete_not_ready_cycles,
+            "oldest_complete_not_ready_overdue_seconds": (
+                gfs_lag.oldest_complete_not_ready_overdue_seconds
+            ),
+            "fill_grace_seconds": fill_grace,
+        },
+        "gefs": {
+            "lag": gefs_lag,
+            "stuck": INGESTION_COLLECTOR.check_stuck("gefs"),
+            "readiness": completeness["gefs"],
+            "cycles_complete_not_ready": gefs_lag.complete_not_ready_cycles,
+            "oldest_complete_not_ready_overdue_seconds": (
+                gefs_lag.oldest_complete_not_ready_overdue_seconds
+            ),
+            "fill_grace_seconds": fill_grace,
+        },
+    }
 
 
 def _run_status(args: argparse.Namespace) -> int:
@@ -1710,6 +1833,11 @@ def _run_status(args: argparse.Namespace) -> int:
     )
 
     dl_dir = getattr(args, "download_dir", "downloads")
+    # The module singleton is constructed without an engine, so without this
+    # wiring evaluate_lag/evaluate_*_completeness silently skip the catalog and
+    # the operator view reports healthy clock-derived values instead of the
+    # real ones (matching the metrics exporter's own wiring).
+    INGESTION_COLLECTOR.engine = engine
     res_data = RESOURCE_COLLECTOR.collect_and_export(disk_paths=(".", dl_dir))
     pg_data = PostgresHealthCollector(engine).collect()
     storage_data = StorageHealthCollector(
@@ -1725,10 +1853,7 @@ def _run_status(args: argparse.Namespace) -> int:
     gefs_state = INGESTION_COLLECTOR.get_model_state("gefs")
     leak_data = LEAK_DETECTOR.evaluate_leak()
 
-    ingestion_data = {
-        "gfs": {"lag": gfs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gfs")},
-        "gefs": {"lag": gefs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gefs")},
-    }
+    ingestion_data = _ingestion_alert_data(gfs_lag, gefs_lag)
 
     active_alerts = ALERT_ENGINE.evaluate_rules(
         resource_data=res_data,
@@ -1760,13 +1885,27 @@ def _run_status(args: argparse.Namespace) -> int:
             "gfs": {
                 "lag_cycles": gfs_lag.lag_cycles,
                 "lag_hours": gfs_lag.lag_hours,
+                "lag_known": gfs_lag.lag_known,
                 "latest_ready": str(gfs_lag.latest_ready_cycle),
+                "latest_servable": str(gfs_lag.latest_servable_cycle),
+                "lag_target": str(gfs_lag.lag_target_cycle),
+                "lag_target_ready": gfs_lag.lag_target_ready,
+                "lag_target_overdue_seconds": gfs_lag.lag_target_overdue_seconds,
+                "data_missing_cycles": gfs_lag.data_missing_cycles,
+                "cycles_complete_not_ready": gfs_lag.complete_not_ready_cycles,
                 "expected_latest": str(gfs_lag.latest_expected_cycle),
             },
             "gefs": {
                 "lag_cycles": gefs_lag.lag_cycles,
                 "lag_hours": gefs_lag.lag_hours,
+                "lag_known": gefs_lag.lag_known,
                 "latest_ready": str(gefs_lag.latest_ready_cycle),
+                "latest_servable": str(gefs_lag.latest_servable_cycle),
+                "lag_target": str(gefs_lag.lag_target_cycle),
+                "lag_target_ready": gefs_lag.lag_target_ready,
+                "lag_target_overdue_seconds": gefs_lag.lag_target_overdue_seconds,
+                "data_missing_cycles": gefs_lag.data_missing_cycles,
+                "cycles_complete_not_ready": gefs_lag.complete_not_ready_cycles,
                 "expected_latest": str(gefs_lag.latest_expected_cycle),
             },
             "lifecycle": {
@@ -1854,6 +1993,9 @@ def _run_audit(args: argparse.Namespace) -> int:
     )
 
     lifecycle_data = LifecycleHealthCollector(engine).collect()
+    # See the note in ``_run_status``: the singleton needs the engine or the
+    # completeness verdicts below degrade to empty, unready placeholders.
+    INGESTION_COLLECTOR.engine = engine
     gfs_comp = INGESTION_COLLECTOR.evaluate_gfs_completeness()
     gefs_comp = INGESTION_COLLECTOR.evaluate_gefs_completeness()
     out = render_audit(
@@ -1887,15 +2029,16 @@ def _run_alert_check(args: argparse.Namespace) -> int:
         access_key=getattr(settings, "MINIO_ACCESS_KEY", "minio_admin"),
         secret_key=getattr(settings, "MINIO_SECRET_KEY", "minio_password"),
     ).probe()
+    # Wire the catalog engine on the module singleton (see the note in
+    # ``_run_status``): without it every ingestion rule evaluates degraded,
+    # always-healthy inputs and a stalled pipeline never alerts.
+    INGESTION_COLLECTOR.engine = engine
     lifecycle_data = LifecycleHealthCollector(engine).collect()
     gfs_lag = INGESTION_COLLECTOR.evaluate_lag("gfs")
     gefs_lag = INGESTION_COLLECTOR.evaluate_lag("gefs")
     leak_data = LEAK_DETECTOR.evaluate_leak()
 
-    ingestion_data = {
-        "gfs": {"lag": gfs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gfs")},
-        "gefs": {"lag": gefs_lag, "stuck": INGESTION_COLLECTOR.check_stuck("gefs")},
-    }
+    ingestion_data = _ingestion_alert_data(gfs_lag, gefs_lag)
 
     ALERT_ENGINE.evaluate_and_dispatch(
         resource_data=res_data,
