@@ -543,6 +543,82 @@ class AlertEngine:
                             )
                         )
 
+                # Stalled readiness: the newest cycle that should already be
+                # complete is still not `ready` a full fill window past its
+                # deadline. The lag gate above cannot see this class of defect —
+                # a cycle can be fully ingested and servable (lag 0) while its
+                # status was never promoted, which is exactly how a promotion
+                # bug stays invisible in every other view.
+                #
+                # The verdict is deliberately about the due cycle and not about
+                # `weather_model_ready_status`, whose newest run is *expected*
+                # to be unready while it fills.
+                fill_grace = float(mdata.get("fill_grace_seconds") or 0.0)
+                overdue = lag.lag_target_overdue_seconds if lag is not None else None
+                if (
+                    lag is not None
+                    and lag.lag_target_ready is False
+                    and overdue is not None
+                    and fill_grace > 0.0
+                    and overdue >= fill_grace
+                ):
+                    alerts.append(
+                        Alert(
+                            name="model_ready_not_promoted",
+                            severity=AlertSeverity.WARNING,
+                            summary=(
+                                f"{model_id.upper()} cycle "
+                                f"{overdue / 3600.0:.1f}h past its fill deadline "
+                                "without being promoted to ready"
+                            ),
+                            description=(
+                                f"The newest cycle that should already be complete "
+                                f"({lag.lag_target_cycle}) is still not 'ready' "
+                                f"{overdue / 3600.0:.1f}h after its f000 ingest anchor plus the "
+                                f"{fill_grace / 3600.0:.1f}h fill budget. Data may be complete; "
+                                "readiness promotion is stalled."
+                            ),
+                            scope=model_id,
+                            value=overdue,
+                            threshold=fill_grace,
+                            runbook_anchor="#model-ready-not-promoted",
+                        )
+                    )
+
+                # Direct probe for the same defect class: cycles whose catalog
+                # contents are complete but whose status is not `ready`. A
+                # single stuck cycle is invisible to the lag gauge (it serves
+                # traffic), so this is what surfaces it within minutes rather
+                # than through an operator noticing a stale badge.
+                probe = int(mdata.get("cycles_complete_not_ready") or 0)
+                probe_overdue = mdata.get("oldest_complete_not_ready_overdue_seconds")
+                if (
+                    probe > 0
+                    and probe_overdue is not None
+                    and fill_grace > 0.0
+                    and float(probe_overdue) >= fill_grace
+                ):
+                    alerts.append(
+                        Alert(
+                            name="cycles_complete_not_ready",
+                            severity=AlertSeverity.WARNING,
+                            summary=(
+                                f"{probe} {model_id.upper()} cycle(s) complete in the "
+                                "catalog but not promoted to ready"
+                            ),
+                            description=(
+                                f"{probe} cycle(s) hold every expected lead (and member) in the "
+                                f"catalog while their run status is not 'ready'; the oldest has "
+                                f"been past its fill deadline for {float(probe_overdue) / 3600.0:.1f}h. "
+                                "This is a readiness-promotion defect, not an ingestion shortfall."
+                            ),
+                            scope=model_id,
+                            value=probe,
+                            threshold=0,
+                            runbook_anchor="#cycles-complete-not-ready",
+                        )
+                    )
+
         # 6. GC pipeline pass rules (in-process stage snapshot from the GC
         # daemon; see ingestion.monitoring.gc_metrics.snapshot_alert_state).
         # Complements the queue-state rules above: reclamation_failed_shards

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -581,6 +582,33 @@ def test_lag_known_gauge_flags_unknown_lag():
     assert _gauge_value(INGESTION_LAG_KNOWN, "gfs") == 1.0
 
 
+def test_complete_not_ready_probe_counts_and_ages_stuck_cycles():
+    """The probe reports complete-but-unpromoted cycles and how long they have sat."""
+    from ingestion.monitoring.ingestion_collector import (
+        INGESTION_CYCLES_COMPLETE_NOT_READY,
+    )
+
+    cycle_18z = datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
+    stale = _fact_collector(
+        [_gfs_fact(cycle_18z, created_hours=4.44, complete=True, status="partial")]
+    )
+    report = stale.evaluate_lag("gfs", now=_NOW)
+    assert report.complete_not_ready_cycles == 1
+    assert report.lag_target_ready is False
+    # 22:26:24 anchor + 2.5h budget = 00:56:24; now is 05:40 -> 4h43m36s.
+    assert report.lag_target_overdue_seconds == pytest.approx(17016.0, abs=60.0)
+    assert report.oldest_complete_not_ready_overdue_seconds is not None
+    assert _gauge_value(INGESTION_CYCLES_COMPLETE_NOT_READY, "gfs") == 1.0
+
+    healthy = _fact_collector(
+        [_gfs_fact(cycle_18z, created_hours=4.44, complete=True, status="ready")]
+    )
+    healthy_report = healthy.evaluate_lag("gfs", now=_NOW)
+    assert healthy_report.complete_not_ready_cycles == 0
+    assert healthy_report.lag_target_ready is True
+    assert _gauge_value(INGESTION_CYCLES_COMPLETE_NOT_READY, "gfs") == 0.0
+
+
 def test_gefs_completeness_thresholds():
     mock_engine = MagicMock()
     collector = IngestionHealthCollector(engine=mock_engine)
@@ -723,6 +751,65 @@ def test_alert_rules_evaluation():
     lc_stuck = LifecycleHealthReport(stuck_claims_critical=1, oldest_claim_age_s=15000.0)
     alerts_lc = engine.evaluate_rules(lifecycle_data=lc_stuck)
     assert any(a.name == "finalizer_claim_stuck_critical" and a.severity == AlertSeverity.CRITICAL for a in alerts_lc)
+
+
+def test_stalled_readiness_alert_requires_a_full_fill_window():
+    """A due cycle that stays unready past a whole fill window alerts; a fresh one does not."""
+    engine = AlertEngine()
+    cycle_18z = datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
+
+    def _data(report: IngestionLagReport) -> dict[str, Any]:
+        return {
+            "gfs": {
+                "lag": report,
+                "stuck": None,
+                "readiness": {"ready": False, "status": "partial", "members": 30},
+                "cycles_complete_not_ready": report.complete_not_ready_cycles,
+                "oldest_complete_not_ready_overdue_seconds": (
+                    report.oldest_complete_not_ready_overdue_seconds
+                ),
+                "fill_grace_seconds": 9000.0,
+            }
+        }
+
+    stalled = _fact_collector(
+        [_gfs_fact(cycle_18z, created_hours=4.44, complete=True, status="partial")]
+    ).evaluate_lag("gfs", now=_NOW)
+    alerts = engine.evaluate_rules(ingestion_data=_data(stalled))
+    assert any(a.name == "model_ready_not_promoted" for a in alerts)
+    assert any(a.name == "cycles_complete_not_ready" for a in alerts)
+
+    # Within a fill window of the deadline nothing is reported yet.
+    just_due = _fact_collector(
+        [_gfs_fact(cycle_18z, created_hours=4.44, complete=True, status="partial")]
+    ).evaluate_lag("gfs", now=datetime(2026, 9, 18, 1, 30, tzinfo=timezone.utc))
+    fresh_alerts = engine.evaluate_rules(ingestion_data=_data(just_due))
+    assert not any(a.name in ("model_ready_not_promoted", "cycles_complete_not_ready") for a in fresh_alerts)
+
+
+def test_complete_not_ready_probe_does_not_alert_on_healthy_cycles():
+    """A probe count of zero never alerts, and a promoted cycle clears the condition."""
+    engine = AlertEngine()
+    cycle_18z = datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
+    healthy = _fact_collector(
+        [_gfs_fact(cycle_18z, created_hours=4.44, complete=True, status="ready")]
+    ).evaluate_lag("gfs", now=_NOW)
+    alerts = engine.evaluate_rules(
+        ingestion_data={
+            "gfs": {
+                "lag": healthy,
+                "stuck": None,
+                "readiness": {"ready": True, "status": "ready"},
+                "cycles_complete_not_ready": 0,
+                "oldest_complete_not_ready_overdue_seconds": None,
+                "fill_grace_seconds": 9000.0,
+            }
+        }
+    )
+    assert not any(
+        a.name in ("model_ready_not_promoted", "cycles_complete_not_ready")
+        for a in alerts
+    )
 
 
 def test_alert_deduplication_cooldown_and_recovery():

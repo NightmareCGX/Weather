@@ -119,6 +119,11 @@ INGESTION_DATA_MISSING_CYCLES = REGISTRY.gauge(
     "Due cycles with no servable data at all (distinct from a status that has not been promoted)",
     labelnames=("model",),
 )
+INGESTION_CYCLES_COMPLETE_NOT_READY = REGISTRY.gauge(
+    "weather_ingestion_cycles_complete_not_ready",
+    "Cycles whose catalog contents are complete while their run status is not ready",
+    labelnames=("model",),
+)
 
 GEFS_AVAILABLE_MEMBERS = REGISTRY.gauge(
     "weather_gefs_available_members_count",
@@ -253,6 +258,24 @@ class IngestionLagReport:
         lag_hours: Hours between target and baseline.
         data_missing_cycles: Deadline-passed cycles with no servable data.
         is_behind: Whether a *known* lag measurement exceeds zero.
+        lag_target_cycle: Newest cycle that should already be complete.
+        latest_missing_run_cycle: Newest deadline-passed cycle with no
+            ``model_runs`` row at all (publication window and fill budget both
+            closed, so there is no f000 anchor to measure from).
+        lag_target_ready: Whether the target cycle's run status is ``ready``,
+            or ``None`` when the target has no run row. Deliberately not the
+            newest run's readiness: the newest cycle is *expected* to be
+            unready while it fills, so only the due cycle's verdict can drive a
+            stalled-promotion alert.
+        lag_target_overdue_seconds: Seconds the target cycle is past its fill
+            deadline (0 when it is not due yet). A full grace period here is
+            the "sustained" evidence an alert needs.
+        complete_not_ready_cycles: Cycles whose catalog contents are complete
+            while their status is not ``ready`` — the direct probe for a
+            promotion defect.
+        oldest_complete_not_ready_overdue_seconds: Overdue time of the oldest
+            such cycle, so a freshly completed cycle mid-promotion is not
+            alerted on.
     """
 
     model: str
@@ -268,6 +291,10 @@ class IngestionLagReport:
     is_behind: bool
     lag_target_cycle: datetime | None = None
     latest_missing_run_cycle: datetime | None = None
+    lag_target_ready: bool | None = None
+    lag_target_overdue_seconds: float | None = None
+    complete_not_ready_cycles: int = 0
+    oldest_complete_not_ready_overdue_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -742,11 +769,39 @@ class IngestionHealthCollector:
             and not (by_cycle[cycle].servable if cycle in by_cycle else False)
         )
 
+        # Readiness view: the shape of a promotion defect. A cycle can be
+        # complete in the catalog while its status was never promoted, which
+        # neither the lag gauge nor a status-based query can see. A complete
+        # cycle is only alerted on once it is a full fill window past its
+        # deadline, so the brief window where a wave fence has downgraded an
+        # otherwise complete run is not reported as a fault.
+        complete_not_ready = [
+            fact for fact in facts if fact.complete and fact.status != "ready"
+        ]
+        complete_not_ready_cycles = len(complete_not_ready)
+        oldest_probe_overdue = (
+            max(
+                max(0.0, (now_utc - _due_at(fact.cycle_time)).total_seconds())
+                for fact in complete_not_ready
+            )
+            if complete_not_ready
+            else None
+        )
+        target_fact = by_cycle.get(target_cycle) if target_cycle is not None else None
+        target_overdue = (
+            max(0.0, (now_utc - _due_at(target_cycle)).total_seconds())
+            if target_cycle is not None
+            else None
+        )
+
         INGESTION_LAG_KNOWN.labels(model=m).set(1.0 if lag_known else 0.0)
         if lag_known:
             INGESTION_LAG_CYCLES.labels(model=m).set(float(lag_cycles))
             INGESTION_LAG_HOURS.labels(model=m).set(lag_hours)
         INGESTION_DATA_MISSING_CYCLES.labels(model=m).set(float(data_missing_cycles))
+        INGESTION_CYCLES_COMPLETE_NOT_READY.labels(model=m).set(
+            float(complete_not_ready_cycles)
+        )
 
         return IngestionLagReport(
             model=m,
@@ -766,6 +821,12 @@ class IngestionHealthCollector:
             is_behind=lag_known and lag_cycles > 0,
             lag_target_cycle=target_cycle,
             latest_missing_run_cycle=max(missing_run) if missing_run else None,
+            lag_target_ready=(
+                target_fact.status == "ready" if target_fact is not None else None
+            ),
+            lag_target_overdue_seconds=target_overdue,
+            complete_not_ready_cycles=complete_not_ready_cycles,
+            oldest_complete_not_ready_overdue_seconds=oldest_probe_overdue,
         )
 
     def evaluate_model_completeness(
