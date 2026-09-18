@@ -221,6 +221,31 @@ def _run_wave_sync(
     return status
 
 
+def _run_wave_sync_collect(
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_db,
+    spec: RunSpec,
+    args: SimpleNamespace,
+    store_path: str,
+) -> tuple[str, list[str]]:
+    """Run one wave and return ``(status, failures)`` without asserting them."""
+    import ingestion.core.wave_runner as wave_runner
+
+    monkeypatch.setattr(wave_runner, "_catalog_session_factory", lambda: catalog_db)
+    failures: list[str] = []
+    status = asyncio.run(
+        _run_wave(
+            spec=spec,
+            args=args,
+            catalog_spec=_build_spec(spec, args, store_path),
+            store_path=store_path,
+            concurrency=4,
+            failures=failures,
+        )
+    )
+    return status, failures
+
+
 def _committed_temperature_regions(store_path: str) -> set[int] | set[tuple[int, int]]:
     """Committed leads (deterministic) / (member, lead) pairs (ensemble).
 
@@ -724,6 +749,126 @@ def test_gefs_wave_cleanup_removes_ensemble_mean_and_idx_artifacts(
             if "Failed to remove staging directory" in rec.message
         ]
         assert not cleanup_warnings, f"Unexpected cleanup warnings logged: {cleanup_warnings}"
+    finally:
+        MODEL_CANONICAL_HORIZONS.clear()
+        MODEL_CANONICAL_HORIZONS.update(saved)
+
+
+def test_wave_survives_seed_with_unreadable_predecessor(
+    tmp_path: Path,
+    catalog_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt predecessor region must not abort the whole wave.
+
+    Regression for the 2026-09-15T06Z endless retry: a 6h-reset lead whose
+    predecessor region is uncommitted (all NaN) cannot be de-accumulated. When
+    that lead was the wave's retained seed — which is decoded before anything
+    else — the exception aborted the entire wave, and because the lead stayed
+    pending every retry aborted identically, so the cycle could never make
+    progress.
+
+    After the fix the item is a single-item failure: the remaining items are
+    still ingested, and the affected lead is never committed (it stays
+    NaN-filled, hence unservable).
+    """
+    from domain.horizon import MODEL_CANONICAL_HORIZONS, register_canonical_lead_horizon
+    from ingestion.core.decode_worker import DecodePool
+
+    horizon = tuple(range(0, 30, 3))  # 0, 3, ..., 27
+    saved = dict(MODEL_CANONICAL_HORIZONS)
+    register_canonical_lead_horizon("gfs", horizon)
+
+    def _synthetic(lead: int) -> xr.Dataset:
+        # Lead 21's precipitation/cloud regions are corrupt upstream (all NaN)
+        # while its temperature is fine, which is exactly the state the catalog
+        # cannot distinguish from a healthy lead.
+        precip = np.nan if lead == 21 else 10.0
+        cloud = np.nan if lead == 21 else 40.0
+        # 101x101 crosses the sharded_v1 inner chunk boundary (100x100), which
+        # the storage format requires a store to span.
+        grid = (101, 101)
+        return xr.Dataset(
+            data_vars={
+                "temperature_2m": (
+                    ("latitude", "longitude"),
+                    np.full(grid, 280.0 + lead, dtype=np.float32),
+                    {"units": "°C"},
+                ),
+                "tp": (
+                    ("latitude", "longitude"),
+                    np.full(grid, precip, dtype=np.float32),
+                    {"units": "mm"},
+                ),
+                "tcc": (
+                    ("latitude", "longitude"),
+                    np.full(grid, cloud, dtype=np.float32),
+                    {"units": "%"},
+                ),
+            },
+            coords={
+                "lead_time_hours": lead,
+                "latitude": np.linspace(90.0, -90.0, grid[0], dtype=np.float32),
+                "longitude": np.linspace(0.0, 359.0, grid[1], dtype=np.float32),
+            },
+            attrs={"cycle_time": "2026-07-21T00:00:00", "model_id": "gfs"},
+        )
+
+    async def _fake_download(
+        self, model, cycle_date, cycle_hour, lead_time_hours, destination, member=None, variables=None, **kwargs
+    ):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"stub-grib2")
+        return destination
+
+    def _fake_submit(self, path):
+        lead = int(Path(path).name.rsplit(".f", 1)[1].removesuffix(".grib2"))
+        fut: Future = Future()
+        fut.set_result(_synthetic(lead))
+        return fut
+
+    monkeypatch.setattr(
+        "ingestion.providers.noaa.connector.NOAAConnector.download", _fake_download
+    )
+    monkeypatch.setattr(DecodePool, "submit", _fake_submit)
+
+    store = str(tmp_path / "gfs.zarr")
+    args = _args(tmp_path)
+    try:
+        # Wave 1 commits leads 0..21 (lead 21 with NaN precipitation/cloud).
+        spec1 = RunSpec(
+            model="gfs",
+            cycle_date=CYCLE,
+            cycle_hour=0,
+            target_lead_time_hours=tuple(range(0, 24, 3)),
+        )
+        status1, failures1 = _run_wave_sync_collect(
+            monkeypatch, catalog_db, spec1, args, store
+        )
+        assert status1 == "partial"
+        assert failures1 == []
+
+        # Wave 2 begins at lead 24, whose predecessor (21) has no readable
+        # precipitation. The seed candidate cannot be normalized, but lead 27
+        # can, so the wave must continue instead of raising.
+        spec2 = RunSpec(
+            model="gfs",
+            cycle_date=CYCLE,
+            cycle_hour=0,
+            target_lead_time_hours=(24, 27),
+        )
+        status2, failures2 = _run_wave_sync_collect(
+            monkeypatch, catalog_db, spec2, args, store
+        )
+        assert status2 == "partial"
+        assert len(failures2) == 1, failures2
+        assert "predecessor" in failures2[0].lower() or "uncommitted" in failures2[0]
+
+        committed = _committed_temperature_regions(store)
+        assert 27 in committed
+        assert 24 not in committed
+        assert 24 not in _catalog_product_leads(catalog_db, _run_id(catalog_db, store))
     finally:
         MODEL_CANONICAL_HORIZONS.clear()
         MODEL_CANONICAL_HORIZONS.update(saved)
