@@ -11,8 +11,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.orm import Session
+
+from domain.canonical import build_fence_index
 
 from domain.reclamation import (
     DEFAULT_EXPECTED_REGION_VARIABLES,
@@ -1781,3 +1783,218 @@ def test_25_purge_cli_action_reports_and_removes(catalog_engine, tmp_path, monke
     assert exit_code == 0
     assert "deleted=1" in capsys.readouterr().out
     assert remaining == []
+
+
+# ===========================================================================
+# Counterfactual fence read: streamed projection, no row-set materialisation
+# ===========================================================================
+FENCED_STATUSES = (
+    RECLAMATION_STATUS_DELETING,
+    RECLAMATION_STATUS_DELETED,
+    RECLAMATION_STATUS_FAILED,
+)
+
+_FENCE_KEY_COLUMNS = frozenset(
+    {"run_id", "lead_time_hours", "variable_code", "target_kind", "member_index"}
+)
+
+
+def _is_counterfactual_fence_query(statement: object) -> bool:
+    """True only for the worker's counterfactual-fence SELECT.
+
+    Identified by its selected column set, which no other query in the pass
+    shares (the run, product and ensemble-member queries all differ).
+    """
+    columns = getattr(statement, "selected_columns", None)
+    if columns is None:
+        return False
+    return {column.key for column in columns} == _FENCE_KEY_COLUMNS
+
+
+class _FenceStreamSpy:
+    """Wraps the fence Result to observe whether the worker drained the stream.
+
+    A half-consumed server-side cursor raises nothing when the transaction that
+    owns it ends — the stream is silently short instead — so "it did not throw"
+    proves nothing and the consumed row count has to be observed directly.
+    """
+
+    def __init__(self, result):
+        self._result = result
+        self.rows_seen = 0
+        self.fetch_size: int | None = None
+        self.drained = False
+
+    def yield_per(self, count: int):
+        self.fetch_size = count
+        self._result.yield_per(count)
+        return self
+
+    def __iter__(self):
+        for row in self._result:
+            self.rows_seen += 1
+            yield row
+        self.drained = True
+
+
+def _fenced_fence_keys(engine) -> list[tuple[str, int, str, str, int]]:
+    """Read the fence rows the way the worker's predicate selects them."""
+    with Session(engine) as session:
+        rows = session.execute(
+            select(
+                ReclamationQueueRecord.run_id,
+                ReclamationQueueRecord.lead_time_hours,
+                ReclamationQueueRecord.variable_code,
+                ReclamationQueueRecord.target_kind,
+                ReclamationQueueRecord.member_index,
+            ).where(ReclamationQueueRecord.status.in_(FENCED_STATUSES))
+        ).all()
+    return [(str(r), int(ld), str(v), str(k), int(m)) for r, ld, v, k, m in rows]
+
+
+def _mark_half_the_queue_terminal(engine, now) -> int:
+    """Turn every other enqueued row terminal so it forms the fence.
+
+    The still-queued half is what the worker claims in this pass; the terminal
+    half is what its counterfactual fence must cover. Returns the fence size.
+    """
+    with Session(engine) as session:
+        row_ids = [
+            row_id
+            for (row_id,) in session.execute(
+                select(ReclamationQueueRecord.id).order_by(ReclamationQueueRecord.id)
+            ).all()
+        ]
+        fenced_ids = row_ids[::2]
+        if fenced_ids:
+            session.execute(
+                update(ReclamationQueueRecord)
+                .where(ReclamationQueueRecord.id.in_(fenced_ids))
+                .values(status=RECLAMATION_STATUS_DELETED, reclaimed_at=now)
+            )
+        session.commit()
+    return len(fenced_ids)
+
+
+def _seed_single_store_backlog(catalog_engine, tmp_path, now) -> None:
+    c0 = _dt(2026, 9, 1, 0)
+    store_dir = tmp_path / "c0"
+    run_id = _seed_run(catalog_engine, "gfs", c0, "ready", store_dir)
+    _seed_gfs_products(
+        catalog_engine,
+        run_id,
+        [6, 9, 12, 15, 18],
+        ["temperature_2m", "precipitation_rate"],
+        store_dir,
+    )
+    with Session(catalog_engine) as session:
+        plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+
+
+def test_fence_read_streams_the_exact_fenced_projection(catalog_engine, tmp_path, monkeypatch):
+    """The streamed index must equal the naive projection of the fenced rows.
+
+    Doubles as the silent-truncation sentinel: an abandoned cursor, or a query
+    whose predicate drifts, leaves the index short without raising anything.
+    """
+    now = _dt(2026, 9, 2, 12)
+    _seed_single_store_backlog(catalog_engine, tmp_path, now)
+    assert _fenced_fence_keys(catalog_engine) == []
+
+    fence_count = _mark_half_the_queue_terminal(catalog_engine, now)
+    expected_keys = _fenced_fence_keys(catalog_engine)
+    assert fence_count == len(expected_keys) > 1
+
+    captured: list[object] = []
+    real_build = worker_mod.build_fence_index
+
+    def _recording_build(keys):
+        index = real_build(keys)
+        captured.append(index)
+        return index
+
+    monkeypatch.setattr(worker_mod, "build_fence_index", _recording_build)
+
+    with Session(catalog_engine) as session:
+        result = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+
+    assert result.deleted_count > 0
+    assert len(captured) == 1, "one store group must read the fence exactly once"
+    assert captured == [build_fence_index(iter(expected_keys))]
+    # Negative control: the comparison above is discriminating, not vacuous.
+    assert captured != [
+        build_fence_index(iter(expected_keys[: len(expected_keys) // 2]))
+    ]
+    index = captured[0]
+    assert len(index.variable_keys) + len(index.member_keys) > 0
+
+
+def test_fence_stream_is_fully_drained_before_the_next_commit(
+    catalog_engine, tmp_path, monkeypatch
+):
+    """The fence cursor must be fully consumed before any later commit.
+
+    The worker's ordering is claim-commit -> build the fence -> write, which is
+    what `yield_per` needs; this pins it, because the failure mode is a quietly
+    smaller fence (over-conservative revalidation, i.e. reclamation silently
+    regressing toward the pre-batch-delete backlog) rather than an exception.
+    """
+    now = _dt(2026, 9, 2, 12)
+    _seed_single_store_backlog(catalog_engine, tmp_path, now)
+    assert _mark_half_the_queue_terminal(catalog_engine, now) > 1
+
+    streams: list[_FenceStreamSpy] = []
+    violations: list[str] = []
+
+    with Session(catalog_engine) as session:
+        real_execute = session.execute
+
+        def _spy_execute(statement, *args, **kwargs):
+            query_result = real_execute(statement, *args, **kwargs)
+            if _is_counterfactual_fence_query(statement):
+                spy = _FenceStreamSpy(query_result)
+                streams.append(spy)
+                return spy
+            return query_result
+
+        session.execute = _spy_execute  # type: ignore[method-assign]
+
+        def _before_commit(_session) -> None:
+            for spy in streams:
+                if not spy.drained:
+                    violations.append(
+                        f"commit with only {spy.rows_seen} fence rows consumed"
+                    )
+
+        event.listen(session, "before_commit", _before_commit)
+        try:
+            result = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+        finally:
+            event.remove(session, "before_commit", _before_commit)
+
+    assert result.deleted_count > 0
+    assert streams, "the fence read must be streamed rather than buffered"
+    assert violations == []
+    for spy in streams:
+        assert spy.drained
+        assert spy.fetch_size == worker_mod.FENCE_FETCH_SIZE
+        assert spy.rows_seen > 1
+
+    # Negative control: the detector really can distinguish an abandoned stream
+    # from a drained one, and it recognises the fence statement.
+    with Session(catalog_engine) as session:
+        fence_stmt = select(
+            ReclamationQueueRecord.run_id,
+            ReclamationQueueRecord.lead_time_hours,
+            ReclamationQueueRecord.variable_code,
+            ReclamationQueueRecord.target_kind,
+            ReclamationQueueRecord.member_index,
+        ).where(ReclamationQueueRecord.status.in_(FENCED_STATUSES))
+        assert _is_counterfactual_fence_query(fence_stmt)
+        abandoned = _FenceStreamSpy(session.execute(fence_stmt).yield_per(1))
+        iterator = iter(abandoned)
+        next(iterator)
+        iterator.close()
+        assert abandoned.drained is False
+        assert abandoned.rows_seen == 1
+

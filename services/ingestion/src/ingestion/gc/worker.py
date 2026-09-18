@@ -19,7 +19,8 @@ from sqlalchemy.orm import Session
 
 from domain.canonical import (
     CanonicalCandidate,
-    filter_candidates_by_physical_fence,
+    build_fence_index,
+    filter_candidates_by_fence_index,
     select_canonical_sources_bulk,
 )
 from domain.coverage import get_expected_members, is_lead_servable
@@ -60,6 +61,15 @@ from ingestion.core.markers import read_store_generation
 from ingestion.core.s3 import get_control_s3_fs
 
 logger = logging.getLogger(__name__)
+
+#: Rows the counterfactual-fence query fetches per server-side cursor round trip.
+#: The fence is streamed rather than buffered, so this bounds the transient row
+#: buffer (1e3 rows, well under 1 MB) while keeping the round-trip count
+#: tolerable (~1.5e3 for the ~1.5e6-row steady-state fence). Measured against a
+#: 1.5e6-row fence, smaller batches win: 1e3 -> 3.5s, 1e4 -> 4.1s, 5e4 -> 4.3s,
+#: versus 49.8s and ~1.1 GB for the buffered ``.all()`` + set-comprehension it
+#: replaces.
+FENCE_FETCH_SIZE = 1_000
 
 
 @dataclass(frozen=True)
@@ -412,10 +422,16 @@ def run_reclamation_worker_pass(
                 ),
                 ReclamationQueueRecord.id.not_in(claimed_ids),
             )
-            other_fenced = {
+            # Streamed straight into the projection: the fence never materialises
+            # the row set, and the index is sized by distinct fence units rather
+            # than by rows in the queue. The cursor is fully consumed inside
+            # build_fence_index, before this store's next write.
+            fence_index = build_fence_index(
                 (str(r), int(ld), str(v), str(k), int(m))
-                for r, ld, v, k, m in session.execute(fenced_query).all()
-            }
+                for r, ld, v, k, m in session.execute(fenced_query).yield_per(
+                    FENCE_FETCH_SIZE
+                )
+            )
 
             # Discover candidates for this model
             serving_start = model_serving_start_valid_time(m_id, now_utc)
@@ -511,9 +527,9 @@ def run_reclamation_worker_pass(
             for vt in cands_by_vt:
                 cands_by_vt[vt].sort(key=lambda c: c.lead_time_hours)
 
-            # Filter candidates using counterfactual fence (other_fenced)
-            filtered_cands = filter_candidates_by_physical_fence(
-                cands_by_vt, other_fenced, is_ensemble=is_ensemble, expected_members=expected_members
+            # Filter candidates using the counterfactual fence (fence_index)
+            filtered_cands = filter_candidates_by_fence_index(
+                cands_by_vt, fence_index, is_ensemble=is_ensemble, expected_members=expected_members
             )
 
             distinct_vars = sorted({t.variable_code for t in targets})
