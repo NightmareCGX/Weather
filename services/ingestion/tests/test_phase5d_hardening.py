@@ -592,3 +592,69 @@ def test_scenario_n_o_repeated_wave_finalization_resource_clean() -> None:
     assert outcome_final.plan is not None
     assert outcome_final.plan.pending_complete_leads == ()
     assert outcome_final.dispatches == []
+
+
+class _LeadershipFakeConn:
+    """Records transaction boundaries on the dedicated leadership connection."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.invalidated = False
+        self.commits = 0
+        self._in_transaction = False
+
+    def execute(self, statement: object, params: object = None) -> object:
+        del statement, params
+        self._in_transaction = True
+
+        class _Result:
+            @staticmethod
+            def scalar() -> bool:
+                return True
+
+        return _Result()
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
+
+    def commit(self) -> None:
+        self.commits += 1
+        self._in_transaction = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def invalidate(self) -> None:
+        self.invalidated = True
+
+
+class _LeadershipFakeEngine:
+    class _Dialect:
+        name = "postgresql"
+
+    dialect = _Dialect()
+
+    def __init__(self, conn: _LeadershipFakeConn) -> None:
+        self._conn = conn
+
+    def connect(self) -> _LeadershipFakeConn:
+        return self._conn
+
+
+def test_scheduler_leadership_ends_its_transaction() -> None:
+    """The scheduler's leadership connection must not sit idle in transaction.
+
+    A connection left ``idle in transaction`` for the daemon's lifetime pins the
+    xmin horizon and blocks VACUUM server-wide (measured in production: two
+    daemons idle in transaction for 11h+ with only the leadership check query).
+    """
+    conn = _LeadershipFakeConn()
+    leadership = SchedulerLeadership(_LeadershipFakeEngine(conn))  # type: ignore[arg-type]
+
+    assert leadership.acquire() is True
+    assert conn.commits == 1
+    assert not conn.in_transaction()
+
+    assert leadership.check_leadership() is True
+    assert conn.commits == 2
+    assert not conn.in_transaction()

@@ -324,6 +324,10 @@ class IngestionSettings(BaseSettings):
     RECLAMATION_LEASE_SECONDS: float = 60.0
     #: Maximum retry attempts before a target is quarantined in 'failed' status.
     RECLAMATION_MAX_RETRIES: int = 5
+    #: Rows removed per batch by the terminal reclamation-queue purge. Kept
+    #: small so every purge transaction stays short and autovacuum can absorb
+    #: the dead tuples instead of one long row-locking DELETE.
+    RECLAMATION_PURGE_BATCH_SIZE: int = 5000
     #: Base exponential backoff (seconds) for failed reclamation attempts.
     RECLAMATION_BASE_BACKOFF_SECONDS: float = 2.0
     #: Detailed metadata retention window in days before sweeping (default: 1 day).
@@ -544,6 +548,11 @@ class IngestionSettings(BaseSettings):
         if reclamation_backoff <= 0.0:
             raise ValueError(
                 f"RECLAMATION_BASE_BACKOFF_SECONDS must be > 0.0, got {reclamation_backoff}"
+            )
+        purge_batch = int(self.RECLAMATION_PURGE_BATCH_SIZE)
+        if purge_batch < 1:
+            raise ValueError(
+                f"RECLAMATION_PURGE_BATCH_SIZE must be >= 1, got {purge_batch}"
             )
         retention_days = int(self.METADATA_RETENTION_DAYS)
         if retention_days < 0:

@@ -854,6 +854,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional run ID to filter requeue",
     )
 
+    rec_purge = rec_sub.add_parser(
+        "purge",
+        help="Delete terminal ('deleted') reclamation_queue rows older than a "
+        "retention window, in bounded batches",
+    )
+    rec_purge.add_argument(
+        "--older-than-days",
+        type=float,
+        required=True,
+        help="Retention window for terminal rows (days); reclaimed_at older than "
+        "this is removed. Terminal rows are audit residue once the physical "
+        "object is gone.",
+    )
+    rec_purge.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(getattr(settings, "RECLAMATION_PURGE_BATCH_SIZE", 5000)),
+        help="Rows per batch (keeps each transaction short so autovacuum can "
+        "absorb the dead tuples).",
+    )
+    rec_purge.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Optional cap on batches; omit to drain every eligible row.",
+    )
+    rec_purge.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="Run VACUUM (ANALYZE) reclamation_queue after the purge (operators "
+        "should confirm this runs outside any open transaction).",
+    )
+
     # -------------------------------------------------------------------------
     # Monitoring & Operational Health Subcommands (Runtime Monitoring)
     # -------------------------------------------------------------------------
@@ -1642,10 +1675,11 @@ def _run_gc(args: argparse.Namespace) -> int:
 
 
 def _run_reclamation(args: argparse.Namespace) -> int:
-    """Execute granular reclamation CLI action (plan, work, or requeue)."""
+    """Execute granular reclamation CLI action (plan, work, requeue, or purge)."""
     from ingestion.core.db import SessionLocal
     from ingestion.gc.planner import plan_reclamation_pass
     from ingestion.gc.worker import (
+        purge_reclaimed_queue_rows,
         requeue_failed_reclamation_targets,
         run_reclamation_worker_pass,
     )
@@ -1682,6 +1716,23 @@ def _run_reclamation(args: argparse.Namespace) -> int:
                 f"markers_cleaned={w_res.markers_cleaned_count}"
             )
             return 0
+        if action == "purge":
+            p_res = purge_reclaimed_queue_rows(
+                session,
+                older_than_days=float(args.older_than_days),
+                batch_size=int(args.batch_size),
+                max_batches=(
+                    int(args.max_batches) if args.max_batches is not None else None
+                ),
+            )
+            print(
+                f"Reclamation Queue Purge: deleted={p_res.deleted_rows}, "
+                f"batches={p_res.batches}, "
+                f"oldest_remaining={p_res.oldest_remaining}"
+            )
+            if args.vacuum:
+                _vacuum_reclamation_queue(session)
+            return 0
         if action == "requeue":
             m_id = getattr(args, "model_id", None)
             r_id = getattr(args, "run_id", None)
@@ -1690,6 +1741,30 @@ def _run_reclamation(args: argparse.Namespace) -> int:
             return 0
     print(f"Unknown reclamation action: {action}")
     return 2
+
+
+def _vacuum_reclamation_queue(session: Any) -> None:
+    """VACUUM (ANALYZE) the reclamation queue after a purge pass.
+
+    autovacuum eventually reclaims the dead tuples a purge leaves behind, but
+    the table is precisely the one whose autovacuum has been blocked (by the
+    idle-in-transaction connections the leadership fix addresses) and whose
+    bloat motivated the purge. An explicit, operator-triggered VACUUM right after
+    the purge is the reliable path; PostgreSQL refuses it inside a transaction,
+    so it runs on a fresh autocommit connection.
+    """
+    from sqlalchemy import text
+
+    bind = session.get_bind()
+    try:
+        with bind.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("VACUUM (ANALYZE) reclamation_queue"))
+        print("Reclamation Queue: VACUUM (ANALYZE) complete")
+    except Exception as exc:  # noqa: BLE001 - vacuum is best-effort guidance
+        print(
+            "Reclamation Queue: VACUUM skipped "
+            f"({exc}); run it manually outside a transaction to reclaim space"
+        )
 
 
 def _ingestion_alert_data(gfs_lag: Any, gefs_lag: Any) -> dict[str, Any]:

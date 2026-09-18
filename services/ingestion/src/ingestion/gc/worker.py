@@ -835,3 +835,131 @@ def requeue_failed_reclamation_targets(
             row.updated_at = now_utc
     session.commit()
     return len(rows)
+
+
+@dataclass(frozen=True)
+class QueuePurgeResult:
+    """Outcome of one terminal-row purge pass.
+
+    Attributes:
+        deleted_rows: Total rows removed across all batches.
+        batches: Number of batches executed (0 when nothing was eligible).
+        oldest_remaining: ``reclaimed_at`` of the oldest terminal row still in
+            the queue afterwards, or ``None`` when none remain.
+    """
+
+    deleted_rows: int
+    batches: int
+    oldest_remaining: datetime | None
+
+
+def purge_reclaimed_queue_rows(
+    session: Session,
+    *,
+    older_than_days: float,
+    batch_size: int | None = None,
+    max_batches: int | None = None,
+    now: datetime | None = None,
+) -> QueuePurgeResult:
+    """Delete terminal reclamation rows older than the retention window.
+
+    The queue is append-mostly: the planner enqueues roughly 1.75x faster than
+    the worker deletes, and terminal rows were previously removed only as a side
+    effect of the per-cycle metadata sweeper. The table therefore grows without
+    bound (382k ``deleted`` rows / 424 MB / 63k dead tuples observed in
+    production), and that backlog is exactly what the sweeper's own VACUUM and
+    the workers' claim scans have to fight.
+
+    A ``deleted`` row whose ``reclaimed_at`` is older than the retention window
+    is pure audit residue: the physical object is gone and the cycle's catalog
+    metadata is either still needed or handled by the metadata sweeper. Deleting
+    it in bounded batches keeps every transaction short (the caller sees many
+    small commits rather than one long row-locking DELETE), and the resulting
+    dead tuples stay within what autovacuum can absorb.
+
+    Rows in ``failed`` are deliberately left alone: they are operator-visible
+    quarantine evidence with their own requeue path
+    (:func:`requeue_failed_reclamation_targets`), and ``queued``/``deleting``
+    rows are live work.
+
+    Args:
+        session: Catalog session (the caller owns its lifecycle).
+        older_than_days: Retention window for terminal rows. Must be >= 0.
+        batch_size: Rows per batch. Defaults to
+            ``settings.RECLAMATION_PURGE_BATCH_SIZE``.
+        max_batches: Optional cap on batches (``None`` drains every eligible
+            row). Must be >= 1 when provided.
+        now: Optional injected current UTC time.
+
+    Returns:
+        The :class:`QueuePurgeResult`.
+
+    Raises:
+        ValueError: If ``older_than_days`` is negative or ``max_batches`` < 1.
+    """
+    from sqlalchemy import delete, func
+
+    if older_than_days < 0:
+        raise ValueError(
+            f"older_than_days must be >= 0, got {older_than_days}"
+        )
+    if max_batches is not None and max_batches < 1:
+        raise ValueError(f"max_batches must be >= 1, got {max_batches}")
+    b_size = (
+        int(batch_size)
+        if batch_size is not None
+        else int(settings.RECLAMATION_PURGE_BATCH_SIZE)
+    )
+    if b_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {b_size}")
+
+    now_utc = _ensure_utc_datetime(now) if now is not None else _utcnow()
+    cutoff = now_utc - timedelta(days=float(older_than_days))
+
+    deleted_rows = 0
+    batches = 0
+    while max_batches is None or batches < max_batches:
+        ids = list(
+            session.execute(
+                select(ReclamationQueueRecord.id)
+                .where(
+                    ReclamationQueueRecord.status == RECLAMATION_STATUS_DELETED,
+                    ReclamationQueueRecord.reclaimed_at.is_not(None),
+                    ReclamationQueueRecord.reclaimed_at < cutoff,
+                )
+                .order_by(ReclamationQueueRecord.reclaimed_at.asc())
+                .limit(b_size)
+            ).scalars()
+        )
+        if not ids:
+            break
+        session.execute(
+            delete(ReclamationQueueRecord).where(
+                ReclamationQueueRecord.id.in_(ids)
+            )
+        )
+        session.commit()
+        deleted_rows += len(ids)
+        batches += 1
+        logger.info(
+            "reclamation queue purge: removed %d terminal rows (%d batch(es), "
+            "cutoff=%s)",
+            deleted_rows,
+            batches,
+            cutoff.isoformat(),
+        )
+
+    oldest_remaining = session.execute(
+        select(func.min(ReclamationQueueRecord.reclaimed_at)).where(
+            ReclamationQueueRecord.status == RECLAMATION_STATUS_DELETED
+        )
+    ).scalar()
+    return QueuePurgeResult(
+        deleted_rows=deleted_rows,
+        batches=batches,
+        oldest_remaining=(
+            _ensure_utc_datetime(oldest_remaining)
+            if oldest_remaining is not None
+            else None
+        ),
+    )

@@ -73,13 +73,6 @@ class SchedulerLeadership:
                 ),
                 {"key": self._key},
             ).scalar()
-            if not held:
-                logger.warning(
-                    "realtime leadership advisory lock is no longer held in session"
-                )
-                self._held = False
-                return False
-            return True
         except Exception as exc:
             logger.warning(
                 "realtime leadership connection health check failed: %s", exc
@@ -91,6 +84,30 @@ class SchedulerLeadership:
                 pass
             self._conn = None
             return False
+        self._end_read_transaction()
+        if not held:
+            logger.warning(
+                "realtime leadership advisory lock is no longer held in session"
+            )
+            self._held = False
+            return False
+        return True
+
+    def _end_read_transaction(self) -> None:
+        """Commit the health check's read so the connection is idle, not mid-transaction.
+
+        A connection left ``idle in transaction`` pins the xmin horizon and
+        blocks VACUUM/reclamation for as long as it lives — which, for a
+        leadership connection, is the entire process lifetime. The advisory lock
+        is session-scoped, so ending the transaction keeps leadership intact.
+        """
+        if self._conn is None:
+            return
+        try:
+            if self._conn.in_transaction():
+                self._conn.commit()
+        except Exception as exc:  # noqa: BLE001 - health check must not raise
+            logger.debug("failed to end the leadership read transaction: %s", exc)
 
     def acquire(self) -> bool:
         """Try to become the leader (non-blocking).
@@ -111,6 +128,12 @@ class SchedulerLeadership:
             acquired = conn.execute(
                 text("SELECT pg_try_advisory_lock(:key)"), {"key": self._key}
             ).scalar()
+            if acquired:
+                # ``pg_try_advisory_lock`` is session-scoped, so committing the
+                # acquisition transaction keeps the lock and leaves the
+                # connection idle rather than idle-in-transaction for the whole
+                # process lifetime (which blocks VACUUM server-wide).
+                conn.commit()
         except BaseException:
             conn.close()
             raise
