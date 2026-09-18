@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 from domain.canonical import (
     CanonicalCandidate,
     _ensure_utc,
+    build_fence_index,
+    filter_candidates_by_fence_index,
     filter_candidates_by_physical_fence,
     select_canonical_anchor,
     select_canonical_sources_bulk,
@@ -554,3 +556,187 @@ def test_filter_candidates_scales_to_production_sized_fenced_set():
 
     assert filtered, "expected the fenced set to retain some candidates"
     assert elapsed < 3.0, f"fence filter regressed to {elapsed:.2f}s"
+
+
+def test_build_fence_index_matches_the_set_built_projection():
+    """The index built from a stream must equal the index built from a set.
+
+    Both paths run the same single projection implementation, so this pins the
+    input-path equivalence that lets the worker hand a database cursor to
+    ``build_fence_index`` instead of materialising the whole row set.
+    """
+    rng = random.Random(20260918)
+    values = ["run_a", "run_b", "run_absent"]
+    vars_ = ["temperature_2m", "wind_u_10m", "relative_humidity_2m"]
+    kinds = ["det", "mean", "mem", "unrecognised"]
+
+    for _ in range(200):
+        fenced = {
+            (
+                rng.choice(values),
+                rng.choice([0, 6, 12]),
+                rng.choice(vars_),
+                rng.choice(kinds),
+                rng.choice([-1, 0, 1, 2, 30, 31]),
+            )
+            for _ in range(rng.randrange(0, 30))
+        }
+        from_set = build_fence_index(fenced)
+        from_stream = build_fence_index(iter(sorted(fenced)))
+        assert from_stream == from_set
+        assert from_stream.has_keys == bool(fenced)
+
+
+def test_build_fence_index_projects_each_target_kind():
+    fenced = [
+        ("run_a", 6, "temperature_2m", "det", 0),
+        ("run_a", 6, "temperature_2m", "mean", -1),
+        ("run_a", 6, "wind_u_10m", "mem", 7),
+        ("run_a", 6, "wind_u_10m", "unrecognised", 0),
+    ]
+    index = build_fence_index(iter(fenced))
+
+    assert index.variable_keys == {("run_a", 6, "temperature_2m")}
+    assert index.member_keys == {("run_a", 6, 7)}
+    assert index.mean_run_leads == {("run_a", 6)}
+    assert index.has_keys is True
+
+
+def test_build_fence_index_consumes_the_iterable_exactly_once_and_fully():
+    consumed: list[int] = []
+
+    def stream():
+        for i in range(1000):
+            consumed.append(i)
+            yield ("run_a", i % 12, "temperature_2m", "mem", 1 + (i % 30))
+
+    index = build_fence_index(stream())
+
+    assert len(consumed) == 1000
+    assert index.has_keys is True
+
+
+def test_build_fence_index_deduplicates_string_components():
+    """The projections must retain one object per distinct string value.
+
+    A database driver hands back a fresh ``str`` per row, so the projections
+    would otherwise hold one owned copy of ``run_id`` / ``variable_code`` per
+    distinct key; at production scale that is the difference between roughly
+    40 MB and 85 MB retained for the same fence semantics.
+    """
+    run_a = "".join(["run_", "dedup"])
+    run_b = "".join(["run_", "dedup"])
+    var_a = "".join(["temperature", "_2m"])
+    var_b = "".join(["temperature", "_2m"])
+    assert run_a is not run_b and run_a == run_b
+    assert var_a is not var_b and var_a == var_b
+
+    index = build_fence_index(
+        [
+            (run_a, 6, var_a, "det", 0),
+            (run_b, 6, var_b, "det", 0),
+            (run_b, 6, "wind_u_10m", "mem", 1),
+            (run_b, 6, var_b, "mean", -1),
+        ]
+    )
+
+    for r_id, _lead, var in index.variable_keys:
+        assert r_id is run_a
+        if var == var_a:
+            assert var is var_a
+    for r_id, _lead, _member in index.member_keys:
+        assert r_id is run_a
+    for r_id, _lead in index.mean_run_leads:
+        assert r_id is run_a
+
+
+def test_filter_candidates_by_fence_index_parity_with_the_raw_set_entry_point():
+    """The streamed entry point must match the raw-set entry point, which must
+    itself still match the linear-scan reference implementation.
+
+    Chain-asserted over the same randomised input family the projection
+    equivalence test uses, so the three implementations cannot drift apart.
+    """
+    rng = random.Random(20260919)
+    all_vars = ["temperature_2m", "precipitation_rate", "wind_u_10m"]
+    kinds = ["det", "mean", "mem"]
+
+    for _ in range(200):
+        fenced = {
+            (rng.choice(["run_a", "run_b", "run_absent"]), rng.choice([0, 6, 12]),
+             rng.choice(all_vars), rng.choice(kinds), rng.choice([-1, 0, 1, 30, 31]))
+            for _ in range(rng.randrange(0, 25))
+        }
+
+        cands_map: dict[datetime, list[CanonicalCandidate]] = {}
+        for idx in range(rng.randrange(1, 4)):
+            vt = _dt(2026, 9, 10, 0) + timedelta(hours=6 * idx)
+            cands_map.setdefault(vt, []).append(
+                CanonicalCandidate(
+                    cycle_time=_dt(2026, 9, 10, 0),
+                    lead_time_hours=rng.choice([0, 6, 12]),
+                    run_id=rng.choice(["run_a", "run_b"]),
+                    store_path="s3://store",
+                    product_types=frozenset(
+                        rng.choice([{"surface"}, {"surface", "ensemble_mean"}])
+                    ),
+                    variables=frozenset(
+                        rng.sample(all_vars, rng.randrange(1, len(all_vars) + 1))
+                    ),
+                    member_indices=tuple(range(1, 31)) if rng.random() < 0.6 else None,
+                )
+            )
+
+        is_ensemble = rng.random() < 0.5
+        expected_members = rng.choice([30, 31])
+
+        from_raw_set = filter_candidates_by_physical_fence(
+            cands_map, fenced, is_ensemble=is_ensemble, expected_members=expected_members
+        )
+        from_streamed_index = filter_candidates_by_fence_index(
+            cands_map,
+            build_fence_index(iter(sorted(fenced))),
+            is_ensemble=is_ensemble,
+            expected_members=expected_members,
+        )
+        from_reference = _reference_filter_candidates_by_physical_fence(
+            cands_map, fenced, is_ensemble=is_ensemble, expected_members=expected_members
+        )
+
+        assert from_streamed_index == from_raw_set
+        assert from_streamed_index == from_reference
+
+
+def test_filter_candidates_by_fence_index_empty_fence_semantics():
+    """Empty-input behaviour, for both entry points.
+
+    The early return keys on the *input* being empty, not on the projections
+    being empty: an input whose every ``target_kind`` is unrecognised projects
+    to three empty sets and must still take the rebuild path.
+    """
+    vt = _dt(2026, 9, 10, 6)
+    cand = CanonicalCandidate(
+        cycle_time=_dt(2026, 9, 10, 0),
+        lead_time_hours=6,
+        run_id="run_det",
+        store_path="s3://store_det",
+        product_types=frozenset({"surface"}),
+        variables=frozenset({"temperature_2m"}),
+    )
+    cands_map = {vt: [cand]}
+
+    empty_index = build_fence_index(iter(()))
+    assert empty_index.has_keys is False
+    assert filter_candidates_by_fence_index(cands_map, empty_index) is cands_map
+    assert filter_candidates_by_physical_fence(cands_map, set()) is cands_map
+
+    unknown_index = build_fence_index([("run_det", 6, "temperature_2m", "unrecognised", 0)])
+    assert unknown_index.has_keys is True
+    assert not unknown_index.variable_keys
+    assert not unknown_index.member_keys
+    assert not unknown_index.mean_run_leads
+
+    rebuilt = filter_candidates_by_fence_index(cands_map, unknown_index)
+    assert rebuilt == cands_map
+    assert rebuilt is not cands_map
+
