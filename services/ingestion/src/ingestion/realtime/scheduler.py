@@ -39,12 +39,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
-from domain.coverage import get_expected_members
-from domain.horizon import canonical_lead_time_hours, max_model_lead_hours
+from domain.horizon import max_model_lead_hours
 from domain.lifecycle import is_cycle_horizon_expired
 from domain.temporal import serving_start_valid_time
 from ingestion.core.config import IngestionSettings, settings
-from ingestion.core.wave_runner import RunSpec, _build_spec, _run_wave
+from ingestion.core.wave_runner import RunSpec, _build_spec, _repair_cycle_status, _run_wave
 from ingestion.providers.noaa.discovery import (
     CycleSnapshot,
     publication_changed,
@@ -53,6 +52,7 @@ from ingestion.providers.noaa.discovery import (
 )
 from ingestion.realtime.committed import read_cycle_committed_state
 from ingestion.realtime.planner import (
+    BLOCK_HORIZON_COMPLETE,
     FrontierPlan,
     ModelCommittedState,
     WavePolicy,
@@ -153,6 +153,7 @@ DiscoverFn = Callable[[CycleIdentity], tuple[CycleSnapshot | None, CycleSnapshot
 ReadCommittedFn = Callable[[CycleIdentity], tuple[ModelCommittedState, ModelCommittedState]]
 DiscoverCandidatesFn = Callable[[CycleIdentity | None, datetime], list[CycleIdentity]]
 IsCompleteFn = Callable[[CycleIdentity], bool]
+RepairStatusFn = Callable[[CycleIdentity], tuple[WaveDispatchResult, ...]]
 SleepFn = Callable[[float], None]
 
 
@@ -168,6 +169,7 @@ class RealtimeScheduler:
         dispatch_wave: DispatchFn | None = None,
         discover_candidates: DiscoverCandidatesFn | None = None,
         is_complete: IsCompleteFn | None = None,
+        repair_status: RepairStatusFn | None = None,
         leadership: SchedulerLeadership | NoopLeadership | None = None,
         clock: Callable[[], float] = time.time,
         sleep: SleepFn | None = None,
@@ -213,6 +215,7 @@ class RealtimeScheduler:
             discover_candidates or self._discover_candidates_production
         )
         self.is_complete = is_complete or self._is_complete_production
+        self.repair_status = repair_status or self._repair_status_production
         self.leadership = leadership
 
         self._machine = PollStateMachine(
@@ -395,6 +398,53 @@ class RealtimeScheduler:
             marker_get_concurrency=self._marker_get_concurrency,
         )
 
+    def _repair_status_production(
+        self, cycle: CycleIdentity
+    ) -> tuple[WaveDispatchResult, ...]:
+        """Re-derive both models' durable run status for one cycle (no ingest work).
+
+        Durable completeness requires BOTH models ready, so a cycle is repaired
+        model by model — each run has its own store and catalog spec. Failures
+        are reported per model so the caller's existing backoff bookkeeping
+        applies unchanged.
+        """
+        args = self._wave_args()
+        results: list[WaveDispatchResult] = []
+        for model in ("gfs", "gefs"):
+            spec = RunSpec(
+                model=model,
+                cycle_date=cycle.cycle_date,
+                cycle_hour=cycle.cycle_hour,
+                target_lead_time_hours=(),
+                members=tuple(range(1, 31)) if model == "gefs" else (),
+            )
+            from ingestion.cli import derive_store_path
+
+            store_path = derive_store_path(model, cycle.cycle_date, cycle.cycle_hour)
+            catalog_spec = _build_spec(spec, args, store_path)
+            try:
+                status = asyncio.run(
+                    _repair_cycle_status(
+                        spec=spec,
+                        args=args,
+                        catalog_spec=catalog_spec,
+                        store_path=store_path,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - one model must not stop the other
+                logger.warning(
+                    "status repair failed for model=%s cycle=%s: %s",
+                    model,
+                    cycle.label,
+                    exc,
+                )
+                results.append(
+                    WaveDispatchResult(model=model, targets=(), error=str(exc))
+                )
+                continue
+            results.append(WaveDispatchResult(model=model, targets=(), status=status))
+        return tuple(results)
+
     # ------------------------------------------------------------------
     # Cycle resolution
     # ------------------------------------------------------------------
@@ -574,25 +624,6 @@ class RealtimeScheduler:
                 self._backlog_snapshots.pop(label, None)
                 continue
 
-            canonical_leads = canonical_lead_time_hours("gfs")
-            expected_gefs_members = tuple(
-                range(1, get_expected_members("gefs") + 1)
-            )
-            gfs_all = all(
-                committed_gfs.is_lead_committed(
-                    lead, ensemble=False, expected_members=()
-                )
-                for lead in canonical_leads
-            )
-            gefs_all = all(
-                committed_gefs.is_lead_committed(
-                    lead, ensemble=True, expected_members=expected_gefs_members
-                )
-                for lead in canonical_leads
-            )
-            if gfs_all and gefs_all:
-                continue
-
             # 5. Discover / snapshot (bounded and cached per historical candidate)
             snaps = self._backlog_snapshots.get(label)
             if snaps is None:
@@ -643,6 +674,21 @@ class RealtimeScheduler:
                 )
                 self._backlog_snapshots.pop(label, None)
                 continue
+
+            # 7. No ingest work remains (the planner walked the whole horizon
+            #    without finding pending or blocked leads) yet the cycle is not
+            #    durably complete. This is the "catalog complete but the status
+            #    was never promoted" case: every future poll would plan exactly
+            #    the same nothing, so the caller must run a finalize-only status
+            #    repair or the stale status survives until the horizon expires.
+            #
+            #    NOTE: this deliberately does NOT skip on catalog completeness.
+            #    Data completeness says nothing about whether the status was
+            #    promoted, so skipping there made the most complete cycles the
+            #    least likely to be repaired.
+            if plan.blocked_reason == BLOCK_HORIZON_COMPLETE:
+                self._selected_backlog_cycle = candidate
+                return candidate, plan
 
         self._selected_backlog_cycle = None
         return None, None
@@ -835,16 +881,24 @@ class RealtimeScheduler:
                 cycle, now, now_utc
             )
             if backlog_cycle is not None and backlog_plan is not None:
+                repairing = not backlog_plan.wave_candidate
                 if not dry_run:
-                    logger.info(
-                        "realtime dispatching backlog catch-up wave for %s (targets gfs=%s gefs=%s)",
-                        backlog_cycle.label,
-                        list(backlog_plan.wave_targets_gfs),
-                        list(backlog_plan.wave_targets_gefs),
-                    )
-                    dispatches = self._dispatch_wave(
-                        backlog_cycle, backlog_plan
-                    )
+                    if repairing:
+                        logger.info(
+                            "realtime repairing durable status for %s (no remaining ingest work)",
+                            backlog_cycle.label,
+                        )
+                        dispatches = list(self.repair_status(backlog_cycle))
+                    else:
+                        logger.info(
+                            "realtime dispatching backlog catch-up wave for %s (targets gfs=%s gefs=%s)",
+                            backlog_cycle.label,
+                            list(backlog_plan.wave_targets_gfs),
+                            list(backlog_plan.wave_targets_gefs),
+                        )
+                        dispatches = self._dispatch_wave(
+                            backlog_cycle, backlog_plan
+                        )
                     dispatched_cycle = backlog_cycle
                     dispatched_plan = backlog_plan
                     if any(not d.ok for d in dispatches):
@@ -864,7 +918,8 @@ class RealtimeScheduler:
                             now + backoff
                         )
                         logger.warning(
-                            "backlog wave dispatch failed for %s (attempt %d); backing off %.1fs",
+                            "backlog %s failed for %s (attempt %d); backing off %.1fs",
+                            "status repair" if repairing else "wave dispatch",
                             backlog_cycle.label,
                             count,
                             backoff,
@@ -882,6 +937,36 @@ class RealtimeScheduler:
                                     backlog_cycle.label,
                                 )
                                 self._invalidate_candidate_cache()
+                            elif repairing:
+                                # The repair did not promote the cycle. Leave the
+                                # candidate in place for the retry backoff path
+                                # rather than spinning on it every poll.
+                                count = (
+                                    self._backlog_failures.get(
+                                        backlog_cycle.label, 0
+                                    )
+                                    + 1
+                                )
+                                self._backlog_failures[backlog_cycle.label] = count
+                                backoff = min(
+                                    float(
+                                        self.settings.REALTIME_BACKLOG_RETRY_BACKOFF_SECONDS
+                                    )
+                                    * (2 ** (count - 1)),
+                                    float(
+                                        self.settings.REALTIME_BACKLOG_MAX_BACKOFF_SECONDS
+                                    ),
+                                )
+                                self._backlog_blocked_until[
+                                    backlog_cycle.label
+                                ] = now + backoff
+                                logger.warning(
+                                    "status repair for %s left it not durably "
+                                    "complete (attempt %d); backing off %.1fs",
+                                    backlog_cycle.label,
+                                    count,
+                                    backoff,
+                                )
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(
                                 "failed to check completion for backlog cycle %s: %s",
@@ -889,12 +974,18 @@ class RealtimeScheduler:
                                 exc,
                             )
                 else:
-                    logger.info(
-                        "realtime dry-run: backlog wave due for %s (targets gfs=%s gefs=%s); no dispatch",
-                        backlog_cycle.label,
-                        list(backlog_plan.wave_targets_gfs),
-                        list(backlog_plan.wave_targets_gefs),
-                    )
+                    if repairing:
+                        logger.info(
+                            "realtime dry-run: status repair due for %s; no dispatch",
+                            backlog_cycle.label,
+                        )
+                    else:
+                        logger.info(
+                            "realtime dry-run: backlog wave due for %s (targets gfs=%s gefs=%s); no dispatch",
+                            backlog_cycle.label,
+                            list(backlog_plan.wave_targets_gfs),
+                            list(backlog_plan.wave_targets_gefs),
+                        )
                     dispatched_cycle = backlog_cycle
                     dispatched_plan = backlog_plan
 

@@ -1536,6 +1536,106 @@ async def _run_wave_impl(
     return status
 
 
+async def _repair_cycle_status(
+    spec: RunSpec,
+    args: Any,
+    catalog_spec: RunCatalogSpec,
+    store_path: str,
+) -> str:
+    """Re-derive a cycle's run status from its store without ingesting anything.
+
+    The finalizer is the only component that derives ``model_runs.status``
+    (catalog reconciliation followed by the store↔catalog readiness gate). A
+    cycle whose catalog is already complete but whose status was never promoted
+    has no remaining ingest work, so no wave will ever run for it again and the
+    finalizer would never be reached: the stale status would survive until the
+    cycle left the serving horizon. This entry point runs exactly that
+    finalizer, through the same ``RunCoordinator`` and the same canonical
+    horizon as a wave, so the promotion decision is identical — only the
+    download/decode/write stages are skipped.
+
+    Nothing is downloaded and no run row is created: a cycle with no
+    ``model_runs`` row has no status to repair and raises instead.
+
+    Args:
+        spec: The forecast-run specification (wave targets are ignored).
+        args: A CLI-compatible namespace (only ``lock_timeout`` is read, via
+            ``getattr`` with a default).
+        catalog_spec: The run's catalog metadata; its ``expected_*`` fields
+            carry the canonical cycle horizon.
+        store_path: The cycle's Zarr store path.
+
+    Returns:
+        The finalizer's derived run status (``ready``/``partial``/``processing``).
+
+    Raises:
+        ValueError: If the horizon is empty or the cycle has no run row.
+        CycleTombstonedError: If the cycle is claimed for deletion or deleted.
+    """
+    from ingestion.core.base import CycleTombstonedError
+    from ingestion.core.catalog import (
+        ModelRunRecord,
+        ModelVersionRecord,
+        is_cycle_fenced_or_deleted,
+    )
+    from ingestion.core.coordinator import RunCoordinator
+    from sqlalchemy import select
+
+    horizon_leads = tuple(catalog_spec.expected_lead_time_hours)
+    horizon_members = tuple(catalog_spec.expected_members)
+    if not horizon_leads:
+        raise ValueError(
+            "catalog_spec.expected_lead_time_hours is empty: the status repair "
+            "requires the canonical cycle horizon to evaluate readiness against."
+        )
+
+    cycle_time = spec.cycle_time
+    with _catalog_session() as session:
+        if is_cycle_fenced_or_deleted(session, cycle_time, model_id=spec.model):
+            raise CycleTombstonedError(
+                f"Refusing status repair for cycle {cycle_time.isoformat()}: "
+                "cycle is claimed for deletion or already tombstoned."
+            )
+        run_id = session.execute(
+            select(ModelRunRecord.id)
+            .join(
+                ModelVersionRecord,
+                ModelRunRecord.model_version_id == ModelVersionRecord.id,
+            )
+            .where(
+                ModelVersionRecord.model_id == catalog_spec.model_id,
+                ModelVersionRecord.version_string == catalog_spec.version_string,
+                ModelRunRecord.cycle_time == cycle_time,
+            )
+        ).scalars().first()
+    if run_id is None:
+        raise ValueError(
+            f"No model_runs row for model={spec.model!r} cycle "
+            f"{cycle_time.isoformat()}; there is no status to repair."
+        )
+
+    coordinator = RunCoordinator(
+        catalog_spec,
+        store_path,
+        timeout_seconds=float(getattr(args, "lock_timeout", 30.0)),
+    )
+    engine = _catalog_session_factory()
+    conn = engine.connect()
+    try:
+        result = coordinator.finalize_run(
+            conn,
+            run_id=str(run_id),
+            spec=catalog_spec,
+            expected_leads=horizon_leads,
+            expected_members=horizon_members,
+        )
+        return result.status
+    finally:
+        # Only the connection is returned; the catalog engine is the shared
+        # process-level pool (unlike a wave, which owns and disposes its own).
+        conn.close()
+
+
 def _decode_and_normalize(
     future: "concurrent.futures.Future[xr.Dataset]",
     catalog_spec: RunCatalogSpec,

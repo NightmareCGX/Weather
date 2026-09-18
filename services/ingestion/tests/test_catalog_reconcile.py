@@ -554,6 +554,148 @@ def test_coordinator_multi_lead_run_reaches_ready(tmp_path, monkeypatch) -> None
     assert status == "ready"
 
 
+def test_repair_cycle_status_promotes_stale_partial_without_ingesting(
+    tmp_path, monkeypatch
+) -> None:
+    """The finalize-only repair re-derives readiness for a stale `partial` cycle.
+
+    Reproduces the end state of a promotion defect: the store holds every
+    committed region and the catalog is complete, but the run row still says
+    ``partial``. No wave will ever run again for such a cycle (the planner finds
+    no pending and no blocked work), so without this path nothing would ever
+    re-derive the status.
+    """
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from sqlalchemy import select
+
+    import ingestion.core.coordinator as CO
+    from ingestion.core import wave_runner as WR
+    from ingestion.core.catalog import ModelRunRecord
+    from ingestion.core.coordinator import RunCoordinator, WaveRegion
+    from ingestion.core.wave_runner import RunSpec, _repair_cycle_status
+
+    store = str(tmp_path / "repair_stale.zarr")
+    spec = _spec(expected_leads=(6, 12, 18))
+
+    engine = create_engine("sqlite:///:memory:")
+    CatalogBase.metadata.create_all(engine)
+    monkeypatch.setattr(CO, "StoreLockCoordinator", _NoopLockCoordinator)
+    # The repair helper resolves its catalog session and engine through the
+    # wave runner's injectable factory.
+    monkeypatch.setattr(WR, "_catalog_session_factory", lambda: engine)
+
+    coordinator = RunCoordinator(spec, store, timeout_seconds=2.0)
+    conn = engine.connect()
+    try:
+        from ingestion.cli import _synthetic_spec_dataset
+
+        with Session(bind=conn) as catalog_session:
+            db_run = record_run(
+                catalog_session, spec, _synthetic_spec_dataset(spec), committed_state=None
+            )
+            run_id = str(db_run.id)
+
+        coordinator.initialize_run_store(
+            conn,
+            seed_dataset=_dataset_leads((6,)),
+            expected_leads=(6, 12, 18),
+            expected_members=(),
+            run_id=run_id,
+            is_same_cycle=True,
+        )
+        for lead in (6, 12, 18):
+            gen = f"gen-{lead}"
+            coordinator.pre_update_wave(
+                conn,
+                regions=[
+                    WaveRegion(lead_time_hours=lead, member=None, generation=gen)
+                ],
+                run_id=run_id,
+                is_same_cycle=True,
+                executor=ThreadPoolExecutor(1),
+                cancel_event=threading.Event(),
+            )
+            coordinator.write_region_worker(
+                conn,
+                dataset=_dataset_leads((lead,)),
+                member=None,
+                generation=gen,
+                expected_leads=(6, 12, 18),
+                expected_members=(),
+            )
+        coordinator.finalize_run(
+            conn,
+            run_id=run_id,
+            spec=spec,
+            expected_leads=(6, 12, 18),
+            expected_members=(),
+        )
+        # The stale downgrade a promotion defect leaves behind.
+        with Session(bind=conn) as catalog_session:
+            run = catalog_session.get(ModelRunRecord, run_id)
+            assert run is not None
+            run.status = "partial"
+            catalog_session.commit()
+    finally:
+        conn.close()
+    coordinator._snapshot = None  # a fresh process holds no store snapshot
+
+    run_spec = RunSpec(
+        model="gfs",
+        cycle_date=CYCLE.date(),
+        cycle_hour=CYCLE.hour,
+        target_lead_time_hours=(),
+    )
+    repaired = asyncio.run(
+        _repair_cycle_status(
+            spec=run_spec,
+            args=SimpleNamespace(lock_timeout=2.0),
+            catalog_spec=spec,
+            store_path=store,
+        )
+    )
+    assert repaired == "ready"
+    with Session(engine) as c:
+        stored = c.execute(
+            select(ModelRunRecord.status).where(ModelRunRecord.id == run_id)
+        ).scalar_one()
+    assert stored == "ready"
+
+
+def test_repair_cycle_status_requires_an_existing_run_row(tmp_path, monkeypatch) -> None:
+    """A cycle with no run row has no status to repair and must not fabricate one."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from ingestion.core import wave_runner as WR
+    from ingestion.core.wave_runner import RunSpec, _repair_cycle_status
+
+    engine = create_engine("sqlite:///:memory:")
+    CatalogBase.metadata.create_all(engine)
+    monkeypatch.setattr(WR, "_catalog_session_factory", lambda: engine)
+
+    spec = _spec(expected_leads=(6,))
+    run_spec = RunSpec(
+        model="gfs",
+        cycle_date=CYCLE.date(),
+        cycle_hour=CYCLE.hour,
+        target_lead_time_hours=(),
+    )
+    with pytest.raises(ValueError, match="No model_runs row"):
+        asyncio.run(
+            _repair_cycle_status(
+                spec=run_spec,
+                args=SimpleNamespace(lock_timeout=2.0),
+                catalog_spec=spec,
+                store_path=str(tmp_path / "absent.zarr"),
+            )
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 
+from domain.horizon import canonical_lead_time_hours
 from ingestion.core.config import IngestionSettings
 from ingestion.providers.noaa.discovery import (
     ArtifactObservation,
@@ -107,6 +108,10 @@ class FakeWorld:
         self.dispatch_started = threading.Event()
         self.dispatch_calls: list[tuple[str, tuple[int, ...], str, bool]] = []
         self.discover_calls: list[str] = []
+        self.repair_calls: list[str] = []
+        self.repair_failures: set[str] = set()
+        #: Cycles a repair promotes (added to ``complete_cycles`` on repair).
+        self.repair_promotes: set[str] = set()
 
     def discover(self, cycle: CycleIdentity):
         self.discover_calls.append(cycle.label)
@@ -140,6 +145,21 @@ class FakeWorld:
             return WaveDispatchResult(model=model, targets=targets, error="simulated failure")
         return WaveDispatchResult(model=model, targets=targets, status="partial")
 
+    def repair_status(self, cycle: CycleIdentity) -> tuple[WaveDispatchResult, ...]:
+        """Finalize-only status repair (no ingest work) for a backlog cycle."""
+        self.repair_calls.append(cycle.label)
+        if cycle.label in self.repair_failures:
+            return (
+                WaveDispatchResult(model="gfs", targets=(), error="simulated failure"),
+                WaveDispatchResult(model="gefs", targets=(), error="simulated failure"),
+            )
+        if cycle.label in self.repair_promotes:
+            self.complete_cycles.add(cycle.label)
+        return (
+            WaveDispatchResult(model="gfs", targets=(), status="ready"),
+            WaveDispatchResult(model="gefs", targets=(), status="ready"),
+        )
+
 
 def _scheduler(
     world: FakeWorld,
@@ -164,6 +184,7 @@ def _scheduler(
         dispatch_wave=world.dispatch_wave,
         discover_candidates=world.discover_candidates,
         is_complete=world.is_complete,
+        repair_status=world.repair_status,
         leadership=leadership,
         clock=lambda: world.clock_time,
         sleep=_sleep,
@@ -790,6 +811,130 @@ def test_backlog_failure_isolation() -> None:
     # Active cycle dispatches normally
     assert outcome2.cycle == CYCLE_12
     assert outcome2.dispatches[0].ok
+
+
+def test_backlog_repairs_catalog_complete_but_unpromoted_cycle() -> None:
+    """A cycle whose catalog is complete but whose status is stale gets repaired.
+
+    Regression for the defect where a fully committed cycle stayed ``partial``
+    forever: the backlog selector skipped any candidate whose *committed data*
+    was complete, so the one cycle that needed a status re-derivation was the
+    one candidate guaranteed never to be selected — every poll planned no work
+    for it and no wave (hence no finalizer) would ever run again.
+    """
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+
+    # 00Z is complete in the catalog for both models but not durably complete
+    # (its status was never promoted), and there is no ingest work left.
+    all_leads = frozenset(canonical_lead_time_hours("gfs"))
+    world.committed_states[CYCLE_00.label] = (
+        ModelCommittedState(leads=all_leads),
+        ModelCommittedState(
+            leads=all_leads,
+            pairs=frozenset((m, lead) for m in MEMBERS for lead in all_leads),
+        ),
+    )
+    world.snapshots[CYCLE_00.label] = (
+        gfs_snapshot(tuple(all_leads), CYCLE_00),
+        gefs_snapshot(tuple(all_leads), CYCLE_00),
+    )
+    world.candidates = [CYCLE_00]
+    world.repair_promotes.add(CYCLE_00.label)
+
+    # max_leads=4 keeps the active cycle from being wave-due, so Priority 2 runs.
+    scheduler = _scheduler(
+        world,
+        settings=_settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0),
+        cycle_override=None,
+    )
+    outcome = scheduler.poll_once()
+
+    assert world.repair_calls == [CYCLE_00.label]
+    assert not world.dispatch_calls  # repair must not download anything
+    assert [d.model for d in outcome.dispatches] == ["gfs", "gefs"]
+    assert all(d.ok for d in outcome.dispatches)
+    assert outcome.cycle == CYCLE_00
+
+    # The repair promoted the cycle, so the next poll neither repairs nor
+    # dispatches it again.
+    world.clock_time += 600.0
+    scheduler.poll_once()
+    assert world.repair_calls == [CYCLE_00.label]
+
+
+def test_backlog_repair_failure_backs_off_without_starving() -> None:
+    """A failing repair backs off instead of being retried every poll."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+    all_leads = frozenset(canonical_lead_time_hours("gfs"))
+    world.committed_states[CYCLE_00.label] = (
+        ModelCommittedState(leads=all_leads),
+        ModelCommittedState(
+            leads=all_leads,
+            pairs=frozenset((m, lead) for m in MEMBERS for lead in all_leads),
+        ),
+    )
+    world.snapshots[CYCLE_00.label] = (
+        gfs_snapshot(tuple(all_leads), CYCLE_00),
+        gefs_snapshot(tuple(all_leads), CYCLE_00),
+    )
+    world.candidates = [CYCLE_00]
+    world.repair_failures.add(CYCLE_00.label)
+
+    scheduler = _scheduler(
+        world,
+        settings=_settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0),
+        cycle_override=None,
+    )
+    scheduler.poll_once()
+    assert world.repair_calls == [CYCLE_00.label]
+    assert scheduler._backlog_failures[CYCLE_00.label] == 1
+    assert scheduler._backlog_blocked_until[CYCLE_00.label] > world.clock_time
+
+    # Still inside the backoff window: no second attempt.
+    world.clock_time += 1.0
+    scheduler.poll_once()
+    assert world.repair_calls == [CYCLE_00.label]
+
+
+def test_backlog_repair_not_attempted_when_ingest_work_remains() -> None:
+    """A candidate with pending upstream work dispatches a wave, not a repair."""
+    world = FakeWorld()
+    world.clock_time = datetime(2026, 7, 21, 15, 30, tzinfo=timezone.utc).timestamp()
+    world.snapshots[CYCLE_12.label] = (
+        gfs_snapshot((0,), CYCLE_12),
+        gefs_snapshot((0,), CYCLE_12),
+    )
+    world.committed_states[CYCLE_00.label] = (
+        ModelCommittedState(leads=frozenset({0})),
+        ModelCommittedState(
+            leads=frozenset({0}), pairs=frozenset((m, 0) for m in MEMBERS)
+        ),
+    )
+    world.snapshots[CYCLE_00.label] = (
+        gfs_snapshot((0, 3), CYCLE_00),
+        gefs_snapshot((0, 3), CYCLE_00),
+    )
+    world.candidates = [CYCLE_00]
+
+    scheduler = _scheduler(
+        world,
+        settings=_settings(REALTIME_WAVE_MAX_LEADS=4, REALTIME_WAVE_MAX_WAIT_SECONDS=1200.0),
+        cycle_override=None,
+    )
+    outcome = scheduler.poll_once()
+
+    assert world.repair_calls == []
+    assert outcome.dispatches[0].targets == (3,)
 
 
 def test_backlog_capped_retry_never_permanently_abandoned() -> None:
