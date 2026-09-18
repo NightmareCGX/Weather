@@ -230,6 +230,76 @@ def select_canonical_sources_bulk(
     )
 
 
+@dataclass(frozen=True)
+class FenceIndex:
+    """A physical fence key set projected into the membership shapes the
+    candidate filter tests against.
+
+    ``build_fence_index`` is the only implementation of that projection. Each
+    set is an exact transliteration of the per-key predicate the filter used to
+    evaluate by scanning the raw key set:
+
+    * ``variable_keys`` <- the ``fk[3] in ("det", "mean")`` guard on the
+      per-variable test (the member axis is deliberately absent from it);
+    * ``member_keys``   <- the per-member test, which matches on
+      ``(run_id, lead, member)`` with no variable component;
+    * ``mean_run_leads`` <- the ``fk[3] == "mean"`` guard on the whole-lead
+      mean test.
+
+    ``has_keys`` records whether the input held any key at all, including keys
+    whose ``target_kind`` matches none of the three projections. The filter's
+    empty-input early return keys on that fact rather than on the projections
+    being empty: an input of exclusively unrecognised kinds still takes the
+    rebuild path and yields freshly constructed candidates.
+    """
+
+    variable_keys: frozenset[tuple[str, int, str]]
+    member_keys: frozenset[tuple[str, int, int]]
+    mean_run_leads: frozenset[tuple[str, int]]
+    has_keys: bool
+
+
+def build_fence_index(
+    fenced_keys: Iterable[tuple[str, int, str, str, int]],
+) -> FenceIndex:
+    """Project raw fence keys into the three membership sets, consuming a stream.
+
+    ``fenced_keys`` is iterated exactly once, so a caller holding a database
+    cursor can pass it straight in: only the projections are retained, and they
+    are sized by the number of distinct fence units rather than by the number of
+    rows read.
+
+    Database drivers hand back a fresh ``str`` per row, so the projections would
+    otherwise retain one copy of ``run_id`` / ``variable_code`` per distinct key.
+    ``memo`` collapses those onto one object per distinct value. It is scoped to
+    this call so the retained values die with the index, unlike ``sys.intern``,
+    which would mutate process-global state from a pure module and keep whatever
+    any caller ever passed in.
+    """
+    variable_keys: set[tuple[str, int, str]] = set()
+    member_keys: set[tuple[str, int, int]] = set()
+    mean_run_leads: set[tuple[str, int]] = set()
+    memo: dict[str, str] = {}
+    has_keys = False
+    for fk in fenced_keys:
+        has_keys = True
+        r_id = memo.setdefault(fk[0], fk[0])
+        kind = fk[3]
+        if kind == "mean":
+            variable_keys.add((r_id, fk[1], memo.setdefault(fk[2], fk[2])))
+            mean_run_leads.add((r_id, fk[1]))
+        elif kind == "det":
+            variable_keys.add((r_id, fk[1], memo.setdefault(fk[2], fk[2])))
+        elif kind == "mem":
+            member_keys.add((r_id, fk[1], fk[4]))
+    return FenceIndex(
+        variable_keys=frozenset(variable_keys),
+        member_keys=frozenset(member_keys),
+        mean_run_leads=frozenset(mean_run_leads),
+        has_keys=has_keys,
+    )
+
+
 def filter_candidates_by_physical_fence(
     candidates_by_valid: dict[datetime, list[CanonicalCandidate]],
     fenced_keys: set[tuple[str, int, str, str, int]],
@@ -240,34 +310,45 @@ def filter_candidates_by_physical_fence(
 
     fenced_keys contains (run_id, lead_time_hours, variable_code, target_kind, member_index).
 
-    The fenced set is indexed once into three projections, so each membership
-    test below is a single hash lookup. The projections are exact
-    transliterations of the per-key predicates this function used to evaluate
-    by scanning ``fenced_keys``:
-
-    * ``fenced_variable_keys`` <- ``fk[3] in ("det", "mean")`` guard on the
-      per-variable test (the member axis is deliberately absent from it);
-    * ``fenced_member_keys``   <- the per-member test, which matches on
-      ``(run_id, lead, member)`` with no variable component;
-    * ``fenced_mean_run_leads`` <- the ``fk[3] == "mean"`` guard on the
-      whole-lead mean test.
-
     Scanning instead of indexing made the caller O(candidates x variables x
     |fenced_keys|): with the production fenced set at ~2.8e5 entries and ~7.8e2
-    candidates that is ~1e10 Python iterations per worker revalidation pass.
+    candidates that is ~1e10 Python iterations per worker revalidation pass, so
+    the set is indexed once into three projections (``FenceIndex``) and every
+    membership test below is a single hash lookup.
+
+    Callers that read the fence out of a database should stream it through
+    ``build_fence_index`` and call ``filter_candidates_by_fence_index``, which
+    never materialises the row set.
     """
     if not fenced_keys:
         return candidates_by_valid
+    return filter_candidates_by_fence_index(
+        candidates_by_valid,
+        build_fence_index(fenced_keys),
+        is_ensemble=is_ensemble,
+        expected_members=expected_members,
+    )
 
-    fenced_variable_keys = {
-        (fk[0], fk[1], fk[2]) for fk in fenced_keys if fk[3] in ("det", "mean")
-    }
-    fenced_member_keys = {
-        (fk[0], fk[1], fk[4]) for fk in fenced_keys if fk[3] == "mem"
-    }
-    fenced_mean_run_leads = {
-        (fk[0], fk[1]) for fk in fenced_keys if fk[3] == "mean"
-    }
+
+def filter_candidates_by_fence_index(
+    candidates_by_valid: dict[datetime, list[CanonicalCandidate]],
+    fence_index: FenceIndex,
+    is_ensemble: bool = False,
+    expected_members: int = 30,
+) -> dict[datetime, list[CanonicalCandidate]]:
+    """Filter candidates against a pre-built :class:`FenceIndex`.
+
+    Semantically identical to ``filter_candidates_by_physical_fence``; this is
+    the entry point for callers that build the index from a stream. The empty
+    test reads ``fence_index.has_keys``, which is the fact the raw key set's own
+    empty test expresses.
+    """
+    if not fence_index.has_keys:
+        return candidates_by_valid
+
+    fenced_variable_keys = fence_index.variable_keys
+    fenced_member_keys = fence_index.member_keys
+    fenced_mean_run_leads = fence_index.mean_run_leads
 
     out: dict[datetime, list[CanonicalCandidate]] = {}
     for v_time, cands in candidates_by_valid.items():
