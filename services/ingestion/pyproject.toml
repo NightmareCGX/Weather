@@ -59,6 +59,11 @@ dev = [
     "fastapi>=0.110.0,<0.111.0",
     "redis>=5.0.2,<6.0.0",
     "geoalchemy2>=0.14.3,<0.15.0",
+    # api.core.geoip imports maxminddb at module scope and api.main reaches it
+    # through the routers, so importing the serving tier here needs it too.
+    # Constraint kept identical to services/api for the shared-dependency
+    # alignment gate.
+    "maxminddb>=3.2.0,<4.0.0",
 ]
 
 [project.scripts]
