@@ -776,4 +776,49 @@ Verify that JSON serialization, Redis caching, and coordinate projections execut
   - Under no circumstances should a permanent tombstone be bypassed. Check scheduler and manual ingestion logs to identify the unauthorized source.
   - Delete any resurrected uncommitted run rows in `model_runs` that violate the permanent tombstone.
 
+### 19.10 Readiness Not Promoted for a Due Cycle (`#model-ready-not-promoted`)
+* **Symptom:** Alert `model_ready_not_promoted` triggers (`WARNING`). The newest cycle that should already be complete — its `model_runs.created_at` (the f000 ingest anchor) plus the fill budget `INGESTION_FILL_IN_GRACE_SECONDS` (default 2.5h) has passed — is still not `ready`.
+* **Important Operational Distinction:**
+  - This is **not** an ingestion-shortfall signal, and it is deliberately **not** gated on `weather_model_ready_status`. That gauge reflects the *newest* run, which is 0 throughout every normal fill window (a fresh cycle is expected to be `partial` while it ingests), so gating on it would fire on a healthy platform once per cycle.
+  - The verdict is taken from the *due* cycle instead. A cycle can be fully ingested and serving traffic (`weather_ingestion_lag_cycles = 0`) while its status was never promoted, which no other view surfaces.
+* **Diagnostic Procedure:**
+  1. Run `weather-ingest status --json` and inspect `gfs`/`gefs`: `lag_target`, `lag_target_ready`, `cycles_complete_not_ready`, `latest_servable` vs `latest_ready`.
+     - If `latest_servable` is at or ahead of `lag_target` while `latest_ready` lags behind it, the data is there and only the status is stale.
+  2. Confirm the affected cycle directly:
+     ```sql
+     SELECT r.cycle_time, r.status, r.created_at
+     FROM model_runs r
+     JOIN model_versions v ON v.id = r.model_version_id
+     WHERE v.model_id = '<model>'
+     ORDER BY r.cycle_time DESC LIMIT 4;
+     ```
+  3. Check whether a wave is mid-flight for that cycle (the pre-update fence sets `partial` on purpose): look for `pre_update_start` without a matching `finalize_complete` in the realtime logs.
+* **Remediation:**
+  - No manual action is normally required: backlog recovery now dispatches a finalize-only status repair for a cycle that has no ingest work left but is not durably complete, so a stale `partial` is re-derived on the next poll.
+  - If it persists, confirm the backlog path is enabled (`REALTIME_BACKLOG_ENABLED`) and look for `realtime repairing durable status for <cycle>` in the logs.
+  - When the store↔catalog gate legitimately rejects promotion, the cause is a real catalog/store divergence: check for intentional reclamation rows before assuming corruption.
+    ```sql
+    SELECT status, count(*) FROM reclamation_queue
+    WHERE run_id = '<run_id>' GROUP BY status;
+    ```
+
+### 19.11 Cycles Complete in the Catalog But Not Promoted (`#cycles-complete-not-ready`)
+* **Symptom:** Alert `cycles_complete_not_ready` triggers (`WARNING`), driven by `weather_ingestion_cycles_complete_not_ready{model} > 0`. One or more cycles hold every expected lead (and, for GEFS, the full expected member matrix) in the catalog while their run status is not `ready`, and the oldest has been past its fill deadline for at least one fill budget.
+* **Diagnostic Procedure:**
+  1. Identify the cycles:
+     ```sql
+     SELECT r.cycle_time, r.status, r.created_at,
+            (SELECT count(DISTINCT lead_time_hours) FROM forecast_products p WHERE p.run_id = r.id) AS leads
+     FROM model_runs r
+     JOIN model_versions v ON v.id = r.model_version_id
+     WHERE v.model_id = '<model>' AND r.status <> 'ready'
+     ORDER BY r.cycle_time DESC;
+     ```
+  2. Compare `leads` against the canonical horizon (81 leads, 0–240h step 3). A cycle at 81 leads with a non-`ready` status is this defect.
+  3. Distinguish it from the harmless transient: immediately after a wave's finalization the cycle is briefly complete-and-then-promoted, and a wave's pre-update fence downgrades a same-cycle re-ingest to `partial` on purpose. Both are shorter than the fill budget and therefore do not alert.
+* **Remediation:**
+  - Expect this to clear itself within one poll interval: backlog recovery re-derives the status through the finalizer (no re-download). Verify with `weather-ingest status --json` (`cycles_complete_not_ready` returning to 0) and re-check `model_runs`.
+  - If a cycle stays complete-but-unpromoted after several polls, the status derivation is failing rather than being skipped: grep the realtime logs for `catalog_reconcile` / `finalize` errors for that cycle, and check whether the store's committed evidence disagrees with the catalog.
+  - Do **not** hand-edit `model_runs.status`; the status is derived, and a manual value would be overwritten by the next derivation while hiding the underlying divergence.
+
 

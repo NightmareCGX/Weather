@@ -787,6 +787,53 @@ def test_stalled_readiness_alert_requires_a_full_fill_window():
     assert not any(a.name in ("model_ready_not_promoted", "cycles_complete_not_ready") for a in fresh_alerts)
 
 
+def test_stalled_readiness_alert_stays_quiet_while_a_new_cycle_fills():
+    """A healthy platform must not alert merely because the newest run is filling.
+
+    `weather_model_ready_status` (and the completeness verdict behind it) is 0
+    for the whole fill window of every cycle, so gating this rule on that gauge
+    would fire once per cycle on a perfectly healthy platform. The verdict is
+    therefore taken from the *due* cycle. This is the regression guard for that
+    distinction: here the due cycle is already ready while the newest run is
+    still ingesting, which is normal operation.
+
+    Timeline uses the real production anchors: the 00Z run row appeared at
+    04:07:42 (fill deadline 06:37:42), the 06Z row at ~10:04, and the platform is
+    healthy at 10:30.
+    """
+    engine = AlertEngine()
+    cycle_00z = datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc)
+    deadline_00z = datetime(2026, 9, 18, 6, 37, 42, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 18, 10, 30, tzinfo=timezone.utc)
+
+    report = _fact_collector(
+        [_gfs_fact(cycle_00z, created_hours=4.1283, complete=True, status="ready")]
+    ).evaluate_lag("gfs", now=now)
+    assert report.lag_target_cycle == cycle_00z
+    assert report.lag_target_ready is True
+    assert (report.lag_target_overdue_seconds or 0.0) == pytest.approx(
+        (now - deadline_00z).total_seconds(), abs=1.0
+    )
+
+    alerts = engine.evaluate_rules(
+        ingestion_data={
+            "gfs": {
+                "lag": report,
+                "stuck": None,
+                # The newest run (06Z) is mid-ingest: expected, not a fault.
+                "readiness": {"ready": False, "status": "partial"},
+                "cycles_complete_not_ready": 0,
+                "oldest_complete_not_ready_overdue_seconds": None,
+                "fill_grace_seconds": 9000.0,
+            }
+        }
+    )
+    assert not any(
+        a.name in ("model_ready_not_promoted", "cycles_complete_not_ready")
+        for a in alerts
+    )
+
+
 def test_complete_not_ready_probe_does_not_alert_on_healthy_cycles():
     """A probe count of zero never alerts, and a promoted cycle clears the condition."""
     engine = AlertEngine()
