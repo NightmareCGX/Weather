@@ -584,6 +584,69 @@ def _lead_times(dataset: xr.Dataset) -> list[int]:
     return [0]
 
 
+@dataclass(frozen=True)
+class ReclaimedTargets:
+    """The physical targets an operator/GC intentionally reclaimed for a run.
+
+    A ``reclamation_queue`` row in ``deleting``/``deleted``/``failed`` is
+    evidence that a lead/member/variable region of the run's store was
+    **deliberately** removed. Such a region is neither a stale catalog claim
+    nor a store shrink: it is an accounted-for absence, and both catalog
+    reconciliation and the READY store↔catalog consistency gate must subtract
+    it from both sides of their comparison.
+
+    Attributes:
+        leads: Lead times with at least one reclaimed target row.
+        pairs: ``(member_index, lead_time_hours)`` pairs with a reclaimed
+            ``mem``-kind target row.
+        variables: Variable codes with at least one reclaimed target row.
+    """
+
+    leads: frozenset[int]
+    pairs: frozenset[tuple[int, int]]
+    variables: frozenset[str]
+
+
+def _reclaimed_targets(db: Session, run_id: str) -> ReclaimedTargets:
+    """Return the intentionally reclaimed targets of one run's store.
+
+    Shared by ``_reconcile_catalog_to_store`` (which must not delete catalog
+    rows for reclaimed regions) and ``_store_consistency_holds`` (which must
+    not treat a reclaimed region as a catalog↔store divergence). Keeping one
+    query here is what prevents the two call sites from drifting apart again —
+    they previously derived reclamation evidence independently, and only the
+    reconciler knew about it.
+
+    Args:
+        db: Database session.
+        run_id: The ``model_runs.id`` whose reclamation queue is read.
+
+    Returns:
+        The reclaimed lead/pair/variable sets (all empty when nothing was
+        reclaimed for the run).
+    """
+    rows = db.execute(
+        select(
+            ReclamationQueueRecord.lead_time_hours,
+            ReclamationQueueRecord.variable_code,
+            ReclamationQueueRecord.target_kind,
+            ReclamationQueueRecord.member_index,
+        ).where(
+            ReclamationQueueRecord.run_id == run_id,
+            ReclamationQueueRecord.status.in_(["deleting", "deleted", "failed"]),
+        )
+    ).all()
+    return ReclaimedTargets(
+        leads=frozenset(int(lead) for lead, _var, _kind, _member in rows),
+        pairs=frozenset(
+            (int(member), int(lead))
+            for lead, _var, kind, member in rows
+            if kind == "mem"
+        ),
+        variables=frozenset(str(var) for _lead, var, _kind, _member in rows),
+    )
+
+
 def _reconcile_catalog_to_store(
     db: Session,
     run: ModelRunRecord,
@@ -634,22 +697,10 @@ def _reconcile_catalog_to_store(
 
     # Pre-query intentionally reclaimed physical shards for this run so intentional
     # V3 physical reclamation is NEVER wiped out as stale catalog corruption.
-    reclaimed_rows = db.execute(
-        select(
-            ReclamationQueueRecord.lead_time_hours,
-            ReclamationQueueRecord.variable_code,
-            ReclamationQueueRecord.target_kind,
-            ReclamationQueueRecord.member_index,
-        ).where(
-            ReclamationQueueRecord.run_id == run.id,
-            ReclamationQueueRecord.status.in_(["deleting", "deleted", "failed"]),
-        )
-    ).all()
-    reclaimed_pairs = {
-        (int(mem), int(lead)) for lead, var, kind, mem in reclaimed_rows if kind == "mem"
-    }
-    reclaimed_leads = {int(lead) for lead, var, kind, mem in reclaimed_rows}
-    reclaimed_vars = {str(var) for lead, var, kind, mem in reclaimed_rows}
+    reclaimed = _reclaimed_targets(db, str(run.id))
+    reclaimed_pairs = set(reclaimed.pairs)
+    reclaimed_leads = set(reclaimed.leads)
+    reclaimed_vars = set(reclaimed.variables)
 
     if committed_state.is_ensemble:
         # 1. Delete stale member-product pairs first (child table; no FK to
@@ -1118,7 +1169,10 @@ def _derive_run_status(
     differs from the actual committed Zarr set (e.g. a store shrunk to ``{6}``
     while the catalog still claims ``{0,6,12,18}``), the run is ``partial``
     even if invocation completeness holds. This prevents a stale catalog from
-    ever being reported ``ready``.
+    ever being reported ``ready``. Intentional physical reclamation is
+    subtracted from both sides of that comparison (see
+    :func:`_store_consistency_holds`) so GC'd early leads do not pin a cycle at
+    ``partial`` forever.
 
     ``partial`` when some but not all expected items are committed, or when the
     catalog does not match the actual committed store.
@@ -1194,6 +1248,16 @@ def _store_consistency_holds(
     (catalog claims leads/members the store does not actually hold) returns
     False so the run cannot be ``ready``.
 
+    **Intentionally reclaimed targets are subtracted from BOTH sides.** GC
+    deletes the earliest leads of every new cycle while the cycle is still
+    filling (the protected serving window has already moved past them by the
+    time NOAA publishes), and reconciliation deliberately retains the matching
+    catalog rows. Comparing the raw sets would therefore make the catalog look
+    one lead "ahead" of the store forever, and the cycle could never be
+    promoted. Subtracting on both sides keeps exactly the semantics that
+    matter: a region is a divergence only when the store neither holds it nor
+    accounts for its removal — a stale catalog claim still fails the gate.
+
     Args:
         db: Database session.
         run: The run row.
@@ -1205,6 +1269,7 @@ def _store_consistency_holds(
     """
     if committed_state is None:
         return True
+    reclaimed = _reclaimed_targets(db, str(run.id))
     committed_leads = set(
         db.execute(
             select(ProductRecord.lead_time_hours).where(
@@ -1212,7 +1277,9 @@ def _store_consistency_holds(
             )
         ).scalars()
     )
-    if committed_leads != committed_state.lead_set():
+    if (committed_leads - reclaimed.leads) != (
+        committed_state.lead_set() - reclaimed.leads
+    ):
         return False
     if committed_state.is_ensemble:
         rows = db.execute(
@@ -1222,7 +1289,8 @@ def _store_consistency_holds(
             ).where(EnsembleMemberProductRecord.run_id == run.id)
         ).all()
         committed_pairs = {(int(member_num), int(lead_num)) for member_num, lead_num in rows}
-        return committed_pairs == set(committed_state.pairs or ())
+        store_pairs = set(committed_state.pairs or ())
+        return (committed_pairs - reclaimed.pairs) == (store_pairs - reclaimed.pairs)
     return True
 
 

@@ -37,6 +37,7 @@ from ingestion.core.catalog import (
     EnsembleMemberProductRecord,
     EnsembleMemberRecord,
     ProductRecord,
+    ReclamationQueueRecord,
     RunCatalogSpec,
     VariableSpec,
     _reconcile_catalog_to_store,
@@ -317,6 +318,86 @@ def test_ensemble_partial_when_declared_members_missing(db: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Intentional reclamation is subtracted from BOTH sides of the READY gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "store_holds_lead", [True, False], ids=["marker-present", "marker-absent"]
+)
+@pytest.mark.parametrize("reclaimed", [True, False], ids=["reclaimed", "not-reclaimed"])
+def test_store_consistency_gate_reclamation_matrix(
+    db: Session, store_holds_lead: bool, reclaimed: bool
+) -> None:
+    """A reclaimed-and-absent lead is not a divergence; an unaccounted one is.
+
+    GC necessarily reclaims the earliest leads of every cycle while it is still
+    filling, so the catalog legitimately claims a lead the store no longer
+    holds. Only the (marker-absent, not-reclaimed) combination is a genuine
+    stale catalog claim and must stay ``partial``.
+    """
+    from ingestion.core.catalog import _derive_run_status
+
+    spec = _spec(expected_leads=(0, 6, 12))
+    run = record_run(db, spec, _dataset_leads((0, 6, 12)), committed_state=None)
+    if reclaimed:
+        _enqueue_reclamation(db, run_id=run.id, model_id=spec.model_id, lead=0)
+
+    store_leads = {0, 6, 12} if store_holds_lead else {6, 12}
+    status = _derive_run_status(db, run, spec, _deterministic_state(store_leads))
+    assert status == ("ready" if (store_holds_lead or reclaimed) else "partial")
+
+
+def test_reconcile_retains_reclaimed_lead_and_promotes(db: Session) -> None:
+    """The reconciler keeps the GC'd lead's rows, and the run still reaches READY."""
+    from ingestion.core.catalog import _derive_run_status
+
+    spec = _spec(expected_leads=(0, 6, 12))
+    run = record_run(db, spec, _dataset_leads((0, 6, 12)), committed_state=None)
+    _enqueue_reclamation(db, run_id=run.id, model_id=spec.model_id, lead=0)
+
+    store_state = _deterministic_state({6, 12})
+    _reconcile_catalog_to_store(db, run, store_state, spec)
+    assert _product_leads(db, run.id) == {0, 6, 12}
+    assert _derive_run_status(db, run, spec, store_state) == "ready"
+
+
+def test_ensemble_gate_ignores_reclaimed_pairs(db: Session) -> None:
+    """The ensemble pair comparison also subtracts reclaimed pairs on both sides."""
+    from ingestion.core.catalog import _derive_run_status
+
+    spec = _spec(is_ensemble=True, expected_leads=(0, 6), expected_members=(1, 2))
+    run = record_run(db, spec, _dataset_member(1, (0, 6)), member=1, committed_state=None)
+    record_run(db, spec, _dataset_member(2, (0, 6)), member=2, committed_state=None)
+    for member in (1, 2):
+        _enqueue_reclamation(
+            db,
+            run_id=run.id,
+            model_id=spec.model_id,
+            lead=0,
+            target_kind="mem",
+            member_index=member,
+        )
+
+    store_state = _ensemble_state({(1, 6), (2, 6)})
+    _reconcile_catalog_to_store(db, run, store_state, spec)
+    assert _member_pairs(db, run.id) == {(1, 0), (1, 6), (2, 0), (2, 6)}
+    assert _derive_run_status(db, run, spec, store_state) == "ready"
+
+
+def test_ensemble_gate_still_flags_unaccounted_pair(db: Session) -> None:
+    """An ensemble pair the store lacks and nothing reclaimed stays PARTIAL."""
+    from ingestion.core.catalog import _derive_run_status
+
+    spec = _spec(is_ensemble=True, expected_leads=(0, 6), expected_members=(1, 2))
+    run = record_run(db, spec, _dataset_member(1, (0, 6)), member=1, committed_state=None)
+    record_run(db, spec, _dataset_member(2, (0, 6)), member=2, committed_state=None)
+
+    store_state = _ensemble_state({(1, 6), (2, 6)})
+    assert _derive_run_status(db, run, spec, store_state) == "partial"
+
+
+# ---------------------------------------------------------------------------
 # Coordinator-path integration: a real multi-region run reaches READY
 # ---------------------------------------------------------------------------
 
@@ -543,6 +624,37 @@ def _add_product(db: Session, run_id: str, spec: RunCatalogSpec, lead: int) -> N
             product_type="surface",
             lead_time_hours=lead,
             zarr_chunk_path=spec.zarr_store_path,
+        )
+    )
+    db.commit()
+
+
+def _enqueue_reclamation(
+    db: Session,
+    *,
+    run_id: str,
+    model_id: str,
+    lead: int,
+    status: str = "deleted",
+    target_kind: str = "det",
+    member_index: int = 0,
+    variable_code: str = "temperature_2m",
+) -> None:
+    """Insert a reclamation_queue row marking a target as intentionally reclaimed."""
+    db.add(
+        ReclamationQueueRecord(
+            id=f"recl_{run_id}_{target_kind}_{member_index}_{lead}_{variable_code}",
+            run_id=run_id,
+            model_id=model_id,
+            cycle_time=CYCLE,
+            lead_time_hours=lead,
+            variable_code=variable_code,
+            target_kind=target_kind,
+            member_index=member_index,
+            valid_time=CYCLE,
+            store_path="/tmp/reconcile.zarr",
+            physical_key=f"shard_{target_kind}_{member_index}_{lead}",
+            status=status,
         )
     )
     db.commit()
