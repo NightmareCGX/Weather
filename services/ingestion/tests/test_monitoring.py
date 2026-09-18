@@ -19,7 +19,7 @@ Covers:
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -39,6 +39,7 @@ from ingestion.monitoring.database import (
     TableStat,
 )
 from ingestion.monitoring.ingestion_collector import (
+    CycleFact,
     IngestionHealthCollector,
     IngestionLagReport,
     ModelIngestionState,
@@ -50,6 +51,7 @@ from ingestion.monitoring.lifecycle_collector import (
     ReclamationQueueStats,
 )
 from ingestion.monitoring.metrics import (
+    Gauge,
     MetricRegistry,
 )
 from ingestion.monitoring.resources import (
@@ -381,34 +383,202 @@ def test_ingestion_stuck_detection_finalize():
 
 
 def test_ingestion_lag_detection():
-    mock_engine = MagicMock()
-    mock_conn = MagicMock()
-    mock_engine.connect.return_value.__enter__.return_value = mock_conn
-    mock_conn.execute.return_value.scalar.return_value = None
-
-    collector = IngestionHealthCollector(engine=mock_engine)
-
-    now = datetime(2026, 9, 12, 14, 0, 0, tzinfo=timezone.utc)  # Expected 12Z
+    """A servable-but-not-ready baseline is lagged against the anchored target."""
+    now = datetime(2026, 9, 12, 14, 0, 0, tzinfo=timezone.utc)
     expected_cycle = latest_synoptic_cycle(now, cadence_hours=6)
     assert expected_cycle == datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc)
 
-    # Scenario A: Upstream NOT yet available (NOAA hasn't published 12Z)
-    report_a = collector.evaluate_lag("gfs", upstream_latest_cycle=None, now=now)
+    # Scenario A: no catalog facts at all -> lag is unknown, not fabricated.
+    unknown = _fact_collector([])
+    report_a = unknown.evaluate_lag("gfs", upstream_latest_cycle=None, now=now)
     assert report_a.upstream_available is False
+    assert report_a.lag_known is False
+    assert report_a.lag_cycles == 0
     assert report_a.is_behind is False
 
-    # Scenario B: Upstream available at 12Z, local catalog max ready is 06Z (1 cycle lag)
-    mock_conn.execute.return_value.scalar.return_value = datetime(2026, 9, 12, 6, 0, 0, tzinfo=timezone.utc)
-
+    # Scenario B: upstream 12Z known, local servable content only reaches 06Z.
+    collector = _fact_collector(
+        [
+            _gfs_fact(datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc), created_hours=3),
+        ]
+    )
     report_b = collector.evaluate_lag(
         "gfs",
         upstream_latest_cycle=datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc),
         now=now,
     )
     assert report_b.upstream_available is True
+    assert report_b.lag_known is True
     assert report_b.lag_cycles == 1
     assert report_b.lag_hours == 6.0
     assert report_b.is_behind is True
+
+
+# =============================================================================
+# 4b. Lag baseline, fill-budget target, and metric honesty
+# =============================================================================
+
+_NOW = datetime(2026, 9, 18, 5, 40, 0, tzinfo=timezone.utc)
+
+
+class _FactCollector(IngestionHealthCollector):
+    """Collector whose catalog facts are injected, so lag tests need no SQL."""
+
+    def __init__(self, facts: list[CycleFact]) -> None:
+        super().__init__(
+            engine=None,
+            fill_grace_seconds=9000.0,
+            publication_delay_seconds=10800.0,
+        )
+        self._facts = facts
+
+    def read_cycle_facts(self, model: str, *, now: datetime) -> list[CycleFact]:
+        return list(self._facts)
+
+
+def _fact_collector(facts: list[CycleFact]) -> _FactCollector:
+    """Build an injected-facts collector."""
+    return _FactCollector(facts)
+
+
+def _gfs_fact(
+    cycle_time: datetime,
+    *,
+    created_hours: float,
+    status: str = "partial",
+    servable: bool = True,
+    complete: bool = False,
+) -> CycleFact:
+    """One GFS cycle fact whose run row was created at ``cycle_time + created_hours``."""
+    return CycleFact(
+        cycle_time=cycle_time,
+        run_created_at=cycle_time + timedelta(hours=created_hours),
+        status=status,
+        committed_leads=81 if servable else 0,
+        servable=servable,
+        complete=complete,
+    )
+
+
+def _gauge_value(gauge: Gauge, model: str) -> float | None:
+    """Read one labelled sample from an in-process gauge (``None`` when unset)."""
+    for line in gauge.collect():
+        if line.startswith("#") or f'model="{model}"' not in line:
+            continue
+        return float(line.rsplit(" ", 1)[-1])
+    return None
+
+
+def test_lag_baseline_uses_servable_partial_cycle():
+    """A fully-ingested cycle stuck at `partial` is not an ingestion shortfall.
+
+    Regression for the production reading where a cycle with every lead
+    committed was reported as 2 cycles of lag purely because its status had not
+    been promoted to `ready`.
+    """
+    collector = _fact_collector(
+        [
+            _gfs_fact(datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc), created_hours=4),
+            _gfs_fact(datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc), created_hours=4),
+            _gfs_fact(
+                datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc),
+                created_hours=4,
+                status="ready",
+            ),
+        ]
+    )
+    report = collector.evaluate_lag("gfs", now=_NOW)
+    assert report.latest_servable_cycle == datetime(
+        2026, 9, 18, 0, 0, tzinfo=timezone.utc
+    )
+    assert report.latest_ready_cycle == datetime(
+        2026, 9, 17, 12, 0, tzinfo=timezone.utc
+    )
+    assert report.lag_known is True
+    assert report.lag_cycles == 0
+    assert report.is_behind is False
+
+
+def test_lag_target_treats_a_filling_cycle_as_not_due():
+    """The newest cycle is excluded from the target while its fill budget runs."""
+    cycle_00z = datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc)
+    collector = _fact_collector(
+        [
+            # Anchored at 04:07:42, so its 2.5h budget expires at 06:37:42.
+            _gfs_fact(cycle_00z, created_hours=4.1283),
+            _gfs_fact(datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc), created_hours=4.44),
+        ]
+    )
+    report = collector.evaluate_lag("gfs", now=_NOW)
+    assert report.lag_target_cycle == datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
+    assert report.lag_cycles == 0
+
+    # Once the budget expires the same cycle becomes the target and is lagged
+    # against the newest servable content.
+    later = datetime(2026, 9, 18, 7, 0, 0, tzinfo=timezone.utc)
+    stale = _fact_collector(
+        [
+            _gfs_fact(cycle_00z, created_hours=4.1283, servable=False),
+            _gfs_fact(datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc), created_hours=4.44),
+        ]
+    )
+    report_later = stale.evaluate_lag("gfs", now=later)
+    assert report_later.lag_target_cycle == cycle_00z
+    assert report_later.lag_cycles == 1
+    # 00Z is past its deadline with no servable data at all, which is the
+    # data-absence signal rather than a promoted-status one.
+    assert report_later.data_missing_cycles == 1
+
+
+def test_lag_reports_missing_run_cycle_without_clock_extrapolation():
+    """A cycle with no run row is a diagnostic signal, never a lag number."""
+    collector = _fact_collector(
+        [
+            _gfs_fact(datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc), created_hours=4.44),
+        ]
+    )
+    # 00Z has no run row; it is past publication delay + fill budget at 05:40.
+    report = collector.evaluate_lag("gfs", now=_NOW)
+    assert report.latest_missing_run_cycle == datetime(
+        2026, 9, 18, 0, 0, tzinfo=timezone.utc
+    )
+    assert report.data_missing_cycles == 1
+    assert report.lag_known is True
+    assert report.lag_target_cycle == datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
+
+
+def test_lag_unknown_when_no_servable_data_exists():
+    """No servable data anywhere: lag stays unknown and data absence is counted."""
+    collector = _fact_collector(
+        [
+            _gfs_fact(
+                datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc),
+                created_hours=4.44,
+                servable=False,
+            )
+        ]
+    )
+    report = collector.evaluate_lag("gfs", now=_NOW)
+    assert report.lag_known is False
+    assert report.lag_cycles == 0
+    assert report.latest_servable_cycle is None
+    assert report.data_missing_cycles == 1
+    assert report.is_behind is False
+
+
+def test_lag_known_gauge_flags_unknown_lag():
+    """The explicit `lag_known` gauge distinguishes unknown from measured lag."""
+    from ingestion.monitoring.ingestion_collector import INGESTION_LAG_KNOWN
+
+    unknown = _fact_collector([])
+    unknown.evaluate_lag("gfs", now=_NOW)
+    assert _gauge_value(INGESTION_LAG_KNOWN, "gfs") == 0.0
+
+    measured = _fact_collector(
+        [_gfs_fact(datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc), created_hours=4.44)]
+    )
+    measured.evaluate_lag("gfs", now=_NOW)
+    assert _gauge_value(INGESTION_LAG_KNOWN, "gfs") == 1.0
 
 
 def test_gefs_completeness_thresholds():
@@ -643,20 +813,26 @@ def test_render_platform_status_layout():
         model="gfs",
         latest_expected_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
         latest_upstream_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
+        latest_servable_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
         latest_ready_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
         upstream_available=True,
+        lag_known=True,
         lag_cycles=0,
         lag_hours=0.0,
+        data_missing_cycles=0,
         is_behind=False,
     )
     gefs_lag = IngestionLagReport(
         model="gefs",
         latest_expected_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
         latest_upstream_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
+        latest_servable_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
         latest_ready_cycle=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
         upstream_available=True,
+        lag_known=True,
         lag_cycles=0,
         lag_hours=0.0,
+        data_missing_cycles=0,
         is_behind=False,
     )
     gfs_state = ModelIngestionState(model="gfs", last_duration_s=108.0)

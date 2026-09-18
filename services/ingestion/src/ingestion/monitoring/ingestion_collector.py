@@ -13,7 +13,7 @@ import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -22,6 +22,7 @@ from sqlalchemy.engine import Connection, Engine
 from domain.cadence import canonical_cycle_cadence_hours
 from domain.coverage import get_expected_members, is_lead_servable
 from domain.horizon import canonical_lead_time_hours, model_max_lead_hours
+from domain.temporal import serving_start_valid_time
 from ingestion.core.observability import PipelineProgressTracker
 from ingestion.monitoring.metrics import REGISTRY
 
@@ -32,6 +33,13 @@ def latest_synoptic_cycle(now_utc: datetime, cadence_hours: int = 6) -> datetime
     """Return the latest synoptic cycle initialization time (00Z, 06Z, 12Z, 18Z) <= now_utc."""
     hour = (now_utc.hour // cadence_hours) * cadence_hours
     return now_utc.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Return ``value`` as a timezone-aware UTC datetime (naive values are UTC)."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 # Prometheus metrics with bounded label cardinality (model="gfs"|"gefs")
 INGESTION_LAST_START_TIMESTAMP = REGISTRY.gauge(
@@ -98,7 +106,17 @@ INGESTION_LAG_CYCLES = REGISTRY.gauge(
 )
 INGESTION_LAG_HOURS = REGISTRY.gauge(
     "weather_ingestion_lag_hours",
-    "Ingestion lag in hours relative to available upstream data",
+    "Ingestion lag in hours relative to the newest cycle that should be complete",
+    labelnames=("model",),
+)
+INGESTION_LAG_KNOWN = REGISTRY.gauge(
+    "weather_ingestion_lag_known",
+    "Whether ingestion lag is a real measurement (1) or could not be computed (0)",
+    labelnames=("model",),
+)
+INGESTION_DATA_MISSING_CYCLES = REGISTRY.gauge(
+    "weather_ingestion_data_missing_cycles",
+    "Due cycles with no servable data at all (distinct from a status that has not been promoted)",
     labelnames=("model",),
 )
 
@@ -167,17 +185,89 @@ class ModelIngestionState:
 
 
 @dataclass(frozen=True)
+class CycleFact:
+    """Catalog evidence for one ``(model, cycle)`` pair at one scrape.
+
+    The row is deliberately *fact-shaped* rather than status-shaped: lag is
+    measured against what the platform can actually serve, so a cycle that is
+    still filling (``partial``) but already has servable leads must not be
+    counted as lag. ``status`` is carried alongside for readiness reporting and
+    for the "complete but not promoted" probe.
+
+    Attributes:
+        cycle_time: The UTC cycle time.
+        run_created_at: ``model_runs.created_at`` — the platform's f000 ingest
+            anchor for the cycle (see
+            :meth:`IngestionHealthCollector.evaluate_lag`).
+        status: The run's ``model_runs.status`` (``processing``/``partial``/
+            ``ready``).
+        committed_leads: Number of distinct leads with catalog product rows.
+        servable: Whether at least one lead satisfies the serving coverage
+            contract (``domain.coverage.is_lead_servable`` for ensembles; any
+            committed lead for deterministic models).
+        complete: Whether the catalog holds every canonical lead and, for
+            ensembles, every expected member at every expected lead —
+            regardless of the run's status.
+    """
+
+    cycle_time: datetime
+    run_created_at: datetime
+    status: str
+    committed_leads: int
+    servable: bool
+    complete: bool
+
+
+@dataclass(frozen=True)
 class IngestionLagReport:
-    """Lag analysis comparing expected, upstream, and local catalog states."""
+    """Lag analysis over the fill anchor, the servable baseline, and readiness.
+
+    Three distinct questions that used to collapse into one number are reported
+    separately:
+
+    * **lag** — how far the newest *servable* cycle trails the newest cycle
+      that *should* already be complete. The "should" comes from our own f000
+      ingest anchor plus a fill budget, never from the wall clock.
+    * **readiness** — the newest cycle whose run status is ``ready``.
+    * **data absence** — cycles whose deadline passed with no servable data at
+      all, which is a different failure from "data present but status not
+      promoted".
+
+    Attributes:
+        model: Platform model identifier.
+        latest_expected_cycle: Clock-derived newest synoptic cycle. Diagnostic
+            only: it is deliberately NOT the lag target, because a cycle is
+            only due once its fill window has closed.
+        latest_upstream_cycle: Explicit upstream cycle when the caller probed
+            one; ``None`` in production (no upstream discovery yet).
+        latest_servable_cycle: Lag baseline — newest cycle with a servable lead.
+        latest_ready_cycle: Newest cycle whose run status is ``ready``.
+        lag_target_cycle: Newest cycle that should already be complete.
+        latest_missing_run_cycle: Newest deadline-passed cycle with no
+            ``model_runs`` row at all (publication window and fill budget both
+            closed, so there is no f000 anchor to measure from).
+        upstream_available: Whether an explicit upstream cycle was supplied.
+        lag_known: Whether :attr:`lag_cycles`/:attr:`lag_hours` are real
+            measurements rather than placeholders.
+        lag_cycles: Whole cadence cycles between target and baseline.
+        lag_hours: Hours between target and baseline.
+        data_missing_cycles: Deadline-passed cycles with no servable data.
+        is_behind: Whether a *known* lag measurement exceeds zero.
+    """
 
     model: str
     latest_expected_cycle: datetime
     latest_upstream_cycle: datetime | None
+    latest_servable_cycle: datetime | None
     latest_ready_cycle: datetime | None
     upstream_available: bool
+    lag_known: bool
     lag_cycles: int
     lag_hours: float
+    data_missing_cycles: int
     is_behind: bool
+    lag_target_cycle: datetime | None = None
+    latest_missing_run_cycle: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -198,13 +288,57 @@ class IngestionHealthCollector:
     STUCK_WRITE_TIMEOUT_S = 600.0  # 10 minutes zero progress
     STUCK_FINALIZE_TIMEOUT_S = 600.0  # 10 minutes finalize
 
-    def __init__(self, engine: Engine | Connection | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine | Connection | None = None,
+        *,
+        fill_grace_seconds: float | None = None,
+        publication_delay_seconds: float | None = None,
+        version_string: str = "v1.0",
+    ) -> None:
+        """Create the collector.
+
+        Args:
+            engine: Catalog engine used for lag/readiness queries. ``None``
+                degrades every catalog-derived value to "unknown" (never to a
+                fabricated one).
+            fill_grace_seconds: Override for the fill budget a cycle may spend
+                filling before it counts as lagging. Defaults to
+                ``IngestionSettings.INGESTION_FILL_IN_GRACE_SECONDS``, resolved
+                lazily so this module stays importable without service
+                settings.
+            publication_delay_seconds: Override for the upstream publication
+                delay used to date cycles that never got a run row. Defaults to
+                ``IngestionSettings.REALTIME_FIRST_PUBLICATION_DELAY_SECONDS``.
+            version_string: Model version whose runs are considered.
+        """
         self.engine = engine
+        self.version_string = version_string
+        self._fill_grace_seconds = fill_grace_seconds
+        self._publication_delay_seconds = publication_delay_seconds
         self._lock = threading.Lock()
         self._states: dict[str, ModelIngestionState] = {
             "gfs": ModelIngestionState(model="gfs"),
             "gefs": ModelIngestionState(model="gefs"),
         }
+
+    @property
+    def fill_grace_seconds(self) -> float:
+        """Seconds a cycle may spend filling before it counts as lagging."""
+        if self._fill_grace_seconds is not None:
+            return float(self._fill_grace_seconds)
+        from ingestion.core.config import settings
+
+        return float(settings.INGESTION_FILL_IN_GRACE_SECONDS)
+
+    @property
+    def publication_delay_seconds(self) -> float:
+        """Seconds after cycle time before upstream publication is expected."""
+        if self._publication_delay_seconds is not None:
+            return float(self._publication_delay_seconds)
+        from ingestion.core.config import settings
+
+        return float(settings.REALTIME_FIRST_PUBLICATION_DELAY_SECONDS)
 
     def register_run_start(
         self,
@@ -382,68 +516,256 @@ class IngestionHealthCollector:
             stuck_duration_seconds=0.0,
         )
 
+    def _serving_horizon_start(self, model: str, now_utc: datetime) -> datetime:
+        """Return the oldest cycle time still inside the model's serving horizon."""
+        max_lead = model_max_lead_hours(
+            model, version_string=self.version_string, default_if_unknown=0
+        )
+        return serving_start_valid_time(now_utc) - timedelta(hours=max_lead)
+
+    def _synoptic_ladder(self, model: str, now_utc: datetime, cadence: int) -> list[datetime]:
+        """Return cycle times from the newest synoptic cycle back to the horizon start."""
+        oldest = self._serving_horizon_start(model, now_utc)
+        ladder: list[datetime] = []
+        current = latest_synoptic_cycle(now_utc, cadence_hours=cadence)
+        while current >= oldest:
+            ladder.append(current)
+            current = current - timedelta(hours=cadence)
+        return ladder
+
+    def read_cycle_facts(self, model: str, *, now: datetime) -> list[CycleFact]:
+        """Read per-cycle catalog facts for one model inside the serving horizon.
+
+        This is the single seam between lag/readiness evaluation and the
+        catalog, so callers that need deterministic inputs (tests, future
+        multi-source probes) can substitute their own implementation instead of
+        mocking SQL. Returns an empty list when no engine is wired or the query
+        fails — "unknown", never a fabricated value.
+
+        Args:
+            model: Platform model identifier (``gfs``/``gefs``).
+            now: The reference UTC time bounding the serving horizon.
+
+        Returns:
+            One :class:`CycleFact` per cycle with a ``model_runs`` row, newest
+            first.
+        """
+        m = model.lower().strip()
+        if self.engine is None:
+            return []
+        expected_leads = canonical_lead_time_hours(
+            m, version_string=self.version_string, default_if_unknown=()
+        )
+        expected_members = get_expected_members(m, default_if_unknown=1)
+        min_cycle = self._serving_horizon_start(m, now)
+        try:
+            conn_ctx = (
+                self.engine.connect()
+                if hasattr(self.engine, "connect")
+                else nullcontext(self.engine)
+            )
+            with conn_ctx as conn:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT r.cycle_time AS cycle_time,
+                               r.created_at AS created_at,
+                               r.status AS status,
+                               p.lead_time_hours AS lead_time_hours,
+                               COUNT(DISTINCT emp.member_index) AS member_count
+                        FROM model_runs r
+                        JOIN model_versions v ON v.id = r.model_version_id
+                        LEFT JOIN forecast_products p ON p.run_id = r.id
+                        LEFT JOIN ensemble_member_products emp
+                               ON emp.run_id = r.id
+                              AND emp.lead_time_hours = p.lead_time_hours
+                        WHERE v.model_id = :mid
+                          AND v.version_string = :ver
+                          AND r.cycle_time >= :min_cycle
+                        GROUP BY r.cycle_time, r.created_at, r.status, p.lead_time_hours
+                        """
+                    ),
+                    {"mid": m, "ver": self.version_string, "min_cycle": min_cycle},
+                ).fetchall()
+        except Exception as exc:
+            logger.debug("Failed reading cycle facts for %s: %s", m, exc)
+            return []
+
+        per_cycle: dict[datetime, dict[str, Any]] = {}
+        for row in rows:
+            cycle_utc = _as_utc(row.cycle_time)
+            entry = per_cycle.setdefault(
+                cycle_utc,
+                {
+                    "created_at": _as_utc(row.created_at),
+                    "status": str(row.status),
+                    "leads": {},
+                },
+            )
+            if row.lead_time_hours is not None:
+                entry["leads"][int(row.lead_time_hours)] = int(row.member_count or 0)
+
+        facts: list[CycleFact] = []
+        for cycle_utc, entry in per_cycle.items():
+            leads: dict[int, int] = entry["leads"]
+            if expected_members <= 1:
+                servable = bool(leads)
+            else:
+                servable = any(
+                    is_lead_servable(count, expected_members)
+                    for count in leads.values()
+                )
+            complete = bool(expected_leads) and set(expected_leads).issubset(leads)
+            if complete and expected_members > 1:
+                complete = all(
+                    leads.get(lead, 0) >= expected_members for lead in expected_leads
+                )
+            facts.append(
+                CycleFact(
+                    cycle_time=cycle_utc,
+                    run_created_at=entry["created_at"],
+                    status=entry["status"],
+                    committed_leads=len(leads),
+                    servable=servable,
+                    complete=complete,
+                )
+            )
+        return sorted(facts, key=lambda fact: fact.cycle_time, reverse=True)
+
     def evaluate_lag(
         self,
         model: str,
         upstream_latest_cycle: datetime | None = None,
         now: datetime | None = None,
     ) -> IngestionLagReport:
-        """Evaluate ingestion lag relative to available upstream publication."""
+        """Evaluate ingestion lag against the newest cycle that should be complete.
+
+        **Target selection (the f000 fill-budget rule).** A cycle counts as
+        "should already be complete" only once
+        ``now > model_runs.created_at + INGESTION_FILL_IN_GRACE_SECONDS``. The
+        anchor is ``model_runs.created_at``: the wave runner creates the row
+        lazily when the cycle's first lead settles and is published, so it
+        marks the moment the platform finished ingesting f000. There is no
+        per-lead commit timestamp in the schema (``forecast_products`` carries
+        no time column and the commit manifest only holds fingerprints), which
+        makes this the only durable anchor the platform has. Before the budget
+        expires the cycle is simply still filling and is not lag — which is
+        why the target cannot come from the wall clock, since a clock-derived
+        target reports a freshly published cycle as lagging immediately.
+
+        A cycle with no ``model_runs`` row has no anchor: it is reported
+        through :attr:`latest_missing_run_cycle` and
+        :attr:`data_missing_cycles`, never through a clock-extrapolated lag.
+
+        **Baseline.** The baseline is the newest *servable* cycle — one with at
+        least one lead meeting the coverage contract — not the newest
+        ``ready`` cycle. A cycle that is fully ingested but whose status was
+        never promoted still serves traffic; using ``ready`` as the baseline
+        translates a bookkeeping defect into an apparent ingestion shortfall.
+
+        ``ingestion_lag_cycles``/``_hours`` are written only when the lag is a
+        real measurement; ``weather_ingestion_lag_known`` carries the 0/1
+        signal explicitly, because an untouched Prometheus gauge keeps its last
+        value.
+
+        Args:
+            model: Platform model identifier (``gfs``/``gefs``).
+            upstream_latest_cycle: Optional explicit upstream cycle. Retained
+                for a future upstream-discovery path and for callers that
+                already know what the center published; when omitted the target
+                comes from the local f000 anchor.
+            now: Optional injected current UTC time.
+
+        Returns:
+            The :class:`IngestionLagReport`.
+        """
         m = model.lower()
         now_utc = now or datetime.now(timezone.utc)
-
-        # Expected latest 6h synoptic cycle (00Z, 06Z, 12Z, 18Z)
         cadence = canonical_cycle_cadence_hours(m, default_if_unknown=6)
         expected_cycle = latest_synoptic_cycle(now_utc, cadence_hours=cadence)
 
-        # Ready cycle from PostgreSQL catalog
-        ready_cycle: datetime | None = None
-        if self.engine is not None:
-            try:
-                conn_ctx = self.engine.connect() if hasattr(self.engine, "connect") else nullcontext(self.engine)
-                with conn_ctx as conn:
-                    q = text(
-                        """
-                        SELECT MAX(r.cycle_time) AS max_ready
-                        FROM model_runs r
-                        JOIN model_versions v ON v.id = r.model_version_id
-                        WHERE v.model_id = :mid AND r.status = 'ready'
-                        """
-                    )
-                    res = conn.execute(q, {"mid": m}).scalar()
-                    if res is not None:
-                        ready_cycle = (
-                            res if res.tzinfo is not None else res.replace(tzinfo=timezone.utc)
-                        )
-            except Exception as exc:
-                logger.debug("Failed query for latest ready cycle: %s", exc)
+        facts = self.read_cycle_facts(m, now=now_utc)
+        by_cycle = {fact.cycle_time: fact for fact in facts}
 
-        upstream_avail = upstream_latest_cycle is not None
-        target_cycle = upstream_latest_cycle or expected_cycle
+        servable_cycles = [f.cycle_time for f in facts if f.servable]
+        latest_servable = max(servable_cycles) if servable_cycles else None
+        ready_cycles = [f.cycle_time for f in facts if f.status == "ready"]
+        latest_ready = max(ready_cycles) if ready_cycles else None
 
-        if ready_cycle is not None:
-            diff_hours = max(0.0, (target_cycle - ready_cycle).total_seconds() / 3600.0)
-            lag_cycles = int(diff_hours // cadence) if cadence > 0 else 0
+        grace = timedelta(seconds=self.fill_grace_seconds)
+        publication = timedelta(seconds=self.publication_delay_seconds)
+
+        def _due_at(cycle_utc: datetime) -> datetime:
+            """The moment a cycle is expected to be complete."""
+            fact = by_cycle.get(cycle_utc)
+            anchor = fact.run_created_at if fact is not None else cycle_utc + publication
+            return anchor + grace
+
+        due_cycles = [f.cycle_time for f in facts if now_utc >= _due_at(f.cycle_time)]
+        anchor_target = max(due_cycles) if due_cycles else None
+        target_cycle = (
+            _as_utc(upstream_latest_cycle)
+            if upstream_latest_cycle is not None
+            else anchor_target
+        )
+
+        lag_known = target_cycle is not None and latest_servable is not None
+        if lag_known:
+            assert target_cycle is not None and latest_servable is not None
+            lag_hours = max(
+                0.0, (target_cycle - latest_servable).total_seconds() / 3600.0
+            )
+            lag_cycles = int(lag_hours // cadence) if cadence > 0 else 0
         else:
-            # No ready runs in catalog
-            diff_hours = max(0.0, (now_utc - target_cycle).total_seconds() / 3600.0)
-            lag_cycles = 1
+            lag_hours = 0.0
+            lag_cycles = 0
+        lag_hours = round(lag_hours, 2)
 
-        # Only consider "behind" if upstream has published a cycle that we do not have ready
-        is_behind = upstream_avail and (lag_cycles > 0)
+        ladder = self._synoptic_ladder(m, now_utc, cadence)
+        missing_run = [
+            cycle
+            for cycle in ladder
+            if cycle not in by_cycle and now_utc >= _due_at(cycle)
+        ]
+        # Data absence is measured from the newest cycle the platform can
+        # actually serve (or, when nothing is servable, the newest cycle it has
+        # any row for). Cycles older than that reference are accounted for;
+        # everything newer that passed its deadline with no servable data is
+        # the current gap. Counting the whole horizon instead would report
+        # thousands of long-expired cycles and drown the signal.
+        reference_cycle = latest_servable or (max(by_cycle) if by_cycle else None)
+        data_missing_cycles = sum(
+            1
+            for cycle in ladder
+            if now_utc >= _due_at(cycle)
+            and (reference_cycle is None or cycle > reference_cycle)
+            and not (by_cycle[cycle].servable if cycle in by_cycle else False)
+        )
 
-        INGESTION_LAG_CYCLES.labels(model=m).set(float(lag_cycles))
-        INGESTION_LAG_HOURS.labels(model=m).set(round(diff_hours, 2))
+        INGESTION_LAG_KNOWN.labels(model=m).set(1.0 if lag_known else 0.0)
+        if lag_known:
+            INGESTION_LAG_CYCLES.labels(model=m).set(float(lag_cycles))
+            INGESTION_LAG_HOURS.labels(model=m).set(lag_hours)
+        INGESTION_DATA_MISSING_CYCLES.labels(model=m).set(float(data_missing_cycles))
 
         return IngestionLagReport(
             model=m,
             latest_expected_cycle=expected_cycle,
-            latest_upstream_cycle=upstream_latest_cycle,
-            latest_ready_cycle=ready_cycle,
-            upstream_available=upstream_avail,
+            latest_upstream_cycle=(
+                _as_utc(upstream_latest_cycle)
+                if upstream_latest_cycle is not None
+                else None
+            ),
+            latest_servable_cycle=latest_servable,
+            latest_ready_cycle=latest_ready,
+            upstream_available=upstream_latest_cycle is not None,
+            lag_known=lag_known,
             lag_cycles=lag_cycles,
-            lag_hours=round(diff_hours, 2),
-            is_behind=is_behind,
+            lag_hours=lag_hours,
+            data_missing_cycles=data_missing_cycles,
+            is_behind=lag_known and lag_cycles > 0,
+            lag_target_cycle=target_cycle,
+            latest_missing_run_cycle=max(missing_run) if missing_run else None,
         )
 
     def evaluate_model_completeness(

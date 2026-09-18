@@ -23,6 +23,15 @@ def _format_bytes(num_bytes: int | float) -> str:
     return f"{val:.1f} PB"
 
 
+def _format_lag(lag: Any | None) -> str:
+    """Render a lag report line, distinguishing an unknown lag from a zero one."""
+    if lag is None:
+        return "unknown"
+    if not lag.lag_known:
+        return f"unknown ({lag.data_missing_cycles} cycle(s) with no servable data)"
+    return f"{lag.lag_cycles} cycles ({lag.lag_hours:.1f}h)"
+
+
 def _format_seconds(seconds: float) -> str:
     """Format seconds into readable string (e.g. 108s or 38m50s or 2.1h)."""
     if seconds < 0:
@@ -114,22 +123,26 @@ def render_platform_status(
     # GFS section
     lines.append("GFS:")
     gfs_ready = gfs_lag.latest_ready_cycle.strftime("%HZ") if (gfs_lag and gfs_lag.latest_ready_cycle) else "none"
+    gfs_servable = gfs_lag.latest_servable_cycle.strftime("%HZ") if (gfs_lag and gfs_lag.latest_servable_cycle) else "none"
     gfs_exp = gfs_lag.latest_expected_cycle.strftime("%HZ") if gfs_lag else "unknown"
     gfs_dur = _format_seconds(gfs_state.last_duration_s) if gfs_state else "none"
     lines.append(f"    latest ready cycle {gfs_ready}")
+    lines.append(f"    latest servable cycle {gfs_servable}")
     lines.append(f"    expected latest {gfs_exp}")
-    lines.append(f"    ingestion lag {gfs_lag.lag_cycles if gfs_lag else 0} cycles ({gfs_lag.lag_hours if gfs_lag else 0.0}h)")
+    lines.append(f"    ingestion lag {_format_lag(gfs_lag)}")
     lines.append(f"    last duration {gfs_dur}")
     lines.append("")
 
     # GEFS section
     lines.append("GEFS:")
     gefs_ready = gefs_lag.latest_ready_cycle.strftime("%HZ") if (gefs_lag and gefs_lag.latest_ready_cycle) else "none"
+    gefs_servable = gefs_lag.latest_servable_cycle.strftime("%HZ") if (gefs_lag and gefs_lag.latest_servable_cycle) else "none"
     gefs_exp = gefs_lag.latest_expected_cycle.strftime("%HZ") if gefs_lag else "unknown"
     gefs_dur = _format_seconds(gefs_state.last_duration_s) if gefs_state else "none"
     lines.append(f"    latest ready cycle {gefs_ready}")
+    lines.append(f"    latest servable cycle {gefs_servable}")
     lines.append(f"    expected latest {gefs_exp}")
-    lines.append(f"    ingestion lag {gefs_lag.lag_cycles if gefs_lag else 0} cycles ({gefs_lag.lag_hours if gefs_lag else 0.0}h)")
+    lines.append(f"    ingestion lag {_format_lag(gefs_lag)}")
     lines.append(f"    last duration {gefs_dur}")
     lines.append("")
 

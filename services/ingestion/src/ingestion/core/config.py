@@ -276,6 +276,15 @@ class IngestionSettings(BaseSettings):
     #: the scheduler considers it eligible for upstream probing (publication
     #: begins roughly 3-3.5h after cycle time, probed in Phase 5A).
     REALTIME_FIRST_PUBLICATION_DELAY_SECONDS: float = 10800.0
+    #: Seconds of normal fill time a cycle is granted after its f000 ingest
+    #: anchor (``model_runs.created_at``) before monitoring counts it as
+    #: lagging. Derived from the wave parameters rather than guessed: one
+    #: complete fill window is
+    #: ``ceil(81 / REALTIME_WAVE_MAX_LEADS) x REALTIME_ACTIVE_POLL_SECONDS``
+    #: = 11 x 600s ~= 1h50m, so the budget is 2h plus a 30min margin. If the
+    #: wave parameters change, recompute this instead of letting the budget
+    #: silently mismatched the schedule.
+    INGESTION_FILL_IN_GRACE_SECONDS: float = 9000.0
 
     #: Master switch for backlog recovery in realtime scheduler (Lifecycle V3 Phase 2).
     REALTIME_BACKLOG_ENABLED: bool = True
@@ -470,6 +479,11 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"REALTIME_FIRST_PUBLICATION_DELAY_SECONDS must be >= 0.0, got "
                 f"{first_publication_delay}"
+            )
+        fill_grace = float(self.INGESTION_FILL_IN_GRACE_SECONDS)
+        if fill_grace <= 0.0:
+            raise ValueError(
+                f"INGESTION_FILL_IN_GRACE_SECONDS must be > 0.0, got {fill_grace}"
             )
         if backlog_retry <= 0.0:
             raise ValueError(
