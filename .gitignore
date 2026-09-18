@@ -75,6 +75,13 @@ screenshots/
 # CLI download staging (created by weather-ingest --download-dir default)
 downloads/
 
+# --- GeoLite2 database (docs/DEPLOYMENT.md §7) ---
+# MaxMind's licence permits local use but not redistribution, so the ~70 MB
+# database is provisioned on the host and bind-mounted into the API container
+# rather than committed or baked into an image.
+data/geoip/
+*.mmdb
+
 # Local reproduction staging for real operational GRIB files (never committed)
 dl_real/
 

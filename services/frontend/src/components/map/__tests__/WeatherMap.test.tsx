@@ -10,6 +10,7 @@ import {
 
 import { WeatherMap } from "@/components/map/WeatherMap";
 import type { ApproximateStartupLocation, SelectedLocation, SpatialLayer } from "@/lib/api/types";
+import { STARTUP_TILE_ZOOM, startupViewZoom } from "@/lib/map/startupView";
 
 const layer: SpatialLayer = {
   tile_url_template: "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=12",
@@ -526,7 +527,31 @@ describe("WeatherMap", () => {
       expect(map.easeTo).toHaveBeenCalledTimes(1);
       expect(map.easeTo).toHaveBeenCalledWith({
         center: [-104.9903, 39.7392],
-        zoom: 6.5,
+        // jsdom reports no container width, so the tile grid's nominal zoom applies.
+        zoom: STARTUP_TILE_ZOOM,
+        duration: 800,
+        essential: false,
+      });
+    });
+
+    it("sizes the startup region from the measured viewport width", () => {
+      const { rerender } = renderMap({ approximateLocation: null });
+      const [map] = getInstances();
+      map.containerWidth = 1400;
+
+      rerender(
+        <WeatherMap
+          layer={layer}
+          selectedLocation={null}
+          approximateLocation={mockApproximateLocation}
+          validTime={null}
+          onSelect={jest.fn()}
+        />
+      );
+
+      expect(map.easeTo).toHaveBeenCalledWith({
+        center: [-104.9903, 39.7392],
+        zoom: startupViewZoom(1400),
         duration: 800,
         essential: false,
       });

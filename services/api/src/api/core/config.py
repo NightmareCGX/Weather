@@ -111,6 +111,27 @@ class Settings(BaseSettings):
     # in an environment where requests are strictly authenticated/firewalled to Cloudflare origins.
     TRUST_CLOUDFLARE_LOCATION_HEADERS: bool = False
 
+    # Coarse IP geolocation from a local GeoLite2 database (self-hosted origins
+    # with no CDN in front, where the ``cf-*`` headers above can never arrive).
+    # ``none`` (default) keeps /v1/locate answering 404; ``maxmind`` reads the
+    # visitor address from the request and resolves it against
+    # ``LOCATE_GEOIP_DB_PATH`` (api/core/geoip.py). The reader is memory-mapped,
+    # so the resident cost is the touched pages only, shared across workers.
+    LOCATE_PROVIDER: str = "none"
+    LOCATE_GEOIP_DB_PATH: str = "/data/geoip/GeoLite2-City.mmdb"
+    # How the visitor address is read off the request. The gateway is always in
+    # front of this tier, so the socket peer alone is the gateway itself.
+    #   auto   (default) uses the gateway-set X-Real-IP when the socket peer is
+    #          not a routable address, which is exactly the case for a request
+    #          that arrived through the gateway container or the host, and
+    #          ignores the header when the peer is public (a caller that reached
+    #          the published API port directly cannot forge its own location).
+    #   always trusts X-Real-IP unconditionally: only safe when the API port is
+    #          firewalled to the gateway.
+    #   never  always uses the socket peer (every visitor then resolves to the
+    #          gateway's own location unless there is no proxy in front).
+    LOCATE_PROXY_MODE: str = "auto"
+
     # Reader-gate configuration (Zarr region-write concurrency).
     # The API serving tier participates in the SHARED store gate when reading
     # forecast Zarr stores so it never observes a store mid-re-ingest.

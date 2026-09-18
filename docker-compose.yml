@@ -110,6 +110,16 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
       MINIO_SECURE: "false"
       UVICORN_WORKERS: ${UVICORN_WORKERS:-4}
+      # Coarse IP geolocation for the startup map viewport (/v1/locate).
+      # `none` (default) disables it and keeps answering 404, as before.
+      LOCATE_PROVIDER: ${LOCATE_PROVIDER:-none}
+      LOCATE_GEOIP_DB_PATH: ${LOCATE_GEOIP_DB_PATH:-/data/geoip/GeoLite2-City.mmdb}
+      LOCATE_PROXY_MODE: ${LOCATE_PROXY_MODE:-auto}
+    volumes:
+      # Read-only GeoLite2 database, provisioned on the host and refreshed
+      # monthly (docs/DEPLOYMENT.md §7). An absent directory is not fatal:
+      # /v1/locate logs one warning and degrades to 404.
+      - ${GEOIP_DATA_DIR:-./data/geoip}:/data/geoip:ro
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:

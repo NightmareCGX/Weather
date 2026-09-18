@@ -1306,13 +1306,14 @@ test("startup coarse IP success: moves map to regional viewport and localizes va
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
 
-  // Wait for map to load and easeTo Denver region (lat ~ 39.7, lon ~ -105.0, zoom ~ 6.5)
+  // Wait for map to load and easeTo the Denver region. The startup camera frames
+  // a 3-tile-wide region of the z8 grid, i.e. zoom ~7.8 on this viewport.
   await page.waitForFunction(() => {
     const map = (window as any).__weatherMap;
     if (!map || typeof map.getCenter !== "function") return false;
     const c = map.getCenter();
     const z = map.getZoom();
-    return Math.abs(c.lat - 39.7392) < 0.5 && Math.abs(c.lng - -104.9903) < 0.5 && z >= 6.0;
+    return Math.abs(c.lat - 39.7392) < 0.5 && Math.abs(c.lng - -104.9903) < 0.5 && z >= 7.0;
   });
 
   // Valid label display uses Mountain Time (MDT/GMT-6)

@@ -391,7 +391,7 @@ The infrastructure endpoint `GET /v1/locate` serves two distinct purposes in the
   • Automatic, best-effort on mount • Explicit user click on Locate Me
   • Ambient context only            • Invoked ONLY on POSITION_UNAVAILABLE or TIMEOUT
   • NO SelectedLocation             • Commits canonical SelectedLocation
-  • Regional easeTo (zoom 6.5)      • Point flyTo (zoom 8) + opens forecast
+  • Regional easeTo (5-9 tiles)      • Point flyTo (zoom 8) + opens forecast
   • Fails silently to CONUS/UTC     • NEVER called on PERMISSION_DENIED (Privacy Invariant)
 ```
 
@@ -406,14 +406,22 @@ The infrastructure endpoint `GET /v1/locate` serves two distinct purposes in the
 
 ### 11.3 Infrastructure Trust Boundary & Production Deployment Requirements
 
-`GET /v1/locate` extracts visitor coordinates from Cloudflare Managed Transforms headers (`cf-iplatitude`, `cf-iplongitude`, `cf-ipcity`, `cf-region`, `cf-ipcountry`).
+`GET /v1/locate` consults two sources in order and answers the same HTTP 404 (`Location unavailable`) whenever neither can place the visitor: the frontend's silent degradation to the CONUS/UTC defaults therefore behaves identically no matter which branch failed.
 
-- **Default Safety:** The backend setting `TRUST_CLOUDFLARE_LOCATION_HEADERS` defaults to `False`. When disabled, the API returns HTTP 404 (`Location unavailable`) for all `/v1/locate` requests.
-- **Production Deployment Requirement:** Enabling `TRUST_CLOUDFLARE_LOCATION_HEADERS=True` is safe **only** when the API origin is strictly firewalled to Cloudflare IP ranges or authenticated using Cloudflare Authenticated Origin Pulls (mTLS). In this architecture, Cloudflare edge transforms sanitize client requests and inject authoritative geolocation headers; direct client-to-origin connections with spoofed `cf-*` headers are rejected at the network edge.
+1. **Trusted infrastructure headers (Cloudflare).** Extracts visitor coordinates from Cloudflare Managed Transforms headers (`cf-iplatitude`, `cf-iplongitude`, `cf-ipcity`, `cf-region`, `cf-ipcountry`).
+   - **Default Safety:** The backend setting `TRUST_CLOUDFLARE_LOCATION_HEADERS` defaults to `False`. When disabled, the API returns HTTP 404 (`Location unavailable`) for all `/v1/locate` requests.
+   - **Production Deployment Requirement:** Enabling `TRUST_CLOUDFLARE_LOCATION_HEADERS=True` is safe **only** when the API origin is strictly firewalled to Cloudflare IP ranges or authenticated using Cloudflare Authenticated Origin Pulls (mTLS). In this architecture, Cloudflare edge transforms sanitize client requests and inject authoritative geolocation headers; direct client-to-origin connections with spoofed `cf-*` headers are rejected at the network edge.
+   - A malformed or absent header pair falls through to the second source rather than failing the request.
+2. **Local GeoLite2 database (self-hosted origins).** With `LOCATE_PROVIDER=maxmind`, the visitor address is read off the request and resolved against `LOCATE_GEOIP_DB_PATH` (provisioned per DEPLOYMENT.md §7). This path exists for deployments where no CDN injects the headers above, so the `cf-*` branch can never produce a value.
+   - **Address Selection (`LOCATE_PROXY_MODE`):** the serving tier always sits behind the edge gateway, so the socket peer alone would resolve every visitor to the gateway's own datacenter. The default `auto` therefore trusts the nginx-set `X-Real-IP` **only when the socket peer is not a routable address** — the case for anything arriving through the gateway — and ignores it when the peer is public, so a caller that reaches the published API port directly cannot forge a viewport. `always` trusts the header unconditionally (safe only with the API port firewalled to the gateway) and `never` always uses the socket peer. `X-Forwarded-For` is deliberately not consulted: nginx appends to it, making its leftmost entry caller-supplied.
+   - **Usable addresses only:** loopback, private, link-local, CGNAT and documentation ranges are rejected, so local development and same-host requests degrade to 404 instead of resolving to whatever the database records for that range.
+   - **Reader lifecycle:** the database is opened with `MODE_MMAP`, never `MODE_MEMORY`. Resident cost is therefore the pages actually touched (a few MB), shared across the uvicorn workers rather than duplicated per worker — the API container runs near its memory limit. The reader is reopened when the file's mtime/size changes, so the monthly refresh needs no restart. Results are not cached: a lookup costs microseconds, less than a Redis round trip, and skipping the cache removes both the stale-entry and per-IP key growth concerns.
 
 ### 11.4 Startup Camera Transition & Race Protection
 
-When startup coarse IP coordinates arrive, the map gently transitions from the default CONUS view (`[-106.8, 39.2]`, zoom 5) to the approximate regional viewport (`zoom: 6.5`, duration 800ms).
+When startup coarse IP coordinates arrive, the map gently transitions from the default CONUS view (`[-106.8, 39.2]`, zoom 5) to the approximate regional viewport (duration 800ms).
+
+The regional viewport is sized by a **tile budget** rather than a fixed zoom: `startupViewZoom()` (`src/lib/map/startupView.ts`) frames `STARTUP_TILE_SPAN` (3) tiles of the `STARTUP_TILE_ZOOM` (z8) Web-Mercator grid across the measured map width, which on a landscape viewport is a 3x2 region — about 6 tiles, roughly 360 km of ground across at mid-latitudes — and keeps that width on any display while the height follows the viewport aspect. Sizing the ground area rather than the zoom is deliberate: MapLibre renders the world at `512 * 2^zoom` CSS px, so one fixed zoom frames a different amount of ground on every viewport, and the number of tiles on screen is a function of viewport pixels alone. Unmeasurable viewports (hidden container, no layout) fall back to the tile grid's nominal zoom.
 
 Startup auto-centering is a **one-time opportunity** guarded by `startupAutoCenterEligibleRef`. It permanently expires when ANY of the following occurs:
 1. The startup IP camera transition (`map.easeTo`) is successfully applied.
