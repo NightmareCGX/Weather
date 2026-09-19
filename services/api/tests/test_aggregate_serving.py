@@ -257,25 +257,38 @@ def test_exceedance_operator_complement_is_consistent(tmp_path) -> None:
     assert above + below == pytest.approx(1.0, abs=1e-6)
 
 
-def test_exceedance_rejects_an_unsupported_operator(tmp_path) -> None:
-    """``between`` needs a second threshold, which this entry point does not take."""
+def test_exceedance_refuses_the_inclusive_operators(tmp_path) -> None:
+    """``gte``/``lte`` need the point mass at the threshold, which a quantile function cannot hold.
+
+    Measured on a zero-inflated field at its natural threshold of 0: the member path reports
+    P(x >= 0) = 1.0 against P(x > 0) = 0.47, and that 0.53 gap *is* the atom. The aggregate's
+    continuous interpolation gives 0.50, which is neither. Refusing is the only honest answer,
+    so the caller serves the members, where the distinction is well defined.
+    """
     rng = np.random.default_rng(10)
-    members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
-    store = _store_with(tmp_path, "temperature_2m", members)
-    assert (
-        exceedance_probability(
-            "temperature_2m",
-            store_path=store,
-            lead_time_hours=LEAD,
-            threshold=281.0,
-            operator="between",
-            chunk_row=0,
-            chunk_col=0,
-            row_in_chunk=5,
-            col_in_chunk=7,
-        )
-        is None
+    members = np.where(
+        rng.random((30, GRID_LAT, GRID_LON)) < 0.5,
+        0.0,
+        rng.gamma(0.35, 1.5, (30, GRID_LAT, GRID_LON)),
+    ).astype(np.float32)
+    store = _store_with(tmp_path, "precipitation_amount_3h", members)
+    common = dict(
+        store_path=store,
+        lead_time_hours=LEAD,
+        threshold=0.0,
+        chunk_row=0,
+        chunk_col=0,
+        row_in_chunk=5,
+        col_in_chunk=7,
     )
+    assert exceedance_probability("precipitation_amount_3h", operator="gte", **common) is None
+    assert exceedance_probability("precipitation_amount_3h", operator="lte", **common) is None
+    assert exceedance_probability("precipitation_amount_3h", operator="between", **common) is None
+    # the strict operator is served, and it is the member path's strict answer
+    strict = exceedance_probability("precipitation_amount_3h", operator="gt", **common)
+    assert strict is not None
+    column = members[:, 5, 7]
+    assert strict == pytest.approx(float((column > 0.0).mean()), abs=0.05)
 
 
 # ---------------------------------------------------------------------------

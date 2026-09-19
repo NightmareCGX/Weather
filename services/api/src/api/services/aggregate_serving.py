@@ -317,12 +317,20 @@ def exceedance_probability(
     generation: str | None = None,
     reader: AggregateShardReader | None = None,
 ) -> float | None:
-    """Serve an exceedance probability at an arbitrary threshold from an aggregate shard.
+    """Serve a strict exceedance probability from an aggregate shard.
 
     This is what the encoding exists for: the store was never told the threshold, and the
     quantile encoding answers it by inverting the stored levels. The bin encoding can answer
     the same question only through its CDF, so it is supported too, with the tail caveat its
     own docstring records.
+
+    **Only the strict operators are served: ``gt`` and ``lt``.** The domain's ``gte``/``lte``
+    count members *at* the threshold, and a stored quantile function cannot resolve that.
+    Measured on a zero-inflated field at the natural threshold of 0, where half the members are
+    exactly zero: the member path reports P(x >= 0) = 1.0 while P(x > 0) = 0.47, a 0.53
+    difference that is the point mass itself. The aggregate's continuous interpolation reports
+    0.50, which is neither. So the inclusive operators return ``None`` and the caller uses the
+    members, where the distinction is well defined.
 
     ``None`` whenever an aggregate cannot answer, so the caller falls back to the members.
 
@@ -331,8 +339,8 @@ def exceedance_probability(
         store_path: The cycle store.
         lead_time_hours: Forecast lead.
         threshold: Threshold in the variable's canonical units.
-        operator: One of ``gt``, ``gte``, ``lt``, ``lte`` (``between`` needs two thresholds and
-            is handled by the caller).
+        operator: ``gt`` or ``lt``. ``gte``/``lte`` need the member sample (see above) and
+            ``between`` needs two thresholds; all three are the caller's to handle.
         chunk_row: Chunk-row of the point's cell.
         chunk_col: Chunk-column of the point's cell.
         row_in_chunk: Row of the cell inside its chunk.
@@ -340,7 +348,7 @@ def exceedance_probability(
         generation: Committed-manifest generation.
         reader: Optional reader to reuse.
     """
-    if operator not in ("gt", "gte", "lt", "lte"):
+    if operator not in ("gt", "lt"):
         return None
     try:
         spec = spec_for(variable)
@@ -392,9 +400,9 @@ def exceedance_probability(
 
     if not math.isfinite(probability_above):
         return None
-    if operator in ("gt", "gte"):
-        return probability_above
-    return 1.0 - probability_above
+    # Only the strict operators reach here; the inclusive ones are refused above because a
+    # stored quantile function cannot represent the point mass at the threshold.
+    return probability_above if operator == "gt" else 1.0 - probability_above
 
 
 
