@@ -33,6 +33,7 @@ import numpy as np
 import s3fs  # type: ignore[import-untyped]
 
 from domain.locks import sha256_hex
+from domain.reclamation import make_shard_filename
 
 
 class InventoryError(RuntimeError):
@@ -643,12 +644,11 @@ def region_expected_object_keys(
 
         out_shards: list[str] = []
         for var in sorted(data_var_paths):
-            if is_mean:
-                out_shards.append(f"{var}/shard.mean_L{lead_val:04d}.shard")
-            elif member is not None:
-                out_shards.append(f"{var}/shard.mem{member:03d}_L{lead_val:04d}.shard")
-            else:
-                out_shards.append(f"{var}/shard.det_L{lead_val:04d}.shard")
+            out_shards.append(
+                make_shard_filename(
+                    var, member=member, lead_time_hours=lead_val, is_mean=is_mean
+                )
+            )
         return sorted(set(out_shards))
 
     # Legacy Zarr v2 unsharded: ~1,680 individual chunk objects

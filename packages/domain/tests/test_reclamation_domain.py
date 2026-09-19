@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 from domain.reclamation import (
+    SHARD_SUFFIX,
     IngestionRegionIdentity,
     PhysicalShardTarget,
     _ensure_utc,
@@ -17,12 +18,16 @@ from domain.reclamation import (
     get_predecessor_lead,
     is_predecessor_dependent_lead,
     is_predecessor_variable,
+    is_shard_filename,
     make_region_marker_physical_key,
     make_region_marker_relative_key,
+    make_shard_filename,
     make_shard_physical_key,
     make_shard_relative_key,
     normalize_member_index,
+    parse_shard_filename,
     register_expected_region_variables,
+    target_kind_for,
 )
 
 
@@ -123,6 +128,97 @@ def test_make_shard_keys():
 
     with pytest.raises(ValueError, match="Unknown target_kind"):
         make_shard_relative_key("var", "invalid", 0)
+
+
+def test_target_kind_for_maps_the_acquisition_convention():
+    assert target_kind_for(None) == ("det", 0)
+    assert target_kind_for(None, is_mean=True) == ("mean", -1)
+    assert target_kind_for(3) == ("mem", 3)
+    # is_mean wins over a supplied member, matching how the writer treats them
+    assert target_kind_for(3, is_mean=True) == ("mean", -1)
+
+
+def test_make_shard_filename_agrees_with_make_shard_relative_key():
+    """The acquisition-convention builder and the target-kind builder must not diverge."""
+    cases = (
+        (None, 0, False, "temperature_2m", "det", 0),
+        (None, 6, True, "temperature_2m", "mean", -1),
+        (3, 12, False, "temperature_2m", "mem", 3),
+    )
+    for member, lead, is_mean, variable, kind, member_index in cases:
+        assert make_shard_filename(
+            variable, member=member, lead_time_hours=lead, is_mean=is_mean
+        ) == make_shard_relative_key(variable, kind, lead, member_index)
+
+    assert (
+        make_shard_filename("temperature_2m", member=None, lead_time_hours=0)
+        == "temperature_2m/shard.det_L0000.shard"
+    )
+    assert (
+        make_shard_filename("temperature_2m", member=None, lead_time_hours=6, is_mean=True)
+        == "temperature_2m/shard.mean_L0006.shard"
+    )
+    assert (
+        make_shard_filename("temperature_2m", member=3, lead_time_hours=6)
+        == "temperature_2m/shard.mem003_L0006.shard"
+    )
+
+
+def test_parse_shard_filename_round_trips_every_kind():
+    """parse_shard_filename must invert make_shard_filename for every region shape."""
+    for member, lead, is_mean in (
+        (None, 0, False),
+        (None, 6, True),
+        (1, 6, False),
+        (30, 240, False),
+    ):
+        key = make_shard_filename(
+            "temperature_2m", member=member, lead_time_hours=lead, is_mean=is_mean
+        )
+        assert parse_shard_filename(key) == (member, lead, is_mean)
+        # a bare filename and a prefixed key must parse identically
+        assert parse_shard_filename(key.rsplit("/", 1)[-1]) == (member, lead, is_mean)
+        assert is_shard_filename(key)
+
+
+def test_parse_shard_filename_rejects_non_shard_names():
+    for bad in (
+        "temperature_2m/.zarray",
+        "temperature_2m/0.0.0.0",
+        "manifest.json",
+        "temperature_2m/shard.agg_L0006.shard",  # agg is not a recognized kind yet
+        "shard.det_L0006.shard",  # no variable prefix is fine, but...
+    ):
+        # the last entry IS a valid shard name (prefix is optional); assert per-case
+        if bad == "shard.det_L0006.shard":
+            assert is_shard_filename(bad)
+            continue
+        assert not is_shard_filename(bad)
+
+    with pytest.raises(ValueError, match="Not a shard filename"):
+        parse_shard_filename("temperature_2m/.zarray")
+
+    with pytest.raises(ValueError, match="Unrecognized shard filename"):
+        parse_shard_filename("temperature_2m/shard.weird_L0006.shard")
+
+
+def test_parse_shard_filename_rejects_malformed_member_name():
+    """A truncated member name must not be silently parsed as a different region."""
+    assert not is_shard_filename("temperature_2m/shard.mem001.shard")
+    assert not is_shard_filename("temperature_2m/shard.mem_L0006.shard")
+
+    with pytest.raises(ValueError, match="Unrecognized shard filename"):
+        parse_shard_filename("temperature_2m/shard.mem001.shard")
+
+
+def test_shard_suffix_constant_is_the_store_layout_marker():
+    """Store layout detection keys on this suffix; it must match the emitted keys."""
+    assert SHARD_SUFFIX == ".shard"
+    for member, is_mean in ((None, False), (None, True), (7, False)):
+        key = make_shard_filename(
+            "temperature_2m", member=member, lead_time_hours=0, is_mean=is_mean
+        )
+        assert key.endswith(SHARD_SUFFIX)
 
 
 def test_make_region_marker_keys():

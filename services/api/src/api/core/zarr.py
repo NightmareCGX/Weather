@@ -28,6 +28,7 @@ import xarray as xr
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from api.core.config import settings
+from domain.reclamation import make_shard_filename
 
 #: Canonical Weather Platform Sharded v1 (sharded_v1) binary layout constants
 SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
@@ -295,11 +296,12 @@ class ShardedV1Reader:
         lead_time_hours: int,
         is_mean: bool = False,
     ) -> str:
-        if is_mean:
-            return f"{variable}/shard.mean_L{lead_time_hours:04d}.shard"
-        if member is not None:
-            return f"{variable}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
-        return f"{variable}/shard.det_L{lead_time_hours:04d}.shard"
+        return make_shard_filename(
+            variable,
+            member=member,
+            lead_time_hours=lead_time_hours,
+            is_mean=is_mean,
+        )
 
     def has_mean_shard(
         self,

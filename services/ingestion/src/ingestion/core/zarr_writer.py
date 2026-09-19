@@ -27,6 +27,12 @@ import xarray as xr
 import zarr
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
+from domain.reclamation import (
+    SHARD_SUFFIX,
+    is_shard_filename,
+    make_shard_filename,
+    parse_shard_filename,
+)
 from ingestion.core.config import IngestionSettings, settings
 from ingestion.core.s3 import resolve_s3_mapper
 
@@ -661,12 +667,12 @@ def encode_region_sharded_v1(
                 var_chunks.append(comp)
 
         shard_payload = build_sharded_v1_container(var_chunks)
-        if is_mean:
-            key = f"{var_name}/shard.mean_L{lead_time_hours:04d}.shard"
-        elif member is not None:
-            key = f"{var_name}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
-        else:
-            key = f"{var_name}/shard.det_L{lead_time_hours:04d}.shard"
+        key = make_shard_filename(
+            var_name,
+            member=member,
+            lead_time_hours=lead_time_hours,
+            is_mean=is_mean,
+        )
         encoded_shards.append((key, shard_payload))
 
     return encoded_shards
@@ -882,21 +888,6 @@ def _coordinate_index(
     )
 
 
-def _parse_shard_filename(fname: str) -> tuple[int | None, int, bool]:
-    """Parse member, lead, and is_mean from shard.mem001_L0006.shard, shard.det_L0006.shard, or shard.mean_L0006.shard."""
-    base = fname.removesuffix(".shard")
-    if ".mean_L" in base:
-        lead_str = base.split(".mean_L")[-1]
-        return None, int(lead_str), True
-    if ".mem" in base:
-        parts = base.split(".mem")[-1].split("_L")
-        return int(parts[0]), int(parts[1]), False
-    if ".det_L" in base:
-        lead_str = base.split(".det_L")[-1]
-        return None, int(lead_str), False
-    return None, 0, False
-
-
 def _populate_sharded_data(
     dataset: xr.Dataset, store: str | PathLike[str] | Mapping[str, bytes]
 ) -> xr.Dataset:
@@ -944,9 +935,9 @@ def _populate_sharded_data(
         try:
             for item in fs.find(root):
                 rel = item[len(root) + 1 :]
-                if rel.endswith(".shard") and "/" in rel:
+                if rel.endswith(SHARD_SUFFIX) and "/" in rel and is_shard_filename(rel):
                     vname, fname = rel.split("/", 1)
-                    member_val, lead_val, is_mean_val = _parse_shard_filename(fname)
+                    member_val, lead_val, is_mean_val = parse_shard_filename(fname)
                     shards_by_var.setdefault(vname, []).append((rel, member_val, lead_val, is_mean_val))
         except Exception:
             pass
@@ -955,8 +946,8 @@ def _populate_sharded_data(
             var_dir = os.path.join(root, str(vname))
             if os.path.isdir(var_dir):
                 for fname in os.listdir(var_dir):
-                    if fname.endswith(".shard"):
-                        member_val, lead_val, is_mean_val = _parse_shard_filename(fname)
+                    if fname.endswith(SHARD_SUFFIX) and is_shard_filename(fname):
+                        member_val, lead_val, is_mean_val = parse_shard_filename(fname)
                         shards_by_var.setdefault(str(vname), []).append(
                             (f"{vname}/{fname}", member_val, lead_val, is_mean_val)
                         )
@@ -1069,14 +1060,12 @@ def read_slice(
         root = rest
 
     # Construct candidate shard filename
-    if is_mean:
-        shard_filename = f"shard.mean_L{lead_time_hours:04d}.shard"
-    elif member is not None:
-        shard_filename = f"shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
-    else:
-        shard_filename = f"shard.det_L{lead_time_hours:04d}.shard"
-
-    rel_key = f"{var_name}/{shard_filename}"
+    rel_key = make_shard_filename(
+        var_name,
+        member=member,
+        lead_time_hours=lead_time_hours,
+        is_mean=is_mean,
+    )
     shard_bytes: bytes | None = None
 
     if is_s3 and fs is not None:

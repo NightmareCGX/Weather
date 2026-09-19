@@ -36,7 +36,11 @@ def test_committed_manifest_path_no_drift() -> None:
 
 
 def test_shard_key_naming_convention_parity() -> None:
-    """Verify that deterministic and ensemble shard keys match between writer and reader."""
+    """Verify that every shard key form matches between writer and reader.
+
+    Covers all three target kinds. The ensemble-mean form was previously asserted only by
+    service-local tests, so a rename could have slipped past this contract suite.
+    """
     reader = api_zarr.ShardedV1Reader("s3://weather-data/gfs/2026-09-03/00/cycle.zarr")
 
     # Deterministic GFS shard key (member=None)
@@ -46,6 +50,89 @@ def test_shard_key_naming_convention_parity() -> None:
     # Ensemble GEFS shard key (member=3)
     gefs_key = reader._get_shard_key("temperature_2m", member=3, lead_time_hours=12)
     assert gefs_key == "temperature_2m/shard.mem003_L0012.shard"
+
+    # Precomputed ensemble-mean shard key (is_mean=True)
+    mean_key = reader._get_shard_key(
+        "temperature_2m", member=None, lead_time_hours=6, is_mean=True
+    )
+    assert mean_key == "temperature_2m/shard.mean_L0006.shard"
+
+
+def test_every_shard_key_construction_site_agrees_with_domain_authority() -> None:
+    """The key template must live in exactly one place.
+
+    ``domain.reclamation.make_shard_filename`` is the authority. The ingestion encoder,
+    the ingestion reader, the store inventory and the API reader all have to agree with it
+    for every region shape -- a divergence in any one of them silently reads or deletes the
+    wrong object rather than failing loudly.
+    """
+    import numpy as np
+    import xarray as xr
+
+    from domain import reclamation
+    from ingestion.core import inventory as ing_inventory
+
+    shapes = (
+        ("det", dict(member=None, lead_time_hours=6, is_mean=False)),
+        ("mean", dict(member=None, lead_time_hours=6, is_mean=True)),
+        ("mem", dict(member=3, lead_time_hours=12, is_mean=False)),
+    )
+    variable = "temperature_2m"
+    # A tiny grid keeps the encoder cheap; only the key matters here.
+    data = np.zeros((1, 1, 4, 4), dtype=np.float32)
+
+    for _label, kwargs in shapes:
+        expected = reclamation.make_shard_filename(variable, **kwargs)
+
+        # 1. domain authority vs the target-kind builder (two spellings, one template)
+        kind, member_index = reclamation.target_kind_for(
+            kwargs["member"], is_mean=kwargs["is_mean"]
+        )
+        assert expected == reclamation.make_shard_relative_key(
+            variable, kind, kwargs["lead_time_hours"], member_index
+        )
+
+        # 2. ingestion encoder
+        ds = xr.Dataset(
+            {
+                variable: (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    data,
+                )
+            }
+        )
+        encoded = ing_zarr.encode_region_sharded_v1(ds, **kwargs)
+        assert [k for k, _ in encoded] == [expected]
+
+        # 3. API reader
+        reader = api_zarr.ShardedV1Reader("s3://weather-data/gfs/2026-09-03/00/cycle.zarr")
+        assert (
+            reader._get_shard_key(
+                variable,
+                member=kwargs["member"],
+                lead_time_hours=kwargs["lead_time_hours"],
+                is_mean=kwargs["is_mean"],
+            )
+            == expected
+        )
+
+        # 4. store inventory
+        assert ing_inventory.region_expected_object_keys(
+            "s3://weather-data/gfs/2026-09-03/00/cycle.zarr",
+            member=kwargs["member"],
+            lead_index=kwargs["lead_time_hours"],
+            lead_time_hours=kwargs["lead_time_hours"],
+            data_var_paths=[variable],
+            format_version="sharded_v1",
+            is_mean=kwargs["is_mean"],
+        ) == [expected]
+
+        # 5. the filename grammar round-trips, so detection agrees with construction
+        assert reclamation.parse_shard_filename(expected) == (
+            kwargs["member"],
+            kwargs["lead_time_hours"],
+            kwargs["is_mean"],
+        )
 
 
 def test_canonical_storage_identity_normalization() -> None:

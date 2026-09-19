@@ -188,6 +188,97 @@ def make_shard_physical_key(
     return f"{clean_store}/{rel}"
 
 
+def target_kind_for(member: int | None, *, is_mean: bool = False) -> tuple[str, int]:
+    """Map the acquisition-side ``(member, is_mean)`` convention onto a target kind.
+
+    This is the single translation point between the two ways the platform names a
+    region: the download/decode side speaks ``member: int | None`` plus an ``is_mean``
+    flag, while reclamation and the shard keys speak ``target_kind`` plus a normalized
+    ``member_index``. Duplicating the mapping is how the two drift apart.
+
+    Returns:
+        ``(target_kind, member_index)`` ready for :func:`make_shard_relative_key`.
+    """
+    if is_mean:
+        return TARGET_KIND_MEAN, -1
+    if member is None:
+        return TARGET_KIND_DET, 0
+    return TARGET_KIND_MEM, int(member)
+
+
+def make_shard_filename(
+    variable_code: str,
+    *,
+    member: int | None,
+    lead_time_hours: int,
+    is_mean: bool = False,
+) -> str:
+    """Generate a shard's store-relative key from the acquisition convention.
+
+    Identical to :func:`make_shard_relative_key` after :func:`target_kind_for`, and the
+    exact inverse of :func:`parse_shard_filename`. Prefer this over hand-built f-strings:
+    the key template is duplicated nowhere else.
+
+    Examples:
+        make_shard_filename('temperature_2m', member=None, lead_time_hours=0)
+        -> 'temperature_2m/shard.det_L0000.shard'
+        make_shard_filename('temperature_2m', member=None, lead_time_hours=6, is_mean=True)
+        -> 'temperature_2m/shard.mean_L0006.shard'
+        make_shard_filename('temperature_2m', member=3, lead_time_hours=6)
+        -> 'temperature_2m/shard.mem003_L0006.shard'
+    """
+    kind, member_index = target_kind_for(member, is_mean=is_mean)
+    return make_shard_relative_key(variable_code, kind, lead_time_hours, member_index)
+
+
+#: Every physical shard object ends with this suffix. Store layout detection keys on it.
+SHARD_SUFFIX = ".shard"
+
+#: Prefixes of the shard filename body, longest first so no prefix shadows another.
+_KIND_FILENAME_PREFIX: tuple[tuple[str, str], ...] = (
+    ("shard.mean_L", TARGET_KIND_MEAN),
+    ("shard.mem", TARGET_KIND_MEM),
+    ("shard.det_L", TARGET_KIND_DET),
+)
+
+
+def parse_shard_filename(filename: str) -> tuple[int | None, int, bool]:
+    """Parse ``(member, lead_time_hours, is_mean)`` from a shard filename.
+
+    The inverse of :func:`make_shard_filename`, and the only place the filename grammar
+    is decoded. Accepts a bare filename or a store-relative key with a variable prefix.
+
+    Raises:
+        ValueError: if the name is not a recognized shard filename. Callers that enumerate
+            a store may encounter unrelated objects; they should test
+            :func:`is_shard_filename` first rather than catching this.
+    """
+    base = filename.rsplit("/", 1)[-1]
+    if not base.endswith(SHARD_SUFFIX):
+        raise ValueError(f"Not a shard filename: {filename!r}")
+    stem = base[: -len(SHARD_SUFFIX)]
+    for prefix, kind in _KIND_FILENAME_PREFIX:
+        if not stem.startswith(prefix):
+            continue
+        rest = stem[len(prefix) :]
+        if kind == TARGET_KIND_MEM:
+            member_str, _, lead_str = rest.partition("_L")
+            if not member_str or not lead_str:
+                break
+            return int(member_str), int(lead_str), False
+        return None, int(rest), kind == TARGET_KIND_MEAN
+    raise ValueError(f"Unrecognized shard filename: {filename!r}")
+
+
+def is_shard_filename(filename: str) -> bool:
+    """Return True if ``filename`` is a well-formed shard object name."""
+    try:
+        parse_shard_filename(filename)
+    except (ValueError, IndexError):
+        return False
+    return True
+
+
 def make_region_marker_relative_key(
     target_kind: str,
     lead_time_hours: int,
