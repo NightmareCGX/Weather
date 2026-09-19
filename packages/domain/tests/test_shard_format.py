@@ -26,6 +26,7 @@ from domain.shard_format import (
     build_trailer,
     container_tail_size,
     extract_chunk,
+    member_count_from_descriptor,
     parse_descriptor,
     parse_index,
     parse_trailer,
@@ -247,9 +248,31 @@ def test_parse_descriptor_rejects_nonzero_reserved_and_flags() -> None:
         parse_descriptor(bytes(raw))
 
     raw = bytearray(build_descriptor(_descriptor()))
-    struct.pack_into("<8s", raw, 32, b"\x01" * 8)
+    struct.pack_into("<4s", raw, 36, b"\x01" * 4)
     with pytest.raises(ShardFormatError, match="reserved descriptor bytes"):
         parse_descriptor(bytes(raw))
+
+
+def test_descriptor_carries_the_member_count_a_reader_cannot_derive() -> None:
+    """The count is stored, because an aggregate has collapsed the members it came from."""
+    assert parse_descriptor(build_descriptor(_descriptor())).member_count == 0
+    assert (
+        parse_descriptor(build_descriptor(_descriptor(member_count=30))).member_count == 30
+    )
+
+
+def test_member_count_is_per_point_only_through_the_observed_cell_property() -> None:
+    """``member_count`` reports the count at a point, and the aggregate stores it per shard.
+
+    The two agree because a single non-finite member makes *every* field at that cell
+    non-finite, so "all fields finite here" means "computed from the full member set". A
+    container with no count yields ``None`` so a caller falls back rather than inventing one.
+    """
+    counted = _descriptor(member_count=30)
+    assert member_count_from_descriptor(counted, observed=True) == 30
+    assert member_count_from_descriptor(counted, observed=False) == 0
+    # A member shard, or an unimplemented case, carries no count.
+    assert member_count_from_descriptor(_descriptor(), observed=True) is None
 
 
 def test_parse_descriptor_rejects_impossible_geometry() -> None:

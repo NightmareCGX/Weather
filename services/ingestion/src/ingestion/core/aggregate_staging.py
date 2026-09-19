@@ -282,7 +282,7 @@ def aggregate_from_planes(
         grid_lon: Grid longitude extent.
 
     Returns:
-        The ``sharded_v2`` container bytes.
+        The ``sharded_v2`` container bytes, carrying the member count it was computed from.
 
     Raises:
         StagingError: if no plane is supplied or the shapes disagree with the grid.
@@ -297,7 +297,10 @@ def aggregate_from_planes(
         )
     fields = compute_aggregate(stack, spec)
     layout = layout_for_spec(spec, grid_lat=grid_lat, grid_lon=grid_lon)
-    return encode_aggregate_shard(list(fields), layout)
+    # The member count is not derivable from the statistics an aggregate stores, so it is
+    # recorded in the descriptor, where a reader reaches it in the same tail read that gives
+    # it the geometry.
+    return encode_aggregate_shard(list(fields), layout, member_count=int(stack.shape[0]))
 
 
 def aggregate_staged_lead(

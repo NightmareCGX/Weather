@@ -228,7 +228,9 @@ def test_aggregate_reader_agrees_with_the_ingestion_writer(tmp_path) -> None:
     ):
         fields = compute_aggregate(members.astype(np.float32), spec)
         layout = layout_for_spec(spec, grid_lat=grid_lat, grid_lon=grid_lon)
-        container = encode_aggregate_shard(list(fields), layout)
+        container = encode_aggregate_shard(
+            list(fields), layout, member_count=members.shape[0]
+        )
         key = aggregate_shard_key(variable, lead)
         full = os.path.join(store, *key.split("/"))
         os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -244,6 +246,11 @@ def test_aggregate_reader_agrees_with_the_ingestion_writer(tmp_path) -> None:
         assert geometry.lat_chunks == layout.lat_chunks
         assert geometry.lon_chunks == layout.lon_chunks
         assert recover_geometry(layout.to_descriptor()) == geometry
+
+        # 1b. and the member count the writer recorded, which an aggregate cannot derive from
+        # the statistics it stores
+        assert reader.member_count(variable, lead, observed=True) == members.shape[0]
+        assert reader.member_count(variable, lead, observed=False) == 0
 
         # 2. and decodes the fields the writer was given, chunk for chunk
         for row in range(geometry.lat_chunks):

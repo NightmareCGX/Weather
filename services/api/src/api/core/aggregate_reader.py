@@ -43,6 +43,7 @@ from domain.shard_format import (
     TRAILER_SIZE,
     ShardDescriptor,
     ShardFormatError,
+    member_count_from_descriptor,
     parse_index,
     parse_trailer,
     split_v2_tail,
@@ -166,6 +167,9 @@ class AggregateShardReader:
         self._index_cache: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
         self._geometry_cache: OrderedDict[str, AggregateGeometry] = OrderedDict()
         self._group_cache: OrderedDict[str, npt.NDArray[np.float32]] = OrderedDict()
+        # The descriptor itself, kept because the geometry deliberately carries only what
+        # addresses chunks, and the member count the API reports is not derivable from it.
+        self._descriptor_cache: OrderedDict[str, ShardDescriptor] = OrderedDict()
         self._cache_lock = threading.Lock()
         self._fs: Any | None = None
 
@@ -265,12 +269,16 @@ class AggregateShardReader:
         ``None`` for anything that is not a well-formed, decodable aggregate container. Those
         checks are the point of this method: a v1 object, an unknown encoding, or a geometry
         that cannot be an aggregate all mean "no aggregate here".
+
+        The descriptor's member count is cached alongside the geometry. It arrives in the same
+        tail read, so keeping it costs nothing and spares a second parse.
         """
         cache_key = f"{self._store_key()}::{generation or 'live'}::{shard_key}"
         with self._cache_lock:
             if cache_key in self._geometry_cache:
                 self._geometry_cache.move_to_end(cache_key)
                 self._index_cache.move_to_end(cache_key)
+                self._descriptor_cache.move_to_end(cache_key)
                 return self._geometry_cache[cache_key], self._index_cache[cache_key]
 
         # The descriptor's length depends on num_chunks, which only the trailer declares, so
@@ -302,12 +310,44 @@ class AggregateShardReader:
         with self._cache_lock:
             self._geometry_cache[cache_key] = geometry
             self._index_cache[cache_key] = entries
+            self._descriptor_cache[cache_key] = descriptor
             while len(self._geometry_cache) > self.max_cached_indices:
                 self._geometry_cache.popitem(last=False)
                 self._index_cache.popitem(last=False)
+                self._descriptor_cache.popitem(last=False)
         return geometry, entries
 
     # -- public API --------------------------------------------------------------
+
+    def member_count(
+        self,
+        variable: str,
+        lead_time_hours: int,
+        *,
+        observed: bool,
+        generation: str | None = None,
+    ) -> int | None:
+        """Members the aggregate was computed from, for a point that was or was not observed.
+
+        The API reports ``member_count`` per point; a container stores it per shard. The two
+        agree because a single non-finite member makes every field at that cell non-finite, so
+        "the fields here are all finite" means "computed from the full set". ``observed`` is the
+        caller's answer to that question for the cell it read.
+
+        Returns:
+            The count for an observed cell, ``0`` for an unobserved one, and ``None`` when the
+            container carries no count -- which a caller must treat as "ask the members", not
+            as zero.
+        """
+        shard_key = aggregate_shard_key(variable, lead_time_hours)
+        if self._load_geometry(shard_key, generation) is None:
+            return None
+        cache_key = f"{self._store_key()}::{generation or 'live'}::{shard_key}"
+        with self._cache_lock:
+            descriptor = self._descriptor_cache.get(cache_key)
+        if descriptor is None:  # pragma: no cover - _load_geometry just populated it
+            return None
+        return member_count_from_descriptor(descriptor, observed=observed)
 
     def open(
         self, variable: str, lead_time_hours: int, *, generation: str | None = None
@@ -424,11 +464,12 @@ class AggregateShardReader:
                 self._group_cache.popitem(last=False)
 
     def invalidate(self) -> None:
-        """Drop every cached index, geometry and field group."""
+        """Drop every cached index, geometry, field group and descriptor."""
         with self._cache_lock:
             self._index_cache.clear()
             self._geometry_cache.clear()
             self._group_cache.clear()
+            self._descriptor_cache.clear()
 
 
 __all__ = [

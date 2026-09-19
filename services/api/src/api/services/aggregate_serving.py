@@ -74,12 +74,16 @@ class AggregatePointStatistics:
         spec: The spec the aggregate was written with.
         exact: Statistics reproduced bit-exactly rather than reconstructed.
         geometry: The container geometry the values were read from.
+        member_count: Ensemble members the aggregate was computed from, when the point was
+            observed. ``None`` when the container does not carry a count, so a caller falls
+            back to the member path rather than reporting an invented number.
     """
 
     values: dict[str, float]
     spec: AggregateSpec
     exact: frozenset[str]
     geometry: AggregateGeometry
+    member_count: int | None = None
 
     def as_ensemble_statistics_kwargs(self) -> dict[str, float | None]:
         """Return the platform's statistics shape, with unexpressible names as ``None``.
@@ -298,8 +302,18 @@ def statistics_from_aggregate(
     if "mean" not in finite:
         # Without a mean the answer would be a partial statistic set; members can do better.
         return None
+    # A single non-finite member makes every field at a cell non-finite, so "every field here
+    # is finite" is exactly "this cell was computed from the whole member set". That, and only
+    # that, is what lets the container's shard-wide count answer the API's per-point question.
+    observed = all(math.isfinite(value) for value in point)
     return AggregatePointStatistics(
-        values=finite, spec=spec, exact=exact, geometry=geometry
+        values=finite,
+        spec=spec,
+        exact=exact,
+        geometry=geometry,
+        member_count=active_reader.member_count(
+            variable, lead_time_hours, observed=observed, generation=generation
+        ),
     )
 
 

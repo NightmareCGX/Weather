@@ -63,9 +63,9 @@ REQUIRED_SCALE: float = 1.0
 
 #: Serialized descriptor layout. All fields little-endian.
 #:
-#: ======  ===  ======================================
+#: ======  ===  ========================================
 #: offset  fmt  field
-#: ======  ===  ======================================
+#: ======  ===  ========================================
 #: 0       4s   magic (``SHV2``)
 #: 4       1B   format version (2)
 #: 5       1B   encoding id
@@ -77,11 +77,21 @@ REQUIRED_SCALE: float = 1.0
 #: 20      4I   grid longitude extent
 #: 24      4I   num_chunks
 #: 28      4I   index_byte_size
-#: 32      8s   reserved (must be zero)
-#: ======  ===  ======================================
-DESCRIPTOR_FMT: str = "<4sBBHfHHIIII8s"
+#: 32      4I   member_count (0 when the container is not a member aggregate)
+#: 36      4s   reserved (must be zero)
+#: ======  ===  ========================================
+#:
+#: ``member_count`` was carved out of the reserved region rather than appended, so the
+#: descriptor is still :data:`DESCRIPTOR_SIZE` bytes and every existing offset still holds.
+#: It is stored rather than derived because an aggregate collapses the members it was computed
+#: from, and the count the API reports cannot be recovered afterwards.
+#:
+#: A reader that predates this field rejects a non-zero reserved region outright, so an older
+#: reader refuses a newer container instead of misreading it -- which is the safe direction,
+#: and why the format version byte did not need to change.
+DESCRIPTOR_FMT: str = "<4sBBHfHHIIIII4s"
 _TRAILER_FMT: str = "<III"
-_RESERVED = b"\x00" * 8
+_RESERVED = b"\x00" * 4
 
 assert struct.calcsize(DESCRIPTOR_FMT) == DESCRIPTOR_SIZE, "descriptor layout drifted"
 assert struct.calcsize(_TRAILER_FMT) == TRAILER_SIZE, "trailer layout drifted"
@@ -108,6 +118,9 @@ class ShardDescriptor:
         grid_lon: Full grid longitude extent.
         num_chunks: Number of inner chunks in the index.
         index_byte_size: ``num_chunks * INDEX_ENTRY_SIZE``.
+        member_count: Ensemble members the aggregate was computed from; ``0`` for a container
+            that is not a member aggregate (a member shard, a flag fraction, an unimplemented
+            case).
         flags: Reserved; must be 0.
     """
 
@@ -119,6 +132,7 @@ class ShardDescriptor:
     grid_lon: int
     num_chunks: int
     index_byte_size: int
+    member_count: int = 0
     flags: int = 0
 
     @property
@@ -138,6 +152,32 @@ class ShardDescriptor:
         if not (0 <= chunk_row < lat_chunks and 0 <= chunk_col < lon_chunks):
             return -1
         return chunk_row * lon_chunks + chunk_col
+
+
+def member_count_from_descriptor(
+    descriptor: ShardDescriptor, *, observed: bool
+) -> int | None:
+    """The per-point member count an aggregate container implies, or ``None``.
+
+    The API reports ``member_count`` as "the members with a finite value **at this point**"
+    (``services/api/src/api/services/ensemble_data.py``). An aggregate stores the count for the
+    whole container instead, because the per-point answer is not recoverable from it -- but the
+    two coincide under a property both encodings hold: a single non-finite member makes *every*
+    field at that cell non-finite (``domain.aggregate.compute_aggregate`` sets all of them), so
+    a cell whose fields are all finite was computed from the full set, and a cell with any
+    non-finite field was not.
+
+    Args:
+        descriptor: The container's descriptor.
+        observed: Whether the queried cell's aggregate values are all finite.
+
+    Returns:
+        ``member_count`` for an observed cell, ``0`` for an unobserved one, and ``None`` when
+        the descriptor does not carry a count, so a caller can fall back rather than invent one.
+    """
+    if descriptor.member_count <= 0:
+        return None
+    return descriptor.member_count if observed else 0
 
 
 #: Numeric format version recorded in the descriptor, and the only one parse_descriptor
@@ -160,6 +200,7 @@ def build_descriptor(descriptor: ShardDescriptor) -> bytes:
         descriptor.grid_lon,
         descriptor.num_chunks,
         descriptor.index_byte_size,
+        descriptor.member_count,
         _RESERVED,
     )
 
@@ -189,6 +230,7 @@ def parse_descriptor(raw: bytes) -> ShardDescriptor:
         grid_lon,
         num_chunks,
         index_byte_size,
+        member_count,
         reserved,
     ) = struct.unpack(DESCRIPTOR_FMT, raw[:DESCRIPTOR_SIZE])
 
@@ -238,6 +280,7 @@ def parse_descriptor(raw: bytes) -> ShardDescriptor:
         grid_lon=int(grid_lon),
         num_chunks=int(num_chunks),
         index_byte_size=int(index_byte_size),
+        member_count=int(member_count),
         flags=int(flags),
     )
 

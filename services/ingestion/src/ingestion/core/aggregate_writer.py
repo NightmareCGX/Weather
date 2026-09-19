@@ -154,8 +154,14 @@ class AggregateShardLayout:
         start = (row * self.lon_chunks + col) * self.n_fields
         return range(start, start + self.n_fields)
 
-    def to_descriptor(self) -> ShardDescriptor:
-        """Build the container descriptor for this layout."""
+    def to_descriptor(self, *, member_count: int = 0) -> ShardDescriptor:
+        """Build the container descriptor for this layout.
+
+        Args:
+            member_count: Ensemble members the planes were computed from. Recorded in the
+                descriptor because the statistics an aggregate stores do not imply it, and the
+                API reports it. ``0`` for a container that is not a member aggregate.
+        """
         return ShardDescriptor(
             encoding_id=ENCODING_F32,
             scale=1.0,
@@ -165,6 +171,7 @@ class AggregateShardLayout:
             grid_lon=self.grid_lon,
             num_chunks=self.num_chunks,
             index_byte_size=self.num_chunks * INDEX_ENTRY_SIZE,
+            member_count=member_count,
         )
 
 
@@ -217,6 +224,7 @@ def encode_aggregate_shard(
     layout: AggregateShardLayout,
     *,
     level: int = DEFAULT_ZSTD_LEVEL,
+    member_count: int = 0,
 ) -> bytes:
     """Encode statistic planes into a single ``sharded_v2`` container.
 
@@ -224,6 +232,8 @@ def encode_aggregate_shard(
         planes: One ``(lat, lon)`` float32 plane per field, in storage order.
         layout: Geometry; ``n_fields`` must equal ``len(planes)``.
         level: Zstd level for the inner chunks.
+        member_count: Ensemble members the planes were computed from, recorded in the
+            descriptor. ``0`` for a container that is not a member aggregate.
 
     Returns:
         The container bytes: payload, index, descriptor, trailer.
@@ -253,7 +263,9 @@ def encode_aggregate_shard(
                 buffer = _chunk_buffer(plane, row, col, layout)
                 payloads.append(compressor.encode(buffer.tobytes(order="C")))
 
-    return build_container_v2(payloads, descriptor=layout.to_descriptor())
+    return build_container_v2(
+        payloads, descriptor=layout.to_descriptor(member_count=member_count)
+    )
 
 
 #: A decoder used only to call ``decode``. A zstd frame is self-describing, so the decode

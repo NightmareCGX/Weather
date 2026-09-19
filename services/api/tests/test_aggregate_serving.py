@@ -40,7 +40,9 @@ def _bin_spec() -> AggregateSpec:
     return AggregateSpec(n_bins=16)
 
 
-def _encode(fields: np.ndarray, encoding_id: int = 1, level: int = 5) -> bytes:
+def _encode(
+    fields: np.ndarray, encoding_id: int = 1, level: int = 5, member_count: int = 0
+) -> bytes:
     """Mirror the writer's chunking from the shared format authority.
 
     Local to this suite because the API tier must not import the ingestion package; the
@@ -71,14 +73,23 @@ def _encode(fields: np.ndarray, encoding_id: int = 1, level: int = 5) -> bytes:
         grid_lon=GRID_LON,
         num_chunks=num_chunks,
         index_byte_size=num_chunks * 16,
+        member_count=member_count,
     )
     return build_container_v2(payloads, descriptor=descriptor)
 
 
-def _store_with(tmp_path, variable: str, members: np.ndarray) -> str:
+def _store_with(
+    tmp_path, variable: str, members: np.ndarray, *, member_count: int | None = None
+) -> str:
+    """Write an aggregate over ``members``; the descriptor records how many it came from.
+
+    ``member_count`` defaults to the member axis, which is what the ingestion writer records.
+    Passing ``None`` is not possible -- callers wanting an uncounted container pass 0.
+    """
     spec = spec_for(variable)
     fields = compute_aggregate(members, spec)
-    blob = _encode(fields)
+    counted = int(members.shape[0]) if member_count is None else member_count
+    blob = _encode(fields, member_count=counted)
     key = aggregate_shard_key(variable, LEAD)
     store = str(tmp_path)
     full = os.path.join(store, *key.split("/"))
@@ -416,3 +427,70 @@ def test_explicit_entry_point_accepts_a_reader(tmp_path) -> None:
         reader=AggregateShardReader(store),
     )
     assert isinstance(result, AggregatePointStatistics)
+
+
+# ---------------------------------------------------------------------------
+# The per-point member count, which an aggregate cannot derive from its statistics
+# ---------------------------------------------------------------------------
+
+
+def test_observed_point_reports_the_stored_member_count(tmp_path) -> None:
+    """The container's count is the API's per-point count wherever the point is observed."""
+    rng = np.random.default_rng(21)
+    members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    store = _store_with(tmp_path, "temperature_2m", members)
+
+    result = _fetch("temperature_2m", store, 5, 7)
+    assert result is not None
+    assert result.member_count == 30
+
+
+def test_an_incomplete_cell_reports_zero_members(tmp_path) -> None:
+    """A cell one member short of complete is unobserved, and says so.
+
+    ``compute_aggregate`` makes *every* field NaN at a cell where any member is NaN, and the
+    API defines ``member_count`` as the finite members at the point. 30 members collapsed into
+    statistics cannot report "29", so an unobserved cell reports 0 rather than a number the
+    container does not hold.
+    """
+    rng = np.random.default_rng(22)
+    members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    members[7, 5, 7] = np.nan
+    store = _store_with(tmp_path, "temperature_2m", members)
+
+    # The unobserved cell cannot answer at all -- there is no mean to serve -- so it falls
+    # through to the members, which is the honest answer.
+    assert _fetch("temperature_2m", store, 5, 7) is None
+    # A neighbouring observed cell still reports the full count.
+    observed = _fetch("temperature_2m", store, 5, 8)
+    assert observed is not None
+    assert observed.member_count == 30
+
+
+def test_uncounted_container_reports_no_member_count(tmp_path) -> None:
+    """A container with no recorded count reports ``None``, so a caller falls back.
+
+    Reporting 0 would be indistinguishable from "no members participated", which is a claim
+    about the data rather than about what the container holds.
+    """
+    rng = np.random.default_rng(23)
+    members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    store = _store_with(tmp_path, "temperature_2m", members, member_count=0)
+
+    result = _fetch("temperature_2m", store, 5, 7)
+    assert result is not None
+    assert result.member_count is None
+
+
+def test_member_count_does_not_need_a_re_read_of_the_container(tmp_path) -> None:
+    """The count rides in the descriptor, which the geometry read already fetched."""
+    from api.core.aggregate_reader import AggregateShardReader
+
+    rng = np.random.default_rng(24)
+    members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    store = _store_with(tmp_path, "temperature_2m", members)
+    reader = AggregateShardReader(store)
+    assert reader.member_count("temperature_2m", LEAD, observed=True) == 30
+    assert reader.member_count("temperature_2m", LEAD, observed=False) == 0
+    # An absent aggregate is "unknown", not zero.
+    assert reader.member_count("wind_gust", LEAD, observed=True) is None
