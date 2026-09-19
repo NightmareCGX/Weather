@@ -592,6 +592,12 @@ def _best_cpu_seconds(fn, iterations: int, rounds: int = 5) -> float:
     the machine. Both matter here: this suite runs alongside container builds and
     parallel CI jobs, and a single wall-clock measurement is routinely noisy
     enough to invert a genuine 3-5x difference.
+
+    ``iterations`` must be large enough that a run spans many clock ticks on the
+    host. ``GetProcessTimes`` on Windows advances in 15.625 ms steps, so a run
+    that measures ~0.125 s is only eight ticks wide and a single tick decides the
+    comparison -- measurably flaky, at roughly one inversion in five. Callers
+    pass enough iterations that the window is at least ~50 ticks.
     """
     best = float("inf")
     for _ in range(rounds):
@@ -617,11 +623,11 @@ def test_png_level_1_encode_performance_and_fidelity():
 
     t_lvl1 = _best_cpu_seconds(
         lambda: encode_rgba_png(raw_tile, width, height, compress_level=1),
-        iterations=20,
+        iterations=150,
     )
     t_lvl6 = _best_cpu_seconds(
         lambda: encode_rgba_png(raw_tile, width, height, compress_level=6),
-        iterations=20,
+        iterations=150,
     )
 
     # Level 1 must be strictly faster (typically 3-5x faster)
