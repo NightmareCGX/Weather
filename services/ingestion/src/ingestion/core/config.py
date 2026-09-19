@@ -231,9 +231,30 @@ class IngestionSettings(BaseSettings):
     # Advisory-lock acquisition timeout for the ingestion coordinator.
     ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
 
-    #: Primary storage format version for newly initialized forecast cycles ("sharded_v1" or "v2_unsharded").
+    #: Primary storage format version for newly initialized forecast cycles
+    #: ("sharded_v1" or "v2_unsharded").
     #: Defaults to "sharded_v1" (14 physical shard objects per region, 120 inner 100x100 chunks).
     STORAGE_FORMAT_VERSION: Any = "sharded_v1"
+
+    #: Whether ensemble members are written to the staging area so the aggregate pass can
+    #: replace them with statistic shards.
+    #:
+    #: Off by default and deliberately so: it begins writing staging objects that nothing yet
+    #: reads, which costs storage until the aggregate pass runs. It is the first half of the
+    #: aggregate path and is enabled per environment while that path is brought up.
+    ENSEMBLE_STAGING_ENABLED: bool = False
+
+    #: Prefix segment version of the staging namespace (see aggregate_staging.STAGING_VERSION).
+    #: Lets a staging layout change coexist with in-flight waves instead of requiring a quiesce.
+    ENSEMBLE_STAGING_VERSION: str = "v1"
+
+    #: Grid geometry the aggregate pass assumes, as (latitude, longitude, chunk_lat, chunk_lon).
+    #: The platform stores one grid today; these are configuration so the pass can refuse a
+    #: mismatch loudly rather than reshape a field silently.
+    ENSEMBLE_AGGREGATE_GRID_LAT: int = 721
+    ENSEMBLE_AGGREGATE_GRID_LON: int = 1440
+    ENSEMBLE_AGGREGATE_CHUNK_LAT: int = 100
+    ENSEMBLE_AGGREGATE_CHUNK_LON: int = 100
 
     #: Global physical object PUT concurrency for shard writes.
     GLOBAL_PUT_CONCURRENCY: Any = 64

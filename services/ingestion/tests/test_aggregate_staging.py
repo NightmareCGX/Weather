@@ -492,3 +492,177 @@ def test_quantile_aggregate_exceedance_survives_the_container_round_trip(tmp_pat
     assert abs(float(np.mean(from_container)) - float(np.mean(truth))) < 0.05
     # quantisation is the only difference, and it is one step of the scale
     assert np.allclose(from_container, from_memory, atol=0.02)
+
+
+# ---------------------------------------------------------------------------
+# Staging writes and the per-lead pass
+# ---------------------------------------------------------------------------
+
+
+def test_stage_region_writes_one_object_per_variable_and_matches_serving_bytes(tmp_path) -> None:
+    """A staged object must be byte-identical to the serving shard for the same data.
+
+    That equality is what makes the aggregate pass's equivalence property meaningful: it
+    computes from the same bytes a reader would see, not from a parallel encoder.
+    """
+    store = str(tmp_path)
+    plane = _planes(1, seed=30)[0]
+    dataset = xr.Dataset(
+        {
+            VARIABLE: (
+                ("lead_time_hours", "latitude", "longitude"),
+                plane[None],
+            )
+        }
+    )
+    written = staging.stage_region(dataset, store, member=1, lead_time_hours=LEAD)
+    assert written == [staging.staging_relative_key(VARIABLE, 1, LEAD)]
+
+    with open(os.path.join(store, *written[0].split("/")), "rb") as handle:
+        staged_bytes = handle.read()
+    serving_bytes = encode_region_sharded_v1(
+        dataset, member=1, lead_time_hours=LEAD
+    )[0][1]
+    assert staged_bytes == serving_bytes
+
+
+def test_stage_region_rejects_a_dataset_with_no_encodable_variable(tmp_path) -> None:
+    dataset = xr.Dataset({"scalar_only": (("lead_time_hours",), np.zeros(1, dtype=np.float32))})
+    with pytest.raises(staging.StagingError, match="nothing encoded"):
+        staging.stage_region(dataset, str(tmp_path), member=1, lead_time_hours=LEAD)
+
+
+def test_staged_objects_by_variable_groups_the_whole_root(tmp_path) -> None:
+    store = str(tmp_path)
+    _stage(store, _planes(2, seed=31), lead=LEAD)
+    other = str(tmp_path / "other.zarr")
+    os.makedirs(other)
+    for index, plane in enumerate(_planes(1, seed=32), start=1):
+        dataset = xr.Dataset(
+            {
+                "wind_gust": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    plane[None, None],
+                )
+            }
+        )
+        blob = encode_region_sharded_v1(dataset, member=index, lead_time_hours=LEAD)[0][1]
+        relative = staging.staging_relative_key("wind_gust", index, LEAD)
+        full = os.path.join(other, *relative.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(blob)
+
+    grouped = staging.staged_objects_by_variable(other)
+    assert set(grouped) == {"wind_gust"}
+    assert grouped["wind_gust"][(1, LEAD)].endswith("mem001_L0006.shard")
+
+
+def test_staged_objects_by_variable_rejects_an_object_without_a_variable() -> None:
+    """The staging namespace is owned entirely by the platform, so a stray key is an error."""
+    mapping: dict[str, bytes] = {
+        f"{staging.STAGING_ROOT}/{staging.STAGING_VERSION}/mem001_L0006.shard": b"x",
+        # a well-formed object so the enumeration reaches the malformed one
+        f"{staging.STAGING_ROOT}/{staging.STAGING_VERSION}/{VARIABLE}/"
+        "mem001_L0006.shard": b"x",
+    }
+    with pytest.raises(staging.StagingError, match="not under a variable segment"):
+        staging.staged_objects_by_variable(mapping)
+
+
+def test_aggregate_lead_all_variables_covers_every_staged_variable(tmp_path) -> None:
+    """One pass must aggregate both classes present at a lead, each with its own encoding."""
+    store = str(tmp_path)
+    _stage(store, _planes(3, seed=33), lead=LEAD)
+    gust_planes = _planes(3, seed=34)
+    for index, plane in enumerate(gust_planes, start=1):
+        dataset = xr.Dataset(
+            {
+                "wind_gust": (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    plane[None, None],
+                )
+            }
+        )
+        blob = encode_region_sharded_v1(dataset, member=index, lead_time_hours=LEAD)[0][1]
+        relative = staging.staging_relative_key("wind_gust", index, LEAD)
+        full = os.path.join(store, *relative.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(blob)
+
+    results = staging.aggregate_lead_all_variables(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    aggregated = {variable: key for variable, key, _count in results}
+    assert set(aggregated) == {VARIABLE, "wind_gust"}
+    assert aggregated[VARIABLE] == f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard"
+    assert aggregated["wind_gust"] == f"wind_gust/shard.agg_L{LEAD:04d}.shard"
+    assert all(count == 3 for _v, _k, count in results)
+    # both leads' staging is gone and both aggregates exist
+    assert staging.staged_objects_by_variable(store) == {}
+    for key in aggregated.values():
+        assert os.path.isfile(os.path.join(store, *key.split("/")))
+
+
+def test_aggregate_lead_all_variables_uses_the_per_variable_encoding(tmp_path) -> None:
+    """The pass must not apply one class's field set to another class's variable."""
+    from domain.aggregate import KIND_QUANTILE_FUNCTION, KIND_MEAN_STD_BINS
+    from domain.variable_class import spec_for
+
+    store = str(tmp_path)
+    _stage(store, _planes(2, seed=35), lead=LEAD)  # temperature_2m -> A
+    staging.aggregate_lead_all_variables(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+
+    # The written container's field count is recoverable from its descriptor, which is what
+    # tells a reader which encoding it holds without consulting the writer.
+    from domain.shard_format import parse_trailer, split_v2_tail
+    from ingestion.core.aggregate_writer import layout_from_descriptor
+
+    key = f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard"
+    with open(os.path.join(store, *key.split("/")), "rb") as handle:
+        container = handle.read()
+    trailer = parse_trailer(container[-12:])
+    _index, descriptor = split_v2_tail(
+        container[-(trailer.index_byte_size + 40 + 12) :], trailer.num_chunks
+    )
+    layout = layout_from_descriptor(descriptor)
+    assert spec_for(VARIABLE).kind == KIND_MEAN_STD_BINS
+    assert layout.n_fields == spec_for(VARIABLE).n_fields
+    assert spec_for("wind_gust").kind == KIND_QUANTILE_FUNCTION
+
+
+def test_aggregate_lead_all_variables_skips_an_unclassified_variable(tmp_path, caplog) -> None:
+    """A variable the platform does not classify must be skipped, not guessed at."""
+    store = str(tmp_path)
+    _stage(store, _planes(2, seed=36), lead=LEAD)
+    dataset = xr.Dataset(
+        {
+            "mystery_variable": (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                _planes(1, seed=37)[0][None, None],
+            )
+        }
+    )
+    blob = encode_region_sharded_v1(dataset, member=1, lead_time_hours=LEAD)[0][1]
+    relative = staging.staging_relative_key("mystery_variable", 1, LEAD)
+    full = os.path.join(store, *relative.split("/"))
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "wb") as handle:
+        handle.write(blob)
+
+    results = staging.aggregate_lead_all_variables(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    assert {variable for variable, _k, _c in results} == {VARIABLE}
+    # the unclassified variable's staging is left alone for a human to resolve
+    assert "mystery_variable" in staging.staged_objects_by_variable(store)
+
+
+def test_aggregate_lead_all_variables_rejects_a_lead_with_nothing_staged(tmp_path) -> None:
+    with pytest.raises(staging.StagingError, match="nothing staged for lead"):
+        staging.aggregate_lead_all_variables(
+            str(tmp_path), 99, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        )

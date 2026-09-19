@@ -36,6 +36,7 @@ from os import PathLike
 
 import numpy as np
 import numpy.typing as npt
+import xarray as xr
 from domain.aggregate import AggregateSpec, compute_aggregate
 from domain.shard_format import (
     SHARD_V1_MAGIC,
@@ -424,14 +425,184 @@ __all__ = [
     "StagingError",
     "aggregate_from_planes",
     "aggregate_layout_for",
+    "aggregate_lead_all_variables",
     "aggregate_staged_lead",
     "collect_member_planes",
     "member_plane_from_shard",
     "parse_staging_name",
     "staged_lead_keys",
     "staged_members_for_lead",
+    "stage_region",
     "staged_objects",
+    "staged_objects_by_variable",
     "staging_object_is_v1_container",
     "staging_prefix",
     "staging_relative_key",
 ]
+
+
+def stage_region(
+    dataset: xr.Dataset,
+    store: StoreRef,
+    *,
+    member: int,
+    lead_time_hours: int,
+    data_vars: Sequence[str] | None = None,
+) -> list[str]:
+    """Write one member region's variables into the staging area.
+
+    Reuses the member-shard encoder unchanged, so a staged object is byte-identical to the
+    serving shard for the same data. That equality is what makes the aggregate pass's
+    equivalence property meaningful: it computes from the same bytes a reader would see.
+
+    Must be called for every committed ensemble member region. The aggregate pass assumes the
+    invariant "a committed member has a staged member", and without it a lead could be
+    aggregated from a partial member set without anyone noticing.
+
+    Args:
+        dataset: The normalized single-lead, single-member dataset.
+        store: Store root.
+        member: Upstream member identity (``1..30``).
+        lead_time_hours: Forecast lead.
+        data_vars: Variables to stage; defaults to every data variable present.
+
+    Returns:
+        The staging keys written, in encoder order.
+
+    Raises:
+        StagingError: if the encoder produces no object, which would mean the dataset does
+            not carry the expected 2-D variables.
+    """
+    from ingestion.core.zarr_writer import encode_region_sharded_v1
+
+    encoded = encode_region_sharded_v1(
+        dataset, member=member, lead_time_hours=lead_time_hours, data_vars=data_vars
+    )
+    if not encoded:
+        raise StagingError(
+            f"nothing encoded for member {member} lead {lead_time_hours}h; "
+            "the dataset carries no 2-D variables"
+        )
+
+    io = StoreIO(store)
+    written: list[str] = []
+    for key, blob in encoded:
+        variable_code = key.split("/", 1)[0]
+        target = staging_relative_key(variable_code, member, lead_time_hours)
+        io.write(target, blob)
+        written.append(target)
+    return written
+
+
+def aggregate_lead_all_variables(
+    store: StoreRef,
+    lead_time_hours: int,
+    *,
+    variables: Sequence[str] | None = None,
+    grid_lat: int | None = None,
+    grid_lon: int | None = None,
+    chunk_lat: int = 100,
+    chunk_lon: int = 100,
+    drop_staging: bool = True,
+) -> list[tuple[str, str, int]]:
+    """Aggregate every classifiable variable staged for one lead.
+
+    The pass is per ``(variable, lead)`` and deliberately sequential: a lead's variables
+    aggregated concurrently would each hold a member stack, and 14 of those do not fit in the
+    container's memory budget. One at a time bounds residency at a single variable's stack.
+
+    Variables are aggregated in the order given, so the pass is reproducible and a partial
+    failure leaves an inspectable prefix rather than an arbitrary subset.
+
+    Args:
+        store: Store root.
+        lead_time_hours: Forecast lead to aggregate.
+        variables: Variables to consider; defaults to every variable with staging objects.
+        grid_lat: Grid latitude extent; defaults to the configured platform grid.
+        grid_lon: Grid longitude extent; defaults to the configured platform grid.
+        chunk_lat: Inner chunk latitude extent.
+        chunk_lon: Inner chunk longitude extent.
+        drop_staging: Remove each variable's staging objects once its aggregate is written.
+
+    Returns:
+        ``(variable, aggregate_key, member_count)`` per variable aggregated.
+
+    Raises:
+        StagingError: if nothing is staged for the lead at all, or a variable's geometry does
+            not match the configured grid. A variable with no staging is skipped: not every
+            lead carries every variable (the GEFS product omits the instantaneous
+            precipitation rate), and that is normal rather than an error.
+    """
+    from domain.variable_class import VariableClassError, spec_for
+    from ingestion.core.aggregate_writer import DEFAULT_CHUNK_LAT, DEFAULT_CHUNK_LON
+
+    resolved_grid_lat = grid_lat or _grid("ENSEMBLE_AGGREGATE_GRID_LAT", 721)
+    resolved_grid_lon = grid_lon or _grid("ENSEMBLE_AGGREGATE_GRID_LON", 1440)
+    resolved_chunk_lat = chunk_lat or _grid("ENSEMBLE_AGGREGATE_CHUNK_LAT", DEFAULT_CHUNK_LAT)
+    resolved_chunk_lon = chunk_lon or _grid("ENSEMBLE_AGGREGATE_CHUNK_LON", DEFAULT_CHUNK_LON)
+
+    staged = staged_objects_by_variable(store)
+    candidates = list(variables) if variables is not None else sorted(staged)
+    leads_present = {lead for by_lead in staged.values() for (_member, lead) in by_lead}
+    if lead_time_hours not in leads_present:
+        raise StagingError(f"nothing staged for lead {lead_time_hours}h")
+
+    results: list[tuple[str, str, int]] = []
+    for variable in candidates:
+        if lead_time_hours not in {lead for (_m, lead) in staged.get(variable, {})}:
+            continue
+        try:
+            spec = spec_for(variable)
+        except VariableClassError:
+            logger.debug(
+                "skipping unclassified variable %s at lead %d",
+                variable,
+                lead_time_hours,
+            )
+            continue
+        key, count = aggregate_staged_lead(
+            store,
+            variable,
+            lead_time_hours,
+            spec=spec,
+            grid_lat=resolved_grid_lat,
+            grid_lon=resolved_grid_lon,
+            chunk_lat=resolved_chunk_lat,
+            chunk_lon=resolved_chunk_lon,
+            drop_staging=drop_staging,
+        )
+        results.append((variable, key, count))
+    return results
+
+
+def staged_objects_by_variable(store: StoreRef) -> dict[str, dict[tuple[int, int], str]]:
+    """Map every variable present in the staging area to its ``(member, lead) -> key`` map.
+
+    Enumerates the staging root once. Staging is a namespace the platform owns entirely, so
+    an object under it that is not a staging key is an error rather than something to skip.
+    """
+    io = StoreIO(store)
+    prefix = f"{STAGING_ROOT}/{STAGING_VERSION}/"
+    by_variable: dict[str, dict[tuple[int, int], str]] = {}
+    for key in io.list_under(prefix):
+        if not key.endswith(".shard"):
+            continue
+        relative = key[len(prefix) :]
+        variable, separator, _name = relative.partition("/")
+        if not separator or not variable:
+            raise StagingError(
+                f"staging object {key!r} is not under a variable segment; the staging "
+                "namespace holds only objects this module wrote"
+            )
+        by_variable.setdefault(variable, {})[parse_staging_name(key)] = key
+    return by_variable
+
+
+def _grid(name: str, default: int) -> int:
+    """Read a geometry setting, falling back to the stored default."""
+    try:
+        from ingestion.core.config import settings
+
+        return int(getattr(settings, name, default))
+    except Exception:  # noqa: BLE001 - configuration must not break an offline call
+        return default
