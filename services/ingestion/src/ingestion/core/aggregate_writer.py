@@ -1,0 +1,331 @@
+"""Encoding of aggregate (statistic) shards into ``sharded_v2`` containers.
+
+An aggregate shard replaces the members of one ``(variable, lead)`` region with a small set
+of statistic field planes computed from the whole member set. The planes are laid out as a
+*virtual member axis*: container chunk ordinal ``k`` addresses ``field = k // chunks_per_field``
+with the same row-major ``(row, col)`` split the member shards use. That keeps the reader's
+addressing identical to the existing path -- it asks for a chunk by ``(field, row, col)``
+instead of by ``(member, row, col)`` -- and it keeps random access at one chunk, so a point
+query still fetches a single compressed chunk rather than a whole plane.
+
+Nothing here chooses *which* statistics to store; that is
+:mod:`domain.aggregate`'s job. This module is only the container plumbing.
+"""
+
+from __future__ import annotations
+
+import struct
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
+import numpy as np
+import numpy.typing as npt
+from numcodecs import Zstd  # type: ignore[import-untyped]
+
+from domain.aggregate import AggregateSpec
+from domain.shard_format import (
+    DESCRIPTOR_SIZE,
+    ENCODING_F32,
+    INDEX_ENTRY_SIZE,
+    SHARD_V2_MAGIC,
+    TRAILER_SIZE,
+    ShardDescriptor,
+    build_container_v2,
+    parse_index,
+    split_v2_tail,
+)
+
+#: Inner chunk geometry. Matches the member-shard chunking so the two layouts share the
+#: reader's geometry handling and the same read-amplification behaviour.
+DEFAULT_CHUNK_LAT: int = 100
+DEFAULT_CHUNK_LON: int = 100
+
+#: Compression level for the inner chunks.
+#:
+#: Level 5 is the measured choice: the ramp from 5 to 7 is small here and 9-12 are worse on
+#: this data, while 19 costs hours per cycle. Changing it is a container-wide decision, not a
+#: local one -- a reader must know the level to decode, and it does not record it.
+DEFAULT_ZSTD_LEVEL: int = 5
+
+#: Suffix of an aggregate shard object, following the shard key grammar.
+AGGREGATE_SHARD_SUFFIX: str = "shard.agg"
+
+
+class AggregateWriterError(ValueError):
+    """Raised when aggregate planes cannot be encoded into a container."""
+
+
+@dataclass(frozen=True)
+class AggregateShardLayout:
+    """Geometry of one aggregate shard container, derivable from the descriptor.
+
+    Attributes:
+        n_fields: Number of statistic planes.
+        grid_lat: Full grid latitude extent.
+        grid_lon: Full grid longitude extent.
+        chunk_lat: Inner chunk latitude extent.
+        chunk_lon: Inner chunk longitude extent.
+    """
+
+    n_fields: int
+    grid_lat: int
+    grid_lon: int
+    chunk_lat: int = DEFAULT_CHUNK_LAT
+    chunk_lon: int = DEFAULT_CHUNK_LON
+
+    def __post_init__(self) -> None:
+        if self.n_fields < 1:
+            raise AggregateWriterError(f"n_fields must be positive, got {self.n_fields}")
+        for name in ("grid_lat", "grid_lon", "chunk_lat", "chunk_lon"):
+            if getattr(self, name) < 1:
+                raise AggregateWriterError(f"{name} must be positive, got {getattr(self, name)}")
+
+    @property
+    def lat_chunks(self) -> int:
+        """Number of chunks along latitude."""
+        return -(-self.grid_lat // self.chunk_lat)
+
+    @property
+    def lon_chunks(self) -> int:
+        """Number of chunks along longitude."""
+        return -(-self.grid_lon // self.chunk_lon)
+
+    @property
+    def chunks_per_field(self) -> int:
+        """Number of chunks in one field plane."""
+        return self.lat_chunks * self.lon_chunks
+
+    @property
+    def num_chunks(self) -> int:
+        """Total chunk count across every field plane."""
+        return self.n_fields * self.chunks_per_field
+
+    def chunk_ordinal(self, field: int, row: int, col: int) -> int:
+        """Container chunk ordinal for ``(field, row, col)``, or ``-1`` when off-grid."""
+        if not (0 <= field < self.n_fields):
+            return -1
+        if not (0 <= row < self.lat_chunks and 0 <= col < self.lon_chunks):
+            return -1
+        return field * self.chunks_per_field + row * self.lon_chunks + col
+
+    def locate(self, ordinal: int) -> tuple[int, int, int]:
+        """Inverse of :func:`chunk_ordinal`.
+
+        Raises:
+            AggregateWriterError: if ``ordinal`` is outside the container.
+        """
+        if not (0 <= ordinal < self.num_chunks):
+            raise AggregateWriterError(
+                f"chunk ordinal {ordinal} outside 0..{self.num_chunks - 1}"
+            )
+        field, within = divmod(ordinal, self.chunks_per_field)
+        row, col = divmod(within, self.lon_chunks)
+        return field, row, col
+
+    def to_descriptor(self) -> ShardDescriptor:
+        """Build the container descriptor for this layout."""
+        return ShardDescriptor(
+            encoding_id=ENCODING_F32,
+            scale=1.0,
+            chunk_lat=self.chunk_lat,
+            chunk_lon=self.chunk_lon,
+            grid_lat=self.grid_lat,
+            grid_lon=self.grid_lon,
+            num_chunks=self.num_chunks,
+            index_byte_size=self.num_chunks * INDEX_ENTRY_SIZE,
+        )
+
+
+def layout_from_descriptor(descriptor: ShardDescriptor) -> AggregateShardLayout:
+    """Recover the layout a reader needs from a container descriptor alone.
+
+    Derived rather than passed in: a reader opening a store it did not write must not assume
+    the field count or the grid, which is exactly what the descriptor exists to remove.
+    """
+    lat_chunks, lon_chunks = descriptor.expected_shape()
+    chunks_per_field = lat_chunks * lon_chunks
+    if chunks_per_field == 0:
+        raise AggregateWriterError("descriptor geometry yields zero chunks per field")
+    if descriptor.num_chunks % chunks_per_field:
+        raise AggregateWriterError(
+            f"descriptor num_chunks {descriptor.num_chunks} is not a multiple of "
+            f"{chunks_per_field} chunks per field"
+        )
+    return AggregateShardLayout(
+        n_fields=descriptor.num_chunks // chunks_per_field,
+        grid_lat=descriptor.grid_lat,
+        grid_lon=descriptor.grid_lon,
+        chunk_lat=descriptor.chunk_lat,
+        chunk_lon=descriptor.chunk_lon,
+    )
+
+
+def _chunk_buffer(
+    plane: npt.NDArray[np.float32],
+    row: int,
+    col: int,
+    layout: AggregateShardLayout,
+) -> npt.NDArray[np.float32]:
+    """Extract one NaN-padded chunk buffer from a plane.
+
+    Edge chunks are padded to the full chunk extent, matching the member-shard writer, so
+    every chunk in a container has the same byte length before compression.
+    """
+    buffer = np.full((layout.chunk_lat, layout.chunk_lon), np.nan, dtype=np.float32)
+    r0, c0 = row * layout.chunk_lat, col * layout.chunk_lon
+    r1 = min(r0 + layout.chunk_lat, plane.shape[0])
+    c1 = min(c0 + layout.chunk_lon, plane.shape[1])
+    if r1 > r0 and c1 > c0:
+        buffer[: r1 - r0, : c1 - c0] = plane[r0:r1, c0:c1]
+    return buffer
+
+
+def encode_aggregate_shard(
+    planes: Sequence[npt.NDArray[np.float32]],
+    layout: AggregateShardLayout,
+    *,
+    level: int = DEFAULT_ZSTD_LEVEL,
+) -> bytes:
+    """Encode statistic planes into a single ``sharded_v2`` container.
+
+    Args:
+        planes: One ``(lat, lon)`` float32 plane per field, in storage order.
+        layout: Geometry; ``n_fields`` must equal ``len(planes)``.
+        level: Zstd level for the inner chunks.
+
+    Returns:
+        The container bytes: payload, index, descriptor, trailer.
+
+    Raises:
+        AggregateWriterError: if the plane count or shapes disagree with the layout.
+    """
+    if len(planes) != layout.n_fields:
+        raise AggregateWriterError(
+            f"{len(planes)} planes but layout declares {layout.n_fields} fields"
+        )
+    compressor = Zstd(level=level)
+    payloads: list[bytes] = []
+    for field, plane in enumerate(planes):
+        if plane.shape != (layout.grid_lat, layout.grid_lon):
+            raise AggregateWriterError(
+                f"field {field} has shape {plane.shape}, expected "
+                f"{(layout.grid_lat, layout.grid_lon)}"
+            )
+        for row in range(layout.lat_chunks):
+            for col in range(layout.lon_chunks):
+                buffer = _chunk_buffer(plane, row, col, layout)
+                payloads.append(compressor.encode(buffer.tobytes(order="C")))
+
+    return build_container_v2(payloads, descriptor=layout.to_descriptor())
+
+
+def decode_aggregate_chunk(
+    container: bytes,
+    ordinal: int,
+    *,
+    level: int = DEFAULT_ZSTD_LEVEL,
+) -> npt.NDArray[np.float32]:
+    """Decode one chunk from an aggregate container by its ordinal.
+
+    Args:
+        container: The full container bytes.
+        ordinal: Row-major chunk ordinal across all field planes.
+        level: Zstd level the container was written with. The format does not record it,
+            so writer and reader must agree out of band; this is a known gap in the current
+            container generation.
+
+    Raises:
+        AggregateWriterError: if the container is malformed or the ordinal is off-grid.
+    """
+    if len(container) < TRAILER_SIZE + DESCRIPTOR_SIZE:
+        raise AggregateWriterError(f"container too short: {len(container)} bytes")
+    num_chunks, index_byte_size, magic = struct.unpack("<III", container[-TRAILER_SIZE:])
+    if magic != SHARD_V2_MAGIC:
+        raise AggregateWriterError(
+            f"not a sharded_v2 container (magic 0x{magic:08x})"
+        )
+    tail_start = len(container) - (index_byte_size + DESCRIPTOR_SIZE + TRAILER_SIZE)
+    if tail_start < 0:
+        raise AggregateWriterError("declared index size exceeds the container length")
+    index_bytes, descriptor = split_v2_tail(container[tail_start:], num_chunks)
+    layout = layout_from_descriptor(descriptor)
+
+    _, row, col = layout.locate(ordinal)
+    entries = parse_index(index_bytes, num_chunks)
+    offset, length = entries[ordinal]
+    if length == 0:
+        return np.full((layout.chunk_lat, layout.chunk_lon), np.nan, dtype=np.float32)
+    raw = Zstd(level=level).decode(container[offset : offset + length])
+    return (
+        np.frombuffer(raw, dtype=np.float32)
+        .reshape(layout.chunk_lat, layout.chunk_lon)
+        .copy()
+    )
+
+
+def chunk_ordinals_for_field(
+    layout: AggregateShardLayout, field: int
+) -> range:
+    """Chunk ordinals covering one field plane, in row-major order.
+
+    Raises:
+        AggregateWriterError: if ``field`` is outside the layout.
+    """
+    if not (0 <= field < layout.n_fields):
+        raise AggregateWriterError(
+            f"field {field} outside 0..{layout.n_fields - 1}"
+        )
+    start = field * layout.chunks_per_field
+    return range(start, start + layout.chunks_per_field)
+
+
+def layout_for_spec(
+    spec: AggregateSpec,
+    *,
+    grid_lat: int,
+    grid_lon: int,
+    chunk_lat: int = DEFAULT_CHUNK_LAT,
+    chunk_lon: int = DEFAULT_CHUNK_LON,
+) -> AggregateShardLayout:
+    """Build the layout for a given aggregate spec and grid."""
+    return AggregateShardLayout(
+        n_fields=spec.n_fields,
+        grid_lat=grid_lat,
+        grid_lon=grid_lon,
+        chunk_lat=chunk_lat,
+        chunk_lon=chunk_lon,
+    )
+
+
+def aggregate_store_relative_key(variable_code: str, lead_time_hours: int) -> str:
+    """Store-relative key of an aggregate shard object.
+
+    Shaped like the member keys so the lifecycle's key grammar and the store inventory need
+    no special case; the kind token is ``agg``.
+    """
+    return f"{variable_code}/shard.agg_L{lead_time_hours:04d}.shard"
+
+
+def field_metadata(
+    spec: AggregateSpec,
+    layout: AggregateShardLayout,
+) -> Mapping[str, object]:
+    """Reader-facing description of an aggregate shard's contents.
+
+    Persisted alongside the container so a reader can interpret it without re-deriving the
+    spec, and so a spec change is visible in the store rather than implied by the writer.
+    """
+    return {
+        "kind": spec.kind,
+        "n_fields": spec.n_fields,
+        "n_bins": spec.n_bins,
+        "sigma_range": spec.sigma_range,
+        "field_names": list(spec.field_names),
+        "field_scales": list(spec.field_scales),
+        "chunk_lat": layout.chunk_lat,
+        "chunk_lon": layout.chunk_lon,
+        "grid_lat": layout.grid_lat,
+        "grid_lon": layout.grid_lon,
+        "chunks_per_field": layout.chunks_per_field,
+        "container_format": "sharded_v2",
+    }
