@@ -18,6 +18,13 @@ Two modes:
       container from the bind-mounted ``uv.lock`` and runs the given scope there. This is
       the CI-equivalent run; it needs network access on first use.
 
+  python scripts/check_validation_env.py --deep --scope packages/domain
+      A scope that holds its own ``pyproject.toml`` is run from inside that directory, the
+      way its CI job does (``working-directory: packages/domain``; ``--directory
+      services/api``). Running such a scope from the repository root would apply the root
+      ``rootdir`` and silently drop the package's own gates -- notably the domain
+      package's 100% coverage floor.
+
 Every line is ``PASS``, ``FAIL`` or ``SKIP`` with a reason, and any ``FAIL`` exits non-zero.
 A ``SKIP`` never counts as a pass.
 """
@@ -141,6 +148,20 @@ def check_linux_preflight() -> tuple[list[tuple[str, str, str]], bool]:
     return rows, not missing and code == 0
 
 
+def _scope_invocation(scope: str) -> tuple[str, list[str]]:
+    """Return the container cwd and pytest argv tail for ``scope``.
+
+    A scope is a path relative to the repository root. When that directory carries its own
+    ``pyproject.toml`` (and therefore its own pytest configuration) the scope is run from
+    inside it with no path argument -- running it from the root instead would apply the
+    root ``rootdir`` and drop the package's gates. Otherwise the scope is run from the
+    root with itself as the target.
+    """
+    if (REPO_ROOT / scope / "pyproject.toml").is_file():
+        return f"/repo/{scope}", []
+    return "/repo", [scope]
+
+
 def run_linux_scope(scope: str, test_args: list[str]) -> list[tuple[str, str, str]]:
     """Build a Linux venv from the mounted lock and run ``scope`` inside the container."""
     # uv is copied in from the official image so the container needs no distro packages.
@@ -148,25 +169,38 @@ def run_linux_scope(scope: str, test_args: list[str]) -> list[tuple[str, str, st
     # into python:3.12-slim instead, matching the runtime the service images use.
     # uv writes the environment to /opt/venv (UV_PROJECT_ENVIRONMENT), never into the
     # read-only mounted repo, and --frozen forbids touching uv.lock.
+    cwd, argv_tail = _scope_invocation(scope)
     script = (
         "set -e; "
         "pip install --quiet --disable-pip-version-check "
         f"'uv=={UV_VERSION}'; "
         "cd /repo; "
         "export UV_PROJECT_ENVIRONMENT=/opt/venv; "
+        # Both caches write into the directory pytest was launched from, which is mounted
+        # read-only; redirect coverage out and disable the cache plugin.
+        "export COVERAGE_FILE=/tmp/.coverage; "
         "uv sync --all-packages --frozen --no-progress; "
-        f"/opt/venv/bin/python -m pytest {scope} -q {' '.join(test_args)}"
+        f"cd {cwd}; "
+        "/opt/venv/bin/python -m pytest -q -p no:cacheprovider "
+        f"{' '.join(argv_tail)} {' '.join(test_args)}"
     )
     cmd = ["docker", "run", "--rm"]
     cmd += _mount_args()
     cmd += ["--workdir", "/repo", CONTAINER_IMAGE, "sh", "-c", script]
     code, out = _run(cmd, timeout=1800)
     if code == 0:
-        # pytest -q ends with its summary line; surface that, not the resolver noise.
-        summary = [ln for ln in out.splitlines() if " passed" in ln or " failed" in ln]
+        # pytest -q ends with a summary line of the form "N passed, M skipped in Xs". Match on
+        # that shape rather than on the words, because the resolver's dependency listing can
+        # also contain them.
+        summary = [
+            ln.strip()
+            for ln in out.splitlines()
+            if ln.strip().split(" ")[0].isdigit()
+            and ("passed" in ln or "failed" in ln or "error" in ln)
+        ]
         detail = summary[-1] if summary else "ok"
     else:
-        detail = "\n".join(out.splitlines()[-12:])
+        detail = "\n".join(out.splitlines()[-15:])
     return [(f"Linux: pytest {scope}", "PASS" if code == 0 else "FAIL", detail)]
 
 
