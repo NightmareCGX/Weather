@@ -283,6 +283,27 @@ def test_aggregate_key_follows_the_shard_key_grammar() -> None:
     assert AGGREGATE_SHARD_SUFFIX in key
 
 
+def test_field_metadata_records_only_the_parameters_that_apply() -> None:
+    """A bin parameter on a quantile shard would be a field a reader could mistrust."""
+    from domain.aggregate import KIND_QUANTILE_FUNCTION
+
+    bins_spec = AggregateSpec(n_bins=8)
+    bins_layout = layout_for_spec(bins_spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
+    bins_meta = field_metadata(bins_spec, bins_layout)
+    assert bins_meta["n_bins"] == 8
+    assert bins_meta["sigma_range"] == bins_spec.sigma_range
+    assert "levels" not in bins_meta
+
+    quantile_spec = AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
+    quantile_layout = layout_for_spec(
+        quantile_spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    quantile_meta = field_metadata(quantile_spec, quantile_layout)
+    assert quantile_meta["levels"] == list(quantile_spec.levels)
+    assert "n_bins" not in quantile_meta
+    assert "sigma_range" not in quantile_meta
+
+
 def test_field_metadata_describes_the_spec_and_layout_completely() -> None:
     """A reader must be able to interpret the container from the recorded metadata."""
     spec = AggregateSpec(n_bins=8)

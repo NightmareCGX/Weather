@@ -13,8 +13,12 @@ import pytest
 from domain.aggregate import (
     BIN_SCALE,
     DEFAULT_N_BINS,
+    DEFAULT_QUANTILE_LEVELS,
+    KIND_MEAN_STD_BINS,
+    KIND_QUANTILE_FUNCTION,
     MEAN_SCALE,
     NAN_SENTINEL,
+    QUANTILE_SCALE,
     STD_SCALE,
     AggregateError,
     AggregateSpec,
@@ -24,6 +28,7 @@ from domain.aggregate import (
     dequantise_field,
     encode_aggregate,
     exceedance_from_bins,
+    exceedance_from_quantiles,
     quantise_field,
 )
 
@@ -326,3 +331,230 @@ def test_exceedance_from_bins_rejects_a_wrong_bin_count() -> None:
     spec, _stack, fields = _fields_with_shapes()
     with pytest.raises(AggregateError, match="expected 32 bins"):
         exceedance_from_bins(fields[0], fields[1], fields[2:-1], 0.0, spec)
+
+
+# ---------------------------------------------------------------------------
+# Quantile-function encoding (the B/C classes)
+# ---------------------------------------------------------------------------
+
+
+def _quantile_spec(n_levels: int | None = None) -> AggregateSpec:
+    if n_levels is None:
+        return AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
+    return AggregateSpec(
+        kind=KIND_QUANTILE_FUNCTION, levels=DEFAULT_QUANTILE_LEVELS[:n_levels]
+    )
+
+
+def _skewed_members(seed: int = 0, n: int = N_MEMBERS) -> np.ndarray:
+    """Members drawn from a zero-inflated heavy-tailed field, i.e. a B/C-class variable."""
+    rng = np.random.default_rng(seed)
+    base = rng.gamma(0.4, 2.0, (LAT, LON)).astype(np.float32)
+    return np.stack([base + rng.gamma(0.4, 2.0, (LAT, LON)) for _ in range(n)]).astype(
+        np.float32
+    )
+
+
+def test_approved_quantile_level_count_is_nineteen() -> None:
+    """19 body-dense levels is the measured optimum; a silent change moves every store.
+
+    17 levels left a reconstruction error of 0.200 at the finest precipitation threshold,
+    and 26 levels were *worse* than 19 because a 30-member sample quantile function cannot
+    resolve a denser grid.
+    """
+    assert len(DEFAULT_QUANTILE_LEVELS) == 19
+    spec = _quantile_spec()
+    assert spec.n_fields == 19
+    assert spec.field_scales == (QUANTILE_SCALE,) * 19
+
+
+def test_quantile_spec_levels_are_strictly_increasing_within_the_open_unit_interval() -> None:
+    levels = _quantile_spec().quantile_levels()
+    assert all(0.0 < level < 1.0 for level in levels)
+    assert list(levels) == sorted(levels)
+    assert len(set(levels)) == len(levels)
+
+
+def test_quantile_spec_field_names_carry_the_level() -> None:
+    """A reader must be able to interpret a plane without re-deriving the spec."""
+    names = _quantile_spec(n_levels=3).field_names
+    assert names == ("Q001", "Q005", "Q020")
+
+
+def test_spec_rejects_mismatched_parameters_between_kinds() -> None:
+    """A bin parameter on a quantile spec means the class was mis-specified."""
+    with pytest.raises(AggregateError, match="unknown aggregate kind"):
+        AggregateSpec(kind="not_a_kind")
+    with pytest.raises(AggregateError, match="levels apply to the quantile_function kind only"):
+        AggregateSpec(kind=KIND_MEAN_STD_BINS, levels=(0.5,))
+    with pytest.raises(AggregateError, match="requires at least one level"):
+        AggregateSpec(kind=KIND_QUANTILE_FUNCTION, levels=())
+    with pytest.raises(AggregateError, match="strictly between 0 and 1"):
+        AggregateSpec(kind=KIND_QUANTILE_FUNCTION, levels=(0.0, 0.5))
+    with pytest.raises(AggregateError, match="strictly increasing"):
+        AggregateSpec(kind=KIND_QUANTILE_FUNCTION, levels=(0.5, 0.5))
+    with pytest.raises(AggregateError, match="has no bin edges"):
+        _quantile_spec().bin_edges()
+    with pytest.raises(AggregateError, match="has no quantile levels"):
+        _spec().quantile_levels()
+
+
+def test_quantile_encoding_matches_the_reference_bit_for_bit() -> None:
+    """Pin the sample-quantile convention: one sort, interpolate at ``p * (n - 1)``.
+
+    A reader that interpolates between two stored levels with a different convention from
+    the writer's sampling would disagree at the scale of a single member step.
+    """
+    stack = _skewed_members(seed=1)
+    spec = _quantile_spec()
+
+    ordered = np.sort(np.where(np.isnan(stack), np.inf, stack), axis=0)
+    last = N_MEMBERS - 1
+    expected = np.stack(
+        [
+            (
+                ordered[int(np.floor(level * last))]
+                * (1 - (level * last - int(np.floor(level * last))))
+                + ordered[min(int(np.floor(level * last)) + 1, last)]
+                * (level * last - int(np.floor(level * last)))
+            ).astype(np.float32)
+            for level in DEFAULT_QUANTILE_LEVELS
+        ]
+    )
+    assert np.array_equal(compute_aggregate(stack, spec), expected)
+
+
+def test_quantile_planes_are_monotone_per_cell() -> None:
+    """An inverse CDF cannot decrease as the level rises."""
+    fields = compute_aggregate(_skewed_members(seed=2), _quantile_spec())
+    assert (np.diff(fields, axis=0) >= -1e-6).all()
+
+
+def test_quantile_encoding_handles_a_constant_cell() -> None:
+    """Every member identical collapses the interpolation span; it must not divide by zero."""
+    stack = np.full((N_MEMBERS, LAT, LON), 3.5, dtype=np.float32)
+    fields = compute_aggregate(stack, _quantile_spec())
+    assert np.isfinite(fields).all()
+    assert np.allclose(fields, 3.5)
+
+
+def test_quantile_encoding_propagates_nan_for_an_incomplete_cell() -> None:
+    """A partially observed cell has no quantile function, so every level must be NaN.
+
+    Without the explicit guard the sorted axis would carry ``inf`` for the missing members
+    and the upper levels would come back finite -- a plausible-looking but fabricated tail.
+    """
+    stack = _skewed_members(seed=3)
+    stack[0, 0, 0] = np.nan
+    fields = compute_aggregate(stack, _quantile_spec())
+    assert np.all(np.isnan(fields[:, 0, 0]))
+    assert np.isfinite(fields[:, 1, 1]).all()
+
+
+def test_quantile_encoding_round_trips_through_quantisation() -> None:
+    spec = _quantile_spec()
+    fields = compute_aggregate(_skewed_members(seed=4), spec)
+    planes = encode_aggregate(fields, spec)
+    assert len(planes) == spec.n_fields
+    back = decode_aggregate(planes, spec)
+    assert np.allclose(back, fields, atol=QUANTILE_SCALE / 2)
+
+
+def test_quantile_encoding_refuses_a_clipping_scale() -> None:
+    """A wind gust in km/h approaches the +-327.67 the scale covers, and clipping is silent.
+
+    The clipped field would quantise to fewer distinct values and therefore compress
+    *better*, so a range overflow must be a hard failure rather than a warning.
+    """
+    spec = _quantile_spec()
+    fields = compute_aggregate(_skewed_members(seed=5), spec).copy()
+    fields[0, 0, 0] = 400.0
+    with pytest.raises(AggregateError, match="would clip"):
+        encode_aggregate(fields, spec)
+
+
+def test_exceedance_from_quantiles_tracks_the_ensemble() -> None:
+    """The quantile encoding must answer a threshold the store was never told about."""
+    stack = _skewed_members(seed=6)
+    spec = _quantile_spec()
+    values = compute_aggregate(stack, spec)
+
+    for percentile in (50.0, 90.0, 99.0):
+        threshold = float(np.percentile(stack, percentile))
+        estimated = exceedance_from_quantiles(values, spec.quantile_levels(), threshold)
+        truth = np.mean(stack > threshold, axis=0)
+        assert abs(float(np.mean(estimated)) - float(np.mean(truth))) < 0.05
+
+
+def test_exceedance_from_quantiles_is_monotone_in_the_threshold() -> None:
+    spec = _quantile_spec()
+    values = compute_aggregate(_skewed_members(seed=7), spec)
+    levels = spec.quantile_levels()
+    low = exceedance_from_quantiles(values, levels, 0.5)
+    mid = exceedance_from_quantiles(values, levels, 2.0)
+    high = exceedance_from_quantiles(values, levels, 8.0)
+    assert (low >= mid - 1e-6).all()
+    assert (mid >= high - 1e-6).all()
+
+
+def test_exceedance_from_quantiles_saturates_at_the_stored_extremes() -> None:
+    """The encoding cannot express probabilities beyond its outermost levels.
+
+    Below the lowest level the answer is ``1 - min(level)`` and above the highest it is
+    ``1 - max(level)`` -- not 0 and 1. That is a property of storing a finite level set, and
+    it is harmless here because the extremes (0.001/0.999) are already far finer than a
+    30-member ensemble can resolve (1/30), which is the real floor.
+    """
+    spec = _quantile_spec()
+    values = compute_aggregate(_skewed_members(seed=8), spec)
+    levels = spec.quantile_levels()
+
+    below = exceedance_from_quantiles(values, levels, -1e6)
+    above = exceedance_from_quantiles(values, levels, 1e6)
+    assert np.allclose(below, 1.0 - levels[0])
+    assert np.allclose(above, 1.0 - levels[-1])
+    # the encoder cannot express anything rarer than a 30-member sample can resolve
+    assert levels[0] < 1.0 / N_MEMBERS
+    assert (1.0 - levels[-1]) < 1.0 / N_MEMBERS
+
+
+def test_exceedance_from_quantiles_is_exact_at_a_stored_level() -> None:
+    """At a stored level the CDF is known exactly, so the answer is ``1 - level``."""
+    spec = _quantile_spec()
+    values = compute_aggregate(_skewed_members(seed=9), spec)
+    levels = spec.quantile_levels()
+
+    for index in (0, len(levels) // 2, len(levels) - 1):
+        threshold = float(values[index][0, 0])
+        estimated = exceedance_from_quantiles(values, levels, threshold)
+        assert abs(float(estimated[0, 0]) - (1.0 - levels[index])) < 1e-5
+
+
+def test_exceedance_from_quantiles_handles_a_degenerate_segment() -> None:
+    """Two levels with the same value carry no position information; must not divide by zero."""
+    spec = _quantile_spec(n_levels=3)
+    values = np.zeros((3, LAT, LON), dtype=np.float32)
+    result = exceedance_from_quantiles(values, spec.quantile_levels(), 0.0)
+    assert np.isfinite(result).all()
+
+
+def test_exceedance_from_quantiles_rejects_bad_input() -> None:
+    spec = _quantile_spec()
+    values = compute_aggregate(_skewed_members(seed=10), spec)
+    with pytest.raises(AggregateError, match="at least two planes"):
+        exceedance_from_quantiles(values[0], (0.5,), 1.0)
+    with pytest.raises(AggregateError, match="planes but"):
+        exceedance_from_quantiles(values[:3], spec.quantile_levels(), 1.0)
+    with pytest.raises(AggregateError, match="strictly increasing"):
+        exceedance_from_quantiles(values, (0.5, 0.5, *spec.quantile_levels()[2:]), 1.0)
+
+
+def test_quantile_encoding_handles_a_single_member() -> None:
+    """With one member every level is that member's value.
+
+    The interpolation span collapses (there is no upper neighbour), which is a real case:
+    an aggregate may be computed from a degenerate set when a wave is repaired.
+    """
+    stack = np.full((1, LAT, LON), 7.25, dtype=np.float32)
+    fields = compute_aggregate(stack, _quantile_spec())
+    assert np.allclose(fields, 7.25)

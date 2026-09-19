@@ -420,3 +420,75 @@ def test_aggregate_is_bit_identical_across_a_recompute(tmp_path) -> None:
 def test_v1_magic_is_the_expected_container_generation() -> None:
     """Guards against a staging object being written by the v2 path by mistake."""
     assert SHARD_V1_MAGIC == 0x53484152
+
+
+def _quantile_spec() -> AggregateSpec:
+    from domain.aggregate import KIND_QUANTILE_FUNCTION
+
+    return AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
+
+
+def test_quantile_aggregate_from_staging_equals_a_direct_computation(tmp_path) -> None:
+    """The B/C-class encoding must hold up through the same chain as the A-class one.
+
+    The two encodings differ in field count and in what each plane means, so equivalence has
+    to be re-established for this kind rather than inferred from the other.
+    """
+    store = str(tmp_path)
+    spec = _quantile_spec()
+    planes = _planes(4, seed=20)
+    _stage(store, planes)
+
+    key, member_count = staging.aggregate_staged_lead(
+        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    assert member_count == len(planes)
+    with open(os.path.join(store, *key.split("/")), "rb") as handle:
+        container = handle.read()
+
+    expected_fields = compute_aggregate(np.stack(planes), spec)
+    layout = layout_for_spec(spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
+    assert layout.n_fields == len(spec.levels) == 19
+
+    for ordinal in range(layout.num_chunks):
+        field, row, col = layout.locate(ordinal)
+        r0, c0 = row * CHUNK, col * CHUNK
+        r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
+        expected = np.full((CHUNK, CHUNK), np.nan, dtype=np.float32)
+        expected[: r1 - r0, : c1 - c0] = expected_fields[field][r0:r1, c0:c1]
+        assert _identical_allow_nan(decode_aggregate_chunk(container, ordinal), expected), ordinal
+
+
+def test_quantile_aggregate_exceedance_survives_the_container_round_trip(tmp_path) -> None:
+    """The published aggregate must answer a threshold as well as the in-memory fields do."""
+    from domain.aggregate import exceedance_from_quantiles
+
+    store = str(tmp_path)
+    spec = _quantile_spec()
+    planes = _planes(6, seed=21)
+    _stage(store, planes)
+    key, _ = staging.aggregate_staged_lead(
+        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    with open(os.path.join(store, *key.split("/")), "rb") as handle:
+        container = handle.read()
+
+    layout = layout_for_spec(spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
+    # Reassemble the levels from the published container, chunk by chunk.
+    levels = np.full((layout.n_fields, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
+    for ordinal in range(layout.num_chunks):
+        field, row, col = layout.locate(ordinal)
+        chunk = decode_aggregate_chunk(container, ordinal)
+        r0, c0 = row * CHUNK, col * CHUNK
+        r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
+        levels[field, r0:r1, c0:c1] = chunk[: r1 - r0, : c1 - c0]
+
+    threshold = float(np.percentile(np.stack(planes), 90.0))
+    from_container = exceedance_from_quantiles(levels, spec.levels, threshold)
+    from_memory = exceedance_from_quantiles(
+        compute_aggregate(np.stack(planes), spec), spec.levels, threshold
+    )
+    truth = np.mean(np.stack(planes) > threshold, axis=0)
+    assert abs(float(np.mean(from_container)) - float(np.mean(truth))) < 0.05
+    # quantisation is the only difference, and it is one step of the scale
+    assert np.allclose(from_container, from_memory, atol=0.02)

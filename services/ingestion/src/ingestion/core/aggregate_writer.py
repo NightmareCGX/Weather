@@ -22,7 +22,7 @@ import numpy as np
 import numpy.typing as npt
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
-from domain.aggregate import AggregateSpec
+from domain.aggregate import KIND_MEAN_STD_BINS, AggregateSpec
 from domain.shard_format import (
     DESCRIPTOR_SIZE,
     ENCODING_F32,
@@ -315,12 +315,13 @@ def field_metadata(
 
     Persisted alongside the container so a reader can interpret it without re-deriving the
     spec, and so a spec change is visible in the store rather than implied by the writer.
+
+    Only the parameters that apply to the spec's kind are recorded. A bin parameter on a
+    quantile shard would be a field the reader could mistake for meaningful.
     """
-    return {
+    metadata: dict[str, object] = {
         "kind": spec.kind,
         "n_fields": spec.n_fields,
-        "n_bins": spec.n_bins,
-        "sigma_range": spec.sigma_range,
         "field_names": list(spec.field_names),
         "field_scales": list(spec.field_scales),
         "chunk_lat": layout.chunk_lat,
@@ -330,3 +331,9 @@ def field_metadata(
         "chunks_per_field": layout.chunks_per_field,
         "container_format": "sharded_v2",
     }
+    if spec.kind == KIND_MEAN_STD_BINS:
+        metadata["n_bins"] = spec.n_bins
+        metadata["sigma_range"] = spec.sigma_range
+    else:
+        metadata["levels"] = list(spec.levels)
+    return metadata
