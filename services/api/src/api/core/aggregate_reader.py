@@ -34,25 +34,31 @@ from dataclasses import dataclass
 from os import PathLike
 from typing import Any
 
+import math
+
 import numpy as np
 import numpy.typing as npt
+from domain.aggregate import AggregateSpec, dequantise_field
+from domain.field_layout import FieldLayoutError, aggregate_fields_for
 from domain.shard_format import (
     DESCRIPTOR_SIZE,
     ENCODING_F32,
+    ENCODING_I16,
     INDEX_ENTRY_SIZE,
+    PER_FIELD_SCALE,
     TRAILER_SIZE,
     ShardDescriptor,
     ShardFormatError,
-    member_count_from_descriptor,
     parse_index,
     parse_trailer,
     split_v2_tail,
 )
+from domain.variable_class import VariableClassError, spec_for
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
 #: Encodings this reader can decode. A container whose descriptor names an id absent here is
 #: refused rather than guessed at, so a newer writer cannot be half-read by an older reader.
-KNOWN_ENCODINGS: frozenset[int] = frozenset({ENCODING_F32})
+KNOWN_ENCODINGS: frozenset[int] = frozenset({ENCODING_F32, ENCODING_I16})
 
 #: Store-relative suffix of an aggregate shard object, matching the writer's key grammar.
 AGGREGATE_SHARD_SUFFIX: str = "shard.agg"
@@ -324,30 +330,53 @@ class AggregateShardReader:
         variable: str,
         lead_time_hours: int,
         *,
-        observed: bool,
+        chunk_row: int,
+        chunk_col: int,
+        row_in_chunk: int,
+        col_in_chunk: int,
         generation: str | None = None,
     ) -> int | None:
-        """Members the aggregate was computed from, for a point that was or was not observed.
+        """Members that were finite at one point, or ``None`` when it cannot be answered.
 
-        The API reports ``member_count`` per point; a container stores it per shard. The two
-        agree because a single non-finite member makes every field at that cell non-finite, so
-        "the fields here are all finite" means "computed from the full set". ``observed`` is the
-        caller's answer to that question for the cell it read.
+        The count is **field 0 of the container**, written per cell by the aggregator, so this
+        returns what the store recorded rather than something inferred. That matters because the
+        API reports ``member_count`` per point while an ensemble aggregate is computed from
+        whichever members are finite there, and the two cannot be reconciled from statistics
+        alone: a cell with 29 of 30 members has a perfectly ordinary-looking mean.
 
         Returns:
-            The count for an observed cell, ``0`` for an unobserved one, and ``None`` when the
-            container carries no count -- which a caller must treat as "ask the members", not
-            as zero.
+            The recorded count when the container can be read, else ``None`` so a caller falls
+            back rather than reporting a number no one stored. An unreadable or unrecognized
+            container is not an error here -- the member path remains the reader of record.
         """
-        shard_key = aggregate_shard_key(variable, lead_time_hours)
-        if self._load_geometry(shard_key, generation) is None:
+        if self.statistics_spec(variable) is None:
             return None
-        cache_key = f"{self._store_key()}::{generation or 'live'}::{shard_key}"
-        with self._cache_lock:
-            descriptor = self._descriptor_cache.get(cache_key)
-        if descriptor is None:  # pragma: no cover - _load_geometry just populated it
+        stack = self.read_location(
+            variable,
+            lead_time_hours=lead_time_hours,
+            chunk_row=chunk_row,
+            chunk_col=chunk_col,
+            generation=generation,
+        )
+        if stack is None or stack.shape[0] < 1:
             return None
-        return member_count_from_descriptor(descriptor, observed=observed)
+        value = float(stack[0, int(row_in_chunk), int(col_in_chunk)])
+        if not math.isfinite(value):
+            # A cell with no member count is a cell the aggregator refused; report none rather
+            # than zero, since "no members participated" and "I cannot tell" are different.
+            return None
+        return int(round(value))
+
+    def statistics_spec(self, variable: str) -> AggregateSpec | None:
+        """The approved spec for a variable, or ``None`` when it has no aggregate encoding.
+
+        Exposed so a caller can compare a container's field count against what the variable's
+        spec implies without importing the variable registry itself.
+        """
+        try:
+            return spec_for(variable)
+        except VariableClassError:
+            return None
 
     def open(
         self, variable: str, lead_time_hours: int, *, generation: str | None = None
@@ -397,6 +426,11 @@ class AggregateShardReader:
             if cache_key in self._group_cache:
                 self._group_cache.move_to_end(cache_key)
                 return self._group_cache[cache_key]
+            descriptor = self._descriptor_cache.get(
+                f"{self._store_key()}::{generation or 'live'}::{shard_key}"
+            )
+        if descriptor is None:  # pragma: no cover - _load_geometry just populated it
+            return None
 
         group = geometry.spatial_group(chunk_row, chunk_col)
         stack = np.full(
@@ -423,7 +457,21 @@ class AggregateShardReader:
         if blob is None:
             return None
 
-        expected_bytes = geometry.chunk_lat * geometry.chunk_lon * 4
+        # The payload's element type follows the container's declared encoding, so the expected
+        # byte length does too: a fixed-point chunk decodes to two bytes per element, not four.
+        # Reading a quantised chunk as float32 would produce a plausible-shaped array of garbage
+        # rather than a failure, which is exactly the kind of mistake the descriptor prevents.
+        is_fixed_point = descriptor.encoding_id == ENCODING_I16
+        if not is_fixed_point and descriptor.encoding_id != ENCODING_F32:
+            return None
+        element_bytes = 2 if is_fixed_point else 4
+        expected_bytes = geometry.chunk_lat * geometry.chunk_lon * element_bytes
+        scales = self._field_scales(descriptor, variable)
+        if scales is None:
+            # The container is not this variable's aggregate: its field vector does not match
+            # the variable's stored layout. Fall back to the members rather than decode it at a
+            # guessed step, which would return a full field of plausible wrong numbers.
+            return None
         for index, ordinal in enumerate(group):
             offset, length = entries[ordinal]
             if length == 0:
@@ -450,12 +498,54 @@ class AggregateShardReader:
                     f"{shard_key}: chunk {ordinal} decoded to {len(raw)} bytes, expected "
                     f"{expected_bytes}"
                 )
-            stack[index] = np.frombuffer(raw, dtype=np.float32).reshape(
-                geometry.chunk_lat, geometry.chunk_lon
-            )
+            if is_fixed_point:
+                codes = np.frombuffer(raw, dtype=np.int16).reshape(
+                    geometry.chunk_lat, geometry.chunk_lon
+                )
+                # Each field has its own step, so the chunk is dequantised at its own field's.
+                # ``index`` is the position within the spatial group, which is field order.
+                stack[index] = dequantise_field(codes, scales[index])
+            else:
+                stack[index] = np.frombuffer(raw, dtype=np.float32).reshape(
+                    geometry.chunk_lat, geometry.chunk_lon
+                )
 
         self._cache_group(cache_key, stack)
         return stack
+
+    def _field_scales(
+        self, descriptor: ShardDescriptor, variable: str
+    ) -> tuple[float, ...] | None:
+        """Per-field fixed-point steps for a container's field vector, or ``None``.
+
+        The steps come from the variable's stored layout -- the same authority the writer takes
+        them from -- rather than from the descriptor, which carries a single scale because one
+        number cannot describe fields of different magnitudes (a 314 K mean needs 0.01 while a
+        bin probability wants 0.001; at 0.001 the mean needs 314000 and overflows int16).
+
+        ``None`` means "this container is not this variable's aggregate", which is a capability
+        answer rather than an error: the caller falls back to the member shards, which remain the
+        reader of record. That is the same contract :meth:`open` has, and it is deliberately not
+        the ``ShardFormatError`` a *damaged* container raises -- a container written from another
+        spec is not corrupt, just not ours, and failing the request over it would turn "the
+        aggregate was built differently" into an outage. A float container needs no steps, and
+        returns ``()``.
+        """
+        if descriptor.encoding_id == ENCODING_F32:
+            return ()
+        if descriptor.scale != PER_FIELD_SCALE:
+            return None
+        try:
+            layout = aggregate_fields_for(variable)
+        except FieldLayoutError:
+            return None
+        lat_chunks, lon_chunks = descriptor.expected_shape()
+        chunks_per_field = lat_chunks * lon_chunks
+        if chunks_per_field <= 0 or descriptor.num_chunks % chunks_per_field:
+            return None
+        if layout.n_fields != descriptor.num_chunks // chunks_per_field:
+            return None
+        return layout.field_scales
 
     def _cache_group(self, cache_key: str, stack: npt.NDArray[np.float32]) -> None:
         with self._cache_lock:

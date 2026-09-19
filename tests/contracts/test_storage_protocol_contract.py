@@ -200,8 +200,12 @@ def test_aggregate_reader_agrees_with_the_ingestion_writer(tmp_path) -> None:
     This is the cross-service assertion, and it belongs here rather than in the API's own
     suite: the API tier is independently deployable and must not import the ingestion package
     (``docs/ARCHITECTURE.md`` 3.1/3.5), so only this suite can exercise both sides at once.
-    A geometry, key or ordering mismatch between them would otherwise surface as misaligned
-    statistic planes rather than as an error.
+    A geometry, key, ordering, encoding or scale mismatch between them would otherwise surface
+    as misaligned or mis-scaled statistic planes rather than as an error.
+
+    The container is built the way production builds it -- int16 at the variable's per-field
+    steps, led by the per-cell member count -- so the reader is exercised through its
+    dequantisation path and not through a layout no store will ever hold.
     """
     import numpy as np
     import os
@@ -211,7 +215,9 @@ def test_aggregate_reader_agrees_with_the_ingestion_writer(tmp_path) -> None:
         aggregate_shard_key,
         recover_geometry,
     )
-    from domain.aggregate import KIND_QUANTILE_FUNCTION, AggregateSpec, compute_aggregate
+    from domain.aggregate import compute_aggregate, finite_member_count
+    from domain.field_layout import aggregate_fields_for
+    from domain.variable_class import spec_for
     from ingestion.core.aggregate_writer import (
         encode_aggregate_shard,
         layout_for_spec,
@@ -222,48 +228,65 @@ def test_aggregate_reader_agrees_with_the_ingestion_writer(tmp_path) -> None:
     members = np.random.default_rng(0).normal(280.0, 8.0, (5, grid_lat, grid_lon))
     store = str(tmp_path / "cycle.zarr")
 
-    for spec in (
-        AggregateSpec(n_bins=4),
-        AggregateSpec(kind=KIND_QUANTILE_FUNCTION),
-    ):
-        fields = compute_aggregate(members.astype(np.float32), spec)
-        layout = layout_for_spec(spec, grid_lat=grid_lat, grid_lon=grid_lon)
-        container = encode_aggregate_shard(
-            list(fields), layout, member_count=members.shape[0]
-        )
-        key = aggregate_shard_key(variable, lead)
-        full = os.path.join(store, *key.split("/"))
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "wb") as handle:
-            handle.write(container)
+    spec = spec_for(variable)
+    layout_spec = aggregate_fields_for(variable)
+    stack = members.astype(np.float32)
+    fields = np.concatenate(
+        [finite_member_count(stack)[None], compute_aggregate(stack, spec)]
+    )
+    layout = layout_for_spec(
+        spec, grid_lat=grid_lat, grid_lon=grid_lon, n_fields=layout_spec.n_fields
+    )
+    container = encode_aggregate_shard(
+        list(fields),
+        layout,
+        member_count=members.shape[0],
+        field_scales=layout_spec.field_scales,
+    )
+    key = aggregate_shard_key(variable, lead)
+    full = os.path.join(store, *key.split("/"))
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "wb") as handle:
+        handle.write(container)
 
-        # 1. the reader recovers exactly the writer's geometry
-        reader = AggregateShardReader(store)
-        geometry = reader.open(variable, lead)
-        assert geometry is not None, spec.kind
-        assert geometry.n_fields == spec.n_fields
-        assert geometry.num_chunks == layout.num_chunks
-        assert geometry.lat_chunks == layout.lat_chunks
-        assert geometry.lon_chunks == layout.lon_chunks
-        assert recover_geometry(layout.to_descriptor()) == geometry
+    # 1. the reader recovers exactly the writer's geometry
+    reader = AggregateShardReader(store)
+    geometry = reader.open(variable, lead)
+    assert geometry is not None, spec.kind
+    assert geometry.n_fields == layout_spec.n_fields
+    assert geometry.num_chunks == layout.num_chunks
+    assert geometry.lat_chunks == layout.lat_chunks
+    assert geometry.lon_chunks == layout.lon_chunks
+    assert recover_geometry(layout.to_descriptor()) == geometry
 
-        # 1b. and the member count the writer recorded, which an aggregate cannot derive from
-        # the statistics it stores
-        assert reader.member_count(variable, lead, observed=True) == members.shape[0]
-        assert reader.member_count(variable, lead, observed=False) == 0
-
-        # 2. and decodes the fields the writer was given, chunk for chunk
-        for row in range(geometry.lat_chunks):
-            for col in range(geometry.lon_chunks):
-                stack = reader.read_location(
-                    variable, lead_time_hours=lead, chunk_row=row, chunk_col=col
+    # 2. and decodes the fields the writer was given, chunk for chunk, within the half step
+    # of the field's own scale -- the bound the fixed-point encoding guarantees.
+    for row in range(geometry.lat_chunks):
+        for col in range(geometry.lon_chunks):
+            stack = reader.read_location(
+                variable, lead_time_hours=lead, chunk_row=row, chunk_col=col
+            )
+            assert stack is not None, (spec.kind, row, col)
+            r0, c0 = row * layout.chunk_lat, col * layout.chunk_lon
+            r1 = min(r0 + layout.chunk_lat, grid_lat)
+            c1 = min(c0 + layout.chunk_lon, grid_lon)
+            for field in range(layout_spec.n_fields):
+                expected = fields[field][r0:r1, c0:c1]
+                got = stack[field][: r1 - r0, : c1 - c0]
+                tolerance = layout_spec.field_scales[field] / 2 + 1e-3
+                assert np.all(np.abs(got - expected) <= tolerance), (
+                    spec.kind,
+                    row,
+                    col,
+                    field,
                 )
-                assert stack is not None, (spec.kind, row, col)
-                r0, c0 = row * layout.chunk_lat, col * layout.chunk_lon
-                r1 = min(r0 + layout.chunk_lat, grid_lat)
-                c1 = min(c0 + layout.chunk_lon, grid_lon)
-                for field in range(spec.n_fields):
-                    assert np.array_equal(
-                        stack[field][: r1 - r0, : c1 - c0],
-                        fields[field][r0:r1, c0:c1],
-                    ), (spec.kind, row, col, field)
+
+    # 3. the per-cell member count is field 0, and the reader reports what the writer recorded
+    # -- not a container-wide total, and not something inferred from the statistics.
+    at = {
+        "chunk_row": 0,
+        "chunk_col": 0,
+        "row_in_chunk": 5,
+        "col_in_chunk": 7,
+    }
+    assert reader.member_count(variable, lead, **at) == members.shape[0]

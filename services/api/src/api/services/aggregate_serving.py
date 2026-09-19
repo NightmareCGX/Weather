@@ -267,7 +267,8 @@ def statistics_from_aggregate(
     )
     if stack is None:
         return None
-    if stack.shape[0] != spec.n_fields:
+    # Field 0 is the per-cell member count, so the encoding's own fields are the ones after it.
+    if stack.shape[0] != spec.n_fields + 1:
         # The container's field count disagrees with the approved encoding for this variable.
         # That means the store was written with a different spec; the members remain the
         # reader of record rather than this reader guessing at the field order.
@@ -276,7 +277,7 @@ def statistics_from_aggregate(
             variable,
             lead_time_hours,
             stack.shape[0],
-            spec.n_fields,
+            spec.n_fields + 1,
         )
         return None
 
@@ -285,11 +286,13 @@ def statistics_from_aggregate(
         return None
 
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    member_count = int(round(float(point[0]))) if math.isfinite(float(point[0])) else None
+    encoding_fields = point[1:]
     try:
         if spec.kind == KIND_MEAN_STD_BINS:
-            values, exact = _statistics_from_bins(point, spec)
+            values, exact = _statistics_from_bins(encoding_fields, spec)
         elif spec.kind == KIND_QUANTILE_FUNCTION:
-            values, exact = _statistics_from_quantiles(point, spec)
+            values, exact = _statistics_from_quantiles(encoding_fields, spec)
         else:  # pragma: no cover - the spec's own validation rejects other kinds
             return None
     except AggregateError as exc:
@@ -305,18 +308,12 @@ def statistics_from_aggregate(
     if "mean" not in finite:
         # Without a mean the answer would be a partial statistic set; members can do better.
         return None
-    # A single non-finite member makes every field at a cell non-finite, so "every field here
-    # is finite" is exactly "this cell was computed from the whole member set". That, and only
-    # that, is what lets the container's shard-wide count answer the API's per-point question.
-    observed = all(math.isfinite(value) for value in point)
     return AggregatePointStatistics(
         values=finite,
         spec=spec,
         exact=exact,
         geometry=geometry,
-        member_count=active_reader.member_count(
-            variable, lead_time_hours, observed=observed, generation=generation
-        ),
+        member_count=member_count,
     )
 
 
@@ -396,10 +393,15 @@ def exceedance_probability(
         chunk_col=chunk_col,
         generation=generation,
     )
-    if stack is None or stack.shape[0] != spec.n_fields:
+    if stack is None or stack.shape[0] != spec.n_fields + 1:
         return None
 
-    point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    # Field 0 is the per-cell member count; the encoding's fields follow it.
+    full_point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    member_count = (
+        int(round(float(full_point[0]))) if math.isfinite(float(full_point[0])) else None
+    )
+    point = full_point[1:]
     try:
         if spec.kind == KIND_QUANTILE_FUNCTION:
             probability_above = float(
@@ -436,13 +438,7 @@ def exceedance_probability(
     # Only the strict operators reach here; the inclusive ones are refused above because a
     # stored quantile function cannot represent the point mass at the threshold.
     probability = probability_above if operator == "gt" else 1.0 - probability_above
-    observed = all(math.isfinite(value) for value in point)
-    return AggregatePointProbability(
-        probability=probability,
-        member_count=active_reader.member_count(
-            variable, lead_time_hours, observed=observed, generation=generation
-        ),
-    )
+    return AggregatePointProbability(probability=probability, member_count=member_count)
 
 
 def gated_statistics_from_aggregate(

@@ -254,8 +254,11 @@ def _aggregate_mean(store: str) -> float:
         decode_aggregate_chunk,
         layout_from_descriptor,
     )
+    from domain.field_layout import aggregate_fields_for
     from domain.shard_format import split_v2_tail
 
+    # Both tiers take the steps from the variable's stored layout, so the test does too.
+    scales = aggregate_fields_for(VARIABLE).field_scales
     key = f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard"
     with open(os.path.join(store, *key.split("/")), "rb") as handle:
         blob = handle.read()
@@ -264,8 +267,10 @@ def _aggregate_mean(store: str) -> float:
         blob[-(index_byte_size + 40 + 12) :], num_chunks
     )
     layout = layout_from_descriptor(descriptor)
-    assert layout.n_fields == 34  # A class: MEAN + STD + 32 bins
-    return float(decode_aggregate_chunk(blob, 0)[0, 0])
+    assert layout.n_fields == 35  # A class: the member count, MEAN, STD, then 32 bins
+    # Field 1 is MEAN; field 0 is the per-cell member count.
+    fields = [decode_aggregate_chunk(blob, ordinal, field_scales=scales) for ordinal in range(2)]
+    return float(fields[1][0, 0])
 
 
 def test_region_write_stages_every_member_and_writes_no_aggregate(
@@ -374,7 +379,10 @@ def test_a_patch_publication_keeps_the_staging_the_next_patch_needs(
         decode_aggregate_chunk,
         layout_from_descriptor,
     )
+    from domain.field_layout import aggregate_fields_for
     from domain.shard_format import split_v2_tail
+
+    scales = aggregate_fields_for(VARIABLE).field_scales
 
     store = str(tmp_path)
     monkeypatch.setattr(aggregate_phase, "staging_enabled", lambda: True)
@@ -402,8 +410,10 @@ def test_a_patch_publication_keeps_the_staging_the_next_patch_needs(
             blob[-(index_byte_size + 40 + 12) :], num_chunks
         )
         layout = layout_from_descriptor(descriptor)
-        assert layout.n_fields == 34
-        return float(decode_aggregate_chunk(blob, 0)[0, 0])
+        assert layout.n_fields == 35
+        # Field 1 is MEAN (field 0 is the member count). Field 1's chunk ordinal is 1, because
+        # the container lays one location's fields contiguously and this grid is a single chunk.
+        return float(decode_aggregate_chunk(blob, 1, field_scales=scales)[0, 0])
 
     for member in (1, 2, 3):
         _stage(member)

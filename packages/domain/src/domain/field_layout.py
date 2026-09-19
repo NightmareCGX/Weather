@@ -25,10 +25,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
-from domain.aggregate import KIND_MEAN_STD_BINS, KIND_QUANTILE_FUNCTION
+from domain.aggregate import (
+    KIND_MEAN_STD_BINS,
+    KIND_QUANTILE_FUNCTION,
+    MEMBER_COUNT_FIELD_NAME,
+    MEMBER_COUNT_SCALE,
+)
 from domain.variable_class import VariableClassError, encoding_for
 
 #: What a field vector's fields mean, so a reader addresses them by role.
+ROLE_MEMBER_COUNT: Final[str] = "member_count"
 ROLE_MEAN: Final[str] = "mean"
 ROLE_STD: Final[str] = "std"
 ROLE_BIN: Final[str] = "bin"
@@ -53,6 +59,11 @@ class FieldLayoutError(ValueError):
 @dataclass(frozen=True)
 class FieldLayout:
     """The fields of one variable's aggregate container, in storage order.
+
+    Field 0 is always the per-cell finite-member count (:data:`ROLE_MEMBER_COUNT`), followed by
+    the encoding's own fields. The count leads because it is read *before* anything else can be
+    interpreted: it answers "is this cell aggregated at all" and "how many members is that
+    statistic over", and both questions come before a mean or a percentile means anything.
 
     Attributes:
         variable: Variable code the layout belongs to.
@@ -135,12 +146,15 @@ def aggregate_fields_for(variable: str) -> FieldLayout:
     else:  # pragma: no cover - AggregateSpec validates its own kind
         raise FieldLayoutError(f"{name!r} has unknown aggregate kind {spec.kind!r}")
 
+    # Field 0 is the per-cell finite-member count, prepended to whatever the spec declares. It
+    # leads rather than trails so the two readers that need it before interpreting anything --
+    # the coverage decision and the reported member count -- find it at a fixed index.
     return FieldLayout(
         variable=name,
         kind=spec.kind,
-        field_names=names,
-        field_scales=spec.field_scales,
-        roles=roles,
+        field_names=(MEMBER_COUNT_FIELD_NAME, *names),
+        field_scales=(MEMBER_COUNT_SCALE, *spec.field_scales),
+        roles=(ROLE_MEMBER_COUNT, *roles),
     )
 
 
@@ -149,6 +163,7 @@ __all__ = [
     "ROLE_BIN",
     "ROLE_LEVEL",
     "ROLE_MEAN",
+    "ROLE_MEMBER_COUNT",
     "ROLE_STD",
     "VALID_MISSING_POLICIES",
     "FieldLayout",

@@ -14,6 +14,7 @@ from domain.field_layout import (
     ROLE_BIN,
     ROLE_LEVEL,
     ROLE_MEAN,
+    ROLE_MEMBER_COUNT,
     ROLE_STD,
     FieldLayout,
     FieldLayoutError,
@@ -22,15 +23,30 @@ from domain.field_layout import (
 from domain.variable_class import APPROVED_BIN_COUNT, APPROVED_LEVEL_COUNT
 
 
-def test_near_gaussian_layout_is_mean_std_then_bins() -> None:
+def test_the_member_count_leads_every_layout() -> None:
+    """Field 0 answers "is this cell aggregated, and over how many members" before any statistic.
+
+    Both questions come before a mean or a percentile means anything, so the count is at a
+    fixed index rather than appended after a variable-length field list.
+    """
+    for variable in ("temperature_2m", "precipitation_amount_3h", "visibility"):
+        layout = aggregate_fields_for(variable)
+        assert layout.roles[0] == ROLE_MEMBER_COUNT
+        assert layout.field_names[0] == "MEMBER_COUNT"
+        assert layout.index_of_role(ROLE_MEMBER_COUNT) == 0
+        # One member per step, so the count survives the fixed-point round trip exactly.
+        assert layout.field_scales[0] == 1.0
+
+
+def test_near_gaussian_layout_is_count_then_mean_std_then_bins() -> None:
     layout = aggregate_fields_for("temperature_2m")
     assert layout.kind == KIND_MEAN_STD_BINS
-    assert layout.n_fields == 2 + APPROVED_BIN_COUNT
-    assert layout.roles[:2] == (ROLE_MEAN, ROLE_STD)
-    assert layout.roles[2:] == (ROLE_BIN,) * APPROVED_BIN_COUNT
-    assert layout.index_of_role(ROLE_MEAN) == 0
-    assert layout.index_of_role(ROLE_STD) == 1
-    assert layout.indices_of_role(ROLE_BIN)[0] == 2
+    assert layout.n_fields == 1 + 2 + APPROVED_BIN_COUNT
+    assert layout.roles[1:3] == (ROLE_MEAN, ROLE_STD)
+    assert layout.roles[3:] == (ROLE_BIN,) * APPROVED_BIN_COUNT
+    assert layout.index_of_role(ROLE_MEAN) == 1
+    assert layout.index_of_role(ROLE_STD) == 2
+    assert layout.indices_of_role(ROLE_BIN)[0] == 3
 
 
 def test_a_role_that_more_than_one_field_claims_is_refused_rather_than_guessed() -> None:
@@ -52,14 +68,14 @@ def test_a_role_that_more_than_one_field_claims_is_refused_rather_than_guessed()
     # A repeated role is not itself invalid -- the bins repeat by design.
     asserted = aggregate_fields_for("temperature_2m")
     assert len(asserted.indices_of_role(ROLE_BIN)) > 1
-    assert asserted.index_of_role(ROLE_MEAN) == 0
+    assert asserted.index_of_role(ROLE_MEAN) == 1
 
 
 def test_quantile_layout_is_one_level_per_field() -> None:
     layout = aggregate_fields_for("precipitation_amount_3h")
     assert layout.kind == KIND_QUANTILE_FUNCTION
-    assert layout.n_fields == APPROVED_LEVEL_COUNT
-    assert layout.roles == (ROLE_LEVEL,) * APPROVED_LEVEL_COUNT
+    assert layout.n_fields == 1 + APPROVED_LEVEL_COUNT
+    assert layout.roles[1:] == (ROLE_LEVEL,) * APPROVED_LEVEL_COUNT
     assert layout.index_of_role(ROLE_MEAN) is None
 
 

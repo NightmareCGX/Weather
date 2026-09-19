@@ -29,6 +29,7 @@ from domain.aggregate import (
     encode_aggregate,
     exceedance_from_bins,
     exceedance_from_quantiles,
+    finite_member_count,
     quantile_at,
     quantile_function_moments,
     quantise_field,
@@ -163,13 +164,49 @@ def test_bins_under_count_members_outside_the_sigma_support() -> None:
     assert np.allclose(total, (N_MEMBERS - 1) / N_MEMBERS, atol=1e-6)
 
 
-def test_compute_aggregate_propagates_nan_through_the_normalisation() -> None:
-    """A partially observed cell has no well-defined ensemble statistic."""
+def test_compute_aggregate_skips_a_missing_member_and_refuses_a_thin_cell() -> None:
+    """One missing member does not discard the cell; too few members does.
+
+    The serving paths filter to finite members and then apply the per-cell coverage rule, so
+    the aggregate reproduces their answer rather than being stricter: a cell the member path
+    can describe must not come back NaN from the aggregate.
+    """
+    spec = _spec(n_bins=4)
+
     stack = _members(seed=4)
     stack[0, 0, 0] = np.nan
-    got = compute_aggregate(stack, _spec(n_bins=4))
-    assert np.all(np.isnan(got[:, 0, 0]))
+    got = compute_aggregate(stack, spec)
+    present = stack[np.isfinite(stack[:, 0, 0]), 0, 0]
+    assert np.isfinite(got[:, 0, 0]).all()
+    assert got[0, 0, 0] == pytest.approx(float(present.mean()), rel=1e-6)
     assert not np.isnan(got[:, 1, 1]).any()
+
+    thin = _members(seed=4)
+    thin[: int(N_MEMBERS * 0.5), 0, 0] = np.nan
+    thin_got = compute_aggregate(thin, spec)
+    assert np.all(np.isnan(thin_got[:, 0, 0]))
+
+
+def test_compute_aggregate_refuses_a_cell_below_the_coverage_floor() -> None:
+    """The floor is the platform's serving rule, evaluated per cell against the contract count.
+
+    ``expected_members`` is what the floor is measured against, which is why it is an argument:
+    an aggregate computed from 26 of a 30-member contract must be judged as 26/30, not as 26/26.
+    """
+    spec = _spec(n_bins=4)
+    stack = _members(seed=6)
+    # 26 of 30 finite at one cell: above 85%, so aggregated.
+    stack[26:, 0, 0] = np.nan
+    above = compute_aggregate(stack, spec, expected_members=N_MEMBERS)
+    assert np.isfinite(above[:, 0, 0]).all()
+    # 24 of 30: below the floor, so refused.
+    stack2 = _members(seed=6)
+    stack2[24:, 0, 0] = np.nan
+    below = compute_aggregate(stack2, spec, expected_members=N_MEMBERS)
+    assert np.all(np.isnan(below[:, 0, 0]))
+    # The same 26-of-26 stack passes when it IS the contract: the ratio is what counts.
+    small = _members(seed=6)[:26]
+    assert np.isfinite(compute_aggregate(small, spec).all(axis=0)).all()
 
 
 def test_zero_spread_cell_stays_finite() -> None:
@@ -440,17 +477,35 @@ def test_quantile_encoding_handles_a_constant_cell() -> None:
     assert np.allclose(fields, 3.5)
 
 
-def test_quantile_encoding_propagates_nan_for_an_incomplete_cell() -> None:
-    """A partially observed cell has no quantile function, so every level must be NaN.
+def test_quantile_encoding_skips_a_missing_member_and_refuses_a_thin_cell() -> None:
+    """A cell one member short is quantiled over the members it has; a thin cell is refused.
 
-    Without the explicit guard the sorted axis would carry ``inf`` for the missing members
-    and the upper levels would come back finite -- a plausible-looking but fabricated tail.
+    Without the finite-prefix sort the ``inf`` that stands in for the missing member would
+    surface at the upper levels as a fabricated tail. Without the coverage guard a cell where
+    most members are missing would still return a confident-looking quantile function.
     """
+    spec = _quantile_spec()
+
+    # One missing member out of N_MEMBERS: the answer is the quantile of the rest, and every
+    # level is finite.
     stack = _skewed_members(seed=3)
     stack[0, 0, 0] = np.nan
-    fields = compute_aggregate(stack, _quantile_spec())
-    assert np.all(np.isnan(fields[:, 0, 0]))
+    fields = compute_aggregate(stack, spec)
+    present = stack[np.isfinite(stack[:, 0, 0]), 0, 0]
+    last = len(present) - 1
+    expected_p50 = np.sort(present)[int(np.floor(0.5 * last))]
+    assert np.isfinite(fields[:, 0, 0]).all()
+    assert fields[list(spec.quantile_levels()).index(0.5), 0, 0] == pytest.approx(
+        float(expected_p50), abs=0.01
+    )
+    # A neighbouring fully-observed cell is unaffected.
     assert np.isfinite(fields[:, 1, 1]).all()
+
+    # Below the coverage floor the cell is refused outright.
+    thin = _skewed_members(seed=3)
+    thin[: int(N_MEMBERS * 0.5), 0, 0] = np.nan
+    thin_fields = compute_aggregate(thin, spec)
+    assert np.all(np.isnan(thin_fields[:, 0, 0]))
 
 
 def test_quantile_encoding_round_trips_through_quantisation() -> None:
@@ -687,3 +742,26 @@ def test_quantile_function_moments_reject_bad_input() -> None:
         quantile_function_moments(values[:3], spec.quantile_levels())
     with pytest.raises(AggregateError, match="positive probability range"):
         quantile_function_moments(values, (0.5,) * len(spec.levels))
+
+
+def test_finite_member_count_is_the_per_cell_count_a_collapse_destroys() -> None:
+    """The count is a field, not a property of the container: one member can be missing here
+    and present at the neighbouring cell."""
+    stack = _members(seed=9)
+    counts = finite_member_count(stack)
+    assert np.array_equal(counts, np.full((LAT, LON), float(N_MEMBERS), dtype=np.float32))
+
+    stack[0, 0, 0] = np.nan
+    stack[1:3, 1, 1] = np.nan
+    counts = finite_member_count(stack)
+    assert counts[0, 0] == N_MEMBERS - 1
+    assert counts[1, 1] == N_MEMBERS - 2
+    assert counts[2, 2] == N_MEMBERS
+    # Exact at its scale of one member, so the count survives the fixed-point round trip.
+    codes = quantise_field(counts, 1.0)
+    assert np.array_equal(dequantise_field(codes, 1.0), counts)
+
+
+def test_finite_member_count_rejects_a_non_stack() -> None:
+    with pytest.raises(AggregateError, match="must be"):
+        finite_member_count(np.zeros((LAT, LON), dtype=np.float32))

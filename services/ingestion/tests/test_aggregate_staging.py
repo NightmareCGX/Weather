@@ -14,7 +14,12 @@ import struct
 import numpy as np
 import pytest
 import xarray as xr
-from domain.aggregate import AggregateSpec, compute_aggregate
+from domain.aggregate import (
+    MEMBER_COUNT_SCALE,
+    AggregateSpec,
+    compute_aggregate,
+    finite_member_count,
+)
 from domain.shard_format import SHARD_V1_MAGIC, SHARD_V2_MAGIC
 from ingestion.core import aggregate_staging as staging
 from ingestion.core.aggregate_writer import (
@@ -68,6 +73,25 @@ def _identical_allow_nan(left: np.ndarray, right: np.ndarray) -> bool:
         np.array_equal(np.isnan(left), np.isnan(right))
         and np.array_equal(left[~np.isnan(left)], right[~np.isnan(right)])
     )
+
+
+def _within_quantisation(
+    left: np.ndarray, right: np.ndarray, tolerance: float
+) -> bool:
+    """Equal in NaN pattern, and within ``tolerance`` where both are finite.
+
+    Stored fields are int16 at a per-field step, so an exact comparison is only meaningful for
+    an unquantised container; for a stored one the bound is half a step plus the float32
+    rounding of the scale multiplication, which is what the quantiser guarantees.
+    """
+    if not np.array_equal(np.isnan(left), np.isnan(right)):
+        return False
+    finite = ~np.isnan(left)
+    # The slack is the scale's own float32 representation error on values of this magnitude:
+    # a mean near 280 stored at 0.01 rounds the product 280.49 * 0.01 to within ~1e-5 of the
+    # exact value, which is three orders below the half-step bound and not a defect.
+    slack = tolerance * 1e-3 + 1e-4
+    return bool(np.all(np.abs(left[finite] - right[finite]) <= tolerance + slack))
 
 
 # ---------------------------------------------------------------------------
@@ -256,9 +280,13 @@ def test_collect_rejects_a_lead_with_nothing_staged(tmp_path) -> None:
 def test_aggregate_from_staging_equals_a_direct_computation(tmp_path) -> None:
     """The published aggregate must equal one computed from the stored member planes.
 
-    Every layer in between -- the v1 container encoder, the chunk reassembly, the layout --
-    could be wrong in a way that still yields a plausible statistic field, so the comparison
-    is per chunk and exact against a direct computation.
+    Every layer in between -- the v1 container encoder, the chunk reassembly, the layout, the
+    fixed-point round trip -- could be wrong in a way that still yields a plausible statistic
+    field, so the comparison is per chunk against a direct computation, bounded by half a
+    quantisation step of the field's own scale.
+
+    Field 0 is the per-cell member count, prepended to the statistic fields, so the comparison
+    offsets by one and the count itself must be exact (its step is one member).
     """
     store = str(tmp_path)
     spec = _spec()
@@ -274,9 +302,15 @@ def test_aggregate_from_staging_equals_a_direct_computation(tmp_path) -> None:
     with open(os.path.join(store, *key.split("/")), "rb") as handle:
         container = handle.read()
 
-    expected_fields = compute_aggregate(np.stack(planes), spec)
-    layout = layout_for_spec(spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
-    assert layout.num_chunks == spec.n_fields * 4
+    stack = np.stack(planes)
+    expected_fields = np.concatenate(
+        [finite_member_count(stack)[None], compute_aggregate(stack, spec)]
+    )
+    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
+    layout = layout_for_spec(
+        spec, grid_lat=GRID_LAT, grid_lon=GRID_LON, n_fields=spec.n_fields + 1
+    )
+    assert layout.num_chunks == (spec.n_fields + 1) * 4
 
     for ordinal in range(layout.num_chunks):
         field, row, col = layout.locate(ordinal)
@@ -284,7 +318,8 @@ def test_aggregate_from_staging_equals_a_direct_computation(tmp_path) -> None:
         r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
         expected = np.full((CHUNK, CHUNK), np.nan, dtype=np.float32)
         expected[: r1 - r0, : c1 - c0] = expected_fields[field][r0:r1, c0:c1]
-        assert _identical_allow_nan(decode_aggregate_chunk(container, ordinal), expected), ordinal
+        decoded = decode_aggregate_chunk(container, ordinal, field_scales=scales)
+        assert _within_quantisation(decoded, expected, scales[field] / 2), ordinal
 
 
 def test_aggregate_is_independent_of_member_staging_order(tmp_path) -> None:
@@ -450,9 +485,15 @@ def test_quantile_aggregate_from_staging_equals_a_direct_computation(tmp_path) -
     with open(os.path.join(store, *key.split("/")), "rb") as handle:
         container = handle.read()
 
-    expected_fields = compute_aggregate(np.stack(planes), spec)
-    layout = layout_for_spec(spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
-    assert layout.n_fields == len(spec.levels) == 19
+    stack = np.stack(planes)
+    expected_fields = np.concatenate(
+        [finite_member_count(stack)[None], compute_aggregate(stack, spec)]
+    )
+    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
+    layout = layout_for_spec(
+        spec, grid_lat=GRID_LAT, grid_lon=GRID_LON, n_fields=spec.n_fields + 1
+    )
+    assert layout.n_fields == len(spec.levels) + 1 == 20
 
     for ordinal in range(layout.num_chunks):
         field, row, col = layout.locate(ordinal)
@@ -460,7 +501,8 @@ def test_quantile_aggregate_from_staging_equals_a_direct_computation(tmp_path) -
         r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
         expected = np.full((CHUNK, CHUNK), np.nan, dtype=np.float32)
         expected[: r1 - r0, : c1 - c0] = expected_fields[field][r0:r1, c0:c1]
-        assert _identical_allow_nan(decode_aggregate_chunk(container, ordinal), expected), ordinal
+        decoded = decode_aggregate_chunk(container, ordinal, field_scales=scales)
+        assert _within_quantisation(decoded, expected, scales[field] / 2), ordinal
 
 
 def test_quantile_aggregate_exceedance_survives_the_container_round_trip(tmp_path) -> None:
@@ -477,15 +519,21 @@ def test_quantile_aggregate_exceedance_survives_the_container_round_trip(tmp_pat
     with open(os.path.join(store, *key.split("/")), "rb") as handle:
         container = handle.read()
 
-    layout = layout_for_spec(spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
-    # Reassemble the levels from the published container, chunk by chunk.
-    levels = np.full((layout.n_fields, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
+    layout = layout_for_spec(
+        spec, grid_lat=GRID_LAT, grid_lon=GRID_LON, n_fields=spec.n_fields + 1
+    )
+    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
+    # Reassemble the levels from the published container, chunk by chunk. Field 0 is the
+    # member count, so the levels start at 1.
+    levels = np.full((spec.n_fields, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
     for ordinal in range(layout.num_chunks):
         field, row, col = layout.locate(ordinal)
-        chunk = decode_aggregate_chunk(container, ordinal)
+        chunk = decode_aggregate_chunk(container, ordinal, field_scales=scales)
+        if field == 0:
+            continue
         r0, c0 = row * CHUNK, col * CHUNK
         r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
-        levels[field, r0:r1, c0:c1] = chunk[: r1 - r0, : c1 - c0]
+        levels[field - 1, r0:r1, c0:c1] = chunk[: r1 - r0, : c1 - c0]
 
     threshold = float(np.percentile(np.stack(planes), 90.0))
     from_container = exceedance_from_quantiles(levels, spec.levels, threshold)
@@ -634,7 +682,10 @@ def test_aggregate_lead_all_variables_uses_the_per_variable_encoding(tmp_path) -
     )
     layout = layout_from_descriptor(descriptor)
     assert spec_for(VARIABLE).kind == KIND_MEAN_STD_BINS
-    assert layout.n_fields == spec_for(VARIABLE).n_fields
+    # One more field than the spec declares: every stored container leads with the per-cell
+    # member count, so the encoding's own field count is still recoverable and is still what
+    # distinguishes the two classes.
+    assert layout.n_fields == spec_for(VARIABLE).n_fields + 1
     assert spec_for("wind_gust").kind == KIND_QUANTILE_FUNCTION
 
 

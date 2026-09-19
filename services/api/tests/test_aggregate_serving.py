@@ -25,10 +25,20 @@ from api.services.aggregate_serving import (
 from domain.aggregate import (
     KIND_MEAN_STD_BINS,
     KIND_QUANTILE_FUNCTION,
+    MEMBER_COUNT_SCALE,
+    NAN_SENTINEL,
     AggregateSpec,
     compute_aggregate,
+    finite_member_count,
+    quantise_field,
 )
-from domain.shard_format import ShardDescriptor, build_container_v2
+from domain.field_layout import aggregate_fields_for
+from domain.shard_format import (
+    ENCODING_I16,
+    PER_FIELD_SCALE,
+    ShardDescriptor,
+    build_container_v2,
+)
 from domain.variable_class import spec_for
 
 GRID_LAT, GRID_LON = 128, 160
@@ -40,24 +50,41 @@ def _bin_spec() -> AggregateSpec:
     return AggregateSpec(n_bins=16)
 
 
+def _field_scales(variable: str) -> tuple[float, ...]:
+    """The stored-field steps for a variable, exactly as the reader derives them."""
+    return aggregate_fields_for(variable).field_scales
+
+
 def _encode(
-    fields: np.ndarray, encoding_id: int = 1, level: int = 5, member_count: int = 0
+    fields: np.ndarray,
+    *,
+    field_scales: tuple[float, ...],
+    level: int = 5,
+    member_count: int = 0,
 ) -> bytes:
-    """Mirror the writer's chunking from the shared format authority.
+    """Mirror the writer's chunking and fixed-point encoding from the shared format authority.
 
     Local to this suite because the API tier must not import the ingestion package; the
     cross-service agreement assertion lives in ``tests/contracts/``.
+
+    The container is written the way production writes it -- int16 at the variable's per-field
+    steps, declaring the per-field scale marker -- so that this suite exercises the reader's
+    dequantisation rather than a path no store will ever produce.
     """
     from numcodecs import Zstd
 
     lat_chunks = -(-GRID_LAT // CHUNK_LAT)
     lon_chunks = -(-GRID_LON // CHUNK_LON)
     compressor = Zstd(level=level)
+    codes = [
+        quantise_field(plane, scale)
+        for plane, scale in zip(fields, field_scales, strict=True)
+    ]
     payloads: list[bytes] = []
     for row in range(lat_chunks):
         for col in range(lon_chunks):
-            for plane in fields:
-                buf = np.full((CHUNK_LAT, CHUNK_LON), np.nan, dtype=np.float32)
+            for plane in codes:
+                buf = np.full((CHUNK_LAT, CHUNK_LON), NAN_SENTINEL, dtype=np.int16)
                 r0, c0 = row * CHUNK_LAT, col * CHUNK_LON
                 r1 = min(r0 + CHUNK_LAT, GRID_LAT)
                 c1 = min(c0 + CHUNK_LON, GRID_LON)
@@ -65,8 +92,8 @@ def _encode(
                 payloads.append(compressor.encode(buf.tobytes(order="C")))
     num_chunks = len(payloads)
     descriptor = ShardDescriptor(
-        encoding_id=encoding_id,
-        scale=1.0,
+        encoding_id=ENCODING_I16,
+        scale=PER_FIELD_SCALE,
         chunk_lat=CHUNK_LAT,
         chunk_lon=CHUNK_LON,
         grid_lat=GRID_LAT,
@@ -81,15 +108,19 @@ def _encode(
 def _store_with(
     tmp_path, variable: str, members: np.ndarray, *, member_count: int | None = None
 ) -> str:
-    """Write an aggregate over ``members``; the descriptor records how many it came from.
+    """Write an aggregate over ``members``, laid out the way the ingestion writer lays it out.
 
-    ``member_count`` defaults to the member axis, which is what the ingestion writer records.
-    Passing ``None`` is not possible -- callers wanting an uncounted container pass 0.
+    The field vector is the per-cell member count followed by the encoding's own fields, and
+    every field is stored at its own fixed-point step -- both taken from the variable's layout,
+    which is the single authority the reader also uses.
     """
     spec = spec_for(variable)
-    fields = compute_aggregate(members, spec)
+    layout = aggregate_fields_for(variable)
+    fields = np.concatenate(
+        [finite_member_count(members)[None], compute_aggregate(members, spec)]
+    )
     counted = int(members.shape[0]) if member_count is None else member_count
-    blob = _encode(fields, member_count=counted)
+    blob = _encode(fields, field_scales=layout.field_scales, member_count=counted)
     key = aggregate_shard_key(variable, LEAD)
     store = str(tmp_path)
     full = os.path.join(store, *key.split("/"))
@@ -120,10 +151,12 @@ def test_bin_encoding_reports_mean_and_spread_as_exact(tmp_path) -> None:
     assert result is not None
     assert result.spec.kind == KIND_MEAN_STD_BINS
     assert result.exact == frozenset({"mean", "spread"})
-    # exact means equal to the member-derived value, not merely close
+    # "Exact" means stored as its own plane rather than reconstructed from the shape, so the
+    # only difference from the member-derived value is the field's fixed-point step.
     column = members[:, 5, 7]
-    assert result.values["mean"] == pytest.approx(float(column.mean()), abs=1e-4)
-    assert result.values["spread"] == pytest.approx(float(column.std()), abs=1e-4)
+    mean_step = aggregate_fields_for("temperature_2m").field_scales[1]
+    assert result.values["mean"] == pytest.approx(float(column.mean()), abs=mean_step)
+    assert result.values["spread"] == pytest.approx(float(column.std()), abs=mean_step)
 
 
 def test_quantile_encoding_reports_the_stored_levels_as_exact(tmp_path) -> None:
@@ -142,9 +175,10 @@ def test_quantile_encoding_reports_the_stored_levels_as_exact(tmp_path) -> None:
     assert result.exact == frozenset({"median", "p10", "p50", "p90"})
 
     column = members[:, 5, 7]
+    level_step = aggregate_fields_for("precipitation_amount_3h").field_scales[1]
     for name, probability in (("p10", 10), ("p50", 50), ("p90", 90)):
         assert result.values[name] == pytest.approx(
-            float(np.percentile(column, probability)), abs=1e-4
+            float(np.percentile(column, probability)), abs=level_step
         )
 
 
@@ -301,11 +335,19 @@ def test_exceedance_refuses_the_inclusive_operators(tmp_path) -> None:
     assert exceedance_probability("precipitation_amount_3h", operator="gte", **common) is None
     assert exceedance_probability("precipitation_amount_3h", operator="lte", **common) is None
     assert exceedance_probability("precipitation_amount_3h", operator="between", **common) is None
-    # the strict operator is served, and it is the member path's strict answer
+    # The strict operator is served, but only to the resolution the stored levels allow: the
+    # atom at zero makes the CDF jump between the 0.30 and 0.40 levels, and linear interpolation
+    # inside that gap cannot place the jump more finely than the gap itself. That is the bound
+    # asserted here -- not a tolerance chosen to make the test pass, but the stated limit of a
+    # 19-level sampled inverse CDF.
     strict = exceedance_probability("precipitation_amount_3h", operator="gt", **common)
     assert strict is not None
+    levels = spec_for("precipitation_amount_3h").quantile_levels()
+    widest_gap = max(b - a for a, b in zip(levels, levels[1:], strict=False))
     column = members[:, 5, 7]
-    assert strict.probability == pytest.approx(float((column > 0.0).mean()), abs=0.05)
+    assert strict.probability == pytest.approx(
+        float((column > 0.0).mean()), abs=widest_gap
+    )
     assert strict.member_count == 30
 
 
@@ -331,27 +373,35 @@ def test_field_count_mismatch_falls_through(tmp_path) -> None:
     """
     rng = np.random.default_rng(11)
     members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
-    fields = compute_aggregate(members, _bin_spec())  # 18 fields; temperature_2m needs 34
+    spec = _bin_spec()  # 18 statistic fields; temperature_2m's stored vector holds 35
+    fields = np.concatenate(
+        [finite_member_count(members)[None], compute_aggregate(members, spec)]
+    )
     key = aggregate_shard_key("temperature_2m", LEAD)
     store = str(tmp_path)
     full = os.path.join(store, *key.split("/"))
     os.makedirs(os.path.dirname(full), exist_ok=True)
+    # Encoded at the spec's own scales, so the only thing wrong with it is that it is not this
+    # variable's layout -- which is exactly the case the field-count check exists to catch.
     with open(full, "wb") as handle:
-        handle.write(_encode(fields))
+        handle.write(
+            _encode(fields, field_scales=(MEMBER_COUNT_SCALE, *spec.field_scales))
+        )
 
     assert _fetch("temperature_2m", store, 5, 7) is None
 
 
 def test_all_nan_aggregate_falls_through(tmp_path) -> None:
     """A fill-only location carries no information, and the members can do better."""
-    spec = spec_for("temperature_2m")
-    fields = np.full((spec.n_fields, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
+    layout = aggregate_fields_for("temperature_2m")
+    # Every field is the NaN sentinel, including the member count: a fill-only location.
+    fields = np.full((layout.n_fields, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
     key = aggregate_shard_key("temperature_2m", LEAD)
     store = str(tmp_path)
     full = os.path.join(store, *key.split("/"))
     os.makedirs(os.path.dirname(full), exist_ok=True)
     with open(full, "wb") as handle:
-        handle.write(_encode(fields))
+        handle.write(_encode(fields, field_scales=layout.field_scales))
 
     assert _fetch("temperature_2m", store, 5, 7) is None
 
@@ -452,55 +502,75 @@ def test_observed_point_reports_the_stored_member_count(tmp_path) -> None:
     assert result.member_count == 30
 
 
-def test_an_incomplete_cell_reports_zero_members(tmp_path) -> None:
-    """A cell one member short of complete is unobserved, and says so.
+def test_a_cell_one_member_short_reports_29_and_still_serves(tmp_path) -> None:
+    """Missing members are skipped, and the count says how many were used.
 
-    ``compute_aggregate`` makes *every* field NaN at a cell where any member is NaN, and the
-    API defines ``member_count`` as the finite members at the point. 30 members collapsed into
-    statistics cannot report "29", so an unobserved cell reports 0 rather than a number the
-    container does not hold.
+    This is what the serving paths do for every variable: filter to finite members, then apply
+    the per-cell coverage floor. The count travels as field 0 of the container precisely so the
+    aggregate can report "29 of 30 here" -- a cell the member path would happily describe, and
+    so one the aggregate must not refuse.
+
+    The three counts below are independent: the recorded count of the missing member's cell, the
+    recorded count of its neighbour, and what a caller reads back.
     """
     rng = np.random.default_rng(22)
     members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
     members[7, 5, 7] = np.nan
     store = _store_with(tmp_path, "temperature_2m", members)
 
-    # The unobserved cell cannot answer at all -- there is no mean to serve -- so it falls
-    # through to the members, which is the honest answer.
-    assert _fetch("temperature_2m", store, 5, 7) is None
-    # A neighbouring observed cell still reports the full count.
-    observed = _fetch("temperature_2m", store, 5, 8)
-    assert observed is not None
-    assert observed.member_count == 30
+    short = _fetch("temperature_2m", store, 5, 7)
+    assert short is not None
+    assert short.member_count == 29
+    # The mean is that of the 29, not of a 30-member sample with a hole in it.
+    present = members[np.isfinite(members[:, 5, 7]), 5, 7]
+    step = aggregate_fields_for("temperature_2m").field_scales[1]
+    assert short.values["mean"] == pytest.approx(float(present.mean()), abs=step)
+
+    # A neighbouring, fully-observed cell reports the full count.
+    full = _fetch("temperature_2m", store, 5, 8)
+    assert full is not None
+    assert full.member_count == 30
 
 
-def test_uncounted_container_reports_no_member_count(tmp_path) -> None:
-    """A container with no recorded count reports ``None``, so a caller falls back.
+def test_a_cell_below_the_floor_has_no_count_and_no_statistics(tmp_path) -> None:
+    """Below the coverage floor there is no aggregate, and the count field says so.
 
-    Reporting 0 would be indistinguishable from "no members participated", which is a claim
-    about the data rather than about what the container holds.
+    The distinction matters: "no members participated" is a claim about the data, while "this
+    cell was refused" is a claim about the aggregate. Only the second is true here, so the
+    reader reports no count rather than zero.
     """
     rng = np.random.default_rng(23)
     members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
-    store = _store_with(tmp_path, "temperature_2m", members, member_count=0)
+    members[24:, 5, 7] = np.nan  # 24 of 30, below 85%
+    store = _store_with(tmp_path, "temperature_2m", members)
 
-    result = _fetch("temperature_2m", store, 5, 7)
-    assert result is not None
-    assert result.member_count is None
+    assert _fetch("temperature_2m", store, 5, 7) is None
 
 
-def test_member_count_does_not_need_a_re_read_of_the_container(tmp_path) -> None:
-    """The count rides in the descriptor, which the geometry read already fetched."""
+def test_member_count_is_read_from_the_field_not_inferred(tmp_path) -> None:
+    """The count is a stored per-cell field, so a caller reads what the writer recorded.
+
+    A container-wide count in the descriptor could only say the total; the count the API reports
+    varies by cell, which is why it is field 0 of the field vector and why this reads the same
+    byte range as the statistics rather than a second object.
+    """
     from api.core.aggregate_reader import AggregateShardReader
 
     rng = np.random.default_rng(24)
     members = rng.normal(280.0, 8.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    members[9, 5, 7] = np.nan
     store = _store_with(tmp_path, "temperature_2m", members)
     reader = AggregateShardReader(store)
-    assert reader.member_count("temperature_2m", LEAD, observed=True) == 30
-    assert reader.member_count("temperature_2m", LEAD, observed=False) == 0
+    at = lambda row, col: {  # noqa: E731 - a local shorthand for six call sites
+        "chunk_row": 0,
+        "chunk_col": 0,
+        "row_in_chunk": row,
+        "col_in_chunk": col,
+    }
+    assert reader.member_count("temperature_2m", LEAD, **at(5, 7)) == 29
+    assert reader.member_count("temperature_2m", LEAD, **at(5, 8)) == 30
     # An absent aggregate is "unknown", not zero.
-    assert reader.member_count("wind_gust", LEAD, observed=True) is None
+    assert reader.member_count("wind_gust", LEAD, **at(5, 7)) is None
 
 
 # ---------------------------------------------------------------------------

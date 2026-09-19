@@ -116,6 +116,19 @@ QUANTILE_SCALE: Final[float] = 0.01
 #: representable quantised value, so it cannot collide with a real value.
 NAN_SENTINEL: Final[int] = -32768
 
+#: Name of the leading field every aggregate carries: how many members were finite at that cell.
+#:
+#: It exists because collapsing the members destroys the count, and the count is what the API
+#: reports as ``member_count`` and what the serving coverage rule is evaluated against. Carrying
+#: it as a field rather than in the descriptor is deliberate: the count is **per cell** (one
+#: member can be missing at one cell and present at its neighbour), while a descriptor is per
+#: container, so a descriptor field could only hold the container-wide total.
+MEMBER_COUNT_FIELD_NAME: Final[str] = "MEMBER_COUNT"
+
+#: Scale of the member-count field. The count is an exact integer that must survive the
+#: fixed-point round trip unchanged, so its step is one member.
+MEMBER_COUNT_SCALE: Final[float] = 1.0
+
 #: Floor applied to the normalisation denominator. Zero-spread cells exist (a member that
 #: is identically zero across the grid) and dividing by zero would make every bin NaN.
 _STD_FLOOR: Final[float] = 1e-9
@@ -272,14 +285,32 @@ class AggregateSpec:
 def compute_aggregate(
     members: npt.NDArray[np.floating],
     spec: AggregateSpec,
+    *,
+    expected_members: int | None = None,
+    min_coverage_ratio: float | None = None,
 ) -> npt.NDArray[np.float32]:
     """Compute the aggregate fields from a member stack.
 
+    Missing members are **skipped**, and a cell is refused only when too few members remain:
+
+    * every cell is computed from the members that are finite there, so one member's gap does
+      not discard a cell the rest of the ensemble can describe;
+    * a cell whose finite count falls below the platform's coverage floor is entirely NaN,
+      because an aggregate over a minority of the ensemble is not the statistic it claims to be.
+
+    That is what the serving paths already do for every variable (the member reader filters to
+    finite members and then applies the per-cell rule), so this reproduces their answer instead
+    of being stricter than them. The count of finite members is not returned here -- it is
+    :func:`finite_member_count`, recorded as its own field -- because a caller that stores these
+    fields needs it and a caller that only wants the arithmetic does not.
+
     Args:
-        members: Array of shape ``(n_members, lat, lon)``. Members must all be present; a
-            NaN in any member makes every field for that cell NaN, because a partially
-            observed cell has no well-defined ensemble statistic.
+        members: Array of shape ``(n_members, lat, lon)``.
         spec: Field set and quantisation.
+        expected_members: The contract's member count the coverage floor is evaluated against.
+            Defaults to the number of members supplied, which is only right for an aggregate
+            computed from the complete set.
+        min_coverage_ratio: Overrides the active configured floor.
 
     Returns:
         ``(n_fields, lat, lon)`` float32 array in :attr:`AggregateSpec.field_names` order.
@@ -295,24 +326,87 @@ def compute_aggregate(
         raise AggregateError("members must contain at least one member")
 
     stack = members.astype(np.float32, copy=False)
+    finite = np.isfinite(stack)
+    counts = finite.sum(axis=0)
+    observed = _observed_cells(
+        counts,
+        expected_members=members.shape[0] if expected_members is None else expected_members,
+        min_coverage_ratio=min_coverage_ratio,
+    )
 
     if spec.kind == KIND_QUANTILE_FUNCTION:
-        return _compute_quantile_function(stack, spec)
-    return _compute_mean_std_bins(stack, spec)
+        return _compute_quantile_function(stack, spec, observed=observed, counts=counts)
+    return _compute_mean_std_bins(stack, spec, observed=observed, counts=counts)
+
+
+def finite_member_count(members: npt.NDArray[np.floating]) -> npt.NDArray[np.float32]:
+    """How many members are finite at each cell, as a field ready to store.
+
+    Returned as float32 because every other field is, and the member-count field has to travel
+    through the same container and the same fixed-point round trip. Its scale is one member, so
+    the value is exact.
+
+    Raises:
+        AggregateError: if ``members`` is not a 3-D array, matching :func:`compute_aggregate`.
+    """
+    if members.ndim != 3:
+        raise AggregateError(
+            f"members must be (n_members, lat, lon); got shape {members.shape}"
+        )
+    return np.isfinite(members).sum(axis=0).astype(np.float32)
+
+
+def _observed_cells(
+    counts: npt.NDArray[np.int64],
+    *,
+    expected_members: int,
+    min_coverage_ratio: float | None,
+) -> npt.NDArray[np.bool_]:
+    """Which cells have enough finite members to be aggregated.
+
+    The floor is the platform's own rule (``domain.coverage.is_cell_statistically_valid``), so
+    the aggregate refuses exactly the cells the serving tier would refuse -- not a stricter set.
+    """
+    from domain.coverage import is_cell_statistically_valid
+
+    return np.asarray(
+        is_cell_statistically_valid(
+            counts, expected_members, min_coverage_ratio=min_coverage_ratio
+        ),
+        dtype=np.bool_,
+    )
+
+
+def _cell_moments(
+    stack: npt.NDArray[np.float32],
+) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+    """Per-cell mean and standard deviation over the finite members.
+
+    Two paths, chosen because they are needed for different inputs rather than for speed:
+
+    * a stack with no non-finite member takes the plain ``mean``/``std``, which are bit-identical
+      to the NaN-aware forms *only* there (verified on real shapes, not assumed) and cost 0.005 s
+      and 0.038 s against 0.067 s and 0.102 s for a 30 x 721 x 1440 stack -- 12.8x and 2.7x;
+    * otherwise the NaN-aware forms, which are the only ones that give the *finite* members'
+      moments rather than propagating one gap across the whole cell.
+
+    The common case is the first: a complete member set has no gaps. The check that selects the
+    path is one pass, against the two reductions it guards.
+    """
+    if np.isnan(stack).any():
+        return np.nanmean(stack, axis=0), np.nanstd(stack, axis=0)
+    return np.mean(stack, axis=0), np.std(stack, axis=0)
 
 
 def _compute_mean_std_bins(
     stack: npt.NDArray[np.float32],
     spec: AggregateSpec,
+    *,
+    observed: npt.NDArray[np.bool_],
+    counts: npt.NDArray[np.int64],
 ) -> npt.NDArray[np.float32]:
-    """``MEAN``, ``STD`` and normalised histogram bins."""
-    n_members = stack.shape[0]
-
-    # mean/std over a complete member axis: identical to the NaN-aware forms here, and
-    # 7x/2.5x cheaper. Any NaN in the stack propagates to NaN, which is the intended
-    # semantics for a cell that is not fully observed.
-    mean = np.mean(stack, axis=0)
-    std = np.std(stack, axis=0)
+    """``MEAN``, ``STD`` and normalised histogram bins over the finite members of each cell."""
+    mean, std = _cell_moments(stack)
 
     # A zero-spread cell (every member identical) has no shape; the floor keeps the
     # normalisation finite without making the bins meaningful, and matches the reference's
@@ -334,14 +428,14 @@ def _compute_mean_std_bins(
         lower = edges[index]
         upper = edges[index + 1]
         out[2 + index] = (
-            np.sum((normalised >= lower) & (normalised < upper), axis=0) / n_members
+            np.sum((normalised >= lower) & (normalised < upper), axis=0) / counts
         ).astype(np.float32)
 
-    # A NaN member already makes MEAN and STD NaN, but NaN fails every comparison, so the
-    # bins would come out as 0 instead -- a cell that decodes as a shape summing to zero
-    # rather than as "unknown". Propagate the undefinedness to every field so the whole
-    # cell is consistently unobserved.
-    undefined = ~np.isfinite(mean)
+    # A cell with too few finite members has no aggregate to report. NaN fails every
+    # comparison, so an undefined cell would otherwise decode as a shape summing to zero --
+    # indistinguishable from "no member landed in any bin". Every field is set together so the
+    # cell is consistently unobserved rather than partially so.
+    undefined = ~observed
     if undefined.any():
         out[:, undefined] = np.float32(np.nan)
 
@@ -351,43 +445,53 @@ def _compute_mean_std_bins(
 def _compute_quantile_function(
     stack: npt.NDArray[np.float32],
     spec: AggregateSpec,
+    *,
+    observed: npt.NDArray[np.bool_],
+    counts: npt.NDArray[np.int64],
 ) -> npt.NDArray[np.float32]:
     """One plane per probability level: a sampled inverse CDF in the variable's units.
 
     The sample quantile uses linear interpolation on the sorted member axis, at position
-    ``p * (n - 1)``. That convention is fixed here and duplicated nowhere: a reader that
-    interpolates between two stored levels with a different convention, or a writer that
-    samples with a different one, would disagree at the level of a single member step.
+    ``p * (k - 1)`` for that cell's finite count ``k``. That convention is fixed here and
+    duplicated nowhere: a reader that interpolates between two stored levels with a different
+    convention, or a writer that samples with a different one, would disagree at the level of a
+    single member step. It is also the convention the serving path arrives at once it has
+    filtered to finite members, so a cell holding 29 of 30 members reports the quantile of those
+    29 rather than of a 30-member sample with a hole in it.
 
-    Members are sorted once for all levels. ``np.percentile`` per level re-partitions the
-    array each time, measured ~50x slower on a 30 x 721 x 1440 stack for identical values.
+    Non-finite members are excluded per cell. NaN sorts last in numpy, so mapping NaN to +inf
+    before sorting puts each cell's finite members in ascending order at the head of its column,
+    which is what makes the positions below index only within the finite prefix.
+
+    The per-level interpolation is one vectorised pass rather than a Python loop per level,
+    because ``k`` varies by cell and the bracketing indices are therefore arrays. ``np.percentile``
+    per level re-partitions the array each time, measured ~50x slower on a 30 x 721 x 1440 stack.
     """
     levels = spec.quantile_levels()
-    n_members = stack.shape[0]
 
-    # NaN sorts last in numpy, so an incomplete cell would report finite quantiles drawn
-    # from the missing members at the tail and NaN at the head. Sorting with NaN mapped to
-    # +inf and then restoring the undefinedness per cell keeps every level for an
-    # incomplete cell NaN, which is the intended semantics.
-    observed = np.isfinite(stack).all(axis=0)
     ordered = np.sort(np.where(np.isfinite(stack), stack, np.float32(np.inf)), axis=0)
 
     out = np.empty((len(levels), *stack.shape[1:]), dtype=np.float32)
-    last = n_members - 1
+    # A single-member cell has no span to interpolate: every level is that member's value.
+    span = np.maximum(counts - 1, 0)
+    lat_idx, lon_idx = np.indices(stack.shape[1:])
     for index, level in enumerate(levels):
-        position = level * last
-        lower = int(np.floor(position))
-        upper = min(lower + 1, last)
+        position = level * span
+        lower = np.floor(position).astype(np.int64)
+        upper = np.minimum(lower + 1, span)
+        # The two weights are rounded to float32 individually, matching the scalar spelling this
+        # replaced: there each weight was a Python float, which NumPy treats as a weak scalar and
+        # applies in float32 (NEP 50). Computing `1.0 - fraction` in float32 would instead round
+        # the subtrahend first and differ by an ulp on some cells, which is enough to break the
+        # bit-for-bit agreement the aggregate pass is verified against.
         fraction = position - lower
-        if upper == lower:
-            out[index] = ordered[lower]
-            continue
-        # Interpolate with the weight as a Python float, which NumPy treats as a weak scalar
-        # and applies in float32 (NEP 50). Promoting to float64 first and rounding once is
-        # the "more accurate" spelling and differs from the reference by one float32 ulp
-        # (~2e-6) on the wider levels -- harmless numerically, but it would break the
-        # bit-for-bit equivalence the aggregate pass is verified against.
-        out[index] = ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+        weight_high = fraction.astype(np.float32)
+        weight_low = (1.0 - fraction).astype(np.float32)
+        # Gather each cell's bracketing pair: lower/upper are per cell, so the take is along
+        # the member axis at per-column indices.
+        low_vals = ordered[lower, lat_idx, lon_idx]
+        high_vals = ordered[upper, lat_idx, lon_idx]
+        out[index] = low_vals * weight_low + high_vals * weight_high
 
     if not observed.all():
         out[:, ~observed] = np.float32(np.nan)

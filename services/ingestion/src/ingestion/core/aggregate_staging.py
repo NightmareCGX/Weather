@@ -36,7 +36,12 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
-from domain.aggregate import AggregateSpec, compute_aggregate
+from domain.aggregate import (
+    MEMBER_COUNT_SCALE,
+    AggregateSpec,
+    compute_aggregate,
+    finite_member_count,
+)
 from domain.shard_format import (
     SHARD_V1_MAGIC,
     TRAILER_SIZE,
@@ -48,6 +53,7 @@ from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.aggregate_writer import (
     AggregateShardLayout,
+    AggregateWriterError,
     aggregate_store_relative_key,
     encode_aggregate_shard,
     layout_for_spec,
@@ -272,20 +278,41 @@ def aggregate_from_planes(
     spec: AggregateSpec,
     grid_lat: int,
     grid_lon: int,
+    expected_members: int | None = None,
 ) -> bytes:
     """Compute and encode the aggregate container from member planes.
 
+    The stored field vector is the encoding's own fields **preceded by the per-cell finite-member
+    count** (``domain.field_layout``). The container records that count per cell rather than per
+    container because one member can be missing at one cell and present at its neighbour, and the
+    count is what the serving coverage rule and the reported ``member_count`` are read from.
+
+    Fields are quantised to int16 at their own scales before encoding. That is not an
+    optimisation that can be deferred: measured on real GEFS members it is 17.73 MB -> 13.54 MB
+    for a 34-field container, and the domain has carried the quantiser and its clipping guard all
+    along. Each field's step differs -- a 314 K mean at a bin probability's 0.001 would need
+    314000 and overflow -- which is why the descriptor stores the per-field marker rather than a
+    single scale.
+
+    The scales come from the spec being encoded, and the reader derives them from the variable's
+    approved spec. That pair agrees because :func:`aggregate_staged_lead` -- the only production
+    caller -- obtains its spec from ``spec_for(variable)`` and checks it against the variable's
+    stored layout before calling this.
+
     Args:
         planes: One plane per member. Order does not affect the result.
-        spec: Which statistics to store and how to quantise them.
+        spec: Which statistics to store.
         grid_lat: Grid latitude extent.
         grid_lon: Grid longitude extent.
+        expected_members: The contract's member count, which the per-cell coverage floor is
+            measured against. Defaults to the number of planes supplied.
 
     Returns:
-        The ``sharded_v2`` container bytes, carrying the member count it was computed from.
+        The ``sharded_v2`` container bytes.
 
     Raises:
-        StagingError: if no plane is supplied or the shapes disagree with the grid.
+        StagingError: if no plane is supplied, the shapes disagree with the grid, or a field
+            would exceed its quantisation scale.
     """
     materialised = [np.asarray(plane, dtype=np.float32) for plane in planes]
     if not materialised:
@@ -295,12 +322,27 @@ def aggregate_from_planes(
         raise StagingError(
             f"member planes have shape {stack.shape[1:]}, expected {(grid_lat, grid_lon)}"
         )
-    fields = compute_aggregate(stack, spec)
-    layout = layout_for_spec(spec, grid_lat=grid_lat, grid_lon=grid_lon)
-    # The member count is not derivable from the statistics an aggregate stores, so it is
-    # recorded in the descriptor, where a reader reaches it in the same tail read that gives
-    # it the geometry.
-    return encode_aggregate_shard(list(fields), layout, member_count=int(stack.shape[0]))
+
+    fields = [finite_member_count(stack)]
+    fields.extend(
+        compute_aggregate(
+            stack,
+            spec,
+            expected_members=expected_members or stack.shape[0],
+        )
+    )
+    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
+
+    layout = layout_for_spec(spec, grid_lat=grid_lat, grid_lon=grid_lon, n_fields=len(fields))
+    try:
+        return encode_aggregate_shard(
+            fields,
+            layout,
+            member_count=int(stack.shape[0]),
+            field_scales=scales,
+        )
+    except AggregateWriterError as exc:
+        raise StagingError(f"cannot encode the aggregate for {spec.kind}: {exc}") from exc
 
 
 def aggregate_staged_lead(
@@ -358,6 +400,7 @@ def aggregate_staged_lead(
         spec=spec,
         grid_lat=grid_lat,
         grid_lon=grid_lon,
+        expected_members=expected_members or len(staged),
     )
     key = aggregate_store_relative_key(variable_code, lead_time_hours)
     io.write(key, container)
@@ -381,10 +424,20 @@ def aggregate_layout_for(
     grid_lon: int,
     chunk_lat: int = 100,
     chunk_lon: int = 100,
+    n_fields: int | None = None,
 ) -> AggregateShardLayout:
-    """Layout an aggregate shard will have, for callers that need it before reading."""
+    """Layout an aggregate shard will have, for callers that need it before reading.
+
+    ``n_fields`` defaults to the spec's own count plus one, because every stored container
+    carries the per-cell member count ahead of the encoding's fields.
+    """
     return layout_for_spec(
-        spec, grid_lat=grid_lat, grid_lon=grid_lon, chunk_lat=chunk_lat, chunk_lon=chunk_lon
+        spec,
+        grid_lat=grid_lat,
+        grid_lon=grid_lon,
+        chunk_lat=chunk_lat,
+        chunk_lon=chunk_lon,
+        n_fields=spec.n_fields + 1 if n_fields is None else n_fields,
     )
 
 

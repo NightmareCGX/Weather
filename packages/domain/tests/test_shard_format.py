@@ -27,9 +27,9 @@ from domain.shard_format import (
     build_container_v2,
     build_descriptor,
     build_trailer,
+    container_member_count,
     container_tail_size,
     extract_chunk,
-    member_count_from_descriptor,
     parse_descriptor,
     parse_index,
     parse_trailer,
@@ -264,18 +264,17 @@ def test_descriptor_carries_the_member_count_a_reader_cannot_derive() -> None:
     )
 
 
-def test_member_count_is_per_point_only_through_the_observed_cell_property() -> None:
-    """``member_count`` reports the count at a point, and the aggregate stores it per shard.
+def test_container_member_count_is_the_total_not_the_per_point_answer() -> None:
+    """The descriptor holds the container-wide total; the per-point count is a stored field.
 
-    The two agree because a single non-finite member makes *every* field at that cell
-    non-finite, so "all fields finite here" means "computed from the full member set". A
-    container with no count yields ``None`` so a caller falls back rather than inventing one.
+    Both exist because they answer different questions. This one says whether a container was
+    built from the complete member set -- the first thing to check when a statistic looks wrong.
+    The per-point count (how many members were finite at one cell) cannot be stored here, since
+    it varies by cell, so it travels as field 0 of the field vector.
     """
-    counted = _descriptor(member_count=30)
-    assert member_count_from_descriptor(counted, observed=True) == 30
-    assert member_count_from_descriptor(counted, observed=False) == 0
-    # A member shard, or an unimplemented case, carries no count.
-    assert member_count_from_descriptor(_descriptor(), observed=True) is None
+    assert container_member_count(_descriptor(member_count=30)) == 30
+    # A member shard, or an unimplemented case, records none.
+    assert container_member_count(_descriptor()) is None
 
 
 def test_parse_descriptor_rejects_impossible_geometry() -> None:

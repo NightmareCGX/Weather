@@ -176,30 +176,18 @@ class ShardDescriptor:
         return chunk_row * lon_chunks + chunk_col
 
 
-def member_count_from_descriptor(
-    descriptor: ShardDescriptor, *, observed: bool
-) -> int | None:
-    """The per-point member count an aggregate container implies, or ``None``.
+def container_member_count(descriptor: ShardDescriptor) -> int | None:
+    """How many members this container was aggregated from, or ``None`` if it records none.
 
-    The API reports ``member_count`` as "the members with a finite value **at this point**"
-    (``services/api/src/api/services/ensemble_data.py``). An aggregate stores the count for the
-    whole container instead, because the per-point answer is not recoverable from it -- but the
-    two coincide under a property both encodings hold: a single non-finite member makes *every*
-    field at that cell non-finite (``domain.aggregate.compute_aggregate`` sets all of them), so
-    a cell whose fields are all finite was computed from the full set, and a cell with any
-    non-finite field was not.
+    This is the **container-wide** total, which is what the descriptor can hold. The count the
+    API reports is per point -- one member can be missing at one cell and present at its
+    neighbour -- and that one is stored as field 0 of the field vector (see
+    ``domain.field_layout``), so a reader wanting the per-point answer reads the field, not this.
 
-    Args:
-        descriptor: The container's descriptor.
-        observed: Whether the queried cell's aggregate values are all finite.
-
-    Returns:
-        ``member_count`` for an observed cell, ``0`` for an unobserved one, and ``None`` when
-        the descriptor does not carry a count, so a caller can fall back rather than invent one.
+    The total is worth keeping anyway: it says whether a container was built from the complete
+    member set, which is the first thing to check when a statistic looks wrong.
     """
-    if descriptor.member_count <= 0:
-        return None
-    return descriptor.member_count if observed else 0
+    return descriptor.member_count if descriptor.member_count > 0 else None
 
 
 #: Numeric format version recorded in the descriptor, and the only one parse_descriptor

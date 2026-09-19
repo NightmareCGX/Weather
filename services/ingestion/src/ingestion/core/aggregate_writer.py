@@ -33,11 +33,20 @@ import numpy as np
 import numpy.typing as npt
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
-from domain.aggregate import KIND_MEAN_STD_BINS, AggregateSpec
+from domain.aggregate import (
+    KIND_MEAN_STD_BINS,
+    NAN_SENTINEL,
+    AggregateError,
+    AggregateSpec,
+    dequantise_field,
+    quantise_field,
+)
 from domain.shard_format import (
     DESCRIPTOR_SIZE,
     ENCODING_F32,
+    ENCODING_I16,
     INDEX_ENTRY_SIZE,
+    PER_FIELD_SCALE,
     SHARD_V2_MAGIC,
     TRAILER_SIZE,
     ShardDescriptor,
@@ -216,17 +225,22 @@ def layout_from_descriptor(descriptor: ShardDescriptor) -> AggregateShardLayout:
 
 
 def _chunk_buffer(
-    plane: npt.NDArray[np.float32],
+    plane: npt.NDArray[np.generic],
     row: int,
     col: int,
     layout: AggregateShardLayout,
-) -> npt.NDArray[np.float32]:
-    """Extract one NaN-padded float32 chunk buffer from a plane.
+) -> npt.NDArray[np.generic]:
+    """Extract one padded chunk buffer from a plane, in the plane's own dtype.
 
-    Edge chunks are padded to the full chunk extent, matching the member-shard writer, so
-    every chunk in a container has the same byte length before compression.
+    Edge chunks are padded to the full chunk extent, matching the member-shard writer, so every
+    chunk in a container has the same byte length before compression. The pad value follows the
+    dtype: NaN for float planes and :data:`NAN_SENTINEL` for fixed-point ones, since a stored
+    int16 cannot hold NaN and a zero pad would decode as a real value.
     """
-    buffer = np.full((layout.chunk_lat, layout.chunk_lon), np.nan, dtype=np.float32)
+    if plane.dtype == np.int16:
+        buffer = np.full((layout.chunk_lat, layout.chunk_lon), NAN_SENTINEL, dtype=np.int16)
+    else:
+        buffer = np.full((layout.chunk_lat, layout.chunk_lon), np.nan, dtype=np.float32)
     r0, c0 = row * layout.chunk_lat, col * layout.chunk_lon
     r1 = min(r0 + layout.chunk_lat, plane.shape[0])
     c1 = min(c0 + layout.chunk_lon, plane.shape[1])
@@ -241,6 +255,7 @@ def encode_aggregate_shard(
     *,
     level: int = DEFAULT_ZSTD_LEVEL,
     member_count: int = 0,
+    field_scales: tuple[float, ...] | None = None,
 ) -> bytes:
     """Encode statistic planes into a single ``sharded_v2`` container.
 
@@ -250,24 +265,90 @@ def encode_aggregate_shard(
         level: Zstd level for the inner chunks.
         member_count: Ensemble members the planes were computed from, recorded in the
             descriptor. ``0`` for a container that is not a member aggregate.
+        field_scales: Fixed-point step per field. When given, each plane is quantised to int16
+            at its own step before compression and the container declares the ``i16`` encoding
+            with the per-field scale marker; when ``None`` the planes are stored as float32.
+            Per field rather than per container because one aggregate holds fields of different
+            magnitudes -- a 314 K mean at a bin probability's 0.001 step would need 314000 and
+            overflow int16 -- and quantising is not optional for size: measured on real GEFS
+            members, float32 17.73 MB becomes 13.54 MB as int16 at the spec's scales.
 
     Returns:
         The container bytes: payload, index, descriptor, trailer.
 
     Raises:
-        AggregateWriterError: if the plane count or shapes disagree with the layout.
+        AggregateWriterError: if the plane count or shapes disagree with the layout, or a
+            field would exceed its scale's range. A field that clips is silently wrong *and*
+            compresses better, so it is refused rather than clamped.
     """
     if len(planes) != layout.n_fields:
         raise AggregateWriterError(
             f"{len(planes)} planes but layout declares {layout.n_fields} fields"
         )
-    compressor = Zstd(level=level)
     for field, plane in enumerate(planes):
         if plane.shape != (layout.grid_lat, layout.grid_lon):
             raise AggregateWriterError(
                 f"field {field} has shape {plane.shape}, expected "
                 f"{(layout.grid_lat, layout.grid_lon)}"
             )
+
+    if field_scales is not None:
+        if len(field_scales) != len(planes):
+            raise AggregateWriterError(
+                f"{len(field_scales)} scales for {len(planes)} fields"
+            )
+        try:
+            codes = quantise_planes(planes, field_scales)
+        except AggregateError as exc:
+            raise AggregateWriterError(str(exc)) from exc
+        return _assemble(
+            codes, layout, level=level, member_count=member_count,
+            encoding_id=ENCODING_I16, scale=PER_FIELD_SCALE,
+        )
+
+    return _assemble(
+        planes, layout, level=level, member_count=member_count,
+        encoding_id=ENCODING_F32, scale=1.0,
+    )
+
+
+def quantise_planes(
+    planes: Sequence[npt.NDArray[np.float32]],
+    field_scales: tuple[float, ...],
+) -> list[npt.NDArray[np.int16]]:
+    """Quantise each plane at its own step, refusing any that would clip.
+
+    Delegates to :func:`domain.aggregate.quantise_field` for the arithmetic so the writer and
+    the domain's own round-trip tests agree by construction rather than by inspection, and adds
+    the range check that ``encode_aggregate`` performs for a spec-driven call.
+    """
+    if len(planes) != len(field_scales):
+        raise AggregateError(f"{len(planes)} fields but {len(field_scales)} scales")
+    for index, (plane, scale) in enumerate(zip(planes, field_scales, strict=True)):
+        finite = np.isfinite(plane)
+        if finite.any() and np.any(np.abs(plane[finite] / scale) > np.iinfo(np.int16).max):
+            raise AggregateError(
+                f"field {index} exceeds its scale {scale} and would clip; widen the scale"
+            )
+    return [quantise_field(plane, scale) for plane, scale in zip(planes, field_scales, strict=True)]
+
+
+def _assemble(
+    planes: Sequence[npt.NDArray[np.generic]],
+    layout: AggregateShardLayout,
+    *,
+    level: int,
+    member_count: int,
+    encoding_id: int,
+    scale: float,
+) -> bytes:
+    """Compress and index a set of equally-shaped planes into a container.
+
+    Shared by the float and fixed-point paths: the only difference between them is the buffer
+    dtype and what the descriptor declares, so the chunking, the spatial-major emit order and
+    the index assembly exist once.
+    """
+    compressor = Zstd(level=level)
 
     # Emit in spatial-major order so the payload matches chunk_ordinal: one location's fields
     # adjacent. Iterating field-major here would silently produce a container whose index
@@ -280,7 +361,10 @@ def encode_aggregate_shard(
                 payloads.append(compressor.encode(buffer.tobytes(order="C")))
 
     return build_container_v2(
-        payloads, descriptor=layout.to_descriptor(member_count=member_count)
+        payloads,
+        descriptor=layout.to_descriptor(
+            member_count=member_count, encoding_id=encoding_id, scale=scale
+        ),
     )
 
 
@@ -293,15 +377,28 @@ _DECODER = Zstd()
 def decode_aggregate_chunk(
     container: bytes,
     ordinal: int,
+    *,
+    field_scales: tuple[float, ...] | None = None,
 ) -> npt.NDArray[np.float32]:
-    """Decode one chunk from an aggregate container by its ordinal.
+    """Decode one chunk from an aggregate container by its ordinal, as float32.
+
+    Applies the container's declared encoding. A fixed-point payload needs the per-field steps,
+    which the descriptor cannot carry (one field cannot describe an aggregate whose fields
+    differ: a 314 K mean needs 0.01 while a bin probability wants 0.001), so ``field_scales``
+    supplies the stored-field table. Both tiers derive it from the variable -- the writer from
+    the spec it was handed, the reader from ``domain.field_layout`` -- so it is passed in rather
+    than guessed.
 
     Args:
         container: The full container bytes.
         ordinal: Row-major chunk ordinal across all field planes.
+        field_scales: Step per stored field, in storage order (the member-count field first).
+            Required for a fixed-point payload.
 
     Raises:
-        AggregateWriterError: if the container is malformed or the ordinal is off-grid.
+        AggregateWriterError: if the container is malformed, the ordinal is off-grid, or a
+            fixed-point payload was handed no usable table. The last is a refusal rather than a
+            default: there is no step a reader could safely assume.
     """
     if len(container) < TRAILER_SIZE + DESCRIPTOR_SIZE:
         raise AggregateWriterError(f"container too short: {len(container)} bytes")
@@ -316,17 +413,37 @@ def decode_aggregate_chunk(
     index_bytes, descriptor = split_v2_tail(container[tail_start:], num_chunks)
     layout = layout_from_descriptor(descriptor)
 
-    _, row, col = layout.locate(ordinal)
+    # Which field this chunk belongs to is what selects the scale, and the layout answers it.
+    field, _row, _col = layout.locate(ordinal)
     entries = parse_index(index_bytes, num_chunks)
     offset, length = entries[ordinal]
     if length == 0:
         return np.full((layout.chunk_lat, layout.chunk_lon), np.nan, dtype=np.float32)
+
     raw = _DECODER.decode(container[offset : offset + length])
-    return (
-        np.frombuffer(raw, dtype=np.float32)
-        .reshape(layout.chunk_lat, layout.chunk_lon)
-        .copy()
+    if descriptor.encoding_id == ENCODING_F32:
+        return (
+            np.frombuffer(raw, dtype=np.float32)
+            .reshape(layout.chunk_lat, layout.chunk_lon)
+            .copy()
+        )
+    if descriptor.encoding_id != ENCODING_I16:  # pragma: no cover - parse rejects others
+        raise AggregateWriterError(
+            f"container declares unknown encoding {descriptor.encoding_id}"
+        )
+    scale = descriptor.scale
+    if scale == PER_FIELD_SCALE:
+        if field_scales is None or len(field_scales) != layout.n_fields:
+            raise AggregateWriterError(
+                "this container stores fixed-point codes at per-field scales, but "
+                f"{'no' if field_scales is None else len(field_scales)} scales were supplied "
+                f"for {layout.n_fields} fields; there is no step a reader could assume"
+            )
+        scale = float(field_scales[field])
+    codes = np.frombuffer(raw, dtype=np.int16).reshape(
+        layout.chunk_lat, layout.chunk_lon
     )
+    return dequantise_field(codes.copy(), scale)
 
 
 def chunk_ordinals_for_field(
@@ -359,10 +476,17 @@ def layout_for_spec(
     grid_lon: int,
     chunk_lat: int = DEFAULT_CHUNK_LAT,
     chunk_lon: int = DEFAULT_CHUNK_LON,
+    n_fields: int | None = None,
 ) -> AggregateShardLayout:
-    """Build the layout for a given aggregate spec and grid."""
+    """Build the layout for a given aggregate spec and grid.
+
+    ``n_fields`` overrides the spec's own field count, which a caller needs when the container
+    also carries fields the spec does not know about -- the per-cell member count leads every
+    stored field vector and is not part of an ``AggregateSpec``, since a spec describes a
+    distribution rather than how it is packaged.
+    """
     return AggregateShardLayout(
-        n_fields=spec.n_fields,
+        n_fields=spec.n_fields if n_fields is None else n_fields,
         grid_lat=grid_lat,
         grid_lon=grid_lon,
         chunk_lat=chunk_lat,
