@@ -12,6 +12,7 @@ from domain.locks import (
     canonical_storage_identity,
     logical_region_encoding,
     manifest_canonical_json,
+    parse_logical_region_encoding,
     physical_conflict_identity,
     region_key,
     serving_state_fingerprint,
@@ -161,6 +162,49 @@ def test_logical_region_encoding() -> None:
     assert logical_region_encoding(lead_time_hours=6, member=17) == "mem017_L0006"
     assert logical_region_encoding(lead_time_hours=0, member=0) == "mem000_L0000"
     assert logical_region_encoding(lead_time_hours=6, is_mean=True) == "mean_L0006"
+
+
+def test_parse_logical_region_encoding_inverts_the_encoder() -> None:
+    """The decode must be the exact inverse of the encode for every region shape.
+
+    The encoder writes object keys; the decoder reads identities back *off storage*. Two
+    hand-maintained copies of this grammar drifted apart before, so the round trip is
+    pinned here rather than left to the callers.
+    """
+    for kwargs, expected in (
+        ({"lead_time_hours": 6}, (None, 6, False)),
+        ({"lead_time_hours": 0}, (None, 0, False)),
+        ({"lead_time_hours": 6, "member": 17}, (17, 6, False)),
+        ({"lead_time_hours": 0, "member": 0}, (0, 0, False)),
+        ({"lead_time_hours": 6, "is_mean": True}, (None, 6, True)),
+        ({"lead_time_hours": 240, "member": 100}, (100, 240, False)),
+    ):
+        assert parse_logical_region_encoding(logical_region_encoding(**kwargs)) == expected
+
+
+def test_parse_logical_region_encoding_rejects_malformed_ids() -> None:
+    """Malformed ids must raise, not be silently coerced into a plausible region.
+
+    The parser this replaces read ``member`` from fixed character offsets, so an
+    unrecognised prefix returned lead 0 for any input -- which would attribute a foreign
+    object to the first lead and publish on evidence that was never a region marker.
+    """
+    for bad in (
+        "",
+        "det",
+        "det_0006",
+        "det_L",
+        "det_Labcd",
+        "mem017",
+        "mem_L0006",
+        "memabc_L0006",
+        "mem0001_L0006",
+        "mean_",
+        "mean_Lx",
+        "median_L0006",
+    ):
+        with pytest.raises(ValueError):
+            parse_logical_region_encoding(bad)
 
 
 def test_physical_conflict_identity() -> None:

@@ -16,9 +16,12 @@ import pytest
 from ingestion.core.markers import (
     HYBRID,
     LEGACY,
+    MARKER_ROOT,
     MARKER_V1,
     MarkerError,
     ProtocolVersionError,
+    assert_marker_namespace,
+    candidate_region_marker_keys,
     list_region_marker_keys,
     manifest_key,
     marker_body,
@@ -54,6 +57,71 @@ def test_marker_key_scoped_and_safe() -> None:
     assert "s3://" not in k
     k2 = marker_key("s3://b/prefix", lead_time_hours=6, member=17)
     assert k2 == "__commit__/v1/regions/mem017_L0006.json"
+
+
+def test_marker_key_matches_the_published_root() -> None:
+    """The exported MARKER_ROOT must be the prefix the keys are actually built from."""
+    assert MARKER_ROOT == "__commit__/v1/regions"
+    for kwargs in (
+        dict(lead_time_hours=6, member=None),
+        dict(lead_time_hours=6, member=17),
+        dict(lead_time_hours=6, member=None, is_mean=True),
+    ):
+        key = marker_key("s3://b/prefix", **kwargs)
+        assert key.startswith(f"{MARKER_ROOT}/")
+        assert_marker_namespace(key)
+
+
+def test_candidate_region_marker_keys_matches_written_markers(tmp_path) -> None:
+    """Candidate keys must be the real keys, not a plausible-looking spelling.
+
+    ``publish_settled_lead`` addressed markers through a hardcoded ``.markers/regions/...``
+    prefix that does not exist in the store; it only worked because the reader re-derived
+    the key from the basename and ignored the prefix. Deriving the candidates from the same
+    authority the writer uses removes that latent mismatch -- and the assertion below is
+    what makes a future divergence fail here instead of on a live publication.
+    """
+    store = str(tmp_path / "store.zarr")
+    for member in (1, 2, 3):
+        write_region_marker(
+            store,
+            lead_time_hours=6,
+            member=member,
+            payload={"state": "complete"},
+        )
+    write_region_marker(store, lead_time_hours=6, member=None, payload={"state": "complete"})
+    write_region_marker(
+        store, lead_time_hours=6, member=None, payload={"state": "complete"}, is_mean=True
+    )
+
+    members = candidate_region_marker_keys(lead_time_hours=6, members=(1, 2, 3))
+    assert members == [
+        "__commit__/v1/regions/mem001_L0006.json",
+        "__commit__/v1/regions/mem002_L0006.json",
+        "__commit__/v1/regions/mem003_L0006.json",
+    ]
+    assert candidate_region_marker_keys(lead_time_hours=6) == [
+        "__commit__/v1/regions/det_L0006.json"
+    ]
+    assert candidate_region_marker_keys(lead_time_hours=6, is_mean=True) == [
+        "__commit__/v1/regions/mean_L0006.json"
+    ]
+
+    listed = set(list_region_marker_keys(store))
+    for key in members + candidate_region_marker_keys(lead_time_hours=6):
+        assert key in listed, f"candidate key {key!r} was never written"
+
+
+def test_assert_marker_namespace_rejects_other_namespaces() -> None:
+    """A key outside the marker namespace must be rejected, not silently accepted."""
+    for bad in (
+        ".markers/regions/det_L0006.json",  # the spelling publish_settled_lead used to build
+        "__commit__/v1/manifest.json",
+        "temperature_2m/shard.det_L0006.shard",
+        "det_L0006.json",
+    ):
+        with pytest.raises(MarkerError, match="canonical namespace"):
+            assert_marker_namespace(bad)
 
 
 def test_manifest_key() -> None:

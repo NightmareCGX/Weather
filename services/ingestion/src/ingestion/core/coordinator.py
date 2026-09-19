@@ -44,8 +44,9 @@ from sqlalchemy.orm import Session
 
 from domain.locks import (
     logical_region_encoding,
-    sha256_hex,
+    parse_logical_region_encoding,
     serving_state_fingerprint,
+    sha256_hex,
 )
 from ingestion.core.config import settings
 from ingestion.core.base import (
@@ -63,6 +64,8 @@ from ingestion.core.markers import (
     HYBRID,
     LEGACY,
     MARKER_V1,
+    assert_marker_namespace,
+    candidate_region_marker_keys,
     list_region_marker_keys,
     read_manifest,
     read_protocol_version,
@@ -1073,10 +1076,9 @@ class RunCoordinator:
             committed_for_lead: set[int] = set()
             if spec.is_ensemble:
                 members_to_check = expected_members if expected_members else tuple(range(1, 31))
-                candidate_keys = [
-                    f".markers/regions/mem{m:03d}_L{lead_time_hours:04d}.json"
-                    for m in members_to_check
-                ]
+                candidate_keys = candidate_region_marker_keys(
+                    lead_time_hours=lead_time_hours, members=members_to_check
+                )
                 marker_results = _read_marker_payloads_bounded(
                     self.store_path, candidate_keys, max_concurrency=16
                 )
@@ -1091,7 +1093,9 @@ class RunCoordinator:
                             if m_val is not None:
                                 committed_for_lead.add(int(str(m_val)))
             else:
-                candidate_keys = [f".markers/regions/det_L{lead_time_hours:04d}.json"]
+                candidate_keys = candidate_region_marker_keys(
+                    lead_time_hours=lead_time_hours
+                )
                 marker_results = _read_marker_payloads_bounded(
                     self.store_path, candidate_keys, max_concurrency=1
                 )
@@ -1414,28 +1418,26 @@ def _validate_lead_schema(
 
 
 def _read_marker_payload(store_path: str, key: str) -> dict[str, object]:
-    """Read a marker by its key using the public marker API.
+    """Read a marker by its canonical key (``__commit__/v1/regions/<region>.json``).
 
-    The key is ``__commit__/v1/regions/<region>.json``; the region id is the
-    basename without the ``.json`` suffix.
+    The key's namespace is asserted rather than assumed: a marker read that silently
+    succeeded on a mis-prefixed key made prefix typos undetectable, because the payload was
+    re-derived from the basename alone.
+
+    Raises:
+        MarkerError: if ``key`` is outside the marker namespace or its region id is not a
+            logical region identity. Callers enumerate keys through
+            :func:`candidate_region_marker_keys` or ``list_region_marker_keys``, so a
+            malformed key means the caller is addressing the wrong object.
     """
     from ingestion.core.markers import read_region_marker
 
+    assert_marker_namespace(key)
     region_id = key.rsplit("/", 1)[-1].removesuffix(".json")
-    if region_id.startswith("det_"):
-        lead = int(region_id[len("det_L") :])
-        return read_region_marker(store_path, lead_time_hours=lead, member=None)
-    if region_id.startswith("mean_"):
-        lead = int(region_id[len("mean_L") :])
-        return read_region_marker(
-            store_path, lead_time_hours=lead, member=None, is_mean=True
-        )
-    if region_id.startswith("mem"):
-        _, _, rest = region_id.partition("_L")
-        member = int(region_id[3:6])
-        lead = int(rest)
-        return read_region_marker(store_path, lead_time_hours=lead, member=member)
-    return {"state": "absent"}
+    member, lead, is_mean = parse_logical_region_encoding(region_id)
+    return read_region_marker(
+        store_path, lead_time_hours=lead, member=member, is_mean=is_mean
+    )
 
 
 def _read_marker_payloads_bounded(
@@ -1626,21 +1628,21 @@ def _region_serving_states(
 
 
 def _parse_region_id(region_id: str) -> tuple[int | None, int]:
-    """Parse a logical region id (``det_L0006`` / ``mem017_L0006`` / ``mean_L0006``)."""
-    if region_id.startswith("det_"):
-        lead = int(region_id[len("det_L") :])
-        return None, lead
-    if region_id.startswith("mean_"):
-        lead = int(region_id[len("mean_L") :])
-        return None, lead
-    if region_id.startswith("mem"):
-        _, _, rest = region_id.partition("_L")
-        member = int(region_id[3:6])
-        lead = int(rest)
-        return member, lead
-    raise ValueError(f"cannot parse region id {region_id!r}")
+    """Parse a logical region id into ``(member, lead_time_hours)``.
+
+    Thin projection of :func:`domain.locks.parse_logical_region_encoding`, which owns the
+    grammar. This local spelling derived ``member`` from fixed character offsets
+    (``region_id[3:6]``), so a member index of 100 or more, or any id whose prefix merely
+    started with "mem", would have been misread instead of rejected.
+    """
+    member, lead, _is_mean = parse_logical_region_encoding(region_id)
+    return member, lead
 
 
 def is_mean_region_id(region_id: str) -> bool:
     """Return True if the logical region id represents an official mean product."""
-    return region_id.startswith("mean_")
+    try:
+        _member, _lead, is_mean = parse_logical_region_encoding(region_id)
+    except ValueError:
+        return False
+    return is_mean

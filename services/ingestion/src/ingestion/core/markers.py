@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Mapping
+from collections.abc import Iterable, Mapping
 
 import s3fs  # type: ignore[import-untyped]
 
@@ -69,6 +69,11 @@ class MarkerError(RuntimeError):
 
 def version_sidecar_key() -> str:
     return _VERSION_ROOT
+
+
+#: Prefix every region marker shares. Callers that expect to enumerate or address region
+#: markers can assert against this instead of hardcoding a stale spelling.
+MARKER_ROOT = _MARKER_ROOT
 
 
 def marker_key(
@@ -275,6 +280,41 @@ def read_region_marker(
         store_path, lead_time_hours=lead_time_hours, member=member, is_mean=is_mean
     )
     return _marker_payload(store_path, key)
+
+
+def candidate_region_marker_keys(
+    *,
+    lead_time_hours: int,
+    members: Iterable[int] | None = None,
+    is_mean: bool = False,
+) -> list[str]:
+    """Return the canonical marker keys a lead's regions would occupy.
+
+    Callers must address markers by their real keys, not by a hand-built spelling: a wrong
+    prefix used to be tolerated because the reader re-derived the key from the basename
+    alone, which meant a typo could go unnoticed for as long as the basename happened to
+    parse.
+
+    Args:
+        lead_time_hours: The forecast lead in hours.
+        members: Ensemble member indices to enumerate. ``None`` yields the single
+            deterministic/mean key implied by ``is_mean``.
+        is_mean: Whether the region is the official ensemble mean product.
+    """
+    if members is None:
+        return [marker_key("", lead_time_hours=lead_time_hours, member=None, is_mean=is_mean)]
+    return [
+        marker_key("", lead_time_hours=lead_time_hours, member=int(m), is_mean=is_mean)
+        for m in members
+    ]
+
+
+def assert_marker_namespace(key: str) -> None:
+    """Raise ``MarkerError`` if ``key`` is not under the canonical marker namespace."""
+    if not key.startswith(f"{_MARKER_ROOT}/"):
+        raise MarkerError(
+            f"marker key {key!r} is not under the canonical namespace {_MARKER_ROOT!r}"
+        )
 
 
 def write_region_marker(

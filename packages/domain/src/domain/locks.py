@@ -232,6 +232,42 @@ def logical_region_encoding(
     return f"mem{int(member):03d}_{lead_token}"
 
 
+def parse_logical_region_encoding(region_id: str) -> tuple[int | None, int, bool]:
+    """Decode a logical region identity into ``(member, lead_time_hours, is_mean)``.
+
+    The exact inverse of :func:`logical_region_encoding`. Keeping the decode next to the
+    encode is the point: the identity string appears both in object keys (derived from the
+    structured form) and as a *name* read back off storage, and the two spellings have to
+    stay in step. Decoders that reimplemented this grammar drifted from it before.
+
+    Args:
+        region_id: A logical region identity such as ``"det_L0006"``, ``"mem017_L0006"``
+            or ``"mean_L0006"``.
+
+    Returns:
+        ``(member, lead_time_hours, is_mean)``, with ``member`` ``None`` for the
+        deterministic and mean encodings.
+
+    Raises:
+        ValueError: if ``region_id`` is not a well-formed logical region identity.
+    """
+    head, sep, lead_token = region_id.partition("_")
+    if not sep or not lead_token.startswith("L"):
+        raise ValueError(f"cannot parse logical region id {region_id!r}")
+    try:
+        lead_time_hours = int(lead_token[1:])
+    except ValueError as exc:
+        raise ValueError(f"cannot parse logical region id {region_id!r}") from exc
+
+    if head == "det":
+        return None, lead_time_hours, False
+    if head == "mean":
+        return None, lead_time_hours, True
+    if head.startswith("mem") and len(head) == 6 and head[3:].isdigit():
+        return int(head[3:]), lead_time_hours, False
+    raise ValueError(f"cannot parse logical region id {region_id!r}")
+
+
 def physical_conflict_identity(
     *,
     array_path: str,
