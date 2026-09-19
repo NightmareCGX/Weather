@@ -17,7 +17,11 @@ import xarray as xr
 from domain.aggregate import AggregateSpec, compute_aggregate
 from domain.shard_format import SHARD_V1_MAGIC, SHARD_V2_MAGIC
 from ingestion.core import aggregate_staging as staging
-from ingestion.core.aggregate_writer import decode_aggregate_chunk, layout_for_spec
+from ingestion.core.aggregate_writer import (
+    decode_aggregate_chunk,
+    encode_aggregate_shard,
+    layout_for_spec,
+)
 from ingestion.core.zarr_writer import encode_region_sharded_v1
 
 GRID_LAT, GRID_LON = 128, 160  # two chunks each way: 4 chunks per field
@@ -832,3 +836,42 @@ def test_classified_variables_excludes_flags_and_unknown_names() -> None:
         "wind_gust",
     ]
     assert [cls for _v, cls, _s in classified] == ["A", "B"]
+
+
+def test_point_query_reads_four_contiguous_ranges(tmp_path) -> None:
+    """The layout's purpose: a point query's window is four contiguous byte ranges.
+
+    The point path needs every stored field at one location, so under the spatial-major layout
+    all ``n_fields`` chunks of a corner are adjacent in the payload and the four corners form
+    four ranges. Field-major would have made it 2 x n_fields ranges. Asserted on the actual
+    index rather than on the ordinal arithmetic, because the index is what determines the
+    fetches a reader issues.
+    """
+    from domain.shard_format import (
+        DESCRIPTOR_SIZE,
+        TRAILER_SIZE,
+        parse_index,
+        parse_trailer,
+        split_v2_tail,
+    )
+
+    spec = _quantile_spec()
+    planes = [_planes(1, seed=61 + index)[0] for index in range(spec.n_fields)]
+    layout = layout_for_spec(spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
+    container = encode_aggregate_shard(planes, layout)
+
+    trailer = parse_trailer(container[-TRAILER_SIZE:])
+    tail = container[-(trailer.index_byte_size + DESCRIPTOR_SIZE + TRAILER_SIZE) :]
+    index_bytes, _descriptor = split_v2_tail(tail, trailer.num_chunks)
+    entries = parse_index(index_bytes, trailer.num_chunks)
+
+    # The location must have all four corners on-grid: GRID_LAT/LON give 2 x 2 chunks.
+    for row, col in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        group = list(layout.spatial_group(row, col))
+        assert len(group) == spec.n_fields
+        offsets = [entries[ordinal][0] for ordinal in group]
+        lengths = [entries[ordinal][1] for ordinal in group]
+        assert all(
+            offsets[index + 1] == offsets[index] + lengths[index]
+            for index in range(len(group) - 1)
+        ), (row, col, offsets)

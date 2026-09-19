@@ -1,12 +1,23 @@
 """Encoding of aggregate (statistic) shards into ``sharded_v2`` containers.
 
 An aggregate shard replaces the members of one ``(variable, lead)`` region with a small set
-of statistic field planes computed from the whole member set. The planes are laid out as a
-*virtual member axis*: container chunk ordinal ``k`` addresses ``field = k // chunks_per_field``
-with the same row-major ``(row, col)`` split the member shards use. That keeps the reader's
-addressing identical to the existing path -- it asks for a chunk by ``(field, row, col)``
-instead of by ``(member, row, col)`` -- and it keeps random access at one chunk, so a point
-query still fetches a single compressed chunk rather than a whole plane.
+of statistic field planes computed from the whole member set. The planes are laid out
+**spatially first**: chunk ordinal ``k`` addresses ``within, field = divmod(k, n_fields)`` and
+``row, col = divmod(within, lon_chunks)``, so one spatial location's every field sits
+contiguously.
+
+The ordering is chosen for the aggregate's actual consumer, which is the point path:
+``/v1/ensembles``, ``/v1/probabilities`` and the ensemble branch of ``/v1/points`` all resolve
+one latitude/longitude and need every stored field's 2x2 corner window. Laying the fields of
+one location together makes that window four contiguous ranges instead of 2 x n_fields of them
+-- measured at 4 range GETs versus 38-68 depending on the encoding. Each fetch costs ~2.5 ms
+on the deployed host, dominated by s3fs/Python overhead rather than bandwidth, so GET count is
+the cost to minimise.
+
+The bytes are identical under either ordering, so the non-consumer loses nothing. A
+whole-field window read would prefer the other order, but no aggregate consumer does that:
+map tiles and the wind vector field read the separate precomputed MEAN shard
+(``has_mean_shard``) and never reduce members at serve time.
 
 Nothing here chooses *which* statistics to store; that is
 :mod:`domain.aggregate`'s job. This module is only the container plumbing.
@@ -101,12 +112,17 @@ class AggregateShardLayout:
         return self.n_fields * self.chunks_per_field
 
     def chunk_ordinal(self, field: int, row: int, col: int) -> int:
-        """Container chunk ordinal for ``(field, row, col)``, or ``-1`` when off-grid."""
+        """Container chunk ordinal for ``(field, row, col)``, or ``-1`` when off-grid.
+
+        Spatially first: a location's fields are contiguous, so a reader needing the same
+        location across every field fetches one range per location rather than one per
+        (field, location).
+        """
         if not (0 <= field < self.n_fields):
             return -1
         if not (0 <= row < self.lat_chunks and 0 <= col < self.lon_chunks):
             return -1
-        return field * self.chunks_per_field + row * self.lon_chunks + col
+        return (row * self.lon_chunks + col) * self.n_fields + field
 
     def locate(self, ordinal: int) -> tuple[int, int, int]:
         """Inverse of :func:`chunk_ordinal`.
@@ -118,9 +134,25 @@ class AggregateShardLayout:
             raise AggregateWriterError(
                 f"chunk ordinal {ordinal} outside 0..{self.num_chunks - 1}"
             )
-        field, within = divmod(ordinal, self.chunks_per_field)
+        within, field = divmod(ordinal, self.n_fields)
         row, col = divmod(within, self.lon_chunks)
         return field, row, col
+
+    def spatial_group(self, row: int, col: int) -> range:
+        """Chunk ordinals covering every field at one location, in field order.
+
+        This is the group a point query needs whole, which is why the layout exists.
+
+        Raises:
+            AggregateWriterError: if the location is off-grid.
+        """
+        if not (0 <= row < self.lat_chunks and 0 <= col < self.lon_chunks):
+            raise AggregateWriterError(
+                f"location ({row}, {col}) outside the "
+                f"{self.lat_chunks}x{self.lon_chunks} chunk grid"
+            )
+        start = (row * self.lon_chunks + col) * self.n_fields
+        return range(start, start + self.n_fields)
 
     def to_descriptor(self) -> ShardDescriptor:
         """Build the container descriptor for this layout."""
@@ -204,15 +236,20 @@ def encode_aggregate_shard(
             f"{len(planes)} planes but layout declares {layout.n_fields} fields"
         )
     compressor = Zstd(level=level)
-    payloads: list[bytes] = []
     for field, plane in enumerate(planes):
         if plane.shape != (layout.grid_lat, layout.grid_lon):
             raise AggregateWriterError(
                 f"field {field} has shape {plane.shape}, expected "
                 f"{(layout.grid_lat, layout.grid_lon)}"
             )
-        for row in range(layout.lat_chunks):
-            for col in range(layout.lon_chunks):
+
+    # Emit in spatial-major order so the payload matches chunk_ordinal: one location's fields
+    # adjacent. Iterating field-major here would silently produce a container whose index
+    # disagrees with its own geometry.
+    payloads: list[bytes] = []
+    for row in range(layout.lat_chunks):
+        for col in range(layout.lon_chunks):
+            for plane in planes:
                 buffer = _chunk_buffer(plane, row, col, layout)
                 payloads.append(compressor.encode(buffer.tobytes(order="C")))
 
@@ -266,8 +303,12 @@ def decode_aggregate_chunk(
 
 def chunk_ordinals_for_field(
     layout: AggregateShardLayout, field: int
-) -> range:
+) -> list[int]:
     """Chunk ordinals covering one field plane, in row-major order.
+
+    Scattered under the spatial-major layout (the stride is ``n_fields``), so this returns a
+    list rather than a range. A reader that wants a whole plane is better served by walking
+    the spatial groups, but this exists for callers that inspect a single field.
 
     Raises:
         AggregateWriterError: if ``field`` is outside the layout.
@@ -276,8 +317,11 @@ def chunk_ordinals_for_field(
         raise AggregateWriterError(
             f"field {field} outside 0..{layout.n_fields - 1}"
         )
-    start = field * layout.chunks_per_field
-    return range(start, start + layout.chunks_per_field)
+    return [
+        layout.chunk_ordinal(field, row, col)
+        for row in range(layout.lat_chunks)
+        for col in range(layout.lon_chunks)
+    ]
 
 
 def layout_for_spec(

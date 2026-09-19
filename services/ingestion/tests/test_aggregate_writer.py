@@ -98,12 +98,20 @@ def test_layout_handles_a_non_standard_grid() -> None:
     assert layout_from_descriptor(layout.to_descriptor()) == layout
 
 
-def test_chunk_ordinal_is_field_major_then_row_major() -> None:
+def test_chunk_ordinal_is_spatial_major_then_field() -> None:
+    """One location's fields are contiguous; that is what the point path needs whole.
+
+    The ordering is not cosmetic: a point query reads every stored field at one latitude and
+    longitude, so placing those fields together turns its window into four contiguous ranges
+    instead of 2 x n_fields of them.
+    """
     layout = _layout(n_fields=3)
     assert layout.chunk_ordinal(0, 0, 0) == 0
-    assert layout.chunk_ordinal(0, 0, 1) == 1
-    assert layout.chunk_ordinal(0, 1, 0) == layout.lon_chunks
-    assert layout.chunk_ordinal(1, 0, 0) == layout.chunks_per_field
+    assert layout.chunk_ordinal(1, 0, 0) == 1
+    assert layout.chunk_ordinal(2, 0, 0) == 2
+    # the next location starts after this location's fields
+    assert layout.chunk_ordinal(0, 0, 1) == 3
+    assert layout.chunk_ordinal(0, 1, 0) == 3 * layout.lon_chunks
     assert layout.chunk_ordinal(2, 7, 14) == layout.num_chunks - 1
 
 
@@ -157,15 +165,36 @@ def test_layout_for_spec_matches_the_spec_field_count() -> None:
     assert layout.n_fields == spec.n_fields == 10
 
 
+def test_spatial_group_covers_every_field_at_one_location() -> None:
+    """The group a point query consumes whole, in field order."""
+    layout = _layout(n_fields=3)
+    for row in (0, layout.lat_chunks - 1):
+        for col in (0, layout.lon_chunks - 1):
+            group = list(layout.spatial_group(row, col))
+            assert len(group) == layout.n_fields
+            assert group == sorted(group)
+            assert [layout.locate(k) for k in group] == [
+                (field, row, col) for field in range(layout.n_fields)
+            ]
+    with pytest.raises(AggregateWriterError, match="outside the"):
+        layout.spatial_group(layout.lat_chunks, 0)
+    with pytest.raises(AggregateWriterError, match="outside the"):
+        layout.spatial_group(0, layout.lon_chunks)
+
+
 def test_chunk_ordinals_for_field_spans_exactly_one_plane() -> None:
+    """Scattered under the spatial-major layout, but still exactly one plane's worth."""
     layout = _layout(n_fields=3)
     for field in range(3):
-        ordinals = list(chunk_ordinals_for_field(layout, field))
+        ordinals = chunk_ordinals_for_field(layout, field)
         assert len(ordinals) == layout.chunks_per_field
-        assert ordinals[0] == field * layout.chunks_per_field
+        assert ordinals == sorted(ordinals)
         assert all(layout.locate(k)[0] == field for k in ordinals)
+        # the field-to-field stride is the field count, which is what makes it scattered
+        if layout.chunks_per_field > 1:
+            assert ordinals[1] - ordinals[0] == layout.n_fields
     with pytest.raises(AggregateWriterError, match="outside"):
-        list(chunk_ordinals_for_field(layout, 3))
+        chunk_ordinals_for_field(layout, 3)
 
 
 # ---------------------------------------------------------------------------
