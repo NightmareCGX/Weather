@@ -75,11 +75,7 @@ from ingestion.core.markers import (
     write_protocol_version,
     write_region_marker,
 )
-from ingestion.core.aggregate_phase import (
-    AggregatePhaseError,
-    aggregate_lead,
-    stage_member_region,
-)
+from ingestion.core.aggregate_phase import stage_member_region
 from ingestion.core.pipeline import (
     _commit_region,
     guard_full_overwrite,
@@ -726,7 +722,6 @@ class RunCoordinator:
                 base_delay = 0.2
                 max_delay = 2.0
 
-                staged_keys: tuple[str, ...] = ()
                 for attempt in range(1, max_attempts + 1):
                     try:
                         # 1a. Stage the member's variables before the member shard is
@@ -734,7 +729,17 @@ class RunCoordinator:
                         # this retry loop: a member committed without a staged copy would be
                         # aggregated as part of a partial set, and nothing would notice.
                         # Inert unless ENSEMBLE_STAGING_ENABLED is set.
-                        staged_keys = stage_member_region(
+                        #
+                        # The aggregate pass is deliberately NOT run here. An aggregate is a
+                        # function of the whole member set, so aggregating at a member commit
+                        # would overwrite the previous aggregate with one computed from a
+                        # single member -- a value that looks like a statistic and is not --
+                        # and, because the pass drops the members it consumed, it would also
+                        # destroy the staging every later member needs. That damage is
+                        # unrecoverable: the members that were dropped are not staged again.
+                        # Aggregation belongs with settlement (the 85%-coverage quiescence
+                        # decision), which is a separate pass.
+                        stage_member_region(
                             dataset,
                             self.store_path,
                             member=member,
@@ -806,19 +811,6 @@ class RunCoordinator:
                                 attempt,
                                 max_attempts,
                             )
-                        # 1c. Aggregate the lead's staged members. Runs only now, with the
-                        # COMPLETE marker durable, so the aggregate object can never exist
-                        # without the member evidence it was derived from. Inert unless the
-                        # phase is enabled.
-                        if staged_keys:
-                            try:
-                                aggregate_lead(self.store_path, lead)
-                            except AggregatePhaseError as exc:
-                                # The member shards remain the reader of record, so a failed
-                                # aggregate is a missing optimisation, not a serving outage.
-                                logger.warning(
-                                    "aggregate phase failed for lead %d: %s", lead, exc
-                                )
                         break
                     except Exception as exc:
                         if attempt < max_attempts and is_retryable_storage_error(exc):

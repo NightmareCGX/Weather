@@ -1,25 +1,62 @@
 """The region write's staging hook, exercised through the coordinator.
 
-The hook is inert unless enabled, and this asserts both states. The enabled state matters
-because of where it sits: staging runs inside the same retry loop as the member commit, and
-the aggregate pass runs only after the COMPLETE marker exists. A staging write outside that
-loop, or an aggregate before the marker, would let a partial member set be aggregated as if
-it were complete.
+Two properties are asserted here, both through the real coordinator entry points rather than
+through the phase module directly:
+
+* The hook is inert unless enabled, and it stages inside the same retry loop as the member
+  commit. A member committed without a staged copy would later be aggregated as part of a
+  partial set, and nothing would notice.
+* The hook **stages and never aggregates**. An aggregate is a function of the whole member
+  set, so aggregating at a member commit would publish a statistic computed from one member
+  and, because the pass drops what it consumed, destroy the staging every later member needs.
 """
 
 from __future__ import annotations
 
 import os
+import struct
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import numpy as np
 import pytest
 import xarray as xr
 from ingestion.core import aggregate_phase, aggregate_staging as staging
+from ingestion.core.catalog import CatalogBase, RunCatalogSpec, VariableSpec, record_run
 from ingestion.core.zarr_writer import encode_region_sharded_v1
 
 VARIABLE = "temperature_2m"
 LEAD = 6
 GRID_LAT, GRID_LON = 128, 160
+CYCLE = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+
+#: The region-write regression's grid: one full inner chunk in each direction, so the member
+#: shards, the staging shards and the aggregate pass all agree on the geometry without any
+#: of them being reconfigured. A smaller grid would make the pre-fix behaviour fail loudly on
+#: a chunk-shape mismatch instead of publishing a wrong statistic, which would hide the
+#: defect the regression is for.
+REGRESSION_GRID = 100
+
+
+class _NoopLockCoordinator:
+    """Advisory locks without PostgreSQL, for a SQLite/local-store test."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def acquire_shared_gate(self) -> None: ...
+    def release_shared_gate(self) -> None: ...
+    def acquire_exclusive_gate(self) -> None: ...
+    def release_exclusive_gate(self) -> None: ...
+    def acquire_admission(self) -> None: ...
+    def release_admission(self) -> None: ...
+    def acquire_shared_admission(self) -> None: ...
+    def release_shared_admission(self) -> None: ...
+    def acquire_region_locks(self, region_ids: object) -> None: ...
+    def release_region_locks(self, region_ids: object) -> None: ...
+    def release_all(self) -> None: ...
+    def close_connection(self) -> None: ...
 
 
 def _dataset(seed: int = 0, member: int = 1) -> xr.Dataset:
@@ -59,14 +96,15 @@ def test_disabled_phase_writes_nothing(tmp_path) -> None:
     assert staging.staged_objects_by_variable(str(tmp_path)) == {}
 
 
-def test_enabled_phase_stages_and_aggregates_through_the_public_entry_points(
+def test_phase_stages_then_aggregates_through_the_public_entry_points(
     tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The two hooks together, in the order the region write calls them.
+    """The two phase entry points, called directly.
 
-    Order is the property under test: stage first, then (once the member is durable)
-    aggregate. The aggregate is written to its real key, so a reader of record that has not
-    been switched over continues to serve the member shards.
+    Settlement calls these in this order once a lead's member set has stopped growing: every
+    member is already staged, then one aggregate is computed from all of them. The aggregate
+    is written to its real key, so a reader of record that has not been switched over
+    continues to serve the member shards.
     """
     store = str(tmp_path)
     monkeypatch.setattr(aggregate_phase, "staging_enabled", lambda: True)
@@ -162,3 +200,159 @@ def test_marker_evidence_still_holds_with_an_aggregate_present(tmp_path) -> None
         marker_expected_fingerprint=expected_write_set_fingerprint(required, omitted),
         existing_objects=existing,
     )
+
+
+# ---------------------------------------------------------------------------
+# The region write stages every member and aggregates none of them
+# ---------------------------------------------------------------------------
+
+
+def _ensemble_spec() -> RunCatalogSpec:
+    return RunCatalogSpec(
+        center_id="noaa",
+        center_name="National Oceanic and Atmospheric Administration",
+        center_country="USA",
+        model_id="gefs",
+        model_name="GEFS",
+        is_ensemble=True,
+        resolution_km=25.0,
+        version_string="v1.0",
+        cycle_time=CYCLE,
+        grid_id="global_025deg",
+        grid_name="Global 0.25 Degree Grid",
+        grid_resolution_km=25.0,
+        product_type="surface",
+        variables=(VariableSpec(VARIABLE, "2-Meter Temperature", "K"),),
+        expected_lead_time_hours=(LEAD,),
+        expected_members=(1, 2),
+    )
+
+
+def _member_dataset(member: int, size: int = REGRESSION_GRID) -> xr.Dataset:
+    """A member plane identifiable by value: member ``m`` is filled with ``280 + m``."""
+    plane = np.full((size, size), 280.0 + member, dtype=np.float32)
+    return xr.Dataset(
+        {
+            VARIABLE: (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                plane[None, None],
+            )
+        },
+        coords={
+            "member": [member],
+            "lead_time_hours": [LEAD],
+            "latitude": np.arange(size, dtype=float),
+            "longitude": np.arange(size, dtype=float),
+        },
+        attrs={"cycle_time": CYCLE.isoformat(), "model_id": "gefs"},
+    )
+
+
+def _aggregate_mean(store: str) -> float:
+    """The MEAN field's first cell in the lead's aggregate object."""
+    from ingestion.core.aggregate_writer import (
+        decode_aggregate_chunk,
+        layout_from_descriptor,
+    )
+    from domain.shard_format import split_v2_tail
+
+    key = f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard"
+    with open(os.path.join(store, *key.split("/")), "rb") as handle:
+        blob = handle.read()
+    num_chunks, index_byte_size, _magic = struct.unpack("<III", blob[-12:])
+    _index, descriptor = split_v2_tail(
+        blob[-(index_byte_size + 40 + 12) :], num_chunks
+    )
+    layout = layout_from_descriptor(descriptor)
+    assert layout.n_fields == 34  # A class: MEAN + STD + 32 bins
+    return float(decode_aggregate_chunk(blob, 0)[0, 0])
+
+
+def test_region_write_stages_every_member_and_writes_no_aggregate(
+    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression: a commit must never aggregate the partial member set it just wrote.
+
+    An earlier wiring called the aggregate pass after each member's COMPLETE marker. Because
+    the pass consumes and drops the staging it aggregated, that both published a statistic
+    computed from a single member -- for two members of 281 and 282 it wrote MEAN = 281, then
+    282, never 281.5 -- and destroyed the staging every later member needed, so the damage was
+    unrecoverable. This drives the real coordinator for two members and asserts the staging of
+    both survives and no aggregate object exists; the aggregate is settlement's job.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    import ingestion.core.coordinator as CO
+    from ingestion.cli import _synthetic_spec_dataset
+    from ingestion.core.coordinator import RunCoordinator, WaveRegion
+
+    store = str(tmp_path / "staging_hook.zarr")
+    spec = _ensemble_spec()
+    engine = create_engine("sqlite:///:memory:")
+    CatalogBase.metadata.create_all(engine)
+
+    monkeypatch.setattr(CO, "StoreLockCoordinator", _NoopLockCoordinator)
+    monkeypatch.setattr(aggregate_phase, "staging_enabled", lambda: True)
+
+    coordinator = RunCoordinator(spec, store, timeout_seconds=2.0)
+    conn = engine.connect()
+    try:
+        with Session(bind=conn) as catalog_session:
+            run = record_run(
+                catalog_session, spec, _synthetic_spec_dataset(spec), committed_state=None
+            )
+            run_id = str(run.id)
+
+        coordinator.initialize_run_store(
+            conn,
+            seed_dataset=_member_dataset(1),
+            expected_leads=(LEAD,),
+            expected_members=(1, 2),
+            run_id=run_id,
+            is_same_cycle=True,
+        )
+
+        for member in (1, 2):
+            generation = f"gen-{member}"
+            coordinator.pre_update_wave(
+                conn,
+                regions=[
+                    WaveRegion(
+                        lead_time_hours=LEAD, member=member, generation=generation
+                    )
+                ],
+                run_id=run_id,
+                is_same_cycle=True,
+                executor=ThreadPoolExecutor(1),
+                cancel_event=threading.Event(),
+            )
+            coordinator.write_region_worker(
+                conn,
+                dataset=_member_dataset(member),
+                member=member,
+                generation=generation,
+                expected_leads=(LEAD,),
+                expected_members=(1, 2),
+            )
+
+            staged = staging.staged_members_for_lead(store, VARIABLE, LEAD)
+            assert staged == list(range(1, member + 1)), (
+                f"after member {member} the staged set is {staged}; a commit that dropped "
+                f"staging would have made the next member's aggregate silently partial"
+            )
+            aggregate = os.path.join(store, VARIABLE, f"shard.agg_L{LEAD:04d}.shard")
+            assert not os.path.isfile(aggregate), (
+                f"the region write published {aggregate} from {member} member(s)"
+            )
+    finally:
+        conn.close()
+        engine.dispose()
+
+    # Settlement is the only thing that may aggregate, and it produces the whole-set answer.
+    result = aggregate_phase.aggregate_lead(
+        store, LEAD, grid_lat=REGRESSION_GRID, grid_lon=REGRESSION_GRID
+    )
+    assert result.aggregates == ((VARIABLE, f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard", 2),)
+    assert _aggregate_mean(store) == 281.5
+    assert staging.staged_objects_by_variable(store) == {}
