@@ -557,8 +557,14 @@ def aggregate_lead_all_variables(
         try:
             spec = spec_for(variable)
         except VariableClassError:
+            # A flag is staged like any member variable and has no ``AggregateSpec``: its
+            # approved representation is a per-cell exceedance fraction, which is a separate
+            # pass. Leaving its staging in place is what keeps the fraction computable later;
+            # it is also why every aggregate pass re-reads this variable and skips it again
+            # rather than the staging quietly disappearing.
             logger.debug(
-                "skipping unclassified variable %s at lead %d",
+                "no aggregate spec for %s at lead %d (a flag, or unclassified); "
+                "its staging is retained",
                 variable,
                 lead_time_hours,
             )
