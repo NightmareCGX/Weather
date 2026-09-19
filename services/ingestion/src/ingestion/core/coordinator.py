@@ -75,7 +75,7 @@ from ingestion.core.markers import (
     write_protocol_version,
     write_region_marker,
 )
-from ingestion.core.aggregate_phase import stage_member_region
+from ingestion.core.aggregate_phase import AggregatePhaseError, aggregate_lead, stage_member_region
 from ingestion.core.pipeline import (
     _commit_region,
     guard_full_overwrite,
@@ -1074,15 +1074,26 @@ class RunCoordinator:
         spec: RunCatalogSpec,
         lead_time_hours: int,
         expected_members: tuple[int, ...],
+        aggregate_variables: tuple[str, ...] = (),
     ) -> None:
         """Publish a settled forecast lead to the catalog and advance serving generation.
 
-        Executed after all expected member tasks for a specific lead have settled.
-        Reads COMPLETE markers for that lead, reconciles catalog rows (forecast_products
-        and ensemble_member_products), updates manifest.json with a new serving generation,
-        and commits the database transaction.
+        Executed when a lead's member set has settled: either every expected member task
+        finished, or the settlement policy decided the set has stopped growing. Reads COMPLETE
+        markers for that lead, reconciles catalog rows (forecast_products and
+        ensemble_member_products), updates manifest.json with a new serving generation, and
+        commits the database transaction.
+
+        Args:
+            aggregate_variables: Variables whose aggregate shard should be (re)computed from
+                the committed members before the new generation is published. Empty leaves the
+                aggregates alone, which is what a caller without the staging area needs.
 
         Does NOT mark the overall run status as 'ready' (status remains 'processing' or 'partial').
+
+        Ordering: the aggregate is written **before** the manifest. A reader keys its caches on
+        the generation, so bumping it first would let a reader that saw the new generation
+        re-read a shard the patch had not yet replaced.
         """
         co = StoreLockCoordinator(
             conn,
@@ -1268,6 +1279,28 @@ class RunCoordinator:
                                 },
                             )
                 db.commit()
+
+            # 3. Aggregate the members that are actually committed for this lead. Runs under
+            # the exclusive gate and before the manifest, so the generation a reader picks up
+            # always describes a store whose aggregates were computed from the member set the
+            # same publication recorded. A caller that passes no variables (or holds no
+            # staging area) skips this, and the aggregates are left as they are.
+            if aggregate_variables:
+                try:
+                    aggregate_lead(
+                        self.store_path,
+                        lead_time_hours,
+                        variables=aggregate_variables,
+                    )
+                except AggregatePhaseError as exc:
+                    # The member shards remain the reader of record, so a failed aggregate is
+                    # a missing optimisation rather than a serving outage -- the same
+                    # reasoning the region write used to apply here.
+                    logger.warning(
+                        "aggregate phase failed for lead %d during publication: %s",
+                        lead_time_hours,
+                        exc,
+                    )
 
             # Advance manifest generation with new serving fingerprint
             run_identity = {

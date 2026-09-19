@@ -256,6 +256,17 @@ class IngestionSettings(BaseSettings):
     ENSEMBLE_AGGREGATE_CHUNK_LAT: int = 100
     ENSEMBLE_AGGREGATE_CHUNK_LON: int = 100
 
+    #: Quiet window (seconds) after which a lead whose member set has stopped growing is
+    #: published anyway, provided coverage is already at the serving floor. 600 s is the
+    #: approved policy: long enough that a member minutes behind its siblings still lands in
+    #: the same publication, short enough that a stalled lead is not withheld.
+    ENSEMBLE_SETTLEMENT_QUIET_SECONDS: float = 600.0
+
+    #: How many leads may aggregate concurrently during settlement. One by default: each pass
+    #: holds a whole variable's member stack, so concurrency multiplies peak residency rather
+    #: than throughput. Raise only with the container's memory budget in hand.
+    ENSEMBLE_SETTLEMENT_WORKERS: int = 1
+
     #: Global physical object PUT concurrency for shard writes.
     GLOBAL_PUT_CONCURRENCY: Any = 64
 
@@ -579,6 +590,16 @@ class IngestionSettings(BaseSettings):
         if retention_days < 0:
             raise ValueError(
                 f"METADATA_RETENTION_DAYS must be >= 0, got {retention_days}"
+            )
+        quiet_seconds = float(self.ENSEMBLE_SETTLEMENT_QUIET_SECONDS)
+        if quiet_seconds <= 0.0:
+            raise ValueError(
+                f"ENSEMBLE_SETTLEMENT_QUIET_SECONDS must be > 0.0, got {quiet_seconds}"
+            )
+        settlement_workers = int(self.ENSEMBLE_SETTLEMENT_WORKERS)
+        if settlement_workers < 1:
+            raise ValueError(
+                f"ENSEMBLE_SETTLEMENT_WORKERS must be >= 1, got {settlement_workers}"
             )
         return self
 

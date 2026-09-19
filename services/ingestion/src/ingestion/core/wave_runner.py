@@ -50,6 +50,7 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from domain.horizon import canonical_lead_time_hours
+from ingestion.core import aggregate_phase
 from ingestion.core.base import (
     DeaccumulationError,
     MissingPredecessorLeadError,
@@ -64,8 +65,12 @@ from ingestion.core.pipeline import (
     _validate_requested_lead,
     _validate_requested_member,
 )
+from ingestion.core.settlement import (
+    LeadSettlementBook,
+    PublicationDecision,
+    settlement_quiet_seconds,
+)
 from ingestion.providers.noaa.connector import NOAAConnector
-
 #: Module-level logger for helpers that run outside ``_run_wave_impl`` (which
 #: binds its own local ``logger``).
 _logger = logging.getLogger(__name__)
@@ -1148,7 +1153,7 @@ async def _run_wave_impl(
 
             loop = asyncio.get_event_loop()
 
-            # Track pending tasks per lead for intermediate settled-lead publication
+            # Lead settlement: when each lead publishes, and what its publication aggregates.
             lead_pending: dict[int, set[tuple[int | None, bool]]] = {
                 lead_val: {(m, is_m) for m, item_lead, is_m in items if item_lead == lead_val}
                 for lead_val in spec.target_lead_time_hours
@@ -1157,10 +1162,47 @@ async def _run_wave_impl(
             published_leads: set[int] = set()
             run_id_for_pub = _resolve_run_id(catalog_spec, store_path)
 
-            def _check_and_publish_lead(lead_val: int) -> None:
-                if lead_val in published_leads:
+            # The aggregate shards a publication should refresh, and the settlement book that
+            # decides when a publication is due. Both are empty/inert unless the aggregate
+            # phase is enabled, so a deployment with the switch off behaves exactly as before.
+            publication_variables = _aggregate_variables_for(spec.members, var_codes)
+            settlement_enabled = bool(publication_variables) and aggregate_phase.staging_enabled()
+            settlement: LeadSettlementBook | None = (
+                LeadSettlementBook(
+                    expected_members=horizon_members or tuple(range(1, 31)),
+                    start_at=time.monotonic(),
+                    quiescence_seconds=settlement_quiet_seconds(),
+                    expected_member_count=(
+                        len(horizon_members) if horizon_members else 30
+                    ),
+                )
+                if settlement_enabled
+                else None
+            )
+
+            def _commit_member_for_lead(member_val: int | None, lead_val: int) -> None:
+                """Record that a member is durably committed for a lead.
+
+                Called only on a successful region write, and only for perturbed members: the
+                deterministic and mean products are not ensemble members, so counting them
+                would report a coverage the member set does not have. Coverage, not item
+                completion, is what the settlement floor is applied to -- an item whose
+                download failed is settled but its member does not exist.
+                """
+                if settlement is None or member_val is None:
                     return
-                published_leads.add(lead_val)
+                with lead_settle_lock:
+                    settlement.note_member_committed(
+                        lead_val, int(member_val), at=time.monotonic()
+                    )
+
+            def _publish_lead(lead_val: int, *, aggregated: bool = False) -> None:
+                """Publish one lead, aggregating its committed members first when asked.
+
+                Synchronous and blocking on purpose: publication takes the exclusive store gate,
+                and the caller runs it on an executor so the event loop keeps draining the
+                pipeline while it holds that gate.
+                """
                 pub_conn = engine.connect()
                 try:
                     coordinator.publish_settled_lead(
@@ -1169,11 +1211,81 @@ async def _run_wave_impl(
                         spec=catalog_spec,
                         lead_time_hours=lead_val,
                         expected_members=spec.members,
+                        aggregate_variables=(
+                            publication_variables if aggregated else ()
+                        ),
                     )
                 except Exception as exc:
                     logger.warning("Settled-lead publication failed for lead %d: %s", lead_val, exc)
                 finally:
                     pub_conn.close()
+
+            def _check_and_publish_lead(lead_val: int) -> None:
+                """Publish a lead whose every item has settled.
+
+                With settlement off this is the only path, and it publishes exactly once per
+                lead, as it always has. With settlement on, it is the completion path, and it
+                records what it published in the book -- otherwise the settlement loop would see
+                an unsettled bookkeeping state and publish the identical set again.
+                """
+                if lead_val in published_leads:
+                    return
+                published_leads.add(lead_val)
+                decision: PublicationDecision | None = None
+                if settlement is not None:
+                    with lead_settle_lock:
+                        settlement.note_lead_settled(lead_val)
+                        decision = settlement.decision_for(
+                            lead_val, now=time.monotonic()
+                        )
+                _publish_lead(lead_val, aggregated=True)
+                if settlement is not None and decision is not None:
+                    with lead_settle_lock:
+                        settlement.note_published(decision)
+
+            async def _settlement_loop() -> None:
+                """Publish a lead whose committed set has stopped growing.
+
+                Runs on the event loop, so the book's updates on the loop thread and this
+                evaluation cannot interleave. The publication itself goes to the write
+                executor: it takes the store's exclusive gate for the duration.
+                """
+                assert settlement is not None
+                tick = settlement.tick_seconds()
+                while not wave_cancel_event.is_set():
+                    due = settlement.due(now=time.monotonic())
+                    for decision in due:
+                        if decision.lead_time_hours in published_leads:
+                            continue
+                        logger.info(
+                            "settlement: publishing lead %d with %d/%d members (%s)",
+                            decision.lead_time_hours,
+                            decision.member_count,
+                            settlement.expected_member_count,
+                            decision.reason,
+                        )
+                        lead_to_publish = decision.lead_time_hours
+
+                        def _publish_patch(lead: int = lead_to_publish) -> None:
+                            _publish_lead(lead, aggregated=True)
+
+                        fut = loop.run_in_executor(executor, _publish_patch)
+                        # The book records only what was actually published: a failure leaves
+                        # the decision standing, so the next tick retries it.
+                        try:
+                            while not fut.done():
+                                try:
+                                    await asyncio.shield(fut)
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception:
+                                    break
+                            fut.result()
+                        except Exception:  # noqa: BLE001 - already logged by _publish_lead
+                            continue
+                        with lead_settle_lock:
+                            settlement.note_published(decision)
+                    await asyncio.sleep(tick)
 
             def _on_item_settled(member_val: int | None, lead_val: int, is_mean_val: bool = False) -> None:
                 with lead_settle_lock:
@@ -1215,6 +1327,7 @@ async def _run_wave_impl(
                             seed_member, seed_lead, duration_ms=wr_dur
                         )
                         write_completed_events[seed_item].set()
+                        _commit_member_for_lead(seed_member, seed_lead)
                         _on_item_settled(seed_member, seed_lead, seed_is_mean)
                     except Exception as exc:  # noqa: BLE001 - report failure
                         wr_dur = (time.monotonic() - t_wr_start) * 1000.0
@@ -1434,6 +1547,7 @@ async def _run_wave_impl(
                                 member, lead, duration_ms=wr_dur
                             )
                             write_completed_events[item_key].set()
+                            _commit_member_for_lead(member, lead)
                             _on_item_settled(member, lead, is_mean)
                         except Exception as exc:  # noqa: BLE001 - report write failure
                             wr_dur = (time.monotonic() - t_wr_start) * 1000.0
@@ -1461,10 +1575,25 @@ async def _run_wave_impl(
 
             # 5. Aggregate drain: wait for all outer pipeline tasks
             tracker.record_milestone("post_write_task_gather_start")
+            settlement_task: asyncio.Task[Any] | None = (
+                asyncio.create_task(_settlement_loop()) if settlement is not None else None
+            )
             results, cancelled = await await_all_workers_non_abandoning(
                 pipeline_tasks, wave_cancel_event
             )
             tracker.record_milestone("post_write_task_gather_complete")
+            if settlement_task is not None:
+                # The drain is done, so no member can arrive and every lead has either been
+                # published by the completion path or is about to be. Stop the timer before
+                # the finalizer takes the gate, and let an in-flight tick finish rather than
+                # cancelling a publication that holds the exclusive gate.
+                settlement_task.cancel()
+                try:
+                    await settlement_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("settlement loop ended with an error: %s", exc)
             for res in results:
                 if isinstance(res, BaseException) and not isinstance(
                     res, asyncio.CancelledError
@@ -1775,6 +1904,21 @@ def _decode_and_normalize(
     ds = _normalize_canonical_units(ds, catalog_spec.variables)
     ds.attrs["model_id"] = catalog_spec.model_id
     return ds
+
+
+def _aggregate_variables_for(
+    members: tuple[int, ...], variables: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Variables whose aggregate shards a publication of this wave should refresh.
+
+    Only the perturbed-member path aggregates, so a deterministic run publishes with none.
+    The set is taken as given rather than filtered by class here, because the aggregate phase
+    already skips variables it has no approved encoding for; a second filter would be a second
+    place for that decision to live.
+    """
+    if not members:
+        return ()
+    return tuple(str(v) for v in variables)
 
 
 def _region_id_for(lead: int, member: int | None, is_mean: bool = False) -> str:
