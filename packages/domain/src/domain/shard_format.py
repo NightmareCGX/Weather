@@ -51,14 +51,36 @@ TAIL_PROBE_SIZE: int = TRAILER_SIZE + DESCRIPTOR_SIZE  # 52
 FORMAT_VERSION_V2: str = "sharded_v2"
 
 #: Value encoding identifiers carried in the descriptor.
+#:
+#: ``f32`` stores IEEE float32 values and declares ``scale = 1.0``.
+#:
+#: ``i16`` stores signed 16-bit fixed-point codes: value = code * scale. The descriptor's
+#: single ``scale`` field cannot describe a multi-field aggregate whose fields carry different
+#: steps (a 314 K mean needs 0.01 to fit int16 while a 0-1 bin probability wants 0.001), so
+#: ``scale == 0.0`` is the explicit marker for "per field, consult the variable's spec". It is
+#: a marker rather than a guess precisely so that a reader without the spec cannot silently
+#: decode a mean with a probability's step: there is no value it could assume.
 ENCODING_F32: int = 1
+ENCODING_I16: int = 2
 ENCODING_NAMES: dict[int, str] = {
     ENCODING_F32: "f32",
+    ENCODING_I16: "i16",
 }
 
-#: Scale every currently defined encoding must declare. A quantized encoding added later
-#: relaxes this; the descriptor field exists now so that adding one does not change the
-#: container layout.
+#: Scale an encoding must declare, or ``None`` when any valid scale is accepted.
+#:
+#: A float container that declares a scale would silently rescale every element on read, so the
+#: mismatch must be rejected. A fixed-point container accepts either a uniform step or the
+#: per-field marker; a negative step is an error in both directions.
+REQUIRED_SCALE_BY_ENCODING: dict[int, float | None] = {
+    ENCODING_F32: 1.0,
+    ENCODING_I16: None,
+}
+
+#: The ``i16`` scale meaning "each field's step comes from the variable's spec".
+PER_FIELD_SCALE: float = 0.0
+
+#: Scale a float container declares. Retained as the name callers already use for "no scaling".
 REQUIRED_SCALE: float = 1.0
 
 #: Serialized descriptor layout. All fields little-endian.
@@ -264,11 +286,21 @@ def parse_descriptor(raw: bytes) -> ShardDescriptor:
             f"num_chunks {num_chunks} * {INDEX_ENTRY_SIZE} = {expected_index}"
         )
     # A container that declares a scale while carrying float values would silently
-    # rescale every element on read, so the mismatch must be rejected here.
-    if scale != REQUIRED_SCALE:
+    # rescale every element on read, so the mismatch must be rejected here -- and a
+    # fixed-point container must name a step (uniform, or the per-field marker) rather
+    # than leaving a reader to assume one.
+    required_scale = REQUIRED_SCALE_BY_ENCODING[encoding_id]
+    if required_scale is not None and scale != required_scale:
         raise ShardFormatError(
             f"encoding {ENCODING_NAMES[encoding_id]!r} must declare scale "
-            f"{REQUIRED_SCALE}, got {scale}"
+            f"{required_scale}, got {scale}"
+        )
+    if required_scale is None and (
+        scale < 0.0 or (scale == 0.0 and encoding_id != ENCODING_I16)
+    ):
+        raise ShardFormatError(
+            f"encoding {ENCODING_NAMES[encoding_id]!r} must declare a non-negative scale "
+            f"(0.0 means per field), got {scale}"
         )
 
     return ShardDescriptor(

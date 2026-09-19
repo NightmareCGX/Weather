@@ -162,17 +162,25 @@ class AggregateShardLayout:
         start = (row * self.lon_chunks + col) * self.n_fields
         return range(start, start + self.n_fields)
 
-    def to_descriptor(self, *, member_count: int = 0) -> ShardDescriptor:
+    def to_descriptor(
+        self,
+        *,
+        member_count: int = 0,
+        encoding_id: int = ENCODING_F32,
+        scale: float = 1.0,
+    ) -> ShardDescriptor:
         """Build the container descriptor for this layout.
 
         Args:
             member_count: Ensemble members the planes were computed from. Recorded in the
                 descriptor because the statistics an aggregate stores do not imply it, and the
                 API reports it. ``0`` for a container that is not a member aggregate.
+            encoding_id: How the payload encodes each value.
+            scale: Value units per stored integer. Must be 1.0 for :data:`ENCODING_F32`.
         """
         return ShardDescriptor(
-            encoding_id=ENCODING_F32,
-            scale=1.0,
+            encoding_id=encoding_id,
+            scale=scale,
             chunk_lat=self.chunk_lat,
             chunk_lon=self.chunk_lon,
             grid_lat=self.grid_lat,
@@ -213,7 +221,7 @@ def _chunk_buffer(
     col: int,
     layout: AggregateShardLayout,
 ) -> npt.NDArray[np.float32]:
-    """Extract one NaN-padded chunk buffer from a plane.
+    """Extract one NaN-padded float32 chunk buffer from a plane.
 
     Edge chunks are padded to the full chunk extent, matching the member-shard writer, so
     every chunk in a container has the same byte length before compression.

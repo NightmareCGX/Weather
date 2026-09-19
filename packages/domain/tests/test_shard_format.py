@@ -14,7 +14,10 @@ import pytest
 from domain.shard_format import (
     DESCRIPTOR_SIZE,
     ENCODING_F32,
+    ENCODING_I16,
+    ENCODING_NAMES,
     INDEX_ENTRY_SIZE,
+    PER_FIELD_SCALE,
     SHARD_V1_MAGIC,
     SHARD_V2_MAGIC,
     TAIL_PROBE_SIZE,
@@ -295,6 +298,35 @@ def test_parse_descriptor_rejects_a_scale_that_would_rescale_values() -> None:
     """A container declaring a scale while carrying floats silently rescales on read."""
     with pytest.raises(ShardFormatError, match="must declare scale 1.0"):
         parse_descriptor(build_descriptor(_descriptor(scale=0.01)))
+
+
+def test_a_fixed_point_container_must_declare_how_to_scale_its_codes() -> None:
+    """``i16`` stores ``value = code * scale``, so the step has to be stated or marked absent.
+
+    Two legitimate forms: a uniform step, and the ``0.0`` marker meaning "each field's step
+    comes from the variable's spec" (which is how a multi-field aggregate declares itself, since
+    one descriptor field cannot carry a 314 K mean's 0.01 and a bin probability's 0.001 at
+    once). A negative step is an error in either form.
+    """
+    fixed = _descriptor(encoding_id=ENCODING_I16, scale=0.01)
+    assert parse_descriptor(build_descriptor(fixed)).scale == pytest.approx(0.01)
+    per_field = _descriptor(encoding_id=ENCODING_I16, scale=PER_FIELD_SCALE)
+    assert parse_descriptor(build_descriptor(per_field)).scale == PER_FIELD_SCALE
+    with pytest.raises(ShardFormatError, match="must declare a non-negative scale"):
+        parse_descriptor(build_descriptor(_descriptor(encoding_id=ENCODING_I16, scale=-0.01)))
+
+
+def test_both_encodings_round_trip_through_the_descriptor() -> None:
+    """The encoding id is the reader's signal for how to interpret the payload."""
+    for encoding_id in (ENCODING_F32, ENCODING_I16):
+        scale = 1.0 if encoding_id == ENCODING_F32 else 0.001
+        descriptor = _descriptor(encoding_id=encoding_id, scale=scale)
+        parsed = parse_descriptor(build_descriptor(descriptor))
+        assert parsed.encoding_id == encoding_id
+        assert parsed.encoding_name == ENCODING_NAMES[encoding_id]
+    # An id no reader knows is refused, so a newer writer cannot be half-read.
+    with pytest.raises(ShardFormatError, match="unknown encoding id"):
+        parse_descriptor(build_descriptor(_descriptor(encoding_id=99, scale=1.0)))
 
 
 def test_parse_descriptor_rejects_truncated_input() -> None:
