@@ -361,8 +361,12 @@ def test_populated_lifecycle_deletion_claims(populated_db: Connection):
     # Tombstones: at least 2 (young tombstone, overdue tombstone, anti-resurrect tombstone)
     assert report.tombstone_cycles >= 2
 
-    # Oldest claim age must reflect the 5-hour claim (>= 18,000s)
-    assert report.oldest_claim_age_s >= 18000.0
+    # Oldest claim age must reflect the 5-hour claim. The seed time comes from this
+    # process's clock while the age is computed from PostgreSQL NOW(), so the two clocks
+    # differ by sub-millisecond amounts and an exact-boundary assertion is flaky. The margin
+    # is 5 s against a 3-hour gap to the next-oldest claim (2 h), so it still asserts the
+    # intent: the oldest claim is the 5-hour one.
+    assert report.oldest_claim_age_s >= 18000.0 - 5.0
 
     # Stuck claims:
     # 2h claim and 5h claim are > 1 hour -> warning >= 2
@@ -381,8 +385,9 @@ def test_populated_reclamation_queue(populated_db: Connection):
     assert rec.deleting_count >= 2
     assert rec.failed_count >= 1
 
-    # Oldest deleting target was seeded at 15 minutes ago (> 900s)
-    assert rec.oldest_deleting_age_s >= 900.0
+    # Oldest deleting target was seeded 15 minutes ago. Same clock-domain caveat as above:
+    # the margin is 5 s against a 14-minute gap to the next-oldest target (60 s).
+    assert rec.oldest_deleting_age_s >= 900.0 - 5.0
 
 
 def test_populated_metadata_sweeper_backlog(populated_db: Connection):

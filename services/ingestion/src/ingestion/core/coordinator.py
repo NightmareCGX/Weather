@@ -75,6 +75,11 @@ from ingestion.core.markers import (
     write_protocol_version,
     write_region_marker,
 )
+from ingestion.core.aggregate_phase import (
+    AggregatePhaseError,
+    aggregate_lead,
+    stage_member_region,
+)
 from ingestion.core.pipeline import (
     _commit_region,
     guard_full_overwrite,
@@ -721,9 +726,22 @@ class RunCoordinator:
                 base_delay = 0.2
                 max_delay = 2.0
 
+                staged_keys: tuple[str, ...] = ()
                 for attempt in range(1, max_attempts + 1):
                     try:
-                        # 1. Write the data region using snapshot
+                        # 1a. Stage the member's variables before the member shard is
+                        # committed. Staging must happen where the commit happens, inside
+                        # this retry loop: a member committed without a staged copy would be
+                        # aggregated as part of a partial set, and nothing would notice.
+                        # Inert unless ENSEMBLE_STAGING_ENABLED is set.
+                        staged_keys = stage_member_region(
+                            dataset,
+                            self.store_path,
+                            member=member,
+                            lead_time_hours=lead,
+                            is_mean=is_mean,
+                        )
+                        # 1b. Write the data region using snapshot
                         _commit_region(
                             dataset,
                             self.store_path,
@@ -788,6 +806,19 @@ class RunCoordinator:
                                 attempt,
                                 max_attempts,
                             )
+                        # 1c. Aggregate the lead's staged members. Runs only now, with the
+                        # COMPLETE marker durable, so the aggregate object can never exist
+                        # without the member evidence it was derived from. Inert unless the
+                        # phase is enabled.
+                        if staged_keys:
+                            try:
+                                aggregate_lead(self.store_path, lead)
+                            except AggregatePhaseError as exc:
+                                # The member shards remain the reader of record, so a failed
+                                # aggregate is a missing optimisation, not a serving outage.
+                                logger.warning(
+                                    "aggregate phase failed for lead %d: %s", lead, exc
+                                )
                         break
                     except Exception as exc:
                         if attempt < max_attempts and is_retryable_storage_error(exc):

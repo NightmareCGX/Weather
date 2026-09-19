@@ -666,3 +666,169 @@ def test_aggregate_lead_all_variables_rejects_a_lead_with_nothing_staged(tmp_pat
         staging.aggregate_lead_all_variables(
             str(tmp_path), 99, grid_lat=GRID_LAT, grid_lon=GRID_LON
         )
+
+
+# ---------------------------------------------------------------------------
+# The pipeline hook (aggregate_phase)
+# ---------------------------------------------------------------------------
+
+
+def _enable_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ingestion.core import config as ingestion_config
+
+    monkeypatch.setattr(
+        ingestion_config.settings, "ENSEMBLE_STAGING_ENABLED", True, raising=False
+    )
+    # aggregate_phase reads the module-level settings object lazily, so patching the shared
+    # settings instance is enough.
+    monkeypatch.setattr(
+        "ingestion.core.aggregate_phase.staging_enabled", lambda: True
+    )
+
+
+def test_phase_is_inert_when_disabled(tmp_path) -> None:
+    """With the switch off nothing is written, which is what makes the phase safe to land."""
+    from ingestion.core import aggregate_phase
+
+    dataset = xr.Dataset(
+        {
+            VARIABLE: (
+                ("member", "lead_time_hours", "latitude", "longitude"),
+                _planes(1, seed=40)[0][None, None],
+            )
+        }
+    )
+    assert aggregate_phase.staging_enabled() is False
+    assert aggregate_phase.stage_member_region(
+        dataset, str(tmp_path), member=1, lead_time_hours=LEAD
+    ) == ()
+    result = aggregate_phase.aggregate_lead(str(tmp_path), LEAD)
+    assert result.aggregates == ()
+    assert staging.staged_objects_by_variable(str(tmp_path)) == {}
+
+
+def test_phase_stages_perturbed_members_only(tmp_path, monkeypatch) -> None:
+    """The mean and deterministic products have no member axis to aggregate over."""
+    from ingestion.core import aggregate_phase
+
+    _enable_phase(monkeypatch)
+    dataset = xr.Dataset(
+        {
+            VARIABLE: (
+                ("lead_time_hours", "latitude", "longitude"),
+                _planes(1, seed=41)[0][None],
+            )
+        }
+    )
+    assert aggregate_phase.stage_member_region(
+        dataset, str(tmp_path), member=None, lead_time_hours=LEAD
+    ) == ()
+    assert aggregate_phase.stage_member_region(
+        dataset, str(tmp_path), member=None, lead_time_hours=LEAD, is_mean=True
+    ) == ()
+    assert staging.staged_objects_by_variable(str(tmp_path)) == {}
+
+
+def test_phase_stages_a_member_and_reports_the_keys(tmp_path, monkeypatch) -> None:
+    from ingestion.core import aggregate_phase
+
+    _enable_phase(monkeypatch)
+    dataset = xr.Dataset(
+        {
+            VARIABLE: (
+                ("lead_time_hours", "latitude", "longitude"),
+                _planes(1, seed=42)[0][None],
+            )
+        }
+    )
+    keys = aggregate_phase.stage_member_region(
+        dataset, str(tmp_path), member=7, lead_time_hours=LEAD
+    )
+    assert keys == (staging.staging_relative_key(VARIABLE, 7, LEAD),)
+    assert staging.staged_members_for_lead(str(tmp_path), VARIABLE, LEAD) == [7]
+
+
+def test_phase_reports_an_unstageable_member_loudly(tmp_path, monkeypatch) -> None:
+    """A member committed without a staged copy would be aggregated as a partial set."""
+    from ingestion.core import aggregate_phase
+
+    _enable_phase(monkeypatch)
+    dataset = xr.Dataset(
+        {"scalar_only": (("lead_time_hours",), np.zeros(1, dtype=np.float32))}
+    )
+    with pytest.raises(aggregate_phase.AggregatePhaseError, match="cannot stage member"):
+        aggregate_phase.stage_member_region(
+            dataset, str(tmp_path), member=1, lead_time_hours=LEAD
+        )
+
+
+def test_phase_aggregates_a_fully_staged_lead(tmp_path, monkeypatch) -> None:
+    from ingestion.core import aggregate_phase
+
+    _enable_phase(monkeypatch)
+    store = str(tmp_path)
+    _stage(store, _planes(4, seed=43), lead=LEAD)
+
+    result = aggregate_phase.aggregate_lead(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    assert result.aggregates == (
+        (VARIABLE, f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard", 4),
+    )
+    assert staging.staged_objects_by_variable(store) == {}
+
+
+def test_phase_aggregate_is_a_no_op_for_a_lead_with_nothing_staged(tmp_path, monkeypatch) -> None:
+    """A lead with no members is a normal state (a wave may not have reached it yet)."""
+    from ingestion.core import aggregate_phase
+
+    _enable_phase(monkeypatch)
+    result = aggregate_phase.aggregate_lead(
+        str(tmp_path), LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    assert result.aggregates == ()
+
+
+def test_explicit_variable_aggregation_ignores_the_switch(tmp_path) -> None:
+    """The explicit form is for a caller that has already decided to aggregate."""
+    from ingestion.core import aggregate_phase
+
+    store = str(tmp_path)
+    _stage(store, _planes(3, seed=44), lead=LEAD)
+    key, count = aggregate_phase.aggregate_variable_lead(
+        store, VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    assert count == 3
+    assert key == f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard"
+
+
+def test_explicit_variable_aggregation_rejects_an_unclassified_variable(tmp_path) -> None:
+    from ingestion.core import aggregate_phase
+
+    with pytest.raises(aggregate_phase.AggregatePhaseError, match="no approved aggregate"):
+        aggregate_phase.aggregate_variable_lead(
+            str(tmp_path), "mystery", LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        )
+
+
+def test_explicit_variable_aggregation_reports_a_staging_failure(tmp_path) -> None:
+    from ingestion.core import aggregate_phase
+
+    with pytest.raises(aggregate_phase.AggregatePhaseError, match="no staged members"):
+        aggregate_phase.aggregate_variable_lead(
+            str(tmp_path), VARIABLE, 99, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        )
+
+
+def test_classified_variables_excludes_flags_and_unknown_names() -> None:
+    """Flags carry a fraction rather than a spec, so the aggregate pass must not see them."""
+    from ingestion.core import aggregate_phase
+
+    classified = aggregate_phase.aggregate_classified_variables(
+        ["temperature_2m", "wind_gust", "crain", "mystery"]
+    )
+    assert [variable for variable, _cls, _spec in classified] == [
+        "temperature_2m",
+        "wind_gust",
+    ]
+    assert [cls for _v, cls, _s in classified] == ["A", "B"]

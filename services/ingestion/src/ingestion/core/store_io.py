@@ -17,6 +17,11 @@ from os import PathLike
 from typing import Any
 
 
+#: The store shapes the ingestion code passes around: an ``s3://`` URL, a local path, or an
+#: in-memory mapping (tests).
+StoreRef = str | PathLike[str] | Mapping[str, bytes]
+
+
 class StoreAccessError(RuntimeError):
     """Raised when a store reference cannot be used for I/O."""
 
@@ -29,7 +34,7 @@ class StoreIO:
         root: For ``"s3"``, the bucket/prefix; for ``"local"``, the resolved directory.
     """
 
-    def __init__(self, store: str | PathLike[str] | Mapping[str, bytes]) -> None:
+    def __init__(self, store: StoreRef) -> None:
         self.kind: str
         self.root: str
         self._mapping: Mapping[str, bytes] | None = None

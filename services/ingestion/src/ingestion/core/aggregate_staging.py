@@ -30,9 +30,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from os import PathLike
 
 import numpy as np
 import numpy.typing as npt
@@ -53,7 +52,7 @@ from ingestion.core.aggregate_writer import (
     encode_aggregate_shard,
     layout_for_spec,
 )
-from ingestion.core.store_io import StoreAccessError, StoreIO
+from ingestion.core.store_io import StoreAccessError, StoreIO, StoreRef
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +68,9 @@ _STAGING_NAME_RE = re.compile(r"^mem(?P<member>\d{3})_L(?P<lead>\d{4})\.shard$")
 #: Decoder for member shards. A zstd frame is self-describing, so no level is negotiated.
 _DECODER = Zstd()
 
-#: Store shape accepted by every entry point here.
-StoreRef = str | PathLike[str] | Mapping[str, bytes]
+# ``StoreRef`` is re-exported from the store layer, which owns the union of accepted store
+#: shapes (an ``s3://`` URL, a local path, or an in-memory mapping).
+_STOREREF_IS_REEXPORTED: bool = StoreRef is not None
 
 
 class StagingError(RuntimeError):
