@@ -1433,24 +1433,8 @@ def _gated_precipitation_member_states(
                         )
                         flags[c] = 1 if c_val >= 0.5 else 0
 
-                t_val: float | None = None
-                if "temperature_2m" in dataset.data_vars:
-                    t_val = float(
-                        reader.interpolate_point(
-                            "temperature_2m",
-                            member=member_num,
-                            lead_time_hours=lead,
-                            lat_idx=lat_idx,
-                            lon_idx=lon_idx,
-                            t_row=t_row,
-                            t_col=t_col,
-                            generation=generation,
-                        )
-                    )
-
                 amt_prev: float | None = None
                 flags_prev: dict[str, int] | None = None
-                t_start_val: float | None = None
 
                 if lead % 6 == 0 and lead > 0:
                     pred_lead = lead - 3
@@ -1485,27 +1469,12 @@ def _gated_precipitation_member_states(
                                 f_p[c] = 1 if f_p_val >= 0.5 else 0
                         if f_p:
                             flags_prev = f_p
-                        if "temperature_2m" in dataset.data_vars:
-                            t_start_val = float(
-                                reader.interpolate_point(
-                                    "temperature_2m",
-                                    member=member_num,
-                                    lead_time_hours=pred_lead,
-                                    lat_idx=lat_idx,
-                                    lon_idx=lon_idx,
-                                    t_row=t_row,
-                                    t_col=t_col,
-                                    generation=generation,
-                                )
-                            )
 
                 state = classify_precipitation_phase(
                     amt_val,
                     flags if flags else None,
                     amount_prev=amt_prev,
                     flags_prev=flags_prev,
-                    t2m_start=t_start_val,
-                    t2m_end=t_val,
                 )
                 return amt_val, state
 
@@ -1523,18 +1492,10 @@ def _gated_precipitation_member_states(
                     f = f.sel(lead_time_hours=lead)
                 cat_fields[c] = f
 
-        t2m_field = None
-        if "temperature_2m" in dataset.data_vars:
-            t = dataset["temperature_2m"]
-            if "lead_time_hours" in t.dims:
-                t = t.sel(lead_time_hours=lead)
-            t2m_field = t
-
         # Predecessor fields for 6-hour reset leads (t=6, 12, 18, 24, ...)
         pred_fields_avail = False
         pred_field_amt = None
         pred_cat_fields = {}
-        pred_t2m_field = None
 
         if lead % 6 == 0 and lead > 0:
             pred_lead = lead - 3
@@ -1548,8 +1509,6 @@ def _gated_precipitation_member_states(
                 for c in ("crain", "csnow", "cfrzr", "cicep"):
                     if c in dataset.data_vars:
                         pred_cat_fields[c] = dataset[c].sel(lead_time_hours=pred_lead)
-                if "temperature_2m" in dataset.data_vars:
-                    pred_t2m_field = dataset["temperature_2m"].sel(lead_time_hours=pred_lead)
 
         amounts: list[float] = []
         states: list[PrecipitationPhaseState] = []
@@ -1582,22 +1541,8 @@ def _gated_precipitation_member_states(
                 )
                 flags_l[c] = 1 if c_val >= 0.5 else 0
 
-            t_val_l: float | None = None
-            if t2m_field is not None:
-                t_val_l = float(
-                    _interpolate_neighborhood(
-                        t2m_field.isel(member=member_pos),
-                        grid,
-                        lat_descending,
-                        lon_descending,
-                        latitude,
-                        longitude,
-                    )
-                )
-
             amt_prev_l: float | None = None
             flags_prev_l: dict[str, int] | None = None
-            t_start_val_l: float | None = None
 
             if pred_fields_avail and pred_field_amt is not None:
                 amt_prev_l = float(
@@ -1625,25 +1570,12 @@ def _gated_precipitation_member_states(
                         )
                         f_p[c] = 1 if c_p_val >= 0.5 else 0
                     flags_prev_l = f_p
-                if pred_t2m_field is not None:
-                    t_start_val_l = float(
-                        _interpolate_neighborhood(
-                            pred_t2m_field.isel(member=member_pos),
-                            grid,
-                            lat_descending,
-                            lon_descending,
-                            latitude,
-                            longitude,
-                        )
-                    )
 
             st = classify_precipitation_phase(
                 amt_val,
                 flags_l if flags_l else None,
                 amount_prev=amt_prev_l,
                 flags_prev=flags_prev_l,
-                t2m_start=t_start_val_l,
-                t2m_end=t_val_l,
             )
             states.append(st)
 

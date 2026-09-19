@@ -145,8 +145,6 @@ def test_classify_rain_to_snow_transition() -> None:
         {"crain": 1, "csnow": 1},
         amount_prev=3.0,
         flags_prev={"crain": 1, "csnow": 0},
-        t2m_start=1.5,
-        t2m_end=-1.0,
     )
     assert state.interval_type == PrecipitationType.MIXED
     assert state.start_type == PrecipitationType.RAIN
@@ -164,8 +162,6 @@ def test_classify_snow_to_rain_transition() -> None:
         {"crain": 1, "csnow": 1},
         amount_prev=2.0,
         flags_prev={"crain": 0, "csnow": 1},
-        t2m_start=-1.0,
-        t2m_end=2.5,
     )
     assert state.interval_type == PrecipitationType.MIXED
     assert state.start_type == PrecipitationType.SNOW
@@ -173,6 +169,33 @@ def test_classify_snow_to_rain_transition() -> None:
     assert state.transition == PrecipitationTransition.SNOW_TO_RAIN
     assert state.evidence == EvidenceState.STRONGLY_INFERRED
     assert state.active_phases == frozenset({PhysicalPhase.SNOW, PhysicalPhase.RAIN})
+
+
+def test_classification_ignores_temperature_entirely() -> None:
+    """The classifier is a pure function of amounts and flags -- temperature is not an input.
+
+    This pins the property the phase aggregate rests on: its dependency set must equal its
+    input set, because the stored phase-support field is reconstructed exactly from the
+    amounts and flags and nothing else. The signature no longer accepts a temperature, so
+    this asserts the behaviour a caller might otherwise expect to differ: an identical
+    (amount, flags) pair classifies identically regardless of how cold or warm the
+    surrounding air is.
+    """
+    import inspect
+
+    parameters = set(inspect.signature(classify_precipitation_phase).parameters)
+    assert "t2m_start" not in parameters
+    assert "t2m_end" not in parameters
+
+    # The same inputs the transition tests use, minus the (now removed) temperatures,
+    # still produce the transition the flags describe.
+    state = classify_precipitation_phase(
+        2.0,
+        {"crain": 1, "csnow": 1},
+        amount_prev=3.0,
+        flags_prev={"crain": 1, "csnow": 0},
+    )
+    assert state.transition == PrecipitationTransition.RAIN_TO_SNOW
 
 
 def test_classify_rain_to_freezing_rain_transition() -> None:

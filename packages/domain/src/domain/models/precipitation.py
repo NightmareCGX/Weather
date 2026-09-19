@@ -146,15 +146,22 @@ def classify_precipitation_phase(
     *,
     amount_prev: float | None = None,
     flags_prev: Mapping[str, int] | tuple[int, int, int, int] | None = None,
-    t2m_start: float | None = None,
-    t2m_end: float | None = None,
     trace_threshold_mm: float = TRACE_THRESHOLD_MM,
 ) -> PrecipitationPhaseState:
     """Classify 3-hour precipitation into an immutable PrecipitationPhaseState.
 
-    Combines current and predecessor precipitation amounts, interval-average
-    categorical flags, and supporting 2m temperature tendency without allowing
-    temperature to override explicit GRIB microphysical diagnostics.
+    Combines the current and predecessor precipitation amounts with their
+    interval-average categorical flags. The classification is a pure function of
+    exactly those four inputs.
+
+    2m temperature is deliberately **not** consulted: an earlier revision accepted
+    ``t2m_start``/``t2m_end`` and documented them as a "supporting tendency", but the
+    body never read them. They were removed rather than wired up, for three reasons:
+    the GRIB microphysical flags are the authoritative phase diagnostic and letting
+    temperature override them would be a specification change, not a fix; the phase
+    support is stored as an aggregate field whose restoration must be exact, so its
+    dependency set has to equal its input set; and every caller was paying two extra
+    member-shard reads per member for values that were discarded.
 
     Args:
         amount_curr: Precipitation amount for target interval [t-3, t] in mm.
@@ -162,8 +169,6 @@ def classify_precipitation_phase(
         flags_curr: Categorical flags (crain, csnow, cfrzr, cicep) for the current window.
         amount_prev: Optional predecessor precipitation amount [t-6, t-3] in mm.
         flags_prev: Optional predecessor categorical flags [t-6, t-3].
-        t2m_start: Optional 2m air temperature at t-3 in °C.
-        t2m_end: Optional 2m air temperature at t in °C.
         trace_threshold_mm: Threshold below which precipitation is classified as dry.
 
     Returns:

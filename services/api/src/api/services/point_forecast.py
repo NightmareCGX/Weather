@@ -381,7 +381,7 @@ def build_point_forecast(
     db.close()
 
     forecasts: list[ForecastSeries] = []
-    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None, float | None]] = {}
+    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None]] = {}
     used_targets: set[tuple[str, str]] = set()
     t_kind = "mean" if model == "gefs" else "det"
     from collections import defaultdict
@@ -771,7 +771,7 @@ def _extract_single_lead_interpolations(
     t_col: float | None,
     latitude: float,
     longitude: float,
-    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None, float | None]] | None = None,
+    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None]] | None = None,
     store_path: str = "",
 ) -> dict[str, Any]:
     """Extract and interpolate all requested variables for a single lead."""
@@ -898,8 +898,11 @@ def _extract_single_lead_interpolations(
                                 out[f_code] = f_val
                             flags_curr[f_code] = 1 if f_val >= 0.5 else 0
 
-                    t2m_val = None
-                    if "temperature_2m" in dataset.data_vars:
+                    # Only read the 2m temperature when the response actually carries it. This
+                    # read used to happen unconditionally whenever the store had the variable,
+                    # because the phase classifier was handed it as `t2m_end`; the classifier
+                    # never used that argument, so the read is now only the output it produces.
+                    if "temperature_2m" in dataset.data_vars and "temperature_2m" in var_codes:
                         if "temperature_2m" in out:
                             t2m_val = out["temperature_2m"]
                         else:
@@ -916,18 +919,16 @@ def _extract_single_lead_interpolations(
                                     is_mean=True,
                                 )
                             )
-                            if "temperature_2m" in var_codes:
-                                out["temperature_2m"] = t2m_val
+                            out["temperature_2m"] = t2m_val
 
                     amt_prev = None
                     flags_prev = None
-                    t2m_start = None
 
                     if lead % 6 == 0 and lead > 0:
                         pred_lead = lead - 3
                         cached_prev = precip_history.get((store_path, pred_lead)) if precip_history is not None else None
                         if cached_prev is not None:
-                            amt_prev, flags_prev, t2m_start = cached_prev
+                            amt_prev, flags_prev = cached_prev
                         else:
                             leads_in_ds = (
                                 [
@@ -971,31 +972,14 @@ def _extract_single_lead_interpolations(
                                 if f_prev:
                                     flags_prev = f_prev
 
-                                if "temperature_2m" in dataset.data_vars:
-                                    t2m_start = float(
-                                        reader.interpolate_point(
-                                            "temperature_2m",
-                                            member=None,
-                                            lead_time_hours=pred_lead,
-                                            lat_idx=lat_idx,
-                                            lon_idx=lon_idx,
-                                            t_row=t_row,
-                                            t_col=t_col,
-                                            generation=generation,
-                                            is_mean=True,
-                                        )
-                                    )
-
                     if precip_history is not None:
-                        precip_history[(store_path, lead)] = (amt_val, flags_curr, t2m_val)
+                        precip_history[(store_path, lead)] = (amt_val, flags_curr)
 
                     phase_state = classify_precipitation_phase(
                         amt_val,
                         flags_curr if flags_curr else None,
                         amount_prev=amt_prev,
                         flags_prev=flags_prev,
-                        t2m_start=t2m_start,
-                        t2m_end=t2m_val,
                     )
                     out["_precipitation_type"] = phase_state.interval_type.value
                     out["_precipitation_transition"] = phase_state.transition.value
@@ -1036,9 +1020,10 @@ def _extract_single_lead_interpolations(
                             flags_curr[f_code] = 1 if f_val >= 0.5 else 0
                             out[f_code] = f_val
 
-                    t2m_val = None
-                    if "temperature_2m" in dataset.data_vars:
-                        t2m_val = float(
+                    # Read the 2m temperature only when the response carries it; see the
+                    # sharded branch above for why this is no longer unconditional.
+                    if "temperature_2m" in dataset.data_vars and "temperature_2m" in var_codes:
+                        out["temperature_2m"] = float(
                             reader.interpolate_point(
                                 "temperature_2m",
                                 member=None,
@@ -1050,12 +1035,9 @@ def _extract_single_lead_interpolations(
                                 generation=generation,
                             )
                         )
-                        if "temperature_2m" in var_codes:
-                            out["temperature_2m"] = t2m_val
 
                     amt_prev = None
                     flags_prev = None
-                    t2m_start = None
 
                     if lead % 6 == 0 and lead > 0:
                         pred_lead = lead - 3
@@ -1099,27 +1081,11 @@ def _extract_single_lead_interpolations(
                             if f_prev:
                                 flags_prev = f_prev
 
-                            if "temperature_2m" in dataset.data_vars:
-                                t2m_start = float(
-                                    reader.interpolate_point(
-                                        "temperature_2m",
-                                        member=None,
-                                        lead_time_hours=pred_lead,
-                                        lat_idx=lat_idx,
-                                        lon_idx=lon_idx,
-                                        t_row=t_row,
-                                        t_col=t_col,
-                                        generation=generation,
-                                    )
-                                )
-
                     phase_state = classify_precipitation_phase(
                         amt_val,
                         flags_curr if flags_curr else None,
                         amount_prev=amt_prev,
                         flags_prev=flags_prev,
-                        t2m_start=t2m_start,
-                        t2m_end=t2m_val,
                     )
                     out["_precipitation_type"] = phase_state.interval_type.value
                     out["_precipitation_transition"] = phase_state.transition.value
@@ -1244,22 +1210,9 @@ def _extract_single_lead_interpolations(
                     flags_curr_l[f_code] = 1 if f_val >= 0.5 else 0
                     out_legacy[f_code] = f_val
 
-            # Optional t2m
-            t2m_val_l: float | None = None
-            if "temperature_2m" in dataset.data_vars:
-                t_field = dataset["temperature_2m"]
-                if "lead_time_hours" in t_field.dims:
-                    t_field = t_field.sel(lead_time_hours=lead)
-                t2m_val_l = float(
-                    _interpolate_neighborhood(
-                        t_field, grid, lat_desc, lon_desc, latitude, longitude
-                    )
-                )
-
             # Predecessor contextual evidence for 6-hour reset leads (t=6, 12, 18, 24, ...)
             amt_prev_l: float | None = None
             flags_prev_l: dict[str, int] | None = None
-            t2m_start_l: float | None = None
 
             if lead % 6 == 0 and lead > 0:
                 pred_lead = lead - 3
@@ -1289,21 +1242,11 @@ def _extract_single_lead_interpolations(
                     if f_prev:
                         flags_prev_l = f_prev
 
-                    if "temperature_2m" in dataset.data_vars:
-                        t_field_p = dataset["temperature_2m"].sel(lead_time_hours=pred_lead)
-                        t2m_start_l = float(
-                            _interpolate_neighborhood(
-                                t_field_p, grid, lat_desc, lon_desc, latitude, longitude
-                            )
-                        )
-
             phase_state = classify_precipitation_phase(
                 amt_val,
                 flags_curr_l if flags_curr_l else None,
                 amount_prev=amt_prev_l,
                 flags_prev=flags_prev_l,
-                t2m_start=t2m_start_l,
-                t2m_end=t2m_val_l,
             )
             out_legacy["_precipitation_type"] = phase_state.interval_type.value
             out_legacy["_precipitation_transition"] = phase_state.transition.value
@@ -1346,7 +1289,7 @@ def batch_gated_point_interpolations(
     requests: dict[int, tuple[str, ...]],
     latitude: float,
     longitude: float,
-    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None, float | None]] | None = None,
+    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None]] | None = None,
 ) -> dict[int, dict[str, Any]] | None:
     """Interpolate requested variables across multiple leads under a SINGLE Reader Gate session."""
     if not requests:
@@ -1464,7 +1407,7 @@ def gated_point_interpolations(
     lead: int,
     latitude: float,
     longitude: float,
-    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None, float | None]] | None = None,
+    precip_history: dict[tuple[str, int], tuple[float | None, dict[str, int] | None]] | None = None,
 ) -> dict[str, Any] | None:
     """Interpolate every requested variable at a point/lead under the gate (wrapper over batch interpolator)."""
     res = batch_gated_point_interpolations(
