@@ -29,11 +29,18 @@ from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from api.core.config import settings
 from domain.reclamation import make_shard_filename
+from domain.shard_format import (
+    INDEX_ENTRY_SIZE as DOMAIN_INDEX_ENTRY_SIZE,
+    SHARD_V1_MAGIC as DOMAIN_SHARD_V1_MAGIC,
+    TRAILER_SIZE as DOMAIN_TRAILER_SIZE,
+)
 
-#: Canonical Weather Platform Sharded v1 (sharded_v1) binary layout constants
-SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
-INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
-TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
+#: Canonical Weather Platform Sharded v1 (sharded_v1) binary layout constants.
+#: Re-exported from :mod:`domain.shard_format`, which owns the byte layout for both
+#: container generations; the names are kept for callers written against the old module.
+SHARD_MAGIC: int = DOMAIN_SHARD_V1_MAGIC
+INDEX_ENTRY_SIZE: int = DOMAIN_INDEX_ENTRY_SIZE
+TRAILER_SIZE: int = DOMAIN_TRAILER_SIZE
 
 #: Shard-index dtype/width: each entry is a little-endian (offset, length) uint64 pair.
 SHARD_INDEX_DTYPE: np.dtype[Any] = np.dtype("<u8")

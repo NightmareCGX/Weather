@@ -1,29 +1,80 @@
-"""Stage 7D-B — Cross-Package Sharded v1 Storage Protocol Contract Suite.
+"""Stage 7D-B — Cross-Package Sharded Storage Protocol Contract Suite.
 
 Asserts structural no-drift in binary format constants, shard key naming conventions,
 and committed manifest paths between the ingestion writer and the API serving reader.
+
+The format bytes themselves are owned by ``domain.shard_format`` (unit-tested in
+``packages/domain/tests/test_shard_format.py``); this suite asserts that both services
+agree with that authority and with each other.
 """
+
+import pytest
 
 from api.core import manifest_reader as api_manifest
 from api.core import zarr as api_zarr
+from domain import shard_format
 from domain.locks import canonical_storage_identity
 from ingestion.core import markers as ing_markers
 from ingestion.core import zarr_writer as ing_zarr
 
 
 def test_sharded_v1_binary_constants_no_drift() -> None:
-    """Verify that binary container constants match exactly between writer and reader."""
+    """Verify that binary container constants match between writer, reader, and the format.
+
+    ``domain.shard_format`` owns the byte layout; the writer and reader re-export it. The
+    assertion is against that authority rather than against a literal, so changing the
+    layout in one place cannot leave the two services agreeing on a stale value.
+    """
     assert (
-        ing_zarr.SHARD_MAGIC == api_zarr.SHARD_MAGIC == 0x53484152
-    ), "SHARD_MAGIC constant drift detected between writer and reader"
+        ing_zarr.SHARD_MAGIC
+        == api_zarr.SHARD_MAGIC
+        == shard_format.SHARD_V1_MAGIC
+        == 0x53484152
+    ), "SHARD_MAGIC constant drift detected between writer, reader, and shard_format"
 
     assert (
-        ing_zarr.INDEX_ENTRY_SIZE == api_zarr.INDEX_ENTRY_SIZE == 16
-    ), "INDEX_ENTRY_SIZE constant drift detected between writer and reader"
+        ing_zarr.INDEX_ENTRY_SIZE
+        == api_zarr.INDEX_ENTRY_SIZE
+        == shard_format.INDEX_ENTRY_SIZE
+        == 16
+    ), "INDEX_ENTRY_SIZE constant drift detected between writer, reader, and shard_format"
 
     assert (
-        ing_zarr.TRAILER_SIZE == api_zarr.TRAILER_SIZE == 12
-    ), "TRAILER_SIZE constant drift detected between writer and reader"
+        ing_zarr.TRAILER_SIZE
+        == api_zarr.TRAILER_SIZE
+        == shard_format.TRAILER_SIZE
+        == 12
+    ), "TRAILER_SIZE constant drift detected between writer, reader, and shard_format"
+
+
+def test_container_generations_have_distinct_magics() -> None:
+    """A v1 reader must not be able to accept a v2 container by accident."""
+    assert shard_format.SHARD_V1_MAGIC != shard_format.SHARD_V2_MAGIC
+    assert shard_format.FORMAT_VERSION_V2 == "sharded_v2"
+
+
+def test_reader_rejects_a_container_whose_magic_is_unknown() -> None:
+    """The trailer magic is a contract, not decoration.
+
+    The reader previously ignored it entirely, so a foreign or corrupted object was sliced
+    as if it were a container. Parsing must fail instead.
+    """
+    import struct
+
+    from domain.shard_format import ShardFormatError, parse_trailer
+
+    good = struct.pack(
+        "<III", 120, 120 * shard_format.INDEX_ENTRY_SIZE, shard_format.SHARD_V1_MAGIC
+    )
+    assert parse_trailer(good).is_v1
+
+    for bad_magic in (0, 0xDEADBEEF, shard_format.SHARD_V2_MAGIC ^ 0xFF):
+        with pytest.raises(ShardFormatError, match="unrecognized container magic"):
+            parse_trailer(
+                struct.pack(
+                    "<III", 120, 120 * shard_format.INDEX_ENTRY_SIZE, bad_magic
+                )
+            )
 
 
 def test_committed_manifest_path_no_drift() -> None:
