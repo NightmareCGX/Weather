@@ -356,3 +356,138 @@ def test_region_write_stages_every_member_and_writes_no_aggregate(
     assert result.aggregates == ((VARIABLE, f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard", 2),)
     assert _aggregate_mean(store) == 281.5
     assert staging.staged_objects_by_variable(store) == {}
+
+
+def test_a_patch_publication_keeps_the_staging_the_next_patch_needs(
+    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial publication must not discard the members it will have to re-aggregate.
+
+    The staging area is the only place a committed member's plane is kept. A publication that
+    discarded it would make the next patch a statistic of the members that arrived *since* --
+    for 27 members followed by 3 more it wrote MEAN over the last 3, not over all 30 -- and
+    there would be nothing left to repair it from.
+    """
+    import struct as _struct
+
+    from ingestion.core.aggregate_writer import (
+        decode_aggregate_chunk,
+        layout_from_descriptor,
+    )
+    from domain.shard_format import split_v2_tail
+
+    store = str(tmp_path)
+    monkeypatch.setattr(aggregate_phase, "staging_enabled", lambda: True)
+
+    def _stage(member: int) -> None:
+        plane = np.full((REGRESSION_GRID, REGRESSION_GRID), 280.0 + member, dtype=np.float32)
+        dataset = xr.Dataset(
+            {
+                VARIABLE: (
+                    ("member", "lead_time_hours", "latitude", "longitude"),
+                    plane[None, None],
+                )
+            }
+        )
+        aggregate_phase.stage_member_region(
+            dataset, store, member=member, lead_time_hours=LEAD
+        )
+
+    def _mean() -> float:
+        key = f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard"
+        with open(os.path.join(store, *key.split("/")), "rb") as handle:
+            blob = handle.read()
+        num_chunks, index_byte_size, _magic = _struct.unpack("<III", blob[-12:])
+        _index, descriptor = split_v2_tail(
+            blob[-(index_byte_size + 40 + 12) :], num_chunks
+        )
+        layout = layout_from_descriptor(descriptor)
+        assert layout.n_fields == 34
+        return float(decode_aggregate_chunk(blob, 0)[0, 0])
+
+    for member in (1, 2, 3):
+        _stage(member)
+    # A quiescent patch: partial, so the staging survives.
+    first = aggregate_phase.aggregate_lead(
+        store, LEAD, grid_lat=REGRESSION_GRID, grid_lon=REGRESSION_GRID, drop_staging=False
+    )
+    assert first.aggregates[0][2] == 3
+    assert _mean() == 282.0
+    assert len(staging.staged_members_for_lead(store, VARIABLE, LEAD)) == 3
+
+    # A later member, then the publication that ends the lead's growth.
+    _stage(4)
+    second = aggregate_phase.aggregate_lead(
+        store, LEAD, grid_lat=REGRESSION_GRID, grid_lon=REGRESSION_GRID, drop_staging=True
+    )
+    assert second.aggregates[0][2] == 4, "the patch aggregated only the new member"
+    assert _mean() == 282.5
+    assert staging.staged_objects_by_variable(store) == {}
+
+
+def test_publication_releases_staging_only_when_it_is_the_leads_last_version(
+    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coordinator must pass the publication's finality through to the aggregate pass.
+
+    ``aggregate_lead`` defaults to dropping the staging it consumed, which is right for a
+    lead's last publication and wrong for a patch: the next patch has to be computed from
+    every committed member, and their planes exist only in the staging area. This asserts the
+    wiring rather than the parameter, because a correct default is exactly what makes the
+    mistake invisible -- the patch would aggregate only the members that arrived since the
+    previous one, and nothing downstream could tell.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    import ingestion.core.coordinator as CO
+    import ingestion.core.coordinator as coordinator_module
+    from ingestion.cli import _synthetic_spec_dataset
+    from ingestion.core.coordinator import RunCoordinator
+
+    calls: list[dict[str, object]] = []
+
+    def _spy_aggregate_lead(store, lead, **kwargs):  # noqa: ANN001, ANN003
+        calls.append({"lead": lead, **kwargs})
+        return aggregate_phase.AggregatePhaseResult()
+
+    monkeypatch.setattr(coordinator_module, "aggregate_lead", _spy_aggregate_lead)
+    monkeypatch.setattr(CO, "StoreLockCoordinator", _NoopLockCoordinator)
+
+    store = str(tmp_path / "publish.zarr")
+    spec = _ensemble_spec()
+    engine = create_engine("sqlite:///:memory:")
+    CatalogBase.metadata.create_all(engine)
+    coordinator = RunCoordinator(spec, store, timeout_seconds=2.0)
+    conn = engine.connect()
+    try:
+        with Session(bind=conn) as catalog_session:
+            run = record_run(
+                catalog_session, spec, _synthetic_spec_dataset(spec), committed_state=None
+            )
+            run_id = str(run.id)
+
+        coordinator.publish_settled_lead(
+            conn,
+            run_id=run_id,
+            spec=spec,
+            lead_time_hours=LEAD,
+            expected_members=spec.expected_members,
+            aggregate_variables=(VARIABLE,),
+            aggregate_is_final=False,
+        )
+        coordinator.publish_settled_lead(
+            conn,
+            run_id=run_id,
+            spec=spec,
+            lead_time_hours=LEAD,
+            expected_members=spec.expected_members,
+            aggregate_variables=(VARIABLE,),
+            aggregate_is_final=True,
+        )
+    finally:
+        conn.close()
+        engine.dispose()
+
+    assert [call["drop_staging"] for call in calls] == [False, True]
+    assert all(call["variables"] == (VARIABLE,) for call in calls)

@@ -157,6 +157,10 @@ def aggregate_lead(
         chunk_lat: Inner chunk latitude extent.
         chunk_lon: Inner chunk longitude extent.
         drop_staging: Remove each variable's staging objects once its aggregate is written.
+            **Pass ``False`` for a partial publication**: the staging area is the only place
+            the already-committed members' planes exist, and the next patch has to be computed
+            from all of them, not from the ones that arrived since. The default is ``True``
+            for the caller that publishes the last version of a lead.
     """
     if not staging_enabled():
         return AggregatePhaseResult()

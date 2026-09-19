@@ -1075,6 +1075,7 @@ class RunCoordinator:
         lead_time_hours: int,
         expected_members: tuple[int, ...],
         aggregate_variables: tuple[str, ...] = (),
+        aggregate_is_final: bool = True,
     ) -> None:
         """Publish a settled forecast lead to the catalog and advance serving generation.
 
@@ -1088,6 +1089,11 @@ class RunCoordinator:
             aggregate_variables: Variables whose aggregate shard should be (re)computed from
                 the committed members before the new generation is published. Empty leaves the
                 aggregates alone, which is what a caller without the staging area needs.
+            aggregate_is_final: Whether this is the last publication the lead will get. A
+                partial publication keeps the staging area, because the next patch must be
+                computed from *all* the committed members and the staging area is the only
+                place their planes live. Discarding it would make each patch a statistic of
+                the handful of members that arrived since the last one.
 
         Does NOT mark the overall run status as 'ready' (status remains 'processing' or 'partial').
 
@@ -1291,6 +1297,7 @@ class RunCoordinator:
                         self.store_path,
                         lead_time_hours,
                         variables=aggregate_variables,
+                        drop_staging=aggregate_is_final,
                     )
                 except AggregatePhaseError as exc:
                     # The member shards remain the reader of record, so a failed aggregate is

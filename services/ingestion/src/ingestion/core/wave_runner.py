@@ -1159,6 +1159,11 @@ async def _run_wave_impl(
                 for lead_val in spec.target_lead_time_hours
             }
             lead_settle_lock = threading.Lock()
+            #: Leads the completion path has published, which is also the set the settlement
+            #: loop must not touch: a lead whose items have all settled is done growing, so a
+            #: later patch of it would be byte-identical content behind a generation bump.
+            #: Patch publications are tracked in the settlement book instead, because only the
+            #: book can tell whether the committed set has moved since the last one.
             published_leads: set[int] = set()
             run_id_for_pub = _resolve_run_id(catalog_spec, store_path)
 
@@ -1196,12 +1201,19 @@ async def _run_wave_impl(
                         lead_val, int(member_val), at=time.monotonic()
                     )
 
-            def _publish_lead(lead_val: int, *, aggregated: bool = False) -> None:
+            def _publish_lead(
+                lead_val: int, *, aggregated: bool = False, final: bool = False
+            ) -> None:
                 """Publish one lead, aggregating its committed members first when asked.
 
                 Synchronous and blocking on purpose: publication takes the exclusive store gate,
                 and the caller runs it on an executor so the event loop keeps draining the
                 pipeline while it holds that gate.
+
+                ``final`` releases the lead's staging area once the aggregate is written. It is
+                set only where no further member can arrive for the lead, because a patch has to
+                be computed from every committed member and the staging area is the only place
+                their planes are kept.
                 """
                 pub_conn = engine.connect()
                 try:
@@ -1214,6 +1226,7 @@ async def _run_wave_impl(
                         aggregate_variables=(
                             publication_variables if aggregated else ()
                         ),
+                        aggregate_is_final=final,
                     )
                 except Exception as exc:
                     logger.warning("Settled-lead publication failed for lead %d: %s", lead_val, exc)
@@ -1238,7 +1251,7 @@ async def _run_wave_impl(
                         decision = settlement.decision_for(
                             lead_val, now=time.monotonic()
                         )
-                _publish_lead(lead_val, aggregated=True)
+                _publish_lead(lead_val, aggregated=True, final=True)
                 if settlement is not None and decision is not None:
                     with lead_settle_lock:
                         settlement.note_published(decision)
@@ -1265,9 +1278,16 @@ async def _run_wave_impl(
                             decision.reason,
                         )
                         lead_to_publish = decision.lead_time_hours
+                        # Only a publication that ends the lead's growth may release its
+                        # staging: a later patch is computed from every committed member, and
+                        # their planes exist only there.
+                        release_staging = decision.is_final
 
-                        def _publish_patch(lead: int = lead_to_publish) -> None:
-                            _publish_lead(lead, aggregated=True)
+                        def _publish_patch(
+                            lead: int = lead_to_publish,
+                            release: bool = release_staging,
+                        ) -> None:
+                            _publish_lead(lead, aggregated=True, final=release)
 
                         fut = loop.run_in_executor(executor, _publish_patch)
                         # The book records only what was actually published: a failure leaves
@@ -1587,6 +1607,10 @@ async def _run_wave_impl(
                 # published by the completion path or is about to be. Stop the timer before
                 # the finalizer takes the gate, and let an in-flight tick finish rather than
                 # cancelling a publication that holds the exclusive gate.
+                #
+                # Every lead whose items all settled has already been finalized by
+                # ``_on_item_settled``, which is the only path that releases staging, so there
+                # is nothing left to drain here.
                 settlement_task.cancel()
                 try:
                     await settlement_task
