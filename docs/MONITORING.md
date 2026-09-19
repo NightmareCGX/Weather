@@ -161,9 +161,9 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
 | `weather_lifecycle_oldest_claim_age_seconds` | Gauge | Age in seconds of oldest in-flight deletion claim | - | Medium |
 | `weather_lifecycle_stuck_claims_warning` | Gauge | Deletion claims older than 1 hour | - | Medium |
 | `weather_lifecycle_stuck_claims_critical` | Gauge | Deletion claims older than 4 hours | - | Medium |
-| `weather_metadata_sweeper_eligible_tombstones` | Gauge | Tombstones older than 14-day retention window | - | Medium |
-| `weather_metadata_sweeper_unpurged_metadata_count`| Gauge | Tombstones older than 14 days still retaining detailed child metadata | - | Medium |
-| `weather_metadata_sweeper_oldest_overdue_seconds` | Gauge | Age in seconds of oldest metadata overdue past 14-day deadline | - | Medium |
+| `weather_metadata_sweeper_eligible_tombstones` | Gauge | Tombstones past the metadata retention deadline (`METADATA_RETENTION_DAYS`, default 1 day) | - | Medium |
+| `weather_metadata_sweeper_unpurged_metadata_count`| Gauge | Tombstones past the deadline still retaining detailed child metadata | - | Medium |
+| `weather_metadata_sweeper_oldest_overdue_seconds` | Gauge | Age in seconds of oldest metadata overdue past the retention deadline | - | Medium |
 | `weather_reclamation_queue_count` | Gauge | Shard reclamation queue row counts | `status` (`queued`, `deleting`, `deleted`, `failed`) | Fast |
 | `weather_reclamation_oldest_queued_age_seconds` | Gauge | Age in seconds of oldest queued reclamation target | - | Medium |
 | `weather_reclamation_oldest_deleting_age_seconds` | Gauge | Age in seconds of oldest leased deleting target | - | Medium |
@@ -321,8 +321,7 @@ Alerts are classified as `INFO`, `WARNING`, or `CRITICAL`. Every alert links dir
 | `ingestion_lag_critical` | CRITICAL | 2+ cycles behind available NOAA upstream | `#ingestion-lag` |
 | `finalizer_claim_stuck_warning`| WARNING | Physical deletion claim age $> 1\text{ hour}$ | `#stuck-deletion-claim` |
 | `finalizer_claim_stuck_critical`| CRITICAL | Physical deletion claim age $> 4\text{ hours}$ | `#stuck-deletion-claim` |
-| `metadata_sweeper_backlog_overdue`| WARNING| Tombstones older than 14 days retain metadata for $> 1\text{ day}$ overdue | `#sweeper-backlog` |
-| `reclamation_failed_shards` | WARNING | Any records in `reclamation_queue` with `status='failed'` | `#reclamation-failures` |
+| `metadata_sweeper_backlog_overdue`| WARNING| Tombstones past the metadata retention deadline (`METADATA_RETENTION_DAYS`) retain detailed metadata | `#sweeper-backlog` || `reclamation_failed_shards` | WARNING | Any records in `reclamation_queue` with `status='failed'` | `#reclamation-failures` |
 | `reclamation_deleting_stuck` | WARNING | Reclaimed target in `deleting` status for $> 600\text{s}$ | `#reclamation-stuck` |
 | `invariant_invalid_lifecycle_transition` | CRITICAL | Cycle has `deleted_at` set without prior `deletion_started_at` | `#anti-resurrection-violation` |
 | `invariant_anti_resurrection_violation` | CRITICAL | Run recreated or active under permanent `deleted_at` tombstone | `#anti-resurrection-violation` |

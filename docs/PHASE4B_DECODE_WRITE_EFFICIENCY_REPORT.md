@@ -367,9 +367,35 @@ Parallelizing chunk PUTs within region writes yields a **5.44× speedup** per re
 ## 22. Compression / Encoding Findings
 
 * 1,680 chunks (43.57 MB float32) compressed with `Zstd(level=5)` in **384 ms** (0.229 ms/chunk).
-* Compression produces 10.36 MB (4.21× compression ratio).
+* Compression produces 10.36 MB (4.21× compression ratio). **See the correction below**: the uncompressed
+  figure is understated, so this ratio is not the store's compression ratio.
 * `Zstd` C bindings execute in native code without GIL contention.
 * Compression accounts for < 9% of total write time.
+
+> ### CORRECTION (2026-09-18): the 4.21× ratio and the 43.57 MB figure are both wrong
+>
+> A region is `120 spatial chunks × 14 variables = 1,680` chunks (this report, §5). Each inner chunk is a
+> **100×100 float32 buffer padded to the full 100×100 even at the grid edge**
+> (`encode_region_sharded_v1`, `services/ingestion/src/ingestion/core/zarr_writer.py:658`), so each chunk is
+> 100 × 100 × 4 = **40,000 bytes** and the region's true uncompressed payload is
+> `1,680 × 40,000 = ` **67.2 MB**, not 43.57 MB.
+>
+> | Basis | Uncompressed | Compressed | Ratio |
+> |---|---|---|---|
+> | This report | 43.57 MB | 10.36 MB | **4.21×** |
+> | Padded payload (per the code) | **67.2 MB** | 10.36 MB | **6.49×** |
+> | 30 regions, `PHASE4F` §… measured | — | 323.98 MB / 420 shards | — |
+>
+> Consequences:
+> * **Do not quote 4.21× as the store's compression ratio.** The correct figure for this workload is
+>   **≈6.5×** on the padded payload, or ≈5.4× on unpadded field data (721 × 1440 × 4 B per field).
+> * The per-region compressed size (**10.36 MB**) and the timing (**384 ms**) are unaffected — only the
+>   denominator was wrong. Every other measurement in this report that uses 10.36 MB stays valid.
+> * The error propagated into capacity planning: a follow-on investigation initially derived a 29 GB
+>   per-cycle footprint from this report's ratio before the compression ratio was recomputed.
+>
+> Corrected by an independent storage-encoding investigation; see
+> `docs/investigations/numeric-encoding/REPORT.md` §9.10.3 and §9.16.
 
 ---
 

@@ -275,7 +275,7 @@ def test_04_runs_disappears_after_metadata_purge(m5_env):
         )
         session.commit()
 
-        # Simulate M3 14-day retention purge of model_runs metadata
+        # Simulate an M3 metadata retention purge of model_runs metadata
         session.delete(r)
         session.commit()
 

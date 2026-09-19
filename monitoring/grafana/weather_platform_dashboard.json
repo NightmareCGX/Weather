@@ -1190,7 +1190,7 @@
         "y": 93
       },
       "id": 32,
-      "title": "14-Day Retention Backlog",
+      "title": "Metadata Retention Backlog",
       "type": "timeseries",
       "targets": [
         {
@@ -1230,7 +1230,7 @@
         "y": 93
       },
       "id": 33,
-      "title": "Oldest Overdue Metadata Past 14-Day Window",
+      "title": "Oldest Overdue Metadata Past Retention Window",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {

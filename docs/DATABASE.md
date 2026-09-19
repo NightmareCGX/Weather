@@ -90,7 +90,7 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
                                                    ▼ (physical stores deleted sequentially)
                                               [deleted_at]      (anti-resurrection tombstone)
                                                    │
-                                                   ▼ (14-day retention window)
+                                                   ▼ (metadata retention window, default 1 day)
                                             [metadata purged]   (tombstone survives indefinitely)
 ```
 

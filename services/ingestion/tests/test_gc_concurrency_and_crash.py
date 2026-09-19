@@ -232,7 +232,7 @@ def test_claimed_cycle_blocks_stale_ingestion_and_reclaims_granularly(postgres_g
         assert lc_final.deletion_started_at is not None
         assert lc_final.deleted_at is not None
 
-        # Catalog metadata is retained (14-day sweeper owns purging)
+        # Catalog metadata is retained (the metadata sweeper owns purging)
         runs_c0 = (
             session.execute(
                 select(ModelRunRecord)

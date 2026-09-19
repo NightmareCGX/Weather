@@ -1,7 +1,7 @@
 """Live integration test suite exercising monitoring collectors against a populated relational catalog.
 
 Validates that all real PostgreSQL queries (PostgreSQL capacity, lifecycle deletion claims,
-14-day metadata retention sweeper, granular reclamation queue depths, GFS completeness,
+metadata retention sweeper, granular reclamation queue depths, GFS completeness,
 GEFS completeness, anti-resurrection audits, and alert mapping) execute correctly against
 realistic data without leaving permanent test fixtures in the database.
 
@@ -385,16 +385,17 @@ def test_populated_reclamation_queue(populated_db: Connection):
     assert rec.oldest_deleting_age_s >= 900.0
 
 
-def test_populated_14_day_metadata_sweeper(populated_db: Connection):
-    """Verify 14-day sweeper detects tombstones older than 14 days with unpurged child metadata."""
+def test_populated_metadata_sweeper_backlog(populated_db: Connection):
+    """Verify the sweeper detects tombstones past the retention deadline with unpurged child metadata."""
     collector = LifecycleHealthCollector(populated_db)
     report = collector.collect()
 
-    # Eligible tombstones older than 14 days
+    # Eligible tombstones past the retention deadline
     assert report.sweeper_eligible_count >= 1
     # Unpurged detailed metadata count
     assert report.sweeper_unpurged_count >= 1
-    # Overdue duration (20 days - 14 days = 6 days overdue >= 500,000s)
+    # Overdue duration: the seeded tombstones are ~20 days old, so the overdue age is
+    # well past 500,000 s regardless of the configured retention window.
     assert report.sweeper_oldest_overdue_s >= 500000.0
 
 

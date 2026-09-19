@@ -8,7 +8,7 @@ Authoritative verification for the integrated Data Lifecycle V3 system:
 - Task 6: Whole-Cycle Finalizer Acceptance (strict horizon, multi-version max horizon, fail-closed, recovery, multi-store, atomic queue normalization)
 - Task 7: Writer / Finalizer Concurrency (all 3 serialization cases, custom store discovery)
 - Task 8: Crash / Restart Acceptance (monotonic recovery from claim, multi-store resumption)
-- Task 9: M3 Retention Acceptance (before/exact/after 14-day boundary, tombstone preservation, batch forward progress, DB-only)
+- Task 9: M3 Retention Acceptance (before/exact/after retention boundary, tombstone preservation, batch forward progress, DB-only)
 - Task 10: Tombstone-Only Anti-Resurrection (post-M3 state rejects re-entry across all paths)
 - Task 11: Cache Acceptance (deletion_started_at & deleted_at invalidate cache)
 - Task 12: API Contract Separation (deleted run in /v1/runs but not /v1/forecast/availability before M3; absent after M3)

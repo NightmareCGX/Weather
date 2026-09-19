@@ -5,7 +5,7 @@ Covers:
 - Cross-platform system resource collection (CPU, RSS, VMS, threads, disk)
 - Cycle-to-cycle resource leak detection (stable vs. sustained monotonic leak)
 - PostgreSQL health collection with bounded catalog queries
-- Lifecycle, finalizer escalation, 14-day sweeper, reclamation queue, and anti-resurrection audits
+- Lifecycle, finalizer escalation, metadata sweeper, reclamation queue, and anti-resurrection audits
 - Ingestion progress tracking, stuck detection (download/decode/write/finalize), and lag analysis
 - GEFS completeness rules (26/30 servable, 30/30 ready)
 - Object storage (MinIO/S3) probes and phase duration metrics

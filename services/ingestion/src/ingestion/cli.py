@@ -729,13 +729,13 @@ def _build_parser() -> argparse.ArgumentParser:
     gc.add_argument(
         "--enable-sweeper",
         action="store_true",
-        help="Run the M3 14-day detailed metadata retention sweeper pass after each "
+        help="Run the M3 detailed metadata retention sweeper pass after each "
         "bookkeeping pass (daemon mode). Also enabled via RECLAMATION_SWEEPER_ENABLED=true.",
     )
     gc.add_argument(
         "--sweep-metadata",
         action="store_true",
-        help="Execute M3 14-day detailed metadata retention sweeper pass.",
+        help="Execute the M3 detailed metadata retention sweeper pass.",
     )
     gc.add_argument(
         "--batch-size",
@@ -1434,7 +1434,7 @@ def _run_gc(args: argparse.Namespace) -> int:
     exclusively through the reclamation planner + worker at
     (variable, valid_time) granularity; bookkeeping itself performs zero
     physical storage operations):
-    * ``--sweep-metadata``: Execute M3 14-day detailed metadata retention sweeper pass.
+    * ``--sweep-metadata``: Execute the M3 detailed metadata retention sweeper pass.
     * ``--inventory``: Run one store-catalog orphan inventory pass and exit.
     * ``--once --dry-run``: Plan and log diagnostics without mutating PostgreSQL.
     * ``--once``: Acquire GC leadership, execute one pipeline pass, and exit.
@@ -1454,8 +1454,8 @@ def _run_gc(args: argparse.Namespace) -> int:
       shard targets after each bookkeeping pass (queue writes only).
     * ``--enable-delete`` (or RECLAMATION_DELETE_ENABLED): authorize the worker
       stage to physically delete enqueued shard targets.
-    * ``--enable-sweeper`` (or RECLAMATION_SWEEPER_ENABLED): include the 14-day
-      metadata sweeper pass in each pipeline pass.
+    * ``--enable-sweeper`` (or RECLAMATION_SWEEPER_ENABLED): include the
+      metadata sweeper pass in each pipeline pass (window = ``METADATA_RETENTION_DAYS``).
 
     Args:
         args: Parsed CLI arguments.

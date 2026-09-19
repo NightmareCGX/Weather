@@ -20,7 +20,16 @@ This framework is cloud- and topology-agnostic. Specific hardware sizing, IP add
 | `<API_WORKERS>` | Number of Uvicorn worker processes per host (`FINALIZE IN STAGE 8`) |
 | `<POSTGRES_MAX_CONNECTIONS>` | Total PostgreSQL server connection ceiling (`FINALIZE IN STAGE 8`) |
 | `<CONTAINER_STOP_GRACE>` | Container runtime stop timeout in seconds ($\ge 50\text{s}$) |
-| `<RETENTION_POLICY>` | Number of historical forecast cycles retained before GC deletion |
+| `<METADATA_RETENTION_DAYS>` | Days detailed catalog metadata is kept after physical deletion, before the sweeper purges it. Configurable via `METADATA_RETENTION_DAYS` (default `1`). **Not** a cycle-retention knob. |
+
+> **Note on the former `<RETENTION_POLICY>` placeholder (removed 2026-09-18).**
+> It read "number of historical forecast cycles retained before GC deletion", which does not describe
+> how this platform reclaims storage. Canonical source resolution is the **sole deletion authority**
+> (`services/ingestion/src/ingestion/gc/planner.py:1-10`): a physical reclamation unit is reclaimable
+> **iff canonical serving no longer selects it** for any protected valid_time and no dependency hold
+> applies. There is no "retain N cycles" setting — the retained set is a *derived consequence*, and it
+> converges to roughly the newest one to two cycles. Adding such a knob would not save space.
+> What *is* configurable is the separate detailed-metadata retention window above.
 
 ---
 
@@ -294,7 +303,7 @@ levels so deletion is always an explicit operator decision:
 |---|---|---|---|
 | Planner | `--enable-planner` | `RECLAMATION_PLANNER_ENABLED=true` | Enqueue reclaimable shard targets into `reclamation_queue` each pass (queue writes only, no physical side effects). |
 | Worker | `--enable-delete` | `RECLAMATION_DELETE_ENABLED=true` | Physically delete enqueued shard targets each pass. **DANGEROUS.** |
-| Sweeper | `--enable-sweeper` | `RECLAMATION_SWEEPER_ENABLED=true` | Include the M3 14-day metadata retention pass each pass. |
+| Sweeper | `--enable-sweeper` | `RECLAMATION_SWEEPER_ENABLED=true` | Include the M3 metadata retention pass each pass (window = `METADATA_RETENTION_DAYS`, default 1 day). |
 
 Recommended rollout: enable planner only, observe
 `GC pass: ... planner enqueued=N ...` summaries for at least one full
@@ -567,7 +576,7 @@ The following settings remain **TBD** until physical server provisioning in Stag
 | **Redis Max Memory** | `<REDIS_MAXMEMORY>` | Host RAM minus API and Ingestion budgets | `FINALIZE IN STAGE 8` |
 | **S3 Storage Provider & FQDN**| `<OBJECT_STORAGE_ENDPOINT>` | Cloud provider S3 endpoint | `FINALIZE IN STAGE 8` |
 | **Staging Disk Allocation** | `<STAGING_DISK_GB>` | Sized for peak concurrent wave downloads | `FINALIZE IN STAGE 8` |
-| **Retention Window Policy** | `<RETENTION_POLICY>` | Number of historical cycles to retain (e.g. 4 cycles) | `FINALIZE IN STAGE 8` |
+| **Metadata Retention Window** | `<METADATA_RETENTION_DAYS>` | Detailed catalog metadata retention after physical deletion (default `1`) | `FINALIZE IN STAGE 8` |
 
 ---
 
@@ -723,14 +732,18 @@ Verify that JSON serialization, Redis caching, and coordinate projections execut
     ```
   - The finalizer will detect existing `deletion_started_at` claims, resume store deletion without re-evaluating horizon eligibility, and commit `deleted_at`.
 
-### 19.7 14-Day Metadata Sweeper Backlog Overdue (`#sweeper-backlog`)
-* **Symptom:** Alert `metadata_sweeper_backlog_overdue` triggers (`WARNING`). Tombstones older than 14 days retain detailed `model_runs` metadata.
+### 19.7 Metadata Sweeper Backlog Overdue (`#sweeper-backlog`)
+* **Symptom:** Alert `metadata_sweeper_backlog_overdue` triggers (`WARNING`). Tombstones past the metadata
+  retention deadline still retain detailed `model_runs` metadata.
+* **Window:** `METADATA_RETENTION_DAYS` (default `1` day). The gauge `weather_metadata_sweeper_oldest_overdue_seconds`
+  and the sweeper both derive their deadline from this setting, so the alert threshold tracks configuration
+  rather than a fixed number of days. (Historically documented as "14 days", which never matched the default.)
 * **Diagnostic Procedure:**
-  1. Check unpurged tombstones count:
+  1. Check unpurged tombstones past the deadline (substitute the configured value):
      ```sql
      SELECT count(*) FROM forecast_cycle_lifecycle l
      JOIN model_runs r ON r.cycle_time = l.cycle_time
-     WHERE l.deleted_at <= NOW() - INTERVAL '14 days';
+     WHERE l.deleted_at <= NOW() - make_interval(days => :metadata_retention_days);
      ```
 * **Remediation:**
   - Trigger a manual metadata sweeper pass:

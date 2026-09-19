@@ -3,7 +3,7 @@
 Observes the authoritative Data Lifecycle V3 contracts:
 - Physical cycle lifecycle (active -> deletion_started_at -> deleted_at)
 - Finalizer progress and stuck deletion claims
-- 14-day detailed metadata sweeper backlog and overdue metadata
+- Detailed metadata sweeper backlog and overdue metadata (window = ``METADATA_RETENTION_DAYS``)
 - Granular reclamation queue states (queued, deleting, deleted, failed)
 - Lifecycle invariants and permanent anti-resurrection tombstone enforcement
 """
