@@ -300,6 +300,18 @@ def test_field_metadata_describes_the_spec_and_layout_completely() -> None:
     assert meta["grid_lon"] == GRID_LON
 
 
+def test_decode_does_not_depend_on_the_write_level() -> None:
+    """A zstd frame is self-describing, so no level has to be negotiated with the reader."""
+    planes = _planes(n_fields=1, seed=9)
+    layout = _layout(n_fields=1)
+    for level in (1, 5, 19):
+        container = encode_aggregate_shard(planes, layout, level=level)
+        decoded = decode_aggregate_chunk(container, 0)
+        expected = np.full((layout.chunk_lat, layout.chunk_lon), np.nan, dtype=np.float32)
+        expected[:100, :100] = planes[0][:100, :100]
+        assert _identical_allow_nan(decoded, expected), level
+
+
 def test_container_from_a_realistic_spec_round_trips() -> None:
     """End to end through the actual encode path with the default field set."""
     spec = AggregateSpec()

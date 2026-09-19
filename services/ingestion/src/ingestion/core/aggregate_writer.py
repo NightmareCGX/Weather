@@ -40,11 +40,11 @@ from domain.shard_format import (
 DEFAULT_CHUNK_LAT: int = 100
 DEFAULT_CHUNK_LON: int = 100
 
-#: Compression level for the inner chunks.
+#: Compression level used by :func:`encode_aggregate_shard` unless overridden.
 #:
-#: Level 5 is the measured choice: the ramp from 5 to 7 is small here and 9-12 are worse on
-#: this data, while 19 costs hours per cycle. Changing it is a container-wide decision, not a
-#: local one -- a reader must know the level to decode, and it does not record it.
+#: Level 5 is the measured choice for this data: the ramp to 7 is small here, 9-12 are worse,
+#: and 19 costs hours per cycle. It is a writer-side knob only -- a zstd frame is
+#: self-describing, so the decode path does not depend on it.
 DEFAULT_ZSTD_LEVEL: int = 5
 
 #: Suffix of an aggregate shard object, following the shard key grammar.
@@ -219,20 +219,21 @@ def encode_aggregate_shard(
     return build_container_v2(payloads, descriptor=layout.to_descriptor())
 
 
+#: A decoder used only to call ``decode``. A zstd frame is self-describing, so the decode
+#: path does not depend on the level the writer chose and no level has to be negotiated
+#: between writer and reader.
+_DECODER = Zstd()
+
+
 def decode_aggregate_chunk(
     container: bytes,
     ordinal: int,
-    *,
-    level: int = DEFAULT_ZSTD_LEVEL,
 ) -> npt.NDArray[np.float32]:
     """Decode one chunk from an aggregate container by its ordinal.
 
     Args:
         container: The full container bytes.
         ordinal: Row-major chunk ordinal across all field planes.
-        level: Zstd level the container was written with. The format does not record it,
-            so writer and reader must agree out of band; this is a known gap in the current
-            container generation.
 
     Raises:
         AggregateWriterError: if the container is malformed or the ordinal is off-grid.
@@ -255,7 +256,7 @@ def decode_aggregate_chunk(
     offset, length = entries[ordinal]
     if length == 0:
         return np.full((layout.chunk_lat, layout.chunk_lon), np.nan, dtype=np.float32)
-    raw = Zstd(level=level).decode(container[offset : offset + length])
+    raw = _DECODER.decode(container[offset : offset + length])
     return (
         np.frombuffer(raw, dtype=np.float32)
         .reshape(layout.chunk_lat, layout.chunk_lon)
