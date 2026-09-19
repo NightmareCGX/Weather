@@ -192,3 +192,71 @@ def test_canonical_storage_identity_normalization() -> None:
     norm_api = canonical_storage_identity(raw_path, endpoint="localhost:9000", secure=False)
     norm_ing = canonical_storage_identity(raw_path, endpoint="localhost:9000", secure=False)
     assert norm_api == norm_ing == "s3://http://localhost:9000/weather-data/gfs/2026-09-03/00/cycle.zarr"
+
+
+def test_aggregate_reader_agrees_with_the_ingestion_writer(tmp_path) -> None:
+    """The API reader and the ingestion writer must agree on the aggregate container.
+
+    This is the cross-service assertion, and it belongs here rather than in the API's own
+    suite: the API tier is independently deployable and must not import the ingestion package
+    (``docs/ARCHITECTURE.md`` 3.1/3.5), so only this suite can exercise both sides at once.
+    A geometry, key or ordering mismatch between them would otherwise surface as misaligned
+    statistic planes rather than as an error.
+    """
+    import numpy as np
+    import os
+
+    from api.core.aggregate_reader import (
+        AggregateShardReader,
+        aggregate_shard_key,
+        recover_geometry,
+    )
+    from domain.aggregate import KIND_QUANTILE_FUNCTION, AggregateSpec, compute_aggregate
+    from ingestion.core.aggregate_writer import (
+        encode_aggregate_shard,
+        layout_for_spec,
+    )
+
+    grid_lat, grid_lon = 128, 160
+    variable, lead = "temperature_2m", 6
+    members = np.random.default_rng(0).normal(280.0, 8.0, (5, grid_lat, grid_lon))
+    store = str(tmp_path / "cycle.zarr")
+
+    for spec in (
+        AggregateSpec(n_bins=4),
+        AggregateSpec(kind=KIND_QUANTILE_FUNCTION),
+    ):
+        fields = compute_aggregate(members.astype(np.float32), spec)
+        layout = layout_for_spec(spec, grid_lat=grid_lat, grid_lon=grid_lon)
+        container = encode_aggregate_shard(list(fields), layout)
+        key = aggregate_shard_key(variable, lead)
+        full = os.path.join(store, *key.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(container)
+
+        # 1. the reader recovers exactly the writer's geometry
+        reader = AggregateShardReader(store)
+        geometry = reader.open(variable, lead)
+        assert geometry is not None, spec.kind
+        assert geometry.n_fields == spec.n_fields
+        assert geometry.num_chunks == layout.num_chunks
+        assert geometry.lat_chunks == layout.lat_chunks
+        assert geometry.lon_chunks == layout.lon_chunks
+        assert recover_geometry(layout.to_descriptor()) == geometry
+
+        # 2. and decodes the fields the writer was given, chunk for chunk
+        for row in range(geometry.lat_chunks):
+            for col in range(geometry.lon_chunks):
+                stack = reader.read_location(
+                    variable, lead_time_hours=lead, chunk_row=row, chunk_col=col
+                )
+                assert stack is not None, (spec.kind, row, col)
+                r0, c0 = row * layout.chunk_lat, col * layout.chunk_lon
+                r1 = min(r0 + layout.chunk_lat, grid_lat)
+                c1 = min(c0 + layout.chunk_lon, grid_lon)
+                for field in range(spec.n_fields):
+                    assert np.array_equal(
+                        stack[field][: r1 - r0, : c1 - c0],
+                        fields[field][r0:r1, c0:c1],
+                    ), (spec.kind, row, col, field)
