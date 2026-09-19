@@ -245,7 +245,13 @@ def test_exceedance_answers_a_threshold_the_store_never_saw(tmp_path) -> None:
         )
         assert probability is not None
         truth = float((column > threshold).mean())
-        assert abs(probability - truth) <= 0.05, (threshold, probability, truth)
+        assert abs(probability.probability - truth) <= 0.05, (
+            threshold,
+            probability,
+            truth,
+        )
+        # the interval the API reports needs a sample size, and the container carries it
+        assert probability.member_count == 30
 
 
 def test_exceedance_operator_complement_is_consistent(tmp_path) -> None:
@@ -265,7 +271,7 @@ def test_exceedance_operator_complement_is_consistent(tmp_path) -> None:
     below = exceedance_probability("temperature_2m", operator="lt", **common)
     assert above is not None
     assert below is not None
-    assert above + below == pytest.approx(1.0, abs=1e-6)
+    assert above.probability + below.probability == pytest.approx(1.0, abs=1e-6)
 
 
 def test_exceedance_refuses_the_inclusive_operators(tmp_path) -> None:
@@ -299,7 +305,8 @@ def test_exceedance_refuses_the_inclusive_operators(tmp_path) -> None:
     strict = exceedance_probability("precipitation_amount_3h", operator="gt", **common)
     assert strict is not None
     column = members[:, 5, 7]
-    assert strict == pytest.approx(float((column > 0.0).mean()), abs=0.05)
+    assert strict.probability == pytest.approx(float((column > 0.0).mean()), abs=0.05)
+    assert strict.member_count == 30
 
 
 # ---------------------------------------------------------------------------
@@ -494,3 +501,73 @@ def test_member_count_does_not_need_a_re_read_of_the_container(tmp_path) -> None
     assert reader.member_count("temperature_2m", LEAD, observed=False) == 0
     # An absent aggregate is "unknown", not zero.
     assert reader.member_count("wind_gust", LEAD, observed=True) is None
+
+
+# ---------------------------------------------------------------------------
+# The capability check the endpoints consult before they try an aggregate
+# ---------------------------------------------------------------------------
+
+
+def test_special_variables_are_never_served_from_an_aggregate() -> None:
+    """Four variables carry per-member answers a collapsed distribution has already lost.
+
+    ``wind_10m`` computes a consensus vector and a wind rose from each member's (u, v) pair;
+    ``precipitation_amount_3h`` a phase-support map from each member's 0/1 flag;
+    ``cloud_ceiling`` and ``cloud_cover_3h`` censor members individually before summarising.
+    None of those is a function of the distribution, so no aggregate can produce them.
+    """
+    from api.services.aggregate_serving import SPECIAL_PER_MEMBER_VARIABLES, aggregate_can_answer
+
+    for variable in sorted(SPECIAL_PER_MEMBER_VARIABLES):
+        assert aggregate_can_answer(variable) is False, variable
+    # a variable that is aggregated in the ordinary way still passes
+    assert aggregate_can_answer("temperature_2m") is True
+
+
+def test_requesting_members_disqualifies_the_aggregate_path() -> None:
+    """``include_members=true`` asks for the raw sample, which the aggregate has collapsed."""
+    from api.services.aggregate_serving import aggregate_can_answer
+
+    assert aggregate_can_answer("temperature_2m", needs_members=True) is False
+
+
+def test_only_the_strict_operators_can_be_answered() -> None:
+    from api.services.aggregate_serving import aggregate_can_answer
+
+    for operator in ("gt", "lt"):
+        assert aggregate_can_answer("temperature_2m", operator=operator) is True
+    for operator in ("gte", "lte", "between"):
+        assert aggregate_can_answer("temperature_2m", operator=operator) is False
+
+
+def test_an_unclassified_variable_cannot_be_answered() -> None:
+    from api.services.aggregate_serving import aggregate_can_answer
+
+    assert aggregate_can_answer("wind_10m") is False  # special, and therefore refused first
+    assert aggregate_can_answer("mystery_variable") is False
+
+
+def test_an_unreadable_store_is_not_an_error_for_the_aggregate_path() -> None:
+    """The gate raises when a run is not readable; the aggregate path must not propagate it.
+
+    The aggregate is an optimisation over the member shards, so "this run is not currently
+    readable" has to reach the member path's own error handling rather than becoming an error
+    raised from a probe the caller only ran as a shortcut.
+    """
+    from api.services.aggregate_serving import try_read_aggregate
+
+    def _refuses() -> int | None:
+        raise FileNotFoundError("run 's3://x/y' is not a ready, readable run")
+
+    assert try_read_aggregate(_refuses) is None
+    assert try_read_aggregate(lambda: 7) == 7
+    assert try_read_aggregate(lambda: None) is None
+
+    # A damaged container is a real fault and must stay visible.
+    from domain.shard_format import ShardFormatError
+
+    def _damaged() -> int | None:
+        raise ShardFormatError("chunk 0 failed to decode")
+
+    with pytest.raises(ShardFormatError):
+        try_read_aggregate(_damaged)

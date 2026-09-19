@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -46,6 +47,8 @@ from domain.variable_class import VariableClassError, spec_for
 from api.core.aggregate_reader import AggregateGeometry, AggregateShardReader
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 #: Statistics the platform serves per variable (``EnsembleStatistics``). A caller passing a
 #: different name gets a KeyError from the dataclass rather than a silent zero.
@@ -317,6 +320,22 @@ def statistics_from_aggregate(
     )
 
 
+@dataclass(frozen=True)
+class AggregatePointProbability:
+    """An exceedance probability at a point, served from an aggregate shard.
+
+    Attributes:
+        probability: ``P(x > threshold)`` (or ``P(x < threshold)`` for ``lt``).
+        member_count: Members the aggregate was computed from, when the point was observed.
+            Carried here rather than fetched separately so the confidence interval the API
+            reports costs no extra read: the count rides in the descriptor the geometry read
+            already fetched.
+    """
+
+    probability: float
+    member_count: int | None
+
+
 def exceedance_probability(
     variable: str,
     *,
@@ -330,7 +349,7 @@ def exceedance_probability(
     col_in_chunk: int,
     generation: str | None = None,
     reader: AggregateShardReader | None = None,
-) -> float | None:
+) -> AggregatePointProbability | None:
     """Serve a strict exceedance probability from an aggregate shard.
 
     This is what the encoding exists for: the store was never told the threshold, and the
@@ -416,9 +435,14 @@ def exceedance_probability(
         return None
     # Only the strict operators reach here; the inclusive ones are refused above because a
     # stored quantile function cannot represent the point mass at the threshold.
-    return probability_above if operator == "gt" else 1.0 - probability_above
-
-
+    probability = probability_above if operator == "gt" else 1.0 - probability_above
+    observed = all(math.isfinite(value) for value in point)
+    return AggregatePointProbability(
+        probability=probability,
+        member_count=active_reader.member_count(
+            variable, lead_time_hours, observed=observed, generation=generation
+        ),
+    )
 
 
 def gated_statistics_from_aggregate(
@@ -528,7 +552,7 @@ def gated_exceedance_from_aggregate(
     threshold: float,
     operator: str,
     generation: str | None = None,
-) -> float | None:
+) -> AggregatePointProbability | None:
     """Serve an exceedance probability from an aggregate shard, under the reader gate.
 
     The same gate and coordinate derivation as :func:`gated_statistics_from_aggregate`, for the
@@ -542,7 +566,7 @@ def gated_exceedance_from_aggregate(
     if resolved_generation is None:
         resolved_generation = manifest_generation(store_path)
 
-    def select(dataset: Any) -> float | None:
+    def select(dataset: Any) -> AggregatePointProbability | None:
         if variable not in dataset.data_vars:
             return None
         grid, lat_descending, lon_descending = _derive_grid(dataset)
@@ -583,9 +607,87 @@ def gated_exceedance_from_aggregate(
 
     return gated_read_dataset_with_selector(store_path, select)
 
+
+#: Variables whose response carries something an aggregate cannot represent, because it is a
+#: function of the *per-member values* rather than of the distribution.
+#:
+#: ``wind_10m`` returns a consensus vector and a wind rose, both computed from each member's
+#: ``(u, v)`` pair; a statistic of the speed distribution does not determine them.
+#: ``precipitation_amount_3h`` returns a phase-support map and transition frequencies, built
+#: from each member's 0/1 phase flag. ``cloud_ceiling`` splits its members into a finite height
+#: and an "unlimited" sentinel before summarising, and ``cloud_cover_3h`` summarises only the
+#: members inside ``[0, 100]`` -- both are per-member censoring, which a collapsed distribution
+#: has already lost.
+#:
+#: These are served from the member shards, which the aggregate phase does not replace.
+SPECIAL_PER_MEMBER_VARIABLES: frozenset[str] = frozenset(
+    {"wind_10m", "precipitation_amount_3h", "cloud_ceiling", "cloud_cover_3h"}
+)
+
+#: The strict operators a stored distribution can answer. ``gte``/``lte`` count members *at*
+#: the threshold, which needs the atom at that value; see :func:`exceedance_probability`.
+STRICT_EXCEEDANCE_OPERATORS: frozenset[str] = frozenset({"gt", "lt"})
+
+
+def aggregate_can_answer(
+    variable: str,
+    *,
+    operator: str | None = None,
+    needs_members: bool = False,
+) -> bool:
+    """Whether this query can be served from an aggregate at all.
+
+    A capability check, separate from the per-request attempt: the endpoints consult it before
+    deciding which path to take, so a variable that can never be served from an aggregate does
+    not pay for a probe that is certain to miss. The per-request attempt still exists, because
+    a store may simply have no aggregate for a variable that could have one.
+
+    Args:
+        variable: Variable code.
+        operator: Exceedance operator, for the probability endpoint.
+        needs_members: Whether the caller asked for the raw member values, which an aggregate
+            has collapsed and therefore cannot return.
+    """
+    if needs_members:
+        return False
+    if variable in SPECIAL_PER_MEMBER_VARIABLES:
+        return False
+    if operator is not None and operator not in STRICT_EXCEEDANCE_OPERATORS:
+        return False
+    try:
+        spec_for(variable)
+    except VariableClassError:
+        return False
+    return True
+
+
+def try_read_aggregate(attempt: Callable[[], _T | None]) -> _T | None:
+    """Run an aggregate read, treating an unreadable store as "no aggregate".
+
+    The aggregate path is an optimisation over the member shards, and it opens the store
+    through the reader gate, which raises ``FileNotFoundError`` when the run is not readable.
+    Propagating that would turn "this store has no usable aggregate" into a failure of a
+    request the member path could have served; the member path is still the reader of record
+    and raises its own error if it cannot read either.
+
+    Only that case is absorbed. A damaged container raises ``ShardFormatError`` and a bad
+    encoding raises through the domain helpers, and both are real faults that must stay
+    visible -- the reader already reports them for exactly that reason.
+    """
+    try:
+        return attempt()
+    except FileNotFoundError:
+        return None
+
+
 __all__ = [
+    "SPECIAL_PER_MEMBER_VARIABLES",
     "STATISTIC_NAMES",
+    "STRICT_EXCEEDANCE_OPERATORS",
+    "AggregatePointProbability",
     "AggregatePointStatistics",
+    "aggregate_can_answer",
     "exceedance_probability",
     "statistics_from_aggregate",
+    "try_read_aggregate",
 ]

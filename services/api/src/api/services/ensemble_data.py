@@ -269,6 +269,42 @@ def build_probability_forecast(
     # Release ORM DB connection before storage reads.
     db.close()
 
+    # Prefer the aggregate shard when the store has a usable one. It is the storage
+    # representation going forward, and it is markedly cheaper: one byte range per point
+    # instead of a read and an interpolation per member. The member path below remains the
+    # reader of record, so ``None`` here simply means "no aggregate answered".
+    served_probability = _aggregate_probability(
+        variable=variable,
+        store_path=store_path_str,
+        lead_time_hours=lead_time_hours,
+        latitude=latitude,
+        longitude=longitude,
+        threshold=threshold,
+        operator=operator,
+        threshold_max=threshold_max,
+        direction_sector=direction_sector,
+        phase=phase,
+        expected_members=expected_members,
+    )
+    if served_probability is not None:
+        probability, lower, upper = served_probability
+        served_data: dict[str, Any] = {
+            "location": ProbabilityLocation(latitude=latitude, longitude=longitude),
+            "variable": variable,
+            "threshold": threshold,
+            "operator": operator,
+            "lead_time_hours": lead_time_hours,
+            "probability": probability,
+            "confidence_interval_95": [lower, upper],
+        }
+        if operator == "between":
+            served_data["threshold_max"] = threshold_max
+        if direction_sector is not None:
+            served_data["direction_sector"] = direction_sector
+        if phase is not None:
+            served_data["phase"] = phase
+        return ProbabilityForecastData(**served_data)
+
     if variable == "wind_10m":
         u_members, v_members = _gated_wind_member_vectors(
             store_path_str, lead_time_hours, latitude, longitude, avail_members
@@ -370,29 +406,12 @@ def build_probability_forecast(
         lower, upper = probability_confidence_interval(probability, len(finite_members))
 
     # Post-read validation: verify participating member shards did not transition to deleting/deleted
-    try:
-        from api.models.entities import ReclamationQueue
-
-        fenced_during_read = db.execute(
-            select(ReclamationQueue.id).where(
-                ReclamationQueue.run_id == provenance_run_id,
-                ReclamationQueue.lead_time_hours == lead_time_hours,
-                ReclamationQueue.target_kind == "mem",
-                ReclamationQueue.member_index.in_(avail_members),
-                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
-            )
-        ).scalars().all()
-        if fenced_during_read:
-            raise HTTPException(status_code=404, detail="Ensemble member shards became unavailable during read.")
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001 - revalidation must never break serving
-        logger.error(
-            "ensemble_post_read_fence_revalidation_failed: run_id=%s lead=%s error=%s",
-            provenance_run_id,
-            lead_time_hours,
-            exc,
-        )
+    _revalidate_member_fencing(
+        db,
+        provenance_run_id=provenance_run_id,
+        lead_time_hours=lead_time_hours,
+        member_indices=avail_members,
+    )
 
     data: dict[str, Any] = {
         "location": ProbabilityLocation(latitude=latitude, longitude=longitude),
@@ -449,6 +468,48 @@ def build_ensemble_statistics(
     _resolve_variables(db, metadata, [variable])
     # Release ORM DB connection before storage reads.
     db.close()
+
+    # Prefer the aggregate shard when the store has a usable one for this variable and lead.
+    # It is the storage representation going forward, and it is markedly cheaper: one byte
+    # range per field group instead of a read and an interpolation per member. ``None`` means
+    # "no aggregate answers this", and the member path below stays the reader of record.
+    #
+    # The response carries the statistics only. That is deliberate and it is the response's
+    # own contract: an aggregate is a function of the whole member set, so every request that
+    # asks for more -- the raw members, the KDE built from them, a per-member consensus vector
+    # or phase support, a censoring rule applied member by member -- is answered from the
+    # member shards instead, which the aggregate phase does not replace.
+    if not series_mode:
+        from api.services.aggregate_serving import (
+            aggregate_can_answer,
+            gated_statistics_from_aggregate,
+            try_read_aggregate,
+        )
+
+        if aggregate_can_answer(variable, needs_members=include_members):
+            served = try_read_aggregate(
+                lambda: gated_statistics_from_aggregate(
+                    variable,
+                    store_path=str(store_path_str),
+                    lead_time_hours=lead_time_hours,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
+            if served is not None and served.member_count is not None:
+                _revalidate_member_fencing(
+                    db,
+                    provenance_run_id=provenance_run_id,
+                    lead_time_hours=lead_time_hours,
+                    member_indices=avail_members,
+                )
+                served_stats = EnsembleStatistics(**served.as_ensemble_statistics_kwargs())
+                return EnsembleStatisticsData(
+                    model=model,
+                    lead_time_hours=lead_time_hours,
+                    member_count=served.member_count,
+                    statistics=served_stats,
+                )
 
     consensus_payload: ConsensusVectorOut | None = None
     wind_rose_payload: WindRoseOut | None = None
@@ -639,29 +700,12 @@ def build_ensemble_statistics(
             )
 
     # Post-read validation: verify participating member shards did not transition to deleting/deleted
-    try:
-        from api.models.entities import ReclamationQueue
-
-        fenced_during_read = db.execute(
-            select(ReclamationQueue.id).where(
-                ReclamationQueue.run_id == provenance_run_id,
-                ReclamationQueue.lead_time_hours == lead_time_hours,
-                ReclamationQueue.target_kind == "mem",
-                ReclamationQueue.member_index.in_(avail_members),
-                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
-            )
-        ).scalars().all()
-        if fenced_during_read:
-            raise HTTPException(status_code=404, detail="Ensemble member shards became unavailable during read.")
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001 - revalidation must never break serving
-        logger.error(
-            "ensemble_post_read_fence_revalidation_failed: run_id=%s lead=%s error=%s",
-            provenance_run_id,
-            lead_time_hours,
-            exc,
-        )
+    _revalidate_member_fencing(
+        db,
+        provenance_run_id=provenance_run_id,
+        lead_time_hours=lead_time_hours,
+        member_indices=avail_members,
+    )
 
     return EnsembleStatisticsData(
         model=model,
@@ -679,6 +723,125 @@ def build_ensemble_statistics(
         finite_member_count=finite_member_count_payload,
         unlimited_member_count=unlimited_member_count_payload,
     )
+
+
+def _aggregate_probability(
+    *,
+    variable: str,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    threshold: float,
+    operator: str,
+    threshold_max: float | None,
+    direction_sector: str | None,
+    phase: str | None,
+    expected_members: int,
+) -> tuple[float, float, float] | None:
+    """Serve ``(probability, lower, upper)`` from an aggregate, or ``None`` for the members.
+
+    ``None`` covers three distinct situations, and they all mean the same thing to the caller:
+    the store has no aggregate for this ``(variable, lead)``; the query asks something a
+    stored distribution cannot answer; or the aggregate's point is unobserved.
+
+    What a stored distribution cannot answer, and why:
+
+    * the inclusive operators. ``gte``/``lte`` count members *at* the threshold, which needs
+      the atom at that value -- a continuous quantile function or a plus-minus-sigma histogram
+      has smoothed it away. Measured on a half-zero precipitation field at the natural
+      threshold of zero, the members give ``P(x >= 0) = 1.0`` (the atom is 0.53) where the
+      interpolated quantile function gives 0.5, and neither is what the members say;
+    * a directional or phase-conditioned query, which is a function of each member's vector or
+      flag rather than of the distribution;
+    * a ``between`` query, which is two inclusive thresholds at once.
+
+    The confidence interval is the same Wilson interval the member path reports, computed from
+    the stored member count. It is a statement about the *sample size*, not about the encoding's
+    reconstruction error, so it is exactly as valid here as there -- and it is the interval the
+    contract already reports for this endpoint.
+    """
+    from api.services.aggregate_serving import (
+        aggregate_can_answer,
+        gated_exceedance_from_aggregate,
+        try_read_aggregate,
+    )
+
+    if threshold_max is not None:
+        return None
+    if direction_sector is not None or phase is not None:
+        return None
+    if not aggregate_can_answer(variable, operator=operator):
+        return None
+
+    served = try_read_aggregate(
+        lambda: gated_exceedance_from_aggregate(
+            variable,
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            latitude=latitude,
+            longitude=longitude,
+            threshold=threshold,
+            operator=operator,
+        )
+    )
+    if served is None or served.member_count is None:
+        return None
+
+    # The interval is the same Wilson score interval the member path reports, from the stored
+    # member count. It quantifies the *sample size*, not the encoding's reconstruction error,
+    # so it means the same thing here -- and it is what this endpoint already returns.
+    lower, upper = probability_confidence_interval(
+        served.probability, max(served.member_count, 1)
+    )
+    return served.probability, float(lower), float(upper)
+
+
+def _revalidate_member_fencing(
+    db: Session,
+    *,
+    provenance_run_id: str,
+    lead_time_hours: int,
+    member_indices: tuple[int, ...],
+) -> None:
+    """Fail the request if a participating member shard was fenced while it was being read.
+
+    Reclamation runs concurrently with serving, so a read can span a member's transition to
+    deleting/deleted and silently mix pre- and post-reclamation data. Both read paths call
+    this after their read, for the same reason: the aggregate path reads the members' *derived*
+    statistics, so a member reclaimed mid-aggregation would serve a value that no longer has
+    the members it came from.
+
+    A database failure here is logged and ignored: revalidation protects against a race, and
+    failing every request when the catalog is briefly unavailable would be a larger outage
+    than the race it guards.
+    """
+    try:
+        from api.models.entities import ReclamationQueue
+
+        fenced_during_read = db.execute(
+            select(ReclamationQueue.id).where(
+                ReclamationQueue.run_id == provenance_run_id,
+                ReclamationQueue.lead_time_hours == lead_time_hours,
+                ReclamationQueue.target_kind == "mem",
+                ReclamationQueue.member_index.in_(member_indices),
+                ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
+            )
+        ).scalars().all()
+        if fenced_during_read:
+            raise HTTPException(
+                status_code=404,
+                detail="Ensemble member shards became unavailable during read.",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - revalidation must never break serving
+        logger.error(
+            "ensemble_post_read_fence_revalidation_failed: run_id=%s lead=%s error=%s",
+            provenance_run_id,
+            lead_time_hours,
+            exc,
+        )
 
 
 def _require_ensemble_model(db: Session, model: str) -> None:
