@@ -29,6 +29,8 @@ from domain.aggregate import (
     encode_aggregate,
     exceedance_from_bins,
     exceedance_from_quantiles,
+    quantile_at,
+    quantile_function_moments,
     quantise_field,
 )
 
@@ -558,3 +560,130 @@ def test_quantile_encoding_handles_a_single_member() -> None:
     stack = np.full((1, LAT, LON), 7.25, dtype=np.float32)
     fields = compute_aggregate(stack, _quantile_spec())
     assert np.allclose(fields, 7.25)
+
+
+# ---------------------------------------------------------------------------
+# Serving the API's statistics from a stored quantile function
+# ---------------------------------------------------------------------------
+
+
+def test_statistic_level_reports_which_contract_percentiles_are_stored() -> None:
+    """P10/P50/P90 are stored levels; P25/P75 are not. A reader needs to know which."""
+    spec = _quantile_spec()
+    assert spec.statistic_level("p10") == 0.10
+    assert spec.statistic_level("P50") == 0.50
+    assert spec.statistic_level("median") == 0.50
+    assert spec.statistic_level("p90") == 0.90
+    assert spec.statistic_level("p25") is None
+    assert spec.statistic_level("p75") is None
+    # a bin spec has no levels at all
+    assert _spec().statistic_level("p50") is None
+    # unrecognised names are not guessed at
+    assert spec.statistic_level("mean") is None
+    assert spec.statistic_level("pXX") is None
+
+
+def test_quantile_function_moments_recover_mean_and_spread_within_sampling_noise() -> None:
+    """The API serves mean and spread for every variable, but the encoding stores neither.
+
+    Measured on the classes this encoding serves, both come back well inside the ensemble's
+    own sampling noise, so storing two extra planes would buy precision the display cannot
+    show. The assertion is against that noise floor rather than an absolute tolerance,
+    because absolute tolerances differ by orders of magnitude between variables.
+    """
+    rng = np.random.default_rng(23)
+    for label, members in (
+        (
+            "zero-inflated precipitation",
+            np.where(
+                rng.random((N_MEMBERS, 4, 64)) < 0.5,
+                0.0,
+                rng.gamma(0.35, 1.5, (N_MEMBERS, 4, 64)),
+            ),
+        ),
+        ("heavy-tailed gust", np.abs(rng.standard_t(2.5, (N_MEMBERS, 4, 64))) * 20.0),
+        ("bounded humidity", np.clip(rng.normal(70, 20, (N_MEMBERS, 4, 64)), 0, 100)),
+    ):
+        stack = np.asarray(members, dtype=np.float32)
+        spec = _quantile_spec()
+        values = compute_aggregate(stack, spec)
+        mean, spread = quantile_function_moments(values, spec.quantile_levels())
+
+        half = N_MEMBERS // 2
+        mean_noise = float(
+            np.max(np.abs(stack[:half].mean(axis=0) - stack[half:].mean(axis=0)))
+        )
+        spread_noise = float(
+            np.max(np.abs(stack[:half].std(axis=0) - stack[half:].std(axis=0)))
+        )
+        mean_err = float(np.max(np.abs(mean - stack.mean(axis=0))))
+        spread_err = float(np.max(np.abs(spread - stack.std(axis=0))))
+        assert mean_err / mean_noise < 1.0, (label, mean_err, mean_noise)
+        assert spread_err / spread_noise < 1.0, (label, spread_err, spread_noise)
+
+
+def test_quantile_at_is_exact_at_a_stored_level() -> None:
+    """A contract percentile that coincides with a stored level must be reproduced exactly."""
+    stack = _skewed_members(seed=50)
+    spec = _quantile_spec()
+    values = compute_aggregate(stack, spec)
+    levels = spec.quantile_levels()
+
+    for probability in (0.10, 0.50, 0.90):
+        index = list(levels).index(probability)
+        read = quantile_at(values, levels, probability)
+        assert np.array_equal(read, values[index].astype(np.float32))
+
+
+def test_quantile_at_interpolates_between_stored_levels() -> None:
+    """P25 and P75 are not stored levels, so they are read by interpolation."""
+    stack = _skewed_members(seed=51)
+    spec = _quantile_spec()
+    values = compute_aggregate(stack, spec)
+    levels = spec.quantile_levels()
+
+    read = quantile_at(values, levels, 0.25)
+    lower = values[list(levels).index(0.20)]
+    upper = values[list(levels).index(0.30)]
+    assert np.all(read >= np.minimum(lower, upper) - 1e-5)
+    assert np.all(read <= np.maximum(lower, upper) + 1e-5)
+    # and within the ensemble's own noise of the true sample percentile
+    truth = np.percentile(stack, 25, axis=0)
+    noise = float(
+        np.max(
+            np.abs(
+                np.percentile(stack[:15], 25, axis=0)
+                - np.percentile(stack[15:], 25, axis=0)
+            )
+        )
+    )
+    assert float(np.max(np.abs(read - truth))) / noise < 1.0
+
+
+def test_quantile_at_clamps_outside_the_stored_range() -> None:
+    stack = _skewed_members(seed=52)
+    spec = _quantile_spec()
+    values = compute_aggregate(stack, spec)
+    levels = spec.quantile_levels()
+    assert np.array_equal(quantile_at(values, levels, 0.0), values[0])
+    assert np.array_equal(quantile_at(values, levels, 1.0), values[-1])
+
+
+def test_quantile_at_rejects_bad_input() -> None:
+    spec = _quantile_spec()
+    values = compute_aggregate(_skewed_members(seed=53), spec)
+    with pytest.raises(AggregateError, match="planes but"):
+        quantile_at(values[:3], spec.quantile_levels(), 0.5)
+    with pytest.raises(AggregateError, match="strictly increasing"):
+        quantile_at(values, (0.5, 0.5, *spec.quantile_levels()[2:]), 0.5)
+    with pytest.raises(AggregateError, match=r"probability must be in \[0, 1\]"):
+        quantile_at(values, spec.quantile_levels(), 1.5)
+
+
+def test_quantile_function_moments_reject_bad_input() -> None:
+    spec = _quantile_spec()
+    values = compute_aggregate(_skewed_members(seed=54), spec)
+    with pytest.raises(AggregateError, match="planes but"):
+        quantile_function_moments(values[:3], spec.quantile_levels())
+    with pytest.raises(AggregateError, match="positive probability range"):
+        quantile_function_moments(values, (0.5,) * len(spec.levels))
