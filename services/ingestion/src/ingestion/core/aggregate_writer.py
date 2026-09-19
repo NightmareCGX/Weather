@@ -53,10 +53,18 @@ DEFAULT_CHUNK_LON: int = 100
 
 #: Compression level used by :func:`encode_aggregate_shard` unless overridden.
 #:
-#: Level 5 is the measured choice for this data: the ramp to 7 is small here, 9-12 are worse,
-#: and 19 costs hours per cycle. It is a writer-side knob only -- a zstd frame is
-#: self-describing, so the decode path does not depend on it.
-DEFAULT_ZSTD_LEVEL: int = 5
+#: Level 6 is the measured optimum for this data, and the measurement is worth stating because
+#: it is not what the earlier investigation concluded. On real GEFS members at 721x1440, a
+#: 34-field aggregate container sized 12.87 MB at level 6, 13.89 MB at 5, **13.54 MB at 7**,
+#: 12.75 MB at 9 and 11.79 MB at 12. Level 7 is 5% *worse* than level 6: a zstd level selects
+#: a search strategy rather than a monotone effort, and 7 lands in a worse local choice here.
+#: The cost of going further is the reason to stop: encoding one container takes 0.84 s at 5,
+#: 1.07 s at 6, 2.18 s at 9 and 6.64 s at 12, which over a cycle's 14 variables x 81 leads is
+#: ~23 minutes of one core at 6 versus ~2.5 hours at 12 for a further 8%.
+#:
+#: It is a writer-side knob only -- a zstd frame is self-describing, so the decode path does
+#: not depend on it.
+DEFAULT_ZSTD_LEVEL: int = 6
 
 #: Suffix of an aggregate shard object, following the shard key grammar.
 AGGREGATE_SHARD_SUFFIX: str = "shard.agg"
