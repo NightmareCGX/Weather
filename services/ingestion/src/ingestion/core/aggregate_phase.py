@@ -37,7 +37,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import xarray as xr
-from domain.aggregate import AggregateSpec
 from domain.variable_class import VariableClassError, spec_for
 
 from ingestion.core.aggregate_staging import (
@@ -244,32 +243,9 @@ def aggregate_variable_lead(
         raise AggregatePhaseError(str(exc)) from exc
 
 
-def aggregate_classified_variables(
-    variables: Sequence[str],
-) -> tuple[tuple[str, str, AggregateSpec], ...]:
-    """Split variables into the ones the phase can aggregate and the ones it cannot.
-
-    Returns:
-        ``(variable, class, spec)`` per classifiable variable, in the given order. Flags are
-        excluded: they carry a per-cell fraction rather than an :class:`AggregateSpec`, and
-        their handling is a separate step.
-    """
-    out: list[tuple[str, str, AggregateSpec]] = []
-    for variable in variables:
-        try:
-            encoding = spec_for(variable)
-        except VariableClassError:
-            continue
-        from domain.variable_class import encoding_for
-
-        out.append((variable, encoding_for(variable).variable_class, encoding))
-    return tuple(out)
-
-
 __all__ = [
     "AggregatePhaseError",
     "AggregatePhaseResult",
-    "aggregate_classified_variables",
     "aggregate_lead",
     "aggregate_variable_lead",
     "stage_member_region",

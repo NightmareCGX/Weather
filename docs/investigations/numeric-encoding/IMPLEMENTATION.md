@@ -247,9 +247,17 @@ D 类的批准表示是**每格点超越比例**。实现时确认了两件事�
 
 **"未分类"与"已知变量但建不出来"从此是两件事。** 前者（`_is_unclassified`）跳过并保留 staging，只记 warning；后者**向上抛**。原来两者都落在同一个 `except VariableClassError: continue` 里，那会让一个真正缺失的输入悄悄降级成一条 warning——而这正是上游要能看见的信号。
 
-**`expected_members` 同时是"覆盖率分母"和"完备性门槛"**：`publish_settled_lead` 把 `len(expected_members)` 传下来，一方面让逐格点的 85% 门槛用**契约的 30** 而不是"本次 staged 的 26"（否则 patch 期会把 API 拒绝服务的格点写成完整统计量），另一方面让 `aggregate_staged_lead` 在成员数不足时**拒绝出版**。`wave_leads` 也从 `publish_settled_lead` 一路贯通到 `spec.target_lead_time_hours`，这样"前置还没到"能被识别成**等待**而不是"前置不存在"。
+**`expected_members` 是"覆盖率分母"，不是"完备性门槛"——这一点我先做错了一次。** 我最初的接线让 `aggregate_staged_lead` 在 staged 成员数 ≠ 契约数时**拒绝出版**，理由是"部分集合不完整"。这直接把**结算策略**（85% 覆盖率 + 10 分钟静默就出版）废掉了：`publish_settled_lead` 在每次 patch 都会传 `len(expected_members) == 30`，于是 26/30 的 patch 一律被拒，而 patch 正是策略要求的行为。现在的规则是：
 
-**Linux/CI 等价验证**：本轮改动（`aggregate_staging.py`、`aggregate_phase.py`、`coordinator.py`、`wave_runner.py` 与其测试）在 `python:3.12-slim` 里跑了 `ruff`（passed）、`mypy`（ingestion 55 files clean）、聚合/结算/协调器范围（124 passed）、`packages/domain` 全量（689 passed，100% 覆盖门槛达成）与跨包契约（24 passed）。Windows 全量 ingestion 套件 891 passed / 29 skipped。
+* `expected_members` **只**作为逐格点 85% 门槛的分母（`compute_aggregate(expected_members=...)`）。这个分母必须是**契约的 30**：用"本次 staged 的 26"当分母，3 个成员就会通过"85% of 3"，容器会把个别成员写成完整统计量——正是 API 会拒绝服务的覆盖率；
+* **比较少**（26/30）是 patch 的正常状态，不拒绝。此时该格点的**全部**字段报 NaN（26/30 < 85%），计数场记录"有 26 个成员"，没有任何字段声称更多；
+* **比较多**（> 契约数）是簿记错误，拒绝——覆盖率的分母会来自一个集合并不来自的计数。
+
+`wave_leads` 则从 `publish_settled_lead` 一路贯通到 `spec.target_lead_time_hours`：这样"前置还没到"能被识别成**等待**而不是"前置不存在"。
+
+**Linux/CI 等价验证**：本轮改动（`aggregate_staging.py`、`aggregate_phase.py`、`coordinator.py`、`wave_runner.py` 与其测试）在 `python:3.12-slim` 里跑了 `ruff`（passed）、`mypy`（ingestion 55 files clean）、聚合/结算/协调器范围（123 passed）、`packages/domain` 全量（689 passed，100% 覆盖门槛达成）与跨包契约（24 passed）。Windows 全量 ingestion 套件 891 passed / 29 skipped。
+
+顺带删掉了 `aggregate_classified_variables`：它是为"标志没有 `AggregateSpec` 所以跳过"写的，而 `field_layout` 之后，标志**有**容器（一个 fraction 场），这个函数既没有生产调用者、判断也已经过时——留着只会让下一个读者以为标志仍然不聚合。
 
 **分歧记录（不做门禁）**：服务路径的相位支持在某个格点上只用"`amount` 有限"的成员，写端还要求四个 flag 有限。到真实数据上 flag 缺失很罕见，且我们只表达"成员支持什么"而不解释，所以按 §19 的分工**如实记录**这个偏差，不改服务路径的门槛。
 

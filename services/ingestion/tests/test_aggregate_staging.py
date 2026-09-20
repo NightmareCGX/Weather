@@ -435,21 +435,59 @@ def test_drop_staging_can_be_disabled(tmp_path) -> None:
     assert staging.staged_members_for_lead(store, VARIABLE, LEAD) == [1, 2]
 
 
-def test_expected_members_refuses_a_partial_aggregate(tmp_path) -> None:
-    """Publication policy may require the complete set; the pass must honour that."""
+def test_expected_members_sets_the_coverage_floor_rather_than_a_completeness_gate(
+    tmp_path,
+) -> None:
+    """A partial set is published; what the contract's count decides is the coverage floor.
+
+    A lead publishes at 85% coverage after a quiet window as well as at completeness
+    (``ingestion.core.settlement``), so refusing a partial set here would refuse the patches the
+    publication policy asks for. What the contract's count must not do is *vary*: measured against
+    the staged count instead, 3 of 30 members would clear a floor of 85% of 3 and the container
+    would report a handful of members as a complete cell -- at coverage the serving tier refuses.
+    """
     store = str(tmp_path)
     _stage(store, _planes(3, seed=17), lead=LEAD)
-    with pytest.raises(staging.StagingError, match="3 staged members, expected 30"):
+
+    key, count = staging.aggregate_staged_lead(
+        store,
+        VARIABLE,
+        LEAD,
+        grid_lat=GRID_LAT,
+        grid_lon=GRID_LON,
+        expected_members=30,
+    )
+    assert count == 3
+    assert staging.staged_members_for_lead(store, VARIABLE, LEAD) == []
+    # 3 of 30 is below the floor, so the container carries no distribution value at all --
+    # the count field records how many members there were, and nothing claims more.
+    from domain.field_layout import aggregate_fields_for
+
+    layout = aggregate_fields_for(VARIABLE)
+    with open(os.path.join(store, *key.split("/")), "rb") as handle:
+        container = handle.read()
+    shard_layout = _container_layout(layout.n_fields)
+    mean_chunk = decode_aggregate_chunk(
+        container,
+        shard_layout.chunk_ordinal(layout.index_of_role("mean"), 0, 0),
+        field_scales=layout.field_scales,
+    )
+    assert np.isnan(mean_chunk[0, 0])
+
+
+def test_more_members_than_the_contract_declares_is_a_bookkeeping_error(tmp_path) -> None:
+    """Thirty-one staged members for a 30-member contract is a fault, not a partial set."""
+    store = str(tmp_path)
+    _stage(store, _planes(3, seed=18), lead=LEAD)
+    with pytest.raises(staging.StagingError, match="more than the 2 the contract declares"):
         staging.aggregate_staged_lead(
             store,
             VARIABLE,
             LEAD,
             grid_lat=GRID_LAT,
             grid_lon=GRID_LON,
-            expected_members=30,
+            expected_members=2,
         )
-    # nothing was published or dropped
-    assert staging.staged_members_for_lead(store, VARIABLE, LEAD) == [1, 2, 3]
 
 
 def test_aggregate_is_bit_identical_across_a_recompute(tmp_path) -> None:
@@ -1039,20 +1077,6 @@ def test_explicit_variable_aggregation_reports_a_staging_failure(tmp_path) -> No
         aggregate_phase.aggregate_variable_lead(
             str(tmp_path), VARIABLE, 99, grid_lat=GRID_LAT, grid_lon=GRID_LON
         )
-
-
-def test_classified_variables_excludes_flags_and_unknown_names() -> None:
-    """Flags carry a fraction rather than a spec, so the aggregate pass must not see them."""
-    from ingestion.core import aggregate_phase
-
-    classified = aggregate_phase.aggregate_classified_variables(
-        ["temperature_2m", "wind_gust", "crain", "mystery"]
-    )
-    assert [variable for variable, _cls, _spec in classified] == [
-        "temperature_2m",
-        "wind_gust",
-    ]
-    assert [cls for _v, cls, _s in classified] == ["A", "B"]
 
 
 def test_point_query_reads_four_contiguous_ranges(tmp_path) -> None:

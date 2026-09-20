@@ -234,9 +234,13 @@ def aggregate_staged_lead(
         drop_staging: Remove this variable's staging objects once the container is written. A
             caller aggregating several variables at one lead passes ``False`` and releases them
             together: the variables a container reads are not the variables it is written as.
-        expected_members: The contract's member count. When given, refuse to publish a partial
-            container. Defaults to the members actually staged, which is what progressive
-            publication wants.
+        expected_members: The contract's member count, which the per-cell coverage floor is
+            measured against. **Not a completeness gate**: a lead publishes at 85% coverage after
+            a quiet window as well as at completeness, so a pass that refused a partial set would
+            be refusing the patches the publication policy asks for. Which leads publish, and
+            when, is :mod:`ingestion.core.settlement`'s decision; this only computes what it was
+            asked for. Defaults to the members actually staged, which floors a repair's run at its
+            own coverage rather than at a contract it was not given.
         wave_leads: The leads this wave is filling, so a predecessor that has not landed yet is
             refused rather than encoded as absent.
 
@@ -260,14 +264,16 @@ def aggregate_staged_lead(
         chunk_lon=chunk_lon,
     )
     own_members = reader.members(variable_code, lead_time_hours)
-    if expected_members is not None:
-        # The variable's own members, not its inputs': a derived variable has none of its own and
-        # takes its member set from a component, so counting there would compare unlike things.
-        if own_members and len(own_members) != expected_members:
-            raise StagingError(
-                f"{variable_code!r} lead {lead_time_hours}h has {len(own_members)} staged "
-                f"members, expected {expected_members}"
-            )
+    if expected_members is not None and own_members and len(own_members) > expected_members:
+        # More members than the contract declares is a bookkeeping error rather than a partial
+        # set: the coverage floor would be measured against a count the set does not come from.
+        # Fewer is the normal case for a quiescent publication and is not refused here -- the
+        # per-cell coverage floor, not the member count, is what decides whether a container has
+        # anything to say, and the publication policy is settlement's decision.
+        raise StagingError(
+            f"{variable_code!r} lead {lead_time_hours}h has {len(own_members)} staged "
+            f"members, more than the {expected_members} the contract declares"
+        )
 
     try:
         fields, member_count = build_container_fields(
