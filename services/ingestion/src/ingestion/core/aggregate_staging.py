@@ -30,18 +30,12 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
-from domain.aggregate import (
-    MEMBER_COUNT_SCALE,
-    AggregateSpec,
-    compute_aggregate,
-    finite_member_count,
-)
+from domain.field_layout import aggregate_fields_for
 from domain.shard_format import (
     SHARD_V1_MAGIC,
     TRAILER_SIZE,
@@ -53,10 +47,8 @@ from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.aggregate_writer import (
     AggregateShardLayout,
-    AggregateWriterError,
     aggregate_store_relative_key,
     encode_aggregate_shard,
-    layout_for_spec,
 )
 from ingestion.core.store_io import StoreAccessError, StoreIO, StoreRef
 
@@ -81,21 +73,6 @@ _STOREREF_IS_REEXPORTED: bool = StoreRef is not None
 
 class StagingError(RuntimeError):
     """Raised when the staging area cannot satisfy a requested aggregate."""
-
-
-@dataclass(frozen=True)
-class StagedMember:
-    """One member's plane as recovered from a staging shard.
-
-    Attributes:
-        member: Ensemble member index.
-        lead_time_hours: Forecast lead the object belongs to.
-        plane: ``(lat, lon)`` float32 field.
-    """
-
-    member: int
-    lead_time_hours: int
-    plane: npt.NDArray[np.float32]
 
 
 def staging_relative_key(variable_code: str, member: int, lead_time_hours: int) -> str:
@@ -224,221 +201,104 @@ def staged_members_for_lead(store: StoreRef, variable_code: str, lead_time_hours
     )
 
 
-def collect_member_planes(
-    store: StoreRef,
-    variable_code: str,
-    lead_time_hours: int,
-    *,
-    grid_lat: int,
-    grid_lon: int,
-    chunk_lat: int = 100,
-    chunk_lon: int = 100,
-) -> list[StagedMember]:
-    """Read every staged member plane for one ``(variable, lead)``.
-
-    Returns:
-        Planes sorted by member index, so the aggregate does not depend on listing order.
-
-    Raises:
-        StagingError: if no member is staged for the requested lead.
-    """
-    io = StoreIO(store)
-    staged = staged_objects(store, variable_code)
-    members = sorted(member for (member, lead) in staged if lead == lead_time_hours)
-    if not members:
-        raise StagingError(
-            f"no staged members for {variable_code!r} at lead {lead_time_hours}h"
-        )
-
-    planes: list[StagedMember] = []
-    for member in members:
-        try:
-            raw = io.read(staged[(member, lead_time_hours)])
-        except StoreAccessError as exc:
-            raise StagingError(f"cannot read staged member {member}: {exc}") from exc
-        planes.append(
-            StagedMember(
-                member=member,
-                lead_time_hours=lead_time_hours,
-                plane=member_plane_from_shard(
-                    raw,
-                    grid_lat=grid_lat,
-                    grid_lon=grid_lon,
-                    chunk_lat=chunk_lat,
-                    chunk_lon=chunk_lon,
-                ),
-            )
-        )
-    return planes
-
-
-def aggregate_from_planes(
-    planes: Iterable[npt.NDArray[np.float32]],
-    *,
-    spec: AggregateSpec,
-    grid_lat: int,
-    grid_lon: int,
-    expected_members: int | None = None,
-) -> bytes:
-    """Compute and encode the aggregate container from member planes.
-
-    The stored field vector is the encoding's own fields **preceded by the per-cell finite-member
-    count** (``domain.field_layout``). The container records that count per cell rather than per
-    container because one member can be missing at one cell and present at its neighbour, and the
-    count is what the serving coverage rule and the reported ``member_count`` are read from.
-
-    Fields are quantised to int16 at their own scales before encoding. That is not an
-    optimisation that can be deferred: measured on real GEFS members it is 17.73 MB -> 13.54 MB
-    for a 34-field container, and the domain has carried the quantiser and its clipping guard all
-    along. Each field's step differs -- a 314 K mean at a bin probability's 0.001 would need
-    314000 and overflow -- which is why the descriptor stores the per-field marker rather than a
-    single scale.
-
-    The scales come from the spec being encoded, and the reader derives them from the variable's
-    approved spec. That pair agrees because :func:`aggregate_staged_lead` -- the only production
-    caller -- obtains its spec from ``spec_for(variable)`` and checks it against the variable's
-    stored layout before calling this.
-
-    Args:
-        planes: One plane per member. Order does not affect the result.
-        spec: Which statistics to store.
-        grid_lat: Grid latitude extent.
-        grid_lon: Grid longitude extent.
-        expected_members: The contract's member count, which the per-cell coverage floor is
-            measured against. Defaults to the number of planes supplied.
-
-    Returns:
-        The ``sharded_v2`` container bytes.
-
-    Raises:
-        StagingError: if no plane is supplied, the shapes disagree with the grid, or a field
-            would exceed its quantisation scale.
-    """
-    materialised = [np.asarray(plane, dtype=np.float32) for plane in planes]
-    if not materialised:
-        raise StagingError("at least one member plane is required to aggregate")
-    stack = np.stack(materialised)
-    if stack.shape[1:] != (grid_lat, grid_lon):
-        raise StagingError(
-            f"member planes have shape {stack.shape[1:]}, expected {(grid_lat, grid_lon)}"
-        )
-
-    fields = [finite_member_count(stack)]
-    fields.extend(
-        compute_aggregate(
-            stack,
-            spec,
-            expected_members=expected_members or stack.shape[0],
-        )
-    )
-    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
-
-    layout = layout_for_spec(spec, grid_lat=grid_lat, grid_lon=grid_lon, n_fields=len(fields))
-    try:
-        return encode_aggregate_shard(
-            fields,
-            layout,
-            member_count=int(stack.shape[0]),
-            field_scales=scales,
-        )
-    except AggregateWriterError as exc:
-        raise StagingError(f"cannot encode the aggregate for {spec.kind}: {exc}") from exc
-
-
 def aggregate_staged_lead(
     store: StoreRef,
     variable_code: str,
     lead_time_hours: int,
     *,
-    spec: AggregateSpec,
     grid_lat: int,
     grid_lon: int,
     chunk_lat: int = 100,
     chunk_lon: int = 100,
     drop_staging: bool = True,
     expected_members: int | None = None,
+    wave_leads: Sequence[int] | None = None,
 ) -> tuple[str, int]:
-    """Aggregate one ``(variable, lead)``'s staged members and write the aggregate object.
+    """Build and write one ``(variable, lead)``'s container from its staged member sets.
+
+    The container is the whole field vector -- the per-cell member count, the variable's
+    distribution, and the supplementary groups its products read -- assembled by
+    :func:`ingestion.core.aggregate_fields.build_container_fields`. Which fields those are is
+    ``domain.field_layout``'s answer, and the same function supplies the per-field fixed-point
+    steps the container is quantised at, so the write and read sides take them from one authority
+    rather than from two that have to agree by inspection.
 
     Args:
         store: Store root.
         variable_code: Variable to aggregate.
         lead_time_hours: Forecast lead.
-        spec: Statistics to store.
         grid_lat: Grid latitude extent.
         grid_lon: Grid longitude extent.
         chunk_lat: Inner chunk latitude extent.
         chunk_lon: Inner chunk longitude extent.
-        drop_staging: Remove the member staging objects once the aggregate is written.
-        expected_members: When given, refuse to publish a partial aggregate. Defaults to
-            aggregating whatever is staged, which is what progressive publication wants.
+        drop_staging: Remove this variable's staging objects once the container is written. A
+            caller aggregating several variables at one lead passes ``False`` and releases them
+            together: the variables a container reads are not the variables it is written as.
+        expected_members: The contract's member count. When given, refuse to publish a partial
+            container. Defaults to the members actually staged, which is what progressive
+            publication wants.
+        wave_leads: The leads this wave is filling, so a predecessor that has not landed yet is
+            refused rather than encoded as absent.
 
     Returns:
         ``(aggregate_relative_key, member_count)``.
 
     Raises:
-        StagingError: if nothing is staged, or ``expected_members`` is not met.
+        StagingError: if an input is not staged, or the container cannot be built or encoded.
     """
-    io = StoreIO(store)
-    staged = collect_member_planes(
+    from ingestion.core.aggregate_fields import (
+        AggregateBuildError,
+        MemberReader,
+        build_container_fields,
+    )
+
+    reader = MemberReader(
         store,
-        variable_code,
-        lead_time_hours,
         grid_lat=grid_lat,
         grid_lon=grid_lon,
         chunk_lat=chunk_lat,
         chunk_lon=chunk_lon,
     )
-    if expected_members is not None and len(staged) != expected_members:
-        raise StagingError(
-            f"{variable_code!r} lead {lead_time_hours}h has {len(staged)} staged members, "
-            f"expected {expected_members}"
-        )
+    own_members = reader.members(variable_code, lead_time_hours)
+    if expected_members is not None:
+        # The variable's own members, not its inputs': a derived variable has none of its own and
+        # takes its member set from a component, so counting there would compare unlike things.
+        if own_members and len(own_members) != expected_members:
+            raise StagingError(
+                f"{variable_code!r} lead {lead_time_hours}h has {len(own_members)} staged "
+                f"members, expected {expected_members}"
+            )
 
-    container = aggregate_from_planes(
-        [item.plane for item in staged],
-        spec=spec,
-        grid_lat=grid_lat,
-        grid_lon=grid_lon,
-        expected_members=expected_members or len(staged),
+    try:
+        fields, member_count = build_container_fields(
+            reader,
+            variable_code,
+            lead_time_hours,
+            expected_members=expected_members or len(own_members) or 1,
+            wave_leads=wave_leads,
+        )
+    except AggregateBuildError as exc:
+        raise StagingError(str(exc)) from exc
+
+    layout = aggregate_fields_for(variable_code)
+    container = encode_aggregate_shard(
+        fields,
+        AggregateShardLayout(
+            n_fields=layout.n_fields,
+            grid_lat=grid_lat,
+            grid_lon=grid_lon,
+            chunk_lat=chunk_lat,
+            chunk_lon=chunk_lon,
+        ),
+        member_count=member_count,
+        field_scales=layout.field_scales,
     )
     key = aggregate_store_relative_key(variable_code, lead_time_hours)
-    io.write(key, container)
+    StoreIO(store).write(key, container)
 
     if drop_staging:
-        keys_by_member = staged_objects(store, variable_code)
-        io.delete_many(
-            [
-                keys_by_member[(item.member, lead_time_hours)]
-                for item in staged
-                if (item.member, lead_time_hours) in keys_by_member
-            ]
-        )
-    return key, len(staged)
-
-
-def aggregate_layout_for(
-    spec: AggregateSpec,
-    *,
-    grid_lat: int,
-    grid_lon: int,
-    chunk_lat: int = 100,
-    chunk_lon: int = 100,
-    n_fields: int | None = None,
-) -> AggregateShardLayout:
-    """Layout an aggregate shard will have, for callers that need it before reading.
-
-    ``n_fields`` defaults to the spec's own count plus one, because every stored container
-    carries the per-cell member count ahead of the encoding's fields.
-    """
-    return layout_for_spec(
-        spec,
-        grid_lat=grid_lat,
-        grid_lon=grid_lon,
-        chunk_lat=chunk_lat,
-        chunk_lon=chunk_lon,
-        n_fields=spec.n_fields + 1 if n_fields is None else n_fields,
-    )
+        _release_staging(store, [variable_code], lead_time_hours)
+    return key, member_count
 
 
 def staging_object_is_v1_container(
@@ -477,13 +337,9 @@ def staged_lead_keys(store: StoreRef, variable_code: str, leads: Sequence[int]) 
 __all__ = [
     "STAGING_ROOT",
     "STAGING_VERSION",
-    "StagedMember",
     "StagingError",
-    "aggregate_from_planes",
-    "aggregate_layout_for",
     "aggregate_lead_all_variables",
     "aggregate_staged_lead",
-    "collect_member_planes",
     "member_plane_from_shard",
     "parse_staging_name",
     "staged_lead_keys",
@@ -560,36 +416,62 @@ def aggregate_lead_all_variables(
     chunk_lat: int = 100,
     chunk_lon: int = 100,
     drop_staging: bool = True,
+    expected_members: int | None = None,
+    wave_leads: Sequence[int] | None = None,
 ) -> list[tuple[str, str, int]]:
     """Aggregate every classifiable variable staged for one lead.
 
     The pass is per ``(variable, lead)`` and deliberately sequential: a lead's variables
     aggregated concurrently would each hold a member stack, and 14 of those do not fit in the
-    container's memory budget. One at a time bounds residency at a single variable's stack.
+    container's memory budget. One at a time bounds residency at a single variable's stack --
+    measured at 1.5 GB for precipitation, the most expensive of the four group-bearing variables.
 
     Variables are aggregated in the order given, so the pass is reproducible and a partial
-    failure leaves an inspectable prefix rather than an arbitrary subset.
+    failure leaves an inspectable prefix rather than an arbitrary subset. That ordering is also
+    what makes the staging release correct, and it is why the release is deferred to the end of
+    the pass: the variables a container *reads* are not the variables it is written as, so
+    dropping a variable's staging as soon as its own container is written would destroy an input
+    the next variable in the pass still needs. ``wind_10m`` reads a component's staging and the
+    phase groups read the four flags, so with the release inline the wind container would lose
+    ``wind_u_10m`` and a later precipitation container would find no flags at all -- and a
+    publication that ran with a subset of the inputs is exactly what every refusal in
+    :mod:`ingestion.core.aggregate_fields` exists to prevent.
+
+    A **derived** variable -- one the platform serves but stores no members for -- is added to the
+    pass whenever its inputs are staged, even when ``variables`` names an explicit set: the wind
+    pair is a fifth of a cycle's member bytes and no caller's variable list contains ``wind_10m``,
+    which is synthesised rather than stored. Which names those are is
+    ``domain.variable_class.DERIVED_VARIABLES``, not an inference.
 
     Args:
         store: Store root.
         lead_time_hours: Forecast lead to aggregate.
-        variables: Variables to consider; defaults to every variable with staging objects.
+        variables: Variables to consider; defaults to every variable with staging objects. A
+            derived variable is added regardless, if its inputs are staged.
         grid_lat: Grid latitude extent; defaults to the configured platform grid.
         grid_lon: Grid longitude extent; defaults to the configured platform grid.
         chunk_lat: Inner chunk latitude extent.
         chunk_lon: Inner chunk longitude extent.
-        drop_staging: Remove each variable's staging objects once its aggregate is written.
+        drop_staging: Remove each variable's staging objects once the whole pass has written
+            its containers, and only for the variables whose container was written.
+        expected_members: The contract's member count, which the per-cell coverage floor is
+            measured against. Defaults to the members actually staged, which is right only when
+            the set is complete.
+        wave_leads: The leads the wave is filling, so a predecessor that has not landed yet is
+            refused rather than encoded as absent -- see
+            :func:`ingestion.core.aggregate_fields.build_container_fields`.
 
     Returns:
         ``(variable, aggregate_key, member_count)`` per variable aggregated.
 
     Raises:
-        StagingError: if nothing is staged for the lead at all, or a variable's geometry does
-            not match the configured grid. A variable with no staging is skipped: not every
-            lead carries every variable (the GEFS product omits the instantaneous
-            precipitation rate), and that is normal rather than an error.
+        StagingError: if nothing is staged for the lead at all, a variable's geometry does not
+            match the configured grid, or a container cannot be built from the staged inputs. A
+            variable with no staging is skipped: not every lead carries every variable (the GEFS
+            product omits the instantaneous precipitation rate), and that is normal rather than an
+            error. A variable the platform does not classify is skipped with its staging retained;
+            a *classified* variable whose container cannot be built is reported.
     """
-    from domain.variable_class import VariableClassError, spec_for
     from ingestion.core.aggregate_writer import DEFAULT_CHUNK_LAT, DEFAULT_CHUNK_LON
 
     resolved_grid_lat = grid_lat or _grid("ENSEMBLE_AGGREGATE_GRID_LAT", 721)
@@ -602,39 +484,125 @@ def aggregate_lead_all_variables(
     leads_present = {lead for by_lead in staged.values() for (_member, lead) in by_lead}
     if lead_time_hours not in leads_present:
         raise StagingError(f"nothing staged for lead {lead_time_hours}h")
+    candidates.extend(
+        _derived_candidates(candidates, staged, lead_time_hours)
+    )
 
     results: list[tuple[str, str, int]] = []
     for variable in candidates:
-        if lead_time_hours not in {lead for (_m, lead) in staged.get(variable, {})}:
+        # A derived variable has no staging of its own: whether it belongs in this pass is decided
+        # by its inputs, which ``_derived_candidates`` has already checked.
+        staged_here = {lead for (_m, lead) in staged.get(variable, {})}
+        if variable in staged and lead_time_hours not in staged_here:
             continue
         try:
-            spec = spec_for(variable)
-        except VariableClassError:
-            # A flag is staged like any member variable and has no ``AggregateSpec``: its
-            # approved representation is a per-cell exceedance fraction, which is a separate
-            # pass. Leaving its staging in place is what keeps the fraction computable later;
-            # it is also why every aggregate pass re-reads this variable and skips it again
-            # rather than the staging quietly disappearing.
-            logger.debug(
-                "no aggregate spec for %s at lead %d (a flag, or unclassified); "
-                "its staging is retained",
+            key, count = aggregate_staged_lead(
+                store,
                 variable,
                 lead_time_hours,
+                grid_lat=resolved_grid_lat,
+                grid_lon=resolved_grid_lon,
+                chunk_lat=resolved_chunk_lat,
+                chunk_lon=resolved_chunk_lon,
+                drop_staging=False,
+                expected_members=expected_members,
+                wave_leads=wave_leads,
             )
-            continue
-        key, count = aggregate_staged_lead(
-            store,
-            variable,
-            lead_time_hours,
-            spec=spec,
-            grid_lat=resolved_grid_lat,
-            grid_lon=resolved_grid_lon,
-            chunk_lat=resolved_chunk_lat,
-            chunk_lon=resolved_chunk_lon,
-            drop_staging=drop_staging,
-        )
+        except StagingError as exc:
+            if _is_unclassified(variable):
+                # A variable the platform does not classify is staged like any other and has no
+                # container to build. Skipping it leaves its staging in place for a human to
+                # resolve, rather than dropping bytes nothing can rebuild from.
+                logger.warning(
+                    "no aggregate encoding for %s at lead %d; its staging is retained: %s",
+                    variable,
+                    lead_time_hours,
+                    exc,
+                )
+                continue
+            raise
         results.append((variable, key, count))
+
+    if drop_staging and results:
+        _release_staging(store, [variable for variable, _k, _c in results], lead_time_hours)
     return results
+
+
+def _is_unclassified(variable: str) -> bool:
+    """Whether the platform has no approved encoding for a variable at all.
+
+    The distinction the pass needs: a variable the registry does not know is one whose container
+    was never designed, and is skipped -- but a *known* variable whose container could not be
+    built from the staged inputs is a failure of the pass and is reported. Treating the two the
+    same would let a missing input vanish into a warning.
+    """
+    from domain.variable_class import VariableClassError, encoding_for
+
+    try:
+        encoding_for(variable)
+    except VariableClassError:
+        return True
+    return False
+
+
+def _derived_candidates(
+    candidates: Sequence[str],
+    staged: dict[str, dict[tuple[int, int], str]],
+    lead_time_hours: int,
+) -> list[str]:
+    """Derived variables to add to the pass, given that their inputs are staged at this lead.
+
+    ``wind_10m`` is the case: the platform serves it, the API synthesises it from two stored
+    components, and it has no member shards at all -- so it never appears in the staging area and
+    a caller listing the staged variables would never name it. Its container is as much of the
+    cycle's storage decision as any other variable's (it is a fifth of a cycle's member bytes),
+    so the pass adds it rather than waiting to be told.
+
+    The set is ``domain.variable_class.DERIVED_VARIABLES`` -- declared, not inferred. A *stored*
+    variable that simply has not been staged at this lead must not be added: its container is
+    computed from its own members, and there are none.
+    """
+    from domain.field_layout import FieldLayoutError, required_member_variables
+    from domain.variable_class import DERIVED_VARIABLES
+
+    staged_leads: dict[str, set[int]] = {}
+    for variable, by_member in staged.items():
+        staged_leads.setdefault(variable, set()).update(
+            lead for (_member, lead) in by_member
+        )
+    known = set(candidates)
+    extra: list[str] = []
+    for variable in sorted(DERIVED_VARIABLES):
+        if variable in known or variable in staged:
+            continue
+        try:
+            needed = required_member_variables(variable)
+        except FieldLayoutError:  # pragma: no cover - a registered name has a layout
+            continue
+        inputs = [name for name in needed if name != variable]
+        if inputs and all(lead_time_hours in staged_leads.get(name, set()) for name in inputs):
+            extra.append(variable)
+    return extra
+
+
+def _release_staging(
+    store: StoreRef, variables: Sequence[str], lead_time_hours: int
+) -> None:
+    """Delete the staged members of ``variables`` at one lead.
+
+    Only the variables whose container was written: a variable the pass skipped -- an
+    unclassified name, or one with no approved encoding -- still has to be stageable by a repair
+    or a later pass, and its members exist nowhere else.
+    """
+    io = StoreIO(store)
+    doomed: list[str] = []
+    for variable in variables:
+        by_member = staged_objects(store, variable)
+        doomed.extend(
+            key for (member, lead), key in by_member.items() if lead == lead_time_hours
+        )
+    if doomed:
+        io.delete_many(sorted(doomed))
 
 
 def staged_objects_by_variable(store: StoreRef) -> dict[str, dict[tuple[int, int], str]]:

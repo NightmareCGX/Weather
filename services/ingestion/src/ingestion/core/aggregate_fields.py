@@ -237,7 +237,15 @@ def build_container_fields(
                 f"{name!r} is encoded as {spec.kind} but has no staged members"
             )
         try:
-            fields.extend(compute_aggregate(own_stack, spec, expected_members=member_count))
+            # The coverage floor is the platform's, and it is measured against the *contract's*
+            # member count -- the same denominator the serving tier applies to the same cells.
+            # Measuring against the staged count instead would floor a patch of 26 members at
+            # 85% of 26 rather than of 30, so the container would carry cells the API refuses to
+            # serve, and "the aggregate agrees with the members" would stop being true exactly
+            # where coverage is thin.
+            fields.extend(
+                compute_aggregate(own_stack, spec, expected_members=expected_members)
+            )
         except AggregateError as exc:
             raise AggregateBuildError(f"cannot compute the distribution: {exc}") from exc
 

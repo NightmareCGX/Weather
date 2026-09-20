@@ -15,10 +15,8 @@ import numpy as np
 import pytest
 import xarray as xr
 from domain.aggregate import (
-    MEMBER_COUNT_SCALE,
     AggregateSpec,
     compute_aggregate,
-    finite_member_count,
 )
 from domain.shard_format import SHARD_V1_MAGIC, SHARD_V2_MAGIC
 from ingestion.core import aggregate_staging as staging
@@ -47,12 +45,19 @@ def _planes(n_members: int = 5, seed: int = 0) -> list[np.ndarray]:
     ]
 
 
-def _stage(store: str, planes: list[np.ndarray], *, lead: int = LEAD, is_mean: bool = False) -> None:
+def _stage(
+    store: str,
+    planes: list[np.ndarray],
+    *,
+    lead: int = LEAD,
+    is_mean: bool = False,
+    variable: str = VARIABLE,
+) -> None:
     """Write member planes into the staging area using the EXISTING v1 write path."""
     for index, plane in enumerate(planes, start=1):
         dataset = xr.Dataset(
             {
-                VARIABLE: (
+                variable: (
                     ("member", "lead_time_hours", "latitude", "longitude"),
                     plane[None, None],
                 )
@@ -61,11 +66,18 @@ def _stage(store: str, planes: list[np.ndarray], *, lead: int = LEAD, is_mean: b
         encoded = encode_region_sharded_v1(
             dataset, member=None if is_mean else index, lead_time_hours=lead, is_mean=is_mean
         )
-        relative = staging.staging_relative_key(VARIABLE, index, lead)
+        relative = staging.staging_relative_key(variable, index, lead)
         full = os.path.join(store, *relative.split("/"))
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "wb") as handle:
             handle.write(encoded[0][1])
+
+
+def _stage_variable(
+    store: str, variable: str, planes: list[np.ndarray], *, lead: int = LEAD
+) -> None:
+    """The same writer, for a variable other than the module-level default."""
+    _stage(store, planes, lead=lead, variable=variable)
 
 
 def _identical_allow_nan(left: np.ndarray, right: np.ndarray) -> bool:
@@ -267,7 +279,7 @@ def test_staging_object_membership_rejects_a_v2_object(tmp_path) -> None:
 
 def test_collect_rejects_a_lead_with_nothing_staged(tmp_path) -> None:
     with pytest.raises(staging.StagingError, match="no staged members"):
-        staging.collect_member_planes(
+        staging.aggregate_staged_lead(
             str(tmp_path), VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
         )
 
@@ -277,24 +289,59 @@ def test_collect_rejects_a_lead_with_nothing_staged(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _container_layout(n_fields: int):
+    """The container geometry the writer uses for a field vector of this width."""
+    from ingestion.core.aggregate_writer import AggregateShardLayout
+
+    return AggregateShardLayout(
+        n_fields=n_fields, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+
+
+def _expected_fields(planes: list[np.ndarray], variable: str = VARIABLE):
+    """The container's field vector for the variable's registered encoding, from the planes.
+
+    The authority is ``domain.field_layout``, which is also where the writer takes the field order
+    and the per-field steps. Recomputing them here independently would make this a test of two
+    transcriptions rather than of the container.
+    """
+    from domain.aggregate import finite_member_count
+    from domain.field_layout import aggregate_fields_for
+    from domain.variable_class import spec_for
+
+    layout = aggregate_fields_for(variable)
+    stack = np.stack(planes)
+    fields = [finite_member_count(stack)]
+    spec = spec_for(variable) if layout.distribution_slice.stop > 1 else None
+    if spec is not None:
+        fields.extend(compute_aggregate(stack, spec, expected_members=len(planes)))
+    for group in layout.groups:
+        # The fixture stages none of the group inputs, so this is only reached for a variable with
+        # no groups. Asserted rather than silently skipped.
+        raise AssertionError(f"this helper does not build the {group!r} group")
+    return np.concatenate([field[None] for field in fields]), layout
+
+
 def test_aggregate_from_staging_equals_a_direct_computation(tmp_path) -> None:
-    """The published aggregate must equal one computed from the stored member planes.
+    """The published container must equal one computed from the stored member planes.
 
     Every layer in between -- the v1 container encoder, the chunk reassembly, the layout, the
     fixed-point round trip -- could be wrong in a way that still yields a plausible statistic
     field, so the comparison is per chunk against a direct computation, bounded by half a
     quantisation step of the field's own scale.
 
-    Field 0 is the per-cell member count, prepended to the statistic fields, so the comparison
-    offsets by one and the count itself must be exact (its step is one member).
+    The variable is ``temperature_2m``, whose container is its distribution alone, so the field
+    vector is the count followed by the spec's own fields. Field 0 is the per-cell member count,
+    and its step is one member, so it must come back exactly.
     """
+    from domain.field_layout import aggregate_fields_for
+
     store = str(tmp_path)
-    spec = _spec()
     planes = _planes(5, seed=12)
     _stage(store, planes)
 
     key, member_count = staging.aggregate_staged_lead(
-        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        store, VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
     )
     assert member_count == len(planes)
     assert key == f"{VARIABLE}/shard.agg_L{LEAD:04d}.shard"
@@ -302,29 +349,27 @@ def test_aggregate_from_staging_equals_a_direct_computation(tmp_path) -> None:
     with open(os.path.join(store, *key.split("/")), "rb") as handle:
         container = handle.read()
 
-    stack = np.stack(planes)
-    expected_fields = np.concatenate(
-        [finite_member_count(stack)[None], compute_aggregate(stack, spec)]
-    )
-    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
-    layout = layout_for_spec(
-        spec, grid_lat=GRID_LAT, grid_lon=GRID_LON, n_fields=spec.n_fields + 1
-    )
-    assert layout.num_chunks == (spec.n_fields + 1) * 4
+    layout = aggregate_fields_for(VARIABLE)
+    assert layout.groups == (), "the fixture stages no group inputs"
+    expected_fields, _declared = _expected_fields(planes)
+    assert expected_fields.shape[0] == layout.n_fields
+    shard_layout = _container_layout(layout.n_fields)
+    assert shard_layout.num_chunks == layout.n_fields * 4
 
-    for ordinal in range(layout.num_chunks):
-        field, row, col = layout.locate(ordinal)
+    for ordinal in range(shard_layout.num_chunks):
+        field, row, col = shard_layout.locate(ordinal)
         r0, c0 = row * CHUNK, col * CHUNK
         r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
         expected = np.full((CHUNK, CHUNK), np.nan, dtype=np.float32)
         expected[: r1 - r0, : c1 - c0] = expected_fields[field][r0:r1, c0:c1]
-        decoded = decode_aggregate_chunk(container, ordinal, field_scales=scales)
-        assert _within_quantisation(decoded, expected, scales[field] / 2), ordinal
+        decoded = decode_aggregate_chunk(
+            container, ordinal, field_scales=layout.field_scales
+        )
+        assert _within_quantisation(decoded, expected, layout.field_scales[field] / 2), ordinal
 
 
 def test_aggregate_is_independent_of_member_staging_order(tmp_path) -> None:
     """Members are aggregated after a sort, so listing order cannot leak into the result."""
-    spec = _spec()
     planes = _planes(4, seed=13)
     first = str(tmp_path / "a")
     second = str(tmp_path / "b")
@@ -350,10 +395,10 @@ def test_aggregate_is_independent_of_member_staging_order(tmp_path) -> None:
             handle.write(blob)
 
     key_a, _ = staging.aggregate_staged_lead(
-        first, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        first, VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
     )
     key_b, _ = staging.aggregate_staged_lead(
-        second, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        second, VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
     )
     with open(os.path.join(first, *key_a.split("/")), "rb") as handle:
         container_a = handle.read()
@@ -368,7 +413,7 @@ def test_staging_is_dropped_after_the_aggregate_is_written(tmp_path) -> None:
     _stage(store, _planes(3, seed=14), lead=LEAD)
     _stage(store, _planes(2, seed=15), lead=12)
     staging.aggregate_staged_lead(
-        store, VARIABLE, LEAD, spec=_spec(), grid_lat=GRID_LAT, grid_lon=GRID_LON
+        store, VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
     )
     assert staging.staged_members_for_lead(store, VARIABLE, LEAD) == []
     # another lead's staging is untouched
@@ -383,7 +428,6 @@ def test_drop_staging_can_be_disabled(tmp_path) -> None:
         store,
         VARIABLE,
         LEAD,
-        spec=_spec(),
         grid_lat=GRID_LAT,
         grid_lon=GRID_LON,
         drop_staging=False,
@@ -400,7 +444,6 @@ def test_expected_members_refuses_a_partial_aggregate(tmp_path) -> None:
             store,
             VARIABLE,
             LEAD,
-            spec=_spec(),
             grid_lat=GRID_LAT,
             grid_lon=GRID_LON,
             expected_members=30,
@@ -409,47 +452,18 @@ def test_expected_members_refuses_a_partial_aggregate(tmp_path) -> None:
     assert staging.staged_members_for_lead(store, VARIABLE, LEAD) == [1, 2, 3]
 
 
-def test_aggregate_from_planes_rejects_shape_and_empty_input() -> None:
-    with pytest.raises(staging.StagingError, match="at least one member plane"):
-        staging.aggregate_from_planes([], spec=_spec(), grid_lat=GRID_LAT, grid_lon=GRID_LON)
-    wrong = np.zeros((8, 8), dtype=np.float32)
-    with pytest.raises(staging.StagingError, match="expected"):
-        staging.aggregate_from_planes(
-            [wrong], spec=_spec(), grid_lat=GRID_LAT, grid_lon=GRID_LON
-        )
-
-
-def test_aggregate_layout_helper_matches_the_written_container(tmp_path) -> None:
-    store = str(tmp_path)
-    spec = _spec()
-    _stage(store, _planes(2, seed=18), lead=LEAD)
-    key, _ = staging.aggregate_staged_lead(
-        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
-    )
-    layout = staging.aggregate_layout_for(
-        spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
-    )
-    with open(os.path.join(store, *key.split("/")), "rb") as handle:
-        container = handle.read()
-    num_chunks, _index_size, magic = struct.unpack("<III", container[-12:])
-    assert magic == SHARD_V2_MAGIC
-    assert num_chunks == layout.num_chunks
-
-
 def test_aggregate_is_bit_identical_across_a_recompute(tmp_path) -> None:
     """Recomputing from the same staging must produce the same bytes, not merely close ones."""
     store = str(tmp_path)
-    spec = _spec()
     _stage(store, _planes(3, seed=19), lead=LEAD)
 
     first_key, _ = staging.aggregate_staged_lead(
-        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON,
-        drop_staging=False,
+        store, VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON, drop_staging=False
     )
     with open(os.path.join(store, *first_key.split("/")), "rb") as handle:
         first = handle.read()
     second_key, _ = staging.aggregate_staged_lead(
-        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        store, VARIABLE, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
     )
     with open(os.path.join(store, *second_key.split("/")), "rb") as handle:
         second = handle.read()
@@ -461,86 +475,91 @@ def test_v1_magic_is_the_expected_container_generation() -> None:
     assert SHARD_V1_MAGIC == 0x53484152
 
 
-def _quantile_spec() -> AggregateSpec:
-    from domain.aggregate import KIND_QUANTILE_FUNCTION
-
-    return AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
-
-
 def test_quantile_aggregate_from_staging_equals_a_direct_computation(tmp_path) -> None:
     """The B/C-class encoding must hold up through the same chain as the A-class one.
 
     The two encodings differ in field count and in what each plane means, so equivalence has
     to be re-established for this kind rather than inferred from the other.
     """
+    from domain.aggregate import finite_member_count
+    from domain.field_layout import aggregate_fields_for
+    from domain.variable_class import spec_for
+
     store = str(tmp_path)
-    spec = _quantile_spec()
+    variable = "wind_gust"
     planes = _planes(4, seed=20)
-    _stage(store, planes)
+    _stage_variable(store, variable, planes)
 
     key, member_count = staging.aggregate_staged_lead(
-        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        store, variable, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
     )
     assert member_count == len(planes)
     with open(os.path.join(store, *key.split("/")), "rb") as handle:
         container = handle.read()
 
+    spec = spec_for(variable)
+    layout = aggregate_fields_for(variable)
+    assert layout.groups == ()
     stack = np.stack(planes)
     expected_fields = np.concatenate(
         [finite_member_count(stack)[None], compute_aggregate(stack, spec)]
     )
-    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
-    layout = layout_for_spec(
-        spec, grid_lat=GRID_LAT, grid_lon=GRID_LON, n_fields=spec.n_fields + 1
-    )
     assert layout.n_fields == len(spec.levels) + 1 == 20
+    shard_layout = _container_layout(layout.n_fields)
 
-    for ordinal in range(layout.num_chunks):
-        field, row, col = layout.locate(ordinal)
+    for ordinal in range(shard_layout.num_chunks):
+        field, row, col = shard_layout.locate(ordinal)
         r0, c0 = row * CHUNK, col * CHUNK
         r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
         expected = np.full((CHUNK, CHUNK), np.nan, dtype=np.float32)
         expected[: r1 - r0, : c1 - c0] = expected_fields[field][r0:r1, c0:c1]
-        decoded = decode_aggregate_chunk(container, ordinal, field_scales=scales)
-        assert _within_quantisation(decoded, expected, scales[field] / 2), ordinal
+        decoded = decode_aggregate_chunk(
+            container, ordinal, field_scales=layout.field_scales
+        )
+        assert _within_quantisation(decoded, expected, layout.field_scales[field] / 2), ordinal
 
 
 def test_quantile_aggregate_exceedance_survives_the_container_round_trip(tmp_path) -> None:
     """The published aggregate must answer a threshold as well as the in-memory fields do."""
     from domain.aggregate import exceedance_from_quantiles
+    from domain.field_layout import aggregate_fields_for
+    from domain.variable_class import spec_for
 
     store = str(tmp_path)
-    spec = _quantile_spec()
+    variable = "wind_gust"
     planes = _planes(6, seed=21)
-    _stage(store, planes)
+    _stage_variable(store, variable, planes)
     key, _ = staging.aggregate_staged_lead(
-        store, VARIABLE, LEAD, spec=spec, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        store, variable, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
     )
     with open(os.path.join(store, *key.split("/")), "rb") as handle:
         container = handle.read()
 
-    layout = layout_for_spec(
-        spec, grid_lat=GRID_LAT, grid_lon=GRID_LON, n_fields=spec.n_fields + 1
-    )
-    scales = (MEMBER_COUNT_SCALE, *spec.field_scales)
-    # Reassemble the levels from the published container, chunk by chunk. Field 0 is the
+    spec = spec_for(variable)
+    layout = aggregate_fields_for(variable)
+    shard_layout = _container_layout(layout.n_fields)
+    # Reassemble the distribution from the published container, chunk by chunk. Field 0 is the
     # member count, so the levels start at 1.
+    distribution = layout.distribution_slice
     levels = np.full((spec.n_fields, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
-    for ordinal in range(layout.num_chunks):
-        field, row, col = layout.locate(ordinal)
-        chunk = decode_aggregate_chunk(container, ordinal, field_scales=scales)
-        if field == 0:
+    for ordinal in range(shard_layout.num_chunks):
+        field, row, col = shard_layout.locate(ordinal)
+        if field not in range(distribution.start, distribution.stop):
             continue
+        chunk = decode_aggregate_chunk(
+            container, ordinal, field_scales=layout.field_scales
+        )
         r0, c0 = row * CHUNK, col * CHUNK
         r1, c1 = min(r0 + CHUNK, GRID_LAT), min(c0 + CHUNK, GRID_LON)
-        levels[field - 1, r0:r1, c0:c1] = chunk[: r1 - r0, : c1 - c0]
+        levels[field - distribution.start, r0:r1, c0:c1] = chunk[: r1 - r0, : c1 - c0]
 
-    threshold = float(np.percentile(np.stack(planes), 90.0))
+    stack = np.stack(planes)
+    threshold = float(np.percentile(stack, 90.0))
     from_container = exceedance_from_quantiles(levels, spec.levels, threshold)
     from_memory = exceedance_from_quantiles(
-        compute_aggregate(np.stack(planes), spec), spec.levels, threshold
+        compute_aggregate(stack, spec), spec.levels, threshold
     )
-    truth = np.mean(np.stack(planes) > threshold, axis=0)
+    truth = np.mean(stack > threshold, axis=0)
     assert abs(float(np.mean(from_container)) - float(np.mean(truth))) < 0.05
     # quantisation is the only difference, and it is one step of the scale
     assert np.allclose(from_container, from_memory, atol=0.02)
@@ -833,6 +852,153 @@ def test_phase_aggregates_a_fully_staged_lead(tmp_path, monkeypatch) -> None:
     assert staging.staged_objects_by_variable(store) == {}
 
 
+def test_the_pass_reads_an_inputs_staging_before_releasing_it(tmp_path) -> None:
+    """A container is a function of *other* variables' staging, so the release is deferred.
+
+    The wind container is built from ``wind_u_10m`` and ``wind_v_10m``, which are themselves
+    variables with containers of their own. Releasing a variable's staging as soon as its own
+    container was written would destroy the wind pair before the wind container was built, and
+    every refusal in ``aggregate_fields`` exists precisely to catch a publication that ran with a
+    subset of its inputs -- so with the release inline this pass would fail rather than publish
+    something wrong, which is the good outcome but still a pass that cannot run.
+    """
+    store = str(tmp_path)
+    # The components are m/s, so the fixture's planes have to be speeds rather than temperatures:
+    # a consensus speed stored at a 0.01 step overflows past +-327 m/s and is refused.
+    components = {
+        name: [
+            np.random.default_rng(seed)
+            .normal(3.0, 4.0, (GRID_LAT, GRID_LON))
+            .astype(np.float32)
+            for seed in (71, 72, 73)
+        ]
+        for name in ("wind_u_10m", "wind_v_10m")
+    }
+    for name, planes in components.items():
+        _stage_variable(store, name, planes)
+
+    results = staging.aggregate_lead_all_variables(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    written = {variable for variable, _key, _count in results}
+    # The two components and the synthesised wind variable all have containers.
+    assert written == {"wind_u_10m", "wind_v_10m", "wind_10m"}, written
+    assert staging.staged_objects_by_variable(store) == {}
+    for variable, key, count in results:
+        assert count == 3, variable
+        assert os.path.isfile(os.path.join(store, *key.split("/"))), key
+
+
+def test_a_variable_with_no_approved_encoding_keeps_its_staging(tmp_path, caplog) -> None:
+    """Nothing can rebuild a skipped variable's members, so its staging is left alone.
+
+    The pass writes at most one container per variable and releases only those, so a name the
+    platform does not classify stays inspectable instead of being dropped.
+    """
+    store = str(tmp_path)
+    _stage(store, _planes(2, seed=72))
+    _stage_variable(store, "mystery_variable", _planes(2, seed=73))
+
+    results = staging.aggregate_lead_all_variables(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    assert {variable for variable, _k, _c in results} == {VARIABLE}
+    remaining = staging.staged_objects_by_variable(store)
+    assert set(remaining) == {"mystery_variable"}
+
+
+def test_a_missing_input_the_pass_could_build_is_reported_not_skipped(tmp_path) -> None:
+    """A known variable whose container cannot be built is a failure, not a variable to skip.
+
+    Distinguishing the two is what keeps a missing input from vanishing into a warning: the
+    precipitation container reads the four flags, so with the amount staged and the flags absent
+    the pass must raise rather than quietly leaving the variable for a later pass to find.
+    """
+    store = str(tmp_path)
+    _stage_variable(store, "precipitation_amount_3h", _planes(2, seed=74))
+
+    with pytest.raises(staging.StagingError, match="not staged at lead"):
+        staging.aggregate_lead_all_variables(
+            store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        )
+
+
+def test_a_later_variable_can_read_an_earlier_ones_staged_members(tmp_path) -> None:
+    """The release is per pass, not per variable, and the pass order is what makes that safe.
+
+    ``precipitation_amount_3h`` reads the four flags, which are variables aggregated in the same
+    pass (and sorted before it). Both have containers afterwards and neither keeps staging.
+    """
+    store = str(tmp_path)
+    _stage_variable(store, "precipitation_amount_3h", _planes(3, seed=75))
+    for flag in ("crain", "csnow", "cfrzr", "cicep"):
+        # Staged as 0/1 planes, which is what the provider emits for a categorical flag.
+        rng = np.random.default_rng(hash(flag) % 1000)
+        _stage_variable(
+            store,
+            flag,
+            [(rng.random((GRID_LAT, GRID_LON)) < 0.5).astype(np.float32) for _ in range(3)],
+        )
+
+    results = staging.aggregate_lead_all_variables(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    written = {variable: count for variable, _key, count in results}
+    assert written == {
+        "precipitation_amount_3h": 3,
+        "crain": 3,
+        "csnow": 3,
+        "cfrzr": 3,
+        "cicep": 3,
+    }
+    assert staging.staged_objects_by_variable(store) == {}
+
+
+def test_a_predecessor_the_wave_is_filling_is_refused_by_the_pass(tmp_path) -> None:
+    """The pass forwards its wave targets, so a late predecessor is a refusal rather than a gap.
+
+    Without this the container for a reset lead would encode the *absent* predecessor reading
+    (``persistent_rain``) for a predecessor that is merely late, and the next patch would silently
+    correct it. Here the amount at lead 6 is staged and its predecessor lead 3 is not, while the
+    wave declares that it is filling lead 3 -- so the pass refuses the container instead of
+    encoding it from half an interval.
+    """
+    store = str(tmp_path)
+    for variable in ("precipitation_amount_3h", "crain", "csnow", "cfrzr", "cicep"):
+        _stage_variable(store, variable, _planes(3, seed=76))
+
+    with pytest.raises(staging.StagingError, match="cannot be classified yet"):
+        staging.aggregate_lead_all_variables(
+            store,
+            LEAD,
+            grid_lat=GRID_LAT,
+            grid_lon=GRID_LON,
+            wave_leads=(LEAD, LEAD - 3),
+            variables=("precipitation_amount_3h",),
+        )
+    # Its staging is untouched, so the next publication can build the container.
+    assert staging.staged_members_for_lead(
+        store, "precipitation_amount_3h", LEAD
+    ) == [1, 2, 3]
+
+
+def test_a_predecessor_outside_the_wave_is_accepted_by_the_pass(tmp_path) -> None:
+    """A lead whose predecessor this wave is not filling has none, and that is a definite answer."""
+    store = str(tmp_path)
+    for variable in ("precipitation_amount_3h", "crain", "csnow", "cfrzr", "cicep"):
+        _stage_variable(store, variable, _planes(3, seed=79))
+
+    results = staging.aggregate_lead_all_variables(
+        store,
+        LEAD,
+        grid_lat=GRID_LAT,
+        grid_lon=GRID_LON,
+        wave_leads=(LEAD,),
+        variables=("precipitation_amount_3h",),
+    )
+    assert [variable for variable, _k, _c in results] == ["precipitation_amount_3h"]
+
+
 def test_phase_aggregate_is_a_no_op_for_a_lead_with_nothing_staged(tmp_path, monkeypatch) -> None:
     """A lead with no members is a normal state (a wave may not have reached it yet)."""
     from ingestion.core import aggregate_phase
@@ -898,6 +1064,7 @@ def test_point_query_reads_four_contiguous_ranges(tmp_path) -> None:
     index rather than on the ordinal arithmetic, because the index is what determines the
     fetches a reader issues.
     """
+    from domain.aggregate import KIND_QUANTILE_FUNCTION
     from domain.shard_format import (
         DESCRIPTOR_SIZE,
         TRAILER_SIZE,
@@ -906,7 +1073,7 @@ def test_point_query_reads_four_contiguous_ranges(tmp_path) -> None:
         split_v2_tail,
     )
 
-    spec = _quantile_spec()
+    spec = AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
     planes = [_planes(1, seed=61 + index)[0] for index in range(spec.n_fields)]
     layout = layout_for_spec(spec, grid_lat=GRID_LAT, grid_lon=GRID_LON)
     container = encode_aggregate_shard(planes, layout)

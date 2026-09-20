@@ -141,6 +141,8 @@ def aggregate_lead(
     chunk_lat: int = 100,
     chunk_lon: int = 100,
     drop_staging: bool = True,
+    expected_members: int | None = None,
+    wave_leads: Sequence[int] | None = None,
 ) -> AggregatePhaseResult:
     """Aggregate every staged variable of one lead, if the phase is enabled.
 
@@ -156,11 +158,15 @@ def aggregate_lead(
         grid_lon: Grid longitude extent; defaults to the configured platform grid.
         chunk_lat: Inner chunk latitude extent.
         chunk_lon: Inner chunk longitude extent.
-        drop_staging: Remove each variable's staging objects once its aggregate is written.
-            **Pass ``False`` for a partial publication**: the staging area is the only place
-            the already-committed members' planes exist, and the next patch has to be computed
-            from all of them, not from the ones that arrived since. The default is ``True``
-            for the caller that publishes the last version of a lead.
+        drop_staging: Remove each variable's staging objects once the whole pass has written its
+            containers. **Pass ``False`` for a partial publication**: the staging area is the
+            only place the already-committed members' planes exist, and the next patch has to be
+            computed from all of them, not from the ones that arrived since. The default is
+            ``True`` for the caller that publishes the last version of a lead.
+        expected_members: The contract's member count, which the per-cell coverage floor is
+            measured against and which a partial publication is refused below.
+        wave_leads: The leads this wave is filling, so a predecessor that has not landed yet is
+            refused rather than encoded as absent.
     """
     if not staging_enabled():
         return AggregatePhaseResult()
@@ -174,6 +180,8 @@ def aggregate_lead(
             chunk_lat=chunk_lat,
             chunk_lon=chunk_lon,
             drop_staging=drop_staging,
+            expected_members=expected_members,
+            wave_leads=wave_leads,
         )
     except StagingError as exc:
         logger.warning(
@@ -203,7 +211,8 @@ def aggregate_variable_lead(
     chunk_lat: int = 100,
     chunk_lon: int = 100,
     drop_staging: bool = True,
-    spec: AggregateSpec | None = None,
+    expected_members: int | None = None,
+    wave_leads: Sequence[int] | None = None,
 ) -> tuple[str, int]:
     """Aggregate one variable's staged members for one lead.
 
@@ -215,7 +224,7 @@ def aggregate_variable_lead(
         AggregatePhaseError: for an unclassified variable or a staging failure.
     """
     try:
-        resolved_spec = spec if spec is not None else spec_for(variable)
+        spec_for(variable)
     except VariableClassError as exc:
         raise AggregatePhaseError(str(exc)) from exc
     try:
@@ -223,12 +232,13 @@ def aggregate_variable_lead(
             store,
             variable,
             lead_time_hours,
-            spec=resolved_spec,
             grid_lat=grid_lat,
             grid_lon=grid_lon,
             chunk_lat=chunk_lat,
             chunk_lon=chunk_lon,
             drop_staging=drop_staging,
+            expected_members=expected_members,
+            wave_leads=wave_leads,
         )
     except StagingError as exc:
         raise AggregatePhaseError(str(exc)) from exc

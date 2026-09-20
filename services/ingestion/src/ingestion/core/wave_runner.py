@@ -1227,6 +1227,11 @@ async def _run_wave_impl(
                             publication_variables if aggregated else ()
                         ),
                         aggregate_is_final=final,
+                        # The pass refuses a reset lead's container while the predecessor it reads
+                        # is still to come, because the classifier reads a missing predecessor and
+                        # a dry one differently. It needs to know which leads this wave is filling
+                        # to tell the two apart, which is exactly ``target_lead_time_hours``.
+                        wave_leads=tuple(spec.target_lead_time_hours),
                     )
                 except Exception as exc:
                     logger.warning("Settled-lead publication failed for lead %d: %s", lead_val, exc)

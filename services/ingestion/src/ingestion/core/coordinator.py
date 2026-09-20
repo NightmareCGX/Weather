@@ -1076,6 +1076,7 @@ class RunCoordinator:
         expected_members: tuple[int, ...],
         aggregate_variables: tuple[str, ...] = (),
         aggregate_is_final: bool = True,
+        wave_leads: tuple[int, ...] | None = None,
     ) -> None:
         """Publish a settled forecast lead to the catalog and advance serving generation.
 
@@ -1094,6 +1095,10 @@ class RunCoordinator:
                 computed from *all* the committed members and the staging area is the only
                 place their planes live. Discarding it would make each patch a statistic of
                 the handful of members that arrived since the last one.
+            wave_leads: The leads this wave is filling, so a reset lead's predecessor that has
+                not landed yet is refused by the aggregate pass rather than encoded as absent --
+                the classifier reads a missing predecessor and a dry one differently. ``None``
+                for a caller that does not know the wave's targets (a repair, a backfill).
 
         Does NOT mark the overall run status as 'ready' (status remains 'processing' or 'partial').
 
@@ -1298,6 +1303,8 @@ class RunCoordinator:
                         lead_time_hours,
                         variables=aggregate_variables,
                         drop_staging=aggregate_is_final,
+                        expected_members=len(expected_members) if expected_members else None,
+                        wave_leads=wave_leads,
                     )
                 except AggregatePhaseError as exc:
                     # The member shards remain the reader of record, so a failed aggregate is

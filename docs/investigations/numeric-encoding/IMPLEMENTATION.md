@@ -234,7 +234,22 @@ D 类的批准表示是**每格点超越比例**。实现时确认了两件事�
 
 **签名保留码与 dtype 上界**：`_UNUSABLE_SIGNATURE = 1023` 高于可达最大签名 304，且仍在 int16 内（签名平面 62 MB/张）。这两条都由 `test_a_signature_fits_the_dtype_the_builder_stores_it_in` **枚举** 16×16 种旗标组合验证，而不是靠推理——保留码一旦低于真实签名，那个格点会被当成"不可分类"而静默丢出求和。
 
-**Linux/CI 等价验证**：本阶段三条改动（`aggregate_fields.py` 与其测试、`product_fields.py` 的分母统一、以及 §19.11 的三处性能修正）在 `python:3.12-slim` 容器里跑过 `ruff`（All checks passed）、`mypy`（domain 33 files / ingestion 55 files clean）、`services/ingestion` 聚合/结算范围（119 passed）与 `packages/domain` 全量（689 passed，100% 覆盖门槛达成）。容器的 `ruff`/`mypy` 需要 `RUFF_CACHE_DIR`/`MYPY_CACHE_DIR` 指向可写目录，否则会在只读挂载上写 cache 而失败——这是验证环境的问题，不是代码的问题。
+### 19.13 构建器接进聚合趟：写端从此写的是**完整字段向量**
+
+`aggregate_staged_lead` 不再自己读成员平面、自己算分布、自己拼 scale，而是调用 `build_container_fields` 并把 `domain.field_layout.aggregate_fields_for(variable)` 的**逐字段 scale** 交给 `encode_aggregate_shard`。读数与写数因此来自**同一个权威**，不再需要"两边恰好一致"这种论证。同时删掉了三个已经被取代的函数：`aggregate_from_planes`、`aggregate_layout_for`、`collect_member_planes`（连同 `StagedMember`），以及 `aggregate_staged_lead` 的 `spec=` 参数——一个既传 `spec` 又自己查 layout 的接口，正是"两处各自决定字段集"的温床。
+
+**删除时机：整趟结束后统一删，而不是每写一个变量就删。** 这是本阶段最关键的顺序问题：**容器读的变量集不等于它的变量名**。`wind_10m` 读 `wind_u_10m`/`wind_v_10m`，降水 group 读四个标志，而这些都是同一趟里、**各自也会被聚合**的变量。原来的实现每写完一个变量就删它自己的 staging，于是：`wind_u_10m` 自己的容器写完后其 staging 被删 → 轮到 `wind_10m` 时它的输入已经不存在。现在的顺序是：整趟**全部用 `drop_staging=False`**，全部成功后按写出的变量名列一次性删除（`_release_staging`）。这同时保证了两件相关的事：
+
+* 被 **skipped** 的变量（未分类名，或本次缺输入）其 staging 一定保留——它的成员除了 staging 无处可寻，删了就再也算不出来；
+* 只有**写过容器**的变量才被删，所以释放集与取代集完全一致。
+
+**派生变量自动加入本趟。** `wind_10m` 在 staging 里根本没有对象（API 从两个分量合成它），所以任何"staged 变量列表"都不会包含它——但它占周期的五分之一成员字节，它的容器必须被写。因此本趟会在 `domain.variable_class.DERIVED_VARIABLES` 里，对**其 `required_member_variables` 都已 staged** 的成员自动追加（`_derived_candidates`）。这一条是声明的派生集合，不是"凡是缺 staging 的注册变量都补"——后者会把"这个时效还没到"误判成"该变量是派生的"。
+
+**"未分类"与"已知变量但建不出来"从此是两件事。** 前者（`_is_unclassified`）跳过并保留 staging，只记 warning；后者**向上抛**。原来两者都落在同一个 `except VariableClassError: continue` 里，那会让一个真正缺失的输入悄悄降级成一条 warning——而这正是上游要能看见的信号。
+
+**`expected_members` 同时是"覆盖率分母"和"完备性门槛"**：`publish_settled_lead` 把 `len(expected_members)` 传下来，一方面让逐格点的 85% 门槛用**契约的 30** 而不是"本次 staged 的 26"（否则 patch 期会把 API 拒绝服务的格点写成完整统计量），另一方面让 `aggregate_staged_lead` 在成员数不足时**拒绝出版**。`wave_leads` 也从 `publish_settled_lead` 一路贯通到 `spec.target_lead_time_hours`，这样"前置还没到"能被识别成**等待**而不是"前置不存在"。
+
+**Linux/CI 等价验证**：本轮改动（`aggregate_staging.py`、`aggregate_phase.py`、`coordinator.py`、`wave_runner.py` 与其测试）在 `python:3.12-slim` 里跑了 `ruff`（passed）、`mypy`（ingestion 55 files clean）、聚合/结算/协调器范围（124 passed）、`packages/domain` 全量（689 passed，100% 覆盖门槛达成）与跨包契约（24 passed）。Windows 全量 ingestion 套件 891 passed / 29 skipped。
 
 **分歧记录（不做门禁）**：服务路径的相位支持在某个格点上只用"`amount` 有限"的成员，写端还要求四个 flag 有限。到真实数据上 flag 缺失很罕见，且我们只表达"成员支持什么"而不解释，所以按 §19 的分工**如实记录**这个偏差，不改服务路径的门槛。
 

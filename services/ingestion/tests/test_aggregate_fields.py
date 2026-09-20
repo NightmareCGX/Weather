@@ -113,12 +113,37 @@ def test_the_distribution_is_the_variables_own_aggregate(store: str) -> None:
     reader = _reader(store)
     variable = "temperature_2m"
     fields, _count = build_container_fields(reader, variable, LEAD, expected_members=30)
-    members, stack = reader.stack(variable, LEAD)
+    _members, stack = reader.stack(variable, LEAD)
 
     assert np.array_equal(fields[0], np.isfinite(stack).sum(axis=0).astype(np.float32))
-    expected = compute_aggregate(stack, spec_for(variable), expected_members=len(members))
+    # The coverage floor is measured against the contract's member count -- the same denominator
+    # the serving tier uses -- not against the members that happen to be staged.
+    expected = compute_aggregate(stack, spec_for(variable), expected_members=30)
     for offset, plane in enumerate(expected):
         assert np.array_equal(fields[1 + offset], plane, equal_nan=True), offset
+
+
+def test_a_partial_publication_uses_the_contracts_coverage_floor(store: str) -> None:
+    """A patch measured against its own staged count would carry cells the API refuses.
+
+    The serving tier floors a lead at its member coverage and a cell at its finite count, both
+    against the contract's 30. An aggregate built from 5 staged members and floored at 85% of
+    5 would report those 5 members as a complete cell -- the aggregate would disagree with the
+    member path exactly where coverage is thin, which is where a reader is most likely to notice
+    and least likely to be able to tell why.
+    """
+    from domain.aggregate import compute_aggregate
+    from domain.variable_class import spec_for
+
+    reader = _reader(store)
+    variable = "temperature_2m"
+    fields, count = build_container_fields(reader, variable, LEAD, expected_members=30)
+    assert count == len(MEMBERS)  # 5 of 30: below the floor
+    _members, stack = reader.stack(variable, LEAD)
+    expected = compute_aggregate(stack, spec_for(variable), expected_members=30)
+    # 5 of 30 is below 85%, so every covered cell is refused and reports no value.
+    assert np.isnan(expected[0]).all()
+    assert np.isnan(fields[1]).all()
 
 
 def test_a_derived_variable_takes_its_member_set_from_its_inputs(store: str) -> None:
