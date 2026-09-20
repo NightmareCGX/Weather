@@ -30,6 +30,12 @@ The rose needs one word: its buckets are **quantile edges of this cycle's member
 the container. So a bucket index is compared against the member path *binned with the same edges*
 -- exactly what a reader does, since the edges travel with the fields.
 
+Result on real GEFS 20260920 00Z, f006 with f003 as its predecessor, 30 members, 200 sampled
+cells: **128 judged comparisons, none at or above the sampling noise**; the worst is 0.564
+(``temperature_2m``'s p90) and the median is 0.003. Two findings came out of building it, both
+fixed: the dry/``trace`` comparison disagreed with the classifier by one ulp (3.5x the noise at the
+cell it bit), and the censoring counts had been stored as fractions at a one-member step.
+
 Run:
     .venv/Scripts/python.exe gefs_fetch_all.py 20260920 00 f006 f003
     .venv/Scripts/python.exe compare_paths.py
