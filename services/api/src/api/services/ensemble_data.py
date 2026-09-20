@@ -132,17 +132,42 @@ def _validate_coordinates(latitude: float, longitude: float) -> None:
         raise HTTPException(status_code=_STATUS_INVALID_INPUT, detail=str(exc)) from exc
 
 
+def _aggregate_represents_members(
+    variable: str, *, store_path: str, lead_time_hours: int
+) -> bool:
+    """Whether a readable container stands in for ``variable``'s members at this lead.
+
+    The serving half of ``domain.supersession``: the members are gone *by design*, so the
+    member-coverage floor no longer describes this variable at this lead -- counting absent
+    members as an outage would turn the migration into one. Both conditions are required, and the
+    switch is the second: with member reclamation off nothing is ever released, so a coverage
+    failure stays a failure and this predicate is inert.
+
+    Imported lazily and guarded, because the API tier must serve a store whose aggregate path was
+    never built.
+    """
+    from api.services.aggregate_serving import aggregate_answers_for_lead
+    from domain.supersession import is_variable_lead_servable
+
+    ready = aggregate_answers_for_lead(
+        variable, store_path=store_path, lead_time_hours=lead_time_hours
+    )
+    return is_variable_lead_servable(member_coverage_ok=False, aggregate_ready=ready)
+
+
 def _resolve_eligible_ensemble_run_and_members(
     db: Session,
     model: str,
     lead_time_hours: int,
     initial_time: str | None = None,
+    variable: str | None = None,
 ) -> tuple[ModelRun, _CycleMetadata, tuple[int, ...]]:
     """Return the newest eligible ensemble run and its committed member indices.
 
     For the given model and lead_time_hours, finds the newest run in ('ready',
     'processing', 'partial') where the lead is servable (coverage >= 85% of
-    expected_members).
+    expected_members) **or** where ``variable``'s members have been replaced by a stored
+    aggregate container.
 
     When initial_time is provided, pins to that exact cycle; if that cycle is not
     eligible or store is unreadable, raises HTTP 404.
@@ -216,7 +241,15 @@ def _resolve_eligible_ensemble_run_and_members(
         except Exception:
             pass
 
-        if not is_lead_servable(len(avail_members), expected_members):
+        if not is_lead_servable(len(avail_members), expected_members) and not (
+            variable is not None
+            and run.zarr_store_path is not None
+            and _aggregate_represents_members(
+                variable,
+                store_path=str(run.zarr_store_path),
+                lead_time_hours=lead_time_hours,
+            )
+        ):
             if initial_time is not None:
                 raise HTTPException(
                     status_code=404,
@@ -285,7 +318,7 @@ def build_probability_forecast(
         metadata = gated_cycle_metadata(store_path_str)
     else:
         run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
-            db, model, lead_time_hours, initial_time=initial_time
+            db, model, lead_time_hours, initial_time=initial_time, variable=variable
         )
         assert run.zarr_store_path is not None
         store_path_str = str(run.zarr_store_path)
@@ -485,7 +518,7 @@ def build_ensemble_statistics(
         metadata = gated_cycle_metadata(store_path_str)
     else:
         run, metadata, avail_members = _resolve_eligible_ensemble_run_and_members(
-            db, model, lead_time_hours, initial_time=initial_time
+            db, model, lead_time_hours, initial_time=initial_time, variable=variable
         )
         assert run.zarr_store_path is not None
         store_path_str = str(run.zarr_store_path)

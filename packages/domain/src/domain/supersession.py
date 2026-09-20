@@ -123,6 +123,38 @@ def is_supersedable(variable: str | None) -> bool:
     return variable.strip() in SUPERSEDABLE_VARIABLES
 
 
+def is_variable_lead_servable(
+    *,
+    member_coverage_ok: bool,
+    aggregate_ready: bool,
+    enabled: bool | None = None,
+) -> bool:
+    """Whether a lead can be served for one variable, from either representation.
+
+    The serving counterpart of :func:`decide_member_reclamation`. The member-coverage floor is
+    the platform's rule for a lead backed by member shards; once a variable's members have been
+    released, the container is the representation and the floor no longer describes anything --
+    the members are gone *by design*, so reading their absence as an outage would turn the
+    migration into an outage.
+
+    The two are alternatives, not a conjunction, and the order matters in only one direction:
+    coverage holding is always enough, because a lead with its members has its data whatever the
+    container says.
+
+    Args:
+        member_coverage_ok: Whatever the caller's coverage rule says -- the lead-level floor for
+            a resolution, the per-cell finite-count rule for a point.
+        aggregate_ready: Whether a readable container for this ``(variable, lead)`` exists.
+        enabled: Override the switch; ``None`` reads it from the module. **This is what keeps the
+            default behaviour identical**: with the switch off no member is ever released, so a
+            coverage failure is still a failure.
+    """
+    if member_coverage_ok:
+        return True
+    active = is_supersession_enabled() if enabled is None else bool(enabled)
+    return bool(active and aggregate_ready)
+
+
 def predecessor_interval_dependent_lead(
     variable: str, lead_time_hours: int, *, max_lead: int | None = None
 ) -> int | None:
@@ -282,6 +314,7 @@ __all__ = [
     "decide_member_reclamation",
     "is_supersedable",
     "is_supersession_enabled",
+    "is_variable_lead_servable",
     "predecessor_interval_dependent_lead",
     "reset_supersession_enabled",
     "same_lead_reader_variables",

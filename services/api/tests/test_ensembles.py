@@ -194,11 +194,13 @@ def test_ensembles_default_omits_members(client):
         "mean",
         "median",
         "spread",
+        "p0.1",
         "p10",
         "p25",
         "p50",
         "p75",
         "p90",
+        "p99.9",
     }
 
 

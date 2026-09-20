@@ -22,6 +22,7 @@ from domain.supersession import (
     decide_member_reclamation,
     is_supersedable,
     is_supersession_enabled,
+    is_variable_lead_servable,
     predecessor_interval_dependent_lead,
     reset_supersession_enabled,
     same_lead_reader_variables,
@@ -315,6 +316,9 @@ def test_a_reader_without_its_own_container_retains_the_members_it_reads() -> No
         enabled=True,
     )
     assert no_readers.authorized is True
+
+
+def test_the_decision_defaults_to_the_configured_switch() -> None:
     """``enabled=None`` reads the module's switch, so a caller need not pass it."""
     assert (
         decide_member_reclamation(
@@ -327,6 +331,60 @@ def test_a_reader_without_its_own_container_retains_the_members_it_reads() -> No
         decide_member_reclamation(
             "temperature_2m", 6, aggregate_evidence_ok=True, committed_leads=(6,)
         ).authorized
+        is True
+    )
+
+
+def test_a_lead_is_servable_from_either_representation() -> None:
+    """The serving counterpart: members and container are alternatives, not a conjunction."""
+    # Coverage holding is always enough, whatever the container says.
+    assert is_variable_lead_servable(member_coverage_ok=True, aggregate_ready=False) is True
+    assert (
+        is_variable_lead_servable(
+            member_coverage_ok=True, aggregate_ready=False, enabled=True
+        )
+        is True
+    )
+    # Coverage failing and a container present: only the switch decides.
+    assert (
+        is_variable_lead_servable(
+            member_coverage_ok=False, aggregate_ready=True, enabled=False
+        )
+        is False
+    )
+    assert (
+        is_variable_lead_servable(
+            member_coverage_ok=False, aggregate_ready=True, enabled=True
+        )
+        is True
+    )
+    # Coverage failing and no container: not servable, switch or no switch.
+    assert (
+        is_variable_lead_servable(
+            member_coverage_ok=False, aggregate_ready=False, enabled=True
+        )
+        is False
+    )
+
+
+def test_the_default_switch_keeps_a_coverage_failure_a_failure() -> None:
+    """With the switch off no member is ever released, so the fallback must not open.
+
+    This is the property that makes the serving change inert before the switch is turned on: a
+    store whose members fall below the floor still reports the lead unservable, exactly as it did
+    before the aggregate path existed.
+    """
+    assert (
+        is_variable_lead_servable(
+            member_coverage_ok=False, aggregate_ready=True, enabled=None
+        )
+        is False
+    )
+    set_supersession_enabled(True)
+    assert (
+        is_variable_lead_servable(
+            member_coverage_ok=False, aggregate_ready=True, enabled=None
+        )
         is True
     )
 

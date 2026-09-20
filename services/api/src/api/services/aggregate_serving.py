@@ -1263,6 +1263,36 @@ def aggregate_can_answer(
     return True
 
 
+def aggregate_answers_for_lead(
+    variable: str, *, store_path: str, lead_time_hours: int
+) -> bool:
+    """Whether a readable container exists for this ``(variable, lead)`` in a store.
+
+    The serving-side evidence check, and the API's own: it opens the container through
+    :class:`~api.core.aggregate_reader.AggregateShardReader` -- the same reader the products come
+    from, so "the probe says yes" and "the read succeeds" cannot disagree -- and applies the same
+    refusals (an unknown encoding, a v1 container, a field count that is not this variable's
+    layout).
+
+    **A probe, not a read.** It fetches the trailer and descriptor and returns; the payload is
+    never touched, which is what makes it affordable on a resolution path that runs per request.
+
+    A caller uses this to decide whether a variable's members are *represented* at a lead -- the
+    case where they have already been released and the coverage floor no longer describes
+    anything. It must not be used to decide anything a product depends on: the products read the
+    container through their own calls and fall through to the members if it is gone.
+    """
+    try:
+        spec_for(variable)
+    except VariableClassError:
+        return False
+    try:
+        geometry = AggregateShardReader(store_path).open(variable, lead_time_hours)
+    except Exception:  # noqa: BLE001 - an unreadable store is "no aggregate", not a failure
+        return False
+    return geometry is not None
+
+
 def try_read_aggregate(attempt: Callable[[], _T | None]) -> _T | None:
     """Run an aggregate read, treating an unreadable store as "no aggregate".
 
@@ -1288,6 +1318,7 @@ __all__ = [
     "STRICT_EXCEEDANCE_OPERATORS",
     "AggregatePointProbability",
     "AggregatePointStatistics",
+    "aggregate_answers_for_lead",
     "aggregate_can_answer",
     "cloud_censoring_at_cell",
     "cloud_censoring_from_aggregate",
