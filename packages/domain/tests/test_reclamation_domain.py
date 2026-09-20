@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 import pytest
 from domain.reclamation import (
     SHARD_SUFFIX,
+    TARGET_KIND_AGG,
+    VALID_TARGET_KINDS,
     IngestionRegionIdentity,
     PhysicalShardTarget,
     _ensure_utc,
@@ -19,6 +21,7 @@ from domain.reclamation import (
     is_predecessor_dependent_lead,
     is_predecessor_variable,
     is_shard_filename,
+    make_aggregate_relative_key,
     make_region_marker_physical_key,
     make_region_marker_relative_key,
     make_shard_filename,
@@ -49,8 +52,40 @@ def test_normalize_member_index():
     assert normalize_member_index("MEAN", 10) == -1
     assert normalize_member_index("mem", 5) == 5
     assert normalize_member_index("MEM", None) == 1
+    # A container is not a member, so its index is the normalized 0 -- the same convention ``det``
+    # uses, and the reason the schema's member_index check admits exactly that pair.
+    assert normalize_member_index("agg") == 0
+    assert normalize_member_index("AGG", 7) == 0
     with pytest.raises(ValueError, match="Unknown target_kind"):
         normalize_member_index("invalid")
+
+
+def test_the_aggregate_kind_is_a_deletion_unit_and_never_a_member_shard():
+    """``agg`` has a key builder and a kind, and the member grammar must keep refusing its key.
+
+    Store-layout detection, the ingestion reader's reassembly and the API reader all identify
+    member shards by the ``shard.<kind>_L####.shard`` grammar. A key that parsed as one would have
+    a reader try to reassemble statistic planes as a member field -- a full field of plausible
+    numbers rather than a failure -- so the three facts below have to hold together.
+    """
+    assert TARGET_KIND_AGG in VALID_TARGET_KINDS
+    key = make_aggregate_relative_key("temperature_2m", 6)
+    assert key == "temperature_2m/shard.agg_L0006.shard"
+    # The same key through the generic builder, which is what the GC planner calls.
+    assert make_shard_relative_key("temperature_2m", TARGET_KIND_AGG, 6) == key
+    assert make_shard_physical_key("s3://store/", "temperature_2m", TARGET_KIND_AGG, 6) == (
+        f"s3://store/{key}"
+    )
+    # And the member grammar still refuses it.
+    assert not is_shard_filename(key)
+    with pytest.raises(ValueError, match="Unrecognized shard filename"):
+        parse_shard_filename(key)
+
+
+def test_the_aggregate_kind_has_no_region_marker():
+    """A marker records an acquired member region; an aggregate is computed, not acquired."""
+    with pytest.raises(ValueError, match="no region marker"):
+        make_region_marker_relative_key(TARGET_KIND_AGG, 6)
 
 
 def test_physical_shard_target_invariants():

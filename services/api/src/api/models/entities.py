@@ -360,12 +360,13 @@ class ReclamationQueue(Base):  # type: ignore[misc]  # declarative_base() is Any
             name="ck_reclamation_queue_status",
         ),
         CheckConstraint(
-            "target_kind IN ('det', 'mean', 'mem')",
+            "target_kind IN ('det', 'mean', 'mem', 'agg')",
             name="ck_reclamation_queue_target_kind",
         ),
         CheckConstraint(
             "(target_kind = 'det' AND member_index = 0) OR "
             "(target_kind = 'mean' AND member_index = -1) OR "
+            "(target_kind = 'agg' AND member_index = 0) OR "
             "(target_kind = 'mem' AND member_index >= 1 AND member_index <= 30)",
             name="ck_reclamation_queue_member_index",
         ),

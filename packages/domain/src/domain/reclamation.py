@@ -19,8 +19,17 @@ from datetime import UTC, datetime
 TARGET_KIND_DET = "det"
 TARGET_KIND_MEAN = "mean"
 TARGET_KIND_MEM = "mem"
+#: The aggregate (statistic) container a variable's members are replaced by.
+#:
+#: It is a **deletion unit** -- the object whose existence authorizes a member's reclamation -- and
+#: deliberately not a member shard. ``parse_shard_filename``/``is_shard_filename`` must keep
+#: rejecting ``shard.agg_L0006.shard``: store-layout detection, the ingestion reader's reassembly
+#: and the API reader all identify member shards by that filename grammar, so a key that parsed as
+#: one would have a reader try to reassemble statistic planes as a member field. The aggregate has
+#: its own key builder (:func:`make_aggregate_relative_key`) for exactly that reason.
+TARGET_KIND_AGG = "agg"
 VALID_TARGET_KINDS: frozenset[str] = frozenset(
-    {TARGET_KIND_DET, TARGET_KIND_MEAN, TARGET_KIND_MEM}
+    {TARGET_KIND_DET, TARGET_KIND_MEAN, TARGET_KIND_MEM, TARGET_KIND_AGG}
 )
 
 #: Reclamation queue statuses.
@@ -59,12 +68,15 @@ def normalize_member_index(target_kind: str, member_index: int | None = None) ->
     - det  -> 0
     - mean -> -1
     - mem  -> 1..30 (defaults to 1 if unspecified)
+    - agg  -> 0 (one container per ``(variable, lead)``: a container is not a member)
     """
     kind = target_kind.lower().strip()
     if kind == TARGET_KIND_DET:
         return 0
     if kind == TARGET_KIND_MEAN:
         return -1
+    if kind == TARGET_KIND_AGG:
+        return 0
     if kind == TARGET_KIND_MEM:
         if member_index is None:
             return 1
@@ -146,13 +158,28 @@ class IngestionRegionIdentity:
         object.__setattr__(self, "member_index", normalized_mem)
 
 
+def make_aggregate_relative_key(variable_code: str, lead_time_hours: int) -> str:
+    """Generate the relative object key for a variable's aggregate container.
+
+    Shaped like a member shard's key because that is what it is: one object per
+    ``(variable, lead)`` holding that variable's statistics. The difference is that
+    :func:`parse_shard_filename` **rejects** it, deliberately -- see
+    :data:`TARGET_KIND_AGG`.
+
+    Examples:
+        make_aggregate_relative_key('temperature_2m', 6)
+        -> 'temperature_2m/shard.agg_L0006.shard'
+    """
+    return f"{variable_code}/shard.{TARGET_KIND_AGG}_L{lead_time_hours:04d}.shard"
+
+
 def make_shard_relative_key(
     variable_code: str,
     target_kind: str,
     lead_time_hours: int,
     member_index: int = 0,
 ) -> str:
-    """Generate the relative object key for a sharded_v1 variable shard.
+    """Generate the relative object key for a stored object of a target kind.
 
     Examples:
         make_shard_relative_key('temperature_2m', 'det', 0)
@@ -161,8 +188,17 @@ def make_shard_relative_key(
         -> 'temperature_2m/shard.mean_L0006.shard'
         make_shard_relative_key('temperature_2m', 'mem', 6, member_index=3)
         -> 'temperature_2m/shard.mem003_L0006.shard'
+        make_shard_relative_key('temperature_2m', 'agg', 6)
+        -> 'temperature_2m/shard.agg_L0006.shard'
+
+    ``agg`` is the one kind this builds whose key :func:`parse_shard_filename` refuses to parse
+    back, and that asymmetry is the point: the aggregate is a deletion unit, not a member shard,
+    so a reader that walks the member grammar must not pick it up. The key template lives here
+    rather than in the ingestion writer for the same reason every other one does.
     """
     kind = target_kind.lower().strip()
+    if kind == TARGET_KIND_AGG:
+        return make_aggregate_relative_key(variable_code, lead_time_hours)
     if kind == TARGET_KIND_DET:
         return f"{variable_code}/shard.det_L{lead_time_hours:04d}.shard"
     if kind == TARGET_KIND_MEAN:
@@ -286,6 +322,11 @@ def make_region_marker_relative_key(
 ) -> str:
     """Generate the relative object key for an ingestion region commit marker.
 
+    ``agg`` has no marker: a region marker records that a *member region was acquired*, and the
+    aggregate is computed from members rather than acquired, so it has nothing to mark. The
+    refusal is explicit rather than inherited from the final ``raise``, so the message says which
+    kind is missing and why rather than "unknown target_kind".
+
     Examples:
         make_region_marker_relative_key('det', 0)
         -> '__commit__/v1/regions/det_L0000.json'
@@ -302,6 +343,11 @@ def make_region_marker_relative_key(
     if kind == TARGET_KIND_MEM:
         mem_idx = normalize_member_index(kind, member_index)
         return f"__commit__/v1/regions/mem{mem_idx:03d}_L{lead_time_hours:04d}.json"
+    if kind == TARGET_KIND_AGG:
+        raise ValueError(
+            "the agg kind has no region marker: a marker records an acquired member region, "
+            "and an aggregate is computed from members rather than acquired"
+        )
     raise ValueError(f"Unknown target_kind: {target_kind!r}")
 
 
