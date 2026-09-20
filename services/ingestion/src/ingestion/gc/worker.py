@@ -39,6 +39,7 @@ from domain.reclamation import (
     get_predecessor_lead,
     make_region_marker_relative_key,
 )
+from domain.supersession import is_supersedable, is_supersession_enabled
 from domain.temporal import (
     get_variable_temporal_metadata,
     is_precipitation_companion,
@@ -59,6 +60,7 @@ from ingestion.core.config import settings
 from ingestion.core.locks import LockTimeoutError, StoreLockCoordinator
 from ingestion.core.markers import read_store_generation
 from ingestion.core.s3 import get_control_s3_fs
+from ingestion.gc.supersession import AggregateEvidenceCache, decide_supersession
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,10 @@ class ReclamationWorkerResult:
     failed_count: int
     markers_cleaned_count: int
     evaluated_at: datetime
+    #: Member units this pass deleted under the aggregate-supersession override: units the
+    #: counterfactual fence held, released because a readable container answers for them. Always
+    #: zero with the supersession switch off, so it is the figure that shows the override at work.
+    supersession_released_count: int = 0
 
 
 def _delete_physical_object(store_path: str, physical_key: str) -> None:
@@ -289,6 +295,11 @@ def run_reclamation_worker_pass(
 
     is_postgres = bool(session.bind and session.bind.dialect.name == "postgresql")
 
+    # Read once for the pass: a store's member units share containers, so the re-check below
+    # probes each ``(store, variable, lead)`` once however many targets name it.
+    evidence_cache = AggregateEvidenceCache()
+    supersession_enabled = is_supersession_enabled()
+
     # 1. Claim batch
     claim_query = (
         select(ReclamationQueueRecord)
@@ -337,6 +348,7 @@ def run_reclamation_worker_pass(
     total_revalidated = 0
     total_failed = 0
     total_markers = 0
+    total_supersession_released = 0
 
     # 2. Process each store under its SHARED store gate
     for store_path, targets in claimed_by_store.items():
@@ -457,6 +469,13 @@ def run_reclamation_worker_pass(
             )
             run_rows = session.execute(runs_stmt).all()
             eligible_runs = {str(r[0]): (_ensure_utc_datetime(r[1]), str(r[2]), str(r[3])) for r in run_rows}
+            # The catalog evidence the supersession re-check reads, from the same rows the
+            # candidate construction below uses: which leads have committed members, and where
+            # each run's objects live.
+            committed_leads_by_run: dict[str, set[int]] = {}
+            store_path_by_run: dict[str, str] = {
+                r_id: triple[2] for r_id, triple in eligible_runs.items()
+            }
 
             prod_rows = session.execute(
                 select(
@@ -498,6 +517,7 @@ def run_reclamation_worker_pass(
                 )
                 rec["product_types"].add(str(p_type))
                 rec["variables"].add(str(var))
+                committed_leads_by_run.setdefault(r_str, set()).add(lead_num)
 
             cands_by_vt: dict[datetime, list[CanonicalCandidate]] = {}
             for (r_str, lead_num), rec in by_rl.items():
@@ -646,11 +666,70 @@ def run_reclamation_worker_pass(
                         # Counterpart not terminal → pair not jointly evaluated yet.
                         deferred_pair_ids.add(target.id)
 
-            # 4. Authorize every target in the store's claimed batch. Each
-            # eligibility decision below (wind-pair atomicity, counterfactual
-            # fence, delete authorization) is still evaluated per target, in
-            # the same order as before; only the physical removal is deferred
-            # to the batched pass that follows.
+            # 4b. Aggregate supersession: the override that lets a canonically *held* member unit be
+            #     deleted anyway, because a stored container answers for it. It is the only thing
+            #     that can override a hold, and it is read here rather than trusted from enqueue
+            #     time: a member unit is enqueued and deleted by different passes, and between them
+            #     the container could be gone or a reader could have appeared that needs these
+            #     members. The members are the only copy, so the evidence is read again -- the same
+            #     reasoning the generation gate applies to the manifest, at the same cost (one tail
+            #     read per ``(variable, lead)`` in the batch).
+            #
+            #     Only units the counterfactual fence holds are candidates. For anything else the
+            #     pre-existing decision stands untouched: a unit the canon does not need is
+            #     deleted because it is not needed, and requiring a container for it would refuse
+            #     every pre-aggregation cycle the platform has.
+            supersession_authorized: set[tuple[str, int, str, str, int]] = set()
+            superseded_candidates = [
+                t
+                for t in targets
+                if t.target_kind == TARGET_KIND_MEM
+                and is_supersedable(t.variable_code)
+                and (
+                    t.run_id,
+                    t.lead_time_hours,
+                    t.variable_code,
+                    t.target_kind,
+                    t.member_index,
+                )
+                in necessary_tuples
+            ]
+            if superseded_candidates:
+                groups = {
+                    (t.run_id, int(t.lead_time_hours), str(t.variable_code))
+                    for t in superseded_candidates
+                }
+                decisions = decide_supersession(
+                    groups,
+                    store_path_by_run=store_path_by_run,
+                    committed_leads_by_run=committed_leads_by_run,
+                    max_lead_by_run={str(r_id): m_max_lead for r_id in eligible_runs},
+                    cache=evidence_cache,
+                    enabled=supersession_enabled,
+                )
+                for t in superseded_candidates:
+                    decision = decisions.get(
+                        (t.run_id, int(t.lead_time_hours), str(t.variable_code))
+                    )
+                    if decision is not None and decision.authorized:
+                        supersession_authorized.add(
+                            (
+                                t.run_id,
+                                t.lead_time_hours,
+                                t.variable_code,
+                                t.target_kind,
+                                t.member_index,
+                            )
+                        )
+                    else:
+                        # The hold stands. Not an error: with the switch off this is every held
+                        # member unit of a supersedable variable, and the hold is the answer.
+                        logger.info(
+                            "Aggregate supersession does not release %s (reason=%s)",
+                            t.id,
+                            decision.reason if decision is not None else "no_store_path",
+                        )
+
             deleted_targets_for_store: list[ReclamationQueueRecord] = []
             authorized_targets: list[ReclamationQueueRecord] = []
             for target in targets:
@@ -669,7 +748,7 @@ def run_reclamation_worker_pass(
                     target.target_kind,
                     target.member_index,
                 )
-                if t_tuple in necessary_tuples:
+                if t_tuple in necessary_tuples and t_tuple not in supersession_authorized:
                     reason = necessary_tuples[t_tuple]
                     logger.info(
                         "Revalidation abort: target %s became required (%s)",
@@ -682,6 +761,13 @@ def run_reclamation_worker_pass(
                     target.updated_at = now_utc
                     total_revalidated += 1
                     continue
+
+                if t_tuple in supersession_authorized:
+                    # The canon holds this unit and a stored container answers for it. Counted
+                    # separately because it is the one deletion path whose authority is the
+                    # aggregate rather than the canonical resolution, and an operator watching the
+                    # switch needs to see how many units went out through it.
+                    total_supersession_released += 1
 
                 # Safe to delete physically
                 if not del_en:
@@ -771,6 +857,7 @@ def run_reclamation_worker_pass(
         failed_count=total_failed,
         markers_cleaned_count=total_markers,
         evaluated_at=now_utc,
+        supersession_released_count=total_supersession_released,
     )
 
 

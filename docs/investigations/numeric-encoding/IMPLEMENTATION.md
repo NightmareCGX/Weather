@@ -290,3 +290,22 @@ python compare_paths.py --quick    # 24 格点
 
 **分歧记录（不做门禁）**：服务路径的相位支持在某个格点上只用"`amount` 有限"的成员，写端还要求四个 flag 有限。到真实数据上 flag 缺失很罕见，且我们只表达"成员支持什么"而不解释，所以按 §19 的分工**如实记录**这个偏差，不改服务路径的门槛。
 
+
+### 19.15 取代判据：聚合如何成为删除授权（**开关默认关闭**）
+
+§19.8 的第（A）条——"成员分片必须成为可回收的物理单元"——在本轮落地为一条**谓词**，而不是一个新的删除器。`domain.supersession` 是纯策略（无 IO），`ingestion/gc/aggregate_evidence.py` 是读证据的那一半，`ingestion/gc/supersession.py` 把两者接起来并缓存，`gc/planner.py` 与 `gc/worker.py` 是仅有的两个消费者。
+
+**删除授权仍然是规范选择（canonical supersession）**。聚合就绪**不能**授权删除一个规范仍然需要的单元——那样会在周期还在服务时把唯一表示删掉。它授权的是**另一件事**：把"规范需要"的判定按**变量**重新解释。规范选择回答"这个 (周期, 时效) 还需不需要服务"，它对整个时效的变量集合给出一个答案；而一个已被容器取代的变量，其成员已经不是服务所需的字节了——容器才是。所以规划器做的是：
+
+* 规范保留的 `(run, lead, variable)` 成员单元，若 `(变量, 时效)` 的容器存在且可读、其**读者**（`field_layout.required_member_variables`，即 `wind_10m` 与四个 flag 的语义）也各有容器、前置窗口已闭合，则从 `held_target_tuples` 移除，转而为**聚合对象本身**在该处占位（`TARGET_KIND_AGG`）；
+* 规范**不**保留的单元：原本就可回收，绕过整个判定（`all_member_units` 与 `held_member_units` 分开正是为此），并要求其容器随之回收——否则"取代"会变成"永久多一个对象"。
+
+**工作器端是同一个谓词的复验，且是唯一的"覆盖保持"路径**。`necessary_tuples`（反事实栅栏）会把这些单元重新判为必需；只有 `supersession_authorized` 里的元组能越过它。这意味着：容器在入队与删除之间消失 → 覆盖不成立 → 行回到 `queued` 并记住 `counterfactual_revalidation_abort`。**打开开关不会让任何"缺失证据"变成删除**，只会在证据成立时多删一类。
+
+**开关与不可逆性。** `ENSEMBLE_AGGREGATE_SUPERSESSION_ENABLED` 默认 false，理由写在 §19.8 第（B）条：终版发布后 staging 已释放，成员只留在 `shard.mem###_L####.shard`，删掉即只能重新 ingest 该周期。这是**产品决策**，不由实现代劳。开关关闭时行为逐元素不变（有一个测试专门钉住"关闭时成员单元集合不变"），但容器仍会被跟踪——容器的可回收性与"是否释放成员"无关，它是被平台写入的物理对象，不该比它取代的成员活得更久。
+
+**代价（实测）。** 谓词对每个 `(run, lead, variable)` 读一次容器**尾部**：先取最后 52 字节（`TAIL_PROBE_BYTES`）拿到 trailer 与描述符，`num_chunks` 决定索引长度，需要时再取一次 `container_tail_size(num_chunks)` 字节。`StoreIO.read_range` 为此新增（三种后端同语义：负 `start` 无 `end` 即取对象末尾 N 字节）。真实 11.5 MB 容器上本地实测 **0.33 ms/次**（整对象读是 2.61 ms），一次遍历整个周期的 14 变量 × 81 时效为 **0.05 s**；缓存按 `(store, 变量, 时效)` 去重，因为一个周期的变量共享输入（四个 flag 都读同一个降水容器）。
+
+**本轮的验证**：Windows 全量 926 passed / 29 skipped；Linux `python:3.12-slim` 容器 ruff + mypy 干净、全量通过；`packages/domain` 704 passed 且 100% 覆盖率门槛达成。新增测试 29 条，分三层：`domain/tests/test_supersession.py`（策略与派生关系）、`tests/test_gc_aggregate_evidence.py`（探针拒绝的每一种容器缺陷）、`tests/test_gc_planner_supersession.py` 与 `tests/test_gc_worker_supersession.py`（规划器的持有/释放与工作器的覆盖/复验）。
+
+**尚未接入的部分**（按计划顺序）：前置变量的 L+3 延迟已在 `domain.supersession.predecessor_interval_dependent_lead` 中实现并被规划器与工作器使用（`max_lead` 处理"L 是本周期最后一个依赖它的时效"），但**没有**接入 §19.8(C) 的写端删除路径——那需要阶段 5 的逐类切换；staging 孤儿清理（§19.8 C 第一条）同样未做。

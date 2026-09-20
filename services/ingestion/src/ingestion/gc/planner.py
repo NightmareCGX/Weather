@@ -35,11 +35,16 @@ from domain.horizon import is_canonical_lead_horizon_registered, model_max_lead_
 from domain.reclamation import (
     PhysicalShardTarget,
     PREDECESSOR_VARIABLES,
+    TARGET_KIND_AGG,
     TARGET_KIND_DET,
     TARGET_KIND_MEAN,
     TARGET_KIND_MEM,
     get_predecessor_lead,
     make_shard_relative_key,
+)
+from domain.supersession import (
+    is_supersession_enabled,
+    same_lead_reader_variables,
 )
 from domain.temporal import (
     get_variable_temporal_metadata,
@@ -48,6 +53,7 @@ from domain.temporal import (
     model_serving_start_valid_time,
     requires_lead0_display_fallback,
 )
+from domain.variable_class import DERIVED_VARIABLES
 from ingestion.core.catalog import (
     EnsembleMemberProductRecord,
     ForecastCycleLifecycleRecord,
@@ -59,6 +65,7 @@ from ingestion.core.catalog import (
     _utcnow,
 )
 from ingestion.core.markers import read_store_generation
+from ingestion.gc.supersession import AggregateEvidenceCache, decide_supersession
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +88,15 @@ class ReclamationPlanResult:
     #: underivable. Reported rather than raised so one unregistered model cannot
     #: stop reclamation for the rest.
     skipped_models: tuple[str, ...] = ()
+    #: Member units this pass stopped retaining because a stored aggregate replaced them. Zero
+    #: with the supersession switch off, and zero for every unit the switch alone was blocking --
+    #: this counts deletions authorized, not deletions recognized as possible.
+    superseded_member_units: int = 0
+    #: Aggregate containers that entered the reclamation chain because the member units they
+    #: replaced left the serving window. Recorded whether or not the supersession switch is on:
+    #: a container is a physical unit of its variable, so it is reclaimable with the rest of the
+    #: cycle rather than outliving every member it replaced.
+    aggregate_units_enqueued: int = 0
 
 
 def enumerate_committed_unit_tuples(
@@ -183,7 +199,14 @@ def plan_reclamation_pass(
     total_held = 0
     total_reclaimable = 0
     total_enqueued = 0
+    total_superseded_members = 0
+    total_aggregate_units = 0
     skipped_models: list[str] = []
+    #: One evidence cache for the whole pass. A cycle's variables share their containers --
+    #: ``precipitation_amount_3h`` and each of the four flags ask about the same ones -- so the
+    #: cache is what keeps the pass at one tail read per ``(store, variable, lead)``.
+    evidence_cache = AggregateEvidenceCache()
+    supersession_enabled = is_supersession_enabled()
 
     # 1. Pre-query lifecycle records for whole-cycle fences
     lc_rows = session.execute(select(ForecastCycleLifecycleRecord)).scalars().all()
@@ -415,6 +438,18 @@ def plan_reclamation_pass(
         if "wind_u_10m" in distinct_vars and "wind_v_10m" in distinct_vars:
             distinct_vars.append("wind_10m")
 
+        # Per-model maps the supersession decision needs: where each run's objects live, which of
+        # its leads have committed members, and how far its horizon reaches. Built here rather
+        # than passed in, because only the planner knows which runs survived the tombstone and
+        # claim filters above.
+        store_path_by_run: dict[str, str] = {
+            r_id: str(meta["store_path"]) for r_id, meta in runs_by_id.items()
+        }
+        max_lead_by_run: dict[str, int] = {
+            r_id: model_max_lead_hours(m_id, version_string=str(meta["version_string"]))
+            for r_id, meta in runs_by_id.items()
+        }
+
         # Active canonical held targets:
         held_target_tuples: set[tuple[str, int, str, str, int]] = set()
 
@@ -565,6 +600,131 @@ def plan_reclamation_pass(
                             (src_cand.run_id, src_cand.lead_time_hours, w_comp, TARGET_KIND_DET, 0)
                         )
 
+        # 8b. Aggregate supersession. A member set the canonical resolution retains may still be
+        #     removable, because a stored aggregate answers everything those members served. The
+        #     deletion authority does not change -- the canonical resolution above is still the
+        #     only thing that says a unit is unnecessary -- but it decides per variable now: a
+        #     variable whose container is present and readable is represented by that container
+        #     instead of by its members.
+        #
+        #     **A container's fate is its members' fate.** It is a physical unit of the same
+        #     variable, it is not in the catalog's product rows, and nothing downstream of here
+        #     knows it exists -- so it is tracked here, and held exactly where the member units it
+        #     replaced stand: retained while the canon selects the variable, reclaimable when it
+        #     does not. Enqueueing it whenever it is seen would delete the only remaining
+        #     representation of a variable the cycle is still serving.
+        #
+        #     Off unless enabled: the members exist nowhere else once the staging area is released,
+        #     so releasing them is not reversible from the store. With the switch off, containers
+        #     are still tracked (a container whose members are already reclaimable has to be
+        #     reclaimable too, or it would outlive every member it replaced) and no member shard is
+        #     ever released.
+        held_member_units: dict[tuple[str, int, str], list[int]] = {}
+        superseded_units = 0
+        if is_ensemble:
+            # Every committed member group, from the physical inventory built above -- not only the
+            # held ones: a group whose valid time has left the window has reclaimable members, and
+            # its container has to follow them out.
+            all_member_units: dict[tuple[str, int, str], list[int]] = {}
+            for shard in all_shards_for_model:
+                if shard.target_kind == TARGET_KIND_MEM:
+                    all_member_units.setdefault(
+                        (shard.run_id, shard.lead_time_hours, shard.variable_code), []
+                    ).append(shard.member_index)
+            for r_str, lead_num, v_code, kind, mem in held_target_tuples:
+                if kind == TARGET_KIND_MEM:
+                    held_member_units.setdefault((r_str, lead_num, v_code), []).append(mem)
+
+            decisions = decide_supersession(
+                all_member_units,
+                store_path_by_run=store_path_by_run,
+                committed_leads_by_run=committed_leads_by_run,
+                max_lead_by_run=max_lead_by_run,
+                cache=evidence_cache,
+                enabled=supersession_enabled,
+            )
+            #: ``(run, lead, variable)`` container -> whether it is held. Held means the
+            #: reconciliation below retains it; absent from the set means the container is not in
+            #: the inventory at all, which is what every store looked like before this step.
+            containers: dict[tuple[str, int, str], bool] = {}
+            for group_key, decision in decisions.items():
+                if not decision.evidence_ok:
+                    # No readable container, so the members are the only representation and
+                    # nothing is handed over. Reported at warning because the classification says
+                    # this variable has a container: its absence means the switch would have
+                    # deleted members that nothing replaces.
+                    logger.warning(
+                        "aggregate supersession declined for %s lead %d: %s",
+                        group_key[2],
+                        group_key[1],
+                        decision.reason,
+                    )
+                    continue
+                held_here = held_member_units.get(group_key)
+                if held_here is None:
+                    # The canon does not select this variable at this lead, so its members are
+                    # already reclaimable -- and the container, being the same data, goes with
+                    # them rather than being left as an object nothing ever reclaims.
+                    containers[group_key] = False
+                    continue
+                containers[group_key] = True
+                if not decision.authorized:
+                    # The container is the live representation either way, so it is held -- and
+                    # the members beside it are retained as they were.
+                    logger.info(
+                        "aggregate supersession withheld for %s lead %d: %s",
+                        group_key[2],
+                        group_key[1],
+                        decision.reason,
+                    )
+                    continue
+                # Every member unit of the variable goes; the container replaces the whole set, not
+                # part of it. Partial removal would leave a member set that is neither the
+                # ensemble's nor the container's.
+                r_str, lead_num, v_code = group_key
+                for member in held_here:
+                    held_target_tuples.discard(
+                        (r_str, lead_num, v_code, TARGET_KIND_MEM, member)
+                    )
+                superseded_units += len(held_here)
+
+            # A **derived** variable's container follows the containers of the members it reads.
+            # It has no member shards of its own -- the platform serves it from other variables'
+            # members -- so no decision above names it, yet its container is the only
+            # representation of that variable. Its container is known to exist: the reader check
+            # in the decision that superseded its inputs required it.
+            for r_str, lead_num, base_variable in sorted(containers):
+                for reader in same_lead_reader_variables(base_variable):
+                    if reader in DERIVED_VARIABLES:
+                        containers.setdefault((r_str, lead_num, reader), containers[
+                            (r_str, lead_num, base_variable)
+                        ])
+
+            for (r_str, lead_num, v_code), is_held in sorted(containers.items()):
+                owner = runs_by_id.get(r_str)
+                if owner is None:
+                    continue
+                if is_held:
+                    held_target_tuples.add((r_str, lead_num, v_code, TARGET_KIND_AGG, 0))
+                # The container joins the physical inventory, so the reconciliation below holds it
+                # exactly where the member units it replaced stood. It is not in
+                # ``all_shards_for_model``, which is built from the catalog's product rows and
+                # knows nothing about containers.
+                all_shards_for_model.append(
+                    PhysicalShardTarget(
+                        run_id=r_str,
+                        model_id=m_id,
+                        cycle_time=owner["cycle_time"],
+                        lead_time_hours=lead_num,
+                        variable_code=v_code,
+                        target_kind=TARGET_KIND_AGG,
+                        member_index=0,
+                        valid_time=owner["cycle_time"] + timedelta(hours=lead_num),
+                        store_path=owner["store_path"],
+                        physical_key=make_shard_relative_key(v_code, TARGET_KIND_AGG, lead_num),
+                    )
+                )
+
         # 9. Reconcile all physical shards against held targets
         dedup_shards = {s.target_tuple: s for s in all_shards_for_model}
         for t_tuple, shard_target in dedup_shards.items():
@@ -573,9 +733,13 @@ def plan_reclamation_pass(
                 total_held += 1
             else:
                 total_reclaimable += 1
+                if shard_target.target_kind == TARGET_KIND_AGG and t_tuple not in existing_queue_targets:
+                    total_aggregate_units += 1
                 # Check if already in queue
                 if t_tuple not in existing_queue_targets:
                     all_would_enqueue.append(shard_target)
+
+        total_superseded_members += superseded_units
 
         # 10. Claimed (retired) runs: every committed unit is directly reclaimable.
         if retired_run_ids:
@@ -617,6 +781,47 @@ def plan_reclamation_pass(
                         valid_time=c_utc_opt + timedelta(hours=lead_num),
                         store_path=store_path,
                         physical_key=make_shard_relative_key(v_code, kind, lead_num, mem),
+                    )
+                )
+
+            # The containers of a retired cycle go with it. A claimed cycle's units are all
+            # reclaimable, so member shards are deleted here without any supersession decision --
+            # and a container left behind would be an object nothing ever reclaims, because the
+            # tombstone path enumerates catalog units and a container is not one.
+            retired_groups = {
+                (r_str, lead_num, v_code)
+                for r_str, lead_num, v_code, _kind, _mem in retired_units
+            }
+            for group_key in sorted(retired_groups):
+                r_str, lead_num, v_code = group_key
+                store_path = store_by_run.get(r_str, "")
+                c_utc_opt = cycle_by_run.get(r_str)
+                if not store_path or c_utc_opt is None:
+                    continue
+                container_key = (r_str, lead_num, v_code, TARGET_KIND_AGG, 0)
+                if container_key in existing_queue_targets:
+                    continue
+                if not evidence_cache.readable(store_path, v_code, lead_num):
+                    # No container for this variable and lead: nothing to reclaim here. Not a
+                    # warning, because a retired cycle is being torn down wholesale and the
+                    # absence of one representation is the normal state of a partially-aggregated
+                    # store.
+                    continue
+                total_aggregate_units += 1
+                all_would_enqueue.append(
+                    PhysicalShardTarget(
+                        run_id=r_str,
+                        model_id=m_id,
+                        cycle_time=c_utc,
+                        lead_time_hours=lead_num,
+                        variable_code=v_code,
+                        target_kind=TARGET_KIND_AGG,
+                        member_index=0,
+                        valid_time=c_utc_opt + timedelta(hours=lead_num),
+                        store_path=store_path,
+                        physical_key=make_shard_relative_key(
+                            v_code, TARGET_KIND_AGG, lead_num
+                        ),
                     )
                 )
 
@@ -694,4 +899,6 @@ def plan_reclamation_pass(
         enqueued_count=total_enqueued if not dry_run else len(all_would_enqueue),
         would_enqueue=tuple(all_would_enqueue),
         skipped_models=tuple(sorted(skipped_models)),
+        superseded_member_units=total_superseded_members,
+        aggregate_units_enqueued=total_aggregate_units,
     )
