@@ -32,6 +32,8 @@ from domain.models.precipitation import (
 from domain.models.wind import CARDINAL_DIRECTIONS_8, compute_wind_rose
 from domain.product_fields import (
     _INTERVAL_CODES,
+    _SIGNATURE_DTYPE,
+    _UNUSABLE_SIGNATURE,
     FLAG_NAMES,
     ROSE_BUCKETS,
     ROSE_SECTORS,
@@ -131,15 +133,30 @@ def test_phase_support_reports_no_predecessor_as_unobserved() -> None:
     assert np.isnan(without[6:]).all()
 
 
-def test_a_cell_with_one_missing_flag_is_unobserved() -> None:
-    """The classifier reads all four flags, so a cell missing one has no phase at all."""
+def test_a_cell_where_one_member_misses_a_flag_still_reports_the_rest() -> None:
+    """One member's gap is a gap in that member's classification, not in the cell's.
+
+    The uniform missing-member rule: the fractions divide by the members the cell could classify.
+    Dividing by the member set instead would report a cell with one unusable member as 29/30 rain
+    rather than as rain, which is a claim about a member nobody classified. A cell where *no*
+    member is classifiable is NaN rather than a zero.
+    """
     amounts, flags = _members(seed=4)
     flags[2, 5, 1, 2] = np.nan
     fields = phase_support_fields(amounts, flags)
-    # The current planes are unobserved at that cell, and so is the absence of a predecessor at
-    # every cell -- the two are different reasons and both are NaN.
-    assert np.isnan(fields[:6, 1, 2]).all()
+    assert np.isfinite(fields[:6, 1, 2]).all()
+    assert fields[:6, 1, 2].sum() == pytest.approx(1.0, abs=1e-6)
+    # The absent predecessor is a different statement and stays absent at every cell.
     assert np.isnan(fields[6:, 1, 2]).all()
+    assert np.isfinite(fields[:6, 0, 0]).all()
+
+
+def test_a_cell_no_member_can_be_classified_at_is_absent() -> None:
+    """NaN, not zero: no member had a phase, so the cell has not made a claim about one."""
+    amounts, flags = _members(seed=6)
+    flags[:, :, 1, 3] = np.nan
+    fields = phase_support_fields(amounts, flags)
+    assert np.isnan(fields[:, 1, 3]).all()
     assert np.isfinite(fields[:6, 0, 0]).all()
 
 
@@ -711,6 +728,48 @@ def test_a_streamed_builder_refuses_malformed_input_and_finishes_nothing_empty()
         builder.add_member(amounts=amounts[0, :1], flags=flags[:, 0, :1])
 
 
+def test_a_streamed_builder_refuses_more_members_than_it_was_told_to_expect() -> None:
+    """The record of which member set the fields describe is checked, not merely carried.
+
+    A caller that configured the builder for 30 members and then fed it 31 has a bookkeeping
+    error, and the fields would be published as a statistic of a set the caller named differently.
+    """
+    amounts, flags = _members(seed=36)
+    builder = PrecipitationGroupBuilder(expected_members=2)
+    for member in range(3):
+        builder.add_member(amounts=amounts[member], flags=flags[:, member])
+    with pytest.raises(AggregateError, match="told to expect"):
+        builder.finish()
+
+
+def test_a_streamed_builder_divides_by_the_members_each_cell_could_classify() -> None:
+    """The masked denominator, checked against the batched path where a member is missing.
+
+    A gap in one member at one cell must not erase that cell: the cell reports the phases of the
+    members that had a value. And a member-cell outside the denominator must not be *summed*
+    either -- its amount is non-finite, so the classifier reads it as dry, which would otherwise
+    inflate another cell's fraction above one.
+    """
+    amounts, flags = _members(seed=37)
+    amounts[4, 1, 2] = np.nan
+    flags[3, 7, 0, 1] = np.nan
+    extra = {name: flags[i] for i, name in enumerate(FLAG_NAMES)}
+    batched = variable_group_fields(
+        "precipitation_amount_3h", members=amounts, extra_members=extra
+    )
+    builder = PrecipitationGroupBuilder(expected_members=N_MEMBERS)
+    for member in range(N_MEMBERS):
+        builder.add_member(
+            amounts=amounts[member],
+            flags=np.stack([flags[i][member] for i in range(len(FLAG_NAMES))]),
+        )
+    streamed = builder.finish()
+    assert np.array_equal(streamed, batched, equal_nan=True)
+    # The cell one member is missing from still reports a full phase distribution.
+    assert streamed[:6, 1, 2].sum() == pytest.approx(1.0, abs=1e-6)
+    assert np.isfinite(streamed[:6, 1, 2]).all()
+
+
 def test_a_signature_fits_the_dtype_the_builder_stores_it_in() -> None:
     """A wrapped signature would resolve a different table entry, not fail.
 
@@ -737,3 +796,6 @@ def test_a_signature_fits_the_dtype_the_builder_stores_it_in() -> None:
     # widest case and nothing else can exceed it.
     assert widest == (_INTERVAL_CODES - 1) * (_INTERVAL_CODES + 1) + (_INTERVAL_CODES - 1)
     assert widest <= np.iinfo(np.int16).max
+    # The reserved "cannot classify" code must be above every reachable signature, or a real
+    # member-cell would be mistaken for an unusable one and silently dropped from the sums.
+    assert widest < _UNUSABLE_SIGNATURE <= np.iinfo(_SIGNATURE_DTYPE).max

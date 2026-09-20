@@ -34,7 +34,7 @@ asserted to be injective with respect to the classifier's inputs in the tests.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -128,22 +128,48 @@ def _check_single_flag_planes(
         )
 
 
-def _fully_observed(
-    amounts: npt.NDArray[np.floating], flags: npt.NDArray[np.floating]
+def _usable_members(
+    amounts: npt.NDArray[np.floating],
+    flags: npt.NDArray[np.floating],
+    previous: npt.NDArray[np.floating] | None = None,
+    previous_flags: npt.NDArray[np.floating] | None = None,
 ) -> npt.NDArray[np.bool_]:
-    """Cells where every member has both an amount and all four flags.
+    """Member-cells the classifier can read: a finite amount and all four finite flags.
 
-    A cell with one missing flag is not partially classifiable: the classifier reads all four, so
-    a cell missing any of them has no phase at all. Reporting NaN there keeps a product field
-    over the same member set as the distribution beside it.
+    The phases and the transitions divide by the members each cell could classify, not by the
+    member set. That is the platform's uniform missing-member rule -- skip the non-finite members,
+    never let one member's gap erase a cell the others describe -- and the serving path already
+    works that way: it hands its phase aggregate the members with a finite amount and divides by
+    that count.
+
+    It is also what makes the streamed and batched builders agree. The streaming builder is handed
+    one member at a time and only learns a cell's usable count once the last member has been
+    added, so a builder dividing by the member count would disagree with the batched path at every
+    cell with a gap -- and the two are compared field for field by the acceptance test that admits
+    the aggregate encoding.
+
+    Args:
+        amounts: ``(n_members, lat, lon)`` the interval's amount.
+        flags: ``(4, n_members, lat, lon)`` the interval's flags.
+        previous: Predecessor amounts, when the group being built reads them. A member without a
+            finite predecessor cannot be classified into a transition, so it does not join that
+            cell's denominator either.
+        previous_flags: Predecessor flags, supplied together with ``previous``.
+
+    Raises:
+        AggregateError: if the flag stacks are not the four named planes shaped like the amounts.
     """
     _check_flag_stack(flags, amounts)
-    # ``flags`` is (4, n_members, lat, lon), so finiteness over members and flags means reducing
-    # both of its leading axes -- expressed as a reshape because numpy rejects a duplicate axis.
-    flag_finite = np.isfinite(flags).reshape(
-        len(FLAG_NAMES) * flags.shape[1], *flags.shape[2:]
-    )
-    return np.isfinite(amounts).all(axis=_MEMBER_AXIS) & flag_finite.all(axis=0)
+    usable = np.isfinite(amounts)
+    for index in range(len(FLAG_NAMES)):
+        usable &= np.isfinite(flags[index])
+    if previous is not None:
+        assert previous_flags is not None
+        _check_flag_stack(previous_flags, previous)
+        usable &= np.isfinite(previous)
+        for index in range(len(FLAG_NAMES)):
+            usable &= np.isfinite(previous_flags[index])
+    return usable
 
 
 def _fraction_of(
@@ -249,14 +275,20 @@ def _phase_signature(
 _DRY_CODE = 0
 _WET_CODE_BASE = 1
 
+#: Signature reserved for a member-cell this group cannot classify, so it can be folded into the
+#: accumulation's own index space instead of masked out of the sum. A transition signature is at
+#: most ``(_INTERVAL_CODES - 1) * (_INTERVAL_CODES + 1) + (_INTERVAL_CODES - 1)`` = 304, so 1023
+#: is unreachable and staying inside int16 keeps the planes 62 MB each rather than 250 MB.
+_UNUSABLE_SIGNATURE: int = 1023
+
 #: The stored dtype of a signature plane, chosen because the streaming builder holds one per
 #: member per group and that is its whole residency. A transition signature is
 #: ``current * (_INTERVAL_CODES + 1) + predecessor`` with each side in ``0.._INTERVAL_CODES - 1``,
 #: so the widest value is 304 -- well inside int16 -- while three such stacks at 721x1440 for
 #: thirty members are 62 MB each in int16 against 250 MB each in int64. Measured: the builder
-#: holds 230 MB after thirty members, against 790 MB before this cast. The bound is asserted by
-#: a test rather than assumed, because a wrap would resolve the wrong table entry and produce a
-#: plausible field instead of a failure.
+#: holds 292 MB after thirty members. The bound is asserted by a test rather than assumed, because
+#: a wrap would resolve the wrong table entry and produce a plausible field instead of a failure,
+#: and the test also pins that the reserved code is above every reachable signature.
 _SIGNATURE_DTYPE: npt.DTypeLike = np.int16
 
 
@@ -345,30 +377,15 @@ def _transition_for_signature(signature: int) -> tuple[float, ...]:
     return _one_hot(_TRANSITIONS.index(state.transition), len(_TRANSITIONS))
 
 
-def _resolve_table(
-    signature: npt.NDArray[np.int64], resolve: Callable[[int], tuple[float, ...]]
-) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.float32]]:
-    """Collapse a signature array to per-code table indices and the table itself.
-
-    Each *distinct* signature is resolved once, which is where the scalar classifier is called --
-    at most 306 times for the transition group, against 30 x lat x lon member-cells.
-    """
-    codes, inverse = np.unique(signature, return_inverse=True)
-    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float32)
-    return inverse.reshape(signature.shape), table
-
-
 def _accumulate_planes(
     accumulator: npt.NDArray[np.float32],
     value_planes: npt.NDArray[np.float32],
 ) -> None:
     """Add one member's value planes, ``(lat, lon, n_outputs)``, into the accumulator in place.
 
-    In place so a caller looping over members holds only one member's planes at a time.
-
-    No observability mask is needed: the resolved values are finite by construction -- a signature
-    names *which* case a member-cell is in, and every case has a definite value vector -- so a cell
-    the caller wants excluded contributes a number that :func:`_finish_fractions` then discards.
+    In place so a caller looping over members holds only one member's planes at a time. Member-cells
+    this group's denominator does not count have already been folded into the zero row by the
+    caller, so there is nothing to mask here.
     """
     accumulator += value_planes
 
@@ -376,36 +393,36 @@ def _accumulate_planes(
 def _finish_fractions(
     accumulator: npt.NDArray[np.float32],
     counts: npt.NDArray[np.int64],
-    observable: npt.NDArray[np.bool_],
 ) -> npt.NDArray[np.float32]:
-    """Turn per-cell member counts into fractions, and mark unobservable cells absent."""
+    """Turn per-cell member counts into fractions.
+
+    A cell whose count is zero reports NaN rather than zero: zero is a claim about the phases, and
+    a cell no member described has not made one.
+    """
     denominator = np.maximum(counts, 1).astype(np.float32)[:, :, None]
     out = (accumulator / denominator).transpose(2, 0, 1)
-    return np.where(observable[None, :, :], out, np.float32(np.nan))
+    return np.where(counts > 0, out, np.float32(np.nan))
 
 
 def _accumulate_by_signature(
     signature: npt.NDArray[np.int64],
-    observable: npt.NDArray[np.bool_],
-    counts: npt.NDArray[np.int64],
+    usable: npt.NDArray[np.bool_],
     *,
     n_outputs: int,
     resolve: Callable[[int], tuple[float, ...]],
 ) -> npt.NDArray[np.float32]:
     """Accumulate a per-signature value vector into per-cell fractions, one member at a time.
 
-    The gathered alternative -- materialising ``(n_members, lat, lon, n_outputs)`` to sum over the
-    member axis -- is 3.0 GB for the phase group and 5.0 GB for the transition group at 721x1440,
-    which is not a shape the container can take; it works on the test grids and would fail on the
-    first real lead.
+    A thin wrapper over :func:`_accumulate_signatures`, which owns the arithmetic, so the batched
+    and streamed paths cannot diverge: the batched caller hands over a whole stack and the streamed
+    one the planes it collected. The gathered alternative to both -- materialising
+    ``(n_members, lat, lon, n_outputs)`` to sum over the member axis -- is 3.0 GB for the phase
+    group and 5.0 GB for the transition group at 721x1440, which is not a shape the container can
+    take; it works on the test grids and would fail on the first real lead.
     """
-    per_member, table = _resolve_table(signature, resolve)
-    accumulator = np.zeros((*signature.shape[1:], n_outputs), dtype=np.float32)
-    for member in range(signature.shape[0]):
-        # ``table[per_member[member]]`` gathers to ``(lat, lon, n_outputs)``, which is the
-        # accumulator's own shape; the gather is over at most 306 rows per member.
-        _accumulate_planes(accumulator, table[per_member[member]])
-    return _finish_fractions(accumulator, counts, observable)
+    return _accumulate_signatures(
+        list(signature), list(usable), n_outputs=n_outputs, resolve=resolve
+    )
 
 
 def phase_support_fields(
@@ -436,22 +453,22 @@ def phase_support_fields(
         ``(12, lat, lon)``: the six current phases then the six predecessor phases, in
         :class:`PhysicalPhase` order, as fractions of the member set.
 
-    A cell where any member is non-finite in amount or flags is NaN, matching the distribution
-    beside it: describing a different member set than the distribution would be worse than
-    describing none.
+    The fractions divide by the members each cell could classify -- a finite amount and all four
+    finite flags -- not by the member set. One member's gap at one cell is a gap in that cell's
+    classification and nothing more, and a cell no member could classify is NaN rather than a
+    zero that would read as a definite phase. That is the platform's uniform missing-member rule
+    and what the serving path's own phase aggregate does, and it is what lets the streamed
+    builder (:class:`PrecipitationGroupBuilder`) reproduce these fields exactly.
     """
-    counts = _counts_per_cell(amounts)
-    observable = _fully_observed(amounts, flags)
+    _check_flag_stack(flags, amounts)
     if (amounts_prev is None) != (flags_prev is None):
         raise AggregateError(
             "a predecessor interval needs both its amounts and its flags, or neither"
         )
-    if flags_prev is not None and amounts_prev is not None:
-        _check_flag_stack(flags_prev, amounts_prev)
+    usable = _usable_members(amounts, flags)
     current = _accumulate_by_signature(
         _phase_signature(amounts, flags),
-        observable,
-        counts,
+        usable,
         n_outputs=len(_PHASES),
         resolve=_weights_for_signature,
     )
@@ -460,8 +477,7 @@ def phase_support_fields(
     else:
         previous = _accumulate_by_signature(
             _phase_signature(amounts_prev, flags_prev),
-            observable,
-            counts,
+            _usable_members(amounts_prev, flags_prev),
             n_outputs=len(_PHASES),
             resolve=_weights_for_signature,
         )
@@ -486,20 +502,19 @@ def transition_fields(
 
     Returns:
         ``(20, lat, lon)`` frequencies in :class:`PrecipitationTransition` order.
+
+    The denominator is the members each cell could classify into a transition -- as
+    :func:`phase_support_fields`, and additionally requiring a finite predecessor when one is
+    supplied, since a member without a predecessor has no transition to count.
     """
-    counts = _counts_per_cell(amounts)
-    observable = _fully_observed(amounts, flags)
+    _check_flag_stack(flags, amounts)
     if (amounts_prev is None) != (flags_prev is None):
         raise AggregateError(
             "a predecessor interval needs both its amounts and its flags, or neither"
         )
-    if amounts_prev is not None and flags_prev is not None:
-        _check_flag_stack(flags_prev, amounts_prev)
-        observable = observable & np.isfinite(amounts_prev).all(axis=_MEMBER_AXIS)
     return _accumulate_by_signature(
         _transition_signature(amounts, flags, amounts_prev, flags_prev),
-        observable,
-        counts,
+        _usable_members(amounts, flags, amounts_prev, flags_prev),
         n_outputs=len(_TRANSITIONS),
         resolve=_transition_for_signature,
     )
@@ -1041,9 +1056,10 @@ class PrecipitationGroupBuilder:
     dimension.
 
     Args:
-        expected_members: How many members the interval's own count divides by, so a cell's
-            fractions describe the member set rather than the subset added so far. Defaults to
-            the number actually added, which is right only when the set is complete.
+        expected_members: The member set the fields describe, used to refuse a builder fed more
+            members than it was told to expect. The fractions divide by the members each cell
+            could classify, which is the only denominator a streaming caller can know and the
+            one the batched path uses -- see :meth:`finish`.
         with_transitions: Whether to accumulate the transition group as well. Both come from the
             same signature, so a caller wanting only the phase group still pays for the flags but
             not for the second accumulator.
@@ -1059,7 +1075,13 @@ class PrecipitationGroupBuilder:
         self._phase_signatures: list[npt.NDArray[np.int64]] = []
         self._previous_signatures: list[npt.NDArray[np.int64]] = []
         self._transition_signatures: list[npt.NDArray[np.int64]] = []
-        self._observable: npt.NDArray[np.bool_] | None = None
+        #: Per member, the member-cells each group's denominator counts. Kept as masks rather than
+        #: running counts because a member-cell outside the mask must not be summed either --
+        #: a non-finite input still resolves to a definite value vector ("dry"), so counting it in
+        #: the denominator of one cell and adding it in the numerator of another would be worse
+        #: than either.
+        self._phase_masks: list[npt.NDArray[np.bool_]] = []
+        self._previous_masks: list[npt.NDArray[np.bool_]] = []
         self._any_predecessor = False
 
     @property
@@ -1096,7 +1118,6 @@ class PrecipitationGroupBuilder:
             _check_single_flag_planes(flags_prev, amounts_prev.shape)
         if self._shape is None:
             self._shape = amounts.shape
-            self._observable = np.isfinite(amounts)
         elif amounts.shape != self._shape:
             raise AggregateError(
                 f"member planes have shape {amounts.shape}, expected {self._shape}"
@@ -1105,7 +1126,7 @@ class PrecipitationGroupBuilder:
         # The same signature helpers the batched path uses, applied to a one-member stack, so
         # the two cannot disagree about what a member's case is -- which is what makes the
         # streaming and batched results identical rather than merely close. Stored narrow: a
-        # signature is at most 323 and the builder holds three of these stacks, one per member.
+        # signature is at most 304 and the builder holds three of these stacks, one per member.
         self._phase_signatures.append(
             _phase_signature(amounts[None], flags[:, None])[0].astype(_SIGNATURE_DTYPE)
         )
@@ -1118,45 +1139,59 @@ class PrecipitationGroupBuilder:
                     None if flags_prev is None else flags_prev[:, None],
                 )[0].astype(_SIGNATURE_DTYPE)
             )
+        # The masks are the members each cell could classify: taken from the same helper the
+        # batched path calls, on a one-member stack, so the two builders cannot disagree about
+        # which member-cells count. The phase group needs the interval's own amount and flags; the
+        # transition group additionally needs the predecessor's, since a member with no
+        # predecessor has no transition to count -- that conjunction is formed at ``finish`` time
+        # from these two rather than stored as a third 31 MB set.
+        self._phase_masks.append(_usable_members(amounts[None], flags[:, None])[0])
         if amounts_prev is not None and flags_prev is not None:
-            # A cell is reportable only if the whole interval -- current and predecessor -- is
-            # finite, which is the condition the serving path applies when it reads both.
-            assert self._observable is not None
-            self._observable &= np.isfinite(amounts_prev)
             self._previous_signatures.append(
                 _phase_signature(amounts_prev[None], flags_prev[:, None])[0].astype(
                     _SIGNATURE_DTYPE
                 )
             )
+            self._previous_masks.append(
+                _usable_members(amounts_prev[None], flags_prev[:, None])[0]
+            )
             self._any_predecessor = True
         else:
             # A member with no predecessor still needs a placeholder so the per-member loop stays
-            # aligned with the others; it contributes nothing because the planes are unobserved.
+            # aligned with the others; it contributes nothing because its mask is all false.
             self._previous_signatures.append(
                 np.zeros(amounts.shape, dtype=_SIGNATURE_DTYPE)
             )
+            self._previous_masks.append(np.zeros(amounts.shape, dtype=np.bool_))
         self._added += 1
 
     def finish(self) -> npt.NDArray[np.float32]:
-        """The concatenated group fields, in the layout's order: phase then transition."""
+        """The concatenated group fields, in the layout's order: phase then transition.
+
+        Each group divides by the members its own cells could classify, which is the same
+        denominator :func:`phase_support_fields` and :func:`transition_fields` use and the only
+        one a streaming caller can know. A cell nobody could classify reports NaN rather than a
+        zero that would read as a definite phase.
+        """
         if not self._phase_signatures:
             raise AggregateError("no members were added")
-        assert self._shape is not None and self._observable is not None
-        denominator = self._expected_members or self._added
-        counts = np.full(self._shape, denominator, dtype=np.int64)
+        if self._expected_members is not None and self._added > self._expected_members:
+            raise AggregateError(
+                f"{self._added} members were added but the builder was told to expect "
+                f"{self._expected_members}; the fields would describe a member set they do not "
+                "come from"
+            )
 
         phase = _accumulate_signatures(
             self._phase_signatures,
-            self._observable,
-            counts,
+            self._phase_masks,
             n_outputs=len(_PHASES),
             resolve=_weights_for_signature,
         )
         if self._any_predecessor:
             previous = _accumulate_signatures(
                 self._previous_signatures,
-                self._observable,
-                counts,
+                self._previous_masks,
                 n_outputs=len(_PHASES),
                 resolve=_weights_for_signature,
             )
@@ -1169,28 +1204,86 @@ class PrecipitationGroupBuilder:
             return phase
         transition = _accumulate_signatures(
             self._transition_signatures,
-            self._observable,
-            counts,
+            self._transition_masks(),
             n_outputs=len(_TRANSITIONS),
             resolve=_transition_for_signature,
         )
         return np.concatenate([phase, transition], axis=0)
 
+    def _transition_masks(self) -> Iterator[npt.NDArray[np.bool_]]:
+        """The member-cells the transition denominator counts, one plane per member.
+
+        Derived from the other two masks rather than stored, because it is exactly their
+        conjunction and a third set of 30 x 721 x 1440 booleans is 31 MB. The conjunction is the
+        condition the batched path applies -- an interval the member could classify *and* a
+        predecessor it had -- so the two agree by construction rather than by inspection.
+
+        When no member had a predecessor at all, the batch the batched path would build is one
+        with ``amounts_prev=None``, whose denominator is the interval's own usable count. That is
+        the case a lead whose predecessor does not exist takes, and it reads the same way here.
+        """
+        if not self._any_predecessor:
+            yield from self._phase_masks
+            return
+        for interval, predecessor in zip(
+            self._phase_masks, self._previous_masks, strict=True
+        ):
+            yield interval & predecessor
+
 
 def _accumulate_signatures(
     signatures: Sequence[npt.NDArray[np.int64]],
-    observable: npt.NDArray[np.bool_],
-    counts: npt.NDArray[np.int64],
+    usable: Iterable[npt.NDArray[np.bool_]],
     *,
     n_outputs: int,
     resolve: Callable[[int], tuple[float, ...]],
 ) -> npt.NDArray[np.float32]:
-    """Accumulate one signature plane per member, resolving each distinct signature once."""
-    codes, inverse = np.unique(np.stack(signatures), return_inverse=True)
-    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float32)
-    per_member = inverse.reshape(len(signatures), *signatures[0].shape)
+    """Accumulate one signature plane per member, resolving each distinct signature once.
 
-    accumulator = np.zeros((*signatures[0].shape, n_outputs), dtype=np.float32)
-    for member in range(len(signatures)):
+    The batched caller hands over a whole stack and the streamed one the planes it collected, so
+    the arithmetic exists once. The gathered alternative to both -- materialising
+    ``(n_members, lat, lon, n_outputs)`` to sum over the member axis -- is 3.0 GB for the phase
+    group and 5.0 GB for the transition group at 721x1440, which is not a shape the container can
+    take; it works on the test grids and would fail on the first real lead.
+
+    ``usable`` is the per-member mask of the member-cells this group's denominator counts, and it
+    is the caller's rather than the accumulator's because the two groups count differently: a
+    transition needs a predecessor where a phase does not.
+
+    An unusable member-cell is *given the reserved code* rather than masked out of the sum. Its
+    value vector is otherwise definite -- a signature names which case the classifier saw, and a
+    non-finite input reads as "dry", whose weight is a full 1.0 -- so adding it while dividing by a
+    denominator that excludes it would report a fraction above one. Folding it into the signature
+    costs one int16 plane compare per member, and the reserved code's table row is then zeroed:
+    masking the value vectors instead would be an ``(lat, lon, n_outputs)`` float comparison per
+    member per group, over a stack that is four to eight times the signature's size. The two are
+    within measurement noise of each other on the production grid (both ~7-10 s for the phase
+    group at 30 x 721 x 1440, run to run), so the choice is made on the smaller working set rather
+    than on speed.
+    """
+    stacked = np.stack([np.asarray(plane) for plane in signatures])
+    counts = np.zeros(stacked.shape[1:], dtype=np.int64)
+    masked = False
+    for index, member_usable in enumerate(usable):
+        counts += member_usable
+        if not member_usable.all():
+            masked = True
+            stacked[index] = np.where(
+                member_usable,
+                stacked[index],
+                np.asarray(_UNUSABLE_SIGNATURE, dtype=stacked.dtype),
+            )
+
+    codes, inverse = np.unique(stacked, return_inverse=True)
+    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float32)
+    if masked:
+        # ``codes`` is sorted, so the reserved code sits at a known position in it: zeroing that
+        # one row is the whole exclusion, rather than a per-cell rewrite of the value planes.
+        for row in np.flatnonzero(codes == _UNUSABLE_SIGNATURE).tolist():
+            table[row] = np.float32(0.0)
+    per_member = inverse.reshape(stacked.shape)
+
+    accumulator = np.zeros((*stacked.shape[1:], n_outputs), dtype=np.float32)
+    for member in range(stacked.shape[0]):
         _accumulate_planes(accumulator, table[per_member[member]])
-    return _finish_fractions(accumulator, counts, observable)
+    return _finish_fractions(accumulator, counts)

@@ -202,10 +202,39 @@ D 类的批准表示是**每格点超越比例**。实现时确认了两件事�
 
 | 变量 | 字段 | 构建耗时 | 峰值（相对构建前） | 改动前 |
 |---|---|---|---|---|
-| `temperature_2m` | 35 | 2.2 s | 494 MB | 526 MB |
-| `cloud_ceiling` | 30 | 3.3 s | 710 MB | 710 MB（202 s 的耗时在此项） |
-| `wind_10m` | 78 | 4.2 s | 1134 MB | 1123 MB |
-| `precipitation_amount_3h` | 52 | **13.8 s** | **1529 MB** | 2464 MB / 19.8 s |
+| `temperature_2m` | 35 | 2.2–3.1 s | 494–530 MB | 526 MB |
+| `cloud_ceiling` | 30 | 3.3–4.6 s | 710 MB | 710 MB（202 s 的耗时在此项） |
+| `wind_10m` | 78 | 4.2–5.6 s | 1134 MB | 1123 MB |
+| `precipitation_amount_3h` | 52 | **13.8–22.9 s** | **1529–1585 MB** | 2464 MB / 19.8 s |
+
+（耗时区间是多次运行的实际抖动；峰值区间里较大的一侧是加入 §19.12 的分母掩码之后测的。）
 
 仍然要注意的是：**降水仍是四个里最贵的一个（1.5 GB）**，因为它的分布（19 个分位平面）与两个 group 的累加器同时在内存里，加上三次签名遍历。这与 §19.8 的结论无关——它只是说明"逐 `(变量, 时效)` 串行构建"这条边界是必需的，不是可选的。
+
+### 19.12 容器构建器已落地（`ingestion/core/aggregate_fields.py`）
+
+`build_container_fields` 是"一个 `(变量, 时效)` 的容器由哪些 staged 成员算出来"的单一入口。它按 `domain.field_layout` 的字段顺序产出向量（计数场 → 分布 → 各 group），最后**断言字段数等于 layout 声明的字段数**——描述符描述的就是这个向量，两者不一致会产出"字段名与内容错位"的容器，那是静默错误的统计量而不是失败。
+
+读入侧有三条硬约束，其中两条是本阶段新发现的：
+
+**（1）容器不是"它自己成员"的函数。** phase/transition group 读四个标志，玫瑰读两个风分量，phase group 还读前置时效。`required_member_variables` 是权威集合；任何一个输入没有 staged 都**拒绝出版**而不是出半个容器——用子集算出来的统计量，下游没有任何办法识别。
+
+**（2）缺失的输入可能是"还没到"而不是"不存在"，两者不可互换。** reset 时效的前置时效是**同一波次的另一个工作项**，所以一个时效第一次出版时它可能只是还没落地。分类器对"前置不存在"报 `persistent_rain`、对"前置干燥"报 `dry_to_rain`，所以在前置到达前构建容器会写下一个**确定但错误**的 transition，而下一次 patch 会静默把它改掉——正是那种没人会注意到的错误。因此：知道波次目标时效的调用方把 `wave_leads` 传进来，构建器在这样的前置缺失时**拒绝**；`None` 是"无法判断"（repair/backfill/测试用），此时按"存在就读"处理。
+
+**（3）降水 group 不能从 stack 构建。** 每成员十张平面（当前与前置各一值四旗标）在 721×1440 × 30 成员下是 1.25 GB，超过容器预算，所以喂给 `PrecipitationGroupBuilder` 逐成员累加；玫瑰则必须 stack（桶边界是全成员集的分位），两张 stack 可以承受。
+
+**（4）分母口径已统一到"逐格点可分类成员数"（本阶段顺手做完）。** 原先三处不一致：服务路径按"该格点有限成员数"除，batched `phase_support_fields`/`transition_fields` 按"整套成员数"除、且要求**所有**成员在格点有限才出值（否则整格点 NaN），流式 builder 也按 `expected_members` 除。三者现在统一为：
+
+* 分母 = 该格点"可分类"的成员数（降水：`amount` 有限 + 四个 flag 都有限；transition 再加"前置 `amount` 有限"，因为没有前置就没有 transition 可数）；
+* 分子只累加这些成员（其余格子携带保留码 `_UNUSABLE_SIGNATURE = 1023`，其表项被置零），因此不会出现"分母 26 却累加 30"这种 >1 的比例；
+* 一个成员都不可分类的格点报 **NaN**（不是 0——0 是对相态的确定性断言）；
+* `expected_members` 不再当除数，只用来在 `finish()` 里**拒绝**超过声明数的输入。
+
+这一改动同时修掉了一个实现缺陷：`_accumulate_signatures` 原先只做累加、由调用方给 `observable` 掩码，而**流式 builder 的掩码取不到**，于是流式与 batched 在有空隙的格点上结果不一致（实测 640 格中 40 格不同）。现在两条路径调用同一个 `_usable_members` 生成掩码、走同一个 `_accumulate_signatures`，掩码**只对无空隙的成员用不变量**（`member_usable.all()`）跳过，所以流式与 batched 逐位相同（含 NaN 位置），并由 `test_a_streamed_builder_divides_by_the_members_each_cell_could_classify` 与既有的两条 `streamed == batched` 钉住。
+
+**签名保留码与 dtype 上界**：`_UNUSABLE_SIGNATURE = 1023` 高于可达最大签名 304，且仍在 int16 内（签名平面 62 MB/张）。这两条都由 `test_a_signature_fits_the_dtype_the_builder_stores_it_in` **枚举** 16×16 种旗标组合验证，而不是靠推理——保留码一旦低于真实签名，那个格点会被当成"不可分类"而静默丢出求和。
+
+**Linux/CI 等价验证**：本阶段三条改动（`aggregate_fields.py` 与其测试、`product_fields.py` 的分母统一、以及 §19.11 的三处性能修正）在 `python:3.12-slim` 容器里跑过 `ruff`（All checks passed）、`mypy`（domain 33 files / ingestion 55 files clean）、`services/ingestion` 聚合/结算范围（119 passed）与 `packages/domain` 全量（689 passed，100% 覆盖门槛达成）。容器的 `ruff`/`mypy` 需要 `RUFF_CACHE_DIR`/`MYPY_CACHE_DIR` 指向可写目录，否则会在只读挂载上写 cache 而失败——这是验证环境的问题，不是代码的问题。
+
+**分歧记录（不做门禁）**：服务路径的相位支持在某个格点上只用"`amount` 有限"的成员，写端还要求四个 flag 有限。到真实数据上 flag 缺失很罕见，且我们只表达"成员支持什么"而不解释，所以按 §19 的分工**如实记录**这个偏差，不改服务路径的门槛。
 
