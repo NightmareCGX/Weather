@@ -211,11 +211,19 @@ export interface EnsembleStatistics {
   mean?: number | null;
   median?: number | null;
   spread?: number | null;
+  /**
+   * The outermost stored percentile pair, which the chart draws in its low/high cells. Read as
+   * quantiles rather than as the sample's min/max, because that is what a container can answer --
+   * and the two sources have to answer the same question for a comparison between them to mean
+   * anything.
+   */
+  "p0.1"?: number | null;
   p10?: number | null;
   p25?: number | null;
   p50?: number | null;
   p75?: number | null;
   p90?: number | null;
+  "p99.9"?: number | null;
 }
 
 /**
@@ -245,6 +253,19 @@ export interface WindRose {
   calm_count: number;
   sectors: WindRoseSector[];
   member_count?: number;
+}
+
+/**
+ * A member-value histogram, delivered alongside the statistics while the distribution's source
+ * changes from raw members to the stored fields.
+ *
+ * Two arrive on one shared bin grid — `histogram_members` counting the raw member values and
+ * `histogram_stored` evaluating the stored fields over the same edges — so both can be drawn
+ * together and compared. Delivery only: neither is stored, and both disappear with the members.
+ */
+export interface EnsembleHistogram {
+  edges: number[];
+  counts: number[];
 }
 
 export type PrecipitationType =
@@ -296,6 +317,14 @@ export interface EnsembleStatisticsData {
   statistics: EnsembleStatistics;
   members?: number[];
   pdf?: EnsemblePDF | null;
+  /** The member-derived distribution, on the same grid as `histogram_stored`. */
+  histogram_members?: EnsembleHistogram | null;
+  /**
+   * The stored-field-derived distribution, on the same grid as `histogram_members`. `null` when
+   * the store has no usable aggregate for this variable and lead — an absent line, not an empty
+   * distribution.
+   */
+  histogram_stored?: EnsembleHistogram | null;
   consensus_vector?: ConsensusVector | null;
   wind_rose?: WindRose | null;
   phase_support?: Record<string, number> | null;

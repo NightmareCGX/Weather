@@ -31,6 +31,7 @@ from domain.models.precipitation import (
 )
 from domain.models.wind import CARDINAL_DIRECTIONS_8, compute_wind_rose
 from domain.product_fields import (
+    _CONDITIONAL_PERCENTILES,
     _INTERVAL_CODES,
     _SIGNATURE_DTYPE,
     _UNUSABLE_SIGNATURE,
@@ -54,6 +55,14 @@ LAT, LON = 3, 4
 
 _PHASES = tuple(PhysicalPhase)
 _TRANSITIONS = tuple(PrecipitationTransition)
+
+#: The conditional percentiles the container stores, and the names the member path's summaries key
+#: them by. Taken from the producer rather than restated: a second list is a second place for the
+#: two to drift, and the drift would be a field order nobody notices.
+_CONDITIONAL_LEVELS: tuple[float, ...] = _CONDITIONAL_PERCENTILES
+_CONDITIONAL_LEVEL_KEYS: tuple[str, ...] = tuple(
+    f"p{int(level) if float(level).is_integer() else level}" for level in _CONDITIONAL_LEVELS
+)
 
 
 def _members(seed: int = 0):
@@ -436,11 +445,13 @@ def test_ceiling_censoring_matches_the_member_summary_cell_by_cell() -> None:
     """
     members = _ceiling_members(seed=12)
     fields = cloud_censoring_fields(members, variable="cloud_ceiling")
-    assert fields.shape == (10, LAT, LON)
+    assert fields.shape == (12, LAT, LON)
 
     for row in range(LAT):
         for col in range(LON):
-            summary = cloud_ceiling_ensemble_summary(members[:, row, col])
+            summary = cloud_ceiling_ensemble_summary(
+                members[:, row, col], percentiles=_CONDITIONAL_LEVELS
+            )
             assert fields[0, row, col] == summary.valid_member_count
             assert fields[1, row, col] == summary.finite_member_count
             assert fields[2, row, col] == summary.unlimited_member_count
@@ -454,7 +465,7 @@ def test_ceiling_censoring_matches_the_member_summary_cell_by_cell() -> None:
                 summary.conditional_spread,
                 *[
                     summary.conditional_percentiles[level]
-                    for level in ("p10", "p25", "p50", "p75", "p90")
+                    for level in _CONDITIONAL_LEVEL_KEYS
                 ],
             ]
             assert fields[3:, row, col] == pytest.approx(expected, abs=1e-4), (
@@ -472,16 +483,15 @@ def test_cover_censoring_matches_the_member_summary_and_has_no_unlimited_class()
 
     for row in range(LAT):
         for col in range(LON):
-            summary = cloud_cover_ensemble_summary(members[:, row, col], min_valid=1)
+            summary = cloud_cover_ensemble_summary(
+                members[:, row, col], percentiles=_CONDITIONAL_LEVELS, min_valid=1
+            )
             assert fields[0, row, col] == summary.valid_member_count
             assert fields[1, row, col] == fields[0, row, col]
             expected = [
                 summary.mean,
                 summary.spread,
-                *[
-                    summary.percentiles[level]
-                    for level in ("p10", "p25", "p50", "p75", "p90")
-                ],
+                *[summary.percentiles[level] for level in _CONDITIONAL_LEVEL_KEYS],
             ]
             assert fields[3:, row, col] == pytest.approx(expected, abs=1e-3), (row, col)
 
@@ -564,8 +574,9 @@ def test_group_fields_are_exactly_what_the_layout_declares() -> None:
         ("temperature_2m", ceiling, None, 0),
         ("wind_10m", u, {"wind_u_10m": u, "wind_v_10m": v}, 77),
         ("precipitation_amount_3h", amounts, extra, 32),
-        ("cloud_ceiling", ceiling, None, 10),
-        ("cloud_cover_3h", np.abs(ceiling), None, 10),
+        # The cloud groups are the three censoring counts plus the nine conditional statistics.
+        ("cloud_ceiling", ceiling, None, 12),
+        ("cloud_cover_3h", np.abs(ceiling), None, 12),
         ("crain", flag_values, None, 1),
     )
     for variable, members, extras, expected in cases:

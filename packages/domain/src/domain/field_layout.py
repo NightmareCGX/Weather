@@ -108,11 +108,16 @@ _FIELD_GROUPS: Final[dict[str, tuple[str, ...]]] = {
     "conditional": (
         "COND_MEAN",
         "COND_SPREAD",
+        # The percentile names are spelled the way the response spells them, so the reader's
+        # "strip the prefix and lower-case" rule yields the contract's own keys rather than a
+        # second mapping that could drift from it.
+        "COND_P0.1",
         "COND_P10",
         "COND_P25",
         "COND_P50",
         "COND_P75",
         "COND_P90",
+        "COND_P99.9",
     ),
     "fraction": ("FRACTION",),
 }
@@ -457,7 +462,7 @@ def _group_roles(group: str) -> list[str]:
     if group == "censoring":
         return [ROLE_CENSORING] * 3
     if group == "conditional":
-        return [ROLE_CONDITIONAL] * 7
+        return [ROLE_CONDITIONAL] * len(_FIELD_GROUPS["conditional"])
     if group == "fraction":
         return [ROLE_FRACTION]
     raise FieldLayoutError(f"unknown field group {group!r}")

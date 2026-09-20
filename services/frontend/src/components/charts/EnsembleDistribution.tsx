@@ -18,6 +18,7 @@ import {
   distributionSummary,
   distributionXDomain,
   histogramBins,
+  mergeHistogramSources,
   toMemberDots,
   toPdfPoints,
 } from "@/lib/forecast/transform";
@@ -150,7 +151,18 @@ export function EnsembleDistribution({
   const dots = toMemberDots(members);
   const summary = distributionSummary(members);
   const pdfPoints = toPdfPoints(data.pdf);
-  const [xMin, xMax] = distributionXDomain(summary, data.pdf);
+  const [xMin, xMax] = distributionXDomain(summary, data.pdf, data.histogram_members);
+  // The migration's comparison: while the front end still receives a member-derived histogram it
+  // draws both sources on one grid, so a change of source can be *seen*. The member line here
+  // comes from the delivered histogram rather than from `histogramBins(members)` -- same values,
+  // but one grid for both lines, which is what makes them comparable at all.
+  const comparison = mergeHistogramSources(data.histogram_members, data.histogram_stored);
+  const storedLine = comparison
+    .filter((bin) => bin.stored !== null)
+    .map((bin) => ({
+      x: bin.x,
+      count: bin.stored as number,
+    }));
 
   // Prepare bin data points with explicit x coordinate for numeric XAxis
   const binChartData = bins.map((bin) => ({
@@ -188,8 +200,10 @@ export function EnsembleDistribution({
         </div>
 
         <dl className="mb-2 grid grid-cols-4 gap-2 text-center text-xs">
-          <StatCell label="Min" value={summary.min} />
-          <StatCell label="Max" value={summary.max} />
+          {/* The outer pair is the stored percentile pair, not the member sample's extremes: the
+              two sources have to answer the same question, and a container holds no extremes. */}
+          <StatCell label="p0.1" value={data.statistics?.["p0.1"] ?? Number.NaN} />
+          <StatCell label="p99.9" value={data.statistics?.["p99.9"] ?? Number.NaN} />
           <StatCell label="Mean" value={summary.mean} />
           <StatCell label="StdDev" value={summary.stdDev} />
         </dl>
@@ -257,6 +271,20 @@ export function EnsembleDistribution({
                   />
                 ))}
               </Bar>
+              {storedLine.length > 0 && (
+                <Line
+                  yAxisId="left"
+                  data={storedLine}
+                  dataKey="count"
+                  type="monotone"
+                  stroke="#f472b6"
+                  strokeWidth={2}
+                  strokeDasharray="4 2"
+                  dot={false}
+                  isAnimationActive={false}
+                  name="Stored fields"
+                />
+              )}
               {pdfPoints.length > 0 && (
                 <Line
                   yAxisId="right"
@@ -316,6 +344,9 @@ export function EnsembleDistribution({
         <p className="mt-1 text-[11px] text-slate-500">
           Histogram bars and dots show the discrete ensemble member sample. The continuous curve
           shows the canonical Gaussian kernel density estimate (probability density).
+          {storedLine.length > 0 &&
+            " The dashed line is the same distribution read from the stored fields, drawn on the" +
+              " same bins so the two sources can be compared before the members are removed."}
         </p>
       </div>
     </div>

@@ -73,7 +73,12 @@ ROSE_SECTORS_HALF_WIDTH_DEG: float = ROSE_SECTORS_WIDTH_DEG / 2.0
 FLAG_NAMES: tuple[str, ...] = ("crain", "csnow", "cfrzr", "cicep")
 
 #: The conditional percentiles a bounded variable's container stores, in the layout's order.
-_CONDITIONAL_PERCENTILES: tuple[float, ...] = (10.0, 25.0, 50.0, 75.0, 90.0)
+#:
+#: The outer pair is 0.1 and 99.9 rather than the sample's min and max: the chart draws a low/high
+#: pair beside the percentiles, and a container holds no extremes -- a stored distribution's
+#: outermost levels bound the *distribution*, so the same two levels answer the same question on
+#: both the member path and the stored one. That is what makes the two sources comparable.
+_CONDITIONAL_PERCENTILES: tuple[float, ...] = (0.1, 10.0, 25.0, 50.0, 75.0, 90.0, 99.9)
 
 #: A flag plane at or above this counts as set, matching the serving path's threshold.
 FLAG_THRESHOLD: float = 0.5

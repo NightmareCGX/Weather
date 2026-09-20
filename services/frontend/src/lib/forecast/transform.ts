@@ -1,4 +1,5 @@
 import type {
+  EnsembleHistogram,
   EnsemblePDF,
   EnsembleStatistics,
   EnsembleStatisticsData,
@@ -345,14 +346,23 @@ export function toPdfPoints(pdf?: EnsemblePDF | null): PdfPoint[] {
 /**
  * Compute the shared numeric X-domain for the member distribution visualization.
  *
- * When a PDF is present, the domain spans the full canonical evaluation window
- * `[min(pdf.x), max(pdf.x)]` so continuous tails are not clipped. When the PDF
- * is absent, it defaults to the observed sample extrema `[min, max]`.
+ * When a histogram is present its edges define the domain: the bins are what the chart draws, and
+ * an axis that disagreed with them would place a bar outside the plot. That is also what makes the
+ * two source lines comparable -- both arrive on one grid, so both are drawn against one axis.
+ * A PDF is only a fallback, and for the same reason: when the distribution is drawn from both raw
+ * members and stored fields, the histogram is the payload that carries the shared grid.
+ *
+ * With neither present the domain falls back to the observed sample extrema `[min, max]`.
  */
 export function distributionXDomain(
   summary: DistributionSummary,
-  pdf?: EnsemblePDF | null
+  pdf?: EnsemblePDF | null,
+  histogram?: EnsembleHistogram | null
 ): [number, number] {
+  const histEdges = validHistogramEdges(histogram);
+  if (histEdges.length > 0) {
+    return [histEdges[0], histEdges[histEdges.length - 1]];
+  }
   if (pdf && Array.isArray(pdf.x) && pdf.x.length > 0) {
     const validX = pdf.x.filter((v) => typeof v === "number" && Number.isFinite(v));
     if (validX.length > 0) {
@@ -369,6 +379,111 @@ export function distributionXDomain(
 }
 
 /**
+ * Turn an API histogram into chart points, one per bin.
+ *
+ * The bin's x coordinate is its midpoint, because the chart plots counts against a numeric axis
+ * shared with the other source's line. A payload whose edges and counts disagree in length is
+ * truncated to the shorter of the two rather than being trusted: a bin without a count would be
+ * drawn as an empty bin, which is a different statement from "the payload is malformed".
+ */
+export function toHistogramPoints(
+  histogram?: EnsembleHistogram | null
+): Array<{ x: number; count: number; start: number; end: number }> {
+  const edges = validHistogramEdges(histogram);
+  if (edges.length < 2 || !histogram) {
+    return [];
+  }
+  const bins = Math.min(edges.length - 1, histogram.counts.length);
+  const points: Array<{ x: number; count: number; start: number; end: number }> = [];
+  for (let index = 0; index < bins; index += 1) {
+    const start = edges[index];
+    const end = edges[index + 1];
+    const count = histogram.counts[index];
+    if (!Number.isFinite(count)) {
+      continue;
+    }
+    points.push({ x: (start + end) / 2, count, start, end });
+  }
+  return points;
+}
+
+/**
+ * The finite, strictly increasing edges of a histogram payload, or an empty array.
+ *
+ * Tolerance for a malformed payload rather than an error: this is a migration aid rendered
+ * alongside a chart that has to keep working, so a bad grid means the second line is not drawn.
+ */
+function validHistogramEdges(histogram?: EnsembleHistogram | null): number[] {
+  if (!histogram || !Array.isArray(histogram.edges) || histogram.edges.length < 2) {
+    return [];
+  }
+  const edges = histogram.edges.filter((edge) => typeof edge === "number" && Number.isFinite(edge));
+  if (edges.length !== histogram.edges.length) {
+    return [];
+  }
+  for (let index = 1; index < edges.length; index += 1) {
+    if (!(edges[index] > edges[index - 1])) {
+      return [];
+    }
+  }
+  return edges;
+}
+
+/** One bin of the two-source comparison, with both sources' counts on the same grid. */
+export interface DualSourceBin {
+  /** Midpoint of the bin, used as the numeric x coordinate. */
+  x: number;
+  /** Members in this bin according to the raw member values, or `null` when unavailable. */
+  members: number | null;
+  /** Members in this bin according to the stored fields, or `null` when unavailable. */
+  stored: number | null;
+  start: number;
+  end: number;
+}
+
+/**
+ * Align the two delivered histograms onto one series, for drawing both on one chart.
+ *
+ * The two payloads arrive on one grid from the API, so this is a merge rather than a rebin: the
+ * grid is taken from whichever side is present, and a side that is missing (or that arrives with a
+ * different grid, which would mean the two are not comparable) contributes `null` per bin -- which
+ * recharts renders as a gap rather than as a zero. That distinction is the whole point: a line at
+ * zero says the ensemble has no members there, a gap says this source has nothing to show.
+ *
+ * Returns an empty array when neither side is usable, which the caller reads as "no comparison".
+ */
+export function mergeHistogramSources(
+  members?: EnsembleHistogram | null,
+  stored?: EnsembleHistogram | null
+): DualSourceBin[] {
+  const memberEdges = validHistogramEdges(members);
+  const storedEdges = validHistogramEdges(stored);
+  const edges = memberEdges.length > 0 ? memberEdges : storedEdges;
+  if (edges.length < 2) {
+    return [];
+  }
+  const comparable = (candidate: number[], other: number[]): boolean =>
+    candidate.length === 0 || candidate.length === other.length;
+  const membersUsable =
+    memberEdges.length > 0 && comparable(memberEdges, edges) && members !== null;
+  const storedUsable = storedEdges.length > 0 && comparable(storedEdges, edges) && stored !== null;
+
+  const bins: DualSourceBin[] = [];
+  for (let index = 0; index < edges.length - 1; index += 1) {
+    const memberCount = membersUsable ? members!.counts[index] : null;
+    const storedCount = storedUsable ? stored!.counts[index] : null;
+    bins.push({
+      x: (edges[index] + edges[index + 1]) / 2,
+      members: Number.isFinite(memberCount) ? (memberCount as number) : null,
+      stored: Number.isFinite(storedCount) ? (storedCount as number) : null,
+      start: edges[index],
+      end: edges[index + 1],
+    });
+  }
+  return bins;
+}
+
+/**
  * Format the ensemble statistics object for a compact readout row, ordered as
  * the API documents them.
  */
@@ -379,11 +494,16 @@ export function ensembleStatisticsEntries(
     ["mean", statistics.mean ?? null],
     ["median", statistics.median ?? null],
     ["spread", statistics.spread ?? null],
+    // The outer pair is what the chart's low/high cells read. It is `p0.1`/`p99.9` now rather
+    // than min/max, because the stored source answers the percentiles and holds no extremes --
+    // and both sources have to answer the same question for the comparison to mean anything.
+    ["p0.1", statistics["p0.1"] ?? null],
     ["p10", statistics.p10 ?? null],
     ["p25", statistics.p25 ?? null],
     ["p50", statistics.p50 ?? null],
     ["p75", statistics.p75 ?? null],
     ["p90", statistics.p90 ?? null],
+    ["p99.9", statistics["p99.9"] ?? null],
   ];
 }
 

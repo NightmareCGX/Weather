@@ -67,20 +67,33 @@ ROSE_EDGE_COUNT: int = ROSE_BUCKETS + 1
 
 #: Statistics the platform serves per variable (``EnsembleStatistics``). A caller passing a
 #: different name gets a KeyError from the dataclass rather than a silent zero.
+#:
+#: ``p0.1`` and ``p99.9`` are the **sample extremes' stand-ins**, not a new product: the chart
+#: shows a low/high pair beside the percentiles, and the raw members that pair used to be read
+#: from are what a container replaces. The quantile encoding stores both levels exactly (0.001 and
+#: 0.999 are in its approved level set), so the pair is as accurate as any other stored level; the
+#: bin encoding can only read them off its bounded shape, which is the same caveat its other
+#: percentiles carry. Reported under percentiles rather than as "min"/"max" because the stored
+#: answer is a *quantile of the distribution*, not the sample's extremes -- calling it min would
+#: claim a value the store never recorded.
 STATISTIC_NAMES: tuple[str, ...] = (
     "mean",
     "median",
     "spread",
+    "p0.1",
     "p10",
     "p25",
     "p50",
     "p75",
     "p90",
+    "p99.9",
 )
 
 #: Statistics that coincide with a stored quantile level for the quantile encoding, and are
 #: therefore reproduced exactly rather than reconstructed.
-_EXACT_QUANTILE_STATISTICS: frozenset[str] = frozenset({"median", "p10", "p50", "p90"})
+_EXACT_QUANTILE_STATISTICS: frozenset[str] = frozenset(
+    {"median", "p0.1", "p10", "p50", "p90", "p99.9"}
+)
 
 
 @dataclass(frozen=True)
@@ -180,11 +193,13 @@ def _statistics_from_bins(
     std_scale = spread if spread > 0.0 else 1.0
     for name, probability in (
         ("median", 0.50),
+        ("p0.1", 0.001),
         ("p10", 0.10),
         ("p25", 0.25),
         ("p50", 0.50),
         ("p75", 0.75),
         ("p90", 0.90),
+        ("p99.9", 0.999),
     ):
         value = quantile(probability)
         if value is not None:
@@ -210,8 +225,12 @@ def _statistics_from_quantiles(
     values: dict[str, float] = {}
     exact: set[str] = set()
 
-    for name in ("p10", "p25", "median", "p50", "p75", "p90"):
-        probability = 0.50 if name == "median" else float(name[1:]) / 100.0
+    for name in ("p0.1", "p10", "p25", "median", "p50", "p75", "p90", "p99.9"):
+        probability = (
+            0.50
+            if name == "median"
+            else float(name.replace("p", "", 1)) / 100.0
+        )
         try:
             values[name] = float(np.asarray(quantile_at(levels_at_point, levels, probability)))
         except AggregateError:  # pragma: no cover - the spec and the planes agree by construction

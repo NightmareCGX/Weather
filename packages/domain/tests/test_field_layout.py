@@ -155,7 +155,9 @@ def test_the_special_variables_carry_the_groups_their_products_need() -> None:
     for variable in ("cloud_ceiling", "cloud_cover_3h"):
         layout = aggregate_fields_for(variable)
         assert layout.groups == ("censoring", "conditional"), variable
-        assert layout.n_fields == 1 + 19 + 3 + 7, variable
+        # 1 count field + 19 levels + 3 censoring counts + the 9 conditional statistics: mean,
+        # spread and the seven percentiles, whose outer pair is p0.1/p99.9 rather than min/max.
+        assert layout.n_fields == 1 + 19 + 3 + 9, variable
         assert layout.group_slice("censoring").stop == layout.group_slice("conditional").start
     for flag in ("crain", "csnow", "cfrzr", "cicep"):
         assert aggregate_fields_for(flag).groups == ("fraction",)

@@ -45,8 +45,9 @@ from domain.aggregate import (
     exceedance_from_quantiles,
 )
 
-#: Bins when the caller does not say. Ten is what the front end's own ``histogramBins`` chooses for
-#: 30 members (``ceil(log2(30)) + 1``), so the two source lines are comparable bin for bin.
+#: Bins when the caller does not say. Ten is a middle resolution for a 30-member sample: the
+#: front end's own Sturges rule asks for six, which is coarse enough that a comparison of two
+#: sources would be dominated by the binning itself rather than by the encoding.
 DEFAULT_BINS: int = 10
 
 

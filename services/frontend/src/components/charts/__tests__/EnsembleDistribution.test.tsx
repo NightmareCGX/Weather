@@ -93,8 +93,9 @@ describe("EnsembleDistribution", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/Member distribution · Sep 10, 06:00 UTC/)).toBeInTheDocument();
     expect(screen.queryByText(/\+6h/)).not.toBeInTheDocument();
-    expect(screen.getByText("Min")).toBeInTheDocument();
-    expect(screen.getByText("Max")).toBeInTheDocument();
+    expect(screen.getByText("p0.1")).toBeInTheDocument();
+    expect(screen.getByText("p99.9")).toBeInTheDocument();
+    expect(screen.queryByText("Min")).not.toBeInTheDocument();
     expect(screen.getByText(/canonical Gaussian kernel density estimate/)).toBeInTheDocument();
 
     // Semantic SVG mark assertions for histogram bars

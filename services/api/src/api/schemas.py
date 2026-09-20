@@ -495,16 +495,26 @@ class SpatialLayerEnvelope(BaseModel):
 
 
 class EnsembleStatistics(BaseModel):
-    """Ensemble dispersion statistics (API.md section 5.1)."""
+    """Ensemble dispersion statistics (API.md section 5.1).
+
+    ``p0.1`` and ``p99.9`` replace what the chart used to label Min and Max. They are the same
+    displayed pair, read as the distribution's outermost stored levels rather than as the raw
+    sample's extremes -- which is what a container can answer, and why the labels changed with
+    them: the stored answer is a quantile, not the sample's minimum.
+    """
 
     mean: float | None = None
     median: float | None = None
     spread: float | None = None
+    p0_1: float | None = Field(default=None, alias="p0.1")
     p10: float | None = None
     p25: float | None = None
     p50: float | None = None
     p75: float | None = None
     p90: float | None = None
+    p99_9: float | None = Field(default=None, alias="p99.9")
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
 
 class EnsemblePDF(BaseModel):

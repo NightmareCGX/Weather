@@ -43,6 +43,7 @@ from domain.exceptions import (
     PointOutsideGridError,
 )
 from domain.geo.coordinates import validate_coordinates
+from domain.field_layout import group_field_names
 from domain.models.cloud import (
     cloud_ceiling_ensemble_summary,
     cloud_cover_ensemble_summary,
@@ -90,6 +91,28 @@ from api.services.point_forecast import (
     _parse_cycle_time,
     _resolve_variables,
     gated_cycle_metadata,
+)
+
+def _outer_percentiles(low: float, high: float) -> dict[str, float]:
+    """The statistics shape fragment for the outermost percentile pair.
+
+    A function rather than the ``p0_1=``/``p99_9=`` keyword pair, because the contract spells these
+    keys ``p0.1`` and ``p99.9`` and neither is a valid Python identifier: the model's aliases let it
+    carry the contract's names, and mypy resolves the alias rather than the attribute, so the
+    identifier spelling is an error it cannot accept. This is the one place that hands the pair
+    over.
+    """
+    return {"p0.1": float(low), "p99.9": float(high)}
+
+
+#: The conditional percentiles a container stores, derived from the layout authority rather than
+#: restated. The member path has to ask its summarisers for the *same* levels, or the two sources
+#: would report different percentiles under the same names -- and the comparison between them
+#: would be comparing level sets rather than distributions.
+_CONDITIONAL_LEVELS: tuple[float, ...] = tuple(
+    float(name.removeprefix("COND_P"))
+    for name in group_field_names("conditional")
+    if name.startswith("COND_P")
 )
 
 logger = logging.getLogger(__name__)
@@ -632,12 +655,15 @@ def build_ensemble_statistics(
         valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
         if valid_cell:
             min_v = 21 if len(participating_members) >= 21 else 1
-            cc_summary = cloud_cover_ensemble_summary(participating_members, min_valid=min_v)
+            cc_summary = cloud_cover_ensemble_summary(
+                participating_members, percentiles=_CONDITIONAL_LEVELS, min_valid=min_v
+            )
             if cc_summary is not None:
                 stats = EnsembleStatistics(
                     mean=float(cc_summary.mean),
                     median=float(cc_summary.median),
                     spread=float(cc_summary.spread),
+                    **_outer_percentiles(cc_summary.percentiles["p0.1"], cc_summary.percentiles["p99.9"]),
                     p10=float(cc_summary.percentiles["p10"]),
                     p25=float(cc_summary.percentiles["p25"]),
                     p50=float(cc_summary.percentiles["p50"]),
@@ -667,6 +693,7 @@ def build_ensemble_statistics(
             min_v = 21 if len(participating_members) >= 21 else 1
             ceil_summary = cloud_ceiling_ensemble_summary(
                 participating_members,
+                percentiles=_CONDITIONAL_LEVELS,
                 min_finite=10,
                 min_valid=min_v,
             )
@@ -680,6 +707,10 @@ def build_ensemble_statistics(
                         mean=float(ceil_summary.conditional_mean) if ceil_summary.conditional_mean is not None else None,
                         median=float(ceil_summary.conditional_median) if ceil_summary.conditional_median is not None else None,
                         spread=float(ceil_summary.conditional_spread) if ceil_summary.conditional_spread is not None else None,
+                        **_outer_percentiles(
+                            ceil_summary.conditional_percentiles["p0.1"],
+                            ceil_summary.conditional_percentiles["p99.9"],
+                        ),
                         p10=float(ceil_summary.conditional_percentiles["p10"]),
                         p25=float(ceil_summary.conditional_percentiles["p25"]),
                         p50=float(ceil_summary.conditional_percentiles["p50"]),
@@ -726,10 +757,18 @@ def build_ensemble_statistics(
     if stats is None:
         valid_cell = is_cell_statistically_valid(len(participating_members), expected_members)
         if valid_cell and participating_members:
+            # The outer pair is the 0.1st and 99.9th percentiles, which is what the chart draws in
+            # the low/high cells and what the stored fields carry at their outermost levels. It is
+            # deliberately not the sample's min/max: the two sources have to answer the same
+            # question for the comparison to mean anything, and a container holds no extremes.
             stats = EnsembleStatistics(
                 mean=ensemble_mean(participating_members),
                 median=ensemble_median(participating_members),
                 spread=ensemble_spread(participating_members),
+                **_outer_percentiles(
+                    ensemble_percentile(participating_members, 0.1),
+                    ensemble_percentile(participating_members, 99.9),
+                ),
                 p10=ensemble_percentile(participating_members, 10),
                 p25=ensemble_percentile(participating_members, 25),
                 p50=ensemble_percentile(participating_members, 50),

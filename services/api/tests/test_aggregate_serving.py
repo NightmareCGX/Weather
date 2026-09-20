@@ -208,7 +208,11 @@ def test_bin_encoding_reports_mean_and_spread_as_exact(tmp_path) -> None:
 
 
 def test_quantile_encoding_reports_the_stored_levels_as_exact(tmp_path) -> None:
-    """P10, P50, the median and P90 are stored levels; the rest are reconstructed."""
+    """The levels the contract names are stored levels; the rest are reconstructed.
+
+    The outer pair counts as stored too: 0.001 and 0.999 are in the approved level set, which is
+    what makes the chart's low/high cells answerable from a container at all.
+    """
     rng = np.random.default_rng(2)
     members = np.where(
         rng.random((30, GRID_LAT, GRID_LON)) < 0.5,
@@ -220,11 +224,17 @@ def test_quantile_encoding_reports_the_stored_levels_as_exact(tmp_path) -> None:
     result = _fetch("precipitation_amount_3h", store, 5, 7)
     assert result is not None
     assert result.spec.kind == KIND_QUANTILE_FUNCTION
-    assert result.exact == frozenset({"median", "p10", "p50", "p90"})
+    assert result.exact == frozenset({"median", "p0.1", "p10", "p50", "p90", "p99.9"})
 
     column = members[:, 5, 7]
     level_step = aggregate_fields_for("precipitation_amount_3h").field_scales[1]
-    for name, probability in (("p10", 10), ("p50", 50), ("p90", 90)):
+    for name, probability in (
+        ("p0.1", 0.1),
+        ("p10", 10),
+        ("p50", 50),
+        ("p90", 90),
+        ("p99.9", 99.9),
+    ):
         assert result.values[name] == pytest.approx(
             float(np.percentile(column, probability)), abs=level_step
         )

@@ -16,6 +16,7 @@ import {
   toEnsembleChartData,
   toEnsembleFanData,
   toEnsemblePhaseSupportData,
+  toHistogramPoints,
   toMemberDots,
   toMeteogramSeries,
   toPdfPoints,
@@ -729,22 +730,37 @@ describe("ensembleStatisticsEntries", () => {
       mean: 1,
       median: 2,
       spread: 3,
+      "p0.1": 3.5,
       p10: 4,
       p25: 5,
       p50: 6,
       p75: 7,
       p90: 8,
+      "p99.9": 8.5,
     });
+    // The outer pair brackets the percentiles, which is where the chart's low/high cells read it.
     expect(entries_.map(([key]) => key)).toEqual([
       "mean",
       "median",
       "spread",
+      "p0.1",
       "p10",
       "p25",
       "p50",
       "p75",
       "p90",
+      "p99.9",
     ]);
+  });
+
+  it("reports an absent outer percentile as null rather than dropping it", () => {
+    // A response from a source that cannot answer the pair still has to render the row: a
+    // missing entry would shift the row's meaning rather than showing "unavailable".
+    const entries_ = ensembleStatisticsEntries({ mean: 1, p10: 4 });
+    const byKey = new Map(entries_);
+    expect(byKey.get("p0.1")).toBeNull();
+    expect(byKey.get("p99.9")).toBeNull();
+    expect(byKey.get("p90")).toBeNull();
   });
 
   describe("toPdfPoints", () => {
@@ -820,6 +836,58 @@ describe("ensembleStatisticsEntries", () => {
         stdDev: 0.0,
       };
       expect(distributionXDomain(constantSummary, null)).toEqual([19.0, 21.0]);
+    });
+
+    it("prefers the histogram's edges, because the bars are what the chart draws", () => {
+      // The two source lines arrive on one grid, so the axis is the grid. A PDF-derived domain
+      // would put the bins and the line on different scales, and the PDF is the line being
+      // retired -- not the axis the bars are drawn against.
+      const pdf = { x: [10.0, 20.0, 30.0], density: [0.01, 0.2, 0.01] };
+      const histogram = { edges: [12.0, 16.0, 20.0], counts: [2, 3] };
+      expect(distributionXDomain(summary, pdf, histogram)).toEqual([12.0, 20.0]);
+    });
+
+    it("ignores a malformed histogram rather than drawing against it", () => {
+      // A grid that is not strictly increasing would place a bar outside the plot, so the domain
+      // falls back to the payloads that are intact.
+      expect(
+        distributionXDomain(summary, null, { edges: [20.0, 15.0, 25.0], counts: [1, 1] })
+      ).toEqual([15.0, 25.0]);
+      expect(
+        distributionXDomain(summary, null, {
+          edges: [10.0, Number.NaN, 30.0],
+          counts: [1, 1],
+        })
+      ).toEqual([15.0, 25.0]);
+      expect(distributionXDomain(summary, null, { edges: [10.0], counts: [] })).toEqual([
+        15.0, 25.0,
+      ]);
+    });
+  });
+
+  describe("toHistogramPoints", () => {
+    it("places each bin at its midpoint with its count", () => {
+      expect(toHistogramPoints({ edges: [0, 1, 2, 4], counts: [3, 5, 2] })).toEqual([
+        { x: 0.5, count: 3, start: 0, end: 1 },
+        { x: 1.5, count: 5, start: 1, end: 2 },
+        { x: 3, count: 2, start: 2, end: 4 },
+      ]);
+    });
+
+    it("truncates to the shorter of edges and counts rather than inventing bins", () => {
+      // A bin with no count would be drawn as an empty bin, which claims the ensemble has no
+      // members there -- a different statement from "this payload is short".
+      expect(toHistogramPoints({ edges: [0, 1, 2, 3], counts: [4, 5] })).toEqual([
+        { x: 0.5, count: 4, start: 0, end: 1 },
+        { x: 1.5, count: 5, start: 1, end: 2 },
+      ]);
+    });
+
+    it("returns nothing for an absent or unusable payload", () => {
+      expect(toHistogramPoints(null)).toEqual([]);
+      expect(toHistogramPoints(undefined)).toEqual([]);
+      expect(toHistogramPoints({ edges: [1], counts: [] })).toEqual([]);
+      expect(toHistogramPoints({ edges: [1, Number.NaN], counts: [1] })).toEqual([]);
     });
   });
 });
