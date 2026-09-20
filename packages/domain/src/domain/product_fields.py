@@ -47,6 +47,7 @@ from domain.field_layout import (
 )
 from domain.models.cloud import CLOUD_CEILING_UNLIMITED_THRESHOLD_KM
 from domain.models.precipitation import (
+    TRACE_THRESHOLD_MM,
     PhysicalPhase,
     PrecipitationTransition,
     classify_precipitation_phase,
@@ -77,9 +78,28 @@ _CONDITIONAL_PERCENTILES: tuple[float, ...] = (10.0, 25.0, 50.0, 75.0, 90.0)
 #: A flag plane at or above this counts as set, matching the serving path's threshold.
 FLAG_THRESHOLD: float = 0.5
 
-#: Trace threshold for a dry interval, from ``domain.models.precipitation.TRACE_THRESHOLD_MM``.
-#: Duplicated as a signature input only -- the classifier itself applies the same value.
-_DRY_AMOUNT_MM: float = 0.10
+#: Trace threshold for a dry interval, taken from ``domain.models.precipitation``'s own constant
+#: rather than restated, so the two cannot drift.
+_DRY_AMOUNT_MM: float = TRACE_THRESHOLD_MM
+
+
+def _is_dry(amounts: npt.NDArray[np.floating]) -> npt.NDArray[np.bool_]:
+    """Whether an amount is at or below the trace threshold, exactly as the classifier reads it.
+
+    **The comparison is ``>=``, not ``>``, and the difference is a whole member's phase.** The
+    classifier is handed one member value as a Python float, so its test is ``float(amount) >
+    0.10`` evaluated in float64 -- and the float32 value GRIB packs trace precipitation at,
+    ``float32(0.1)``, is 1.5e-9 *above* 0.10 in float64. Comparing it in float32 instead
+    (``amounts > np.float32(0.10)``) calls that member dry, which is a different phase and a
+    different transition for every cell it touches. Measured on real GEFS members: 3 of 30
+    members at one cell landed on exactly that value, and the stored dry share came out 0.100
+    higher than the member path's.
+
+    For a float32 input the two spellings are equivalent to ``amounts >= float32(0.10)``, because
+    no float32 lies strictly between ``float32(0.1)`` and ``0.1``. Stated as a comparison against
+    the float32 step and pinned by a test against the classifier itself.
+    """
+    return ~(np.isfinite(amounts) & (amounts >= np.float32(_DRY_AMOUNT_MM)))
 
 _PHASES: tuple[PhysicalPhase, ...] = tuple(PhysicalPhase)
 _TRANSITIONS: tuple[PrecipitationTransition, ...] = tuple(PrecipitationTransition)
@@ -251,11 +271,6 @@ def _flag_bits(flags: npt.NDArray[np.floating]) -> npt.NDArray[np.int32]:
     return bits
 
 
-def _dry(amounts: npt.NDArray[np.floating]) -> npt.NDArray[np.bool_]:
-    """Whether an amount is at or below the trace threshold, or not finite."""
-    return ~(np.isfinite(amounts) & (amounts > _DRY_AMOUNT_MM))
-
-
 def _phase_signature(
     amounts: npt.NDArray[np.floating], flags: npt.NDArray[np.floating]
 ) -> npt.NDArray[np.int64]:
@@ -266,7 +281,7 @@ def _phase_signature(
     from "dry" and "no flags set" (an unknown wet phase), and the phases are the flag bits, so
     those two inputs are the whole input. Sixteen bit patterns times dry/wet is 32 signatures.
     """
-    return (_dry(amounts).astype(np.int64) << 4) | _flag_bits(flags).astype(np.int64)
+    return (_is_dry(amounts).astype(np.int64) << 4) | _flag_bits(flags).astype(np.int64)
 
 
 #: Signature ranges for one interval, kept disjoint so the combination stays injective.
@@ -296,7 +311,7 @@ def _interval_code(
     amounts: npt.NDArray[np.floating], flags: npt.NDArray[np.floating]
 ) -> npt.NDArray[np.int64]:
     """Signature of one interval: dry, or wet with the flag bits that select its phases."""
-    dry = _dry(amounts)
+    dry = _is_dry(amounts)
     return np.where(
         dry, _DRY_CODE, _WET_CODE_BASE + _flag_bits(flags).astype(np.int64)
     )

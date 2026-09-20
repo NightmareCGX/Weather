@@ -38,7 +38,9 @@ from domain.product_fields import (
     ROSE_BUCKETS,
     ROSE_SECTORS,
     PrecipitationGroupBuilder,
+    _phase_signature,
     _transition_signature,
+    _weights_for_signature,
     cloud_censoring_fields,
     fraction_of_members,
     phase_support_fields,
@@ -790,7 +792,44 @@ def test_a_streamed_builder_divides_by_the_members_each_cell_could_classify() ->
     assert np.isfinite(streamed[:6, 1, 2]).all()
 
 
-def test_a_signature_fits_the_dtype_the_builder_stores_it_in() -> None:
+def test_the_dry_test_agrees_with_the_classifier_at_the_trace_threshold() -> None:
+    """A trace amount is the classifier's call, not the signature's.
+
+    The classifier is handed one member value as a Python float and compares in float64, while the
+    signature is built from float32 planes. At the trace threshold those differ: ``float32(0.1)``
+    is 1.5e-9 *above* 0.10 in float64, so a member sitting exactly on the packed trace value is
+    wet to the classifier and dry to a float32 ``>`` comparison -- a different phase and a
+    different transition. Measured on real GEFS members, that was 3 of 30 members at one cell, and
+    a stored dry share 0.100 higher than the member path's.
+
+    Enumerated at and around the threshold rather than reasoned about, because the failure is a
+    single ulp wide.
+    """
+    from domain.models.precipitation import classify_precipitation_phase, compute_phase_weights
+
+    values = [
+        np.float32(0.0),
+        np.float32(0.0999999),
+        np.float32(0.1),
+        np.float32(0.1000001),
+        np.float32(0.11),
+        np.float32(1.0),
+    ]
+    # ``(n_members, lat, lon)`` amounts and ``(4, n_members, lat, lon)`` flags: the signature
+    # helper takes a member stack, so each value is one member at one cell.
+    amounts = np.array(values, dtype=np.float32).reshape(-1, 1, 1)
+    flags = np.zeros((4, len(values), 1, 1), dtype=np.float32)
+    flags[0, :, 0, 0] = 1.0  # rain set, so a wet member is rain and a dry one is dry
+    signature = _phase_signature(amounts, flags)[:, 0, 0]
+    for index, amount in enumerate(values):
+        state = classify_precipitation_phase(
+            float(amount), {"crain": 1, "csnow": 0, "cfrzr": 0, "cicep": 0}
+        )
+        expected = compute_phase_weights(state)
+        resolved = _weights_for_signature(int(signature[index]))
+        assert resolved == pytest.approx([expected[phase] for phase in _PHASES]), (
+            f"{amount!r} classified as {state.interval_type.value}"
+        )
     """A wrapped signature would resolve a different table entry, not fail.
 
     The builder holds one signature plane per member per group, so the dtype is its residency:
