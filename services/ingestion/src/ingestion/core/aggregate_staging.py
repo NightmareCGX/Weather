@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -297,7 +297,14 @@ def aggregate_staged_lead(
     StoreIO(store).write(key, container)
 
     if drop_staging:
-        _release_staging(store, [variable_code], lead_time_hours)
+        # This is the single-variable form, so it has no pass-wide listing to share and lists just
+        # its own variable -- one LIST for one container.
+        _release_staging(
+            store,
+            _staged_keys_for_lead(
+                staged_objects_by_variable(store), [variable_code], lead_time_hours
+            ),
+        )
     return key, member_count
 
 
@@ -524,7 +531,15 @@ def aggregate_lead_all_variables(
         results.append((variable, key, count))
 
     if drop_staging and results:
-        _release_staging(store, [variable for variable, _k, _c in results], lead_time_hours)
+        # Only the variables whose container was written. A variable the pass skipped keeps its
+        # staging -- its members exist nowhere else, so deleting them would make a later pass
+        # unable to build the container rather than merely late.
+        _release_staging(
+            store,
+            _staged_keys_for_lead(
+                staged, [variable for variable, _k, _c in results], lead_time_hours
+            ),
+        )
     return results
 
 
@@ -585,24 +600,34 @@ def _derived_candidates(
     return extra
 
 
-def _release_staging(
-    store: StoreRef, variables: Sequence[str], lead_time_hours: int
-) -> None:
-    """Delete the staged members of ``variables`` at one lead.
+def _release_staging(store: StoreRef, keys: Iterable[str]) -> int:
+    """Delete staged objects by key, returning how many were removed.
 
-    Only the variables whose container was written: a variable the pass skipped -- an
-    unclassified name, or one with no approved encoding -- still has to be stageable by a repair
-    or a later pass, and its members exist nowhere else.
+    The caller decides *which* keys: an aggregate pass that has already listed the whole staging
+    root passes the subset it wrote containers for, and the single-variable form lists just its own
+    variable. Taking keys rather than variable names keeps the two listings from having to agree
+    on a shape.
     """
-    io = StoreIO(store)
-    doomed: list[str] = []
+    doomed = sorted(set(keys))
+    if not doomed:
+        return 0
+    return StoreIO(store).delete_many(doomed)
+
+
+def _staged_keys_for_lead(
+    staged: dict[str, dict[tuple[int, int], str]],
+    variables: Iterable[str],
+    lead_time_hours: int,
+) -> list[str]:
+    """The staged keys of ``variables`` at one lead, from a listing the caller already has."""
+    keys: list[str] = []
     for variable in variables:
-        by_member = staged_objects(store, variable)
-        doomed.extend(
-            key for (member, lead), key in by_member.items() if lead == lead_time_hours
+        keys.extend(
+            key
+            for (member, lead), key in staged.get(variable, {}).items()
+            if lead == lead_time_hours
         )
-    if doomed:
-        io.delete_many(sorted(doomed))
+    return keys
 
 
 def staged_objects_by_variable(store: StoreRef) -> dict[str, dict[tuple[int, int], str]]:
