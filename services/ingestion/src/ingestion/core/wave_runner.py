@@ -1210,9 +1210,14 @@ async def _run_wave_impl(
                 finished, or it cannot tell a predecessor that is gone by design from one that has
                 not landed -- and it refuses in both cases. Measured on a wave filling leads 3 and
                 6: without this, lead 6 cannot publish at all.
+
+                **The caller must already hold ``lead_settle_lock``**, which is why this does not
+                take it. The completion path publishes from inside that lock, and the lock is a
+                plain ``threading.Lock`` -- a re-entrant take here would wedge the very path that
+                matters, which is exactly what happened: with settlement off every wave deadlocked
+                the moment its first lead completed, and no lead ever published.
                 """
-                with lead_settle_lock:
-                    return tuple(sorted(published_leads))
+                return tuple(sorted(published_leads))
 
             def _publish_lead(
                 lead_val: int, *, aggregated: bool = False, final: bool = False
@@ -1286,9 +1291,15 @@ async def _run_wave_impl(
                 assert settlement is not None
                 tick = settlement.tick_seconds()
                 while not wave_cancel_event.is_set():
-                    due = settlement.due(now=time.monotonic())
+                    with lead_settle_lock:
+                        due = settlement.due(now=time.monotonic())
+                        new_leads = {
+                            decision.lead_time_hours
+                            for decision in due
+                            if decision.lead_time_hours not in published_leads
+                        }
                     for decision in due:
-                        if decision.lead_time_hours in published_leads:
+                        if decision.lead_time_hours not in new_leads:
                             continue
                         logger.info(
                             "settlement: publishing lead %d with %d/%d members (%s)",
