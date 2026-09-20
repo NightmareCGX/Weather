@@ -269,3 +269,40 @@ def test_the_distribution_slice_does_not_depend_on_how_many_groups_follow() -> N
     # ...and so is a product-fields variable's, whose products are its rose.
     wind = aggregate_fields_for("wind_10m").distribution_slice
     assert wind.start == wind.stop
+
+
+def test_a_group_declares_which_member_variables_it_reads() -> None:
+    """The inputs are part of the group's definition, so the writer and the planner agree.
+
+    A publication has to know every member set a container depends on before it can build one;
+    for most variables that is the variable itself, but the phase and transition fields are
+    functions of the four flags and the rose is a function of the two wind components.
+    """
+    from domain.field_layout import group_inputs, needs_predecessor, required_member_variables
+
+    assert group_inputs("rose") == (("wind_u_10m", "wind_v_10m"), False)
+    assert group_inputs("phase")[0] == ("crain", "csnow", "cfrzr", "cicep")
+    assert group_inputs("phase")[1] is True
+    with pytest.raises(FieldLayoutError, match="unknown field group"):
+        group_inputs("invented")
+
+    # The variable's own members are always a further input.
+    assert required_member_variables("temperature_2m") == ("temperature_2m",)
+    assert required_member_variables("wind_10m") == (
+        "wind_10m",
+        "wind_u_10m",
+        "wind_v_10m",
+    )
+    assert required_member_variables("precipitation_amount_3h") == (
+        "precipitation_amount_3h",
+        "crain",
+        "csnow",
+        "cfrzr",
+        "cicep",
+    )
+    assert required_member_variables("crain") == ("crain",)
+
+    # Only the precipitation groups read the predecessor interval.
+    assert needs_predecessor("precipitation_amount_3h") is True
+    assert needs_predecessor("temperature_2m") is False
+    assert needs_predecessor("cloud_ceiling") is False

@@ -49,6 +49,11 @@ ROLE_CENSORING: Final[str] = "censoring"
 ROLE_CONDITIONAL: Final[str] = "conditional"
 ROLE_FRACTION: Final[str] = "fraction"
 
+#: The four categorical flag variables, which the precipitation phase classification reads. Named
+#: once because three places depend on the set: the phase group, the transition group, and the
+#: registry that classifies them.
+FLAG_VARIABLE_NAMES: Final[tuple[str, ...]] = ("crain", "csnow", "cfrzr", "cicep")
+
 #: Field groups stored alongside a variable's distribution, with the observation that forced each.
 #:
 #: Each exists because a product the platform serves is a function of the *per-member values* and
@@ -133,6 +138,25 @@ _VARIABLE_GROUPS: Final[dict[str, tuple[str, ...]]] = {
     "csnow": ("fraction",),
     "cfrzr": ("fraction",),
     "cicep": ("fraction",),
+}
+
+#: Which member variables a group reads, beyond the variable's own field, and whether it also
+#: needs the predecessor interval.
+#:
+#: Declared here rather than in the writer because it is the group's own definition: a group that
+#: reads a second variable is a function of *that* variable's members, and the writer, the reader
+#: and the reclamation rule all have to agree on it. A group whose inputs are missing cannot be
+#: computed, and the variable whose container holds it cannot be published.
+#:
+#: ``fraction`` reads the variable itself, so its entry names no extra variable.
+_GROUP_INPUTS: Final[dict[str, tuple[tuple[str, ...], bool]]] = {
+    # (extra member variables, needs the predecessor interval)
+    "rose": (("wind_u_10m", "wind_v_10m"), False),
+    "phase": ((*FLAG_VARIABLE_NAMES,), True),
+    "transition": ((*FLAG_VARIABLE_NAMES,), True),
+    "censoring": ((), False),
+    "conditional": ((), False),
+    "fraction": ((), False),
 }
 
 #: Variables whose container holds supplementary fields and no distribution at all.
@@ -267,6 +291,49 @@ class FieldLayout:
         return out
 
 
+def group_inputs(group: str) -> tuple[tuple[str, ...], bool]:
+    """Which member variables a group reads, and whether it also needs the predecessor.
+
+    Returns:
+        ``(extra_variables, needs_predecessor)``. The variable's own members are always a
+        further input; this names only what is read *besides* them.
+
+    Raises:
+        FieldLayoutError: for an unknown group name.
+    """
+    try:
+        return _GROUP_INPUTS[group]
+    except KeyError as exc:
+        raise FieldLayoutError(
+            f"unknown field group {group!r}; known: {sorted(_GROUP_INPUTS)}"
+        ) from exc
+
+
+def required_member_variables(variable: str) -> tuple[str, ...]:
+    """Every member variable needed to build a variable's container, its own included.
+
+    A publication needs all of these committed before it can build the container. For most
+    variables that is the variable itself; for the phase and transition groups it is the four
+    flags, and for the rose it is the two wind components -- so a partial member set can block a
+    container even when the variable's own members have all arrived.
+    """
+    name = variable.strip()
+    needed = [name]
+    for group in _VARIABLE_GROUPS.get(name, ()):
+        extra, _needs_predecessor = group_inputs(group)
+        for extra_variable in extra:
+            if extra_variable not in needed:
+                needed.append(extra_variable)
+    return tuple(needed)
+
+
+def needs_predecessor(variable: str) -> bool:
+    """Whether a variable's container is a function of the predecessor interval as well."""
+    return any(
+        group_inputs(group)[1] for group in _VARIABLE_GROUPS.get(variable.strip(), ())
+    )
+
+
 def group_field_names(group: str) -> tuple[str, ...]:
     """Field names of a supplementary group, in storage order.
 
@@ -382,4 +449,7 @@ __all__ = [
     "aggregate_fields_for",
     "group_field_names",
     "group_field_scales",
+    "group_inputs",
+    "needs_predecessor",
+    "required_member_variables",
 ]
