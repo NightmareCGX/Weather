@@ -302,7 +302,7 @@ def _transition_for_signature(signature: int) -> tuple[float, ...]:
     return _one_hot(_TRANSITIONS.index(state.transition), len(_TRANSITIONS))
 
 
-def _scatter_by_signature(
+def _accumulate_by_signature(
     signature: npt.NDArray[np.int64],
     observable: npt.NDArray[np.bool_],
     counts: npt.NDArray[np.int64],
@@ -312,16 +312,26 @@ def _scatter_by_signature(
 ) -> npt.NDArray[np.float32]:
     """Accumulate a per-signature value vector into per-cell fractions.
 
-    One pass classifies each *distinct* signature and then gathers the result back, so the
-    per-member cost is an integer compare plus a fancy-index rather than a Python call.
+    Each *distinct* signature is resolved once -- that is where the scalar classifier is called,
+    at most 306 times for the transition group -- and its value vector is then added at every
+    member-cell carrying it. The addition is one member plane at a time rather than one gathered
+    array of every member-cell, because the gathered form is ``n_members x lat x lon x n_outputs``:
+    for the transition group at 721x1440 that is 5 GB, which is not a shape this can take.
+
+    The accumulator is float32 and the added values are small integers, so the sums are exact --
+    the largest is a member count, well inside float32's exact-integer range.
     """
     codes, inverse = np.unique(signature, return_inverse=True)
-    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float64)
-    # (n_cells * n_members) member-cell rows, each a vector of output values, summed per cell.
-    flat = table[inverse.reshape(-1)].reshape(*signature.shape, n_outputs)
-    total = flat.sum(axis=_MEMBER_AXIS, dtype=np.float64)
-    denominator = np.maximum(counts, 1).astype(np.float64)[:, :, None]
-    out = (total / denominator).transpose(2, 0, 1).astype(np.float32)
+    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float32)
+    per_member = inverse.reshape(signature.shape)
+
+    total = np.zeros((*signature.shape[1:], n_outputs), dtype=np.float32)
+    for member in range(signature.shape[0]):
+        # One plane's worth of value vectors, resolved by a table lookup.
+        np.add(total, table[per_member[member]], out=total)
+
+    denominator = np.maximum(counts, 1).astype(np.float32)[:, :, None]
+    out = (total / denominator).transpose(2, 0, 1)
     return np.where(observable[None, :, :], out, np.float32(np.nan))
 
 
@@ -365,7 +375,7 @@ def phase_support_fields(
         )
     if flags_prev is not None and amounts_prev is not None:
         _check_flag_stack(flags_prev, amounts_prev)
-    current = _scatter_by_signature(
+    current = _accumulate_by_signature(
         _phase_signature(amounts, flags),
         observable,
         counts,
@@ -375,7 +385,7 @@ def phase_support_fields(
     if amounts_prev is None or flags_prev is None:
         previous = np.full_like(current, np.nan)
     else:
-        previous = _scatter_by_signature(
+        previous = _accumulate_by_signature(
             _phase_signature(amounts_prev, flags_prev),
             observable,
             counts,
@@ -413,7 +423,7 @@ def transition_fields(
     if amounts_prev is not None and flags_prev is not None:
         _check_flag_stack(flags_prev, amounts_prev)
         observable = observable & np.isfinite(amounts_prev).all(axis=_MEMBER_AXIS)
-    return _scatter_by_signature(
+    return _accumulate_by_signature(
         _transition_signature(amounts, flags, amounts_prev, flags_prev),
         observable,
         counts,
