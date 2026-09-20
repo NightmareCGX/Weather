@@ -48,6 +48,7 @@ ROLE_TRANSITION: Final[str] = "transition"
 ROLE_CENSORING: Final[str] = "censoring"
 ROLE_CONDITIONAL: Final[str] = "conditional"
 ROLE_FRACTION: Final[str] = "fraction"
+ROLE_ROSE_EDGES: Final[str] = "rose_edges"
 
 #: The four categorical flag variables, which the precipitation phase classification reads. Named
 #: once because three places depend on the set: the phase group, the transition group, and the
@@ -92,6 +93,11 @@ _FIELD_GROUPS: Final[dict[str, tuple[str, ...]]] = {
         "CONSENSUS_COHERENCE",
         "CONSENSUS_DIR_SIN",
         "CONSENSUS_DIR_COS",
+        # The bucket edges travel with the fields, as constant planes. They are per
+        # ``(variable, lead)`` -- quantile edges of that member set -- so a reader cannot label a
+        # bucket, or add the rose up into a speed histogram, without them; and they belong in the
+        # container rather than a sidecar object so one read answers the whole product.
+        *(f"ROSE_EDGE_{index:02d}" for index in range(9)),
     ),
     "phase": (
         *(f"PHASE_{index}" for index in range(6)),
@@ -112,9 +118,11 @@ _FIELD_GROUPS: Final[dict[str, tuple[str, ...]]] = {
 }
 
 #: Fixed-point step per group. All of these are probabilities or bounded in [0, 1] except the
-#: consensus scalars, which are a speed in m/s and bounded by the rose's own range.
+#: consensus scalars and the rose's bucket edges, which are speeds in m/s: a wind gust reaches
+#: the low hundreds, so 0.01 m/s covers +-327 m/s.
 _GROUP_SCALES: Final[dict[str, float]] = {
     "rose": 0.001,
+    "rose_speed": 0.01,
     "phase": 0.001,
     "transition": 0.001,
     "censoring": 1.0,
@@ -348,9 +356,30 @@ def group_field_names(group: str) -> tuple[str, ...]:
         ) from exc
 
 
+#: Which fields of a group need a different step from the group's default. Named by field name so
+#: the exception is visible where it is made, rather than as an index offset a reader has to
+#: recount whenever the group changes.
+_FIELD_SCALE_OVERRIDES: Final[dict[str, float]] = {
+    "CONSENSUS_SPEED": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_00": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_01": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_02": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_03": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_04": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_05": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_06": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_07": _GROUP_SCALES["rose_speed"],
+    "ROSE_EDGE_08": _GROUP_SCALES["rose_speed"],
+}
+
+
 def group_field_scales(group: str) -> tuple[float, ...]:
     """Fixed-point step of each field in a supplementary group."""
-    return (_GROUP_SCALES[group],) * len(group_field_names(group))
+    default = _GROUP_SCALES[group]
+    overridden = tuple(
+        _FIELD_SCALE_OVERRIDES.get(name, default) for name in group_field_names(group)
+    )
+    return overridden
 
 
 def aggregate_fields_for(variable: str) -> FieldLayout:
@@ -414,7 +443,7 @@ def aggregate_fields_for(variable: str) -> FieldLayout:
 def _group_roles(group: str) -> list[str]:
     """The role of each field in a group."""
     if group == "rose":
-        return [ROLE_ROSE] * 64 + [ROLE_CONSENSUS] * 4
+        return [ROLE_ROSE] * 64 + [ROLE_CONSENSUS] * 4 + [ROLE_ROSE_EDGES] * 9
     if group == "phase":
         return [ROLE_PHASE_CURRENT] * 6 + [ROLE_PHASE_PREVIOUS] * 6
     if group == "transition":
@@ -441,6 +470,7 @@ __all__ = [
     "ROLE_PHASE_CURRENT",
     "ROLE_PHASE_PREVIOUS",
     "ROLE_ROSE",
+    "ROLE_ROSE_EDGES",
     "ROLE_STD",
     "ROLE_TRANSITION",
     "VALID_MISSING_POLICIES",

@@ -146,8 +146,9 @@ def test_the_special_variables_carry_the_groups_their_products_need() -> None:
     reclaiming its member shards, and would need a hand-written exception in the planner.
     """
     # wind_10m has no distribution fields: its speed histogram is its rose summed over sectors.
+    # The rose is 64 bins, four consensus scalars, and the nine bucket edges it was binned with.
     assert aggregate_fields_for("wind_10m").groups == ("rose",)
-    assert aggregate_fields_for("wind_10m").n_fields == 1 + 64 + 4
+    assert aggregate_fields_for("wind_10m").n_fields == 1 + 64 + 4 + 9
     assert aggregate_fields_for("wind_10m").kind == ""
     # The cloud variables carry their distribution (19 levels), the counts taken before
     # summarising, and the statistics computed over the finite subset.
@@ -163,7 +164,12 @@ def test_the_special_variables_carry_the_groups_their_products_need() -> None:
 
 def test_group_metadata_is_available_without_a_layout() -> None:
     """A caller sizing or labelling a group should not have to build a variable's layout."""
-    assert len(group_field_names("rose")) == 68
+    assert len(group_field_names("rose")) == 77
+    # The bucket edges and the consensus speed carry a speed's step; the bins carry a
+    # probability's. A single step for the group would clip a gust in the hundreds of m/s.
+    rose_scales = group_field_scales("rose")
+    assert rose_scales[group_field_names("rose").index("ROSE_EDGE_00")] == 0.01
+    assert rose_scales[group_field_names("rose").index("ROSE_N_0")] == 0.001
     assert len(group_field_names("phase")) == 12
     assert len(group_field_names("transition")) == 20
     assert len(group_field_scales("censoring")) == 3
