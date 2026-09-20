@@ -31,10 +31,12 @@ from domain.models.precipitation import (
 )
 from domain.models.wind import CARDINAL_DIRECTIONS_8, compute_wind_rose
 from domain.product_fields import (
+    _INTERVAL_CODES,
     FLAG_NAMES,
     ROSE_BUCKETS,
     ROSE_SECTORS,
     PrecipitationGroupBuilder,
+    _transition_signature,
     cloud_censoring_fields,
     fraction_of_members,
     phase_support_fields,
@@ -707,3 +709,31 @@ def test_a_streamed_builder_refuses_malformed_input_and_finishes_nothing_empty()
     # A later member with a different grid extent would broadcast silently, so it is refused.
     with pytest.raises(AggregateError, match="expected"):
         builder.add_member(amounts=amounts[0, :1], flags=flags[:, 0, :1])
+
+
+def test_a_signature_fits_the_dtype_the_builder_stores_it_in() -> None:
+    """A wrapped signature would resolve a different table entry, not fail.
+
+    The builder holds one signature plane per member per group, so the dtype is its residency:
+    int16 rather than int64 is 62 MB against 250 MB per stack at 721x1440 for thirty members.
+    That is only safe while every reachable signature fits, and the set is small and enumerable
+    -- so it is enumerated rather than reasoned about.
+    """
+    widest = 0
+    amounts = np.array([[[1.0]], [[1.0]]], dtype=np.float32)
+    for current_bits in range(1 << len(FLAG_NAMES)):
+        for predecessor_bits in range(1 << len(FLAG_NAMES)):
+            bit_values = [
+                float((current_bits >> bit) & 1) for bit in range(len(FLAG_NAMES))
+            ] + [float((predecessor_bits >> bit) & 1) for bit in range(len(FLAG_NAMES))]
+            flags = np.array(bit_values, dtype=np.float32).reshape(
+                len(FLAG_NAMES), 2, 1, 1
+            )
+            signature = _transition_signature(
+                amounts, flags, amounts[1:], flags[:, 1:]
+            )
+            widest = max(widest, int(signature.max()))
+    # The dry side of each interval is the low end of the range, so the all-wet pair is the
+    # widest case and nothing else can exceed it.
+    assert widest == (_INTERVAL_CODES - 1) * (_INTERVAL_CODES + 1) + (_INTERVAL_CODES - 1)
+    assert widest <= np.iinfo(np.int16).max
