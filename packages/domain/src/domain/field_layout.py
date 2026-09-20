@@ -117,9 +117,15 @@ _FIELD_GROUPS: Final[dict[str, tuple[str, ...]]] = {
     "fraction": ("FRACTION",),
 }
 
-#: Fixed-point step per group. All of these are probabilities or bounded in [0, 1] except the
-#: consensus scalars and the rose's bucket edges, which are speeds in m/s: a wind gust reaches
-#: the low hundreds, so 0.01 m/s covers +-327 m/s.
+#: Fixed-point step per group. Three kinds of quantity, and the step has to match the kind:
+#:
+#: * **probabilities**, bounded in [0, 1]: a step of 0.001 bounds the error at half a thousandth,
+#:   which is below what a 30-member sample can resolve.
+#: * **member counts** (``censoring``): the step is one member, because a count *is* an integer
+#:   and a step of 1.0 stores it exactly. It also means a fraction of the member set must not be
+#:   stored here: 19/30 at that step quantises to 0.
+#: * **speeds in m/s** (the consensus scalars and the rose's bucket edges): 0.01 covers +-327 m/s,
+#:   which is past any wind the platform stores.
 _GROUP_SCALES: Final[dict[str, float]] = {
     "rose": 0.001,
     "rose_speed": 0.01,

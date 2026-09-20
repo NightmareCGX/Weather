@@ -769,16 +769,18 @@ def cloud_censoring_fields(
 ) -> npt.NDArray[np.float32]:
     """The three counts a cloud variable takes before summarising, and its conditional statistics.
 
-    Returns ``(4, lat, lon)`` for the censoring group (valid, finite, unlimited counts as
-    fractions of the member set) followed by the seven conditional fields (mean, spread and the
-    five percentiles, over the finite members).
+    Returns the censoring group's three fields followed by the seven conditional fields (mean,
+    spread and the five percentiles, over the finite members).
 
-    The counts are stored as **fractions of the member set** rather than as member counts, for the
-    same reason the member-count field is a number: a fraction composes with the count field, so a
-    reader multiplying the two recovers the count, while a count alone cannot be sanity-checked
-    against the member set it came from. ``valid_count`` is the quantity the API reports as
-    ``valid_member_count``, and it is what the serving coverage rule reads once the members are
-    gone -- an integer count would also do, but the fraction needs no second field to interpret.
+    The counts are stored as **member counts**, not fractions, which is a correction of an earlier
+    revision of this function. The argument for fractions was that one "composes with the count
+    field" -- but the count field's scale is one member, so a fraction stored in the same container
+    quantises to 0 or 1 and the composition recovers nothing: measured through the real writer and
+    reader, a cell with 19 of 30 finite members came back as ``FINITE_COUNT = 0.0``. Counts are
+    also the cheaper representation (an integer in 0..30 needs one int16 step, and the reader wants
+    ``valid_member_count`` as an integer anyway -- it is the quantity the contract names and the
+    serving coverage rule reads). The count field is then a second, independent way to see the
+    same member set, which is what the fraction was supposed to buy.
 
     The conditional statistics are stored because they cannot be recovered from a mixture. The
     unlimited members of a ceiling field sit at one value (the 20 km sentinel), so a percentile of
@@ -790,8 +792,8 @@ def cloud_censoring_fields(
         variable: ``"cloud_ceiling"`` or ``"cloud_cover_3h"``, which decide the censoring rule.
 
     Returns:
-        ``(10, lat, lon)``: valid, finite and unlimited fractions, then the conditional mean,
-        spread, p10, p25, p50, p75 and p90.
+        ``(10, lat, lon)``: the valid, finite and unlimited member counts, then the conditional
+        mean, spread, p10, p25, p50, p75 and p90.
 
     Raises:
         AggregateError: for an unknown variable, or a member stack that is not 3-D.
@@ -832,20 +834,17 @@ def _censoring_payload(
     unlimited: npt.NDArray[np.bool_],
     values: npt.NDArray[np.float32],
 ) -> npt.NDArray[np.float32]:
-    """The three fractions and the seven conditional fields, computed over the finite members.
+    """The three member counts and the seven conditional fields, over the finite members.
 
     A cell with no finite member has no conditional statistics and reports NaN for all seven,
     rather than zeros that would read as a distribution concentrated at zero.
     """
-    total = values.shape[0]
-    denominator = np.full(values.shape[1:], float(total))
-    valid_fraction = in_range.sum(axis=_MEMBER_AXIS) / denominator
-    finite_fraction = finite.sum(axis=_MEMBER_AXIS) / denominator
-    unlimited_fraction = unlimited.sum(axis=_MEMBER_AXIS) / denominator
+    valid_count = in_range.sum(axis=_MEMBER_AXIS)
+    finite_count = finite.sum(axis=_MEMBER_AXIS)
+    unlimited_count = unlimited.sum(axis=_MEMBER_AXIS)
 
     masked = np.where(finite, values, np.nan)
-    counts = finite.sum(axis=_MEMBER_AXIS)
-    enough = counts >= 1
+    enough = finite_count >= 1
     # The percentile convention is the member path's: linear interpolation over the finite
     # members, sorted. A cell with no finite member makes the NaN-aware reductions report an
     # empty slice, which numpy announces with a warning even though NaN is exactly the answer
@@ -855,14 +854,14 @@ def _censoring_payload(
         warnings.simplefilter("ignore", RuntimeWarning)
         mean = np.nanmean(masked, axis=_MEMBER_AXIS)
         spread = np.nanstd(masked, axis=_MEMBER_AXIS)
-        percentiles = _conditional_percentiles(masked, counts)
+        percentiles = _conditional_percentiles(masked, finite_count)
     conditional_fields = np.stack([mean, spread, *percentiles]).astype(np.float32)
     conditional_fields = np.where(enough[None], conditional_fields, np.float32(np.nan))
 
-    fractions = np.stack(
-        [valid_fraction, finite_fraction, unlimited_fraction]
+    counts = np.stack(
+        [valid_count, finite_count, unlimited_count]
     ).astype(np.float32)
-    return np.concatenate([fractions, conditional_fields], axis=0)
+    return np.concatenate([counts, conditional_fields], axis=0)
 
 
 def variable_group_fields(

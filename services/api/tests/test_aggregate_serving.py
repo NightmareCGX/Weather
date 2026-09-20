@@ -33,6 +33,12 @@ from domain.aggregate import (
     quantise_field,
 )
 from domain.field_layout import aggregate_fields_for
+from domain.models.cloud import cloud_ceiling_ensemble_summary
+from domain.models.precipitation import (
+    aggregate_ensemble_phase_support,
+    classify_precipitation_phase,
+)
+from domain.models.wind import compute_consensus_vector, compute_wind_rose
 from domain.shard_format import (
     ENCODING_I16,
     PER_FIELD_SCALE,
@@ -106,26 +112,63 @@ def _encode(
 
 
 def _store_with(
-    tmp_path, variable: str, members: np.ndarray, *, member_count: int | None = None
+    tmp_path,
+    variable: str,
+    members: np.ndarray,
+    *,
+    member_count: int | None = None,
+    group_members: dict[str, np.ndarray] | None = None,
 ) -> str:
     """Write an aggregate over ``members``, laid out the way the ingestion writer lays it out.
 
-    The field vector is the per-cell member count, then the encoding's own fields, then one plane
-    per supplementary group field -- placeholder zeros here, because this suite exercises the
-    distribution path and only the field *count* has to match the layout the reader will check
-    against. Every field is stored at its own fixed-point step.
+    The field vector is the per-cell member count, then the encoding's own fields, then the
+    variable's supplementary groups. Which fields those are comes from
+    ``domain.field_layout`` -- the same authority the writer uses -- so the container this
+    produces is the one production produces.
+
+    Args:
+        tmp_path: Where to write the store.
+        variable: Variable code.
+        members: The variable's own ``(n_members, lat, lon)`` stack.
+        member_count: The count recorded in the descriptor; defaults to the stack's.
+        group_members: The *other* variables a group reads, keyed by variable code (the wind
+            components, or the four flags). Absent means the groups are written as placeholders,
+            which is what a distribution-only test wants.
     """
-    spec = spec_for(variable)
+    from domain.field_layout import group_inputs
+    from domain.product_fields import variable_group_fields
+
     layout = aggregate_fields_for(variable)
-    distribution = np.concatenate(
-        [finite_member_count(members)[None], compute_aggregate(members, spec)]
+    fields: list[np.ndarray] = [finite_member_count(members)]
+    if layout.distribution_slice.stop > layout.distribution_slice.start:
+        fields.extend(compute_aggregate(members, spec_for(variable)))
+    if layout.groups:
+        supplied = group_members or {}
+        # A group whose inputs are all in hand is computed for real: the censoring and fraction
+        # groups read only the variable's own members, so a caller writing a cloud variable gets
+        # its real counts without asking for anything extra. A group that reads *another*
+        # variable and was not given it is written as a placeholder, which is what a
+        # distribution-only test over a wind variable wants.
+        if all(
+            name in supplied or name == variable
+            for group in layout.groups
+            for name in group_inputs(group)[0]
+        ):
+            fields.append(
+                variable_group_fields(variable, members=members, extra_members=supplied)
+            )
+        else:
+            fields.append(
+                np.zeros(
+                    (layout.n_fields - len(fields), GRID_LAT, GRID_LON), dtype=np.float32
+                )
+            )
+    stacked = np.concatenate(
+        [field[None] if field.ndim == 2 else field for field in fields]
     )
-    placeholders = np.zeros(
-        (layout.n_fields - distribution.shape[0], GRID_LAT, GRID_LON), dtype=np.float32
-    )
-    fields = np.concatenate([distribution, placeholders])
+    assert stacked.shape[0] == layout.n_fields, stacked.shape
     counted = int(members.shape[0]) if member_count is None else member_count
-    blob = _encode(fields, field_scales=layout.field_scales, member_count=counted)
+    blob = _encode(stacked, field_scales=layout.field_scales, member_count=counted)
     key = aggregate_shard_key(variable, LEAD)
     store = str(tmp_path)
     full = os.path.join(store, *key.split("/"))
@@ -583,18 +626,165 @@ def test_member_count_is_read_from_the_field_not_inferred(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_special_variables_are_never_served_from_an_aggregate() -> None:
-    """Four variables carry per-member answers a collapsed distribution has already lost.
+def test_the_stored_products_answer_every_field_that_used_to_need_members(tmp_path) -> None:
+    """The supplementary groups are why no variable is special any more.
 
-    ``wind_10m`` computes a consensus vector and a wind rose from each member's (u, v) pair;
-    ``precipitation_amount_3h`` a phase-support map from each member's 0/1 flag;
-    ``cloud_ceiling`` and ``cloud_cover_3h`` censor members individually before summarising.
-    None of those is a function of the distribution, so no aggregate can produce them.
+    Each of these products is a function of the *per-member* values -- a (u, v) pair, a 0/1
+    phase flag, a censoring rule applied before summarising -- so none is recoverable from a
+    distribution. They are stored as fields for exactly that reason, and this reads them back.
     """
-    from api.services.aggregate_serving import SPECIAL_PER_MEMBER_VARIABLES, aggregate_can_answer
+    from api.services.aggregate_serving import (
+        SPECIAL_PER_MEMBER_VARIABLES,
+        cloud_censoring_at_cell,
+        precipitation_phase_from_aggregate,
+        wind_products_from_aggregate,
+    )
 
-    for variable in sorted(SPECIAL_PER_MEMBER_VARIABLES):
-        assert aggregate_can_answer(variable) is False, variable
+    assert SPECIAL_PER_MEMBER_VARIABLES == frozenset(), (
+        "every special variable has stored fields now; a name here would mean a response field "
+        "no container can answer"
+    )
+
+    rng = np.random.default_rng(31)
+    u = rng.normal(3.0, 4.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    v = rng.normal(2.0, 4.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    wind_store = _store_with(
+        tmp_path / "wind",
+        "wind_10m",
+        u,
+        group_members={"wind_u_10m": u, "wind_v_10m": v},
+    )
+    products = wind_products_from_aggregate(
+        store_path=wind_store,
+        lead_time_hours=LEAD,
+        chunk_row=0,
+        chunk_col=0,
+        row_in_chunk=5,
+        col_in_chunk=7,
+    )
+    assert products is not None
+    reference = compute_consensus_vector(u[:, 5, 7], v[:, 5, 7])
+    assert products["consensus"]["speed_mps"] == pytest.approx(reference.speed_mps, abs=0.02)
+    assert products["consensus"]["cardinal"] == reference.cardinal
+    # The stored direction is a sin/cos pair at a 0.001 step, so atan2's recovery error is
+    # bounded by the pair's quantisation: measured over a full sweep, 0.04 degrees worst case.
+    if reference.direction_deg is not None:
+        assert products["consensus"]["direction_deg"] == pytest.approx(
+            reference.direction_deg, abs=0.05
+        )
+    rose_reference = compute_wind_rose(u[:, 5, 7], v[:, 5, 7])
+    assert products["rose"]["calm_count"] == rose_reference.calm_count
+    by_sector = {sector["sector"]: sector for sector in products["rose"]["sectors"]}
+    for sector in rose_reference.sectors:
+        assert by_sector[sector.sector]["count"] == sector.count, sector.sector
+
+    amounts = np.where(
+        rng.random((30, GRID_LAT, GRID_LON)) < 0.5,
+        0.0,
+        rng.gamma(0.4, 1.5, (30, GRID_LAT, GRID_LON)),
+    ).astype(np.float32)
+    flags = {
+        name: (rng.random((30, GRID_LAT, GRID_LON)) < 0.4).astype(np.float32)
+        for name in ("crain", "csnow", "cfrzr", "cicep")
+    }
+    precip_store = _store_with(
+        tmp_path / "precip",
+        "precipitation_amount_3h",
+        amounts,
+        group_members=flags,
+    )
+    phase = precipitation_phase_from_aggregate(
+        store_path=precip_store,
+        lead_time_hours=LEAD,
+        chunk_row=0,
+        chunk_col=0,
+        row_in_chunk=5,
+        col_in_chunk=7,
+    )
+    assert phase is not None
+    states = [
+        classify_precipitation_phase(
+            float(amounts[member, 5, 7]),
+            {name: int(plane[member, 5, 7] >= 0.5) for name, plane in flags.items()},
+        )
+        for member in range(30)
+    ]
+    expected_support = aggregate_ensemble_phase_support(states)
+    for name, value in expected_support.items():
+        if name.value in phase["phase_support"]:
+            assert phase["phase_support"][name.value] == pytest.approx(value, abs=0.002)
+
+    ceiling = np.where(
+        rng.random((30, GRID_LAT, GRID_LON)) < 0.4,
+        np.float32(20.0),
+        rng.uniform(0.2, 12.0, (30, GRID_LAT, GRID_LON)),
+    ).astype(np.float32)
+    cloud_store = _store_with(tmp_path / "cloud", "cloud_ceiling", ceiling)
+    censoring = cloud_censoring_at_cell(
+        "cloud_ceiling", store_path=cloud_store, lead_time_hours=LEAD, lat_idx=5, lon_idx=7
+    )
+    assert censoring is not None
+    summary = cloud_ceiling_ensemble_summary(ceiling[:, 5, 7])
+    assert summary is not None
+    # The counts are integers stored at a step of one member, so they come back exactly.
+    assert censoring["valid_member_count"] == summary.valid_member_count
+    assert censoring["finite_member_count"] == summary.finite_member_count
+    assert censoring["unlimited_member_count"] == summary.unlimited_member_count
+    assert censoring["unlimited_probability"] == pytest.approx(
+        summary.unlimited_probability, abs=1e-4
+    )
+    # And the conditional statistics are the writer's, computed over the finite members.
+    assert censoring["conditional"]["p50"] == pytest.approx(
+        summary.conditional_percentiles["p50"], abs=0.02
+    )
+
+
+def test_a_cell_with_no_rose_reports_an_all_calm_rose_rather_than_nothing(tmp_path) -> None:
+    """An all-calm cell has a rose: every member is in it, and none has a direction.
+
+    The reference's own convention: a calm member is counted as calm and contributes to no
+    sector, so the rose's cells sum to zero and the calm count is the whole member set. The
+    consensus direction is absent -- there is no direction to report -- but the counts are a
+    definite answer and a caller reading them should get it.
+    """
+    from api.services.aggregate_serving import wind_products_from_aggregate
+
+    u = np.full((30, GRID_LAT, GRID_LON), 0.1, dtype=np.float32)
+    v = np.full((30, GRID_LAT, GRID_LON), 0.1, dtype=np.float32)
+    store = _store_with(
+        tmp_path, "wind_10m", u, group_members={"wind_u_10m": u, "wind_v_10m": v}
+    )
+    products = wind_products_from_aggregate(
+        store_path=store,
+        lead_time_hours=LEAD,
+        chunk_row=0,
+        chunk_col=0,
+        row_in_chunk=5,
+        col_in_chunk=7,
+    )
+    assert products is not None
+    assert products["consensus"]["direction_deg"] is None
+    assert products["consensus"]["cardinal"] == "CALM"
+    assert products["rose"]["calm_count"] == 30
+    assert products["rose"]["calm_probability"] == pytest.approx(1.0)
+    assert sum(sector["probability"] for sector in products["rose"]["sectors"]) == 0.0
+
+
+def test_special_variables_are_never_served_from_an_aggregate() -> None:
+    """The list of variables with no stored answer is empty, and stays checked.
+
+    Every response field used to need the members: ``wind_10m``'s consensus vector and rose,
+    ``precipitation_amount_3h``'s phase support, and the two cloud variables' censoring. They
+    are stored fields now (``domain.field_layout``'s supplementary groups), read back by the
+    functions asserted above. The set is kept so a future exception has a home -- and so this
+    fails loudly if one is added without the fields that would answer it.
+    """
+    from api.services.aggregate_serving import (
+        SPECIAL_PER_MEMBER_VARIABLES,
+        aggregate_can_answer,
+    )
+
+    assert SPECIAL_PER_MEMBER_VARIABLES == frozenset()
     # a variable that is aggregated in the ordinary way still passes
     assert aggregate_can_answer("temperature_2m") is True
 
@@ -604,6 +794,9 @@ def test_requesting_members_disqualifies_the_aggregate_path() -> None:
     from api.services.aggregate_serving import aggregate_can_answer
 
     assert aggregate_can_answer("temperature_2m", needs_members=True) is False
+    # Stored products do not change this: the products and the members are different things, and
+    # a response that asks for both has to be answered from the members.
+    assert aggregate_can_answer("wind_10m", needs_members=True) is False
 
 
 def test_only_the_strict_operators_can_be_answered() -> None:
@@ -618,7 +811,6 @@ def test_only_the_strict_operators_can_be_answered() -> None:
 def test_an_unclassified_variable_cannot_be_answered() -> None:
     from api.services.aggregate_serving import aggregate_can_answer
 
-    assert aggregate_can_answer("wind_10m") is False  # special, and therefore refused first
     assert aggregate_can_answer("mystery_variable") is False
 
 

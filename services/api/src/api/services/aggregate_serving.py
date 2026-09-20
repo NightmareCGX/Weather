@@ -42,7 +42,11 @@ from domain.aggregate import (
     quantile_at,
     quantile_function_moments,
 )
-from domain.field_layout import FieldLayoutError, aggregate_fields_for
+from domain.field_layout import (
+    FieldLayoutError,
+    aggregate_fields_for,
+    group_field_names,
+)
 from domain.variable_class import VariableClassError, spec_for
 
 from api.core.aggregate_reader import AggregateGeometry, AggregateShardReader
@@ -50,6 +54,16 @@ from api.core.aggregate_reader import AggregateGeometry, AggregateShardReader
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+#: How the rose group addresses its parts, mirroring ``domain.field_layout``'s declaration: 64
+#: sector-bucket cells, then four consensus scalars, then the nine bucket edges. Named here rather
+#: than imported because the *reader* must not depend on the writer's producer module; the counts
+#: are asserted against the layout by a test, so a layout change cannot silently shift them.
+ROSE_BUCKETS: int = 8
+ROSE_CELL_COUNT: int = 64
+ROSE_SCALAR_OFFSET: int = ROSE_CELL_COUNT
+ROSE_SCALAR_COUNT: int = 4
+ROSE_EDGE_COUNT: int = ROSE_BUCKETS + 1
 
 #: Statistics the platform serves per variable (``EnsembleStatistics``). A caller passing a
 #: different name gets a KeyError from the dataclass rather than a silent zero.
@@ -608,21 +622,506 @@ def gated_exceedance_from_aggregate(
     return gated_read_dataset_with_selector(store_path, select)
 
 
+def cloud_censoring_from_aggregate(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    chunk_row: int,
+    chunk_col: int,
+    row_in_chunk: int,
+    col_in_chunk: int,
+    generation: str | None = None,
+    reader: AggregateShardReader | None = None,
+) -> dict[str, Any] | None:
+    """The cloud variables' per-member censoring, read from their container's own fields.
+
+    What this replaces, and why it is not the same as the callers' member path:
+
+    * ``cloud_ceiling`` splits its members into a finite height and an "unlimited" sentinel and
+      summarises each separately. The **counts** are the container's censoring fields; the
+      conditional statistics are the ``conditional`` group, computed by the writer over exactly
+      the finite members. The member path's own ``min_finite``/``min_valid`` thresholds are its
+      rules, not the container's, so the answer says what was stored and lets the caller decide.
+    * ``cloud_cover_3h`` summarises only the members inside ``[0, 100]``, and its counts have no
+      unlimited class -- the container stores that count as zero rather than leaving it out.
+
+    ``None`` whenever an aggregate cannot answer -- no shard, an unreadable container, an
+    off-grid location -- so the caller uses the members, which remain the reader of record.
+
+    Returns:
+        ``valid_member_count``, ``finite_member_count``, ``unlimited_member_count`` and
+        ``unlimited_probability``, plus the seven conditional statistics under ``conditional_*``
+        (``None`` where the container has no conditional value for that cell).
+    """
+    try:
+        layout = aggregate_fields_for(variable)
+    except FieldLayoutError:
+        return None
+
+    active_reader = reader if reader is not None else AggregateShardReader(store_path)
+    stack = active_reader.read_location(
+        variable,
+        lead_time_hours=lead_time_hours,
+        chunk_row=chunk_row,
+        chunk_col=chunk_col,
+        generation=generation,
+    )
+    if stack is None or stack.shape[0] != layout.n_fields:
+        return None
+
+    point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+
+    def count(value: float) -> int | None:
+        return int(round(value)) if math.isfinite(value) else None
+
+    censoring = point[layout.group_slice("censoring")]
+    valid_count = count(float(censoring[0]))
+    finite_count = count(float(censoring[1]))
+    unlimited_count = count(float(censoring[2]))
+    if valid_count is None:
+        # A cell the aggregator refused: the counts are absent together, so there is nothing to
+        # report and the members can say more.
+        return None
+    probability: float | None = None
+    if unlimited_count is not None and valid_count > 0:
+        probability = unlimited_count / valid_count
+
+    conditional = point[layout.group_slice("conditional")]
+    names = group_field_names("conditional")
+    payload: dict[str, Any] = {
+        "valid_member_count": valid_count,
+        "finite_member_count": finite_count,
+        "unlimited_member_count": unlimited_count,
+        "unlimited_probability": probability,
+    }
+    # The stored names carry the group's own prefix (``COND_MEAN``); the caller wants the
+    # statistics under the names the response schema uses, so the prefix is stripped rather than
+    # re-listed -- a second list would be a second place for the two to drift.
+    conditional_values: dict[str, float] = {}
+    for index, name in enumerate(names):
+        value = float(conditional[index])
+        if math.isfinite(value):
+            conditional_values[name.removeprefix("COND_").lower()] = value
+    payload["conditional"] = conditional_values if conditional_values else None
+    return payload
+
+
+def wind_products_from_aggregate(
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    chunk_row: int,
+    chunk_col: int,
+    row_in_chunk: int,
+    col_in_chunk: int,
+    generation: str | None = None,
+    reader: AggregateShardReader | None = None,
+) -> dict[str, Any] | None:
+    """Serve the wind products -- consensus vector and rose -- from ``wind_10m``'s container.
+
+    Those two products are functions of each member's ``(u, v)`` pair rather than of the speed
+    distribution, so they cannot be read off a distribution. They are stored as fields for
+    exactly that reason (``domain.field_layout``'s rose group), and this is the read side of
+    that decision.
+
+    Two things the container can say that the member path cannot:
+
+    * **the consensus direction's error is bounded and small.** Its angle is stored as a sin/cos
+      pair at a 0.001 step, because a degree field near 0/360 is discontinuous and a fixed-point
+      angle would need 360/step (past int16 beyond a step of 0.1). Measured over a full sweep,
+      the worst-case recovery error is **0.04 degrees** and the mean 0.014 -- inside the 0.1
+      degrees the response rounds to.
+    * **the calm count is derived, not stored.** The rose's cells sum to the share of *non-calm*
+      members -- a calm member has no direction -- so the calm count is the members less the
+      non-calm ones the rose accounts for. It is ``None`` when the container has no rose at all.
+
+    ``None`` whenever an aggregate cannot answer.
+
+    Returns:
+        ``{"consensus": {...}, "rose": {...}}``, or ``None``. The rose's sector probabilities
+        are fractions of the member set and its ``bins``' keys are bucket indices -- the bucket
+        *edges* travel as fields, because they are quantiles of this cycle's member set and a
+        reader cannot label a bucket without them.
+    """
+    from domain.models.wind import (
+        CARDINAL_DIRECTIONS_8,
+        derive_meteorological_direction,
+    )
+
+    try:
+        layout = aggregate_fields_for("wind_10m")
+    except FieldLayoutError:  # pragma: no cover - the variable is registered
+        return None
+
+    active_reader = reader if reader is not None else AggregateShardReader(store_path)
+    stack = active_reader.read_location(
+        "wind_10m",
+        lead_time_hours=lead_time_hours,
+        chunk_row=chunk_row,
+        chunk_col=chunk_col,
+        generation=generation,
+    )
+    if stack is None or stack.shape[0] != layout.n_fields:
+        return None
+
+    point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    member_count = float(point[0])
+    if not math.isfinite(member_count) or member_count <= 0:
+        return None
+
+    rose_fields_point = point[layout.group_slice("rose")]
+    scalars = rose_fields_point[
+        ROSE_SCALAR_OFFSET : ROSE_SCALAR_OFFSET + ROSE_SCALAR_COUNT
+    ]
+    edges = rose_fields_point[-ROSE_EDGE_COUNT:]
+    consensus_speed_mps = float(scalars[0])
+    coherence = float(scalars[1])
+    direction_sin = float(scalars[2])
+    direction_cos = float(scalars[3])
+    if not all(
+        math.isfinite(value)
+        for value in (consensus_speed_mps, coherence, direction_sin, direction_cos)
+    ):
+        # No member had a direction here -- an all-calm or all-missing cell -- so there is no
+        # consensus to report and the members can say more about why.
+        return None
+
+    mean_u = -consensus_speed_mps * direction_sin
+    mean_v = -consensus_speed_mps * direction_cos
+    direction_deg = derive_meteorological_direction(mean_u, mean_v)
+    cardinal = (
+        CARDINAL_DIRECTIONS_8[
+            int(math.floor(((direction_deg or 0.0) + 22.5) / 45.0)) % len(CARDINAL_DIRECTIONS_8)
+        ]
+        if direction_deg is not None
+        else "CALM"
+    )
+
+    cells = rose_fields_point[:ROSE_CELL_COUNT]
+    if not np.isfinite(cells).all():
+        return None
+    # The rose holds a share of the non-calm members, so the calm count is what it leaves over.
+    non_calm = float(np.sum(cells)) * member_count
+    calm_count = int(round(member_count - non_calm))
+    sectors: list[dict[str, Any]] = []
+    for sector_index, name in enumerate(CARDINAL_DIRECTIONS_8):
+        sector_cells = cells[
+            sector_index * ROSE_BUCKETS : (sector_index + 1) * ROSE_BUCKETS
+        ]
+        probability = float(np.sum(sector_cells))
+        sectors.append(
+            {
+                "sector": name,
+                "count": int(round(probability * member_count)),
+                "probability": probability,
+                "bins": {
+                    str(bucket): float(sector_cells[bucket])
+                    for bucket in range(ROSE_BUCKETS)
+                },
+            }
+        )
+    return {
+        "consensus": {
+            "speed_mps": consensus_speed_mps,
+            "direction_deg": direction_deg,
+            "cardinal": cardinal,
+            "coherence": coherence,
+        },
+        "rose": {
+            "calm_count": calm_count,
+            "calm_probability": calm_count / member_count,
+            "member_count": int(round(member_count)),
+            "bucket_edges_mps": [float(edge) for edge in edges],
+            "sectors": sectors,
+        },
+    }
+
+
+def precipitation_phase_from_aggregate(
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    chunk_row: int,
+    chunk_col: int,
+    row_in_chunk: int,
+    col_in_chunk: int,
+    generation: str | None = None,
+    reader: AggregateShardReader | None = None,
+) -> dict[str, Any] | None:
+    """Serve the precipitation phase support and transition frequencies from the container.
+
+    The phase group stores the six physical-phase supports for the current interval and the six
+    for its predecessor, which is what ``phase_support`` reports; the transition group stores the
+    twenty categories. Both are functions of the per-member flags rather than of the amount
+    distribution, which is why they are fields.
+
+    ``transition_frequency`` is keyed by category value, and the zero-frequency categories are
+    **kept**: the member path drops them, but a stored field is a count and a reader that wants
+    to know a category is never reached should not have to infer it from an absence.
+
+    ``phase_support`` is keyed by :class:`~domain.models.precipitation.PhysicalPhase` value. A
+    cell whose phase planes are all absent (a lead with no predecessor, or no member the
+    classifier could read) reports ``None`` for the affected planes rather than zeros: a zero
+    would claim the ensemble said "not that phase", and the container's own statement is that it
+    has nothing to say.
+
+    ``None`` whenever an aggregate cannot answer.
+    """
+    from domain.models.precipitation import PhysicalPhase, PrecipitationTransition
+
+    try:
+        layout = aggregate_fields_for("precipitation_amount_3h")
+    except FieldLayoutError:  # pragma: no cover - the variable is registered
+        return None
+
+    active_reader = reader if reader is not None else AggregateShardReader(store_path)
+    stack = active_reader.read_location(
+        "precipitation_amount_3h",
+        lead_time_hours=lead_time_hours,
+        chunk_row=chunk_row,
+        chunk_col=chunk_col,
+        generation=generation,
+    )
+    if stack is None or stack.shape[0] != layout.n_fields:
+        return None
+
+    point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    member_count = float(point[0])
+    if not math.isfinite(member_count) or member_count <= 0:
+        return None
+
+    phase = point[layout.group_slice("phase")]
+    current = phase[: len(PhysicalPhase)]
+    previous = phase[len(PhysicalPhase) :]
+    support: dict[str, float | None] = {}
+    for index, phase_name in enumerate(PhysicalPhase):
+        value = float(current[index])
+        support[phase_name.value] = value if math.isfinite(value) else None
+        previous_value = float(previous[index])
+        if math.isfinite(previous_value):
+            support[f"previous_{phase_name.value}"] = previous_value
+    if all(value is None for value in support.values()):
+        return None
+
+    transition = point[layout.group_slice("transition")]
+    frequencies = {
+        name.value: float(transition[index])
+        for index, name in enumerate(PrecipitationTransition)
+        if math.isfinite(float(transition[index]))
+    }
+    return {
+        "member_count": int(round(member_count)),
+        "phase_support": support,
+        "transition_frequency": frequencies,
+    }
+
+
+def cloud_censoring_at_cell(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    lat_idx: int,
+    lon_idx: int,
+    generation: str | None = None,
+) -> dict[str, Any] | None:
+    """Censoring from a container addressed by absolute grid indices."""
+    active_reader = AggregateShardReader(store_path)
+    geometry = active_reader.open(variable, lead_time_hours, generation=generation)
+    if geometry is None or not (
+        0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon
+    ):
+        return None
+    chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
+    chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
+    return cloud_censoring_from_aggregate(
+        variable,
+        store_path=store_path,
+        lead_time_hours=lead_time_hours,
+        chunk_row=chunk_row,
+        chunk_col=chunk_col,
+        row_in_chunk=row_in_chunk,
+        col_in_chunk=col_in_chunk,
+        generation=generation,
+        reader=active_reader,
+    )
+
+
+def gated_wind_products(
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    generation: str | None = None,
+) -> dict[str, Any] | None:
+    """The wind products for a geographic point, under the reader gate.
+
+    The cell is derived from the store's own coordinate axes inside the same gate the member path
+    uses, because the descriptor carries extents but not axis values (see
+    :func:`gated_statistics_from_aggregate`).
+    """
+    from api.core.manifest_reader import manifest_generation
+    from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.services.point_forecast import _derive_grid
+
+    resolved_generation = generation
+    if resolved_generation is None:
+        resolved_generation = manifest_generation(store_path)
+
+    def select(dataset: Any) -> dict[str, Any] | None:
+        if "wind_10m" not in dataset.data_vars and not (
+            "wind_u_10m" in dataset.data_vars and "wind_v_10m" in dataset.data_vars
+        ):
+            return None
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        try:
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
+            return None
+        row = min(int(math.floor(row_f)), grid.rows - 1)
+        col = min(int(math.floor(col_f)), grid.cols - 1)
+
+        def stored(value: int, size: int, descending: bool) -> int:
+            return (size - 1 - value) if descending else value
+
+        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
+        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
+        geometry = AggregateShardReader(store_path).open(
+            "wind_10m", lead_time_hours, generation=resolved_generation
+        )
+        if geometry is None or not (
+            0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon
+        ):
+            return None
+        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
+        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
+        return wind_products_from_aggregate(
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            chunk_row=chunk_row,
+            chunk_col=chunk_col,
+            row_in_chunk=row_in_chunk,
+            col_in_chunk=col_in_chunk,
+            generation=resolved_generation,
+        )
+
+    return gated_read_dataset_with_selector(store_path, select)
+
+
+def gated_precipitation_phase(
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    generation: str | None = None,
+) -> dict[str, Any] | None:
+    """The precipitation phase products for a geographic point, under the reader gate."""
+    from api.core.manifest_reader import manifest_generation
+    from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.services.point_forecast import _derive_grid
+
+    resolved_generation = generation
+    if resolved_generation is None:
+        resolved_generation = manifest_generation(store_path)
+
+    def select(dataset: Any) -> dict[str, Any] | None:
+        if "precipitation_amount_3h" not in dataset.data_vars:
+            return None
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        try:
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
+            return None
+        row = min(int(math.floor(row_f)), grid.rows - 1)
+        col = min(int(math.floor(col_f)), grid.cols - 1)
+
+        def stored(value: int, size: int, descending: bool) -> int:
+            return (size - 1 - value) if descending else value
+
+        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
+        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
+        geometry = AggregateShardReader(store_path).open(
+            "precipitation_amount_3h", lead_time_hours, generation=resolved_generation
+        )
+        if geometry is None or not (
+            0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon
+        ):
+            return None
+        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
+        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
+        return precipitation_phase_from_aggregate(
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            chunk_row=chunk_row,
+            chunk_col=chunk_col,
+            row_in_chunk=row_in_chunk,
+            col_in_chunk=col_in_chunk,
+            generation=resolved_generation,
+        )
+
+    return gated_read_dataset_with_selector(store_path, select)
+
+
+def gated_cloud_censoring(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    generation: str | None = None,
+) -> dict[str, Any] | None:
+    """The cloud censoring counts and conditional statistics for a point, under the reader gate."""
+    from api.core.manifest_reader import manifest_generation
+    from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.services.point_forecast import _derive_grid
+
+    resolved_generation = generation
+    if resolved_generation is None:
+        resolved_generation = manifest_generation(store_path)
+
+    def select(dataset: Any) -> dict[str, Any] | None:
+        if variable not in dataset.data_vars:
+            return None
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        try:
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
+            return None
+        row = min(int(math.floor(row_f)), grid.rows - 1)
+        col = min(int(math.floor(col_f)), grid.cols - 1)
+
+        def stored(value: int, size: int, descending: bool) -> int:
+            return (size - 1 - value) if descending else value
+
+        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
+        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
+        return cloud_censoring_at_cell(
+            variable,
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            lat_idx=lat_idx,
+            lon_idx=lon_idx,
+            generation=resolved_generation,
+        )
+
+    return gated_read_dataset_with_selector(store_path, select)
+
+
 #: Variables whose response carries something an aggregate cannot represent, because it is a
 #: function of the *per-member values* rather than of the distribution.
 #:
-#: ``wind_10m`` returns a consensus vector and a wind rose, both computed from each member's
-#: ``(u, v)`` pair; a statistic of the speed distribution does not determine them.
-#: ``precipitation_amount_3h`` returns a phase-support map and transition frequencies, built
-#: from each member's 0/1 phase flag. ``cloud_ceiling`` splits its members into a finite height
-#: and an "unlimited" sentinel before summarising, and ``cloud_cover_3h`` summarises only the
-#: members inside ``[0, 100]`` -- both are per-member censoring, which a collapsed distribution
-#: has already lost.
-#:
-#: These are served from the member shards, which the aggregate phase does not replace.
-SPECIAL_PER_MEMBER_VARIABLES: frozenset[str] = frozenset(
-    {"wind_10m", "precipitation_amount_3h", "cloud_ceiling", "cloud_cover_3h"}
-)
+#: This set is now **empty**, and that is the point of the supplementary groups: ``wind_10m``'s
+#: consensus vector and rose, ``precipitation_amount_3h``'s phase support and transitions, and
+#: the two cloud variables' censoring are all stored as fields, computed by the same arithmetic
+#: the member path uses (``domain.product_fields``) and read back by the functions above. The set
+#: is kept rather than deleted because it is the place a future variable's exception would go,
+#: and because the capability check below reads from it -- an empty set is a fact about the
+#: design, not an unfinished list.
+SPECIAL_PER_MEMBER_VARIABLES: frozenset[str] = frozenset()
 
 #: The strict operators a stored distribution can answer. ``gte``/``lte`` count members *at*
 #: the threshold, which needs the atom at that value; see :func:`exceedance_probability`.
@@ -687,7 +1186,17 @@ __all__ = [
     "AggregatePointProbability",
     "AggregatePointStatistics",
     "aggregate_can_answer",
+    "cloud_censoring_at_cell",
+    "cloud_censoring_from_aggregate",
     "exceedance_probability",
+    "gated_cloud_censoring",
+    "gated_exceedance_from_aggregate",
+    "gated_precipitation_phase",
+    "gated_statistics_from_aggregate",
+    "gated_wind_products",
+    "precipitation_phase_from_aggregate",
     "statistics_from_aggregate",
+    "statistics_from_aggregate_at_cell",
     "try_read_aggregate",
+    "wind_products_from_aggregate",
 ]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime
 from typing import Any, Literal
 
 import numpy as np
@@ -474,19 +475,58 @@ def build_ensemble_statistics(
     # range per field group instead of a read and an interpolation per member. ``None`` means
     # "no aggregate answers this", and the member path below stays the reader of record.
     #
-    # The response carries the statistics only. That is deliberate and it is the response's
-    # own contract: an aggregate is a function of the whole member set, so every request that
-    # asks for more -- the raw members, the KDE built from them, a per-member consensus vector
-    # or phase support, a censoring rule applied member by member -- is answered from the
-    # member shards instead, which the aggregate phase does not replace.
+    # Two responses are still the member path's alone: the raw members and the KDE built from
+    # them. Both are what ``include_members`` asks for, and an aggregate has collapsed the
+    # members by construction -- there is no reading of a stored distribution that returns them.
+    # Every other field in the response is stored: the statistics are the distribution, and the
+    # consensus vector, rose, phase support, transition frequencies and censoring counts are the
+    # supplementary groups (``domain.field_layout``), computed once per cycle by the same
+    # arithmetic this module applies per request.
     if not series_mode:
         from api.services.aggregate_serving import (
             aggregate_can_answer,
+            gated_cloud_censoring,
+            gated_precipitation_phase,
             gated_statistics_from_aggregate,
+            gated_wind_products,
             try_read_aggregate,
         )
 
-        if aggregate_can_answer(variable, needs_members=include_members):
+        served_products: dict[str, Any] | None = None
+        if variable == "wind_10m":
+            served_products = try_read_aggregate(
+                lambda: gated_wind_products(
+                    store_path=str(store_path_str),
+                    lead_time_hours=lead_time_hours,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
+        elif variable == "precipitation_amount_3h":
+            served_products = try_read_aggregate(
+                lambda: gated_precipitation_phase(
+                    store_path=str(store_path_str),
+                    lead_time_hours=lead_time_hours,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
+        elif variable in ("cloud_ceiling", "cloud_cover_3h"):
+            served_products = try_read_aggregate(
+                lambda: gated_cloud_censoring(
+                    variable,
+                    store_path=str(store_path_str),
+                    lead_time_hours=lead_time_hours,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
+
+        # The raw members and the KDE built from them are the one thing an aggregate cannot
+        # answer: it has collapsed the members by construction. A request that asks for them
+        # takes the member path for the whole response, rather than mixing a stored product with
+        # an absent member list.
+        if not include_members and aggregate_can_answer(variable):
             served = try_read_aggregate(
                 lambda: gated_statistics_from_aggregate(
                     variable,
@@ -504,11 +544,13 @@ def build_ensemble_statistics(
                     member_indices=avail_members,
                 )
                 served_stats = EnsembleStatistics(**served.as_ensemble_statistics_kwargs())
-                return EnsembleStatisticsData(
+                return _ensemble_payload_from_aggregate(
                     model=model,
                     lead_time_hours=lead_time_hours,
                     member_count=served.member_count,
                     statistics=served_stats,
+                    products=served_products,
+                    source_cycle=None,
                 )
 
     consensus_payload: ConsensusVectorOut | None = None
@@ -714,6 +756,113 @@ def build_ensemble_statistics(
         statistics=stats,
         members=participating_members if include_members else None,
         pdf=pdf_payload if include_members else None,
+        consensus_vector=consensus_payload,
+        wind_rose=wind_rose_payload,
+        phase_support=phase_support_payload,
+        transition_frequency=transition_freq_payload,
+        valid_member_count=valid_member_count_payload,
+        unlimited_probability=unlimited_prob_payload,
+        finite_member_count=finite_member_count_payload,
+        unlimited_member_count=unlimited_member_count_payload,
+    )
+
+
+def _ensemble_payload_from_aggregate(
+    *,
+    model: str,
+    lead_time_hours: int,
+    member_count: int,
+    statistics: EnsembleStatistics,
+    products: dict[str, Any] | None,
+    source_cycle: datetime | None,
+) -> EnsembleStatisticsData:
+    """Assemble a response from a container's stored fields, with no member read.
+
+    The stored-field shapes are the response's own shapes, so this is a translation and nothing
+    else: which supplementary group answers which response field is decided by the *variable*,
+    because that is what the group was computed for. A field the container does not carry stays
+    ``None`` -- the response schema models every one of them as optional, and ``None`` is how it
+    says "this store's container has nothing for this lead", which is a different statement from
+    a zero.
+    """
+    consensus_payload: ConsensusVectorOut | None = None
+    wind_rose_payload: WindRoseOut | None = None
+    phase_support_payload: dict[str, float] | None = None
+    transition_freq_payload: dict[str, float] | None = None
+    valid_member_count_payload: int | None = None
+    unlimited_prob_payload: float | None = None
+    finite_member_count_payload: int | None = None
+    unlimited_member_count_payload: int | None = None
+
+    if products is not None:
+        if "consensus" in products:
+            consensus = products["consensus"]
+            consensus_payload = ConsensusVectorOut(
+                speed=round(float(consensus["speed_mps"]) * 3.6, 2),
+                direction=(
+                    round(float(consensus["direction_deg"]), 1)
+                    if consensus["direction_deg"] is not None
+                    else None
+                ),
+                cardinal=str(consensus["cardinal"]),
+                coherence=round(float(consensus["coherence"]), 4),
+            )
+        if "rose" in products:
+            rose = products["rose"]
+            wind_rose_payload = WindRoseOut(
+                calm_percentage=round(float(rose["calm_probability"]) * 100.0, 1),
+                calm_count=int(rose["calm_count"]),
+                sectors=[
+                    WindRoseSectorOut(
+                        sector=str(sector["sector"]),
+                        count=int(sector["count"]),
+                        probability=round(float(sector["probability"]), 4),
+                        bins={
+                            key: round(float(value), 4)
+                            for key, value in sector["bins"].items()
+                        },
+                    )
+                    for sector in rose["sectors"]
+                ],
+            )
+        if "phase_support" in products:
+            support = products["phase_support"]
+            # The container's phase planes are its own names, including the predecessor's; the
+            # response reports the current interval's support, which is what the member path's
+            # ``aggregate_ensemble_phase_support`` returns.
+            phase_support_payload = {
+                name: round(float(value), 4)
+                for name, value in support.items()
+                if value is not None and not name.startswith("previous_")
+            }
+        if "transition_frequency" in products:
+            transition_freq_payload = {
+                name: round(float(value), 4)
+                for name, value in products["transition_frequency"].items()
+            }
+        if "valid_member_count" in products:
+            valid_member_count_payload = products["valid_member_count"]
+            unlimited_prob_payload = products["unlimited_probability"]
+            finite_member_count_payload = products["finite_member_count"]
+            unlimited_member_count_payload = products["unlimited_member_count"]
+            conditional = products["conditional"]
+            if conditional:
+                statistics = EnsembleStatistics(
+                    mean=conditional.get("mean"),
+                    median=conditional.get("p50"),
+                    spread=conditional.get("spread"),
+                    p10=conditional.get("p10"),
+                    p25=conditional.get("p25"),
+                    p50=conditional.get("p50"),
+                    p75=conditional.get("p75"),
+                    p90=conditional.get("p90"),
+                )
+
+    return EnsembleStatisticsData(
+        model=model,
+        lead_time_hours=lead_time_hours,
+        member_count=member_count,
+        statistics=statistics,
         consensus_vector=consensus_payload,
         wind_rose=wind_rose_payload,
         phase_support=phase_support_payload,

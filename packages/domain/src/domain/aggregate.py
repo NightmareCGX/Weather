@@ -123,6 +123,12 @@ NAN_SENTINEL: Final[int] = -32768
 #: it as a field rather than in the descriptor is deliberate: the count is **per cell** (one
 #: member can be missing at one cell and present at its neighbour), while a descriptor is per
 #: container, so a descriptor field could only hold the container-wide total.
+#:
+#: What it counts, precisely: the members the variable's *own* values are finite for. A
+#: supplementary group may cover fewer members than that -- the phase group needs the four flags
+#: as well, and a derived variable's rose needs both components -- and a group says so by writing
+#: NaN at the cells it cannot describe. So "the count is 30 and this cell's phase support is NaN"
+#: is coherent: the count describes the distribution, the group describes itself.
 MEMBER_COUNT_FIELD_NAME: Final[str] = "MEMBER_COUNT"
 
 #: Scale of the member-count field. The count is an exact integer that must survive the

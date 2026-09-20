@@ -427,7 +427,11 @@ def _ceiling_members(seed: int = 11):
 
 
 def test_ceiling_censoring_matches_the_member_summary_cell_by_cell() -> None:
-    """The stored counts and conditional statistics must equal the member path's own summary."""
+    """The stored counts and conditional statistics must equal the member path's own summary.
+
+    The counts are integers and are compared as such: the serving path reports
+    ``valid_member_count`` as a count, and a count is what the coverage rule is evaluated against.
+    """
     members = _ceiling_members(seed=12)
     fields = cloud_censoring_fields(members, variable="cloud_ceiling")
     assert fields.shape == (10, LAT, LON)
@@ -435,14 +439,13 @@ def test_ceiling_censoring_matches_the_member_summary_cell_by_cell() -> None:
     for row in range(LAT):
         for col in range(LON):
             summary = cloud_ceiling_ensemble_summary(members[:, row, col])
-            assert fields[0, row, col] == pytest.approx(
-                summary.valid_member_count / N_MEMBERS
-            )
-            assert fields[1, row, col] == pytest.approx(
-                summary.finite_member_count / N_MEMBERS
-            )
-            assert fields[2, row, col] == pytest.approx(
-                summary.unlimited_member_count / N_MEMBERS
+            assert fields[0, row, col] == summary.valid_member_count
+            assert fields[1, row, col] == summary.finite_member_count
+            assert fields[2, row, col] == summary.unlimited_member_count
+            # The three counts account for the whole member set, which is what makes them
+            # readable as counts rather than as share-of-something.
+            assert (
+                fields[1, row, col] + fields[2, row, col] == fields[0, row, col]
             )
             expected = [
                 summary.conditional_mean,
@@ -468,10 +471,8 @@ def test_cover_censoring_matches_the_member_summary_and_has_no_unlimited_class()
     for row in range(LAT):
         for col in range(LON):
             summary = cloud_cover_ensemble_summary(members[:, row, col], min_valid=1)
-            assert fields[0, row, col] == pytest.approx(
-                summary.valid_member_count / N_MEMBERS
-            )
-            assert fields[1, row, col] == pytest.approx(fields[0, row, col])
+            assert fields[0, row, col] == summary.valid_member_count
+            assert fields[1, row, col] == fields[0, row, col]
             expected = [
                 summary.mean,
                 summary.spread,
@@ -481,6 +482,25 @@ def test_cover_censoring_matches_the_member_summary_and_has_no_unlimited_class()
                 ],
             ]
             assert fields[3:, row, col] == pytest.approx(expected, abs=1e-3), (row, col)
+
+
+def test_the_censoring_counts_are_stored_exactly_at_their_step() -> None:
+    """A count is an integer, and its step is one member, so the round trip is exact.
+
+    This is the property that makes the field representable at all: its group's step is 1.0, so
+    anything that is not an integer -- a fraction of the member set, for instance -- quantises to
+    zero or one and is lost. Measured through the real writer and reader before the fields became
+    counts: a cell with 19 of 30 finite members decoded as ``FINITE_COUNT = 0.0``.
+    """
+    from domain.aggregate import dequantise_field, quantise_field
+    from domain.field_layout import group_field_scales
+
+    members = _ceiling_members(seed=15)
+    fields = cloud_censoring_fields(members, variable="cloud_ceiling")
+    scale = group_field_scales("censoring")[0]
+    for index in range(3):
+        stored = dequantise_field(quantise_field(fields[index], scale), scale)
+        assert np.array_equal(stored, fields[index]), index
 
 
 def test_a_cell_with_no_finite_member_has_no_conditional_statistics() -> None:
@@ -494,12 +514,12 @@ def test_a_cell_with_no_finite_member_has_no_conditional_statistics() -> None:
     members[:, 0, 1] = np.nan
     fields = cloud_censoring_fields(members, variable="cloud_ceiling")
     # The all-unlimited cell has counts but no finite member, so the conditionals are absent.
-    assert fields[0, 0, 0] == pytest.approx(1.0)
-    assert fields[1, 0, 0] == pytest.approx(0.0)
-    assert fields[2, 0, 0] == pytest.approx(1.0)
+    assert fields[0, 0, 0] == N_MEMBERS
+    assert fields[1, 0, 0] == 0
+    assert fields[2, 0, 0] == N_MEMBERS
     assert np.isnan(fields[3:, 0, 0]).all()
     # The all-NaN cell has no valid member at all.
-    assert fields[0, 0, 1] == pytest.approx(0.0)
+    assert fields[0, 0, 1] == 0
     assert np.isnan(fields[3:, 0, 1]).all()
 
 
