@@ -17,6 +17,10 @@ import math
 import numpy as np
 import pytest
 from domain.aggregate import AggregateError
+from domain.models.cloud import (
+    cloud_ceiling_ensemble_summary,
+    cloud_cover_ensemble_summary,
+)
 from domain.models.precipitation import (
     PhysicalPhase,
     PrecipitationTransition,
@@ -29,6 +33,7 @@ from domain.product_fields import (
     FLAG_NAMES,
     ROSE_BUCKETS,
     ROSE_SECTORS,
+    cloud_censoring_fields,
     fraction_of_members,
     phase_support_fields,
     rose_fields,
@@ -380,3 +385,102 @@ def test_a_malformed_flag_stack_is_refused() -> None:
         phase_support_fields(amounts, flags, amounts_prev=amounts)
     with pytest.raises(AggregateError, match="both its amounts and its flags"):
         transition_fields(amounts, flags, flags_prev=flags)
+
+
+# ---------------------------------------------------------------------------
+# Cloud censoring
+# ---------------------------------------------------------------------------
+
+
+def _ceiling_members(seed: int = 11):
+    """Thirty members with roughly 40% of them at the unlimited sentinel."""
+    rng = np.random.default_rng(seed)
+    unlimited = rng.random((N_MEMBERS, LAT, LON)) < 0.40
+    return np.where(
+        unlimited, 20.0, rng.uniform(0.2, 12.0, (N_MEMBERS, LAT, LON))
+    ).astype(np.float32)
+
+
+def test_ceiling_censoring_matches_the_member_summary_cell_by_cell() -> None:
+    """The stored counts and conditional statistics must equal the member path's own summary."""
+    members = _ceiling_members(seed=12)
+    fields = cloud_censoring_fields(members, variable="cloud_ceiling")
+    assert fields.shape == (10, LAT, LON)
+
+    for row in range(LAT):
+        for col in range(LON):
+            summary = cloud_ceiling_ensemble_summary(members[:, row, col])
+            assert fields[0, row, col] == pytest.approx(
+                summary.valid_member_count / N_MEMBERS
+            )
+            assert fields[1, row, col] == pytest.approx(
+                summary.finite_member_count / N_MEMBERS
+            )
+            assert fields[2, row, col] == pytest.approx(
+                summary.unlimited_member_count / N_MEMBERS
+            )
+            expected = [
+                summary.conditional_mean,
+                summary.conditional_spread,
+                *[
+                    summary.conditional_percentiles[level]
+                    for level in ("p10", "p25", "p50", "p75", "p90")
+                ],
+            ]
+            assert fields[3:, row, col] == pytest.approx(expected, abs=1e-4), (
+                row,
+                col,
+            )
+
+
+def test_cover_censoring_matches_the_member_summary_and_has_no_unlimited_class() -> None:
+    members = np.random.default_rng(13).uniform(0, 100, (N_MEMBERS, LAT, LON))
+    # A tenth of the members are outside the physical range and must be excluded.
+    members[np.random.default_rng(14).random((N_MEMBERS, LAT, LON)) < 0.1] = 120.0
+    fields = cloud_censoring_fields(members.astype(np.float32), variable="cloud_cover_3h")
+    assert (fields[2] == 0.0).all(), "cloud cover has no unlimited class"
+
+    for row in range(LAT):
+        for col in range(LON):
+            summary = cloud_cover_ensemble_summary(members[:, row, col], min_valid=1)
+            assert fields[0, row, col] == pytest.approx(
+                summary.valid_member_count / N_MEMBERS
+            )
+            assert fields[1, row, col] == pytest.approx(fields[0, row, col])
+            expected = [
+                summary.mean,
+                summary.spread,
+                *[
+                    summary.percentiles[level]
+                    for level in ("p10", "p25", "p50", "p75", "p90")
+                ],
+            ]
+            assert fields[3:, row, col] == pytest.approx(expected, abs=1e-3), (row, col)
+
+
+def test_a_cell_with_no_finite_member_has_no_conditional_statistics() -> None:
+    """The conditional median needs the finite members: a mixture cannot supply it.
+
+    The unlimited members are a point mass at the top of the range, so a percentile of the
+    mixture says how much mass lies below it and nothing about the finite spread below that --
+    which is why the conditional fields are stored rather than derived.
+    """
+    members = np.full((N_MEMBERS, 1, 2), 20.0, dtype=np.float32)
+    members[:, 0, 1] = np.nan
+    fields = cloud_censoring_fields(members, variable="cloud_ceiling")
+    # The all-unlimited cell has counts but no finite member, so the conditionals are absent.
+    assert fields[0, 0, 0] == pytest.approx(1.0)
+    assert fields[1, 0, 0] == pytest.approx(0.0)
+    assert fields[2, 0, 0] == pytest.approx(1.0)
+    assert np.isnan(fields[3:, 0, 0]).all()
+    # The all-NaN cell has no valid member at all.
+    assert fields[0, 0, 1] == pytest.approx(0.0)
+    assert np.isnan(fields[3:, 0, 1]).all()
+
+
+def test_censoring_refuses_a_variable_with_no_rule() -> None:
+    members = np.zeros((N_MEMBERS, 1, 1), dtype=np.float32)
+    with pytest.raises(AggregateError, match="no censoring rule"):
+        cloud_censoring_fields(members, variable="temperature_2m")
+    with pytest.raises(AggregateError, match="must be"):
+        cloud_censoring_fields(np.zeros((1, 1), dtype=np.float32), variable="cloud_ceiling")

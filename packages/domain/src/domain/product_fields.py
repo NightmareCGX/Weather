@@ -33,12 +33,14 @@ asserted to be injective with respect to the classifier's inputs in the tests.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 
 import numpy as np
 import numpy.typing as npt
 
 from domain.aggregate import AggregateError
+from domain.models.cloud import CLOUD_CEILING_UNLIMITED_THRESHOLD_KM
 from domain.models.precipitation import (
     PhysicalPhase,
     PrecipitationTransition,
@@ -555,6 +557,7 @@ def _mean_over_members(
 
 __all__ = [
     "FLAG_NAMES",
+    "cloud_censoring_fields",
     "FLAG_THRESHOLD",
     "ROSE_BUCKETS",
     "ROSE_SECTORS",
@@ -563,3 +566,113 @@ __all__ = [
     "rose_fields",
     "transition_fields",
 ]
+
+
+def cloud_censoring_fields(
+    members: npt.NDArray[np.floating],
+    *,
+    variable: str,
+) -> npt.NDArray[np.float32]:
+    """The three counts a cloud variable takes before summarising, and its conditional statistics.
+
+    Returns ``(4, lat, lon)`` for the censoring group (valid, finite, unlimited counts as
+    fractions of the member set) followed by the seven conditional fields (mean, spread and the
+    five percentiles, over the finite members).
+
+    The counts are stored as **fractions of the member set** rather than as member counts, for the
+    same reason the member-count field is a number: a fraction composes with the count field, so a
+    reader multiplying the two recovers the count, while a count alone cannot be sanity-checked
+    against the member set it came from. ``valid_count`` is the quantity the API reports as
+    ``valid_member_count``, and it is what the serving coverage rule reads once the members are
+    gone -- an integer count would also do, but the fraction needs no second field to interpret.
+
+    The conditional statistics are stored because they cannot be recovered from a mixture. The
+    unlimited members of a ceiling field sit at one value (the 20 km sentinel), so a percentile of
+    the mixture says how much mass lies below it and nothing about how the finite mass is spread
+    below that; recovering the conditional median needs the finite members themselves.
+
+    Args:
+        members: ``(n_members, lat, lon)`` the variable's member values.
+        variable: ``"cloud_ceiling"`` or ``"cloud_cover_3h"``, which decide the censoring rule.
+
+    Returns:
+        ``(10, lat, lon)``: valid, finite and unlimited fractions, then the conditional mean,
+        spread, p10, p25, p50, p75 and p90.
+
+    Raises:
+        AggregateError: for an unknown variable, or a member stack that is not 3-D.
+    """
+    if members.ndim != 3:
+        raise AggregateError(
+            f"members must be (n_members, lat, lon); got shape {members.shape}"
+        )
+    if variable == "cloud_ceiling":
+        return _ceiling_censoring(members)
+    if variable == "cloud_cover_3h":
+        return _cover_censoring(members)
+    raise AggregateError(
+        f"{variable!r} has no censoring rule; this is for the bounded cloud variables"
+    )
+
+
+def _ceiling_censoring(members: npt.NDArray[np.floating]) -> npt.NDArray[np.float32]:
+    """Ceiling: finite below the sentinel, unlimited at or above it, out-of-range excluded."""
+    values = members.astype(np.float32, copy=False)
+    finite_member = np.isfinite(values)
+    in_range = finite_member & (values >= 0.0)
+    unlimited = in_range & (values >= CLOUD_CEILING_UNLIMITED_THRESHOLD_KM)
+    finite = in_range & ~unlimited
+    conditional = finite.astype(np.float32)
+    return _censoring_payload(in_range, finite, unlimited, values, conditional)
+
+
+def _cover_censoring(members: npt.NDArray[np.floating]) -> npt.NDArray[np.float32]:
+    """Cover: in range is [0, 100]; there is no unlimited class, so that count is zero."""
+    values = members.astype(np.float32, copy=False)
+    in_range = np.isfinite(values) & (values >= 0.0) & (values <= 100.0)
+    unlimited = np.zeros_like(in_range)
+    conditional = in_range.astype(np.float32)
+    return _censoring_payload(in_range, in_range, unlimited, values, conditional)
+
+
+def _censoring_payload(
+    in_range: npt.NDArray[np.bool_],
+    finite: npt.NDArray[np.bool_],
+    unlimited: npt.NDArray[np.bool_],
+    values: npt.NDArray[np.float32],
+    conditional: npt.NDArray[np.float32],
+) -> npt.NDArray[np.float32]:
+    """The three fractions and the seven conditional fields, computed over the finite members.
+
+    A cell with no finite member has no conditional statistics and reports NaN for all seven,
+    rather than zeros that would read as a distribution concentrated at zero.
+    """
+    total = values.shape[0]
+    denominator = np.full(values.shape[1:], float(total))
+    valid_fraction = in_range.sum(axis=_MEMBER_AXIS) / denominator
+    finite_fraction = finite.sum(axis=_MEMBER_AXIS) / denominator
+    unlimited_fraction = unlimited.sum(axis=_MEMBER_AXIS) / denominator
+
+    masked = np.where(finite, values, np.nan)
+    counts = finite.sum(axis=_MEMBER_AXIS)
+    enough = counts >= 1
+    # The percentile convention is the member path's: linear interpolation over the finite
+    # members, sorted. A cell with no finite member makes the NaN-aware reductions report an
+    # empty slice, which numpy announces with a warning even though NaN is exactly the answer
+    # wanted here; the warning is silenced rather than the array masked, because masking would
+    # need a gather and a scatter to reach the same NaN.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean = np.nanmean(masked, axis=_MEMBER_AXIS)
+        spread = np.nanstd(masked, axis=_MEMBER_AXIS)
+        percentiles = [
+            np.nanpercentile(masked, level, axis=_MEMBER_AXIS, method="linear")
+            for level in (10, 25, 50, 75, 90)
+        ]
+    conditional_fields = np.stack([mean, spread, *percentiles]).astype(np.float32)
+    conditional_fields = np.where(enough[None], conditional_fields, np.float32(np.nan))
+
+    fractions = np.stack(
+        [valid_fraction, finite_fraction, unlimited_fraction]
+    ).astype(np.float32)
+    return np.concatenate([fractions, conditional_fields], axis=0)
