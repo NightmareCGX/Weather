@@ -34,7 +34,7 @@ asserted to be injective with respect to the classifier's inputs in the tests.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -104,6 +104,24 @@ def _check_flag_stack(
     if amounts is not None and flags.shape[1:] != amounts.shape:
         raise AggregateError(
             f"flags describe {flags.shape[1:]} but amounts are {amounts.shape}"
+        )
+
+
+def _check_single_flag_planes(
+    flags: npt.NDArray[np.floating], shape: tuple[int, int]
+) -> None:
+    """Refuse a per-member flag stack that is not the four planes shaped like one cell grid.
+
+    Checked per member rather than once, because a streamed caller supplies the planes member by
+    member and a later member with a different extent would otherwise broadcast silently.
+
+    Raises:
+        AggregateError: on a wrong leading axis or a wrong grid extent.
+    """
+    if flags.ndim != 3 or flags.shape[0] != len(FLAG_NAMES) or flags.shape[1:] != shape:
+        raise AggregateError(
+            f"flags must be ({len(FLAG_NAMES)}, *grid) matching {shape} for one member; "
+            f"got {flags.shape}"
         )
 
 
@@ -183,12 +201,19 @@ def fraction_of_members(
 
 
 def _flag_bits(flags: npt.NDArray[np.floating]) -> npt.NDArray[np.int32]:
-    """Pack four flag planes into one integer per member-cell.
+    """Pack four flag planes into one integer per cell.
+
+    Accepts either a whole member stack, ``(4, n_members, lat, lon)``, or one member's planes,
+    ``(4, lat, lon)``, because both the batched and the streamed paths pack the same bits.
 
     Raises:
-        AggregateError: if the flag stack does not hold exactly the four planes.
+        AggregateError: if the leading axis is not the four named flags.
     """
-    _check_flag_stack(flags)
+    if flags.ndim not in (3, 4) or flags.shape[0] != len(FLAG_NAMES):
+        raise AggregateError(  # pragma: no cover - both callers validate the shape first
+            f"flags must lead with the {len(FLAG_NAMES)} named planes "
+            f"({', '.join(FLAG_NAMES)}); got {flags.shape}"
+        )
     bits = np.zeros(flags.shape[1:], dtype=np.int32)
     for index, _name in enumerate(FLAG_NAMES):
         plane = flags[index]
@@ -602,6 +627,7 @@ def _mean_over_members(
 
 __all__ = [
     "FLAG_NAMES",
+    "PrecipitationGroupBuilder",
     "variable_group_fields",
     "cloud_censoring_fields",
     "FLAG_THRESHOLD",
@@ -896,3 +922,171 @@ def _predecessor_interval(
             f"missing {missing}. A predecessor is its amount and all four flags, or none of them"
         )
     return amount, np.stack([plane for plane in planes if plane is not None]).astype(np.float32)
+
+
+class PrecipitationGroupBuilder:
+    """The phase and transition groups, accumulated one member at a time.
+
+    The groups read ten member planes: the precipitation amount and four flags for the interval,
+    and the same five for its predecessor. Held as stacks that is 1.25 GB at 721x1440 for thirty
+    members -- over the container's budget -- while streamed it is ten planes in flight (42 MB)
+    plus the accumulator (32 fields, 133 MB). So the writer feeds this one member at a time
+    instead of assembling a stack, and both groups come out of the same pass.
+
+    The arithmetic is :func:`phase_support_fields`' and :func:`transition_fields`': each member's
+    cell is reduced to a signature, the distinct signatures are resolved once through the same
+    scalar classifier the serving path uses, and the resolved value vectors are accumulated. What
+    differs is only that the member axis is a loop the caller drives rather than an array
+    dimension.
+
+    Args:
+        expected_members: How many members the interval's own count divides by, so a cell's
+            fractions describe the member set rather than the subset added so far. Defaults to
+            the number actually added, which is right only when the set is complete.
+        with_transitions: Whether to accumulate the transition group as well. Both come from the
+            same signature, so a caller wanting only the phase group still pays for the flags but
+            not for the second accumulator.
+    """
+
+    def __init__(
+        self, *, expected_members: int | None = None, with_transitions: bool = True
+    ) -> None:
+        self._expected_members = expected_members
+        self._with_transitions = with_transitions
+        self._added = 0
+        self._shape: tuple[int, int] | None = None
+        self._phase_signatures: list[npt.NDArray[np.int64]] = []
+        self._previous_signatures: list[npt.NDArray[np.int64]] = []
+        self._transition_signatures: list[npt.NDArray[np.int64]] = []
+        self._observable: npt.NDArray[np.bool_] | None = None
+        self._any_predecessor = False
+
+    @property
+    def members_added(self) -> int:
+        """How many members have been added."""
+        return self._added
+
+    def add_member(
+        self,
+        *,
+        amounts: npt.NDArray[np.floating],
+        flags: npt.NDArray[np.floating],
+        amounts_prev: npt.NDArray[np.floating] | None = None,
+        flags_prev: npt.NDArray[np.floating] | None = None,
+    ) -> None:
+        """Add one member's planes for the interval and, when supplied, its predecessor.
+
+        Args:
+            amounts: ``(lat, lon)`` the member's precipitation amount.
+            flags: ``(4, lat, lon)`` the member's four flags.
+            amounts_prev: ``(lat, lon)`` the predecessor's amount, or ``None``.
+            flags_prev: ``(4, lat, lon)`` the predecessor's flags, or ``None``.
+
+        Raises:
+            AggregateError: if the planes do not share a shape, if the flag stack is not the four
+                planes, or if one side of the predecessor interval is given without the other.
+        """
+        _check_single_flag_planes(flags, amounts.shape)
+        if (amounts_prev is None) != (flags_prev is None):
+            raise AggregateError(
+                "a predecessor interval needs both its amounts and its flags, or neither"
+            )
+        if flags_prev is not None and amounts_prev is not None:
+            _check_single_flag_planes(flags_prev, amounts_prev.shape)
+        if self._shape is None:
+            self._shape = amounts.shape
+            self._observable = np.isfinite(amounts)
+        elif amounts.shape != self._shape:
+            raise AggregateError(
+                f"member planes have shape {amounts.shape}, expected {self._shape}"
+            )
+
+        # The same signature helpers the batched path uses, applied to a one-member stack, so
+        # the two cannot disagree about what a member's case is -- which is what makes the
+        # streaming and batched results identical rather than merely close.
+        self._phase_signatures.append(
+            _phase_signature(amounts[None], flags[:, None])[0]
+        )
+        if self._with_transitions:
+            self._transition_signatures.append(
+                _transition_signature(
+                    amounts[None],
+                    flags[:, None],
+                    None if amounts_prev is None else amounts_prev[None],
+                    None if flags_prev is None else flags_prev[:, None],
+                )[0]
+            )
+        if amounts_prev is not None and flags_prev is not None:
+            # A cell is reportable only if the whole interval -- current and predecessor -- is
+            # finite, which is the condition the serving path applies when it reads both.
+            assert self._observable is not None
+            self._observable &= np.isfinite(amounts_prev)
+            self._previous_signatures.append(
+                _phase_signature(amounts_prev[None], flags_prev[:, None])[0]
+            )
+            self._any_predecessor = True
+        else:
+            # A member with no predecessor still needs a placeholder so the per-member loop stays
+            # aligned with the others; it contributes nothing because the planes are unobserved.
+            self._previous_signatures.append(
+                np.zeros(amounts.shape, dtype=np.int64)
+            )
+        self._added += 1
+
+    def finish(self) -> npt.NDArray[np.float32]:
+        """The concatenated group fields, in the layout's order: phase then transition."""
+        if not self._phase_signatures:
+            raise AggregateError("no members were added")
+        assert self._shape is not None and self._observable is not None
+        denominator = self._expected_members or self._added
+        counts = np.full(self._shape, denominator, dtype=np.int64)
+
+        phase = _accumulate_signatures(
+            self._phase_signatures,
+            self._observable,
+            counts,
+            n_outputs=len(_PHASES),
+            resolve=_weights_for_signature,
+        )
+        if self._any_predecessor:
+            previous = _accumulate_signatures(
+                self._previous_signatures,
+                self._observable,
+                counts,
+                n_outputs=len(_PHASES),
+                resolve=_weights_for_signature,
+            )
+        else:
+            # No member had a predecessor: the previous planes are absent, not zero, because a
+            # zero would claim every member's predecessor was dry.
+            previous = np.full_like(phase, np.nan)
+        phase = np.concatenate([phase, previous], axis=0)
+        if not self._with_transitions:
+            return phase
+        transition = _accumulate_signatures(
+            self._transition_signatures,
+            self._observable,
+            counts,
+            n_outputs=len(_TRANSITIONS),
+            resolve=_transition_for_signature,
+        )
+        return np.concatenate([phase, transition], axis=0)
+
+
+def _accumulate_signatures(
+    signatures: Sequence[npt.NDArray[np.int64]],
+    observable: npt.NDArray[np.bool_],
+    counts: npt.NDArray[np.int64],
+    *,
+    n_outputs: int,
+    resolve: Callable[[int], tuple[float, ...]],
+) -> npt.NDArray[np.float32]:
+    """Accumulate one signature plane per member, resolving each distinct signature once."""
+    codes, inverse = np.unique(np.stack(signatures), return_inverse=True)
+    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float32)
+    per_member = inverse.reshape(len(signatures), *signatures[0].shape)
+
+    accumulator = np.zeros((*signatures[0].shape, n_outputs), dtype=np.float32)
+    for member in range(len(signatures)):
+        _accumulate_planes(accumulator, table[per_member[member]])
+    return _finish_fractions(accumulator, counts, observable)

@@ -34,6 +34,7 @@ from domain.product_fields import (
     FLAG_NAMES,
     ROSE_BUCKETS,
     ROSE_SECTORS,
+    PrecipitationGroupBuilder,
     cloud_censoring_fields,
     fraction_of_members,
     phase_support_fields,
@@ -380,6 +381,9 @@ def test_a_malformed_flag_stack_is_refused() -> None:
         phase_support_fields(amounts, np.zeros((2, 4, 2, 2), dtype=np.float32))
     with pytest.raises(AggregateError, match="flags must be"):
         transition_fields(amounts, np.zeros((4, 4, 2), dtype=np.float32))
+    # Two dimensions is neither a stack nor one member's planes.
+    with pytest.raises(AggregateError, match="flags must be"):
+        phase_support_fields(amounts, np.zeros((4, 2), dtype=np.float32))
     # A predecessor interval is both its amounts and its flags, or neither: half of it would
     # silently classify against a predecessor the caller did not describe.
     flags = np.zeros((4, 4, 2, 2), dtype=np.float32)
@@ -617,3 +621,89 @@ def test_the_predecessor_interval_is_taken_whole_or_not_at_all() -> None:
             extra_members=flags,
             predecessor_members={"crain": members},
         )
+
+
+# ---------------------------------------------------------------------------
+# The streamed precipitation builder
+# ---------------------------------------------------------------------------
+
+
+def test_streamed_precipitation_groups_equal_the_batched_ones() -> None:
+    """The writer streams members; the batched path is the reference. They must agree exactly.
+
+    Streaming is what keeps the pass inside its memory budget -- the groups read ten member
+    planes, which as stacks is 1.25 GB at 721x1440 -- so the two implementations exist and have
+    to produce the same fields, not merely close ones.
+    """
+    amounts, flags = _members(seed=31)
+    previous_amounts, previous_flags = _members(seed=32)
+    extra = {name: flags[i] for i, name in enumerate(FLAG_NAMES)}
+    prev_extra = {name: previous_flags[i] for i, name in enumerate(FLAG_NAMES)}
+    prev_extra["precipitation_amount_3h"] = previous_amounts
+
+    batched = variable_group_fields(
+        "precipitation_amount_3h",
+        members=amounts,
+        extra_members=extra,
+        predecessor_members=prev_extra,
+    )
+    builder = PrecipitationGroupBuilder(expected_members=N_MEMBERS)
+    for member in range(N_MEMBERS):
+        builder.add_member(
+            amounts=amounts[member],
+            flags=np.stack([flags[i][member] for i in range(len(FLAG_NAMES))]),
+            amounts_prev=previous_amounts[member],
+            flags_prev=np.stack([previous_flags[i][member] for i in range(len(FLAG_NAMES))]),
+        )
+    assert builder.members_added == N_MEMBERS
+    streamed = builder.finish()
+    assert streamed.shape == batched.shape
+    assert np.array_equal(streamed, batched, equal_nan=True)
+
+
+def test_streamed_groups_report_an_absent_predecessor_as_absent() -> None:
+    """A member with no predecessor contributes nothing, and the planes stay NaN."""
+    amounts, flags = _members(seed=33)
+    extra = {name: flags[i] for i, name in enumerate(FLAG_NAMES)}
+    batched = variable_group_fields(
+        "precipitation_amount_3h", members=amounts, extra_members=extra
+    )
+    builder = PrecipitationGroupBuilder(expected_members=N_MEMBERS)
+    for member in range(N_MEMBERS):
+        builder.add_member(
+            amounts=amounts[member],
+            flags=np.stack([flags[i][member] for i in range(len(FLAG_NAMES))]),
+        )
+    streamed = builder.finish()
+    assert np.array_equal(streamed, batched, equal_nan=True)
+    assert np.isnan(streamed[6:12]).all()
+
+
+def test_a_streamed_builder_can_skip_the_transition_group() -> None:
+    """A caller wanting only the phase support does not pay for the second accumulator."""
+    amounts, flags = _members(seed=34)
+    builder = PrecipitationGroupBuilder(
+        expected_members=N_MEMBERS, with_transitions=False
+    )
+    for member in range(N_MEMBERS):
+        builder.add_member(
+            amounts=amounts[member],
+            flags=np.stack([flags[i][member] for i in range(len(FLAG_NAMES))]),
+        )
+    fields = builder.finish()
+    assert fields.shape[0] == 12
+
+
+def test_a_streamed_builder_refuses_malformed_input_and_finishes_nothing_empty() -> None:
+    amounts, flags = _members(seed=35)
+    builder = PrecipitationGroupBuilder(expected_members=N_MEMBERS)
+    with pytest.raises(AggregateError, match="no members were added"):
+        builder.finish()
+    with pytest.raises(AggregateError, match="flags must be"):
+        builder.add_member(amounts=amounts[0], flags=flags[:3, 0])
+    with pytest.raises(AggregateError, match="both its amounts and its flags"):
+        builder.add_member(amounts=amounts[0], flags=flags[:, 0], amounts_prev=amounts[0])
+    builder.add_member(amounts=amounts[0], flags=flags[:, 0])
+    # A later member with a different grid extent would broadcast silently, so it is refused.
+    with pytest.raises(AggregateError, match="expected"):
+        builder.add_member(amounts=amounts[0, :1], flags=flags[:, 0, :1])
