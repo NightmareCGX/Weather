@@ -12,13 +12,19 @@ from domain.aggregate import KIND_MEAN_STD_BINS, KIND_QUANTILE_FUNCTION
 from domain.field_layout import (
     MISSING_SKIP_AT_COVERAGE,
     ROLE_BIN,
+    ROLE_FRACTION,
     ROLE_LEVEL,
     ROLE_MEAN,
     ROLE_MEMBER_COUNT,
+    ROLE_PHASE_CURRENT,
+    ROLE_PHASE_PREVIOUS,
     ROLE_STD,
+    ROLE_TRANSITION,
     FieldLayout,
     FieldLayoutError,
     aggregate_fields_for,
+    group_field_names,
+    group_field_scales,
 )
 from domain.variable_class import APPROVED_BIN_COUNT, APPROVED_LEVEL_COUNT
 
@@ -71,11 +77,50 @@ def test_a_role_that_more_than_one_field_claims_is_refused_rather_than_guessed()
     assert asserted.index_of_role(ROLE_MEAN) == 1
 
 
-def test_quantile_layout_is_one_level_per_field() -> None:
+def test_quantile_layout_is_one_level_per_field_then_its_groups() -> None:
+    """A variable's distribution fields come first, then whatever groups its products need.
+
+    Precipitation carries the amount's distribution and then its phase and transition groups,
+    because its products are functions of the per-member phase rather than of the distribution.
+    """
     layout = aggregate_fields_for("precipitation_amount_3h")
     assert layout.kind == KIND_QUANTILE_FUNCTION
-    assert layout.n_fields == 1 + APPROVED_LEVEL_COUNT
-    assert layout.roles[1:] == (ROLE_LEVEL,) * APPROVED_LEVEL_COUNT
+    assert layout.groups == ("phase", "transition")
+    assert layout.roles[1 : 1 + APPROVED_LEVEL_COUNT] == (ROLE_LEVEL,) * APPROVED_LEVEL_COUNT
+    assert layout.n_fields == 1 + APPROVED_LEVEL_COUNT + 12 + 20
+    assert layout.index_of_role(ROLE_MEAN) is None
+    # The two phase groups are distinguishable: a consumer asking for the current interval's
+    # phases must not be handed the predecessor's.
+    assert len(layout.indices_of_role(ROLE_PHASE_CURRENT)) == 6
+    assert len(layout.indices_of_role(ROLE_PHASE_PREVIOUS)) == 6
+    assert len(layout.indices_of_role(ROLE_TRANSITION)) == 20
+
+
+def test_a_variable_distribution_is_locatable_next_to_its_groups() -> None:
+    """Group offsets are derived from the group sizes, so a group can be read without counting."""
+    layout = aggregate_fields_for("precipitation_amount_3h")
+    phase = layout.group_slice("phase")
+    transition = layout.group_slice("transition")
+    assert phase.stop == transition.start
+    assert transition.stop == layout.n_fields
+    assert layout.roles[phase.start] == ROLE_PHASE_CURRENT
+    assert layout.roles[transition.start] == ROLE_TRANSITION
+    # A group the variable does not carry is a specification mismatch, not a missing value.
+    with pytest.raises(FieldLayoutError, match="carries no 'rose' fields"):
+        layout.group_slice("rose")
+
+
+def test_a_flag_is_its_fraction() -> None:
+    """A 0/1 flag's shape carries nothing, so its fraction *is* its representation.
+
+    This is the one case where a container has no distribution fields at all: reading it means
+    reading the fraction, and the member count says how many members that fraction is over.
+    """
+    layout = aggregate_fields_for("crain")
+    assert layout.kind == ""
+    assert layout.groups == ("fraction",)
+    assert layout.n_fields == 2
+    assert layout.roles == (ROLE_MEMBER_COUNT, ROLE_FRACTION)
     assert layout.index_of_role(ROLE_MEAN) is None
 
 
@@ -94,10 +139,37 @@ def test_every_field_carries_its_own_scale_because_one_container_holds_several()
     assert 314.0 / bin_scale > 32767, "...and must NOT fit at the bins' finer scale"
 
 
-def test_a_flag_has_no_field_vector() -> None:
-    """A 0/1 flag's approved representation is a per-cell fraction, not an ``AggregateSpec``."""
-    with pytest.raises(FieldLayoutError, match="no aggregate spec"):
-        aggregate_fields_for("crain")
+def test_the_special_variables_carry_the_groups_their_products_need() -> None:
+    """Every one of the four has a container, which is what makes the reclamation rule uniform.
+
+    A variable with no container would make "the aggregate exists" unusable as the condition for
+    reclaiming its member shards, and would need a hand-written exception in the planner.
+    """
+    # wind_10m has no distribution fields: its speed histogram is its rose summed over sectors.
+    assert aggregate_fields_for("wind_10m").groups == ("rose",)
+    assert aggregate_fields_for("wind_10m").n_fields == 1 + 64 + 4
+    assert aggregate_fields_for("wind_10m").kind == ""
+    # The cloud variables carry their distribution (19 levels), the counts taken before
+    # summarising, and the statistics computed over the finite subset.
+    for variable in ("cloud_ceiling", "cloud_cover_3h"):
+        layout = aggregate_fields_for(variable)
+        assert layout.groups == ("censoring", "conditional"), variable
+        assert layout.n_fields == 1 + 19 + 3 + 7, variable
+        assert layout.group_slice("censoring").stop == layout.group_slice("conditional").start
+    for flag in ("crain", "csnow", "cfrzr", "cicep"):
+        assert aggregate_fields_for(flag).groups == ("fraction",)
+        assert aggregate_fields_for(flag).n_fields == 2
+
+
+def test_group_metadata_is_available_without_a_layout() -> None:
+    """A caller sizing or labelling a group should not have to build a variable's layout."""
+    assert len(group_field_names("rose")) == 68
+    assert len(group_field_names("phase")) == 12
+    assert len(group_field_names("transition")) == 20
+    assert len(group_field_scales("censoring")) == 3
+    assert set(group_field_scales("censoring")) == {1.0}
+    with pytest.raises(FieldLayoutError, match="unknown field group"):
+        group_field_names("invented")
 
 
 def test_an_unclassified_variable_is_refused_rather_than_defaulted() -> None:
@@ -148,3 +220,52 @@ def test_missing_member_policy_is_uniform_and_matches_the_serving_paths() -> Non
     """
     for variable in ("temperature_2m", "precipitation_amount_3h", "cloud_ceiling"):
         assert aggregate_fields_for(variable).missing_policy == MISSING_SKIP_AT_COVERAGE
+
+
+def test_a_specless_variable_with_no_group_is_refused() -> None:
+    """Class D and S carry no spec, so their container must come from a registered group.
+
+    Registering such a variable without a group would otherwise produce a layout with only the
+    member count, which no reader could interpret as anything.
+    """
+    from domain.variable_class import (
+        CLASS_PRODUCT_FIELDS,
+        VariableEncoding,
+        register_encoding,
+    )
+
+    variable = "specless_without_a_group"
+    register_encoding(
+        VariableEncoding(variable=variable, variable_class=CLASS_PRODUCT_FIELDS, spec=None)
+    )
+    with pytest.raises(FieldLayoutError, match="no fraction group registered"):
+        aggregate_fields_for(variable)
+
+
+def test_an_unknown_group_role_is_refused_rather_than_defaulted() -> None:
+    """A group added to the map without a role would decode with fields nobody can address."""
+    from domain.field_layout import _group_roles
+
+    with pytest.raises(FieldLayoutError, match="unknown field group"):
+        _group_roles("invented")
+
+
+def test_the_distribution_slice_does_not_depend_on_how_many_groups_follow() -> None:
+    """Reading the distribution by position is what keeps a group addition from shifting it.
+
+    A role lookup cannot serve this: ``quantile_function`` has nineteen fields carrying
+    ``ROLE_LEVEL``, so "the field with that role" has nineteen answers. The slice is derived from
+    the group sizes instead.
+    """
+    # temperature has no groups, precipitation two, a flag none and no distribution either.
+    temp = aggregate_fields_for("temperature_2m").distribution_slice
+    assert (temp.start, temp.stop) == (1, 35)
+    precip = aggregate_fields_for("precipitation_amount_3h").distribution_slice
+    assert (precip.start, precip.stop) == (1, 20)
+    assert precip.stop == aggregate_fields_for("precipitation_amount_3h").group_slice("phase").start
+    # A flag's distribution is empty: its fraction is its representation.
+    flag = aggregate_fields_for("crain").distribution_slice
+    assert flag.start == flag.stop
+    # ...and so is a product-fields variable's, whose products are its rose.
+    wind = aggregate_fields_for("wind_10m").distribution_slice
+    assert wind.start == wind.stop

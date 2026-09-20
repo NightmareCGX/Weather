@@ -42,6 +42,7 @@ from domain.aggregate import (
     quantile_at,
     quantile_function_moments,
 )
+from domain.field_layout import FieldLayoutError, aggregate_fields_for
 from domain.variable_class import VariableClassError, spec_for
 
 from api.core.aggregate_reader import AggregateGeometry, AggregateShardReader
@@ -254,7 +255,8 @@ def statistics_from_aggregate(
     """
     try:
         spec = spec_for(variable)
-    except VariableClassError:
+        layout = aggregate_fields_for(variable)
+    except (VariableClassError, FieldLayoutError):
         return None
 
     active_reader = reader if reader is not None else AggregateShardReader(store_path)
@@ -267,17 +269,16 @@ def statistics_from_aggregate(
     )
     if stack is None:
         return None
-    # Field 0 is the per-cell member count, so the encoding's own fields are the ones after it.
-    if stack.shape[0] != spec.n_fields + 1:
-        # The container's field count disagrees with the approved encoding for this variable.
-        # That means the store was written with a different spec; the members remain the
-        # reader of record rather than this reader guessing at the field order.
+    # Field 0 is the per-cell member count; the distribution follows it, then the variable's
+    # supplementary groups. The count has to match the whole vector, not just the distribution,
+    # because a container written for a different layout would decode as plausible nonsense.
+    if stack.shape[0] != layout.n_fields:
         logger.warning(
             "aggregate for %s at lead %d holds %d fields, expected %d; using members",
             variable,
             lead_time_hours,
             stack.shape[0],
-            spec.n_fields + 1,
+            layout.n_fields,
         )
         return None
 
@@ -287,7 +288,9 @@ def statistics_from_aggregate(
 
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
     member_count = int(round(float(point[0]))) if math.isfinite(float(point[0])) else None
-    encoding_fields = point[1:]
+    # The distribution is the fields between the count and the groups, located by the layout
+    # rather than by counting, so a group added to it cannot shift what this reader is handed.
+    encoding_fields = point[layout.distribution_slice]
     try:
         if spec.kind == KIND_MEAN_STD_BINS:
             values, exact = _statistics_from_bins(encoding_fields, spec)
@@ -382,7 +385,8 @@ def exceedance_probability(
         return None
     try:
         spec = spec_for(variable)
-    except VariableClassError:
+        layout = aggregate_fields_for(variable)
+    except (VariableClassError, FieldLayoutError):
         return None
 
     active_reader = reader if reader is not None else AggregateShardReader(store_path)
@@ -393,15 +397,15 @@ def exceedance_probability(
         chunk_col=chunk_col,
         generation=generation,
     )
-    if stack is None or stack.shape[0] != spec.n_fields + 1:
+    if stack is None or stack.shape[0] != layout.n_fields:
         return None
 
-    # Field 0 is the per-cell member count; the encoding's fields follow it.
+    # Field 0 is the per-cell member count; the distribution follows, then the groups.
     full_point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
     member_count = (
         int(round(float(full_point[0]))) if math.isfinite(float(full_point[0])) else None
     )
-    point = full_point[1:]
+    point = full_point[layout.distribution_slice]
     try:
         if spec.kind == KIND_QUANTILE_FUNCTION:
             probability_above = float(

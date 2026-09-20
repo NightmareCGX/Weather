@@ -23,8 +23,11 @@ from domain.variable_class import (
     CLASS_BOUNDED,
     CLASS_FLAG,
     CLASS_NEAR_GAUSSIAN,
+    CLASS_PRODUCT_FIELDS,
     CLASS_ZERO_INFLATED,
+    DERIVED_VARIABLES,
     REGISTERED_VARIABLES,
+    SPECLESS_CLASSES,
     VALID_CLASSES,
     VariableClassError,
     VariableEncoding,
@@ -70,7 +73,11 @@ def test_registry_has_no_variable_the_platform_does_not_store() -> None:
         ("gefs", TARGET_KIND_MEM),
     ):
         stored |= set(DEFAULT_EXPECTED_REGION_VARIABLES[(model_id, "v1.0", kind)])
-    assert frozenset(stored) >= REGISTERED_VARIABLES
+    # A derived variable is classified without being stored: wind_10m is built at serve time
+    # from its two components, so it has a container but no member shards of its own.
+    assert frozenset(stored) >= (REGISTERED_VARIABLES - DERIVED_VARIABLES)
+    for variable in DERIVED_VARIABLES:
+        assert variable not in stored, variable
 
 
 def test_approved_counts_are_the_measured_ones() -> None:
@@ -128,13 +135,33 @@ def test_bounded_variables_share_the_quantile_encoding_deliberately() -> None:
 
 
 def test_flag_variables_carry_no_spec() -> None:
-    """A shape over two values carries nothing, so flags store a fraction instead."""
+    """A shape over two values carries nothing, so flags store a fraction instead.
+
+    ``field_count`` counts *distribution* fields, and a flag has none: its fraction is a
+    product-defined group, which is ``domain.field_layout``'s business rather than the
+    distribution's.
+    """
     for variable in ("crain", "csnow", "cfrzr", "cicep"):
         encoding = encoding_for(variable)
         assert encoding.variable_class == CLASS_FLAG
         assert encoding.is_flag
         assert encoding.spec is None
-        assert encoding.field_count == 1
+        assert not encoding.has_distribution
+        assert encoding.field_count == 0
+
+
+def test_a_derived_variable_carries_no_spec_and_is_not_stored() -> None:
+    """``wind_10m`` has a container but no distribution spec and no member shards of its own.
+
+    Everything its products show is a function of each member's ``(u, v)`` pair, and its speed
+    histogram is its rose summed over sectors, so there is no distribution for a spec to order.
+    """
+    encoding = encoding_for("wind_10m")
+    assert encoding.variable_class == CLASS_PRODUCT_FIELDS
+    assert encoding.spec is None
+    assert not encoding.has_distribution
+    assert encoding.field_count == 0
+    assert frozenset({"wind_10m"}) == DERIVED_VARIABLES
 
 
 def test_spec_for_rejects_a_flag() -> None:
@@ -160,13 +187,24 @@ def test_class_identifiers_are_the_documented_letters() -> None:
         CLASS_ZERO_INFLATED,
         CLASS_BOUNDED,
         CLASS_FLAG,
+        CLASS_PRODUCT_FIELDS,
     } == VALID_CLASSES
-    assert (CLASS_NEAR_GAUSSIAN, CLASS_ZERO_INFLATED, CLASS_BOUNDED, CLASS_FLAG) == (
+    assert (
+        CLASS_NEAR_GAUSSIAN,
+        CLASS_ZERO_INFLATED,
+        CLASS_BOUNDED,
+        CLASS_FLAG,
+        CLASS_PRODUCT_FIELDS,
+    ) == (
         "A",
         "B",
         "C",
         "D",
+        "S",
     )
+    # The classes with no distribution spec, asserted by name so adding a fourth has to be
+    # deliberate rather than incidental.
+    assert frozenset({CLASS_FLAG, CLASS_PRODUCT_FIELDS}) == SPECLESS_CLASSES
 
 
 def test_encoding_invariants_are_enforced() -> None:

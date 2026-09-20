@@ -110,15 +110,20 @@ def _store_with(
 ) -> str:
     """Write an aggregate over ``members``, laid out the way the ingestion writer lays it out.
 
-    The field vector is the per-cell member count followed by the encoding's own fields, and
-    every field is stored at its own fixed-point step -- both taken from the variable's layout,
-    which is the single authority the reader also uses.
+    The field vector is the per-cell member count, then the encoding's own fields, then one plane
+    per supplementary group field -- placeholder zeros here, because this suite exercises the
+    distribution path and only the field *count* has to match the layout the reader will check
+    against. Every field is stored at its own fixed-point step.
     """
     spec = spec_for(variable)
     layout = aggregate_fields_for(variable)
-    fields = np.concatenate(
+    distribution = np.concatenate(
         [finite_member_count(members)[None], compute_aggregate(members, spec)]
     )
+    placeholders = np.zeros(
+        (layout.n_fields - distribution.shape[0], GRID_LAT, GRID_LON), dtype=np.float32
+    )
+    fields = np.concatenate([distribution, placeholders])
     counted = int(members.shape[0]) if member_count is None else member_count
     blob = _encode(fields, field_scales=layout.field_scales, member_count=counted)
     key = aggregate_shard_key(variable, LEAD)

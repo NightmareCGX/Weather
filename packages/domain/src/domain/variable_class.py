@@ -46,9 +46,25 @@ CLASS_NEAR_GAUSSIAN: Final[str] = "A"
 CLASS_ZERO_INFLATED: Final[str] = "B"
 CLASS_BOUNDED: Final[str] = "C"
 CLASS_FLAG: Final[str] = "D"
+#: A variable whose representation is **entirely** product-defined supplementary fields: it has
+#: no distribution spec because no scalar or percentile statistic describes it.
+#:
+#: ``wind_10m`` is the case. It is synthesised by the API from ``wind_u_10m`` and
+#: ``wind_v_10m`` rather than stored itself, and everything its products show -- consensus
+#: vector, wind rose, directional probability -- is a function of each member's ``(u, v)`` pair.
+#: Its speed histogram is the rose summed over its sectors, so even the distribution path is
+#: served by the rose. Class D is the other group-only case, but there the reason is the
+#: opposite: a 0/1 flag's shape carries too little to store, where wind's carries too much for a
+#: single ordering.
+CLASS_PRODUCT_FIELDS: Final[str] = "S"
 
 VALID_CLASSES: Final[frozenset[str]] = frozenset(
-    {CLASS_NEAR_GAUSSIAN, CLASS_ZERO_INFLATED, CLASS_BOUNDED, CLASS_FLAG}
+    {CLASS_NEAR_GAUSSIAN, CLASS_ZERO_INFLATED, CLASS_BOUNDED, CLASS_FLAG, CLASS_PRODUCT_FIELDS}
+)
+
+#: Classes that carry no :class:`~domain.aggregate.AggregateSpec`.
+SPECLESS_CLASSES: Final[frozenset[str]] = frozenset(
+    {CLASS_FLAG, CLASS_PRODUCT_FIELDS}
 )
 
 #: Approved bin count for the near-Gaussian class.
@@ -71,7 +87,8 @@ class VariableEncoding:
     Attributes:
         variable: Variable code, as it appears in the store.
         variable_class: One of :data:`VALID_CLASSES`.
-        spec: The aggregate spec for classes A/B/C, or ``None`` for the flag class.
+        spec: The aggregate spec for classes A/B/C, or ``None`` for a flag (too little shape to
+            store) and for a product-fields variable (no single distribution to store).
     """
 
     variable: str
@@ -83,12 +100,13 @@ class VariableEncoding:
             raise VariableClassError(
                 f"unknown variable class {self.variable_class!r} for {self.variable!r}"
             )
-        is_flag = self.variable_class == CLASS_FLAG
-        if is_flag and self.spec is not None:
+        specless = self.variable_class in SPECLESS_CLASSES
+        if specless and self.spec is not None:
             raise VariableClassError(
-                f"{self.variable!r} is a flag and must not carry an aggregate spec"
+                f"{self.variable!r} is class {self.variable_class} and must not carry an "
+                "aggregate spec"
             )
-        if not is_flag and self.spec is None:
+        if not specless and self.spec is None:
             raise VariableClassError(
                 f"{self.variable!r} is class {self.variable_class} and requires an aggregate spec"
             )
@@ -99,9 +117,19 @@ class VariableEncoding:
         return self.variable_class == CLASS_FLAG
 
     @property
+    def has_distribution(self) -> bool:
+        """Whether the variable has distribution fields, or only product-defined ones."""
+        return self.spec is not None
+
+    @property
     def field_count(self) -> int:
-        """Stored fields: one per ``AggregateSpec`` field, or one fraction for a flag."""
-        return 1 if self.spec is None else self.spec.n_fields
+        """Distribution fields: one per ``AggregateSpec`` field, none without a spec.
+
+        The product-defined groups a variable carries are not counted here -- they are
+        ``domain.field_layout``'s business, since they belong to the container rather than to the
+        distribution.
+        """
+        return 0 if self.spec is None else self.spec.n_fields
 
 
 def _near_gaussian(variable: str) -> VariableEncoding:
@@ -131,8 +159,16 @@ def _flag(variable: str) -> VariableEncoding:
     return VariableEncoding(variable=variable, variable_class=CLASS_FLAG, spec=None)
 
 
+def _product_fields(variable: str) -> VariableEncoding:
+    return VariableEncoding(
+        variable=variable, variable_class=CLASS_PRODUCT_FIELDS, spec=None
+    )
+
+
 #: The approved classification. Keys are the canonical variable codes the platform stores
-#: (``domain.reclamation.get_expected_region_variables`` is the authority on which exist).
+#: (``domain.reclamation.get_expected_region_variables`` is the authority on which exist), plus
+#: ``wind_10m``, which the API synthesises from its two components and which therefore has a
+#: container of its own without appearing in the stored-variable list.
 _VARIABLE_ENCODINGS: Final[dict[str, VariableEncoding]] = {
     # A -- near-Gaussian
     "temperature_2m": _near_gaussian("temperature_2m"),
@@ -155,10 +191,17 @@ _VARIABLE_ENCODINGS: Final[dict[str, VariableEncoding]] = {
     "csnow": _flag("csnow"),
     "cfrzr": _flag("cfrzr"),
     "cicep": _flag("cicep"),
+    # S -- product-defined supplementary fields only
+    "wind_10m": _product_fields("wind_10m"),
 }
 
 #: The set of variables this module classifies.
 REGISTERED_VARIABLES: Final[frozenset[str]] = frozenset(_VARIABLE_ENCODINGS)
+
+#: Classified variables the platform does not store as such: they are derived at serve time from
+#: other stored variables. Kept separate because ``domain.reclamation``'s stored-variable list is
+#: the authority on which variables have member shards, and these do not.
+DERIVED_VARIABLES: Final[frozenset[str]] = frozenset({"wind_10m"})
 
 
 def encoding_for(variable: str) -> VariableEncoding:
