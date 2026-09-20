@@ -74,6 +74,7 @@ from api.models.entities import (
 from api.services.lifecycle import filter_visible_runs, require_cycle_visible
 from api.schemas import (
     ConsensusVectorOut,
+    EnsembleHistogram,
     EnsemblePDF,
     EnsembleStatistics,
     EnsembleStatisticsData,
@@ -749,6 +750,15 @@ def build_ensemble_statistics(
         member_indices=avail_members,
     )
 
+    histogram_members_payload, histogram_stored_payload = _dual_source_histograms(
+        variable=variable,
+        store_path=str(store_path_str),
+        lead_time_hours=lead_time_hours,
+        latitude=latitude,
+        longitude=longitude,
+        member_values=participating_members,
+    )
+
     return EnsembleStatisticsData(
         model=model,
         lead_time_hours=lead_time_hours,
@@ -756,6 +766,8 @@ def build_ensemble_statistics(
         statistics=stats,
         members=participating_members if include_members else None,
         pdf=pdf_payload if include_members else None,
+        histogram_members=histogram_members_payload,
+        histogram_stored=histogram_stored_payload,
         consensus_vector=consensus_payload,
         wind_rose=wind_rose_payload,
         phase_support=phase_support_payload,
@@ -765,6 +777,74 @@ def build_ensemble_statistics(
         finite_member_count=finite_member_count_payload,
         unlimited_member_count=unlimited_member_count_payload,
     )
+
+
+def _dual_source_histograms(
+    *,
+    variable: str,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    member_values: list[float],
+) -> tuple[EnsembleHistogram | None, EnsembleHistogram | None]:
+    """The member-derived and stored-derived histograms, on one shared bin grid.
+
+    Delivery for the source migration only, and off by default (``ENSEMBLE_DUAL_SOURCE_ENABLED``):
+    while the front end still draws the member-derived distribution, both sources are handed over
+    so a change of source can be *seen* rather than trusted. Both lines are on the grid the member
+    values define, and the stored line is the stored distribution integrated over that same grid.
+
+    The stored line is computed even when no members were read -- that is its purpose, and a store
+    whose members are already reclaimed is exactly the case the migration has to render. The member
+    line is absent when there are no member values to count, which says the same thing as
+    ``members: null`` does.
+
+    A store without a usable aggregate gets ``histogram_stored = None`` and the response is
+    otherwise unchanged: the caller draws one line, which is what it drew before this existed.
+    """
+    from api.core.config import settings
+
+    if not getattr(settings, "ENSEMBLE_DUAL_SOURCE_ENABLED", False):
+        return None, None
+
+    from api.services.aggregate_serving import stored_histogram_at_point, try_read_aggregate
+    from api.services.dual_source import (
+        member_histogram,
+        shared_edges,
+    )
+
+    bins = int(getattr(settings, "ENSEMBLE_DUAL_SOURCE_BINS", 10))
+    finite = [float(value) for value in member_values if math.isfinite(float(value))]
+    if not finite:
+        # No member values to define a grid, so there is nothing to compare against either.
+        return None, None
+    edges = shared_edges(np.asarray(finite, dtype=np.float64), bins)
+    if not edges:
+        return None, None
+
+    member_line = EnsembleHistogram(
+        edges=edges, counts=member_histogram(np.asarray(finite, dtype=np.float64), edges)
+    )
+    stored_counts = try_read_aggregate(
+        lambda: stored_histogram_at_point(
+            variable,
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            latitude=latitude,
+            longitude=longitude,
+            edges=edges,
+        )
+    )
+    # A stored line the caller asked for but the store cannot answer is reported as absent rather
+    # than as zeros: a chart with a flat second line would say "the stored distribution is empty",
+    # which is a different and much more alarming statement than "there is none to draw".
+    stored_line = (
+        EnsembleHistogram(edges=edges, counts=stored_counts)
+        if stored_counts is not None
+        else None
+    )
+    return member_line, stored_line
 
 
 def _ensemble_payload_from_aggregate(

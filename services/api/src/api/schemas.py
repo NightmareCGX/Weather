@@ -514,6 +514,19 @@ class EnsemblePDF(BaseModel):
     density: list[float]
 
 
+class EnsembleHistogram(BaseModel):
+    """A member-value histogram, delivered alongside the statistics during the source migration.
+
+    Not part of the statistics contract and not a stored quantity: it is computed per request from
+    the same member values the statistics came from, so a client can draw the member-derived
+    distribution and the stored-field-derived one together and compare them. It disappears with the
+    members, which is the point of its existing.
+    """
+
+    edges: list[float]
+    counts: list[int]
+
+
 class ConsensusVectorOut(BaseModel):
     """Ensemble consensus vector flow metrics for wind products."""
 
@@ -560,6 +573,12 @@ class EnsembleStatisticsData(BaseModel):
     statistics: EnsembleStatistics
     members: list[float] | None = None
     pdf: EnsemblePDF | None = None
+    #: The two histograms the migration compares, on one shared bin grid. ``histogram_members``
+    #: counts the raw member values and ``histogram_stored`` counts the same grid off the stored
+    #: fields, so a client draws both lines and a difference between them is visible rather than
+    #: being a change of drawing.
+    histogram_members: EnsembleHistogram | None = None
+    histogram_stored: EnsembleHistogram | None = None
     consensus_vector: ConsensusVectorOut | None = None
     wind_rose: WindRoseOut | None = None
     phase_support: dict[str, float] | None = None
@@ -586,6 +605,10 @@ class EnsembleStatisticsData(BaseModel):
         if self.members is not None:
             payload["members"] = self.members
             payload["pdf"] = self.pdf
+        if self.histogram_members is not None:
+            payload["histogram_members"] = self.histogram_members
+        if self.histogram_stored is not None:
+            payload["histogram_stored"] = self.histogram_stored
         if self.consensus_vector is not None:
             payload["consensus_vector"] = self.consensus_vector
         if self.wind_rose is not None:

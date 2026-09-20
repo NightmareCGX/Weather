@@ -264,6 +264,24 @@ class Settings(BaseSettings):
     # Constrained to (0.0, 1.0]; default 0.85 (85%).
     ENSEMBLE_MIN_COVERAGE_RATIO: float = 0.85
 
+    # Dual-source delivery: when set, ``/v1/ensembles`` returns a ``histogram`` alongside the
+    # statistics, computed from the *same member values* the statistics came from.
+    #
+    # Its purpose is the migration, not the product. The front end is moving from drawing
+    # distributions out of raw members to drawing them out of the stored fields, and a change of
+    # source that shows only one line is unauditable: a difference between the two would look like
+    # a rendering change. So both are delivered while both exist, the client draws both, and the
+    # member-derived line is deleted once they have been seen to agree.
+    #
+    # The histogram is built here rather than client-side because the bin domain belongs to the
+    # data: the member values are interpolated at a point, and a client that guessed its own axis
+    # domain would put the same numbers in different buckets. Delivery only -- it is not part of
+    # the statistics contract and it disappears with the members.
+    ENSEMBLE_DUAL_SOURCE_ENABLED: bool = False
+    # Bins in that histogram. Ten is what the front end's own ``histogramBins`` chooses for 30
+    # members (``ceil(log2(30)) + 1``), so the two lines are comparable bin for bin.
+    ENSEMBLE_DUAL_SOURCE_BINS: int = 10
+
     # Background wind vector-field cache prewarm (cycle publication warm-up).
     # A lifespan-owned task periodically resolves the serving window's valid
     # times and computes cache-missing vector fields so real users never hit

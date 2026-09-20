@@ -1111,6 +1111,90 @@ def gated_cloud_censoring(
     return gated_read_dataset_with_selector(store_path, select)
 
 
+def stored_histogram_at_point(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    edges: list[float],
+    generation: str | None = None,
+) -> list[int] | None:
+    """The stored distribution's mass in each bin of ``edges``, for a geographic point.
+
+    The read side of the source migration's comparison. The caller supplies the bin grid the member
+    values defined; this reads the same point's stored distribution and differences its tail
+    probability across those edges, so the two histograms are on one partition.
+
+    ``None`` whenever an aggregate cannot answer, or the point is off-grid: the caller then has no
+    stored line to draw, which is a state the migration has to be able to show rather than hide.
+    """
+    from api.core.manifest_reader import manifest_generation
+    from api.core.reader_gate import gated_read_dataset_with_selector
+    from api.services.dual_source import stored_exceedance, stored_histogram
+    from api.services.point_forecast import _derive_grid
+    from domain.variable_class import spec_for
+
+    try:
+        spec = spec_for(variable)
+        layout = aggregate_fields_for(variable)
+    except (VariableClassError, FieldLayoutError):
+        return None
+    if not edges:
+        return None
+
+    resolved_generation = generation
+    if resolved_generation is None:
+        resolved_generation = manifest_generation(store_path)
+
+    def select(dataset: Any) -> list[int] | None:
+        if variable not in dataset.data_vars:
+            return None
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+        try:
+            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+        except Exception:  # noqa: BLE001 - an off-grid point has no stored line
+            return None
+        row = min(int(math.floor(row_f)), grid.rows - 1)
+        col = min(int(math.floor(col_f)), grid.cols - 1)
+
+        def stored(value: int, size: int, descending: bool) -> int:
+            return (size - 1 - value) if descending else value
+
+        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
+        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
+        active_reader = AggregateShardReader(store_path)
+        geometry = active_reader.open(
+            variable, lead_time_hours, generation=resolved_generation
+        )
+        if geometry is None or not (
+            0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon
+        ):
+            return None
+        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
+        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
+        stack = active_reader.read_location(
+            variable,
+            lead_time_hours=lead_time_hours,
+            chunk_row=chunk_row,
+            chunk_col=chunk_col,
+            generation=resolved_generation,
+        )
+        if stack is None or stack.shape[0] != layout.n_fields:
+            return None
+        point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+        member_count = float(point[0])
+        if not math.isfinite(member_count) or member_count <= 0:
+            return None
+        tail = stored_exceedance(point[layout.distribution_slice], spec, edges)
+        if not tail:
+            return None
+        return stored_histogram(tail, edges, int(round(member_count)))
+
+    return gated_read_dataset_with_selector(store_path, select)
+
+
 #: Variables whose response carries something an aggregate cannot represent, because it is a
 #: function of the *per-member values* rather than of the distribution.
 #:
@@ -1197,6 +1281,7 @@ __all__ = [
     "precipitation_phase_from_aggregate",
     "statistics_from_aggregate",
     "statistics_from_aggregate_at_cell",
+    "stored_histogram_at_point",
     "try_read_aggregate",
     "wind_products_from_aggregate",
 ]
