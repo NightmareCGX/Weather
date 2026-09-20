@@ -1077,6 +1077,7 @@ class RunCoordinator:
         aggregate_variables: tuple[str, ...] = (),
         aggregate_is_final: bool = True,
         wave_leads: tuple[int, ...] | None = None,
+        published_leads: tuple[int, ...] | None = None,
     ) -> None:
         """Publish a settled forecast lead to the catalog and advance serving generation.
 
@@ -1099,6 +1100,9 @@ class RunCoordinator:
                 not landed yet is refused by the aggregate pass rather than encoded as absent --
                 the classifier reads a missing predecessor and a dry one differently. ``None``
                 for a caller that does not know the wave's targets (a repair, a backfill).
+            published_leads: The leads of this wave already published. An earlier publication
+                released its predecessors' staging, so without this a reset lead's build cannot
+                tell a predecessor that is finished from one that has not landed, and refuses.
 
         Does NOT mark the overall run status as 'ready' (status remains 'processing' or 'partial').
 
@@ -1305,6 +1309,7 @@ class RunCoordinator:
                         drop_staging=aggregate_is_final,
                         expected_members=len(expected_members) if expected_members else None,
                         wave_leads=wave_leads,
+                        published_leads=published_leads,
                     )
                 except AggregatePhaseError as exc:
                     # The member shards remain the reader of record, so a failed aggregate is

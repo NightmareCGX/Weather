@@ -184,6 +184,7 @@ def build_container_fields(
     *,
     expected_members: int,
     wave_leads: Sequence[int] | None = None,
+    published_leads: Sequence[int] | None = None,
 ) -> tuple[list[npt.NDArray[np.float32]], int]:
     """Every field of a variable's container, in storage order, and its member count.
 
@@ -262,6 +263,7 @@ def build_container_fields(
             group,
             own_stack=own_stack,
             wave_leads=wave_leads,
+            published_leads=published_leads,
         ):
             fields.extend(list(block))
 
@@ -321,6 +323,7 @@ def _group_fields(
     *,
     own_stack: npt.NDArray[np.float32] | None,
     wave_leads: Sequence[int] | None = None,
+    published_leads: Sequence[int] | None = None,
 ) -> list[npt.NDArray[np.float32]]:
     """One group's fields, from whichever member stacks it reads.
 
@@ -333,7 +336,12 @@ def _group_fields(
     if group in ("phase", "transition"):
         return [
             _precipitation_block(
-                reader, variable, lead_time_hours, group, wave_leads=wave_leads
+                reader,
+                variable,
+                lead_time_hours,
+                group,
+                wave_leads=wave_leads,
+                published_leads=published_leads,
             )
         ]
     needs_own = _needs_own_stack(variable, group, own_stack)
@@ -400,6 +408,7 @@ def _precipitation_block(
     group: str,
     *,
     wave_leads: Sequence[int] | None = None,
+    published_leads: Sequence[int] | None = None,
 ) -> npt.NDArray[np.float32]:
     """One precipitation group, streamed one member at a time.
 
@@ -441,7 +450,9 @@ def _precipitation_block(
     if predecessor_lead is not None:
         assert predecessor_lead is not None  # narrowed for the reads below
         predecessor_members = reader.members(variable, predecessor_lead)
-        if not predecessor_members and _predecessor_is_expected(predecessor_lead, wave_leads):
+        if not predecessor_members and _predecessor_is_expected(
+            variable, predecessor_lead, wave_leads, published_leads
+        ):
             raise AggregateBuildError(
                 f"{variable!r} lead {lead_time_hours}h has no staged predecessor at lead "
                 f"{predecessor_lead}h, which this wave is filling; the transitions cannot be "
@@ -509,17 +520,39 @@ def _predecessor_lead(lead_time_hours: int) -> int | None:
 
 
 def _predecessor_is_expected(
-    predecessor_lead: int, wave_leads: Sequence[int] | None
+    variable: str,
+    predecessor_lead: int,
+    wave_leads: Sequence[int] | None,
+    published_leads: Sequence[int] | None,
 ) -> bool:
-    """Whether a wave is filling the predecessor lead, so its staging is on its way.
+    """Whether a missing predecessor is a lead that is *on its way* rather than absent.
 
-    ``None`` for the leads means the caller does not know the wave's target set, and the only
-    honest answer is "cannot tell" -- which the caller reads as "not expected", the behaviour
-    before this distinction existed.
+    Two conditions, both of which have to hold, and the second is the one an implementation is
+    likely to miss:
+
+    **the wave has to be filling it** -- ``None`` for the leads means the caller does not know its
+    target set, and the only honest answer is "cannot tell" (read as "not expected", the behaviour
+    before this distinction existed);
+
+    **and it must not have been published and released yet.** A wave publishes lead by lead, and
+    each publication releases the staging it consumed -- *including the predecessor variables'*,
+    because the variables a container reads are not the variables it is written as. So by the time
+    a reset lead is built, its predecessor's staging is usually already gone: measured on a wave
+    filling leads 3 and 6, lead 3's publication removes lead 3's amount and flags, and lead 6's
+    build then refuses for want of a predecessor that in fact existed. Without this second
+    condition every reset lead after the first would fail to publish, which is every third lead of
+    a cycle.
     """
     if wave_leads is None:
         return False
-    return predecessor_lead in set(wave_leads)
+    if predecessor_lead not in set(wave_leads):
+        return False
+    if published_leads is not None and predecessor_lead in set(published_leads):
+        # Its container is already written, so its members are no longer needed and its staging is
+        # legitimately gone. The predecessor's *products* are in its own container; the predecessor
+        # *interval* the phase group reads is therefore absent, which is the honest reading.
+        return False
+    return True
 
 
 __all__ = [

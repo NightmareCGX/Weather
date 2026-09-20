@@ -213,6 +213,7 @@ def aggregate_staged_lead(
     drop_staging: bool = True,
     expected_members: int | None = None,
     wave_leads: Sequence[int] | None = None,
+    published_leads: Sequence[int] | None = None,
 ) -> tuple[str, int]:
     """Build and write one ``(variable, lead)``'s container from its staged member sets.
 
@@ -243,6 +244,9 @@ def aggregate_staged_lead(
             own coverage rather than at a contract it was not given.
         wave_leads: The leads this wave is filling, so a predecessor that has not landed yet is
             refused rather than encoded as absent.
+        published_leads: The leads of this wave that have already been published, and whose
+            staging was therefore released. A predecessor among them is not "late" but *finished*:
+            its own container exists, and the interval this one reads is genuinely gone.
 
     Returns:
         ``(aggregate_relative_key, member_count)``.
@@ -282,6 +286,7 @@ def aggregate_staged_lead(
             lead_time_hours,
             expected_members=expected_members or len(own_members) or 1,
             wave_leads=wave_leads,
+            published_leads=published_leads,
         )
     except AggregateBuildError as exc:
         raise StagingError(str(exc)) from exc
@@ -431,6 +436,7 @@ def aggregate_lead_all_variables(
     drop_staging: bool = True,
     expected_members: int | None = None,
     wave_leads: Sequence[int] | None = None,
+    published_leads: Sequence[int] | None = None,
 ) -> list[tuple[str, str, int]]:
     """Aggregate every classifiable variable staged for one lead.
 
@@ -471,8 +477,12 @@ def aggregate_lead_all_variables(
             measured against. Defaults to the members actually staged, which is right only when
             the set is complete.
         wave_leads: The leads the wave is filling, so a predecessor that has not landed yet is
-            refused rather than encoded as absent -- see
+            refused rather than encoded as absent, and a predecessor already published is read as
+            finished rather than late -- see
             :func:`ingestion.core.aggregate_fields.build_container_fields`.
+        published_leads: The leads of this wave already published, whose staging has been
+            released. Required for the distinction above to hold: without it a reset lead whose
+            predecessor was published first would refuse to publish at all.
 
     Returns:
         ``(variable, aggregate_key, member_count)`` per variable aggregated.
@@ -520,6 +530,7 @@ def aggregate_lead_all_variables(
                 drop_staging=False,
                 expected_members=expected_members,
                 wave_leads=wave_leads,
+                published_leads=published_leads,
             )
         except StagingError as exc:
             if _is_unclassified(variable):

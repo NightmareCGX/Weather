@@ -239,6 +239,41 @@ def test_a_lead_without_a_predecessor_produces_absent_previous_planes(store: str
     assert np.isnan(previous).all()
 
 
+def test_a_predecessor_that_was_published_first_is_finished_rather_than_late(store: str) -> None:
+    """A wave publishes lead by lead, and each publication releases the staging it consumed.
+
+    So a reset lead's predecessor is usually already gone by the time this lead is built -- and its
+    presence in ``published_leads`` is what says so. Without that signal the builder cannot tell it
+    from a predecessor that has not landed yet, and it refuses: measured on a wave filling leads 3
+    and 6, lead 3's publication removes lead 3's amount and flags, and lead 6's build then fails.
+    That would be every third lead of a cycle.
+    """
+    predecessor_path = os.path.join(
+        store, "__staging__", "v1", "precipitation_amount_3h"
+    )
+    for member in MEMBERS:
+        os.remove(
+            os.path.join(predecessor_path, f"mem{member:03d}_L{PREDECESSOR_LEAD:04d}.shard")
+        )
+    for flag in ("crain", "csnow", "cfrzr", "cicep"):
+        flag_path = os.path.join(store, "__staging__", "v1", flag)
+        for member in MEMBERS:
+            os.remove(
+                os.path.join(flag_path, f"mem{member:03d}_L{PREDECESSOR_LEAD:04d}.shard")
+            )
+    fields, _count = build_container_fields(
+        _reader(store),
+        "precipitation_amount_3h",
+        LEAD,
+        expected_members=30,
+        wave_leads=(LEAD, PREDECESSOR_LEAD),
+        published_leads=(PREDECESSOR_LEAD,),
+    )
+    layout = aggregate_fields_for("precipitation_amount_3h")
+    previous = fields[layout.group_slice("phase")][6:]
+    assert np.isnan(previous).all()
+
+
 def test_a_predecessor_the_wave_is_still_filling_is_refused_rather_than_absent(store: str) -> None:
     """The distinction the transition group's correctness rests on.
 

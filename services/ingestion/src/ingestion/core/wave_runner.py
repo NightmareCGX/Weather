@@ -1201,6 +1201,19 @@ async def _run_wave_impl(
                         lead_val, int(member_val), at=time.monotonic()
                     )
 
+            def _published_leads_snapshot() -> tuple[int, ...]:
+                """The leads already published, for the predecessor distinction.
+
+                A reset lead's predecessor is another work item of this wave, and it is *usually*
+                published before this lead is: each publication releases the staging it consumed,
+                including the predecessor variables'. So the builder has to be told which leads are
+                finished, or it cannot tell a predecessor that is gone by design from one that has
+                not landed -- and it refuses in both cases. Measured on a wave filling leads 3 and
+                6: without this, lead 6 cannot publish at all.
+                """
+                with lead_settle_lock:
+                    return tuple(sorted(published_leads))
+
             def _publish_lead(
                 lead_val: int, *, aggregated: bool = False, final: bool = False
             ) -> None:
@@ -1230,8 +1243,10 @@ async def _run_wave_impl(
                         # The pass refuses a reset lead's container while the predecessor it reads
                         # is still to come, because the classifier reads a missing predecessor and
                         # a dry one differently. It needs to know which leads this wave is filling
-                        # to tell the two apart, which is exactly ``target_lead_time_hours``.
+                        # to tell the two apart -- and which of them are already published, since
+                        # a publication releases its predecessors' staging.
                         wave_leads=tuple(spec.target_lead_time_hours),
+                        published_leads=_published_leads_snapshot(),
                     )
                 except Exception as exc:
                     logger.warning("Settled-lead publication failed for lead %d: %s", lead_val, exc)

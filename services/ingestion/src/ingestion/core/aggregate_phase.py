@@ -142,6 +142,7 @@ def aggregate_lead(
     drop_staging: bool = True,
     expected_members: int | None = None,
     wave_leads: Sequence[int] | None = None,
+    published_leads: Sequence[int] | None = None,
 ) -> AggregatePhaseResult:
     """Aggregate every staged variable of one lead, if the phase is enabled.
 
@@ -166,6 +167,8 @@ def aggregate_lead(
             measured against and which a partial publication is refused below.
         wave_leads: The leads this wave is filling, so a predecessor that has not landed yet is
             refused rather than encoded as absent.
+        published_leads: The leads of this wave already published, whose staging is gone. A
+            predecessor among them is finished rather than late.
     """
     if not staging_enabled():
         return AggregatePhaseResult()
@@ -181,6 +184,7 @@ def aggregate_lead(
             drop_staging=drop_staging,
             expected_members=expected_members,
             wave_leads=wave_leads,
+            published_leads=published_leads,
         )
     except StagingError as exc:
         logger.warning(
@@ -212,6 +216,7 @@ def aggregate_variable_lead(
     drop_staging: bool = True,
     expected_members: int | None = None,
     wave_leads: Sequence[int] | None = None,
+    published_leads: Sequence[int] | None = None,
 ) -> tuple[str, int]:
     """Aggregate one variable's staged members for one lead.
 
@@ -238,6 +243,7 @@ def aggregate_variable_lead(
             drop_staging=drop_staging,
             expected_members=expected_members,
             wave_leads=wave_leads,
+            published_leads=published_leads,
         )
     except StagingError as exc:
         raise AggregatePhaseError(str(exc)) from exc
