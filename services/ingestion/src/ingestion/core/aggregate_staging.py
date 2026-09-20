@@ -352,6 +352,49 @@ def staged_lead_keys(store: StoreRef, variable_code: str, leads: Sequence[int]) 
     return sorted(key for (_member, lead), key in staged.items() if lead in wanted)
 
 
+def release_wave_staging(store: StoreRef, *, leads: Iterable[int]) -> int:
+    """Remove a finished wave's leftover staging objects for the leads it filled.
+
+    The aggregate pass releases the staging of every variable it wrote a container for, so this
+    exists for the objects it *deliberately* leaves: a variable the platform does not classify has
+    no container to write and keeps its staging (``aggregate_lead_all_variables`` says so, and it
+    is right to -- dropping it would destroy members nothing can rebuild from). Those objects are
+    orphans the moment the wave ends: no later pass will aggregate them, because they are still
+    unclassified, and nothing else in the platform enumerates the staging area.
+
+    **Scoped by lead, not by variable.** A lead belongs to exactly one wave, so a lead-scoped
+    sweep cannot touch another wave's in-flight staging; a variable-scoped one could, since the
+    same variable is staged by every wave. The listing is the only way to see an unclassified
+    variable at all -- the wave's own variable list is the catalog's, which is exactly the list
+    that does not mention the variable whose staging is stranded.
+
+    **Best effort, and it never raises.** Staging bytes that survive cost storage until the next
+    sweep; failing a wave that has already been finalized and published would cost the wave. The
+    caller logs what happened and carries on.
+    """
+    wanted = set(int(lead) for lead in leads)
+    if not wanted:
+        return 0
+    try:
+        staged = staged_objects_by_variable(store)
+    except (StagingError, StoreAccessError) as exc:
+        logger.warning("staging sweep could not list the staging area: %s", exc)
+        return 0
+    doomed = [
+        key
+        for by_lead in staged.values()
+        for (_member, lead), key in by_lead.items()
+        if lead in wanted
+    ]
+    if not doomed:
+        return 0
+    try:
+        return _release_staging(store, doomed)
+    except StoreAccessError as exc:
+        logger.warning("staging sweep could not delete %d object(s): %s", len(doomed), exc)
+        return 0
+
+
 __all__ = [
     "STAGING_ROOT",
     "STAGING_VERSION",
@@ -360,6 +403,7 @@ __all__ = [
     "aggregate_staged_lead",
     "member_plane_from_shard",
     "parse_staging_name",
+    "release_wave_staging",
     "staged_lead_keys",
     "staged_members_for_lead",
     "stage_region",

@@ -51,6 +51,7 @@ from sqlalchemy.orm import Session
 
 from domain.horizon import canonical_lead_time_hours
 from ingestion.core import aggregate_phase
+from ingestion.core import aggregate_staging
 from ingestion.core.base import (
     DeaccumulationError,
     MissingPredecessorLeadError,
@@ -1722,6 +1723,26 @@ async def _run_wave_impl(
                         exc,
                         residual_desc,
                     )
+
+            # Sweep the aggregate staging area for the leads this wave filled. The aggregate pass
+            # releases the staging of every variable it wrote a container for; what it leaves is a
+            # variable the platform does not classify, whose members exist nowhere else -- so the
+            # pass is right to keep them, and this is the only place that can drop them once the
+            # wave that staged them has ended. Lead-scoped, so another wave's in-flight staging is
+            # untouched. Best effort: bytes that survive cost storage, and a failure here must not
+            # fail a wave that has already been finalized.
+            try:
+                swept = aggregate_staging.release_wave_staging(
+                    store_path, leads=spec.target_lead_time_hours
+                )
+                if swept:
+                    logger.info(
+                        "staging sweep removed %d leftover object(s) for leads %s",
+                        swept,
+                        sorted(set(spec.target_lead_time_hours)),
+                    )
+            except Exception as exc:  # noqa: BLE001 - cleanup must never fail the wave
+                logger.warning("staging sweep failed for %s: %s", store_path, exc)
         except Exception:
             fin_dur = (time.monotonic() - t_fin_start) * 1000.0
             tracker.on_finalize_failed(duration_ms=fin_dur)

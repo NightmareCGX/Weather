@@ -1117,3 +1117,95 @@ def test_point_query_reads_four_contiguous_ranges(tmp_path) -> None:
             offsets[index + 1] == offsets[index] + lengths[index]
             for index in range(len(group) - 1)
         ), (row, col, offsets)
+
+
+# ---------------------------------------------------------------------------
+# The wave-end sweep
+# ---------------------------------------------------------------------------
+
+
+def test_the_sweep_removes_leftovers_for_the_leads_it_is_given(tmp_path) -> None:
+    """The pass leaves an unclassified variable's staging on purpose; the sweep is what ends it.
+
+    A variable the platform does not classify has no container to write, so
+    ``aggregate_lead_all_variables`` keeps its members -- nothing can rebuild them. They are
+    orphans the moment the wave that staged them ends, and no later pass will take them, so the
+    sweep is the only thing that can drop them.
+    """
+    store = str(tmp_path)
+    _stage(store, _planes(2, seed=81))
+    _stage_variable(store, "mystery_variable", _planes(2, seed=82))
+    staging.aggregate_lead_all_variables(store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON)
+
+    # The pass released the classified variable's staging and left the other's.
+    assert set(staging.staged_objects_by_variable(store)) == {"mystery_variable"}
+
+    removed = staging.release_wave_staging(store, leads=[LEAD])
+    assert removed == 2
+    assert staging.staged_objects_by_variable(store) == {}
+
+
+def test_the_sweep_leaves_another_waves_lead_alone(tmp_path) -> None:
+    """Scoped by lead, because a lead belongs to exactly one wave and a variable does not.
+
+    The same variable is staged by every wave; sweeping by variable would delete a concurrent
+    wave's in-flight members, which is the one thing the staging area must not lose.
+    """
+    other_lead = LEAD + 3
+    store = str(tmp_path)
+    _stage_variable(store, "mystery_variable", _planes(2, seed=83), lead=LEAD)
+    _stage_variable(store, "mystery_variable", _planes(2, seed=84), lead=other_lead)
+
+    removed = staging.release_wave_staging(store, leads=[LEAD])
+    assert removed == 2
+    remaining = staging.staged_objects_by_variable(store)
+    assert set(remaining) == {"mystery_variable"}
+    assert {lead for (_member, lead) in remaining["mystery_variable"]} == {other_lead}
+
+
+def test_the_sweep_is_a_no_op_for_a_lead_with_nothing_left(tmp_path) -> None:
+    """The ordinary end state of a converted wave: the pass released everything already."""
+    store = str(tmp_path)
+    _stage(store, _planes(2, seed=85))
+    staging.aggregate_lead_all_variables(store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON)
+
+    assert staging.release_wave_staging(store, leads=[LEAD]) == 0
+    assert staging.release_wave_staging(store, leads=[]) == 0
+    assert staging.release_wave_staging(store, leads=[LEAD + 99]) == 0
+
+
+def test_a_store_that_cannot_be_listed_is_reported_rather_than_raised(caplog) -> None:
+    """Cleanup is best effort: leftover bytes cost storage, a failed sweep must not cost a wave.
+
+    The sweep runs after the wave has been finalized and published, so anything it cannot do is a
+    storage cost rather than a correctness problem -- and an unusable store reference is the
+    honest way to reach that branch, since a real one would have to be made unreadable.
+    """
+    from ingestion.core.store_io import StoreAccessError
+
+    with caplog.at_level("WARNING"):
+        # A store reference the I/O layer refuses outright.
+        with pytest.raises(StoreAccessError):
+            staging.staged_objects_by_variable(123)  # type: ignore[arg-type]
+        assert staging.release_wave_staging(123, leads=[LEAD]) == 0  # type: ignore[arg-type]
+    assert "could not list the staging area" in caplog.text
+
+
+def test_a_read_only_staging_area_is_left_alone(tmp_path) -> None:
+    """An immutable mapping store cannot be swept, and the sweep reports zero rather than raising.
+
+    A read-only mapping is the store shape a caller passes when it wants a pass to run without
+    touching storage. The delete layer already answers zero for it, and the sweep has to pass
+    that through rather than turning it into a failure.
+    """
+    from types import MappingProxyType
+
+    store = str(tmp_path)
+    _stage_variable(store, "mystery_variable", _planes(2, seed=86))
+    keys = staging.staged_objects_by_variable(store)["mystery_variable"]
+    assert keys, "the sweep has something to find, or the test proves nothing"
+
+    read_only = MappingProxyType({key: b"" for key in keys.values()})
+    assert staging.release_wave_staging(read_only, leads=[LEAD]) == 0
+    # The objects on disk are untouched, which is what "left alone" means.
+    assert set(staging.staged_objects_by_variable(store)) == {"mystery_variable"}
