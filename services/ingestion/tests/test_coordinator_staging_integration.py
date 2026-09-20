@@ -485,6 +485,7 @@ def test_publication_releases_staging_only_when_it_is_the_leads_last_version(
             expected_members=spec.expected_members,
             aggregate_variables=(VARIABLE,),
             aggregate_is_final=False,
+            wave_leads=(LEAD,),
         )
         coordinator.publish_settled_lead(
             conn,
@@ -494,6 +495,7 @@ def test_publication_releases_staging_only_when_it_is_the_leads_last_version(
             expected_members=spec.expected_members,
             aggregate_variables=(VARIABLE,),
             aggregate_is_final=True,
+            wave_leads=(LEAD,),
         )
     finally:
         conn.close()
@@ -501,3 +503,8 @@ def test_publication_releases_staging_only_when_it_is_the_leads_last_version(
 
     assert [call["drop_staging"] for call in calls] == [False, True]
     assert all(call["variables"] == (VARIABLE,) for call in calls)
+    # The coverage floor and the completeness floor are both measured against the contract's
+    # member count, not the staged count, and the pass needs the wave's target leads to tell a
+    # predecessor that has not landed yet from one that does not exist.
+    assert all(call["expected_members"] == len(spec.expected_members) for call in calls)
+    assert all(call["wave_leads"] == (LEAD,) for call in calls)
