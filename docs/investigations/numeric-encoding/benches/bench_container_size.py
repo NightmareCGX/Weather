@@ -16,6 +16,19 @@ host), so it is taken from the investigation's existing measurement of ~2.5 ms p
 is dominated by s3fs/Python overhead rather than bandwidth.
 
 Run:  .venv/Scripts/python.exe bench_container_size.py
+
+The wind section additionally needs the two 10 m wind components cached, which gefs_fetch.py does
+not fetch by default (its table carries 2t and tp). Fetch them into a second cache and point the
+env var at it, or the section reports what is missing and skips:
+
+    WEATHER_REALDATA_CACHE=$TEMP/weather_realdata_wind python -c "
+    import gefs_fetch, os
+    gefs_fetch.CACHE = os.environ['WEATHER_REALDATA_CACHE']
+    gefs_fetch.VARIABLES = (('UGRD','10 m above ground','10u',10),
+                            ('VGRD','10 m above ground','10v',10))
+    for m in range(1, 31):
+        for _, _, short, _ in gefs_fetch.VARIABLES:
+            gefs_fetch.fetch('20260918', '00', 'f006', m, short)"
 """
 
 from __future__ import annotations
@@ -93,12 +106,20 @@ def build(
     *,
     quantised: bool = True,
 ) -> bytes:
-    """Write one aggregate container the way production writes it."""
+    """Write one aggregate container the way production writes it.
+
+    The variable's own fields come from its declared layout, so the distribution is padded to the
+    field count the layout expects -- the supplementary groups are placeholder zeros here, since
+    this script measures container *size*, not the fields' values.
+    """
     spec = spec_for(variable)
     layout = aggregate_fields_for(variable)
-    fields = [
+    distribution = [
         finite_member_count(stack),
         *list(compute_aggregate(stack, spec, expected_members=stack.shape[0])),
+    ]
+    fields = distribution + [
+        np.zeros_like(distribution[0]) for _ in range(layout.n_fields - len(distribution))
     ]
     scales = list(layout.field_scales)
     if extra is not None:
@@ -288,5 +309,83 @@ def main() -> None:
     print("    change does not trade read cost for size -- it improves both.")
 
 
+def wind_rose_cost(components: tuple[str, str] = ("10u", "10v")) -> None:
+    """The wind variable's real container cost, against the member shards it replaces.
+
+    Needs ``gefs_fetch.py`` to have cached the two 10 m wind components: GEFS publishes them at
+    ``10 m above ground`` as ``UGRD``/``VGRD``, which its ``VARIABLES`` table does not fetch by
+    default, so this reports what is missing rather than failing on an empty cache.
+    """
+    from domain.aggregate import compute_aggregate, finite_member_count
+    from domain.field_layout import FieldLayout
+    from domain.product_fields import rose_fields
+    from domain.variable_class import spec_for
+    from ingestion.core.aggregate_writer import AggregateShardLayout
+
+    def layout_of(declared: FieldLayout, lat: int, lon: int) -> AggregateShardLayout:
+        return AggregateShardLayout(n_fields=declared.n_fields, grid_lat=lat, grid_lon=lon)
+
+    try:
+        u = load_stack(components[0])
+        v = load_stack(components[1])
+    except SystemExit as exc:
+        print(f"  wind rose: skipped ({exc})")
+        return
+
+    started = time.perf_counter()
+    rose, scalars, _edges = rose_fields(u, v)
+    rose_ms = 1000 * (time.perf_counter() - started)
+
+    wind_declared = aggregate_fields_for("wind_10m")
+    wind_container = encode_aggregate_shard(
+        list(
+            np.concatenate(
+                [
+                    np.full((1, *u.shape[1:]), float(u.shape[0]), dtype=np.float32),
+                    rose,
+                    scalars,
+                ]
+            )
+        ),
+        layout_of(wind_declared, u.shape[1], u.shape[2]),
+        member_count=u.shape[0],
+        field_scales=wind_declared.field_scales,
+    )
+
+    component_blobs: dict[str, bytes] = {}
+    for name, stack in (("wind_u_10m", u), ("wind_v_10m", v)):
+        declared = aggregate_fields_for(name)
+        spec = spec_for(name)
+        component_blobs[name] = encode_aggregate_shard(
+            list(
+                np.concatenate(
+                    [
+                        finite_member_count(stack)[None],
+                        compute_aggregate(stack, spec, expected_members=stack.shape[0]),
+                    ]
+                )
+            ),
+            layout_of(declared, stack.shape[1], stack.shape[2]),
+            member_count=stack.shape[0],
+            field_scales=declared.field_scales,
+        )
+
+    total = len(wind_container) + sum(len(b) for b in component_blobs.values())
+    print()
+    print("=" * 104)
+    print("WIND: the rose as a container of its own, plus its components' distributions")
+    print("=" * 104)
+    print()
+    print(f"  rose_fields CPU                       {rose_ms:8.0f} ms")
+    print(f"  wind_10m container    {len(wind_container)/1e6:6.2f} MB  ({wind_declared.n_fields} fields)")
+    for name, blob in component_blobs.items():
+        print(f"  {name} container  {len(blob)/1e6:6.2f} MB")
+    print(f"  total                 {total/1e6:6.2f} MB")
+    print()
+    print("  the u and v member shards it replaces were measured at 129.70 MB in main(),")
+    print(f"  so the wind group is about {129.70 / (total/1e6):.1f}x on its own.")
 if __name__ == "__main__":
     main()
+    wind_rose_cost()
+
+
