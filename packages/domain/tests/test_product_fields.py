@@ -17,6 +17,7 @@ import math
 import numpy as np
 import pytest
 from domain.aggregate import AggregateError
+from domain.field_layout import aggregate_fields_for
 from domain.models.cloud import (
     cloud_ceiling_ensemble_summary,
     cloud_cover_ensemble_summary,
@@ -38,6 +39,7 @@ from domain.product_fields import (
     phase_support_fields,
     rose_fields,
     transition_fields,
+    variable_group_fields,
 )
 
 N_MEMBERS = 30
@@ -484,3 +486,134 @@ def test_censoring_refuses_a_variable_with_no_rule() -> None:
         cloud_censoring_fields(members, variable="temperature_2m")
     with pytest.raises(AggregateError, match="must be"):
         cloud_censoring_fields(np.zeros((1, 1), dtype=np.float32), variable="cloud_ceiling")
+
+
+# ---------------------------------------------------------------------------
+# The writer's entry point
+# ---------------------------------------------------------------------------
+
+
+def test_group_fields_are_exactly_what_the_layout_declares() -> None:
+    """Every variable's group fields match its container layout, field for field.
+
+    The writer takes the field vector's length from the layout and its content from this
+    function, so a disagreement is a container whose descriptor describes fields it does not
+    hold -- the reader would then decode the wrong planes under the right names.
+    """
+    rng = np.random.default_rng(21)
+    extra = {
+        name: (rng.random((N_MEMBERS, LAT, LON)) < 0.5).astype(np.float32)
+        for name in FLAG_NAMES
+    }
+    u = rng.normal(3.0, 4.0, (N_MEMBERS, LAT, LON)).astype(np.float32)
+    v = rng.normal(2.0, 4.0, (N_MEMBERS, LAT, LON)).astype(np.float32)
+    amounts = np.abs(rng.normal(1.0, 2.0, (N_MEMBERS, LAT, LON))).astype(np.float32)
+    ceiling = np.where(
+        rng.random((N_MEMBERS, LAT, LON)) < 0.4,
+        20.0,
+        rng.uniform(0.2, 12.0, (N_MEMBERS, LAT, LON)),
+    ).astype(np.float32)
+    flag_values = (rng.random((N_MEMBERS, LAT, LON)) < 0.3).astype(np.float32)
+
+    cases = (
+        ("temperature_2m", ceiling, None, 0),
+        ("wind_10m", u, {"wind_u_10m": u, "wind_v_10m": v}, 77),
+        ("precipitation_amount_3h", amounts, extra, 32),
+        ("cloud_ceiling", ceiling, None, 10),
+        ("cloud_cover_3h", np.abs(ceiling), None, 10),
+        ("crain", flag_values, None, 1),
+    )
+    for variable, members, extras, expected in cases:
+        fields = variable_group_fields(
+            variable, members=members, extra_members=extras
+        )
+        layout = aggregate_fields_for(variable)
+        assert fields.shape[0] == expected, variable
+        # and the layout agrees: its fields are the count, the distribution, then these.
+        non_distribution = layout.n_fields - 1 - (
+            layout.distribution_slice.stop - layout.distribution_slice.start
+        )
+        assert fields.shape[0] == non_distribution, variable
+        assert fields.shape[1:] == (LAT, LON)
+
+
+def test_group_fields_are_absent_for_a_variable_with_no_groups() -> None:
+    fields = variable_group_fields(
+        "temperature_2m", members=np.zeros((N_MEMBERS, LAT, LON), dtype=np.float32)
+    )
+    assert fields.shape == (0, LAT, LON)
+
+
+def test_a_group_missing_its_inputs_is_refused_rather_than_zero_filled() -> None:
+    """A group built from nothing would publish zeros, which read as a definite answer."""
+    members = np.zeros((N_MEMBERS, LAT, LON), dtype=np.float32)
+    with pytest.raises(AggregateError, match="reads 'wind_u_10m'"):
+        variable_group_fields("wind_10m", members=members)
+    with pytest.raises(AggregateError, match="reads all four flags"):
+        variable_group_fields("precipitation_amount_3h", members=members)
+    # A partial flag stack is worse than none: the classifier would read the missing flag as
+    # unset and classify against the wrong phase set.
+    partial = {"crain": members, "csnow": members}
+    with pytest.raises(AggregateError, match="reads all four flags"):
+        variable_group_fields(
+            "precipitation_amount_3h", members=members, extra_members=partial
+        )
+    with pytest.raises(AggregateError, match="no approved aggregate encoding"):
+        variable_group_fields("mystery_variable", members=members)
+
+
+def test_the_rose_edges_travel_as_constant_planes() -> None:
+    """A reader needs the bucket edges to label a bucket or build a speed histogram."""
+    rng = np.random.default_rng(22)
+    u = rng.normal(3.0, 4.0, (N_MEMBERS, LAT, LON)).astype(np.float32)
+    v = rng.normal(2.0, 4.0, (N_MEMBERS, LAT, LON)).astype(np.float32)
+    fields = variable_group_fields(
+        "wind_10m", members=u, extra_members={"wind_u_10m": u, "wind_v_10m": v}
+    )
+    edges = fields[68:77]
+    # Constant across the grid, and non-decreasing.
+    assert np.allclose(edges, edges[:, :1, :1], equal_nan=True)
+    column = edges[:, 0, 0]
+    assert (np.diff(column) >= 0).all()
+    assert column[-1] > column[0]
+
+
+def test_the_predecessor_interval_is_taken_whole_or_not_at_all() -> None:
+    """A container built with a predecessor carries its phase planes; without one it does not.
+
+    Supplying a partial predecessor -- the amount but not the flags -- is refused, because the
+    classification would read the absent flags as unset and report a transition the members did
+    not describe.
+    """
+    members = np.zeros((N_MEMBERS, LAT, LON), dtype=np.float32)
+    flags = {name: members for name in FLAG_NAMES}
+
+    without = variable_group_fields(
+        "precipitation_amount_3h", members=members, extra_members=flags
+    )
+    assert np.isnan(without[6:12]).all(), "no predecessor means the previous planes are absent"
+
+    with_prev = variable_group_fields(
+        "precipitation_amount_3h",
+        members=members,
+        extra_members=flags,
+        predecessor_members={**flags, "precipitation_amount_3h": members},
+    )
+    assert np.isfinite(with_prev[6:12]).all()
+
+    # Half an interval is refused rather than treated as absent: the classification would
+    # otherwise read the absent flags as unset and report a transition nobody described.
+    with pytest.raises(AggregateError, match="part of a predecessor interval"):
+        variable_group_fields(
+            "precipitation_amount_3h",
+            members=members,
+            extra_members=flags,
+            predecessor_members={"precipitation_amount_3h": members},
+        )
+    with pytest.raises(AggregateError, match="part of a predecessor interval"):
+        variable_group_fields(
+            "precipitation_amount_3h",
+            members=members,
+            extra_members=flags,
+            predecessor_members={"crain": members},
+        )

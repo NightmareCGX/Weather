@@ -34,12 +34,17 @@ asserted to be injective with respect to the classifier's inputs in the tests.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import numpy as np
 import numpy.typing as npt
 
 from domain.aggregate import AggregateError
+from domain.field_layout import (
+    FieldLayoutError,
+    aggregate_fields_for,
+    group_field_names,
+)
 from domain.models.cloud import CLOUD_CEILING_UNLIMITED_THRESHOLD_KM
 from domain.models.precipitation import (
     PhysicalPhase,
@@ -597,6 +602,7 @@ def _mean_over_members(
 
 __all__ = [
     "FLAG_NAMES",
+    "variable_group_fields",
     "cloud_censoring_fields",
     "FLAG_THRESHOLD",
     "ROSE_BUCKETS",
@@ -716,3 +722,177 @@ def _censoring_payload(
         [valid_fraction, finite_fraction, unlimited_fraction]
     ).astype(np.float32)
     return np.concatenate([fractions, conditional_fields], axis=0)
+
+
+def variable_group_fields(
+    variable: str,
+    *,
+    members: npt.NDArray[np.float32],
+    extra_members: Mapping[str, npt.NDArray[np.float32]] | None = None,
+    predecessor_members: Mapping[str, npt.NDArray[np.float32]] | None = None,
+) -> npt.NDArray[np.float32]:
+    """Build every supplementary group a variable's container carries, concatenated in order.
+
+    This is the writer's entry point: it maps a variable's declared groups onto the member stacks
+    those groups read, in the order :func:`domain.field_layout.aggregate_fields_for` lays them out.
+
+    Args:
+        variable: The variable whose container is being built.
+        members: ``(n_members, lat, lon)`` the variable's own members.
+        extra_members: Member stacks for the *other* variables a group reads, keyed by variable
+            code. The rose needs ``wind_u_10m`` and ``wind_v_10m``; the phase and transition
+            groups need the four flags. :func:`domain.field_layout.required_member_variables`
+            names the set, so a caller can check its own completeness rather than infer it here.
+        predecessor_members: The same stacks for the predecessor interval, for a group that reads
+            it. Absent means the predecessor interval is not available.
+
+    Returns:
+        ``(n_group_fields, lat, lon)``.
+
+    Raises:
+        AggregateError: for a variable with no groups, a group whose inputs are missing, or a
+            group named by the layout that this function cannot build. The last is deliberate:
+            a group with no producer would otherwise be published as zeros, which reads as a
+            definite answer.
+    """
+    name = variable.strip()
+    try:
+        layout = aggregate_fields_for(name)
+    except FieldLayoutError as exc:
+        raise AggregateError(str(exc)) from exc
+    if not layout.groups:
+        return np.zeros((0, *members.shape[1:]), dtype=np.float32)
+
+    extra = extra_members or {}
+    previous = predecessor_members or {}
+    blocks: list[npt.NDArray[np.float32]] = []
+    for group in layout.groups:
+        blocks.append(_group_block(name, group, members, extra, previous))
+    return np.concatenate(blocks, axis=0)
+
+
+def _group_block(
+    variable: str,
+    group: str,
+    members: npt.NDArray[np.float32],
+    extra: Mapping[str, npt.NDArray[np.float32]],
+    previous: Mapping[str, npt.NDArray[np.float32]],
+) -> npt.NDArray[np.float32]:
+    """One group's fields, from the member stacks it reads."""
+    if group == "rose":
+        u = _require_input(extra, "wind_u_10m", variable, group)
+        v = _require_input(extra, "wind_v_10m", variable, group)
+        rose, scalars, edges = rose_fields(u, v)
+        # The edges travel as constant planes, so the container is self-describing: a reader can
+        # label a bucket, or add the rose up into a speed histogram, without a sidecar object.
+        edge_planes = np.broadcast_to(
+            edges[:, None, None], (edges.size, *members.shape[1:])
+        ).astype(np.float32)
+        return np.concatenate([rose, scalars, edge_planes], axis=0)
+
+    if group in ("phase", "transition"):
+        flags = _required_flag_stack(extra, variable, group)
+        prev_amounts, prev_flags = _predecessor_interval(previous, variable, group)
+        if group == "phase":
+            return phase_support_fields(
+                members,
+                flags,
+                amounts_prev=prev_amounts,
+                flags_prev=prev_flags,
+            )
+        return transition_fields(
+            members, flags, amounts_prev=prev_amounts, flags_prev=prev_flags
+        )
+
+    if group in ("censoring", "conditional"):
+        # One computation produces both groups -- the counts and the statistics they condition --
+        # so it is done once and split by each group's own declared width rather than recomputed
+        # per group, which would also be a second sorting pass over the members.
+        payload = cloud_censoring_fields(members, variable=variable)
+        censoring_width = len(group_field_names("censoring"))
+        if group == "censoring":
+            return payload[:censoring_width]
+        return payload[censoring_width:]
+
+    if group == "fraction":
+        finite = np.isfinite(members)
+        # A flag plane's "set" is the same threshold the serving path applies, and a non-finite
+        # member neither satisfies it nor counts towards the denominator: a NaN flag is an
+        # unknown, and calling it a "no" would understate the fraction.
+        return fraction_of_members((members >= FLAG_THRESHOLD) & finite, finite=finite)[
+            None
+        ]
+
+    raise AggregateError(  # pragma: no cover - every declared group has a producer here
+        f"{variable!r} declares the {group!r} group, but no producer is registered for it"
+    )
+
+
+def _require_input(
+    stacks: Mapping[str, npt.NDArray[np.float32]], needed: str, variable: str, group: str
+) -> npt.NDArray[np.float32]:
+    """One member stack a group reads, or a refusal naming which input is missing.
+
+    Raises:
+        AggregateError: if the caller did not supply it. Refusing rather than skipping keeps a
+            container from being published with a group silently built from nothing.
+    """
+    try:
+        return stacks[needed]
+    except KeyError as exc:
+        raise AggregateError(
+            f"the {group!r} group of {variable!r} reads {needed!r}, which was not supplied"
+        ) from exc
+
+
+def _required_flag_stack(
+    stacks: Mapping[str, npt.NDArray[np.float32]], variable: str, group: str
+) -> npt.NDArray[np.float32]:
+    """The four flag planes as one ``(4, n_members, lat, lon)`` stack.
+
+    Raises:
+        AggregateError: if any of the four is missing. A partial stack is worse than none: the
+            classifier would read the absent flag as unset and classify against the wrong phase
+            set, which produces a plausible field rather than a failure.
+    """
+    planes = [stacks.get(name) for name in FLAG_NAMES]
+    if any(plane is None for plane in planes):
+        missing = [
+            name for name, plane in zip(FLAG_NAMES, planes, strict=True) if plane is None
+        ]
+        raise AggregateError(
+            f"the {group!r} group of {variable!r} reads all four flags "
+            f"({', '.join(FLAG_NAMES)}), but {missing} were not supplied"
+        )
+    return np.stack([plane for plane in planes if plane is not None]).astype(np.float32)
+
+
+def _predecessor_interval(
+    stacks: Mapping[str, npt.NDArray[np.float32]], variable: str, group: str
+) -> tuple[npt.NDArray[np.float32] | None, npt.NDArray[np.float32] | None]:
+    """The predecessor interval's amounts and flags, or ``(None, None)`` when it is not supplied.
+
+    All or nothing: an interval is its amount *and* its flags, and half of one would classify a
+    transition against a predecessor the members never described. A caller that wants "no
+    predecessor" supplies none of the five stacks -- which is the normal case for a lead whose
+    predecessor does not exist, i.e. lead 0.
+
+    Raises:
+        AggregateError: if some of the interval's stacks are supplied and others are not.
+    """
+    planes = [stacks.get(name) for name in FLAG_NAMES]
+    amount = stacks.get(variable)
+    supplied = sum(plane is not None for plane in planes) + (amount is not None)
+    if supplied == 0:
+        return None, None
+    if supplied != len(FLAG_NAMES) + 1:
+        missing = [
+            name for name, plane in zip(FLAG_NAMES, planes, strict=True) if plane is None
+        ]
+        if amount is None:
+            missing.insert(0, variable)
+        raise AggregateError(
+            f"the {group!r} group of {variable!r} was given part of a predecessor interval; "
+            f"missing {missing}. A predecessor is its amount and all four flags, or none of them"
+        )
+    return amount, np.stack([plane for plane in planes if plane is not None]).astype(np.float32)
