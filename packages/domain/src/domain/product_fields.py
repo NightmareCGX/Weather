@@ -302,6 +302,45 @@ def _transition_for_signature(signature: int) -> tuple[float, ...]:
     return _one_hot(_TRANSITIONS.index(state.transition), len(_TRANSITIONS))
 
 
+def _resolve_table(
+    signature: npt.NDArray[np.int64], resolve: Callable[[int], tuple[float, ...]]
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.float32]]:
+    """Collapse a signature array to per-code table indices and the table itself.
+
+    Each *distinct* signature is resolved once, which is where the scalar classifier is called --
+    at most 306 times for the transition group, against 30 x lat x lon member-cells.
+    """
+    codes, inverse = np.unique(signature, return_inverse=True)
+    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float32)
+    return inverse.reshape(signature.shape), table
+
+
+def _accumulate_planes(
+    accumulator: npt.NDArray[np.float32],
+    value_planes: npt.NDArray[np.float32],
+) -> None:
+    """Add one member's value planes, ``(lat, lon, n_outputs)``, into the accumulator in place.
+
+    In place so a caller looping over members holds only one member's planes at a time.
+
+    No observability mask is needed: the resolved values are finite by construction -- a signature
+    names *which* case a member-cell is in, and every case has a definite value vector -- so a cell
+    the caller wants excluded contributes a number that :func:`_finish_fractions` then discards.
+    """
+    accumulator += value_planes
+
+
+def _finish_fractions(
+    accumulator: npt.NDArray[np.float32],
+    counts: npt.NDArray[np.int64],
+    observable: npt.NDArray[np.bool_],
+) -> npt.NDArray[np.float32]:
+    """Turn per-cell member counts into fractions, and mark unobservable cells absent."""
+    denominator = np.maximum(counts, 1).astype(np.float32)[:, :, None]
+    out = (accumulator / denominator).transpose(2, 0, 1)
+    return np.where(observable[None, :, :], out, np.float32(np.nan))
+
+
 def _accumulate_by_signature(
     signature: npt.NDArray[np.int64],
     observable: npt.NDArray[np.bool_],
@@ -310,29 +349,20 @@ def _accumulate_by_signature(
     n_outputs: int,
     resolve: Callable[[int], tuple[float, ...]],
 ) -> npt.NDArray[np.float32]:
-    """Accumulate a per-signature value vector into per-cell fractions.
+    """Accumulate a per-signature value vector into per-cell fractions, one member at a time.
 
-    Each *distinct* signature is resolved once -- that is where the scalar classifier is called,
-    at most 306 times for the transition group -- and its value vector is then added at every
-    member-cell carrying it. The addition is one member plane at a time rather than one gathered
-    array of every member-cell, because the gathered form is ``n_members x lat x lon x n_outputs``:
-    for the transition group at 721x1440 that is 5 GB, which is not a shape this can take.
-
-    The accumulator is float32 and the added values are small integers, so the sums are exact --
-    the largest is a member count, well inside float32's exact-integer range.
+    The gathered alternative -- materialising ``(n_members, lat, lon, n_outputs)`` to sum over the
+    member axis -- is 3.0 GB for the phase group and 5.0 GB for the transition group at 721x1440,
+    which is not a shape the container can take; it works on the test grids and would fail on the
+    first real lead.
     """
-    codes, inverse = np.unique(signature, return_inverse=True)
-    table = np.array([resolve(int(code)) for code in codes.tolist()], dtype=np.float32)
-    per_member = inverse.reshape(signature.shape)
-
-    total = np.zeros((*signature.shape[1:], n_outputs), dtype=np.float32)
+    per_member, table = _resolve_table(signature, resolve)
+    accumulator = np.zeros((*signature.shape[1:], n_outputs), dtype=np.float32)
     for member in range(signature.shape[0]):
-        # One plane's worth of value vectors, resolved by a table lookup.
-        np.add(total, table[per_member[member]], out=total)
-
-    denominator = np.maximum(counts, 1).astype(np.float32)[:, :, None]
-    out = (total / denominator).transpose(2, 0, 1)
-    return np.where(observable[None, :, :], out, np.float32(np.nan))
+        # ``table[per_member[member]]`` gathers to ``(lat, lon, n_outputs)``, which is the
+        # accumulator's own shape; the gather is over at most 306 rows per member.
+        _accumulate_planes(accumulator, table[per_member[member]])
+    return _finish_fractions(accumulator, counts, observable)
 
 
 def phase_support_fields(
