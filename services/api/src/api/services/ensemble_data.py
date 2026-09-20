@@ -901,8 +901,14 @@ def _aggregate_probability(
       has smoothed it away. Measured on a half-zero precipitation field at the natural
       threshold of zero, the members give ``P(x >= 0) = 1.0`` (the atom is 0.53) where the
       interpolated quantile function gives 0.5, and neither is what the members say;
-    * a directional or phase-conditioned query, which is a function of each member's vector or
-      flag rather than of the distribution;
+    * a **joint** query over a threshold and a per-member attribute: ``?direction_sector=`` asks
+      for ``P(speed >= t AND sector)`` and ``?phase=`` for ``P(amount >= t AND phase)``. The
+      stored fields carry each side's *marginal* -- the rose has ``P(sector AND bucket)`` and the
+      phase group has ``P(phase)`` -- and neither reconstructs the joint: the rose's buckets are
+      quantile edges of this cycle's member set, so summing the buckets above a fixed threshold
+      is not ``P(speed >= t)``, and multiplying the two marginals is the systematic
+      overestimate that makes a joint field the wrong object to store in the first place. Both
+      therefore stay on the member path, which is the only place the joint is defined;
     * a ``between`` query, which is two inclusive thresholds at once.
 
     The confidence interval is the same Wilson interval the member path reports, computed from
