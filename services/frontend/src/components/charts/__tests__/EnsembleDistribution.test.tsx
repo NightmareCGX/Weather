@@ -183,14 +183,67 @@ describe("EnsembleDistribution", () => {
     expect(dots.length).toBe(withMembersNullPdf.members!.length);
   });
 
-  it("shows an honest unavailable state when members are absent", () => {
+  it("shows an honest unavailable state when there are neither members nor a stored line", () => {
     render(
       <EnsembleDistribution {...baseProps} data={withoutMembers} status="success" error={null} />
     );
 
-    expect(screen.getByText(/returned no raw member values/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/returned no raw member values and no stored distribution/)
+    ).toBeInTheDocument();
     // No fabricated histogram is rendered.
     expect(screen.queryByRole("img", { name: /Histogram/ })).not.toBeInTheDocument();
+  });
+
+  it("draws the stored distribution when the members have been reclaimed", () => {
+    // The case a fully converted store reaches: the members are gone, the container is the answer,
+    // and the line has to be drawable without any member values -- including the bin edges, which
+    // the payload carries because a container holds no values to derive them from.
+    const storedOnly: EnsembleStatisticsData = {
+      ...withoutMembers,
+      histogram_stored: { edges: [10, 12, 14, 16, 18, 20], counts: [1, 1, 1, 1, 1] },
+    };
+    const { container } = render(
+      <EnsembleDistribution {...baseProps} data={storedOnly} status="success" error={null} />
+    );
+
+    expect(screen.getByText(/Stored distribution · Sep 10, 06:00 UTC/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: /Stored distribution for Temperature/ })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/members have been aggregated into a summary container/)
+    ).toBeInTheDocument();
+    // Bars are drawn, one per bin the payload declared, and no member rug is fabricated.
+    expect(container.querySelectorAll(".recharts-rectangle").length).toBe(5);
+    expect(container.querySelectorAll(".recharts-scatter-symbol").length).toBe(0);
+    // The summary cells fall back to the stored statistics rather than to "—".
+    expect(screen.getByText("17.5")).toBeInTheDocument();
+  });
+
+  it("keeps the member line when the stored line is delivered beside it", () => {
+    // The comparison state, unchanged: both grids agree, so both lines are drawn and the bars stay
+    // the member sample's.
+    const both: EnsembleStatisticsData = {
+      ...withMembersAndPdf,
+      histogram_members: { edges: [10, 15, 20, 25, 30], counts: [1, 1, 1, 1, 1] },
+      histogram_stored: { edges: [10, 15, 20, 25, 30], counts: [1, 0, 3, 1, 0] },
+    };
+    const { container } = render(
+      <EnsembleDistribution {...baseProps} data={both} status="success" error={null} />
+    );
+
+    expect(screen.getByText(/Member distribution · Sep 10, 06:00 UTC/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: /Histogram and PDF of 5 ensemble members/ })
+    ).toBeInTheDocument();
+    // Two lines: the dashed stored line and the PDF. The bars are still the member sample's own
+    // Sturges bins, not the delivered grid's -- the member count is what says which source the
+    // chart is about, and a stored payload beside members does not change that.
+    expect(container.querySelectorAll(".recharts-line-curve").length).toBe(2);
+    expect(container.querySelectorAll(".recharts-rectangle").length).toBe(
+      histogramBins(withMembersAndPdf.members!).length
+    );
   });
 
   it("shows a loading state while fetching", () => {

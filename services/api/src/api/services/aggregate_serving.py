@@ -1130,28 +1130,30 @@ def gated_cloud_censoring(
     return gated_read_dataset_with_selector(store_path, select)
 
 
-def stored_histogram_at_point(
+def _stored_distribution_at_point(
     variable: str,
     *,
     store_path: str,
     lead_time_hours: int,
     latitude: float,
     longitude: float,
-    edges: list[float],
-    generation: str | None = None,
-) -> list[int] | None:
-    """The stored distribution's mass in each bin of ``edges``, for a geographic point.
+    edges: list[float] | None,
+    bins: int,
+    generation: str | None,
+) -> tuple[list[float], list[int]] | None:
+    """The stored distribution at a point, on ``edges`` or on a grid it states itself.
 
-    The read side of the source migration's comparison. The caller supplies the bin grid the member
-    values defined; this reads the same point's stored distribution and differences its tail
-    probability across those edges, so the two histograms are on one partition.
+    One implementation for both grid modes, because everything except the grid is identical and
+    the gate, the coordinate derivation and the field slicing must not be able to drift between
+    two copies. The two callers differ only in whether the members still exist to define a range.
 
-    ``None`` whenever an aggregate cannot answer, or the point is off-grid: the caller then has no
-    stored line to draw, which is a state the migration has to be able to show rather than hide.
+    ``None`` whenever an aggregate cannot answer, the point is off-grid, or the cell is
+    unobserved: the caller then has no stored line to draw, which is a state the migration has to
+    be able to show rather than hide.
     """
     from api.core.manifest_reader import manifest_generation
     from api.core.reader_gate import gated_read_dataset_with_selector
-    from api.services.dual_source import stored_exceedance, stored_histogram
+    from api.services.dual_source import stored_edges, stored_exceedance, stored_histogram
     from api.services.point_forecast import _derive_grid
     from domain.variable_class import spec_for
 
@@ -1160,14 +1162,14 @@ def stored_histogram_at_point(
         layout = aggregate_fields_for(variable)
     except (VariableClassError, FieldLayoutError):
         return None
-    if not edges:
+    if edges is not None and not edges:
         return None
 
     resolved_generation = generation
     if resolved_generation is None:
         resolved_generation = manifest_generation(store_path)
 
-    def select(dataset: Any) -> list[int] | None:
+    def select(dataset: Any) -> tuple[list[float], list[int]] | None:
         if variable not in dataset.data_vars:
             return None
         grid, lat_descending, lon_descending = _derive_grid(dataset)
@@ -1206,12 +1208,97 @@ def stored_histogram_at_point(
         member_count = float(point[0])
         if not math.isfinite(member_count) or member_count <= 0:
             return None
-        tail = stored_exceedance(point[layout.distribution_slice], spec, edges)
+        distribution = point[layout.distribution_slice]
+        # The grid, when the caller has none: the distribution's own bounds. Computed here rather
+        # than by the caller because it is a function of the *cell being read* -- on the bin
+        # encoding the range is that cell's mean and spread, not the container's.
+        active_edges = edges
+        if active_edges is None:
+            active_edges = stored_edges(distribution, spec, bins)
+            if not active_edges:
+                return None
+        tail = stored_exceedance(distribution, spec, active_edges)
         if not tail:
             return None
-        return stored_histogram(tail, edges, int(round(member_count)))
+        counts = stored_histogram(tail, active_edges, int(round(member_count)))
+        if counts is None:
+            return None
+        return active_edges, counts
 
     return gated_read_dataset_with_selector(store_path, select)
+
+
+def stored_histogram_at_point(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    edges: list[float],
+    generation: str | None = None,
+) -> list[int] | None:
+    """The stored distribution's mass in each bin of ``edges``, for a geographic point.
+
+    The comparison mode of :func:`_stored_distribution_at_point`: the caller supplies the bin grid
+    the member values defined, so the two histograms are on one partition and can be compared bin
+    for bin.
+    """
+    from api.services.dual_source import DEFAULT_BINS
+
+    resolved = _stored_distribution_at_point(
+        variable,
+        store_path=store_path,
+        lead_time_hours=lead_time_hours,
+        latitude=latitude,
+        longitude=longitude,
+        edges=edges,
+        bins=DEFAULT_BINS,
+        generation=generation,
+    )
+    return None if resolved is None else resolved[1]
+
+
+def stored_distribution_at_point(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    bins: int | None = None,
+    generation: str | None = None,
+) -> tuple[list[float], list[int]] | None:
+    """The stored distribution at a point **as its own grid**, with no member values needed.
+
+    The mode a store needs once its members are gone. The comparison mode above takes its grid from
+    the member values because they are what is being replaced, and that is still the right choice
+    while they exist; but a store whose members have been reclaimed has no such values, and the
+    chart drawn from the stored fields is then the answer rather than a second opinion about one.
+    Asking the members for a range at that point would make the stored line disappear exactly when
+    it became the only line there is.
+
+    The grid comes from the distribution's own outermost information -- the outer stored levels for
+    the quantile encoding, the mean and spread for the bin encoding -- so it is a statement the
+    container already makes about itself. See :func:`api.services.dual_source.stored_edges`.
+
+    Returns:
+        ``(edges, counts)`` for one point, or ``None`` when an aggregate cannot answer. The edges
+        are returned because they are per cell on one of the two encodings, so a caller cannot
+        reconstruct them from the variable alone.
+    """
+    from api.services.dual_source import DEFAULT_BINS
+
+    return _stored_distribution_at_point(
+        variable,
+        store_path=store_path,
+        lead_time_hours=lead_time_hours,
+        latitude=latitude,
+        longitude=longitude,
+        edges=None,
+        bins=DEFAULT_BINS if bins is None else int(bins),
+        generation=generation,
+    )
 
 
 #: Variables whose response carries something an aggregate cannot represent, because it is a
@@ -1331,6 +1418,7 @@ __all__ = [
     "precipitation_phase_from_aggregate",
     "statistics_from_aggregate",
     "statistics_from_aggregate_at_cell",
+    "stored_distribution_at_point",
     "stored_histogram_at_point",
     "try_read_aggregate",
     "wind_products_from_aggregate",

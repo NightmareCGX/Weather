@@ -608,6 +608,13 @@ def build_ensemble_statistics(
                     statistics=served_stats,
                     products=served_products,
                     source_cycle=None,
+                    histogram_stored=_stored_only_histogram(
+                        variable=variable,
+                        store_path=str(store_path_str),
+                        lead_time_hours=lead_time_hours,
+                        latitude=latitude,
+                        longitude=longitude,
+                    ),
                 )
 
     consensus_payload: ConsensusVectorOut | None = None
@@ -919,6 +926,49 @@ def _dual_source_histograms(
     return member_line, stored_line
 
 
+def _stored_only_histogram(
+    *,
+    variable: str,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+) -> EnsembleHistogram | None:
+    """The stored distribution as a histogram, on the grid the container states about itself.
+
+    The line a fully converted store draws. It is the *only* line such a store can draw, because
+    the members it would be compared against no longer exist -- so it takes its bin edges from the
+    distribution rather than from the member values, and it does not need the members to be read at
+    all (``api.services.aggregate_serving.stored_distribution_at_point``).
+
+    Delivered on every stored-only response, not behind the comparison switch: that switch exists to
+    put two lines on one chart while both sources are available, and there is nothing to switch on
+    or off when only one source exists. A store whose members are still present takes the member
+    path for the whole response, so the two never both appear.
+
+    ``None`` when the container cannot answer, which the chart renders as no line -- the truthful
+    statement, and the one the comparison mode already makes for its own absent line.
+    """
+    from api.services.aggregate_serving import (
+        stored_distribution_at_point,
+        try_read_aggregate,
+    )
+
+    resolved = try_read_aggregate(
+        lambda: stored_distribution_at_point(
+            variable,
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            latitude=latitude,
+            longitude=longitude,
+        )
+    )
+    if resolved is None:
+        return None
+    edges, counts = resolved
+    return EnsembleHistogram(edges=edges, counts=counts)
+
+
 def _ensemble_payload_from_aggregate(
     *,
     model: str,
@@ -927,6 +977,7 @@ def _ensemble_payload_from_aggregate(
     statistics: EnsembleStatistics,
     products: dict[str, Any] | None,
     source_cycle: datetime | None,
+    histogram_stored: EnsembleHistogram | None = None,
 ) -> EnsembleStatisticsData:
     """Assemble a response from a container's stored fields, with no member read.
 
@@ -1023,6 +1074,7 @@ def _ensemble_payload_from_aggregate(
         unlimited_probability=unlimited_prob_payload,
         finite_member_count=finite_member_count_payload,
         unlimited_member_count=unlimited_member_count_payload,
+        histogram_stored=histogram_stored,
     )
 
 

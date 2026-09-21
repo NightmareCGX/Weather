@@ -153,3 +153,97 @@ def test_a_field_vector_of_the_wrong_width_is_refused() -> None:
     # And a mismatched edge count is not a histogram either.
     assert stored_histogram([0.5], [0.0, 1.0], 30) is None
     assert stored_histogram([0.5, 0.1], [0.0], 30) is None
+
+
+# ---------------------------------------------------------------------------
+# The stored-only grid
+# ---------------------------------------------------------------------------
+
+
+def test_stored_edges_come_from_the_distribution_itself() -> None:
+    """The grid for a store whose members are gone, with no member values involved.
+
+    The whole point of the mode: the comparison grid needs the members, and the members are exactly
+    what a fully converted store no longer has. A distribution can still say what its own range is.
+    """
+    from api.services.dual_source import stored_edges
+
+    members = _quantile_members(seed=11)
+    spec = AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
+    fields = compute_aggregate(members, spec, expected_members=30)[:, 0, 0]
+
+    edges = stored_edges(fields, spec, bins=10)
+    assert len(edges) == 11
+    assert all(edges[index] < edges[index + 1] for index in range(10))
+    # The outermost stored levels bound the range, so the grid brackets the sample's own.
+    sample_low = float(np.min(members))
+    sample_high = float(np.max(members))
+    assert edges[0] <= sample_low
+    assert edges[-1] >= sample_high
+    # A margin, not a wide one: the grid's span is close to the quantile range it came from.
+    assert edges[-1] - edges[0] < (sample_high - sample_low) * 2.5
+
+
+def test_the_bin_encoding_states_its_range_as_mean_and_spread() -> None:
+    """A bin-encoded container stores no levels, so its bounds are its support."""
+    from api.services.dual_source import stored_edges
+
+    rng = np.random.default_rng(12)
+    members = rng.normal(280.0, 8.0, 30).astype(np.float32)
+    spec = AggregateSpec(kind=KIND_MEAN_STD_BINS)
+    fields = compute_aggregate(members[:, None, None], spec, expected_members=30)[:, 0, 0]
+
+    edges = stored_edges(fields, spec, bins=8)
+    assert len(edges) == 9
+    mean = float(np.mean(members))
+    std = float(np.std(members))
+    # Bounded by the encoding's own support -- mean +- ``sigma_range`` standard deviations, which is
+    # the normalised range its bins cover -- widened by the margin. So it brackets the sample and
+    # is a stated bound rather than an arbitrarily wide one.
+    assert edges[0] < float(np.min(members))
+    assert edges[-1] > float(np.max(members))
+    assert edges[0] < mean < edges[-1]
+    span_in_sigma = (edges[-1] - edges[0]) / std
+    assert span_in_sigma == pytest.approx(2 * float(spec.sigma_range) * 1.1, rel=1e-6)
+
+
+def test_a_degenerate_stored_range_still_produces_a_usable_grid() -> None:
+    """Every member identical: the bin encoding stores a zero spread, and the grid must survive."""
+    from api.services.dual_source import stored_edges
+
+    spec = AggregateSpec(kind=KIND_MEAN_STD_BINS)
+    members = np.full((5, 1, 1), 7.0, dtype=np.float32)
+    fields = compute_aggregate(members, spec, expected_members=5)[:, 0, 0]
+
+    edges = stored_edges(fields, spec, bins=4)
+    assert len(edges) == 5
+    assert edges[-1] > edges[0]
+    assert edges[0] < 7.0 < edges[-1]
+
+
+def test_an_unobserved_cell_states_no_grid() -> None:
+    """Nothing stored at a cell is no grid, rather than a grid at invented bounds."""
+    from api.services.dual_source import stored_edges
+
+    spec = AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
+    assert stored_edges(np.full(spec.n_fields, np.nan, dtype=np.float32), spec) == []
+    # A field vector of another encoding's width is not this variable's distribution.
+    assert stored_edges(np.zeros(spec.n_fields - 1, dtype=np.float32), spec) == []
+
+
+def test_the_two_grids_agree_about_where_the_distribution_sits() -> None:
+    """The stored-line's counts are the same quantity on either grid, which is what lets the
+    stored-only mode replace the comparison mode without changing what is drawn."""
+    from api.services.dual_source import stored_edges
+
+    members = _quantile_members(seed=13)
+    spec = AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
+    fields = compute_aggregate(members, spec, expected_members=30)[:, 0, 0]
+    flat = np.asarray(members).reshape(-1)
+
+    for edges in (shared_edges(flat, 10), stored_edges(fields, spec, bins=10)):
+        tail = stored_exceedance(fields, spec, edges)
+        counts = stored_histogram(tail, edges, len(flat))
+        assert counts is not None
+        assert sum(counts) == len(flat)
+        assert counts[0] >= 1, "a zero-inflated sample puts mass at its minimum"

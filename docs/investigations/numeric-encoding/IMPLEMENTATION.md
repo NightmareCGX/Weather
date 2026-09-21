@@ -309,3 +309,22 @@ python compare_paths.py --quick    # 24 格点
 **本轮的验证**：Windows 全量 926 passed / 29 skipped；Linux `python:3.12-slim` 容器 ruff + mypy 干净、全量通过；`packages/domain` 704 passed 且 100% 覆盖率门槛达成。新增测试 29 条，分三层：`domain/tests/test_supersession.py`（策略与派生关系）、`tests/test_gc_aggregate_evidence.py`（探针拒绝的每一种容器缺陷）、`tests/test_gc_planner_supersession.py` 与 `tests/test_gc_worker_supersession.py`（规划器的持有/释放与工作器的覆盖/复验）。
 
 **尚未接入的部分**（按计划顺序）：前置变量的 L+3 延迟已在 `domain.supersession.predecessor_interval_dependent_lead` 中实现并被规划器与工作器使用（`max_lead` 处理"L 是本周期最后一个依赖它的时效"），但**没有**接入 §19.8(C) 的写端删除路径——那需要阶段 5 的逐类切换；staging 孤儿清理（§19.8 C 第一条）同样未做。
+
+### 19.16 存储侧直方图：无成员值也能画（阶段 5 的前置条件）
+
+§19.14 的对拍把"两条线画在同一张图上"作为删除的准入条件，而它的实现有一处**结构性依赖**：`_dual_source_histograms` 从**成员值**取分箱边界，且 `if not finite: return None, None`。也就是说——**成员一旦被回收，存储那条线就消失了**。而成员被回收之后，存储分布恰恰是**唯一**剩下的答案，不是"第二种意见"。前端更直接：`EnsembleDistribution` 在 `rawMembers` 为空时直接返回"not yet available"。
+
+于是"打开取代开关"会把图表清空，而不是把图表切到存储来源。这不是阶段 5 的退化，而是阶段 5 **根本走不通**——所以先补这一项。
+
+**怎么做（方案 A：存储分布自述边界）**
+
+* `domain`/`aggregate` 已经提供了两种编码各自的"最外层信息"：分位编码的 `levels` 首末项即分布自身的极值分位；分箱编码的 `mean ± sigma_range·std` 是它构造上的支撑区间。二者都是**容器已经对自己做过的陈述**，不需要任何成员值。
+* `dual_source.stored_edges(fields, spec, bins)` 取这两者之一作为 `[low, high]`，再按 `STORED_EDGE_MARGIN = 5%` 向外扩一点——否则最外侧那一格没有落点，形状的两端会被构造性地压平。
+* `stored_histogram` 的首格语义因此从"`P(X > edges[0])` 之外"改写为统一的 **`1 - P(X > edges[1])`**（即"落在第一格内"），并把这个前提写进 docstring：**首边界必须位于分布最小值处或其下**。`shared_edges` 按定义满足（下边界就是样本最小值），`stored_edges` 按构造满足（自带外扩）。这是同一条规则在两种网格下的统一形式，而不是两条分支。
+* `aggregate_serving` 把点读取抽成 `_stored_distribution_at_point(edges=None 表示自述网格)`，两个入口共用同一处门禁、同一套坐标推导、同一段字段切片——否则两处副本一旦漂移，就是"同一张图两条线读的不是同一个分布"。
+* `ensemble_data._stored_only_histogram` 在**聚合分支**返回 `histogram_stored`，**不受 `ENSEMBLE_DUAL_SOURCE_ENABLED` 开关约束**：那个开关是"在两种来源都还在时把两条线放在一张图上"的意思，只剩一种来源时没有可开关的对象。
+* 前端据 `members` 是否存在决定模式：有成员 → 条形图来自成员（Sturges 分箱），存储线是虚线；无成员 → 条形图直接来自 `histogram_stored` 的边界与计数，并画一条明确的说明文案。`histogramStored` 置底为 `distributionXDomain` 的兜底网格。
+
+**实测与验证**：新增 `services/api/tests/test_aggregate_stored_distribution.py`（9 条，走真实 reader gate，需要 seeded catalog + lifespan）、`test_dual_source.py` 增 5 条（自述边界、支撑区间、退化区间、未观测格点、两种网格给出同一数量）、前端 `EnsembleDistribution.test.tsx` 增 2 条（存储单线模式 / 双线对照模式不变）。全量：Windows ingestion 977 passed（带 Postgres/Redis/MinIO），API 771 passed（含既有 `test_35` 顺序敏感 flake，见下），frontend 521 passed，domain 707 passed 且 100% 覆盖门槛达成；`ruff` / `mypy` 两端干净。
+
+**已知未修**：`tests/test_canonical_resolver_v3.py::test_35` 在**全量顺序**下失败、单独运行通过。原因是 `TestClient(app)` 的 lifespan 退出会 `reader_lifecycle.begin_shutdown()`，该对象是**进程级全局**；任何用 `with TestClient(app)` 的模块跑在前面，都会让后续所有 gated read 拿到 `ReaderGateClosing`。这是测试隔离问题而非服务问题（生产一个进程一个 lifespan，随后退出）。它在本次改动之前就存在（`git stash` 后仍复现），本轮**未修**：修法（在每个测试前后重置 lifecycle，或让该测试自带 lifespan）会改动共享 fixture，属于独立的一件事，不夹带进本提交。

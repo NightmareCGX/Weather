@@ -18,6 +18,7 @@ import {
   distributionSummary,
   distributionXDomain,
   histogramBins,
+  histogramBinsFromPayload,
   mergeHistogramSources,
   toMemberDots,
   toPdfPoints,
@@ -104,13 +105,25 @@ export function EnsembleDistribution({
   const rawMembers = data.members;
   const members = isCeiling ? (rawMembers?.filter((m) => m < 19.99) ?? []) : (rawMembers ?? []);
 
-  if (rawMembers === undefined || rawMembers.length === 0) {
+  // The stored-only case: the API has no members to send because the store's members were
+  // reclaimed, and the distribution it sent instead came from the container. That line is the
+  // answer rather than a second opinion about one, so it is drawn as the bars -- the same series,
+  // fed a grid the payload carries instead of one derived from values that no longer exist.
+  //
+  // Which mode is in use is decided by the members, not by the stored payload: while members are
+  // present the stored line is the comparison's second line, on the member grid, and the bars stay
+  // the member sample's. The API sends a stored histogram in both states, and drawing it as the
+  // bars whenever it is present would silently change which source the chart is *about*.
+  const hasMembers = rawMembers !== undefined && rawMembers.length > 0;
+  const storedOnlyBars = hasMembers ? [] : histogramBinsFromPayload(data.histogram_stored);
+
+  if (!hasMembers && storedOnlyBars.length === 0) {
     return (
       <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
         <p className="text-xs text-slate-600">
           Ensemble distribution for {variableLabel}
           {timeLabel ? ` at ${timeLabel}` : ""} is not yet available: the API returned no raw member
-          values. The summary above is shown instead.
+          values and no stored distribution. The summary above is shown instead.
         </p>
       </div>
     );
@@ -147,15 +160,21 @@ export function EnsembleDistribution({
     );
   }
 
-  const bins = histogramBins(members);
-  const dots = toMemberDots(members);
-  const summary = distributionSummary(members);
+  const bins = storedOnlyBars.length > 0 ? storedOnlyBars : histogramBins(members);
+  const dots = storedOnlyBars.length > 0 ? [] : toMemberDots(members);
+  const summary =
+    storedOnlyBars.length > 0 ? distributionSummary([]) : distributionSummary(members);
   const pdfPoints = toPdfPoints(data.pdf);
-  const [xMin, xMax] = distributionXDomain(summary, data.pdf, data.histogram_members);
+  const [xMin, xMax] = distributionXDomain(
+    summary,
+    data.pdf,
+    data.histogram_members ?? data.histogram_stored
+  );
   // The migration's comparison: while the front end still receives a member-derived histogram it
   // draws both sources on one grid, so a change of source can be *seen*. The member line here
   // comes from the delivered histogram rather than from `histogramBins(members)` -- same values,
-  // but one grid for both lines, which is what makes them comparable at all.
+  // but one grid for both lines, which is what makes them comparable at all. It is empty when the
+  // members are gone, which is also when the stored line has become the bars.
   const comparison = mergeHistogramSources(data.histogram_members, data.histogram_stored);
   const storedLine = comparison
     .filter((bin) => bin.stored !== null)
@@ -190,27 +209,51 @@ export function EnsembleDistribution({
       <div>
         <div className="mb-1 flex items-baseline justify-between">
           <h4 className="text-sm font-semibold text-slate-200">
-            {isCeiling
-              ? `Conditional finite distribution · ${timeLabel}`
-              : `Member distribution · ${timeLabel}`}
+            {storedOnlyBars.length > 0
+              ? `Stored distribution · ${timeLabel}`
+              : isCeiling
+                ? `Conditional finite distribution · ${timeLabel}`
+                : `Member distribution · ${timeLabel}`}
           </h4>
           <span className="text-xs font-mono text-cyan-400">
-            {isCeiling ? `${finiteCount} finite members` : `${memberCount} members`}
+            {storedOnlyBars.length > 0
+              ? `${memberCount} members aggregated`
+              : isCeiling
+                ? `${finiteCount} finite members`
+                : `${memberCount} members`}
           </span>
         </div>
 
         <dl className="mb-2 grid grid-cols-4 gap-2 text-center text-xs">
           {/* The outer pair is the stored percentile pair, not the member sample's extremes: the
-              two sources have to answer the same question, and a container holds no extremes. */}
+              two sources have to answer the same question, and a container holds no extremes.
+              They come from the response's own statistics, so they are present on both paths --
+              which is also why the summary cells fall back to them when no members were read. */}
           <StatCell label="p0.1" value={data.statistics?.["p0.1"] ?? Number.NaN} />
           <StatCell label="p99.9" value={data.statistics?.["p99.9"] ?? Number.NaN} />
-          <StatCell label="Mean" value={summary.mean} />
-          <StatCell label="StdDev" value={summary.stdDev} />
+          <StatCell
+            label="Mean"
+            value={
+              Number.isFinite(summary.mean) ? summary.mean : (data.statistics?.mean ?? Number.NaN)
+            }
+          />
+          <StatCell
+            label="StdDev"
+            value={
+              Number.isFinite(summary.stdDev)
+                ? summary.stdDev
+                : (data.statistics?.spread ?? Number.NaN)
+            }
+          />
         </dl>
 
         <div
           role="img"
-          aria-label={`Histogram and PDF of ${members.length} ensemble members for ${variableLabel}`}
+          aria-label={
+            dots.length > 0
+              ? `Histogram and PDF of ${members.length} ensemble members for ${variableLabel}`
+              : `Stored distribution for ${variableLabel}`
+          }
           className="h-44 w-full"
         >
           <ResponsiveContainer width="100%" height="100%">
@@ -261,7 +304,7 @@ export function EnsembleDistribution({
                 dataKey="count"
                 isAnimationActive={false}
                 radius={[2, 2, 0, 0]}
-                name="Member count"
+                name={storedOnlyBars.length > 0 ? "Stored count" : "Member count"}
                 barSize={32}
               >
                 {bins.map((bin, index) => (
@@ -302,39 +345,41 @@ export function EnsembleDistribution({
           </ResponsiveContainer>
         </div>
 
-        <div
-          role="img"
-          aria-label={`Member values for ${variableLabel} at ${timeLabel}`}
-          className="mt-2 h-12 w-full"
-        >
-          <ResponsiveContainer width="100%" height="100%">
-            <ScatterChart margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
-              <XAxis
-                type="number"
-                dataKey="value"
-                tick={{ fontSize: 10, fill: "#94a3b8" }}
-                tickLine={false}
-                domain={[xMin, xMax]}
-              />
-              <YAxis hide domain={[0, 1]} />
-              <Tooltip
-                cursor={{ strokeDasharray: "3 3" }}
-                formatter={(value: number) => [formatValue(value, ""), "Member value"]}
-                labelFormatter={() => ""}
-                contentStyle={{
-                  fontSize: 12,
-                  backgroundColor: "#0f172a",
-                  borderColor: "#334155",
-                  color: "#f8fafc",
-                  borderRadius: 8,
-                }}
-              />
-              <Scatter data={dots} dataKey="value" fill={ACCENT} isAnimationActive={false} />
-            </ScatterChart>
-          </ResponsiveContainer>
-        </div>
+        {dots.length > 0 && (
+          <div
+            role="img"
+            aria-label={`Member values for ${variableLabel} at ${timeLabel}`}
+            className="mt-2 h-12 w-full"
+          >
+            <ResponsiveContainer width="100%" height="100%">
+              <ScatterChart margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+                <XAxis
+                  type="number"
+                  dataKey="value"
+                  tick={{ fontSize: 10, fill: "#94a3b8" }}
+                  tickLine={false}
+                  domain={[xMin, xMax]}
+                />
+                <YAxis hide domain={[0, 1]} />
+                <Tooltip
+                  cursor={{ strokeDasharray: "3 3" }}
+                  formatter={(value: number) => [formatValue(value, ""), "Member value"]}
+                  labelFormatter={() => ""}
+                  contentStyle={{
+                    fontSize: 12,
+                    backgroundColor: "#0f172a",
+                    borderColor: "#334155",
+                    color: "#f8fafc",
+                    borderRadius: 8,
+                  }}
+                />
+                <Scatter data={dots} dataKey="value" fill={ACCENT} isAnimationActive={false} />
+              </ScatterChart>
+            </ResponsiveContainer>
+          </div>
+        )}
 
-        {data.pdf === null && (
+        {data.pdf === null && dots.length > 0 && (
           <p className="mt-1 text-[11px] text-amber-400">
             Continuous probability density is unavailable for this lead time (insufficient spread
             across members).
@@ -342,11 +387,21 @@ export function EnsembleDistribution({
         )}
 
         <p className="mt-1 text-[11px] text-slate-500">
-          Histogram bars and dots show the discrete ensemble member sample. The continuous curve
-          shows the canonical Gaussian kernel density estimate (probability density).
-          {storedLine.length > 0 &&
-            " The dashed line is the same distribution read from the stored fields, drawn on the" +
-              " same bins so the two sources can be compared before the members are removed."}
+          {dots.length > 0 ? (
+            <>
+              Histogram bars and dots show the discrete ensemble member sample. The continuous curve
+              shows the canonical Gaussian kernel density estimate (probability density).
+              {storedLine.length > 0 &&
+                " The dashed line is the same distribution read from the stored fields, drawn on" +
+                  " the same bins so the two sources can be compared before the members are removed."}
+            </>
+          ) : (
+            <>
+              Histogram bars show the stored distribution: these members have been aggregated into a
+              summary container, so the bars are read from it and binned on the range it states
+              about itself. The member values are no longer stored.
+            </>
+          )}
         </p>
       </div>
     </div>

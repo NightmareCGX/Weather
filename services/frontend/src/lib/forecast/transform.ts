@@ -408,6 +408,23 @@ export function toHistogramPoints(
 }
 
 /**
+ * A stored histogram payload as chart bins, in the shape the bar series draws.
+ *
+ * The stored-only path's counterpart of :func:`histogramBins`: when a store's members have been
+ * reclaimed there are no member values to bin, so the distribution arrives already binned and the
+ * chart draws it directly. Same `HistogramBin` shape, so the bar series and its labels do not have
+ * to know which source produced them.
+ */
+export function histogramBinsFromPayload(histogram?: EnsembleHistogram | null): HistogramBin[] {
+  return toHistogramPoints(histogram).map((point) => ({
+    start: point.start,
+    end: point.end,
+    count: point.count,
+    mid: point.x,
+  }));
+}
+
+/**
  * The finite, strictly increasing edges of a histogram payload, or an empty array.
  *
  * Tolerance for a malformed payload rather than an error: this is a migration aid rendered

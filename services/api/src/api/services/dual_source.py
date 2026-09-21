@@ -9,11 +9,21 @@ change, and the migration's whole risk is exactly that the stored fields are *ne
 answer. So while both exist, both are delivered, the client draws both, and the member-derived line
 is deleted once the two have been seen to agree.
 
-Both lines therefore have to be on **one bin grid**, and the grid has to be the same on both sides
-or the comparison is between two different partitions. The grid comes from the member values (their
-range, ten equal bins by default) and the stored side is *integrated over that grid* rather than
-re-derived from a distribution of its own: a stored quantile function knows its CDF at every point,
-and the mass in a bin is the CDF's difference across it.
+**Why the stored side can also define the grid** (:func:`stored_edges`), and why that matters more
+than the comparison does. While both sources exist the grid comes from the member values, for the
+reason below. Once a variable's members have been reclaimed there are no member values to take a
+range from -- and the chart is then the *only* thing left to draw, so a stored line that needed the
+members to say where its bins went would disappear at exactly the moment it became the answer
+(``IMPLEMENTATION.md`` §19.16). A stored distribution can state its own range: the quantile
+encoding's outermost stored levels, or the bin encoding's mean and spread, which are the bounds it
+was built on. The stored side therefore has two grid modes, and which one is in use is the caller's
+choice because it is the caller that knows whether members still exist.
+
+Both lines on **one grid** is what makes them comparable at all, and the grid has to be the same on
+both sides or the comparison is between two different partitions. The member grid is the members'
+range in ten equal bins by default; the stored side is *integrated over that grid* rather than
+re-derived from a distribution of its own, because a stored quantile function knows its CDF at
+every point and the mass in a bin is the CDF's difference across it.
 
 What each side is, precisely
 ----------------------------
@@ -26,8 +36,8 @@ accumulated normalised shape. Both go through the same ``domain.aggregate`` help
 reader uses, so this histogram and the percentiles a response reports cannot disagree about the
 distribution they came from.
 
-Both are delivery-only. Neither is part of the statistics contract, and both disappear with the
-members -- which is the point of the exercise.
+Both are delivery-only. Neither is part of the statistics contract; the member line disappears with
+the members, which is the point of the exercise.
 """
 
 from __future__ import annotations
@@ -43,6 +53,7 @@ from domain.aggregate import (
     AggregateSpec,
     exceedance_from_bins,
     exceedance_from_quantiles,
+    quantile_at,
 )
 
 #: Bins when the caller does not say. Ten is a middle resolution for a 30-member sample: the
@@ -87,6 +98,75 @@ def member_histogram(values: npt.NDArray[np.floating], edges: list[float]) -> li
     finite = finite[np.isfinite(finite)]
     counts = np.histogram(finite, bins=np.asarray(edges, dtype=np.float64))[0]
     return [int(count) for count in counts]
+
+
+#: Fraction of the stored range by which :func:`stored_edges` widens its own bounds. A grid whose
+#: outermost edges are the extreme stored levels puts the entire upper tail's mass in the last bin
+#: and nothing outside it, so the shape's ends are flat by construction. Widening by this much
+#: gives the ends a bin to fall in -- chosen small because the stored levels are already the
+#: distribution's own range and a wider margin would spend resolution on empty bins.
+STORED_EDGE_MARGIN: float = 0.05
+
+
+def stored_edges(
+    fields_at_point: npt.NDArray[np.float32],
+    spec: AggregateSpec,
+    bins: int = DEFAULT_BINS,
+) -> list[float]:
+    """The bin edges a stored distribution states about itself, or ``[]`` if it cannot.
+
+    The grid for a chart drawn from a store whose members are gone. Unlike :func:`shared_edges`,
+    nothing here needs the member values: the range comes from the encoding's own outermost
+    information.
+
+    * **quantile function** -- the lowest and highest stored levels are the distribution's own
+      outermost quantiles, so they are the range's bounds by definition. The *mean* is deliberately
+      not used to centre them: it is a moment, and a heavy-tailed field's mean sits far from where
+      its mass does.
+    * **mean/std bins** -- the encoding's support is ``mean +- sigma_range * std`` in normalised
+      units, and it is bounded by construction, so those are the bounds. Reading the levels instead
+      would be wrong: a bin-encoded container stores no quantiles at all.
+
+    The bounds are widened by :data:`STORED_EDGE_MARGIN` of the range so the outermost bins have
+    mass in them (see that constant). A degenerate range -- every member identical, which the bin
+    encoding represents as a zero spread -- is widened by one unit on each side, the same fallback
+    :func:`shared_edges` uses.
+
+    ``[]`` for an unobserved cell or a field vector that is not this spec's shape, so a caller
+    reports "no stored line" rather than drawing one at invented bounds.
+    """
+    if fields_at_point.size != spec.n_fields:
+        return []
+    point = np.asarray(fields_at_point, dtype=np.float32)
+    if not np.isfinite(point).any():
+        return []
+
+    if spec.kind == KIND_QUANTILE_FUNCTION:
+        levels = spec.quantile_levels()
+        try:
+            low = float(np.asarray(quantile_at(point, levels, 0.0)))
+            high = float(np.asarray(quantile_at(point, levels, 1.0)))
+        except AggregateError:  # pragma: no cover - the shapes agree by construction
+            return []
+    elif spec.kind == KIND_MEAN_STD_BINS:
+        mean = float(point[0])
+        spread = float(point[1])
+        if not math.isfinite(mean) or not math.isfinite(spread):
+            return []
+        half = float(spec.sigma_range) * spread
+        low, high = mean - half, mean + half
+    else:  # pragma: no cover - the spec's own validation rejects other kinds
+        return []
+
+    if not math.isfinite(low) or not math.isfinite(high):
+        return []
+    if not high > low:
+        low -= 1.0
+        high += 1.0
+    margin = (high - low) * STORED_EDGE_MARGIN
+    low -= margin
+    high += margin
+    return [low + (high - low) * index / bins for index in range(bins + 1)]
 
 
 def stored_exceedance(
@@ -158,14 +238,19 @@ def stored_histogram(
     count is that probability times the member count -- which is what makes the two histograms
     comparable: both are counts of the members the container was computed from.
 
-    **The first bin is the exception, and it is not a detail.** Its lower edge is the sample
-    minimum, and a zero-inflated field has a large atom there: ``P(X > min)`` excludes every member
-    that *is* the minimum, and the member histogram counts them. Measured on real GEFS
-    precipitation, one cell had 30% of its members exactly at zero, so ``P(X > min)`` dropped nine
-    of thirty members and the stored line came out a third short in its first bin alone. The first
-    bin's mass is therefore ``P(X <= edges[1])``, which is ``1 - P(X > edges[1])`` for a grid whose
-    lower edge is the sample minimum -- the caller's grid, by construction
-    (:func:`shared_edges`).
+    **The first bin is the exception, and it is not a detail.** The general form differences
+    ``P(X > edge)`` across the bin, which counts ``(edges[i], edges[i+1]]`` -- the *open* lower
+    bound, so any member sitting exactly on the lower edge is dropped. For the first bin that is a
+    real loss rather than a boundary convention: a zero-inflated field has a large atom at its
+    minimum, and the member histogram counts it. Measured on real GEFS precipitation, one cell had
+    30% of its members exactly at zero, so ``P(X > min)`` dropped nine of thirty members and the
+    stored line came out a third short in its first bin alone. The first bin's mass is therefore
+    ``1 - P(X > edges[1])`` -- everything at or below the first edge belongs to it.
+
+    That form is correct for both grid modes, and it needs one property either way: the first edge
+    must sit at or below the distribution's lowest value, so that "at or below the first edge" is
+    the same set as "in the first bin". :func:`shared_edges` has it by definition (its lower edge
+    *is* the sample minimum) and :func:`stored_edges` by construction (it widens its own bounds).
 
     **The counts are apportioned rather than rounded independently.** Each bin's mass is a fraction
     of a member -- a ten-bin histogram of thirty members has 3 members per bin at most -- so
@@ -189,8 +274,9 @@ def stored_histogram(
             if index == 0
             else probabilities[index] - probabilities[index + 1]
         )
-    # A grid whose lower edge is not the sample minimum is a caller error, and the negative mass it
-    # produces would be worse than reading as one: said out loud rather than clipped silently.
+    # A grid whose lower edge is not the distribution's minimum is a caller error, and the negative
+    # mass it produces would be worse than reading as one: said out loud rather than clipped
+    # silently.
     if any(mass < -1e-9 for mass in masses):
         return None
     return _apportion([max(mass, 0.0) for mass in masses], member_count)
@@ -219,8 +305,10 @@ def _apportion(masses: list[float], member_count: int) -> list[int]:
 
 __all__ = [
     "DEFAULT_BINS",
+    "STORED_EDGE_MARGIN",
     "member_histogram",
     "shared_edges",
+    "stored_edges",
     "stored_exceedance",
     "stored_histogram",
 ]

@@ -10,6 +10,7 @@ import {
   distributionSummary,
   distributionXDomain,
   ensembleStatisticsEntries,
+  histogramBinsFromPayload,
   forecastLeadTimes,
   forecastVariableCodes,
   histogramBins,
@@ -761,6 +762,31 @@ describe("ensembleStatisticsEntries", () => {
     expect(byKey.get("p0.1")).toBeNull();
     expect(byKey.get("p99.9")).toBeNull();
     expect(byKey.get("p90")).toBeNull();
+  });
+
+  describe("histogramBinsFromPayload", () => {
+    it("turns a delivered histogram into the bar series' own bin shape", () => {
+      // The stored-only path: there are no member values to bin, so the payload's edges and counts
+      // *are* the histogram. Same `HistogramBin` shape as the member path, so the bar series and
+      // its labels do not have to know which source produced them.
+      const bins = histogramBinsFromPayload({
+        edges: [10, 12, 14, 16],
+        counts: [1, 4, 2],
+      });
+      expect(bins).toEqual([
+        { start: 10, end: 12, count: 1, mid: 11 },
+        { start: 12, end: 14, count: 4, mid: 13 },
+        { start: 14, end: 16, count: 2, mid: 15 },
+      ]);
+    });
+
+    it("reports nothing for an absent or malformed payload", () => {
+      // A bad grid means "no line to draw" rather than an error: the chart has to keep working.
+      expect(histogramBinsFromPayload(null)).toEqual([]);
+      expect(histogramBinsFromPayload(undefined)).toEqual([]);
+      expect(histogramBinsFromPayload({ edges: [1], counts: [] })).toEqual([]);
+      expect(histogramBinsFromPayload({ edges: [1, 1], counts: [1] })).toEqual([]);
+    });
   });
 
   describe("toPdfPoints", () => {
