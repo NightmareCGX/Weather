@@ -556,11 +556,26 @@ class WindRoseSectorOut(BaseModel):
 
 
 class WindRoseOut(BaseModel):
-    """8-sector Wind Rose representing speed x direction ensemble distribution."""
+    """8-sector Wind Rose representing speed x direction ensemble distribution.
+
+    ``bins``, ``bucket_edges_mps`` and ``member_count`` are carried by the **stored** rose only.
+    Its speed buckets are quantile edges of the cycle's own member set -- one bucket holding as
+    much of the distribution as the next -- so the edges have to travel with the buckets for a
+    client to label or combine them, and a fixed table of speed ranges cannot describe them. The
+    member path bins by fixed physical ranges instead
+    (``domain.models.wind.WIND_ROSE_SPEED_BINS_MPS``), so its sector ``bins`` are keyed by name
+    there and these fields are absent.
+    """
 
     calm_percentage: float
     calm_count: int
     sectors: list[WindRoseSectorOut]
+    #: Speed distribution summed over sectors -- the rose *is* ``wind_10m``'s distribution, so
+    #: this is what a caller reads a speed histogram off without adding the sectors up itself.
+    bins: dict[str, float] | None = None
+    #: The bucket boundaries those keys index, ascending, ``len(bins) + 1`` of them.
+    bucket_edges_mps: list[float] | None = None
+    member_count: int | None = None
 
 
 class EnsembleStatisticsData(BaseModel):

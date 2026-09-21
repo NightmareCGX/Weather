@@ -96,3 +96,75 @@ describe("WindRose", () => {
     expect(screen.getByText(/Gale\+/i)).toBeInTheDocument();
   });
 });
+
+describe("WindRose with a stored rose", () => {
+  // The stored rose's buckets are quantile edges of the cycle's own member set, so the labels
+  // come from the edges rather than from the fixed physical ranges the member path uses. Reading
+  // the member table against stored keys would draw the right heights under the wrong legend.
+  const storedRose = {
+    calm_percentage: 8.0,
+    calm_count: 2,
+    member_count: 30,
+    bucket_edges_mps: [1, 4, 7, 10, 13, 16, 19, 22, 26],
+    bins: {
+      bucket_0: 0.05,
+      bucket_1: 0.1,
+      bucket_2: 0.15,
+      bucket_3: 0.2,
+      bucket_4: 0.15,
+      bucket_5: 0.1,
+      bucket_6: 0.05,
+      bucket_7: 0.02,
+    },
+    sectors: [
+      {
+        sector: "N",
+        count: 4,
+        probability: 0.2,
+        bins: {
+          bucket_0: 0.01,
+          bucket_1: 0.02,
+          bucket_2: 0.03,
+          bucket_3: 0.04,
+          bucket_4: 0.03,
+          bucket_5: 0.03,
+          bucket_6: 0.02,
+          bucket_7: 0.02,
+        },
+      },
+      {
+        sector: "S",
+        count: 6,
+        probability: 0.3,
+        bins: {
+          bucket_0: 0.04,
+          bucket_1: 0.08,
+          bucket_2: 0.12,
+          bucket_3: 0.16,
+          bucket_4: 0.12,
+          bucket_5: 0.07,
+          bucket_6: 0.03,
+          bucket_7: 0.0,
+        },
+      },
+    ],
+  };
+
+  it("labels the buckets from the edges the payload carries", () => {
+    render(<WindRose windRose={storedRose} />);
+
+    // The first bucket spans edges[0]..edges[1] = 1..4 m/s = 4..14 km/h.
+    expect(screen.getByText("4–14 km/h")).toBeInTheDocument();
+    // The last is open-ended, because the outermost edge bounds it.
+    expect(screen.getByText("≥79 km/h")).toBeInTheDocument();
+    // The member path's fixed labels are gone: they would be wrong for a quantile grid.
+    expect(screen.queryByText(/\(Light\)/)).not.toBeInTheDocument();
+    expect(screen.getByText("8%")).toBeInTheDocument();
+  });
+
+  it("still uses the physical labels for a member-derived rose", () => {
+    render(<WindRose windRose={MOCK_WIND_ROSE} />);
+    expect(screen.getByText("1.8–20 km/h (Light)")).toBeInTheDocument();
+    expect(screen.queryByText(/km\/h$/)).not.toBeInTheDocument();
+  });
+});

@@ -252,6 +252,17 @@ export interface WindRose {
   calm_percentage: number;
   calm_count: number;
   sectors: WindRoseSector[];
+  /**
+   * The speed distribution summed over sectors, keyed `bucket_0`..`bucket_7`. Present on the
+   * **stored** rose, whose buckets are quantile edges of the cycle's own member set; absent on the
+   * member path's, whose sectors are keyed by fixed physical speed names instead.
+   */
+  bins?: Record<string, number> | null;
+  /**
+   * The bucket boundaries `bins` indexes, ascending, one more of them than there are buckets.
+   * A bucket cannot be labelled without these, because the edges differ between cycles.
+   */
+  bucket_edges_mps?: number[] | null;
   member_count?: number;
 }
 

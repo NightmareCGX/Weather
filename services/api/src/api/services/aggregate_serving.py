@@ -936,7 +936,7 @@ def wind_products_from_aggregate(
                 "count": int(round(probability * member_count)),
                 "probability": probability,
                 "bins": {
-                    str(bucket): float(sector_cells[bucket])
+                    _rose_bucket_name(bucket): float(sector_cells[bucket])
                     for bucket in range(ROSE_BUCKETS)
                 },
             }
@@ -952,10 +952,36 @@ def wind_products_from_aggregate(
             "calm_count": calm_count,
             "calm_probability": calm_count / member_count,
             "member_count": int(round(member_count)),
+            # The bucket edges travel with the fields because a bucket is defined by them: they are
+            # *quantile* edges of this cycle's member set, one bucket holding as much of the
+            # distribution as the next, so no fixed table can label them.
             "bucket_edges_mps": [float(edge) for edge in edges],
             "sectors": sectors,
+            # The speed distribution, summed over sectors. The rose *is* wind_10m's distribution,
+            # so this is what a caller reads a speed histogram off without adding the sectors up
+            # itself -- and the member path's static speed bins cannot be compared with these
+            # quantile buckets, which is why the edges are above.
+            #
+            # The cells are laid out sector-major (``sector * ROSE_BUCKETS + bucket``), so the sum
+            # is over sector *stride*, not over the first eight cells.
+            "bins": {
+                _rose_bucket_name(bucket): float(
+                    sum(cells[sector * ROSE_BUCKETS + bucket] for sector in range(8))
+                )
+                for bucket in range(ROSE_BUCKETS)
+            },
         },
     }
+
+
+def _rose_bucket_name(index: int) -> str:
+    """Stable name of a rose speed bucket, for a client keying sectors by bin.
+
+    ``bucket_0`` .. ``bucket_7``: positional, because the bucket *boundaries* are quantiles of the
+    cycle's own member set and therefore differ between cycles, leads and variables. A name that
+    claimed a speed range would be wrong for every cycle but the one it was written from.
+    """
+    return f"bucket_{index}"
 
 
 def precipitation_phase_from_aggregate(

@@ -1074,6 +1074,15 @@ def _ensemble_payload_from_aggregate(
                     )
                     for sector in rose["sectors"]
                 ],
+                # The stored rose states its own bucket boundaries, because they are quantiles of
+                # the cycle's member set rather than fixed speed ranges. Passing them on is what
+                # lets a client label the buckets -- and the summed distribution is the variable's
+                # speed histogram, which the member path has no equivalent of.
+                bins={key: round(float(value), 4) for key, value in rose["bins"].items()},
+                bucket_edges_mps=[
+                    round(float(edge), 2) for edge in rose["bucket_edges_mps"]
+                ],
+                member_count=int(rose["member_count"]),
             )
         if "phase_support" in products:
             support = products["phase_support"]

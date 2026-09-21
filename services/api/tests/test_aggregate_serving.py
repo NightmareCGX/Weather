@@ -906,3 +906,70 @@ def test_a_flag_fraction_is_refused_where_it_says_nothing(tmp_path) -> None:
     members = np.full((30, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
     store = _store_with(tmp_path, "crain", members)
     assert _fetch("crain", store, 0, 0) is None
+
+
+def test_the_stored_rose_states_its_own_bucket_boundaries(tmp_path) -> None:
+    """The buckets are quantiles of this cycle's members, so the edges travel with them.
+
+    A reader cannot label a bucket from a fixed table -- bucket 3 of one cycle is not bucket 3 of
+    the next -- and cannot sum the rose into a speed histogram without knowing where the buckets
+    end. Both come from the container, and both reach the response.
+    """
+    from api.services.aggregate_serving import wind_products_from_aggregate
+
+    rng = np.random.default_rng(41)
+    u = rng.normal(3.0, 4.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    v = rng.normal(2.0, 4.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    store = _store_with(
+        tmp_path, "wind_10m", u, group_members={"wind_u_10m": u, "wind_v_10m": v}
+    )
+
+    products = wind_products_from_aggregate(
+        store_path=store,
+        lead_time_hours=LEAD,
+        chunk_row=0,
+        chunk_col=0,
+        row_in_chunk=5,
+        col_in_chunk=7,
+    )
+    assert products is not None
+    rose = products["rose"]
+    assert len(rose["bucket_edges_mps"]) == 9
+    assert all(
+        rose["bucket_edges_mps"][i] < rose["bucket_edges_mps"][i + 1] for i in range(8)
+    )
+    # The summed distribution is the variable's speed histogram, and it accounts for the same
+    # members the sectors do -- the rose *is* wind_10m's distribution. The tolerance is the
+    # quantisation the fields went through: each of the 64 cells is stored at a 0.001 step, so
+    # summing 8 of them either way can differ by a few steps.
+    assert len(rose["bins"]) == 8
+    assert sum(rose["bins"].values()) == pytest.approx(
+        sum(sector["probability"] for sector in rose["sectors"]), abs=0.01
+    )
+    # Bucket keys are positional: a name claiming a speed range would be wrong for every cycle but
+    # the one it was written from.
+    assert set(rose["bins"]) == {f"bucket_{index}" for index in range(8)}
+    assert set(rose["sectors"][0]["bins"]) == set(rose["bins"])
+
+
+def test_the_member_rose_keeps_its_own_bin_names(tmp_path) -> None:
+    """The member path bins by fixed physical ranges, so its keys are physical names.
+
+    The two are not interchangeable and the schema says so: ``bins``/``bucket_edges_mps`` are the
+    stored rose's, because the member path's ranges need no explanation. A client that wants to
+    compare them has to do it through the edges, which is what the fields are for.
+    """
+    from api.schemas import WindRoseOut, WindRoseSectorOut
+
+    member_rose = WindRoseOut(
+        calm_percentage=10.0,
+        calm_count=3,
+        sectors=[
+            WindRoseSectorOut(
+                sector="N", count=1, probability=0.1, bins={"light": 0.1}
+            )
+        ],
+    )
+    assert member_rose.bins is None
+    assert member_rose.bucket_edges_mps is None
+    assert member_rose.member_count is None
