@@ -561,3 +561,87 @@ def test_the_floor_is_unchanged_for_a_variable_with_no_container(
                 )
     finally:
         reset_supersession_enabled()
+
+
+def test_asking_for_members_of_a_reclaimed_variable_is_refused(
+    client, migrated_db, tmp_path
+) -> None:
+    """A request for raw members gets an error, not an empty list beside an unread distribution.
+
+    ``members: []`` with null statistics reads as "no data for this lead" while the stored
+    distribution sits in the same response unread. That is worse than a refusal: it looks like a
+    gap in the data rather than a request for something this store no longer keeps.
+    """
+    from api.services.ensemble_data import build_ensemble_statistics
+
+    members = _members("temperature_2m", 52)
+    store = _point_store(tmp_path, "temperature_2m", members)
+    cycle = _register_store(migrated_db, store)
+    _reclaim_most_members(migrated_db, store, cycle)
+
+    set_supersession_enabled(True)
+    try:
+        with Session(migrated_db) as session:
+            with pytest.raises(HTTPException) as refused:
+                build_ensemble_statistics(
+                    session,
+                    latitude=0.0,
+                    longitude=0.0,
+                    variable="temperature_2m",
+                    model=MODEL_ID,
+                    lead_time_hours=LEAD,
+                    include_members=True,
+                    initial_time=cycle.isoformat(),
+                )
+        assert refused.value.status_code == 422
+        assert "include_members" in str(refused.value.detail)
+
+        # And the statistics-only request in the same state is served, from the container.
+        with Session(migrated_db) as session:
+            served = build_ensemble_statistics(
+                session,
+                latitude=0.0,
+                longitude=0.0,
+                variable="temperature_2m",
+                model=MODEL_ID,
+                lead_time_hours=LEAD,
+                initial_time=cycle.isoformat(),
+            )
+        assert served.members is None
+        assert served.histogram_stored is not None
+        assert served.statistics.mean is not None
+    finally:
+        reset_supersession_enabled()
+
+
+def _reclaim_most_members(engine, store: str, cycle: datetime) -> None:
+    """Mark every member but one deleted, as the reclamation worker leaves them.
+
+    One survivor rather than none: a run with *no* surviving member rows is assumed complete by
+    the resolver's legacy fallback, which would hide the coverage failure these tests exercise.
+    """
+    with Session(engine) as session:
+        run_id = session.execute(
+            select(ModelRun.id).where(ModelRun.zarr_store_path == store)
+        ).scalar_one()
+        for member in range(1, REGISTERED_MEMBERS):
+            session.add(
+                ReclamationQueue(
+                    id=f"probe_inc_{run_id}_{member}",
+                    run_id=run_id,
+                    model_id=MODEL_ID,
+                    cycle_time=cycle,
+                    lead_time_hours=LEAD,
+                    variable_code="temperature_2m",
+                    target_kind="mem",
+                    member_index=member,
+                    valid_time=cycle + timedelta(hours=LEAD),
+                    store_path=store,
+                    physical_key=f"temperature_2m/shard.mem{member:03d}_L{LEAD:04d}.shard",
+                    status="deleted",
+                    attempt_count=1,
+                    created_at=cycle,
+                    updated_at=cycle,
+                )
+            )
+        session.commit()

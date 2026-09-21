@@ -155,6 +155,32 @@ def _aggregate_represents_members(
     return is_variable_lead_servable(member_coverage_ok=False, aggregate_ready=ready)
 
 
+def _members_have_been_reclaimed(
+    *,
+    variable: str,
+    store_path: str,
+    lead_time_hours: int,
+    available_members: tuple[int, ...],
+    expected_members: int,
+) -> bool:
+    """Whether this variable's members were released, as opposed to simply missing.
+
+    The distinction a request for raw members needs: **released** means the store has a readable
+    container that answers for them, so the members are gone by design and no amount of waiting
+    brings them back. **Missing** means the coverage floor failed for some other reason -- a
+    partial cycle, a failed download -- and the ordinary rules already cover it.
+
+    Requiring the container is what keeps the refusal narrow. A store with no aggregate keeps the
+    member path and its existing behaviour, whatever its coverage happens to be.
+    """
+    if is_lead_servable(len(available_members), expected_members):
+        # The members are there, so the caller gets them; nothing was reclaimed.
+        return False
+    return _aggregate_represents_members(
+        variable, store_path=store_path, lead_time_hours=lead_time_hours
+    )
+
+
 def _resolve_eligible_ensemble_run_and_members(
     db: Session,
     model: str,
@@ -579,10 +605,31 @@ def build_ensemble_statistics(
                 )
             )
 
-        # The raw members and the KDE built from them are the one thing an aggregate cannot
-        # answer: it has collapsed the members by construction. A request that asks for them
-        # takes the member path for the whole response, rather than mixing a stored product with
-        # an absent member list.
+        # A request for the raw members is one an aggregate cannot answer: it has collapsed them
+        # by construction. While the members are still stored the member path serves the whole
+        # response. Once they have been reclaimed they are gone for good, and the honest answer is
+        # a refusal rather than an empty list -- `members: []` with null statistics reads as "no
+        # data for this lead" while the stored distribution sits beside it unread, which is worse
+        # than an error: it looks like a gap in the data rather than a request for something this
+        # store no longer keeps.
+        if include_members and _members_have_been_reclaimed(
+            variable=variable,
+            store_path=str(store_path_str),
+            lead_time_hours=lead_time_hours,
+            available_members=avail_members,
+            expected_members=expected_members,
+        ):
+            raise HTTPException(
+                status_code=_STATUS_INVALID_INPUT,
+                detail=(
+                    f"Variable '{variable}' is served from a stored distribution at lead "
+                    f"{lead_time_hours}h: its ensemble members have been aggregated into a "
+                    "summary container and are no longer stored, so 'include_members' cannot be "
+                    "answered. Request the statistics without it, or read the stored "
+                    "distribution from 'histogram_stored'."
+                ),
+            )
+
         if not include_members and aggregate_can_answer(variable):
             served = try_read_aggregate(
                 lambda: gated_statistics_from_aggregate(

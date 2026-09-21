@@ -219,3 +219,72 @@ describe("useEnsembleDistribution", () => {
     );
   });
 });
+
+describe("useEnsembleDistribution on a store whose members were aggregated away", () => {
+  it("asks again without include_members when the members request is refused", async () => {
+    // The refusal is not a failure: the store answers the statistics, it just no longer keeps the
+    // members. So the hook falls back to the statistics-only request and draws the stored
+    // distribution -- which is what the response carries.
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: {
+              type: "invalid_request_error",
+              code: "invalid_request",
+              message: "Variable 'temperature_2m' is served from a stored distribution.",
+            },
+          },
+          422
+        )
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          object: "ensemble_statistics",
+          data: {
+            model: "gefs",
+            lead_time_hours: 6,
+            member_count: 30,
+            statistics: {
+              mean: 10,
+              median: 10,
+              spread: 2,
+              p10: 8,
+              p25: 9,
+              p50: 10,
+              p75: 11,
+              p90: 12,
+            },
+            histogram_stored: { edges: [8, 9, 10, 11, 12], counts: [2, 5, 12, 8, 3] },
+          },
+          has_more: false,
+          next_cursor: null,
+        })
+      );
+
+    const { result } = renderHook(() =>
+      useEnsembleDistribution(location, 6, "temperature_2m", { model: "gefs" })
+    );
+    await waitFor(() => expect(result.current.status).toBe("success"));
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(String(mockFetch.mock.calls[0][0])).toContain("include_members=true");
+    expect(String(mockFetch.mock.calls[1][0])).not.toContain("include_members");
+    expect(result.current.data?.histogram_stored?.counts).toEqual([2, 5, 12, 8, 3]);
+    expect(result.current.data?.members).toBeUndefined();
+  });
+
+  it("surfaces a 422 that the fallback also fails on", async () => {
+    // The fallback is one retry, not a loop: if the statistics-only request fails too, the caller
+    // is told rather than left loading.
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse({ error: { message: "members gone" } }, 422))
+      .mockResolvedValueOnce(jsonResponse({ error: { message: "still failing" } }, 500));
+
+    const { result } = renderHook(() =>
+      useEnsembleDistribution(location, 6, "temperature_2m", { model: "gefs" })
+    );
+    await waitFor(() => expect(result.current.status).toBe("error"));
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
