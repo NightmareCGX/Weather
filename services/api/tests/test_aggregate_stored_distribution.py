@@ -23,40 +23,65 @@ from api.services.aggregate_serving import (
 )
 from domain.aggregate import compute_aggregate, finite_member_count
 from domain.field_layout import aggregate_fields_for
+from domain.supersession import reset_supersession_enabled, set_supersession_enabled
 from domain.variable_class import spec_for
 from api.models.entities import (
+    EnsembleMemberProduct,
     ForecastCenter,
     ForecastProduct,
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationQueue,
 )
+from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from tests._zarr_writer import write_dataset
 from tests.test_aggregate_serving import _encode
 
 GRID_LAT, GRID_LON = 128, 160
 LEAD = 6
-#: Model identity the seeded run is registered under. One model is enough: nothing here depends on
-#: the model, only on a catalog row whose ``zarr_store_path`` is the store being read.
-MODEL_ID = "gfs"
+#: Model identity the seeded run is registered under. **GEFS, not GFS**, because the resolver rule
+#: these tests exercise is the *ensemble* member-coverage floor: a deterministic model never reaches
+#: it, so a deterministic registration could not distinguish a working waiver from an absent one.
+MODEL_ID = "gefs"
+#: Members the registration declares. The contract's count, so the coverage floor is the real one.
+REGISTERED_MEMBERS = 30
 
 
-#: Cycle time the registered runs count up from. Far from the seeded cycles, and paired with a
-#: version string of this module's own: ``(model_version_id, cycle_time)`` is unique on
-#: ``model_runs``, so each registration needs a cycle of its own -- the gate looks a store up by
-#: path, which means two test stores cannot share one run row.
-_REGISTERED_CYCLE = datetime(2026, 7, 21, tzinfo=timezone.utc)
+#: Cycle time the registered runs count up from, **and it is late in the day on purpose.**
+#:
+#: Two reasons, and the first one bit during development:
+#:
+#: * ``(model_version_id, cycle_time)`` is unique on ``model_runs``, so each registration needs a
+#:   cycle of its own -- the gate looks a store up by path, which means two test stores cannot
+#:   share one run row.
+#: * the cycle has to be **newer than anything the shared fixture catalog provides**, or the
+#:   resolver's newest-cycle-wins rule hands the valid time back to a seeded run with a complete
+#:   member set, and a test of the coverage floor silently tests the fixture instead.
+#:
+#: At 18Z with the six-hour lead the tests use, the valid time is the next day's 00Z -- which the
+#: fixture GEFS run (cycle 00Z, leads 0/6/12/18) cannot reach at all. So a registered run is the
+#: only candidate there, and whatever the resolver decides for it is observable.
+_REGISTERED_CYCLE = datetime(2026, 7, 21, 18, tzinfo=timezone.utc)
 _registration_count = itertools.count()
 
 
-def _register_store(engine, store: str, variable: str = "temperature_2m") -> None:
+def _register_store(
+    engine, store: str, variable: str = "temperature_2m"
+) -> datetime:
     """Give a test store a catalog run, because the reader gate revalidates against it.
 
     The gate's revalidation is a catalog read: it looks the store path up in ``model_runs`` and
     refuses to hand back a dataset when no run in a readable status owns it. That is the mechanism
     which stops a reader from serving a store the platform has stopped serving, so a test that
     wants to read through the gate has to own a row -- the same thing every other gated suite does.
+
+    Returns:
+        The cycle time the run was registered at, which the run's valid times are derived from.
+        Handed back rather than recomputed because the cycle is allocated from a module counter --
+        two stores cannot share a run row, since the gate looks a store up by path.
     """
     version_id = f"version_{MODEL_ID}_stored_dist"
     with Session(engine) as session:
@@ -112,7 +137,20 @@ def _register_store(engine, store: str, variable: str = "temperature_2m") -> Non
                 zarr_chunk_path=store,
             )
         )
+        # The committed member rows, so the coverage floor has something to count. Without them the
+        # resolver's legacy fallback assumes a complete set, and a test of the floor would be
+        # testing the fallback instead.
+        for member in range(1, REGISTERED_MEMBERS + 1):
+            session.add(
+                EnsembleMemberProduct(
+                    id=f"emp_{run_id}_{member}",
+                    run_id=run_id,
+                    member_index=member,
+                    lead_time_hours=LEAD,
+                )
+            )
         session.commit()
+    return cycle
 
 
 def _point_store(tmp_path, variable: str, members: np.ndarray) -> str:
@@ -379,3 +417,147 @@ def test_the_grid_is_a_function_of_the_encodings_own_information(variable: str) 
     edges = stored_edges(fields, spec, bins=10)
     assert len(edges) == 11
     assert all(edges[i] < edges[i + 1] for i in range(10))
+
+
+# ---------------------------------------------------------------------------
+# The valid-time resolution path, once the members are gone
+# ---------------------------------------------------------------------------
+
+
+def test_the_valid_time_path_still_resolves_a_reclaimed_variable(
+    client, migrated_db, tmp_path
+) -> None:
+    """The whole point of the resolver change: the timeline URL keeps working.
+
+    Every endpoint that takes ``valid_time`` resolves through the canonical resolver, and that
+    resolver's candidate rule is a member-coverage floor. The floor counts committed member rows
+    minus the ones the platform deleted -- so a store whose members were reclaimed by *design*
+    reads as an outage, and every one of those endpoints would 404 at exactly the moment the
+    members were released. The floor is now waived for a candidate whose caller-named variables are
+    all represented by a readable container.
+    """
+    from api.services.resolver import resolve_valid_time_source
+
+    members = _members("temperature_2m", 51)
+    store = _point_store(tmp_path, "temperature_2m", members)
+    cycle = _register_store(migrated_db, store)
+
+    target = cycle + timedelta(hours=LEAD)
+    with Session(migrated_db) as session:
+        run_id = session.execute(
+            select(ModelRun.id).where(ModelRun.zarr_store_path == store)
+        ).scalar_one()
+        # The members reach 'deleted' exactly as the reclamation worker leaves them, and the
+        # container is the only representation left. All but one is deleted: a run with *no*
+        # surviving member rows is assumed complete by the resolver's legacy fallback, which would
+        # hide the coverage failure instead of exercising it.
+        for member in range(1, REGISTERED_MEMBERS):
+            session.add(
+                ReclamationQueue(
+                    id=f"probe_rec_{run_id}_{member}",
+                    run_id=run_id,
+                    model_id=MODEL_ID,
+                    cycle_time=cycle,
+                    lead_time_hours=LEAD,
+                    variable_code="temperature_2m",
+                    target_kind="mem",
+                    member_index=member,
+                    valid_time=target,
+                    store_path=store,
+                    physical_key=f"temperature_2m/shard.mem{member:03d}_L{LEAD:04d}.shard",
+                    status="deleted",
+                    attempt_count=1,
+                    created_at=cycle,
+                    updated_at=cycle,
+                )
+            )
+        session.commit()
+
+    # With the reclamation switch off the coverage floor still applies, so the release never
+    # happens and this is the pre-existing answer.
+    reset_supersession_enabled()
+    with Session(migrated_db) as session:
+        with pytest.raises(HTTPException):
+            resolve_valid_time_source(
+                session, MODEL_ID, target, variable="temperature_2m", require_members=True
+            )
+
+    # With it on, the container answers for the variable and the resolution succeeds.
+    set_supersession_enabled(True)
+    try:
+        with Session(migrated_db) as session:
+            source = resolve_valid_time_source(
+                session, MODEL_ID, target, variable="temperature_2m", require_members=True
+            )
+        assert source.store_path == store
+        assert source.lead_time_hours == LEAD
+    finally:
+        reset_supersession_enabled()
+
+
+def test_the_floor_is_unchanged_for_a_variable_with_no_container(
+    client, migrated_db, tmp_path
+) -> None:
+    """A reclaimed store is not a licence to serve something nobody can read.
+
+    The waiver is per variable and per lead and needs readable bytes. Here the members are deleted
+    and there is no container, so the resolution fails -- which is also the state of every store
+    written before the aggregate path existed.
+    """
+    from api.services.resolver import resolve_valid_time_source
+
+    store = str(tmp_path)
+    write_dataset(
+        xr.Dataset(
+            data_vars={
+                "temperature_2m": (
+                    ("lead_time_hours", "latitude", "longitude"),
+                    np.zeros((1, GRID_LAT, GRID_LON), dtype=np.float32),
+                )
+            },
+            coords={
+                "lead_time_hours": [LEAD],
+                "latitude": np.linspace(-49.5, 49.5, GRID_LAT, dtype=np.float32),
+                "longitude": np.linspace(-99.5, 99.5, GRID_LON, dtype=np.float32),
+            },
+        ),
+        store,
+    )
+    cycle = _register_store(migrated_db, store)
+    target = cycle + timedelta(hours=LEAD)
+
+    with Session(migrated_db) as session:
+        run_id = session.execute(
+            select(ModelRun.id).where(ModelRun.zarr_store_path == store)
+        ).scalar_one()
+        for member in range(1, REGISTERED_MEMBERS):
+            session.add(
+                ReclamationQueue(
+                    id=f"probe_noc_{run_id}_{member}",
+                    run_id=run_id,
+                    model_id=MODEL_ID,
+                    cycle_time=cycle,
+                    lead_time_hours=LEAD,
+                    variable_code="temperature_2m",
+                    target_kind="mem",
+                    member_index=member,
+                    valid_time=target,
+                    store_path=store,
+                    physical_key=f"temperature_2m/shard.mem{member:03d}_L{LEAD:04d}.shard",
+                    status="deleted",
+                    attempt_count=1,
+                    created_at=cycle,
+                    updated_at=cycle,
+                )
+            )
+        session.commit()
+
+    set_supersession_enabled(True)
+    try:
+        with Session(migrated_db) as session:
+            with pytest.raises(HTTPException):
+                resolve_valid_time_source(
+                    session, MODEL_ID, target, variable="temperature_2m", require_members=True
+                )
+    finally:
+        reset_supersession_enabled()

@@ -264,13 +264,16 @@ def _discover_candidates_bulk(
     *,
     start_lead_time_hours: int | None = None,
     end_lead_time_hours: int | None = None,
+    variables: Iterable[str] | None = None,
     now: datetime | None = None,
 ) -> dict[datetime, list[_CandidateRecord]]:
     """Discover all valid-time candidates using exactly 1 catalog query (+1 member query for ensembles).
 
     Applies model-scoped physical deletion fencing.
-    For GEFS ensembles, strictly enforces that candidates have both official geavg
-    and servable member coverage (>=85%).
+    For GEFS ensembles, enforces that candidates have both official geavg and servable member
+    coverage (>=85%) -- unless every one of ``variables`` is represented by a stored aggregate
+    container at that lead, in which case the coverage floor no longer describes the variable and
+    the candidate is kept (see :func:`_container_stands_in`).
     Filters out physical shards that are in reclamation_queue with status IN ('deleting', 'deleted').
     """
     now_utc = now if now is not None else get_current_time()
@@ -278,6 +281,38 @@ def _discover_candidates_bulk(
     m_id = model.lower().strip()
     expected_members = get_expected_members(m_id, default_if_unknown=1)
     is_ensemble = expected_members > 1
+
+    #: The variables the caller needs at this resolution, in order and without repeats. Empty for a
+    #: caller that named none, which is the "no single answer to give" case: a bulk anchor or
+    #: availability query wants every variable, so a per-variable container answer cannot speak for
+    #: it and its behaviour is deliberately unchanged.
+    requested = tuple(dict.fromkeys(str(v) for v in variables)) if variables else ()
+    #: Container probes already made in this call, keyed by store, variable and lead. A probe is a
+    #: tail read of one object (measured at ~0.04 ms), and it only happens for a candidate whose
+    #: coverage has *already* failed -- so a store with its members intact pays nothing.
+    container_probes: dict[tuple[str, str, int], bool] = {}
+
+    def _container_stands_in(store_path: str, variable: str, lead_hours: int) -> bool:
+        """Whether a readable container replaces ``variable``'s members at this lead.
+
+        The store-side half of the same predicate the reclamation planner deletes by
+        (``domain.supersession``): with member reclamation off nothing is ever released, so a
+        coverage failure stays a failure and this is inert.
+        """
+        key = (store_path, variable, lead_hours)
+        cached = container_probes.get(key)
+        if cached is None:
+            from api.services.aggregate_serving import aggregate_answers_for_lead
+            from domain.supersession import is_variable_lead_servable
+
+            cached = is_variable_lead_servable(
+                member_coverage_ok=False,
+                aggregate_ready=aggregate_answers_for_lead(
+                    variable, store_path=store_path, lead_time_hours=lead_hours
+                ),
+            )
+            container_probes[key] = cached
+        return cached
 
     # 1. Main catalog query: model_runs ⋈ forecast_products with physical fence filter
     has_reclamation_queue = True
@@ -414,9 +449,21 @@ def _discover_candidates_bulk(
 
             m_indices = tuple(sorted(raw_members)) if raw_members else ()
             # Strict GEFS Coherent Vintage Invariant:
-            # Candidate is eligible ONLY if both mean product AND >=85% members exist
+            # Candidate is eligible ONLY if both mean product AND >=85% members exist -- unless
+            # every variable the caller asked for is represented by a container instead.
+            #
+            # The floor counts committed member rows minus the ones the platform deleted, so a
+            # store whose members were reclaimed by design reads as an outage. That is the same
+            # question the reclamation planner answers per variable, and it is answered here from
+            # the same evidence: a candidate survives a coverage failure only when the caller named
+            # variables and *all* of them have a readable container at this lead. An unnamed
+            # variable (a bulk anchor query), a variable with no container, and a store with the
+            # reclamation switch off all keep the floor exactly as it was.
             if not is_lead_servable(len(m_indices), expected_members):
-                continue
+                if not requested or not all(
+                    _container_stands_in(rec["store_path"], var, lead_num) for var in requested
+                ):
+                    continue
             if not rec["product_types"]:
                 continue
 
@@ -517,6 +564,7 @@ def resolve_valid_time_candidates(
         model,
         start_lead_time_hours=start_lead_time_hours,
         end_lead_time_hours=end_lead_time_hours,
+        variables=(variable,) if variable is not None else None,
         now=now,
     )
 
@@ -733,7 +781,9 @@ def _resolve_variable_source_uncached(
             db, model, "precipitation_amount_3h", v_utc, initial_time=initial_time, now=now_utc
         )
 
-    candidates_map = _discover_candidates_bulk(db, model, now=now_utc)
+    candidates_map = _discover_candidates_bulk(
+        db, model, variables=(variable,), now=now_utc
+    )
     cands = candidates_map.get(v_utc)
     if not cands:
         raise HTTPException(
@@ -890,11 +940,15 @@ def resolve_canonical_sources_bulk(
     m_id = model.lower().strip()
     var_list = list(variables) if variables is not None else []
 
+    # A bulk caller names the variables it wants, so a candidate whose coverage failed can be kept
+    # when every one of them is represented by a container. ``var_list`` empty (an availability
+    # query with no variables) passes nothing, and the coverage floor applies unchanged.
     cands_map = _discover_candidates_bulk(
         db,
         m_id,
         start_lead_time_hours=start_lead_time_hours,
         end_lead_time_hours=end_lead_time_hours,
+        variables=var_list or None,
         now=now_utc,
     )
 
@@ -1078,7 +1132,9 @@ def list_canonical_valid_times(
     now: datetime | None = None,
 ) -> list[datetime]:
     """Return ordered ascending list of servable canonical valid times >= serving_start."""
-    cands_map = _discover_candidates_bulk(db, model, now=now)
+    cands_map = _discover_candidates_bulk(
+        db, model, variables=(variable,) if variable is not None else None, now=now
+    )
     if variable is None:
         return sorted(cands_map.keys())
 
