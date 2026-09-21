@@ -29,11 +29,19 @@ from dataclasses import dataclass, field
 #: ``__commit__/`` and ``.markers/`` are metadata and are reported separately.
 METADATA_PREFIXES = ("__commit__/", ".markers/")
 
+#: The aggregate pass's staging area. Not forecast data the cycle serves -- it is the *input* its
+#: containers were computed from, and the aggregate pass releases it as it publishes. It has to be
+#: its own row rather than folded into a variable's: while the aggregate path is being phased in
+#: this is where a cycle's member bytes sit, and a profile that attributed 4 MB of staging to a
+#: variable called ``__staging__`` would hide both sides of the replacement being measured.
+STAGING_ROOT = "__staging__/"
+
 KIND_LABELS = {
     "det": "deterministic",
     "mean": "ensemble mean",
     "mem": "ensemble member",
     "agg": "aggregate (statistics)",
+    "staging": "staging (pre-aggregate input)",
 }
 
 
@@ -59,6 +67,11 @@ def classify(key: str) -> tuple[str, str]:
     """
     if key.startswith(METADATA_PREFIXES):
         return "", "metadata"
+    if key.startswith(STAGING_ROOT):
+        # ``__staging__/v<version>/<variable>/mem###_L####.shard``: the variable is the third
+        # segment, and the kind is what the row is, not which variable staged it.
+        segments = key[len(STAGING_ROOT) :].split("/")
+        return (segments[1] if len(segments) > 1 else ""), "staging"
     parts = key.split("/")
     variable = parts[0] if parts else key
     name = parts[-1] if len(parts) > 1 else ""
