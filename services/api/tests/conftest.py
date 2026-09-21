@@ -61,7 +61,7 @@ def _default_test_simulated_time(monkeypatch):
 @pytest.fixture(autouse=True)
 def _clear_serving_micro_caches():
     from api.core.manifest_reader import _clear_manifest_cache
-    from api.core.reader_gate import reset_admission_semaphore
+    from api.core.reader_gate import reset_admission_semaphore, reset_reader_gate_lifecycle
     from api.services.resolver import _clear_resolver_cache
     from api.services.tiles import (
         _clear_grid_cache,
@@ -74,6 +74,11 @@ def _clear_serving_micro_caches():
     _clear_grid_cache()
     _clear_tile_geom_cache()
     reset_admission_semaphore()
+    # The reader gate's lifecycle is process-global and the app's lifespan closes it on exit, so a
+    # module that opens a client with ``with TestClient(app)`` -- several do, deliberately, to
+    # exercise the shutdown path -- would otherwise leave the gate closed for every later test in
+    # the run. That made the suite order-dependent rather than the gate broken.
+    reset_reader_gate_lifecycle()
     shutdown_wind_executor()
     yield
     _clear_manifest_cache()
@@ -81,6 +86,7 @@ def _clear_serving_micro_caches():
     _clear_grid_cache()
     _clear_tile_geom_cache()
     reset_admission_semaphore()
+    reset_reader_gate_lifecycle()
     shutdown_wind_executor()
 
 

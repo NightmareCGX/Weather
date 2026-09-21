@@ -1253,6 +1253,17 @@ def test_35_ensemble_endpoint_does_not_re_resolve_canonical_source(v3_db, monkey
             "api.services.ensemble_data._gated_member_values",
             lambda *args, **kwargs: [20.0] * 30,
         )
+        # The stored-aggregate capability check is the third storage seam beside the two above: a
+        # variable that could be served from a container is probed, and the probe goes through the
+        # reader gate, which revalidates against the *shared* catalog. This module's own database
+        # is SQLite, so the probe would read whatever schema that shared catalog happens to be in
+        # -- and what this test asserts has nothing to do with aggregates: that the source was
+        # pre-resolved rather than looked up again. Answering "no aggregate here" leaves the member
+        # path, which the two seams above already stand in for.
+        monkeypatch.setattr(
+            "api.services.aggregate_serving.aggregate_can_answer",
+            lambda *args, **kwargs: False,
+        )
 
         v_iso = target_v.isoformat().replace("+00:00", "Z")
         res = client.get(f"/v1/ensembles?lat=38.0&lon=-107.0&model=gefs&variable=temperature_2m&valid_time={v_iso}")

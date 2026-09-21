@@ -459,6 +459,24 @@ def reset_admission_semaphore() -> None:
         _admission_semaphore = None
 
 
+def reset_reader_gate_lifecycle() -> None:
+    """Replace the process-wide gate lifecycle with a fresh one (tests).
+
+    The lifespan owns that object: it is created on startup and ``begin_shutdown`` is called on it
+    at the end of every ``with TestClient(app)`` block. A test that opens a client that way --
+    which several do, deliberately, to exercise the shutdown path -- therefore leaves the gate
+    closed for the whole process, and every later gated read fails with ``ReaderGateClosing``
+    instead of reading anything. That made the suite order-dependent: a module ran green alone and
+    red after another module had shut a lifespan down.
+
+    A test-isolation concern, not a serving one -- in production the process serves one lifespan
+    and exits with it.
+    """
+    import api.main as main_module
+
+    main_module.reader_lifecycle = ReaderGateLifecycle()
+
+
 def gated_read(
     pool: ReaderLockPool,
     lifecycle: ReaderGateLifecycle,
