@@ -102,7 +102,9 @@ class AggregatePointStatistics:
 
     Attributes:
         values: Statistic name to value, for the names the encoding can express.
-        spec: The spec the aggregate was written with.
+        spec: The spec the aggregate was written with. ``None`` for a variable that stores a
+            fraction instead of a distribution -- a 0/1 flag, whose per-cell fraction is its whole
+            representation (``domain.variable_class.CLASS_FLAG``).
         exact: Statistics reproduced bit-exactly rather than reconstructed.
         geometry: The container geometry the values were read from.
         member_count: Ensemble members the aggregate was computed from, when the point was
@@ -111,7 +113,7 @@ class AggregatePointStatistics:
     """
 
     values: dict[str, float]
-    spec: AggregateSpec
+    spec: AggregateSpec | None
     exact: frozenset[str]
     geometry: AggregateGeometry
     member_count: int | None = None
@@ -250,6 +252,90 @@ def _statistics_from_quantiles(
     return values, frozenset(exact)
 
 
+def fraction_statistics(
+    fields_at_point: npt.NDArray[np.float32],
+    *,
+    layout: Any,
+    member_count: int,
+) -> tuple[dict[str, float], frozenset[str]] | None:
+    """The statistics a 0/1 flag's stored fraction implies at one cell.
+
+    A flag's container holds one field -- the share of members that were set -- because a shape
+    over two values carries nothing (``domain.variable_class.CLASS_FLAG``). That single number is
+    still enough for every statistic the response reports, because the sample behind it is 0/1 and
+    the statistics of such a sample are closed forms. With ``k = round(f * n)`` of ``n`` members
+    set:
+
+    * mean is ``k/n``, which *is* the stored fraction (to the fraction's own 0.001 step);
+    * spread is ``sqrt(f(1-f))``, the population standard deviation of a Bernoulli sample;
+    * a percentile is the same ``linear`` interpolation over a sorted two-valued sample that
+      ``numpy.percentile`` performs -- position ``p = q(n-1)``, and the sample is ``n-k`` zeros
+      followed by ``k`` ones, so the answer is 0 below the run, 1 inside it, and the boundary
+      blend only in the single position that straddles it.
+
+    Every one is therefore **exact**, which is what makes a flag's container a replacement for its
+    members rather than an approximation of them: the fraction is the only thing the sample had.
+    The formulas are verified exhaustively against the member path for every ``k`` at 30 members.
+
+    Args:
+        fields_at_point: The cell's field vector.
+        layout: The variable's field layout, for the fraction's index.
+        member_count: Members that were finite at this cell, from the container's count field.
+
+    Returns:
+        ``(values, exact)``, or ``None`` for an unobserved cell -- a NaN fraction means the store
+        refused the cell, which is not the same statement as a fraction of zero.
+    """
+    fraction = float(fields_at_point[layout.group_slice("fraction").start])
+    if not math.isfinite(fraction) or member_count <= 0:
+        return None
+    fraction = min(max(fraction, 0.0), 1.0)
+    ones = min(member_count, max(0, int(round(fraction * member_count))))
+    values: dict[str, float] = {
+        "mean": ones / member_count,
+        "spread": math.sqrt(_bernoulli_fraction(ones, member_count) * (1.0 - _bernoulli_fraction(ones, member_count))),
+        "median": 0.0 if ones * 2 < member_count else (1.0 if ones * 2 > member_count else 0.5),
+    }
+    for name, probability in (
+        ("p0.1", 0.001),
+        ("p10", 0.10),
+        ("p25", 0.25),
+        ("p50", 0.50),
+        ("p75", 0.75),
+        ("p90", 0.90),
+        ("p99.9", 0.999),
+    ):
+        values[name] = _two_valued_percentile(ones, member_count, probability)
+    return values, frozenset(values)
+
+
+def _bernoulli_fraction(ones: int, member_count: int) -> float:
+    """The mean of a 0/1 sample, as a float in [0, 1]."""
+    return ones / member_count
+
+
+def _two_valued_percentile(ones: int, member_count: int, probability: float) -> float:
+    """A percentile of a sample of ``member_count`` values, ``ones`` of which are 1.
+
+    ``numpy.percentile``'s ``linear`` method, evaluated without materialising the sample: position
+    ``p = probability * (n - 1)``, and the sorted sample is ``n - ones`` zeros then ``ones`` ones,
+    so the interpolation is 0 below the run of ones, 1 inside it, and a blend only in the one
+    position that straddles the boundary.
+    """
+    if member_count <= 0:
+        return 0.0
+    position = probability * (member_count - 1)
+    lower = math.floor(position)
+    started = member_count - ones
+    if lower >= started:
+        return 1.0
+    if lower + 1 <= started - 1:
+        return 0.0
+    if lower == started - 1:
+        return position - lower
+    return 1.0
+
+
 def statistics_from_aggregate(
     variable: str,
     *,
@@ -287,10 +373,15 @@ def statistics_from_aggregate(
         The statistics and their exactness, or ``None`` to fall through to the members.
     """
     try:
-        spec = spec_for(variable)
         layout = aggregate_fields_for(variable)
-    except (VariableClassError, FieldLayoutError):
+    except FieldLayoutError:
         return None
+    try:
+        spec = spec_for(variable)
+    except VariableClassError:
+        # Not an error: a 0/1 flag has no distribution spec, and its fraction answers every
+        # statistic the response reports (see :func:`fraction_statistics`).
+        spec = None
 
     active_reader = reader if reader is not None else AggregateShardReader(store_path)
     stack = active_reader.read_location(
@@ -321,24 +412,32 @@ def statistics_from_aggregate(
 
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
     member_count = int(round(float(point[0]))) if math.isfinite(float(point[0])) else None
-    # The distribution is the fields between the count and the groups, located by the layout
-    # rather than by counting, so a group added to it cannot shift what this reader is handed.
-    encoding_fields = point[layout.distribution_slice]
-    try:
-        if spec.kind == KIND_MEAN_STD_BINS:
-            values, exact = _statistics_from_bins(encoding_fields, spec)
-        elif spec.kind == KIND_QUANTILE_FUNCTION:
-            values, exact = _statistics_from_quantiles(encoding_fields, spec)
-        else:  # pragma: no cover - the spec's own validation rejects other kinds
+    if spec is None:
+        if member_count is None:
             return None
-    except AggregateError as exc:
-        logger.warning(
-            "aggregate for %s at lead %d could not be interpreted (%s); using members",
-            variable,
-            lead_time_hours,
-            exc,
-        )
-        return None
+        fraction = fraction_statistics(point, layout=layout, member_count=member_count)
+        if fraction is None:
+            return None
+        values, exact = fraction
+    else:
+        # The distribution is the fields between the count and the groups, located by the layout
+        # rather than by counting, so a group added to it cannot shift what this reader is handed.
+        encoding_fields = point[layout.distribution_slice]
+        try:
+            if spec.kind == KIND_MEAN_STD_BINS:
+                values, exact = _statistics_from_bins(encoding_fields, spec)
+            elif spec.kind == KIND_QUANTILE_FUNCTION:
+                values, exact = _statistics_from_quantiles(encoding_fields, spec)
+            else:  # pragma: no cover - the spec's own validation rejects other kinds
+                return None
+        except AggregateError as exc:
+            logger.warning(
+                "aggregate for %s at lead %d could not be interpreted (%s); using members",
+                variable,
+                lead_time_hours,
+                exc,
+            )
+            return None
 
     finite = {name: value for name, value in values.items() if math.isfinite(value)}
     if "mean" not in finite:
@@ -417,9 +516,11 @@ def exceedance_probability(
     if operator not in ("gt", "lt"):
         return None
     try:
-        spec = spec_for(variable)
         layout = aggregate_fields_for(variable)
-    except (VariableClassError, FieldLayoutError):
+        spec = spec_for(variable)
+    except (FieldLayoutError, VariableClassError):
+        # A threshold query needs a distribution: a flag's fraction is a probability, not a set of
+        # values to compare a threshold against, so `P(X > t)` cannot be read off it.
         return None
 
     active_reader = reader if reader is not None else AggregateShardReader(store_path)
@@ -1341,11 +1442,23 @@ def aggregate_can_answer(
         return False
     if variable in SPECIAL_PER_MEMBER_VARIABLES:
         return False
-    if operator is not None and operator not in STRICT_EXCEEDANCE_OPERATORS:
-        return False
+    if operator is not None:
+        # A threshold query reads the stored distribution, so it needs one: `gt`/`lt` are the
+        # operators the encodings can express, and a flag stores a probability rather than a
+        # distribution to compare a threshold against.
+        if operator not in STRICT_EXCEEDANCE_OPERATORS:
+            return False
+        try:
+            spec_for(variable)
+        except VariableClassError:
+            return False
+        return True
+    # A statistics query is answerable whenever the variable has a stored field layout: the
+    # distribution encodings answer it from their fields, and a 0/1 flag answers it from its
+    # fraction (see :func:`fraction_statistics`).
     try:
-        spec_for(variable)
-    except VariableClassError:
+        aggregate_fields_for(variable)
+    except FieldLayoutError:
         return False
     return True
 

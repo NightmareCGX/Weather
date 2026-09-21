@@ -848,3 +848,61 @@ def test_an_unreadable_store_is_not_an_error_for_the_aggregate_path() -> None:
 
     with pytest.raises(ShardFormatError):
         try_read_aggregate(_damaged)
+
+
+# ---------------------------------------------------------------------------
+# A 0/1 flag: its fraction answers every statistic exactly
+# ---------------------------------------------------------------------------
+
+
+def test_a_flag_fraction_reproduces_the_member_statistics_exactly(tmp_path) -> None:
+    """A flag's container is not an approximation of its members -- the fraction *is* the sample.
+
+    The sample behind a flag is 0/1, so its mean, spread and percentiles are closed forms in the
+    count of members that were set. That is what makes the four flags reclaimable at all: their
+    container carries one field, and every statistic the response reports comes out of it exactly
+    rather than through a reconstruction.
+    """
+    from api.services.aggregate_serving import aggregate_can_answer
+
+    members = np.zeros((30, GRID_LAT, GRID_LON), dtype=np.float32)
+    # 10 of 30 set, so the fraction is 1/3 -- an interior value where the median is a blend and the
+    # percentiles are not all endpoints.
+    members[:10] = 1.0
+    store = _store_with(tmp_path, "crain", members)
+    result = _fetch("crain", store, 0, 0)
+    assert result is not None
+    # A flag has no distribution spec, which is what the reader has to cope with.
+    assert result.spec is None
+
+    population = members[:, 0, 0]
+    assert result.values["mean"] == pytest.approx(float(np.mean(population)), abs=1e-6)
+    assert result.values["spread"] == pytest.approx(float(np.std(population)), abs=1e-3)
+    for name, probability in (
+        ("p0.1", 0.1),
+        ("p10", 10.0),
+        ("p25", 25.0),
+        ("p50", 50.0),
+        ("p75", 75.0),
+        ("p90", 90.0),
+        ("p99.9", 99.9),
+    ):
+        assert result.values[name] == pytest.approx(
+            float(np.percentile(population, probability, method="linear")), abs=1e-6
+        ), name
+    # Every statistic a flag reports is exact, by construction.
+    assert result.exact == frozenset(
+        {"mean", "spread", "median", "p0.1", "p10", "p25", "p50", "p75", "p90", "p99.9"}
+    )
+
+    # The capability check lets a statistics query through for a flag, and refuses a threshold one:
+    # a fraction is a probability, not a set of values to compare a threshold against.
+    assert aggregate_can_answer("crain") is True
+    assert aggregate_can_answer("crain", operator="gt") is False
+
+
+def test_a_flag_fraction_is_refused_where_it_says_nothing(tmp_path) -> None:
+    """An unobserved cell has no fraction, and a NaN is not a fraction of zero."""
+    members = np.full((30, GRID_LAT, GRID_LON), np.nan, dtype=np.float32)
+    store = _store_with(tmp_path, "crain", members)
+    assert _fetch("crain", store, 0, 0) is None

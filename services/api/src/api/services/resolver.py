@@ -896,6 +896,14 @@ def resolve_valid_time_source(
     Preserves existing signature for backward compatibility. ``initial_time``
     optionally pins the newest-cycle preference to that cycle (see
     :func:`resolve_canonical_source`).
+
+    ``require_members`` is accepted and **deliberately not read.** It dates from before the
+    resolver discovered members itself: the candidate discovery it delegates to queries
+    ``ensemble_member_products`` and applies the coverage floor for every ensemble model, so a
+    caller cannot get a source without member coverage by leaving the flag off -- the flag has no
+    effect on either path. It is kept because removing it would change four call signatures and a
+    test seam for no behaviour, and it is documented here because a parameter that looks like a
+    gate but is not one is worse than no parameter.
     """
     if variable is not None:
         src = resolve_variable_source(
