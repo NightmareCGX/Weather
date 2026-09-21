@@ -112,11 +112,45 @@ class StoreIO:
 
     # -- helpers -----------------------------------------------------------------
 
-    def _sync(self, func: Any, *args: Any, **kwargs: Any) -> Any:
-        """Run one s3fs coroutine against its loop."""
+    def _sync(self, coroutine_name: str, *args: Any, **kwargs: Any) -> Any:
+        """Run one s3fs **coroutine** against its loop and return its result.
+
+        ``coroutine_name`` is the private coroutine's name without its underscore -- ``"find"``
+        for ``fs._find`` -- and the mapping is deliberate rather than incidental.
+
+        **The public ``fs.find`` is not a coroutine, and that is the whole reason this exists.**
+        s3fs replaces a public method with a blocking wrapper (``sync_wrapper``) whenever its
+        private coroutine exists, so ``fs.find(...)`` runs the whole operation and returns a
+        ``list``. Handing that to :func:`fsspec.asyn.sync` makes fsspec call it, get the finished
+        result, and try to ``await`` it -- which is an error, not a slow path::
+
+            TypeError: object list can't be used in 'await' expression
+
+        The mistake is invisible against a local directory and against an in-memory mapping,
+        because neither takes this branch at all; every store the staging and aggregate tests use
+        is one of those two. It only appears on ``s3://``, which is the only shape production
+        runs -- so the first symptom is a warning in a real cycle's log and a step that silently
+        did nothing.
+
+        Taking the *name* rather than a bound method keeps that trap out of reach: a caller cannot
+        pass the blocking wrapper by accident, and a name s3fs renames fails loudly here instead of
+        quietly becoming a no-op.
+
+        Raises:
+            StoreAccessError: if the named coroutine does not exist on this filesystem. A missing
+                name means the pinned s3fs no longer provides it, which must not read as "nothing
+                to do".
+        """
         import fsspec.asyn  # type: ignore[import-untyped]
 
-        return fsspec.asyn.sync(self._loop, func, *args, **kwargs)
+        private = f"_{coroutine_name}"
+        coroutine = getattr(self._fs, private, None)
+        if coroutine is None or not callable(coroutine):
+            raise StoreAccessError(
+                f"s3fs provides no {private!r} on {type(self._fs).__name__}; "
+                "the pinned s3fs version no longer exposes this operation"
+            )
+        return fsspec.asyn.sync(self._loop, coroutine, *args, **kwargs)
 
     def _local_full(self, relative_key: str) -> str:
         return os.path.join(self.root, *relative_key.split("/"))
@@ -138,7 +172,7 @@ class StoreIO:
                 if isinstance(key, str) and key.startswith(relative_prefix)
             ]
         if self.kind == "s3":
-            found = self._sync(self._fs.find, f"{self.root}/{relative_prefix}")
+            found = self._sync("find", f"{self.root}/{relative_prefix}")
             return [str(key)[len(self.root) + 1 :] for key in found]
         base = self._local_full(relative_prefix.rstrip("/"))
         if not os.path.isdir(base):
@@ -166,7 +200,7 @@ class StoreIO:
                 raise StoreAccessError(f"missing object {relative_key!r}") from exc
         if self.kind == "s3":
             try:
-                data = self._sync(self._fs.cat_file, f"{self.root}/{relative_key}")
+                data = self._sync("cat_file", f"{self.root}/{relative_key}")
             except Exception as exc:  # noqa: BLE001 - surfaced as a typed error
                 raise StoreAccessError(
                     f"cannot read {relative_key!r}: {type(exc).__name__}: {exc}"
@@ -184,7 +218,7 @@ class StoreIO:
             assert self._mapping is not None
             return relative_key in self._mapping
         if self.kind == "s3":
-            return bool(self._sync(self._fs.exists, f"{self.root}/{relative_key}"))
+            return bool(self._sync("exists", f"{self.root}/{relative_key}"))
         return os.path.isfile(self._local_full(relative_key))
 
     def read_range(
@@ -221,7 +255,7 @@ class StoreIO:
         if self.kind == "s3":
             try:
                 data = self._sync(
-                    self._fs.cat_file, f"{self.root}/{relative_key}", start=start, end=end
+                    "cat_file", f"{self.root}/{relative_key}", start=start, end=end
                 )
             except Exception as exc:  # noqa: BLE001 - surfaced as a typed error
                 raise StoreAccessError(
@@ -253,7 +287,7 @@ class StoreIO:
             return
         if self.kind == "s3":
             try:
-                self._sync(self._fs._pipe_file, f"{self.root}/{relative_key}", data)
+                self._sync("pipe_file", f"{self.root}/{relative_key}", data)
             except Exception as exc:  # noqa: BLE001 - surfaced as a typed error
                 raise StoreAccessError(
                     f"cannot write {relative_key!r}: {type(exc).__name__}: {exc}"
@@ -284,7 +318,7 @@ class StoreIO:
         if self.kind == "s3":
             targets = [f"{self.root}/{key}" for key in relative_keys]
             try:
-                self._sync(self._fs.rm, targets)
+                self._sync("rm", targets)
             except FileNotFoundError:
                 pass
             except Exception as exc:  # noqa: BLE001 - cleanup is best-effort

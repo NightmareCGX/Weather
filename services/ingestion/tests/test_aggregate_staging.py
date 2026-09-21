@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import struct
+from collections.abc import Iterator
 
 import numpy as np
 import pytest
@@ -1209,3 +1210,159 @@ def test_a_read_only_staging_area_is_left_alone(tmp_path) -> None:
     assert staging.release_wave_staging(read_only, leads=[LEAD]) == 0
     # The objects on disk are untouched, which is what "left alone" means.
     assert set(staging.staged_objects_by_variable(store)) == {"mystery_variable"}
+
+
+# ---------------------------------------------------------------------------
+# The s3:// store shape
+# ---------------------------------------------------------------------------
+#
+# Every test above uses a local directory or an in-memory mapping, and **both of those take a
+# different branch** through :class:`~ingestion.core.store_io.StoreIO` than an ``s3://`` URL does.
+# That is how a defect in the S3 branch survived a full suite and a deployment: the aggregate and
+# staging tests never reached it, and it was invisible until a real cycle's log said
+#
+#     staging sweep failed for s3://weather-data/gefs/...: object list can't be used in 'await'
+#     expression
+#
+# The tests below are the shape that would have caught it, and they only run against a real MinIO
+# (``WEATHER_TEST_MINIO=1``), because the branch under test is the one that talks to it.
+
+
+@pytest.fixture
+def minio_store() -> Iterator[str]:
+    """An ``s3://`` store URL, skipping when no MinIO endpoint is configured or reachable."""
+    import uuid
+
+    from ingestion.core.config import IngestionSettings
+
+    if os.environ.get("WEATHER_TEST_MINIO") != "1":
+        pytest.skip("WEATHER_TEST_MINIO != 1; skipping the s3:// store shape")
+    conn = IngestionSettings()
+    try:
+        import boto3
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=f"http://{conn.MINIO_ENDPOINT}",
+            aws_access_key_id=conn.MINIO_ACCESS_KEY,
+            aws_secret_access_key=conn.MINIO_SECRET_KEY,
+        )
+        s3.list_buckets()
+    except Exception as exc:  # noqa: BLE001 - an unreachable endpoint skips rather than fails
+        pytest.skip(f"MinIO endpoint is not reachable: {exc}")
+
+    store = f"s3://{conn.MINIO_BUCKET_NAME}/staging-shape/{uuid.uuid4().hex}"
+    try:
+        yield store
+    finally:
+        from ingestion.core.s3 import get_control_s3_fs
+
+        fs = get_control_s3_fs(conn)
+        try:
+            for key in fs.find(store[len("s3://") :]):
+                fs.rm(key)
+        except Exception:  # noqa: BLE001 - best-effort cleanup of an opt-in store
+            pass
+
+
+def test_every_store_operation_round_trips_over_s3(minio_store) -> None:
+    """Each StoreIO operation against a real object store, including the ones that only read.
+
+    The reads are the point. ``write`` was the *only* S3 operation that worked, because it was the
+    one call StoreIO already routed to a private coroutine -- so a test that only wrote and read
+    back through the same broken helper would still have failed, but a test that wrote and read
+    back through ``read_range`` or ``exists`` would have. Exercising all six is what makes this a
+    guard rather than a sample.
+    """
+    from ingestion.core.store_io import StoreAccessError, StoreIO
+
+    io = StoreIO(minio_store)
+    assert io.kind == "s3"
+
+    io.write("__staging__/v1/crain/mem001_L0006.shard", b"x" * 64)
+    io.write("temperature_2m/shard.agg_L0006.shard", b"y" * 200)
+
+    assert io.exists("temperature_2m/shard.agg_L0006.shard") is True
+    assert io.exists("nothing/here.shard") is False
+    assert sorted(io.list_under("__staging__/v1/")) == [
+        "__staging__/v1/crain/mem001_L0006.shard"
+    ]
+    assert io.read("__staging__/v1/crain/mem001_L0006.shard") == b"x" * 64
+    # The tail form the evidence probe depends on: a negative start with no end is a suffix GET.
+    assert io.read_range("temperature_2m/shard.agg_L0006.shard", start=-8) == b"y" * 8
+    assert io.read_range("temperature_2m/shard.agg_L0006.shard", start=0, end=4) == b"y" * 4
+    assert io.delete_many(["temperature_2m/shard.agg_L0006.shard"]) == 1
+    assert io.exists("temperature_2m/shard.agg_L0006.shard") is False
+    # A missing object is a typed error, not a backend exception leaking through.
+    with pytest.raises(StoreAccessError):
+        io.read("nothing/here.shard")
+
+
+def test_the_staging_pass_and_sweep_work_over_s3(minio_store) -> None:
+    """The listing, the release and the lead-scoped sweep -- the aggregate path's own operations.
+
+    These are the calls the production log was complaining about, and the local-directory tests
+    above cover them only on the branch that never touches S3.
+    """
+    from ingestion.core.store_io import StoreIO
+
+    io = StoreIO(minio_store)
+    for member in (1, 2, 3):
+        io.write(f"__staging__/v1/crain/mem{member:03d}_L0006.shard", b"q" * 32)
+        io.write(f"__staging__/v1/temperature_2m/mem{member:03d}_L0006.shard", b"w" * 32)
+        io.write(f"__staging__/v1/crain/mem{member:03d}_L0009.shard", b"e" * 32)
+
+    staged = staging.staged_objects_by_variable(minio_store)
+    assert {name: len(entries) for name, entries in staged.items()} == {
+        "crain": 6,
+        "temperature_2m": 3,
+    }
+    assert len(staging.staged_lead_keys(minio_store, "crain", [6])) == 3
+
+    # The sweep is scoped by lead, so the other lead's objects have to survive it.
+    assert staging.release_wave_staging(minio_store, leads=[6]) == 6
+    remaining = staging.staged_objects_by_variable(minio_store)
+    assert {name: sorted({lead for _member, lead in v}) for name, v in remaining.items()} == {
+        "crain": [9]
+    }
+
+
+def test_the_evidence_probe_reads_a_real_container_over_s3(minio_store) -> None:
+    """The GC's aggregate evidence over S3: the tail read the predicate is built on.
+
+    ``probe_aggregate`` is what decides whether a member shard may be deleted, so a shape it
+    cannot read on the deployment's own storage is a reclamation that can never be authorized.
+    """
+    import numpy as np
+    from domain.field_layout import aggregate_fields_for
+    from ingestion.core.aggregate_writer import (
+        AggregateShardLayout,
+        aggregate_store_relative_key,
+        encode_aggregate_shard,
+    )
+    from ingestion.core.store_io import StoreIO
+    from ingestion.gc.aggregate_evidence import probe_aggregate
+
+    layout = aggregate_fields_for("temperature_2m")
+    rng = np.random.default_rng(11)
+    container = encode_aggregate_shard(
+        [rng.normal(0.5, 0.1, (20, 20)).astype(np.float32) for _ in range(layout.n_fields)],
+        AggregateShardLayout(
+            n_fields=layout.n_fields,
+            grid_lat=20,
+            grid_lon=20,
+            chunk_lat=10,
+            chunk_lon=10,
+        ),
+        member_count=30,
+        field_scales=layout.field_scales,
+    )
+    key = aggregate_store_relative_key("temperature_2m", 6)
+    StoreIO(minio_store).write(key, container)
+
+    evidence = probe_aggregate(minio_store, "temperature_2m", 6)
+    assert evidence.ok is True
+    assert evidence.member_count == 30
+    assert evidence.detail == ""
+    # And a lead with no container is still "no evidence" rather than an error.
+    assert probe_aggregate(minio_store, "temperature_2m", 9).ok is False
