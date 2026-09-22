@@ -533,11 +533,15 @@ def aggregate_lead_all_variables(
 
     Raises:
         StagingError: if nothing is staged for the lead at all, a variable's geometry does not
-            match the configured grid, or a container cannot be built from the staged inputs. A
-            variable with no staging is skipped: not every lead carries every variable (the GEFS
-            product omits the instantaneous precipitation rate), and that is normal rather than an
-            error. A variable the platform does not classify is skipped with its staging retained;
-            a *classified* variable whose container cannot be built is reported.
+            match the configured grid, or a container cannot be built from the staged inputs.
+            A **variable with no staging at this lead is skipped**, with its staging -- there is
+            none -- left alone: a model product may genuinely not carry the variable (the GEFS
+            ``pgrb2s`` files have no instantaneous precipitation rate, so ``precipitation_rate``
+            is never staged for those cycles), and a wave may simply not have reached it yet.
+            Skipping rather than attempting is what keeps one absent variable from costing the
+            lead every container after it in the candidate order. A variable the platform does not
+            classify is skipped with its staging retained; a *classified* variable that **is**
+            staged here but whose container cannot be built is reported.
     """
     from ingestion.core.aggregate_writer import DEFAULT_CHUNK_LAT, DEFAULT_CHUNK_LON
 
@@ -557,10 +561,28 @@ def aggregate_lead_all_variables(
 
     results: list[tuple[str, str, int]] = []
     for variable in candidates:
-        # A derived variable has no staging of its own: whether it belongs in this pass is decided
-        # by its inputs, which ``_derived_candidates`` has already checked.
         staged_here = {lead for (_m, lead) in staged.get(variable, {})}
-        if variable in staged and lead_time_hours not in staged_here:
+        if lead_time_hours not in staged_here and not _is_derived(variable):
+            # Nothing of this variable is staged for this lead, so there is nothing to aggregate
+            # and no container to write. Two ordinary cases land here: a model product that does
+            # not carry the variable at all -- the GEFS ``pgrb2s`` files have no instantaneous
+            # precipitation rate, so ``precipitation_rate`` is never staged for those cycles --
+            # and a wave whose lead has simply not received it yet.
+            #
+            # Both must be *skipped* rather than attempted. This pass runs on the publication
+            # path, and the raise below is not isolation: the containers are written one
+            # variable at a time as the loop goes, so an exception on the second candidate
+            # leaves the lead with a container for the first one and nothing for the other
+            # twelve. Every consumer of an aggregate -- the supersession evidence gate above
+            # all -- then reads the variable as absent, which is exactly the state the phase
+            # exists to leave behind. Measured against the real 09-22 00Z GEFS cycle, whose
+            # staging holds 14 variables and no ``precipitation_rate``: the pass aborted on its
+            # second candidate and wrote one container per lead.
+            #
+            # A **derived** variable is exempt and is attempted: it is stored as no member
+            # shards of its own by construction, so an empty staging set is its normal state
+            # rather than an absence, and ``_derived_candidates`` has already checked that the
+            # inputs its container reads are staged for this lead.
             continue
         try:
             key, count = aggregate_staged_lead(
@@ -602,6 +624,18 @@ def aggregate_lead_all_variables(
             ),
         )
     return results
+
+
+def _is_derived(variable: str) -> bool:
+    """Whether the platform stores no member shards for this variable at all.
+
+    ``wind_10m`` is the case: its container is a function of the two wind components' members,
+    so an empty staging set for the name itself is its normal state rather than a model product
+    omitting it. The set is declared in ``domain.variable_class``, not inferred.
+    """
+    from domain.variable_class import DERIVED_VARIABLES
+
+    return variable in DERIVED_VARIABLES
 
 
 def _is_unclassified(variable: str) -> bool:

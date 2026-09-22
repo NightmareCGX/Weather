@@ -962,6 +962,63 @@ def test_a_missing_input_the_pass_could_build_is_reported_not_skipped(tmp_path) 
         )
 
 
+def test_a_variable_this_cycle_does_not_carry_does_not_abort_the_pass(tmp_path) -> None:
+    """A variable named in the list but absent from the store is skipped, not attempted.
+
+    The caller's list is the platform's vocabulary, and a model product genuinely omits
+    variables from it: the GEFS ``pgrb2s`` files have no instantaneous precipitation rate, so
+    ``precipitation_rate`` is never staged for a GEFS cycle. Attempting it raises, and the raise
+    is not isolation -- the containers are written as the loop goes, so the lead is left with a
+    container for whichever candidates preceded the absent one and nothing for the rest. That is
+    worse than writing nothing: the supersession evidence gate reads an unwritten container as
+    "this variable has no aggregate", which is the one reading that authorizes deleting the
+    members it would have described.
+
+    Reproduced against the real 09-22 00Z GEFS store, whose staging holds 14 variables and no
+    ``precipitation_rate``: the pass wrote exactly one container per lead.
+    """
+    store = str(tmp_path)
+    _stage(store, _planes(3, seed=81), lead=LEAD)
+    _stage_variable(store, "wind_gust", _planes(3, seed=82), lead=LEAD)
+
+    results = staging.aggregate_lead_all_variables(
+        store,
+        LEAD,
+        grid_lat=GRID_LAT,
+        grid_lon=GRID_LON,
+        # The absent name is first, so a pass that attempted it would write nothing at all.
+        variables=("precipitation_rate", VARIABLE, "wind_gust"),
+    )
+    assert {variable for variable, _k, _c in results} == {VARIABLE, "wind_gust"}
+    for variable, key, _count in results:
+        assert os.path.isfile(os.path.join(store, *key.split("/"))), variable
+    # The absent variable has no container, and the two staged ones released their staging.
+    assert not os.path.exists(
+        os.path.join(store, "precipitation_rate", f"shard.agg_L{LEAD:04d}.shard")
+    )
+    assert staging.staged_objects_by_variable(store) == {}
+
+
+def test_a_staged_variable_absent_from_this_lead_is_skipped(tmp_path) -> None:
+    """A variable staged at another lead only is skipped for this one, not attempted.
+
+    A wave fills leads in turn, so a variable's staging exists for the leads already processed
+    and not for the lead being published. The pass is per ``(variable, lead)``, so the absent
+    lead is an ordinary state -- and it must not cost the other variables their containers.
+    """
+    store = str(tmp_path)
+    _stage(store, _planes(2, seed=83), lead=LEAD)
+    # wind_gust is staged at a different lead only.
+    _stage_variable(store, "wind_gust", _planes(2, seed=84), lead=LEAD + 3)
+
+    results = staging.aggregate_lead_all_variables(
+        store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+    )
+    assert {variable for variable, _k, _c in results} == {VARIABLE}
+    # The other lead's staging is neither consumed nor touched.
+    assert staging.staged_members_for_lead(store, "wind_gust", LEAD + 3) == [1, 2]
+
+
 def test_a_later_variable_can_read_an_earlier_ones_staged_members(tmp_path) -> None:
     """The release is per pass, not per variable, and the pass order is what makes that safe.
 
