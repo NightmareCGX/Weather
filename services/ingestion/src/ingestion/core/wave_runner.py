@@ -1266,21 +1266,26 @@ async def _run_wave_impl(
                 lead, as it always has. With settlement on, it is the completion path, and it
                 records what it published in the book -- otherwise the settlement loop would see
                 an unsettled bookkeeping state and publish the identical set again.
+
+                **The caller must already hold ``lead_settle_lock``**, which is why this does not
+                take it: ``_on_item_settled`` is its only caller and publishes from inside that
+                lock, so a re-entrant take here would wedge the event loop on the first lead
+                whose members all committed -- and with them the whole wave, since the loop thread
+                is the one that blocks. That is the same mistake ``_published_leads_snapshot``
+                documents, from the other side of the call.
                 """
                 if lead_val in published_leads:
                     return
                 published_leads.add(lead_val)
                 decision: PublicationDecision | None = None
                 if settlement is not None:
-                    with lead_settle_lock:
-                        settlement.note_lead_settled(lead_val)
-                        decision = settlement.decision_for(
-                            lead_val, now=time.monotonic()
-                        )
+                    settlement.note_lead_settled(lead_val)
+                    decision = settlement.decision_for(
+                        lead_val, now=time.monotonic()
+                    )
                 _publish_lead(lead_val, aggregated=True, final=True)
                 if settlement is not None and decision is not None:
-                    with lead_settle_lock:
-                        settlement.note_published(decision)
+                    settlement.note_published(decision)
 
             async def _settlement_loop() -> None:
                 """Publish a lead whose committed set has stopped growing.

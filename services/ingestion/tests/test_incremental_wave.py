@@ -529,6 +529,130 @@ def test_gefs_full_horizon_converges_to_ready_exact_pairs(
     assert _run_status(catalog_db, store) == "ready"
 
 
+def test_a_lead_whose_members_all_commit_publishes_with_the_aggregate_phase_on(
+    tmp_path: Path,
+    catalog_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The completion path publishes from inside the settlement lock, and must not take it again.
+
+    ``_on_item_settled`` holds ``lead_settle_lock`` when it calls the completion path, which
+    publishes the lead synchronously -- and that path used to acquire the same non-reentrant
+    lock. The first lead whose members all committed therefore wedged the event loop thread
+    forever: no later item could settle, no download or decode could proceed, and the wave never
+    returned. The whole process is stuck while its threads all sleep, so the only symptom is a
+    pipeline that stops mid-cycle, and the aggregate it was about to write never appears.
+
+    This is a timing-free reproduction of that: three members on one lead, staged with the
+    aggregate phase on, so the last member's commit triggers the completion path. The wave is
+    run on a thread with a timeout, because a failure here is a hang rather than an assertion.
+    """
+    import os
+    import threading
+
+    import numpy as np
+    import xarray as xr
+    from domain.horizon import MODEL_CANONICAL_HORIZONS, register_canonical_lead_horizon
+    from ingestion.core import config as ingestion_config
+    from ingestion.core.decode_worker import DecodePool
+
+    saved = dict(MODEL_CANONICAL_HORIZONS)
+    register_canonical_lead_horizon("gefs", (0, 3))
+
+    lat = np.linspace(90.0, -90.0, 721, dtype=np.float32)
+    lon = np.linspace(0.0, 359.75, 1440, dtype=np.float32)
+
+    def _synthetic(lead: int, member: int | None = None) -> xr.Dataset:
+        coords: dict[str, object] = {
+            "lead_time_hours": lead,
+            "latitude": lat,
+            "longitude": lon,
+        }
+        if member is not None:
+            coords["member"] = member
+        return xr.Dataset(
+            data_vars={
+                "temperature_2m": (
+                    ("latitude", "longitude"),
+                    np.full((721, 1440), 280.0 + lead, dtype=np.float32),
+                    {"units": "°C"},
+                )
+            },
+            coords=coords,  # type: ignore[arg-type]
+            attrs={"cycle_time": "2026-07-21T00:00:00", "model_id": "gefs"},
+        )
+
+    async def _fake_download(
+        self, model, cycle_date, cycle_hour, lead_time_hours, destination,
+        member=None, variables=None, **kwargs,
+    ):
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"mock-grib2-data")
+        return dest
+
+    def _fake_submit(self, path):
+        name = Path(path).name
+        lead = int(name.rsplit(".f", 1)[1].removesuffix(".grib2"))
+        member = int(name[3:5]) if name.startswith("gep") else None
+        fut: Future = Future()
+        fut.set_result(_synthetic(lead, member))
+        return fut
+
+    monkeypatch.setattr(
+        "ingestion.providers.noaa.connector.NOAAConnector.download", _fake_download
+    )
+    monkeypatch.setattr(DecodePool, "submit", _fake_submit)
+    # The phase is what arms settlement and the aggregate a publication refreshes; the member
+    # geometry above is the platform's, so the pass can build a real container.
+    monkeypatch.setattr(
+        ingestion_config.settings, "ENSEMBLE_STAGING_ENABLED", True, raising=False
+    )
+
+    store = str(tmp_path / "gefs.zarr")
+    args = _args(tmp_path)
+    spec = RunSpec(
+        model="gefs",
+        cycle_date=CYCLE,
+        cycle_hour=0,
+        target_lead_time_hours=(3,),
+        members=(1, 2, 3),
+    )
+    outcome: dict[str, object] = {}
+
+    def _run() -> None:
+        outcome["status"] = _run_wave_sync(monkeypatch, catalog_db, spec, args, store)
+
+    try:
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        # Generous: the wave itself takes about a second. A join that times out is the defect.
+        thread.join(timeout=90)
+        assert not thread.is_alive(), (
+            "the wave never returned: the completion path is holding the settlement lock"
+        )
+
+        assert outcome["status"] == "partial"
+        # The publication ran to completion: the aggregate it computes exists, and the staging it
+        # consumed is released.
+        assert os.path.isfile(
+            os.path.join(store, "temperature_2m", "shard.agg_L0003.shard")
+        )
+        staging_root = os.path.join(store, "__staging__")
+        leftovers = [
+            name
+            for _root, _dirs, files in os.walk(staging_root)
+            for name in files
+        ]
+        assert leftovers == [], leftovers
+        # And the catalog recorded the members, which only the publication path does.
+        pairs = _catalog_pairs(catalog_db, _run_id(catalog_db, store))
+        assert pairs == {(m, 3) for m in (1, 2, 3)}
+    finally:
+        MODEL_CANONICAL_HORIZONS.clear()
+        MODEL_CANONICAL_HORIZONS.update(saved)
+
+
 def test_gefs_cross_wave_predecessor_normalization_regression(
     tmp_path: Path,
     catalog_db,
