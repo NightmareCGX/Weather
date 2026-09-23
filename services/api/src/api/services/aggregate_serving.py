@@ -140,10 +140,159 @@ def _bilinear_from_corners(
     so applying the interpolation to the stored statistic is the approximation this whole
     encoding rests on -- and the reason the acceptance yardstick is the ensemble's own sampling
     noise rather than a point-value tolerance.
+
+    ``corners`` is in ascending grid order: ``[row0col0, row0col1, row1col0, row1col1]``.
     """
     lower = corners[0] + (corners[1] - corners[0]) * np.float32(t_col)
     upper = corners[2] + (corners[3] - corners[2]) * np.float32(t_col)
     return (lower + (upper - lower) * np.float32(t_row)).astype(np.float32)
+
+
+def fields_at_point(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    corners: list[tuple[int, int]],
+    t_row: float,
+    t_col: float,
+    generation: str | None = None,
+    reader: AggregateShardReader | None = None,
+) -> npt.NDArray[np.float32] | None:
+    """The container's fields at a fractional grid position, bilinearly blended.
+
+    **Why a window and not a cell.** The endpoint serves a *point*, and the member path resolves
+    one by interpolating the 2x2 neighbourhood (``_interpolate_neighborhood``). Reading the single
+    cell that contains the point instead makes the stored answer a different question: measured on
+    the real 09-23 00Z GEFS store, ``temperature_2m``'s mean came back 0.45 K from the interpolated
+    answer where the ensemble's own split-half noise is 0.40 K -- over the §9 gate -- and the
+    customer-visible symptom was a stored distribution with a visibly different shape from the
+    member one. Blending the container's fields over the same window the members use puts the two
+    back on one question: measured on the same store, the ratio drops to 0.01-0.40 across every
+    product compared.
+
+    The four corners are read through the same cache the cell path uses, so corners sharing a
+    chunk cost one fetch between them and a point at a node costs one.
+
+    Args:
+        corners: The four stored ``(lat_idx, lon_idx)`` corners in ascending grid order. The caller
+            derives them from the store's own axes, because the descriptor carries extents but not
+            axis values.
+        t_row: Fractional row offset of the point inside the window, in ascending grid order.
+        t_col: Fractional column offset, likewise.
+
+    Returns:
+        The blended ``(n_fields,)`` vector, or ``None`` when no corner could be read. A corner the
+        container did not answer is skipped and the rest are averaged, so a point on the edge of a
+        partially written region is still served rather than falling back entirely.
+    """
+    try:
+        layout = aggregate_fields_for(variable)
+    except FieldLayoutError:
+        return None
+
+    active_reader = reader if reader is not None else AggregateShardReader(store_path)
+    geometry = active_reader.open(variable, lead_time_hours, generation=generation)
+    if geometry is None:
+        return None
+
+    vectors: list[npt.NDArray[np.float32]] = []
+    for lat_idx, lon_idx in corners:
+        if not (0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon):
+            continue
+        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
+        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
+        stack = active_reader.read_location(
+            variable,
+            lead_time_hours=lead_time_hours,
+            chunk_row=chunk_row,
+            chunk_col=chunk_col,
+            generation=generation,
+        )
+        if stack is None or stack.shape[0] != layout.n_fields:
+            continue
+        vectors.append(_corner_values(stack, int(row_in_chunk), int(col_in_chunk)))
+    if not vectors:
+        return None
+
+    if len(vectors) == 4:
+        return _bilinear_from_corners(vectors, t_row, t_col)
+    # A corner the store did not answer. Averaging the ones it did is the same statement the
+    # member path makes when a member is absent at a cell: the answer is over what exists, and the
+    # member-count field beside it says how much that was.
+    stacked = np.stack(vectors)
+    with np.errstate(invalid="ignore"):
+        return np.nanmean(stacked, axis=0).astype(np.float32)
+
+
+def point_window(
+    dataset: Any,
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    generation: str | None = None,
+) -> tuple[npt.NDArray[np.float32], AggregateGeometry] | None:
+    """The container's fields at a geographic point, blended over the member reader's window.
+
+    One place for the coordinate derivation, because every stored product needs the same window and
+    four copies of it is four places for the answer to drift. The caller passes the already-open
+    ``dataset`` so this runs inside the reader gate the caller holds.
+
+    Returns:
+        ``(fields, geometry)``, or ``None`` when the point is off-grid or no corner is readable.
+    """
+    from api.services.point_forecast import _derive_grid
+
+    try:
+        grid, lat_descending, lon_descending = _derive_grid(dataset)
+    except Exception:  # noqa: BLE001 - an underivable grid has no stored answer
+        return None
+    if grid.rows < 1 or grid.cols < 1:
+        return None
+    try:
+        row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
+    except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
+        return None
+    # The window is clamped so it always has two rows and two columns, exactly as
+    # ``_interpolate_neighborhood`` clamps it: at the last node the window is the pair before it.
+    row_0 = min(int(math.floor(row_f)), grid.rows - 2) if grid.rows >= 2 else 0
+    col_0 = min(int(math.floor(col_f)), grid.cols - 2) if grid.cols >= 2 else 0
+    t_row = row_f - row_0
+    t_col = col_f - col_0
+
+    def stored(value: int, size: int, descending: bool) -> int:
+        return (size - 1 - value) if descending else value
+
+    lat_size = int(dataset.sizes["latitude"])
+    lon_size = int(dataset.sizes["longitude"])
+    rows = [stored(row_0, lat_size, lat_descending)]
+    cols = [stored(col_0, lon_size, lon_descending)]
+    if grid.rows >= 2:
+        rows.append(stored(row_0 + 1, lat_size, lat_descending))
+    if grid.cols >= 2:
+        cols.append(stored(col_0 + 1, lon_size, lon_descending))
+    corners = [(r, c) for r in rows for c in cols]
+
+    fields = fields_at_point(
+        variable,
+        store_path=store_path,
+        lead_time_hours=lead_time_hours,
+        corners=corners,
+        t_row=t_row,
+        t_col=t_col,
+        generation=generation,
+    )
+    if fields is None:
+        return None
+    geometry = AggregateShardReader(store_path).open(
+        variable, lead_time_hours, generation=generation
+    )
+    if geometry is None:  # pragma: no cover - fields_at_point already required it
+        return None
+    return fields, geometry
 
 
 def _corner_values(
@@ -336,6 +485,105 @@ def _two_valued_percentile(ones: int, member_count: int, probability: float) -> 
     return 1.0
 
 
+def statistics_from_fields(
+    variable: str,
+    fields: npt.NDArray[np.float32],
+    geometry: AggregateGeometry,
+    *,
+    lead_time_hours: int,
+) -> AggregatePointStatistics | None:
+    """Interpret one field vector -- already blended to the requested point -- as statistics.
+
+    Split out of :func:`statistics_from_aggregate` so the point path and the cell path cannot
+    disagree about what a field vector means. They differ only in **how the vector is obtained**:
+    a point blends the 2x2 window, a caller that already has absolute indices reads one cell. The
+    interpretation -- which slice is the distribution, which groups answer which field, what
+    counts as exact -- is one implementation.
+    """
+    try:
+        layout = aggregate_fields_for(variable)
+    except FieldLayoutError:
+        return None
+    try:
+        spec = spec_for(variable)
+    except VariableClassError:
+        # Not an error: a 0/1 flag has no distribution spec, and its fraction answers every
+        # statistic the response reports (see :func:`fraction_statistics`).
+        spec = None
+    return _interpret_fields(
+        variable,
+        fields,
+        geometry,
+        layout=layout,
+        spec=spec,
+        lead_time_hours=lead_time_hours,
+    )
+
+
+def _interpret_fields(
+    variable: str,
+    fields: npt.NDArray[np.float32],
+    geometry: AggregateGeometry,
+    *,
+    layout: Any,
+    spec: AggregateSpec | None,
+    lead_time_hours: int,
+) -> AggregatePointStatistics | None:
+    """The interpretation shared by the point and cell entry points."""
+    member_count = int(round(float(fields[0]))) if math.isfinite(float(fields[0])) else None
+    if spec is None:
+        # No distribution spec, so this variable stores something else instead of one. Two such
+        # variables exist and they are not interchangeable: a 0/1 flag stores its per-cell
+        # fraction, and the fraction answers every statistic the response reports
+        # (``fraction_statistics``); a product-fields variable stores only its supplementary
+        # groups, and those answer its *products* -- the wind rose, the consensus vector -- not a
+        # scalar statistic set. Reading a rose as if it were a fraction asks the layout for a
+        # group it does not carry, which raises rather than returning None, so the check is on the
+        # group and not on the absent spec: measured on the real 09-22 18Z store, an
+        # ``include_members=false`` request for ``wind_10m`` at a lead whose container is written
+        # raised ``FieldLayoutError: 'wind_10m' carries no 'fraction' fields`` out of the request
+        # instead of falling through to the members that can answer it.
+        if "fraction" not in layout.groups:
+            return None
+        if member_count is None:
+            return None
+        fraction = fraction_statistics(fields, layout=layout, member_count=member_count)
+        if fraction is None:
+            return None
+        values, exact = fraction
+    else:
+        # The distribution is the fields between the count and the groups, located by the layout
+        # rather than by counting, so a group added to it cannot shift what this reader is handed.
+        encoding_fields = fields[layout.distribution_slice]
+        try:
+            if spec.kind == KIND_MEAN_STD_BINS:
+                values, exact = _statistics_from_bins(encoding_fields, spec)
+            elif spec.kind == KIND_QUANTILE_FUNCTION:
+                values, exact = _statistics_from_quantiles(encoding_fields, spec)
+            else:  # pragma: no cover - the spec's own validation rejects other kinds
+                return None
+        except AggregateError as exc:
+            logger.warning(
+                "aggregate for %s at lead %d could not be interpreted (%s); using members",
+                variable,
+                lead_time_hours,
+                exc,
+            )
+            return None
+
+    finite = {name: value for name, value in values.items() if math.isfinite(value)}
+    if "mean" not in finite:
+        # Without a mean the answer would be a partial statistic set; members can do better.
+        return None
+    return AggregatePointStatistics(
+        values=finite,
+        spec=spec,
+        exact=exact,
+        geometry=geometry,
+        member_count=member_count,
+    )
+
+
 def statistics_from_aggregate(
     variable: str,
     *,
@@ -348,15 +596,16 @@ def statistics_from_aggregate(
     generation: str | None = None,
     reader: AggregateShardReader | None = None,
 ) -> AggregatePointStatistics | None:
-    """Serve one variable's ensemble statistics at a point from its aggregate shard.
+    """Serve one variable's ensemble statistics at a stored CELL from its aggregate shard.
 
     ``None`` whenever an aggregate cannot answer -- no shard, an unreadable container, an
     unclassified variable, an off-grid location. The caller then uses the member path, so a
     ``None`` here is a missing optimisation and never a partial answer.
 
-    A single location is read rather than a 2x2 window, because the caller has already resolved
-    the point to a cell; interpolating between cells would need four reads for a correction
-    smaller than the encoding's own reconstruction error.
+    **This addresses a cell, not a point.** A point request goes through
+    :func:`gated_statistics_from_aggregate`, which blends the 2x2 window the member path
+    interpolates over; this entry point is for a caller that already holds absolute indices --
+    a grid consumer, a test, a future tile path -- and wants that cell's own numbers.
 
     Args:
         variable: Variable code.
@@ -376,12 +625,6 @@ def statistics_from_aggregate(
         layout = aggregate_fields_for(variable)
     except FieldLayoutError:
         return None
-    try:
-        spec = spec_for(variable)
-    except VariableClassError:
-        # Not an error: a 0/1 flag has no distribution spec, and its fraction answers every
-        # statistic the response reports (see :func:`fraction_statistics`).
-        spec = None
 
     active_reader = reader if reader is not None else AggregateShardReader(store_path)
     stack = active_reader.read_location(
@@ -411,57 +654,8 @@ def statistics_from_aggregate(
         return None
 
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
-    member_count = int(round(float(point[0]))) if math.isfinite(float(point[0])) else None
-    if spec is None:
-        # No distribution spec, so this variable stores something else instead of one. Two such
-        # variables exist and they are not interchangeable: a 0/1 flag stores its per-cell
-        # fraction, and the fraction answers every statistic the response reports
-        # (``fraction_statistics``); a product-fields variable stores only its supplementary
-        # groups, and those answer its *products* -- the wind rose, the consensus vector -- not a
-        # scalar statistic set. Reading a rose as if it were a fraction asks the layout for a
-        # group it does not carry, which raises rather than returning None, so the check is on the
-        # group and not on the absent spec: measured on the real 09-22 18Z store, an
-        # ``include_members=false`` request for ``wind_10m`` at a lead whose container is written
-        # raised ``FieldLayoutError: 'wind_10m' carries no 'fraction' fields`` out of the request
-        # instead of falling through to the members that can answer it.
-        if "fraction" not in layout.groups:
-            return None
-        if member_count is None:
-            return None
-        fraction = fraction_statistics(point, layout=layout, member_count=member_count)
-        if fraction is None:
-            return None
-        values, exact = fraction
-    else:
-        # The distribution is the fields between the count and the groups, located by the layout
-        # rather than by counting, so a group added to it cannot shift what this reader is handed.
-        encoding_fields = point[layout.distribution_slice]
-        try:
-            if spec.kind == KIND_MEAN_STD_BINS:
-                values, exact = _statistics_from_bins(encoding_fields, spec)
-            elif spec.kind == KIND_QUANTILE_FUNCTION:
-                values, exact = _statistics_from_quantiles(encoding_fields, spec)
-            else:  # pragma: no cover - the spec's own validation rejects other kinds
-                return None
-        except AggregateError as exc:
-            logger.warning(
-                "aggregate for %s at lead %d could not be interpreted (%s); using members",
-                variable,
-                lead_time_hours,
-                exc,
-            )
-            return None
-
-    finite = {name: value for name, value in values.items() if math.isfinite(value)}
-    if "mean" not in finite:
-        # Without a mean the answer would be a partial statistic set; members can do better.
-        return None
-    return AggregatePointStatistics(
-        values=finite,
-        spec=spec,
-        exact=exact,
-        geometry=geometry,
-        member_count=member_count,
+    return statistics_from_fields(
+        variable, point, geometry, lead_time_hours=lead_time_hours
     )
 
 
@@ -530,8 +724,11 @@ def exceedance_probability(
         return None
     try:
         layout = aggregate_fields_for(variable)
+    except FieldLayoutError:
+        return None
+    try:
         spec = spec_for(variable)
-    except (FieldLayoutError, VariableClassError):
+    except VariableClassError:
         # A threshold query needs a distribution: a flag's fraction is a probability, not a set of
         # values to compare a threshold against, so `P(X > t)` cannot be read off it.
         return None
@@ -547,12 +744,53 @@ def exceedance_probability(
     if stack is None or stack.shape[0] != layout.n_fields:
         return None
 
+    geometry = active_reader.open(variable, lead_time_hours, generation=generation)
+    if geometry is None:  # pragma: no cover - read_location already required it
+        return None
     # Field 0 is the per-cell member count; the distribution follows, then the groups.
     full_point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
-    member_count = (
-        int(round(float(full_point[0]))) if math.isfinite(float(full_point[0])) else None
+    return _probability_from_fields(
+        variable,
+        full_point,
+        geometry,
+        lead_time_hours=lead_time_hours,
+        threshold=threshold,
+        operator=operator,
+        layout=layout,
+        spec=spec,
     )
-    point = full_point[layout.distribution_slice]
+
+
+def _probability_from_fields(
+    variable: str,
+    fields: npt.NDArray[np.float32],
+    geometry: AggregateGeometry,
+    *,
+    lead_time_hours: int,
+    threshold: float,
+    operator: str,
+    layout: Any | None = None,
+    spec: AggregateSpec | None = None,
+) -> AggregatePointProbability | None:
+    """The exceedance answered by one field vector, already blended to the point it describes.
+
+    Shared by the cell entry point and the point one for the same reason the statistics are: the
+    inversion is the encoding's own arithmetic and there must be one copy of it, with the two
+    callers differing only in how they obtained the vector.
+    """
+    if layout is None:
+        try:
+            layout = aggregate_fields_for(variable)
+        except FieldLayoutError:
+            return None
+    if spec is None:
+        try:
+            spec = spec_for(variable)
+        except VariableClassError:
+            return None
+
+    member_count = int(round(float(fields[0]))) if math.isfinite(float(fields[0])) else None
+    point = fields[layout.distribution_slice]
     try:
         if spec.kind == KIND_QUANTILE_FUNCTION:
             probability_above = float(
@@ -603,18 +841,23 @@ def gated_statistics_from_aggregate(
 ) -> AggregatePointStatistics | None:
     """Serve statistics from an aggregate shard for a geographic point, under the reader gate.
 
-    The point's cell is derived from the store's own coordinate axes, read inside the same
-    gate the member path uses. That is deliberate: the aggregate descriptor carries extents
-    but not axis *values*, so deriving the cell from the descriptor alone would mean assuming
-    the platform's canonical grid -- exactly the kind of hidden assumption the descriptor
-    exists to remove. Coordinates plus the gate are already available on this path, so they are
-    used instead of assumed.
+    **The window, not the cell.** The member path answers a point by interpolating the 2x2
+    neighbourhood (``_interpolate_neighborhood``), so the stored path has to blend its fields over
+    the same window or the two are answering different questions. They were: measured on the real
+    09-23 00Z GEFS store, reading one cell put ``temperature_2m``'s mean 0.45 K from the
+    interpolated answer against 0.40 K of split-half noise -- over the §9 gate -- and the
+    user-visible symptom was a stored distribution whose shape differed from the member one.
+    Blending the window brings every compared product back under the gate (0.01-0.40x).
+
+    The coordinates and the window come from the store's own axes, inside the same gate the member
+    path uses. That is deliberate: the aggregate descriptor carries extents but not axis *values*,
+    so deriving a cell from the descriptor alone would mean assuming the platform's canonical grid
+    -- exactly the kind of hidden assumption the descriptor exists to remove.
 
     ``None`` whenever an aggregate cannot answer, so the caller uses the members.
     """
     from api.core.manifest_reader import manifest_generation
     from api.core.reader_gate import gated_read_dataset_with_selector
-    from api.services.point_forecast import _derive_grid
 
     resolved_generation = generation
     if resolved_generation is None:
@@ -623,28 +866,20 @@ def gated_statistics_from_aggregate(
     def select(dataset: Any) -> AggregatePointStatistics | None:
         if variable not in dataset.data_vars:
             return None
-        grid, lat_descending, lon_descending = _derive_grid(dataset)
-        if grid.rows < 1 or grid.cols < 1:
-            return None
-        try:
-            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
-        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
-            return None
-        row = min(int(math.floor(row_f)), grid.rows - 1)
-        col = min(int(math.floor(col_f)), grid.cols - 1)
-
-        def stored(value: int, size: int, descending: bool) -> int:
-            return (size - 1 - value) if descending else value
-
-        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
-        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
-        return statistics_from_aggregate_at_cell(
+        window = point_window(
+            dataset,
             variable,
             store_path=store_path,
             lead_time_hours=lead_time_hours,
-            lat_idx=lat_idx,
-            lon_idx=lon_idx,
+            latitude=latitude,
+            longitude=longitude,
             generation=resolved_generation,
+        )
+        if window is None:
+            return None
+        fields, geometry = window
+        return statistics_from_fields(
+            variable, fields, geometry, lead_time_hours=lead_time_hours
         )
 
     return gated_read_dataset_with_selector(store_path, select)
@@ -702,12 +937,13 @@ def gated_exceedance_from_aggregate(
 ) -> AggregatePointProbability | None:
     """Serve an exceedance probability from an aggregate shard, under the reader gate.
 
-    The same gate and coordinate derivation as :func:`gated_statistics_from_aggregate`, for the
-    probability endpoint. ``None`` whenever an aggregate cannot answer.
+    The same window and blending as :func:`gated_statistics_from_aggregate` -- the probability
+    endpoint answers the same kind of question about the same point, so a threshold that fell on
+    the far side of a cell boundary would otherwise answer about a different place than the
+    statistics beside it. ``None`` whenever an aggregate cannot answer.
     """
     from api.core.manifest_reader import manifest_generation
     from api.core.reader_gate import gated_read_dataset_with_selector
-    from api.services.point_forecast import _derive_grid
 
     resolved_generation = generation
     if resolved_generation is None:
@@ -716,40 +952,25 @@ def gated_exceedance_from_aggregate(
     def select(dataset: Any) -> AggregatePointProbability | None:
         if variable not in dataset.data_vars:
             return None
-        grid, lat_descending, lon_descending = _derive_grid(dataset)
-        try:
-            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
-        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
-            return None
-        row = min(int(math.floor(row_f)), grid.rows - 1)
-        col = min(int(math.floor(col_f)), grid.cols - 1)
-
-        def stored(value: int, size: int, descending: bool) -> int:
-            return (size - 1 - value) if descending else value
-
-        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
-        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
-
-        reader = AggregateShardReader(store_path)
-        geometry = reader.open(variable, lead_time_hours, generation=resolved_generation)
-        if geometry is None:
-            return None
-        if not (0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon):
-            return None
-        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
-        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
-        return exceedance_probability(
+        window = point_window(
+            dataset,
             variable,
             store_path=store_path,
             lead_time_hours=lead_time_hours,
+            latitude=latitude,
+            longitude=longitude,
+            generation=resolved_generation,
+        )
+        if window is None:
+            return None
+        fields, geometry = window
+        return _probability_from_fields(
+            variable,
+            fields,
+            geometry,
+            lead_time_hours=lead_time_hours,
             threshold=threshold,
             operator=operator,
-            chunk_row=chunk_row,
-            chunk_col=chunk_col,
-            row_in_chunk=row_in_chunk,
-            col_in_chunk=col_in_chunk,
-            generation=resolved_generation,
-            reader=reader,
         )
 
     return gated_read_dataset_with_selector(store_path, select)
@@ -804,6 +1025,14 @@ def cloud_censoring_from_aggregate(
         return None
 
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    return _censoring_from_fields(point, layout)
+
+
+def _censoring_from_fields(
+    point: npt.NDArray[np.float32],
+    layout: Any,
+) -> dict[str, Any] | None:
+    """The cloud censoring one field vector answers, at the point it describes."""
 
     def count(value: float) -> int | None:
         return int(round(value)) if math.isfinite(value) else None
@@ -877,11 +1106,6 @@ def wind_products_from_aggregate(
         *edges* travel as fields, because they are quantiles of this cycle's member set and a
         reader cannot label a bucket without them.
     """
-    from domain.models.wind import (
-        CARDINAL_DIRECTIONS_8,
-        derive_meteorological_direction,
-    )
-
     try:
         layout = aggregate_fields_for("wind_10m")
     except FieldLayoutError:  # pragma: no cover - the variable is registered
@@ -899,6 +1123,19 @@ def wind_products_from_aggregate(
         return None
 
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    return _wind_products_from_fields(point, layout)
+
+
+def _wind_products_from_fields(
+    point: npt.NDArray[np.float32],
+    layout: Any,
+) -> dict[str, Any] | None:
+    """The wind products one field vector answers, already blended to the point it describes."""
+    from domain.models.wind import (
+        CARDINAL_DIRECTIONS_8,
+        derive_meteorological_direction,
+    )
+
     member_count = float(point[0])
     if not math.isfinite(member_count) or member_count <= 0:
         return None
@@ -1027,8 +1264,6 @@ def precipitation_phase_from_aggregate(
 
     ``None`` whenever an aggregate cannot answer.
     """
-    from domain.models.precipitation import PhysicalPhase, PrecipitationTransition
-
     try:
         layout = aggregate_fields_for("precipitation_amount_3h")
     except FieldLayoutError:  # pragma: no cover - the variable is registered
@@ -1046,6 +1281,16 @@ def precipitation_phase_from_aggregate(
         return None
 
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+    return _phase_from_fields(point, layout)
+
+
+def _phase_from_fields(
+    point: npt.NDArray[np.float32],
+    layout: Any,
+) -> dict[str, Any] | None:
+    """The phase support and transitions one field vector answers, at the point it describes."""
+    from domain.models.precipitation import PhysicalPhase, PrecipitationTransition
+
     member_count = float(point[0])
     if not math.isfinite(member_count) or member_count <= 0:
         return None
@@ -1117,13 +1362,13 @@ def gated_wind_products(
 ) -> dict[str, Any] | None:
     """The wind products for a geographic point, under the reader gate.
 
-    The cell is derived from the store's own coordinate axes inside the same gate the member path
-    uses, because the descriptor carries extents but not axis values (see
-    :func:`gated_statistics_from_aggregate`).
+    The window and the blending are the statistics path's (see
+    :func:`gated_statistics_from_aggregate`): the rose is a distribution over the same member set,
+    so reading the containing cell while the statistics beside it blend the window would put two
+    answers about two different places in one response.
     """
     from api.core.manifest_reader import manifest_generation
     from api.core.reader_gate import gated_read_dataset_with_selector
-    from api.services.point_forecast import _derive_grid
 
     resolved_generation = generation
     if resolved_generation is None:
@@ -1134,37 +1379,23 @@ def gated_wind_products(
             "wind_u_10m" in dataset.data_vars and "wind_v_10m" in dataset.data_vars
         ):
             return None
-        grid, lat_descending, lon_descending = _derive_grid(dataset)
-        try:
-            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
-        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
-            return None
-        row = min(int(math.floor(row_f)), grid.rows - 1)
-        col = min(int(math.floor(col_f)), grid.cols - 1)
-
-        def stored(value: int, size: int, descending: bool) -> int:
-            return (size - 1 - value) if descending else value
-
-        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
-        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
-        geometry = AggregateShardReader(store_path).open(
-            "wind_10m", lead_time_hours, generation=resolved_generation
-        )
-        if geometry is None or not (
-            0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon
-        ):
-            return None
-        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
-        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
-        return wind_products_from_aggregate(
+        window = point_window(
+            dataset,
+            "wind_10m",
             store_path=store_path,
             lead_time_hours=lead_time_hours,
-            chunk_row=chunk_row,
-            chunk_col=chunk_col,
-            row_in_chunk=row_in_chunk,
-            col_in_chunk=col_in_chunk,
+            latitude=latitude,
+            longitude=longitude,
             generation=resolved_generation,
         )
+        if window is None:
+            return None
+        fields, _geometry = window
+        try:
+            layout = aggregate_fields_for("wind_10m")
+        except FieldLayoutError:  # pragma: no cover - the variable is registered
+            return None
+        return _wind_products_from_fields(fields, layout)
 
     return gated_read_dataset_with_selector(store_path, select)
 
@@ -1177,10 +1408,14 @@ def gated_precipitation_phase(
     longitude: float,
     generation: str | None = None,
 ) -> dict[str, Any] | None:
-    """The precipitation phase products for a geographic point, under the reader gate."""
+    """The precipitation phase products for a geographic point, under the reader gate.
+
+    The window and the blending are the statistics path's (see
+    :func:`gated_statistics_from_aggregate`): a member's phase is classified from its amount and
+    flags at one place, so a phase read from a neighbouring cell is a phase no member had.
+    """
     from api.core.manifest_reader import manifest_generation
     from api.core.reader_gate import gated_read_dataset_with_selector
-    from api.services.point_forecast import _derive_grid
 
     resolved_generation = generation
     if resolved_generation is None:
@@ -1189,37 +1424,23 @@ def gated_precipitation_phase(
     def select(dataset: Any) -> dict[str, Any] | None:
         if "precipitation_amount_3h" not in dataset.data_vars:
             return None
-        grid, lat_descending, lon_descending = _derive_grid(dataset)
-        try:
-            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
-        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
-            return None
-        row = min(int(math.floor(row_f)), grid.rows - 1)
-        col = min(int(math.floor(col_f)), grid.cols - 1)
-
-        def stored(value: int, size: int, descending: bool) -> int:
-            return (size - 1 - value) if descending else value
-
-        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
-        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
-        geometry = AggregateShardReader(store_path).open(
-            "precipitation_amount_3h", lead_time_hours, generation=resolved_generation
-        )
-        if geometry is None or not (
-            0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon
-        ):
-            return None
-        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
-        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
-        return precipitation_phase_from_aggregate(
+        window = point_window(
+            dataset,
+            "precipitation_amount_3h",
             store_path=store_path,
             lead_time_hours=lead_time_hours,
-            chunk_row=chunk_row,
-            chunk_col=chunk_col,
-            row_in_chunk=row_in_chunk,
-            col_in_chunk=col_in_chunk,
+            latitude=latitude,
+            longitude=longitude,
             generation=resolved_generation,
         )
+        if window is None:
+            return None
+        fields, _geometry = window
+        try:
+            layout = aggregate_fields_for("precipitation_amount_3h")
+        except FieldLayoutError:  # pragma: no cover - the variable is registered
+            return None
+        return _phase_from_fields(fields, layout)
 
     return gated_read_dataset_with_selector(store_path, select)
 
@@ -1233,10 +1454,14 @@ def gated_cloud_censoring(
     longitude: float,
     generation: str | None = None,
 ) -> dict[str, Any] | None:
-    """The cloud censoring counts and conditional statistics for a point, under the reader gate."""
+    """The cloud censoring counts and conditional statistics for a point, under the reader gate.
+
+    The window and the blending are the statistics path's (see
+    :func:`gated_statistics_from_aggregate`): the counts and conditionals are the same cell's
+    numbers as the distribution beside them, so they must come from the same place.
+    """
     from api.core.manifest_reader import manifest_generation
     from api.core.reader_gate import gated_read_dataset_with_selector
-    from api.services.point_forecast import _derive_grid
 
     resolved_generation = generation
     if resolved_generation is None:
@@ -1245,27 +1470,23 @@ def gated_cloud_censoring(
     def select(dataset: Any) -> dict[str, Any] | None:
         if variable not in dataset.data_vars:
             return None
-        grid, lat_descending, lon_descending = _derive_grid(dataset)
-        try:
-            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
-        except Exception:  # noqa: BLE001 - an off-grid point falls back to the members
-            return None
-        row = min(int(math.floor(row_f)), grid.rows - 1)
-        col = min(int(math.floor(col_f)), grid.cols - 1)
-
-        def stored(value: int, size: int, descending: bool) -> int:
-            return (size - 1 - value) if descending else value
-
-        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
-        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
-        return cloud_censoring_at_cell(
+        window = point_window(
+            dataset,
             variable,
             store_path=store_path,
             lead_time_hours=lead_time_hours,
-            lat_idx=lat_idx,
-            lon_idx=lon_idx,
+            latitude=latitude,
+            longitude=longitude,
             generation=resolved_generation,
         )
+        if window is None:
+            return None
+        fields, _geometry = window
+        try:
+            layout = aggregate_fields_for(variable)
+        except FieldLayoutError:
+            return None
+        return _censoring_from_fields(fields, layout)
 
     return gated_read_dataset_with_selector(store_path, select)
 
@@ -1284,8 +1505,12 @@ def _stored_distribution_at_point(
     """The stored distribution at a point, on ``edges`` or on a grid it states itself.
 
     One implementation for both grid modes, because everything except the grid is identical and
-    the gate, the coordinate derivation and the field slicing must not be able to drift between
-    two copies. The two callers differ only in whether the members still exist to define a range.
+    the gate, the window and the field slicing must not be able to drift between two copies. The
+    two callers differ only in whether the members still exist to define a range.
+
+    The vector is the **blended window**, the same one the statistics path reads, because this is
+    the same request's distribution: a stored line drawn from a neighbouring cell while the
+    numbers beside it came from the point would be a comparison of two places.
 
     ``None`` whenever an aggregate cannot answer, the point is off-grid, or the cell is
     unobserved: the caller then has no stored line to draw, which is a state the migration has to
@@ -1294,7 +1519,6 @@ def _stored_distribution_at_point(
     from api.core.manifest_reader import manifest_generation
     from api.core.reader_gate import gated_read_dataset_with_selector
     from api.services.dual_source import stored_edges, stored_exceedance, stored_histogram
-    from api.services.point_forecast import _derive_grid
     from domain.variable_class import spec_for
 
     try:
@@ -1312,39 +1536,18 @@ def _stored_distribution_at_point(
     def select(dataset: Any) -> tuple[list[float], list[int]] | None:
         if variable not in dataset.data_vars:
             return None
-        grid, lat_descending, lon_descending = _derive_grid(dataset)
-        try:
-            row_f, col_f = grid.row_col_from_coordinates(latitude, longitude)
-        except Exception:  # noqa: BLE001 - an off-grid point has no stored line
-            return None
-        row = min(int(math.floor(row_f)), grid.rows - 1)
-        col = min(int(math.floor(col_f)), grid.cols - 1)
-
-        def stored(value: int, size: int, descending: bool) -> int:
-            return (size - 1 - value) if descending else value
-
-        lat_idx = stored(row, int(dataset.sizes["latitude"]), lat_descending)
-        lon_idx = stored(col, int(dataset.sizes["longitude"]), lon_descending)
-        active_reader = AggregateShardReader(store_path)
-        geometry = active_reader.open(
-            variable, lead_time_hours, generation=resolved_generation
-        )
-        if geometry is None or not (
-            0 <= lat_idx < geometry.grid_lat and 0 <= lon_idx < geometry.grid_lon
-        ):
-            return None
-        chunk_row, row_in_chunk = divmod(lat_idx, geometry.chunk_lat)
-        chunk_col, col_in_chunk = divmod(lon_idx, geometry.chunk_lon)
-        stack = active_reader.read_location(
+        window = point_window(
+            dataset,
             variable,
+            store_path=store_path,
             lead_time_hours=lead_time_hours,
-            chunk_row=chunk_row,
-            chunk_col=chunk_col,
+            latitude=latitude,
+            longitude=longitude,
             generation=resolved_generation,
         )
-        if stack is None or stack.shape[0] != layout.n_fields:
+        if window is None:
             return None
-        point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
+        point, _geometry = window
         member_count = float(point[0])
         if not math.isfinite(member_count) or member_count <= 0:
             return None

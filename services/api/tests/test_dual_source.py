@@ -128,6 +128,50 @@ def test_the_bin_encoding_answers_the_same_question() -> None:
     assert sum(stored_counts) == pytest.approx(len(members), abs=2)
 
 
+def test_a_distribution_the_grid_cannot_hold_is_refused_not_flattened() -> None:
+    """A stored cell outside the member-derived grid must report nothing, not a flat line.
+
+    The masses sum to ``1 - P(X > top edge)``. When the stored cell sits entirely above the grid
+    -- which is what reading a *neighbouring* cell produces at a point halfway between nodes --
+    every ``P(X > edge)`` is 1, every mass is 0, and apportioning zero mass used to hand each bin
+    one leftover member: the stored line came back as ``[1, 1, ..., 1]``, a flat plateau summing
+    to the bin count rather than the member count. Beside a member line with a clear peak that
+    reads as a real distribution, which is exactly the shape the user reported.
+
+    A mass the grid *can* carry is still drawn: half the distribution below the first edge and half
+    inside is a legitimate comparison, and only the un-carryable case is refused.
+    """
+    edges = [2.0 + 0.2 * index for index in range(11)]
+
+    # Every probability 1: no mass falls in any bin.
+    assert stored_histogram([1.0] * 11, edges, 30) is None
+
+    # Mass the grid can hold is drawn, and it still sums to the member count.
+    half_below = [0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.001, 0.0]
+    counts = stored_histogram(half_below, edges, 30)
+    assert counts is not None
+    assert sum(counts) == 30
+    assert len(set(counts)) > 1, "a real distribution is not a flat line"
+
+    # And a container with no members has no histogram at all.
+    assert stored_histogram([0.99, 0.9, 0.7] + [0.0] * 8, edges, 0) is None
+
+
+def test_a_flat_line_cannot_be_produced_by_any_plausible_tail() -> None:
+    """The specific signature the user saw, asserted against directly.
+
+    A stored line of all-equal counts is only reachable when the grid carries no mass at all, and
+    that case is refused. This guards the regression rather than the code path: if a future change
+    lets ``_apportion`` hand out leftovers again, the flat line reappears here.
+    """
+    edges = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    for tail in (
+        [1.0] * 11,                       # no mass anywhere in the grid
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    ):
+        assert stored_histogram(tail, edges, 30) is None
+
+
 def test_an_unobserved_cell_produces_no_stored_histogram() -> None:
     """A cell the store refused reports nothing, rather than a histogram of zeros.
 

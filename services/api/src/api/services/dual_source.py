@@ -252,6 +252,22 @@ def stored_histogram(
     the same set as "in the first bin". :func:`shared_edges` has it by definition (its lower edge
     *is* the sample minimum) and :func:`stored_edges` by construction (it widens its own bounds).
 
+    **A distribution that is not on this grid is refused rather than drawn.** The masses sum to
+    ``1 - P(X > top edge)`` -- everything the grid can hold. When the stored cell sits outside the
+    member-derived grid, every ``P(X > edge)`` is 1, so every mass is 0 and the sum is 0: the two
+    sides are not describing the same place. Apportioning that would be a fabrication, and it was
+    one -- ``_apportion`` hands each bin at most one leftover member, so a zero-mass grid came back
+    as a flat ``[1, 1, ..., 1]`` line summing to the *bin* count rather than the member count.
+    Measured on the real 09-23 00Z store: a request for a point between nodes drew a flat stored
+    line beside a member line with a clear peak, and the two were one cell apart in the store.
+
+    The refusal is ``_apportion``'s own, and it is a tight rule rather than a tolerance: the
+    member grid's top edge *is* the sample maximum, so a stored distribution computed from those
+    same members has no mass above it and fills the grid completely. Asking for the member count
+    the grid cannot carry is therefore the statement that the distribution lives somewhere else.
+    The caller renders ``None`` the way it renders "no usable aggregate" -- as no stored line --
+    rather than as a flat one.
+
     **The counts are apportioned rather than rounded independently.** Each bin's mass is a fraction
     of a member -- a ten-bin histogram of thirty members has 3 members per bin at most -- so
     rounding each bin on its own loses the remainders and the counts came out three short of the
@@ -267,6 +283,8 @@ def stored_histogram(
     if any(value is None or not math.isfinite(value) for value in exceedance):
         return None
     probabilities = [float(value) for value in exceedance if value is not None]
+    if member_count <= 0:
+        return None
     masses: list[float] = []
     for index in range(len(edges) - 1):
         masses.append(
@@ -282,17 +300,24 @@ def stored_histogram(
     return _apportion([max(mass, 0.0) for mass in masses], member_count)
 
 
-def _apportion(masses: list[float], member_count: int) -> list[int]:
+def _apportion(masses: list[float], member_count: int) -> list[int] | None:
     """Turn per-bin probabilities into integer counts that sum to ``member_count``.
 
     Largest remainder: every bin gets its floor, and the members left over go to the bins with the
     largest fractional parts. The alternative -- rounding each bin on its own -- is what produced a
     histogram three members short of its own member set, because every bin in a coarse histogram has
     a fractional part worth discarding.
+
+    ``None`` when the masses cannot carry the member count: a bin can take at most one leftover
+    member, so needing more leftovers than there are bins means the distribution does not live on
+    this grid at all. Handing out one member per bin regardless is what turned a zero-mass grid
+    into a flat line of ones, which reads as a distribution rather than as an absence.
     """
     exact = [mass * member_count for mass in masses]
     counts = [int(math.floor(value)) for value in exact]
     remaining = member_count - sum(counts)
+    if remaining < 0 or remaining > len(counts):
+        return None
     if remaining > 0:
         order = sorted(
             range(len(counts)),

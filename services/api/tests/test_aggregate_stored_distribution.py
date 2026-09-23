@@ -645,3 +645,80 @@ def _reclaim_most_members(engine, store: str, cycle: datetime) -> None:
                 )
             )
         session.commit()
+
+
+# ---------------------------------------------------------------------------
+# The point window: a request between nodes is not the cell that contains it
+# ---------------------------------------------------------------------------
+
+
+def _linspace_store(tmp_path, variable: str, members: np.ndarray) -> str:
+    """A store whose axes start at a known node, so a midpoint can be addressed exactly.
+
+    ``_point_store``'s axes are ``linspace(-49.5, 49.5, 128)`` and ``linspace(-99.5, 99.5, 160)``,
+    which puts 0.0 on a node of both. Latitude 0.375 and longitude 0.5 are then half a cell away
+    in each direction -- the fractional position a point request actually asks about, and the one
+    the member path interpolates for.
+    """
+    return _point_store(tmp_path, variable, members)
+
+
+def test_a_point_between_nodes_is_blended_not_truncated(client, migrated_db, tmp_path) -> None:
+    """The stored answer at a fractional point must be the window's, not the containing cell's.
+
+    The member path interpolates the 2x2 neighbourhood (``_interpolate_neighborhood``); the stored
+    path used to read the one cell containing the point. Measured on the real 09-23 00Z GEFS store,
+    that made ``temperature_2m``'s mean 0.45 K from the interpolated answer against 0.40 K of
+    split-half noise -- over the §9 gate -- and the user-visible symptom was a stored distribution
+    whose shape differed from the member one.
+
+    This pins the mechanism locally: the point below sits halfway between two nodes whose stored
+    means differ, so a blended answer lands between them and a truncated one on a node.
+    """
+    from api.core.aggregate_reader import AggregateShardReader
+    from api.services.aggregate_serving import point_window
+    from api.services.point_forecast import _derive_grid
+
+    # A gradient along latitude, so neighbouring nodes differ by much more than the encoding's step.
+    base = np.linspace(0.0, 20.0, GRID_LAT, dtype=np.float32)[None, :, None]
+    members = np.broadcast_to(base, (30, GRID_LAT, GRID_LON)).copy()
+    store = _point_store(tmp_path, "temperature_2m", members)
+    _register_store(migrated_db, store)
+
+    import xarray as xr
+
+    dataset = xr.open_zarr(store)
+    grid, _latd, _lond = _derive_grid(dataset)
+    assert grid.rows >= 2 and grid.cols >= 2
+    # Half a cell above the grid's first latitude node.
+    node_lat = float(dataset.coords["latitude"].values[0])
+    step = float(dataset.coords["latitude"].values[1] - node_lat)
+    midpoint_lat = node_lat + step / 2.0
+    node_lon = float(dataset.coords["longitude"].values[0])
+
+    at_node = point_window(
+        dataset, "temperature_2m", store_path=store, lead_time_hours=LEAD,
+        latitude=node_lat, longitude=node_lon,
+    )
+    at_mid = point_window(
+        dataset, "temperature_2m", store_path=store, lead_time_hours=LEAD,
+        latitude=midpoint_lat, longitude=node_lon,
+    )
+    dataset.close()
+    assert at_node is not None and at_mid is not None
+    mid_mean = float(at_mid[0][1])
+
+    # The two latitudes' own stored means, read straight from their cells.
+    reader = AggregateShardReader(store)
+    geometry = reader.open("temperature_2m", LEAD, generation=None)
+    assert geometry is not None
+    first = reader.read_location(
+        "temperature_2m", lead_time_hours=LEAD, chunk_row=0, chunk_col=0
+    )
+    assert first is not None
+    cell_low = float(first[1, 0, 0])
+    cell_high = float(first[1, 1, 0])
+    # The midpoint is strictly inside the pair, so it is a blend rather than either cell.
+    assert min(cell_low, cell_high) < mid_mean < max(cell_low, cell_high)
+    assert mid_mean != pytest.approx(cell_low, abs=1e-6)
+    assert mid_mean != pytest.approx(cell_high, abs=1e-6)
