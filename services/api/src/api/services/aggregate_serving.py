@@ -42,6 +42,7 @@ from domain.aggregate import (
     quantile_at,
     quantile_function_moments,
 )
+from domain.ensemble.pdf import EnsemblePDF
 from domain.field_layout import (
     FieldLayoutError,
     aggregate_fields_for,
@@ -1571,6 +1572,88 @@ def _stored_distribution_at_point(
     return gated_read_dataset_with_selector(store_path, select)
 
 
+def stored_pdf_at_point(
+    variable: str,
+    *,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+    generation: str | None = None,
+) -> EnsemblePDF | None:
+    """The canonical KDE of the stored distribution at a point, with no member values.
+
+    A KDE is an integral against the distribution rather than against the atom list, so a container
+    that states the distribution can still draw the curve -- which is what a store whose members
+    are gone has to do, and what the chart's second line needs while both sources exist.
+
+    The curve is built on the **member path's own rules**: the same bandwidth (Silverman's on the
+    reconstruction), the same 100-point grid, the same kernel, so the two curves lie on one
+    coordinate system rather than merely resembling each other. What differs is the input, and
+    that is the point of the comparison.
+
+    ``None`` whenever an aggregate cannot answer, the point is unobserved, or the encoding cannot
+    state the distribution's shape -- a point mass wider than a member, which a continuous quantile
+    function necessarily smears (see ``domain.ensemble.pdf.quantile_point_mass``). A wrong curve is
+    worse than none: the caller keeps whatever it had.
+    """
+    from api.core.manifest_reader import manifest_generation
+    from api.core.reader_gate import gated_read_dataset_with_selector
+    from domain.ensemble.pdf import estimate_pdf_from_bins, estimate_pdf_from_quantiles
+    from domain.variable_class import spec_for
+
+    try:
+        spec = spec_for(variable)
+        layout = aggregate_fields_for(variable)
+    except (VariableClassError, FieldLayoutError):
+        return None
+
+    resolved_generation = generation
+    if resolved_generation is None:
+        resolved_generation = manifest_generation(store_path)
+
+    def select(dataset: Any) -> EnsemblePDF | None:
+        if variable not in dataset.data_vars:
+            return None
+        window = point_window(
+            dataset,
+            variable,
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            latitude=latitude,
+            longitude=longitude,
+            generation=resolved_generation,
+        )
+        if window is None:
+            return None
+        point, _geometry = window
+        member_count = int(round(float(point[0])))
+        if not math.isfinite(float(point[0])) or member_count <= 1:
+            return None
+        distribution = point[layout.distribution_slice]
+        if spec.kind == KIND_QUANTILE_FUNCTION:
+            return estimate_pdf_from_quantiles(
+                spec.quantile_levels(), distribution, member_count
+            )
+        if spec.kind == KIND_MEAN_STD_BINS:
+            mean = float(distribution[0])
+            spread = float(distribution[1])
+            if not (math.isfinite(mean) and math.isfinite(spread)):
+                return None
+            half = float(spec.sigma_range) * spread
+            edges = np.linspace(mean - half, mean + half, spec.n_bins + 1, dtype=np.float64)
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            return estimate_pdf_from_bins(
+                centers,
+                distribution[2 : 2 + spec.n_bins],
+                member_count=member_count,
+                bin_count=spec.n_bins,
+            )
+        return None
+
+    return gated_read_dataset_with_selector(store_path, select)
+
+
 def stored_histogram_at_point(
     variable: str,
     *,
@@ -1775,6 +1858,7 @@ __all__ = [
     "statistics_from_aggregate_at_cell",
     "stored_distribution_at_point",
     "stored_histogram_at_point",
+    "stored_pdf_at_point",
     "try_read_aggregate",
     "wind_products_from_aggregate",
 ]

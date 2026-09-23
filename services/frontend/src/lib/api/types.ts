@@ -318,6 +318,13 @@ export type EvidenceState = "exact" | "strongly_inferred" | "ambiguous";
  * degenerate). Both are absent on statistics-only responses, so the
  * Distribution View must treat absence as "not yet available" rather than
  * fabricating a distribution from aggregate statistics.
+ *
+ * `pdf_stored` is the same curve evaluated over the **stored** distribution
+ * rather than the members, on the same canonical grid, so a client draws the two
+ * together exactly as it draws the two histograms. It comes from the container,
+ * so it is present even when no members were read — and absent when the encoding
+ * cannot state the distribution's shape (a point mass wider than a member, which
+ * a continuous quantile function necessarily smears).
  */
 export interface EnsembleStatisticsData {
   model: string;
@@ -328,6 +335,8 @@ export interface EnsembleStatisticsData {
   statistics: EnsembleStatistics;
   members?: number[];
   pdf?: EnsemblePDF | null;
+  /** The stored-field-derived KDE, on the same canonical grid as `pdf`. */
+  pdf_stored?: EnsemblePDF | null;
   /** The member-derived distribution, on the same grid as `histogram_stored`. */
   histogram_members?: EnsembleHistogram | null;
   /**

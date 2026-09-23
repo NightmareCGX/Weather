@@ -9,6 +9,9 @@ and ``estimate_ensemble_pdf`` which returns an ``EnsemblePDF | None``):
 - ``ensemble_spread``
 - ``ensemble_percentile``
 - ``estimate_ensemble_pdf``
+- ``estimate_pdf_from_quantiles``
+- ``estimate_pdf_from_bins``
+- ``quantile_point_mass``
 - ``EnsemblePDF``
 - ``probability_above_threshold``
 - ``probability_below_threshold``
@@ -19,7 +22,13 @@ Shared input validation and internal helpers are private and not exported.
 """
 
 from domain.ensemble.interval import probability_confidence_interval
-from domain.ensemble.pdf import EnsemblePDF, estimate_ensemble_pdf
+from domain.ensemble.pdf import (
+    EnsemblePDF,
+    estimate_ensemble_pdf,
+    estimate_pdf_from_bins,
+    estimate_pdf_from_quantiles,
+    quantile_point_mass,
+)
 from domain.ensemble.probability import (
     probability_above_threshold,
     probability_at_or_above_threshold,
@@ -41,10 +50,13 @@ __all__ = [
     "ensemble_percentile",
     "ensemble_spread",
     "estimate_ensemble_pdf",
+    "estimate_pdf_from_bins",
+    "estimate_pdf_from_quantiles",
     "probability_above_threshold",
     "probability_at_or_above_threshold",
     "probability_at_or_below_threshold",
     "probability_below_threshold",
     "probability_between_thresholds",
     "probability_confidence_interval",
+    "quantile_point_mass",
 ]

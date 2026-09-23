@@ -662,6 +662,13 @@ def build_ensemble_statistics(
                         latitude=latitude,
                         longitude=longitude,
                     ),
+                    pdf_stored=_stored_pdf(
+                        variable=variable,
+                        store_path=str(store_path_str),
+                        lead_time_hours=lead_time_hours,
+                        latitude=latitude,
+                        longitude=longitude,
+                    ),
                 )
 
     consensus_payload: ConsensusVectorOut | None = None
@@ -884,6 +891,23 @@ def build_ensemble_statistics(
         longitude=longitude,
         member_values=participating_members,
     )
+    # The stored curve, for the same reason the stored histogram is delivered -- and behind the
+    # same switch, because it is the same comparison. A change of source that shows only one line
+    # cannot be audited, and the curve is the series a reader actually looks at; it is computed
+    # from the container, so it is exactly the second source the switch turns on.
+    from api.core.config import settings as _settings
+
+    pdf_stored_payload = (
+        _stored_pdf(
+            variable=variable,
+            store_path=str(store_path_str),
+            lead_time_hours=lead_time_hours,
+            latitude=latitude,
+            longitude=longitude,
+        )
+        if getattr(_settings, "ENSEMBLE_DUAL_SOURCE_ENABLED", False)
+        else None
+    )
 
     return EnsembleStatisticsData(
         model=model,
@@ -892,6 +916,7 @@ def build_ensemble_statistics(
         statistics=stats,
         members=participating_members if include_members else None,
         pdf=pdf_payload if include_members else None,
+        pdf_stored=pdf_stored_payload,
         histogram_members=histogram_members_payload,
         histogram_stored=histogram_stored_payload,
         consensus_vector=consensus_payload,
@@ -1022,6 +1047,43 @@ def _stored_only_histogram(
     return EnsembleHistogram(edges=edges, counts=counts)
 
 
+def _stored_pdf(
+    *,
+    variable: str,
+    store_path: str,
+    lead_time_hours: int,
+    latitude: float,
+    longitude: float,
+) -> EnsemblePDF | None:
+    """The canonical KDE of the stored distribution, or ``None`` when it cannot be drawn.
+
+    The curve a converted store draws where the member path draws a KDE of the members. Both are
+    on the same canonical grid with the same bandwidth rule, so a client can put them side by side
+    -- which is the same reason the two histograms are delivered, and the same reason neither is
+    switched off while the other exists.
+
+    ``None`` is a real answer here and not a failure: the encoding may not state the distribution's
+    shape (a point mass wider than a member, which a continuous quantile function smears), and a
+    smoothed curve in that case would be off by several times the ensemble's own sampling noise.
+    """
+    from api.services.aggregate_serving import stored_pdf_at_point, try_read_aggregate
+
+    domain_pdf = try_read_aggregate(
+        lambda: stored_pdf_at_point(
+            variable,
+            store_path=store_path,
+            lead_time_hours=lead_time_hours,
+            latitude=latitude,
+            longitude=longitude,
+        )
+    )
+    if domain_pdf is None:
+        return None
+    # Translated into the response's own model the way the member path translates its own curve,
+    # so the two arrive in one shape rather than two that agree by inspection.
+    return EnsemblePDF(x=domain_pdf.x, density=domain_pdf.density)
+
+
 def _ensemble_payload_from_aggregate(
     *,
     model: str,
@@ -1031,6 +1093,7 @@ def _ensemble_payload_from_aggregate(
     products: dict[str, Any] | None,
     source_cycle: datetime | None,
     histogram_stored: EnsembleHistogram | None = None,
+    pdf_stored: EnsemblePDF | None = None,
 ) -> EnsembleStatisticsData:
     """Assemble a response from a container's stored fields, with no member read.
 
@@ -1137,6 +1200,7 @@ def _ensemble_payload_from_aggregate(
         finite_member_count=finite_member_count_payload,
         unlimited_member_count=unlimited_member_count_payload,
         histogram_stored=histogram_stored,
+        pdf_stored=pdf_stored,
     )
 
 

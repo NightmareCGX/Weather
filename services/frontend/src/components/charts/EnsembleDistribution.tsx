@@ -164,18 +164,28 @@ export function EnsembleDistribution({
   const dots = storedOnlyBars.length > 0 ? [] : toMemberDots(members);
   const summary =
     storedOnlyBars.length > 0 ? distributionSummary([]) : distributionSummary(members);
-  const pdfPoints = toPdfPoints(data.pdf);
+  // The two curves the migration compares, exactly as it compares the two histograms: the member
+  // path's own KDE and the same KDE evaluated over the stored distribution, on one canonical grid.
+  // Which one is drawn depends on whether the members are still there -- a converted store has
+  // only the stored curve, and the member curve is what it is replacing.
+  const pdfPoints = toPdfPoints(storedOnlyBars.length > 0 ? data.pdf_stored : data.pdf);
   const [xMin, xMax] = distributionXDomain(
     summary,
-    data.pdf,
+    data.pdf ?? data.pdf_stored,
     data.histogram_members ?? data.histogram_stored
   );
   // The migration's comparison: while the front end still receives a member-derived histogram it
   // draws both sources on one grid, so a change of source can be *seen*. The member line here
   // comes from the delivered histogram rather than from `histogramBins(members)` -- same values,
-  // but one grid for both lines, which is what makes them comparable at all. It is empty when the
-  // members are gone, which is also when the stored line has become the bars.
-  const comparison = mergeHistogramSources(data.histogram_members, data.histogram_stored);
+  // but one grid for both lines, which is what makes them comparable at all.
+  //
+  // Gated on the *members*, not on the stored payload: without them there is nothing to compare
+  // against, and `mergeHistogramSources` falls back to the stored edges -- so the same counts
+  // would be drawn twice, once as the bars and once as a dashed line over them. Measured: that is
+  // what a converted store rendered before this gate existed.
+  const comparison = hasMembers
+    ? mergeHistogramSources(data.histogram_members, data.histogram_stored)
+    : [];
   const storedLine = comparison
     .filter((bin) => bin.stored !== null)
     .map((bin) => ({
@@ -400,6 +410,9 @@ export function EnsembleDistribution({
               Histogram bars show the stored distribution: these members have been aggregated into a
               summary container, so the bars are read from it and binned on the range it states
               about itself. The member values are no longer stored.
+              {pdfPoints.length > 0 &&
+                " The continuous curve is the same distribution's kernel density estimate, read" +
+                  " from the stored summary rather than from the members it replaced."}
             </>
           )}
         </p>

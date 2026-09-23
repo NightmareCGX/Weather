@@ -246,6 +246,49 @@ describe("EnsembleDistribution", () => {
     );
   });
 
+  it("draws the stored curve on a converted store, where no member curve exists", () => {
+    // The curve is what a reader actually looks at, so a converted store has to be able to draw
+    // one. The API sends the same KDE over the stored distribution on the canonical grid, so the
+    // chart falls back to it exactly as it falls back to the stored histogram.
+    const storedOnlyWithCurve: EnsembleStatisticsData = {
+      ...withoutMembers,
+      histogram_stored: { edges: [10, 12, 14, 16, 18, 20], counts: [1, 1, 1, 1, 1] },
+      pdf_stored: {
+        x: [10.0, 12.5, 15.0, 17.5, 20.0],
+        density: [0.01, 0.12, 0.2, 0.12, 0.01],
+      },
+    };
+    const { container } = render(
+      <EnsembleDistribution
+        {...baseProps}
+        data={storedOnlyWithCurve}
+        status="success"
+        error={null}
+      />
+    );
+
+    expect(screen.getByText(/Stored distribution · Sep 10, 06:00 UTC/)).toBeInTheDocument();
+    // The stored curve is drawn -- one line, since no stored histogram line is delivered without
+    // members to compare it against.
+    expect(container.querySelectorAll(".recharts-line-curve").length).toBe(1);
+  });
+
+  it("draws no curve when the encoding cannot state the distribution's shape", () => {
+    // The API omits `pdf_stored` for a distribution with a point mass wider than a member, because
+    // a smooth curve over that smear would overstate its spread several-fold. The chart draws the
+    // bars and no curve, which is the absence rather than a wrong shape.
+    const storedOnlyNoCurve: EnsembleStatisticsData = {
+      ...withoutMembers,
+      histogram_stored: { edges: [10, 12, 14, 16, 18, 20], counts: [1, 1, 1, 1, 1] },
+    };
+    const { container } = render(
+      <EnsembleDistribution {...baseProps} data={storedOnlyNoCurve} status="success" error={null} />
+    );
+
+    expect(container.querySelectorAll(".recharts-rectangle").length).toBe(5);
+    expect(container.querySelectorAll(".recharts-line-curve").length).toBe(0);
+  });
+
   it("shows a loading state while fetching", () => {
     render(<EnsembleDistribution {...baseProps} data={null} status="loading" error={null} />);
     expect(screen.getByText(/Loading ensemble distribution…/)).toBeInTheDocument();

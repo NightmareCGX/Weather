@@ -1844,6 +1844,28 @@
         "title": "EnsembleHistogram",
         "description": "A member-value histogram, delivered alongside the statistics during the source migration.\n\nNot part of the statistics contract and not a stored quantity: it is computed per request from\nthe same member values the statistics came from, so a client can draw the member-derived\ndistribution and the stored-field-derived one together and compare them. It disappears with the\nmembers, which is the point of its existing."
       },
+      "EnsemblePDF": {
+        "properties": {
+          "x": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "X"
+          },
+          "density": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Density"
+          }
+        },
+        "type": "object",
+        "required": ["x", "density"],
+        "title": "EnsemblePDF",
+        "description": "Ensemble probability density function estimate."
+      },
       "EnsembleStatisticsData": {
         "additionalProperties": true,
         "type": "object"

@@ -588,6 +588,14 @@ class EnsembleStatisticsData(BaseModel):
     members is degenerate / std = 0). Both are opt-in fields returned only
     when the request sets ``include_members=true``; they are omitted on
     statistics-only responses (API.md section 5.1, additive opt-in extension).
+
+    ``pdf_stored`` is the same curve evaluated over the **stored** distribution
+    instead of the members, on the same canonical grid, and it is delivered
+    whenever an aggregate can answer -- which is what lets a fully converted
+    store still draw a curve at all, and what puts the two curves side by side
+    while both sources exist. It is absent when the encoding cannot state the
+    distribution's shape: a point mass wider than a member, which a continuous
+    quantile function necessarily smears rather than reproducing.
     """
 
     model: str
@@ -598,6 +606,7 @@ class EnsembleStatisticsData(BaseModel):
     statistics: EnsembleStatistics
     members: list[float] | None = None
     pdf: EnsemblePDF | None = None
+    pdf_stored: EnsemblePDF | None = None
     #: The two histograms the migration compares, on one shared bin grid. ``histogram_members``
     #: counts the raw member values and ``histogram_stored`` counts the same grid off the stored
     #: fields, so a client draws both lines and a difference between them is visible rather than
@@ -630,6 +639,8 @@ class EnsembleStatisticsData(BaseModel):
         if self.members is not None:
             payload["members"] = self.members
             payload["pdf"] = self.pdf
+        if self.pdf_stored is not None:
+            payload["pdf_stored"] = self.pdf_stored
         if self.histogram_members is not None:
             payload["histogram_members"] = self.histogram_members
         if self.histogram_stored is not None:
