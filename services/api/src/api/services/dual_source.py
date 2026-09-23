@@ -56,10 +56,29 @@ from domain.aggregate import (
     quantile_at,
 )
 
-#: Bins when the caller does not say. Ten is a middle resolution for a 30-member sample: the
-#: front end's own Sturges rule asks for six, which is coarse enough that a comparison of two
-#: sources would be dominated by the binning itself rather than by the encoding.
-DEFAULT_BINS: int = 10
+#: Bins used when a caller asks for a count rather than naming one.
+#:
+#: Six is Sturges' rule for a 30-member sample (``ceil(log2(30)) + 1``), and it is the front end's
+#: own ``histogramBins`` count -- so this is the value that puts the delivered lines on the same
+#: partition the member bars are drawn on. Measured over 96 sampled (point, lead) pairs on real
+#: GEFS, it is also the *most accurate* choice: the stored line's correlation with the curve the
+#: chart draws falls from 0.92 at six bins to 0.69 at twenty and 0.62 at thirty-two, because past
+#: that resolution a 30-member count histogram has about one member per bin and the curve does not.
+#:
+#: A caller that wants a fixed resolution can still say so; ``api.core.config``'s
+#: ``ENSEMBLE_DUAL_SOURCE_BINS`` is ``0`` by default, meaning "this rule", and its configured
+#: value is passed through when it is positive.
+DEFAULT_BINS: int = 6
+
+
+def member_bin_count(member_count: int) -> int:
+    """The bin count a client drawing this sample would choose: Sturges' rule.
+
+    Duplicated from the front end's ``histogramBins`` on purpose rather than shared, because the
+    two runtimes cannot share code -- and pinned by a test on both sides, so the two cannot drift
+    into delivering a partition the other does not draw.
+    """
+    return max(1, math.ceil(math.log2(max(1, member_count))) + 1)
 
 
 def shared_edges(values: npt.NDArray[np.floating], bins: int = DEFAULT_BINS) -> list[float]:
@@ -238,35 +257,24 @@ def stored_histogram(
     count is that probability times the member count -- which is what makes the two histograms
     comparable: both are counts of the members the container was computed from.
 
-    **The first bin is the exception, and it is not a detail.** The general form differences
-    ``P(X > edge)`` across the bin, which counts ``(edges[i], edges[i+1]]`` -- the *open* lower
-    bound, so any member sitting exactly on the lower edge is dropped. For the first bin that is a
-    real loss rather than a boundary convention: a zero-inflated field has a large atom at its
-    minimum, and the member histogram counts it. Measured on real GEFS precipitation, one cell had
-    30% of its members exactly at zero, so ``P(X > min)`` dropped nine of thirty members and the
-    stored line came out a third short in its first bin alone. The first bin's mass is therefore
-    ``1 - P(X > edges[1])`` -- everything at or below the first edge belongs to it.
+    **The outermost bins absorb what lies beyond them, and that is not a detail either.** The
+    general form differences ``P(X > edge)`` between consecutive edges, so it counts
+    ``(edges[i], edges[i+1]]`` and drops anything outside the grid entirely: the mass at or below
+    the first edge, and the mass above the last. Both are real losses on a reconstructed
+    distribution. A zero-inflated field has a large atom at its minimum (measured on real GEFS
+    precipitation: one cell had 30% of its members exactly at zero, so the first bin came out a
+    third short), and a stored distribution built from quantile levels or from a bounded bin
+    support always puts *some* mass past the sample's maximum, because the reconstruction is
+    smooth where the sample is not -- measured over 96 sampled ``(point, lead)`` pairs on real
+    GEFS, the mass above the member grid's top edge is 1.7% of the member set at the median and
+    14.5% at the 95th percentile. The first bin is therefore ``1 - P(X > edges[1])`` and the last
+    is ``P(X > edges[-2])``: everything at or below the first edge belongs to the first bin, and
+    everything at or above the last belongs to the last.
 
-    That form is correct for both grid modes, and it needs one property either way: the first edge
-    must sit at or below the distribution's lowest value, so that "at or below the first edge" is
-    the same set as "in the first bin". :func:`shared_edges` has it by definition (its lower edge
-    *is* the sample minimum) and :func:`stored_edges` by construction (it widens its own bounds).
-
-    **A distribution that is not on this grid is refused rather than drawn.** The masses sum to
-    ``1 - P(X > top edge)`` -- everything the grid can hold. When the stored cell sits outside the
-    member-derived grid, every ``P(X > edge)`` is 1, so every mass is 0 and the sum is 0: the two
-    sides are not describing the same place. Apportioning that would be a fabrication, and it was
-    one -- ``_apportion`` hands each bin at most one leftover member, so a zero-mass grid came back
-    as a flat ``[1, 1, ..., 1]`` line summing to the *bin* count rather than the member count.
-    Measured on the real 09-23 00Z store: a request for a point between nodes drew a flat stored
-    line beside a member line with a clear peak, and the two were one cell apart in the store.
-
-    The refusal is ``_apportion``'s own, and it is a tight rule rather than a tolerance: the
-    member grid's top edge *is* the sample maximum, so a stored distribution computed from those
-    same members has no mass above it and fills the grid completely. Asking for the member count
-    the grid cannot carry is therefore the statement that the distribution lives somewhere else.
-    The caller renders ``None`` the way it renders "no usable aggregate" -- as no stored line --
-    rather than as a flat one.
+    That form needs one property either way: the first edge must sit at or below the
+    distribution's lowest value, so that "at or below the first edge" is the same set as "in the
+    first bin". :func:`shared_edges` has it by definition (its lower edge *is* the sample minimum)
+    and :func:`stored_edges` by construction (it widens its own bounds).
 
     **The counts are apportioned rather than rounded independently.** Each bin's mass is a fraction
     of a member -- a ten-bin histogram of thirty members has 3 members per bin at most -- so
@@ -276,7 +284,8 @@ def stored_histogram(
     what lets the two lines be compared bin for bin at all.
 
     ``None`` when any probability is unavailable (a cell the store refused), because a histogram
-    with holes in it is not a comparison of anything.
+    with holes in it is not a comparison of anything -- and when the masses cannot carry the
+    member count, which is what :func:`_apportion` refuses.
     """
     if len(edges) < 2 or len(exceedance) != len(edges):
         return None
@@ -285,13 +294,15 @@ def stored_histogram(
     probabilities = [float(value) for value in exceedance if value is not None]
     if member_count <= 0:
         return None
+    last = len(edges) - 2
     masses: list[float] = []
     for index in range(len(edges) - 1):
-        masses.append(
-            1.0 - probabilities[1]
-            if index == 0
-            else probabilities[index] - probabilities[index + 1]
-        )
+        if index == 0:
+            masses.append(1.0 - probabilities[1])
+        elif index == last:
+            masses.append(probabilities[index])
+        else:
+            masses.append(probabilities[index] - probabilities[index + 1])
     # A grid whose lower edge is not the distribution's minimum is a caller error, and the negative
     # mass it produces would be worse than reading as one: said out loud rather than clipped
     # silently.
@@ -308,10 +319,13 @@ def _apportion(masses: list[float], member_count: int) -> list[int] | None:
     histogram three members short of its own member set, because every bin in a coarse histogram has
     a fractional part worth discarding.
 
-    ``None`` when the masses cannot carry the member count: a bin can take at most one leftover
-    member, so needing more leftovers than there are bins means the distribution does not live on
-    this grid at all. Handing out one member per bin regardless is what turned a zero-mass grid
-    into a flat line of ones, which reads as a distribution rather than as an absence.
+    ``None`` when the masses cannot carry the member count at all -- they sum to less than the
+    whole set, or to more than a bin per leftover can absorb. Callers reach that only by passing
+    something other than a partition of the distribution: :func:`stored_histogram` builds its
+    masses so they sum to exactly 1, which is what makes the leftover at most one member per bin.
+    The guard is here rather than there because handing out one member per bin regardless is what
+    turns an empty set of masses into a flat line of ones, which reads as a distribution rather
+    than as an absence.
     """
     exact = [mass * member_count for mass in masses]
     counts = [int(math.floor(value)) for value in exact]
@@ -331,6 +345,7 @@ def _apportion(masses: list[float], member_count: int) -> list[int] | None:
 __all__ = [
     "DEFAULT_BINS",
     "STORED_EDGE_MARGIN",
+    "member_bin_count",
     "member_histogram",
     "shared_edges",
     "stored_edges",

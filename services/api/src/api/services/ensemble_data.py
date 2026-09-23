@@ -936,15 +936,21 @@ def _dual_source_histograms(
 
     from api.services.aggregate_serving import stored_histogram_at_point, try_read_aggregate
     from api.services.dual_source import (
+        member_bin_count,
         member_histogram,
         shared_edges,
     )
 
-    bins = int(getattr(settings, "ENSEMBLE_DUAL_SOURCE_BINS", 10))
+    configured = int(getattr(settings, "ENSEMBLE_DUAL_SOURCE_BINS", 0))
     finite = [float(value) for value in member_values if math.isfinite(float(value))]
     if not finite:
         # No member values to define a grid, so there is nothing to compare against either.
         return None, None
+    # Zero means "the count a client would choose", which is the only value that puts the two
+    # delivered lines on the partition the member bars are drawn on. A fixed ten against the front
+    # end's Sturges six is what put the dashed line and the bars on different partitions: the two
+    # series then differ by the binning alone, which reads as two different distributions.
+    bins = configured if configured > 0 else member_bin_count(len(finite))
     edges = shared_edges(np.asarray(finite, dtype=np.float64), bins)
     if not edges:
         return None, None

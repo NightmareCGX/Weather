@@ -21,6 +21,7 @@ from api.services.aggregate_serving import (
     stored_distribution_at_point,
     stored_histogram_at_point,
 )
+from api.services.dual_source import member_bin_count
 from domain.aggregate import compute_aggregate, finite_member_count
 from domain.field_layout import aggregate_fields_for
 from domain.supersession import reset_supersession_enabled, set_supersession_enabled
@@ -220,10 +221,14 @@ def test_the_stored_distribution_needs_no_member_values(client, migrated_db, tmp
     )
     assert resolved is not None
     edges, counts = resolved
-    assert len(edges) == 11
-    assert len(counts) == 10
+    # The stored-only line is the *bars* a converted store draws, and the bars are binned at the
+    # client's own Sturges count for this member set -- so the container states its grid at the
+    # same resolution, and the chart does not change resolution when the members go.
+    expected_bins = member_bin_count(30)
+    assert len(edges) == expected_bins + 1
+    assert len(counts) == expected_bins
     assert sum(counts) == 30
-    assert all(edges[index] < edges[index + 1] for index in range(10))
+    assert all(edges[index] < edges[index + 1] for index in range(expected_bins))
     # The grid brackets the values **at the cell that was read**, which is what the bin encoding's
     # support is built around: ``mean +- sigma_range * std`` of that cell, not of the field. A
     # global sample minimum over 128x160 cells sits many standard deviations out by construction --

@@ -11,9 +11,12 @@ line rather than a flat one).
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 from api.services.dual_source import (
+    DEFAULT_BINS,
     member_histogram,
     shared_edges,
     stored_exceedance,
@@ -128,25 +131,54 @@ def test_the_bin_encoding_answers_the_same_question() -> None:
     assert sum(stored_counts) == pytest.approx(len(members), abs=2)
 
 
-def test_a_distribution_the_grid_cannot_hold_is_refused_not_flattened() -> None:
-    """A stored cell outside the member-derived grid must report nothing, not a flat line.
+def test_the_outermost_bins_absorb_the_mass_beyond_them() -> None:
+    """A reconstructed distribution puts mass past the sample's own extremes, and it has to land.
 
-    The masses sum to ``1 - P(X > top edge)``. When the stored cell sits entirely above the grid
-    -- which is what reading a *neighbouring* cell produces at a point halfway between nodes --
-    every ``P(X > edge)`` is 1, every mass is 0, and apportioning zero mass used to hand each bin
-    one leftover member: the stored line came back as ``[1, 1, ..., 1]``, a flat plateau summing
-    to the bin count rather than the member count. Beside a member line with a clear peak that
-    reads as a real distribution, which is exactly the shape the user reported.
+    The general form differences ``P(X > edge)`` between consecutive edges, which counts
+    ``(edges[i], edges[i+1]]`` and so drops both ends: the atom at or below the first edge, and
+    everything above the last. Both are real. A quantile encoding is a smooth interpolation of a
+    30-member sample, so its upper tail extends past the sample maximum by construction, and the
+    member grid's top edge *is* that maximum -- meaning a part of every correct stored distribution
+    falls outside the grid.
 
-    A mass the grid *can* carry is still drawn: half the distribution below the first edge and half
-    inside is a legitimate comparison, and only the un-carryable case is refused.
+    Left unabsorbed, that mass is exactly what produced the flat line the user reported: the masses
+    summed to less than 1, and the largest-remainder pass handed the missing members out one per
+    bin. The outermost bins take it instead, and the masses then sum to the whole set -- which is
+    the property the apportionment's own guard relies on.
     """
     edges = [2.0 + 0.2 * index for index in range(11)]
 
-    # Every probability 1: no mass falls in any bin.
-    assert stored_histogram([1.0] * 11, edges, 30) is None
+    # One member's worth above the top edge (P(X > top) = 1/30), the rest spread inside.
+    one_above = [1.0, 1.0, 1.0, 0.967, 0.9, 0.8, 0.6, 0.4, 0.25, 0.12, 1.0 / 30.0]
+    counts = stored_histogram(one_above, edges, 30)
+    assert counts is not None
+    assert sum(counts) == 30
+    # It lands in the last bin rather than being sprinkled across the line.
+    assert counts[-1] >= 1
+    assert len(set(counts)) > 1
 
-    # Mass the grid can hold is drawn, and it still sums to the member count.
+    # Every member at or below the first edge -- a zero-inflated field's atom at its minimum. The
+    # first bin is what holds it, by the same rule read the other way.
+    assert stored_histogram([0.0] * 11, edges, 30) == [30] + [0] * 9
+
+
+def test_a_grid_the_distribution_has_left_behind_spikes_rather_than_flattening() -> None:
+    """The degenerate case, asserted for its shape rather than for a refusal.
+
+    When the store's cell sits entirely above the grid, every ``P(X > edge)`` is 1 and every
+    interior mass is 0. Apportioning that used to hand each bin one leftover member and produce a
+    flat ``[1, 1, ..., 1]`` line; the outermost bin now takes the whole set, which says the one
+    true thing available -- this grid's last bin is where that mass belongs.
+
+    A spike at an edge is a poor picture, but it is a *readable* one, and it is not the failure the
+    plot had: a flat line looks like a distribution, whereas a single spike at the top of the range
+    does not. What produced wrong-place grids was the stored path reading the containing cell
+    instead of the window, which is fixed where the window is computed.
+    """
+    edges = [2.0 + 0.2 * index for index in range(11)]
+    assert stored_histogram([1.0] * 11, edges, 30) == [0] * 9 + [30]
+
+    # Mass the grid can hold is drawn normally, and it still sums to the member count.
     half_below = [0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.001, 0.0]
     counts = stored_histogram(half_below, edges, 30)
     assert counts is not None
@@ -155,21 +187,6 @@ def test_a_distribution_the_grid_cannot_hold_is_refused_not_flattened() -> None:
 
     # And a container with no members has no histogram at all.
     assert stored_histogram([0.99, 0.9, 0.7] + [0.0] * 8, edges, 0) is None
-
-
-def test_a_flat_line_cannot_be_produced_by_any_plausible_tail() -> None:
-    """The specific signature the user saw, asserted against directly.
-
-    A stored line of all-equal counts is only reachable when the grid carries no mass at all, and
-    that case is refused. This guards the regression rather than the code path: if a future change
-    lets ``_apportion`` hand out leftovers again, the flat line reappears here.
-    """
-    edges = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-    for tail in (
-        [1.0] * 11,                       # no mass anywhere in the grid
-        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-    ):
-        assert stored_histogram(tail, edges, 30) is None
 
 
 def test_an_unobserved_cell_produces_no_stored_histogram() -> None:
@@ -291,3 +308,32 @@ def test_the_two_grids_agree_about_where_the_distribution_sits() -> None:
         assert counts is not None
         assert sum(counts) == len(flat)
         assert counts[0] >= 1, "a zero-inflated sample puts mass at its minimum"
+
+
+def test_the_default_grid_is_the_one_a_client_would_draw() -> None:
+    """The delivered lines must land on the partition the client bins its bars on.
+
+    The chart draws the member bars with Sturges' rule (``ceil(log2(n)) + 1``, six for 30 members)
+    and the stored line from this payload. While the API used a fixed ten, the two visible series
+    were on different partitions -- ten segments against six -- so the dashed line stepped where
+    the bars did not and the pair read as two different distributions rather than as two sources
+    of one. Measured on the live store, that mismatch is also the *larger* of the two errors: the
+    stored line's correlation with the curve falls from 0.92 at six bins to 0.62 at thirty-two, so
+    a fixed resolution was both incomparable and less accurate.
+    """
+    from api.services.dual_source import member_bin_count
+
+    assert DEFAULT_BINS == 6
+    # The front end's own rule, spelled out here so the two cannot drift silently.
+    def staleness_guard(n: int) -> int:
+        return max(1, math.ceil(math.log2(max(1, n))) + 1)
+
+    for members in (5, 12, 30, 31, 60):
+        assert member_bin_count(members) == staleness_guard(members), members
+
+    # And the edges a 30-member sample produces are the ones the front end would produce.
+    values = np.linspace(10.0, 20.0, 30)
+    edges = shared_edges(values, member_bin_count(30))
+    low, high = float(values.min()), float(values.max())
+    expected = [low + (high - low) * i / 6 for i in range(7)]
+    assert edges == pytest.approx(expected)
