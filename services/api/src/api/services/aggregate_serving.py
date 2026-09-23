@@ -413,6 +413,19 @@ def statistics_from_aggregate(
     point = _corner_values(stack, int(row_in_chunk), int(col_in_chunk))
     member_count = int(round(float(point[0]))) if math.isfinite(float(point[0])) else None
     if spec is None:
+        # No distribution spec, so this variable stores something else instead of one. Two such
+        # variables exist and they are not interchangeable: a 0/1 flag stores its per-cell
+        # fraction, and the fraction answers every statistic the response reports
+        # (``fraction_statistics``); a product-fields variable stores only its supplementary
+        # groups, and those answer its *products* -- the wind rose, the consensus vector -- not a
+        # scalar statistic set. Reading a rose as if it were a fraction asks the layout for a
+        # group it does not carry, which raises rather than returning None, so the check is on the
+        # group and not on the absent spec: measured on the real 09-22 18Z store, an
+        # ``include_members=false`` request for ``wind_10m`` at a lead whose container is written
+        # raised ``FieldLayoutError: 'wind_10m' carries no 'fraction' fields`` out of the request
+        # instead of falling through to the members that can answer it.
+        if "fraction" not in layout.groups:
+            return None
         if member_count is None:
             return None
         fraction = fraction_statistics(point, layout=layout, member_count=member_count)

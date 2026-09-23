@@ -418,6 +418,39 @@ def test_unclassified_variable_falls_through(tmp_path) -> None:
     assert _fetch("mystery_variable", str(tmp_path), 0, 0) is None
 
 
+def test_a_product_fields_variable_falls_through_to_its_own_reader(tmp_path) -> None:
+    """``wind_10m``'s container answers its rose, not a scalar statistic set, and must decline.
+
+    The variable stores no distribution spec -- it is classified as product-fields -- so the
+    reader takes the "spec is None" branch. That branch is a flag's, and a flag carries a
+    ``fraction`` group; ``wind_10m`` carries only ``rose``. Asking the layout for a group it does
+    not have raises rather than returning ``None``, and the raise escapes as the request's
+    response: measured on the real 09-22 18Z store, ``include_members=false`` at a lead whose
+    container is written raised ``FieldLayoutError: 'wind_10m' carries no 'fraction' fields`` out
+    of the endpoint instead of falling through to the members, which answer it.
+
+    The same shape is asserted for a *flag*, whose container must still answer -- the guard is on
+    the group the branch needs, not on the absent spec.
+    """
+    rng = np.random.default_rng(41)
+    u = rng.normal(3.0, 4.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    v = rng.normal(2.0, 4.0, (30, GRID_LAT, GRID_LON)).astype(np.float32)
+    wind_store = _store_with(
+        tmp_path / "wind",
+        "wind_10m",
+        u,
+        group_members={"wind_u_10m": u, "wind_v_10m": v},
+    )
+    # No members were reclaimed here, so the answer the caller needs is the member path's.
+    assert _fetch("wind_10m", wind_store, 5, 7) is None
+
+    flag_members = (rng.random((30, GRID_LAT, GRID_LON)) < 0.4).astype(np.float32)
+    flag_store = _store_with(tmp_path / "flag", "crain", flag_members)
+    served = _fetch("crain", flag_store, 5, 7)
+    assert served is not None, "a flag's container must still answer from its fraction"
+    assert served.values["mean"] == pytest.approx(flag_members[:, 5, 7].mean(), abs=1e-3)
+
+
 def test_missing_aggregate_falls_through(tmp_path) -> None:
     assert _fetch("temperature_2m", str(tmp_path), 0, 0) is None
 
