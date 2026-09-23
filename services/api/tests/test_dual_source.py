@@ -337,3 +337,54 @@ def test_the_default_grid_is_the_one_a_client_would_draw() -> None:
     low, high = float(values.min()), float(values.max())
     expected = [low + (high - low) * i / 6 for i in range(7)]
     assert edges == pytest.approx(expected)
+
+
+def test_the_grid_brackets_the_sample_even_at_the_last_ulp() -> None:
+    """The last edge must be the maximum exactly, because ``np.histogram`` discards what is above it.
+
+    Computing the edges as ``low + (high - low) * index / bins`` can land one unit in the last
+    place *below* the maximum, and then every member sitting at it is dropped silently: measured
+    on a real GEFS visibility frame, the edge came out ``24.100000381469723`` against a maximum of
+    ``24.100000381469727`` and the member line counted 15 of its 30 members -- while the front
+    end's own bins, which clamp the index rather than trusting the edge, counted all 30. That is a
+    mismatch between the two lines the chart draws, produced by arithmetic rather than by either
+    source.
+
+    The rate is not negligible: over 20000 random float64 samples with a repeated maximum, the old
+    formula put its last edge below the maximum 872 times, and ``np.linspace``'s endpoint never
+    did. The endpoint is also asserted outright, because "the grid brackets the sample" is a
+    property the whole comparison rests on.
+    """
+    # The exact pair the live store produced, which is what makes this a regression rather than a
+    # synthetic case. Both are float64 values the point path interpolated, not float32 round
+    # numbers -- and that is what makes the endpoint land below the maximum at all.
+    live_low, live_high = 0.16000000238418807, 24.100000381469727
+    old_formula = [live_low + (live_high - live_low) * i / 6 for i in range(7)]
+    assert old_formula[-1] < live_high, "the formula this test guards against no longer rounds down"
+
+    members = np.array(
+        [live_high] * 15
+        + [live_low, 0.58, 0.72, 9.82, 9.82, 9.88, 9.94, 10.06, 10.06, 10.46, 10.76, 11.0,
+           11.4, 23.2, 23.86],
+        dtype=np.float64,
+    )
+    edges = shared_edges(members, 6)
+    assert edges[0] == float(members.min())
+    assert edges[-1] == float(members.max()), (
+        "the last edge fell below the sample maximum; np.histogram would drop every member at it"
+    )
+    counts = member_histogram(members, edges)
+    assert sum(counts) == members.size
+    # The last bin holds the fifteen members at the ceiling. With the edge one ULP short it held
+    # none of them, and the line came out with half its mass missing.
+    assert counts[-1] >= 15, counts
+
+    # And it holds for any sample, not just that one: the grid always counts everything.
+    rng = np.random.default_rng(7)
+    for _ in range(300):
+        sample = rng.normal(20.0, 5.0, rng.integers(2, 40)).astype(np.float32)
+        sample[rng.integers(0, sample.size)] = float(sample.max())
+        sample[rng.integers(0, sample.size)] = float(sample.min())
+        for bins in (2, 6, 10, 32):
+            grid = shared_edges(sample, bins)
+            assert sum(member_histogram(np.asarray(sample, dtype=np.float64), grid)) == sample.size

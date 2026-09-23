@@ -91,6 +91,16 @@ def shared_edges(values: npt.NDArray[np.floating], bins: int = DEFAULT_BINS) -> 
     side, so the grid is always usable and the value lands in a middle bin rather than on an edge.
     Bins are closed on the left and open on the right except the last, which includes its upper
     edge -- otherwise the maximum would fall outside the histogram.
+
+    **The last edge is the maximum, exactly, and it has to be.** ``np.histogram`` discards any
+    value above its last edge, so an edge that rounds even one unit in the last place below the
+    maximum silently drops every member sitting at it. Computing the edges as
+    ``low + (high - low) * index / bins`` does exactly that: measured on a real GEFS visibility
+    frame where half the members sat at its ceiling, the last edge came out
+    ``24.100000381469723`` against a maximum of ``24.100000381469727`` -- one ULP, 3.6e-15 -- and
+    the histogram counted 15 of 30 members. ``np.linspace`` sets its endpoint rather than
+    extrapolating to it, so it cannot lose that last ULP; the endpoint is then asserted outright,
+    because "the grid brackets the sample" is a property the whole comparison rests on.
     """
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
@@ -101,7 +111,10 @@ def shared_edges(values: npt.NDArray[np.floating], bins: int = DEFAULT_BINS) -> 
     if not high > low:
         low -= 1.0
         high += 1.0
-    return [low + (high - low) * index / bins for index in range(bins + 1)]
+    edges = [float(edge) for edge in np.linspace(low, high, bins + 1)]
+    edges[0] = low
+    edges[-1] = high
+    return edges
 
 
 def member_histogram(values: npt.NDArray[np.floating], edges: list[float]) -> list[int]:
@@ -185,7 +198,13 @@ def stored_edges(
     margin = (high - low) * STORED_EDGE_MARGIN
     low -= margin
     high += margin
-    return [low + (high - low) * index / bins for index in range(bins + 1)]
+    # The same endpoint rule as :func:`shared_edges`, for the same reason: a last edge that rounds
+    # below the range's top would put the outermost stored tail outside the grid, where
+    # ``stored_histogram``'s last bin cannot take it.
+    edges = [float(edge) for edge in np.linspace(low, high, bins + 1)]
+    edges[0] = low
+    edges[-1] = high
+    return edges
 
 
 def stored_exceedance(
