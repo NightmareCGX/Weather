@@ -1106,6 +1106,64 @@ def test_phase_aggregate_is_a_no_op_for_a_lead_with_nothing_staged(tmp_path, mon
     assert result.aggregates == ()
 
 
+def test_a_field_that_would_clip_does_not_cost_the_lead_its_other_containers(tmp_path, caplog) -> None:
+    """A magnitude past the fixed-point step is skipped and reported, not raised out of the pass.
+
+    ``encode_aggregate_shard`` refuses a field that exceeds its step rather than clipping it --
+    a clipped field is silently wrong *and* compresses better. The refusal is a property of the
+    member set's magnitude, so waiting cannot fix it, and raising it out of the pass has two
+    costs that were both measured on the real 09-22 12Z GEFS cycle:
+
+    * the containers are written one candidate at a time, so the lead lost every container after
+      the offending variable -- seven of them -- while keeping the ones before it;
+    * it escapes as an error ``publish_settled_lead`` does not handle, so the *manifest* was
+      never written either. Leads 3, 6, 9 and 12 had every container but the gust's and no
+      manifest, and the only log line was "Settled-lead publication failed for lead N". The lead
+      is not retried: the completion path records it as published before publishing.
+
+    The offending variable keeps its members, which are the only representation of it that
+    exists, and the pass reports it at warning level.
+    """
+    import logging
+
+    store = str(tmp_path)
+    # ``wind_gust`` is a quantile variable whose planes carry km/h, so 900 exceeds the 0.01
+    # step's +-327.67; ``temperature_2m`` is fine at its own scale.
+    _stage_variable(
+        store, "wind_gust", [np.full((GRID_LAT, GRID_LON), 900.0, np.float32)] * 2
+    )
+    _stage(store, _planes(3, seed=91), lead=LEAD)
+
+    with caplog.at_level(logging.WARNING):
+        results = staging.aggregate_lead_all_variables(
+            store, LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        )
+
+    # Every variable that could be encoded was, in the same pass.
+    assert {variable for variable, _k, _c in results} == {VARIABLE}
+    for _variable, key, _count in results:
+        assert os.path.isfile(os.path.join(store, *key.split("/")))
+    assert any("cannot encode wind_gust" in record.getMessage() for record in caplog.records)
+    # The refused variable kept its staging, so a later pass can still build it -- on a cycle
+    # whose gust stays inside the step's range, which is the ordinary case.
+    assert staging.staged_members_for_lead(store, "wind_gust", LEAD) == [1, 2]
+    assert staging.staged_objects_by_variable(store) != {}
+
+
+def test_the_single_variable_entry_point_still_raises_the_encoding_refusal(tmp_path) -> None:
+    """The explicit form asked for one container, so it must learn it cannot be built."""
+    from ingestion.core import aggregate_phase
+
+    store = str(tmp_path)
+    _stage_variable(
+        store, "wind_gust", [np.full((GRID_LAT, GRID_LON), 900.0, np.float32)] * 2
+    )
+    with pytest.raises(aggregate_phase.AggregatePhaseError, match="would clip"):
+        aggregate_phase.aggregate_variable_lead(
+            store, "wind_gust", LEAD, grid_lat=GRID_LAT, grid_lon=GRID_LON
+        )
+
+
 def test_explicit_variable_aggregation_ignores_the_switch(tmp_path) -> None:
     """The explicit form is for a caller that has already decided to aggregate."""
     from ingestion.core import aggregate_phase

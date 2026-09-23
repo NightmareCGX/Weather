@@ -47,6 +47,7 @@ from numcodecs import Zstd  # type: ignore[import-untyped]
 
 from ingestion.core.aggregate_writer import (
     AggregateShardLayout,
+    AggregateWriterError,
     aggregate_store_relative_key,
     encode_aggregate_shard,
 )
@@ -73,6 +74,23 @@ _STOREREF_IS_REEXPORTED: bool = StoreRef is not None
 
 class StagingError(RuntimeError):
     """Raised when the staging area cannot satisfy a requested aggregate."""
+
+
+class EncodingRangeError(StagingError):
+    """Raised when a container cannot be encoded because a field exceeds its fixed-point step.
+
+    Separate from its parent because the two failures call for opposite responses inside one
+    pass, and the pass can only tell them apart by type:
+
+    * a **missing input** -- a predecessor interval still to land, a flag variable not staged --
+      is a staging state, and the pass must report it rather than quietly leave the variable for
+      a later pass to find;
+    * an **encoding refusal** is a property of the member set's magnitude. Nothing about the
+      staging will change by waiting, so failing the pass over it only takes the containers away
+      from the variables that come after it in the candidate order -- measured on the real
+      09-22 12Z GEFS cycle, a wind gust's 338 km/h P99.5 past the 0.01 step's +-327.67 left
+      seven later variables with no container at all.
+    """
 
 
 def staging_relative_key(variable_code: str, member: int, lead_time_hours: int) -> str:
@@ -292,18 +310,29 @@ def aggregate_staged_lead(
         raise StagingError(str(exc)) from exc
 
     layout = aggregate_fields_for(variable_code)
-    container = encode_aggregate_shard(
-        fields,
-        AggregateShardLayout(
-            n_fields=layout.n_fields,
-            grid_lat=grid_lat,
-            grid_lon=grid_lon,
-            chunk_lat=chunk_lat,
-            chunk_lon=chunk_lon,
-        ),
-        member_count=member_count,
-        field_scales=layout.field_scales,
-    )
+    try:
+        container = encode_aggregate_shard(
+            fields,
+            AggregateShardLayout(
+                n_fields=layout.n_fields,
+                grid_lat=grid_lat,
+                grid_lon=grid_lon,
+                chunk_lat=chunk_lat,
+                chunk_lon=chunk_lon,
+            ),
+            member_count=member_count,
+            field_scales=layout.field_scales,
+        )
+    except AggregateWriterError as exc:
+        # A magnitude the fixed-point step cannot hold. Raised typed rather than as the parent
+        # ``StagingError`` because the pass has to tell it apart from a missing input: waiting
+        # cannot fix a step, so failing the pass over it would cost every later candidate its
+        # container -- and it would also escape as an error ``publish_settled_lead`` does not
+        # handle, skipping the manifest write that follows and leaving the lead published to
+        # nobody. Measured on the real 09-22 12Z GEFS cycle: a wind gust's P99.5 of 338 km/h past
+        # the 0.01 step's +-327.67 took down the manifest for leads 0, 3, 6, 9 and 12, each of
+        # which had written every container but that one.
+        raise EncodingRangeError(str(exc)) from exc
     key = aggregate_store_relative_key(variable_code, lead_time_hours)
     StoreIO(store).write(key, container)
 
@@ -398,6 +427,7 @@ def release_wave_staging(store: StoreRef, *, leads: Iterable[int]) -> int:
 __all__ = [
     "STAGING_ROOT",
     "STAGING_VERSION",
+    "EncodingRangeError",
     "StagingError",
     "aggregate_lead_all_variables",
     "aggregate_staged_lead",
@@ -540,8 +570,16 @@ def aggregate_lead_all_variables(
             is never staged for those cycles), and a wave may simply not have reached it yet.
             Skipping rather than attempting is what keeps one absent variable from costing the
             lead every container after it in the candidate order. A variable the platform does not
-            classify is skipped with its staging retained; a *classified* variable that **is**
-            staged here but whose container cannot be built is reported.
+            classify is skipped with its staging retained; a *recognised* variable that **is**
+            staged here but whose container cannot be built from the members present is reported,
+            because a missing input is a staging state a later pass can fix.
+
+            An :class:`EncodingRangeError` -- a field past its fixed-point step -- is **not**
+            raised out of the pass. It is a property of the member set's magnitude that waiting
+            cannot change, so the variable is skipped with its members retained and the rest of
+            the pass continues; see the class's own note for why the two are told apart. The
+            single-variable entry point does raise it, because that caller asked for one
+            container and has nothing to lose by learning it cannot be built.
     """
     from ingestion.core.aggregate_writer import DEFAULT_CHUNK_LAT, DEFAULT_CHUNK_LON
 
@@ -598,6 +636,21 @@ def aggregate_lead_all_variables(
                 wave_leads=wave_leads,
                 published_leads=published_leads,
             )
+        except EncodingRangeError as exc:
+            # A magnitude the encoding cannot represent, so it is skipped the way an absent
+            # variable is -- but it is *reported*, which is the distinction this branch exists
+            # for. Waiting will not fix it (the step is the format's, not the staging's), so the
+            # one thing the pass must not do is let it cost the container of every variable after
+            # it in the candidate order. The members are retained, which is what keeps the
+            # variable servable: they are the only representation of it that exists.
+            logger.warning(
+                "cannot encode %s at lead %d (%s); its members are retained and the rest of the "
+                "pass continues",
+                variable,
+                lead_time_hours,
+                exc,
+            )
+            continue
         except StagingError as exc:
             if _is_unclassified(variable):
                 # A variable the platform does not classify is staged like any other and has no
