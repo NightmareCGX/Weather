@@ -21,9 +21,16 @@ choice because it is the caller that knows whether members still exist.
 
 Both lines on **one grid** is what makes them comparable at all, and the grid has to be the same on
 both sides or the comparison is between two different partitions. The member grid is the members'
-range in ten equal bins by default; the stored side is *integrated over that grid* rather than
+range in equal bins by default; the stored side is *integrated over that grid* rather than
 re-derived from a distribution of its own, because a stored quantile function knows its CDF at
 every point and the mass in a bin is the CDF's difference across it.
+
+**One grid is not enough: the two sides also have to close their intervals on the same side.** A
+bin is the set ``[edge_i, edge_{i+1})``, and a value equal to an interior edge belongs to the bin
+*above* it -- ``np.histogram``'s convention, and therefore the member bars'. The stored bars are
+differences of a tail, so they get that convention by reading the tail inclusively
+(``P(X >= edge)``); read strictly, an atom sitting on an edge falls into the bin below and the
+whole column is displaced by one. ``test_dual_source``'s atom test is what pins it.
 
 What each side is, precisely
 ----------------------------
@@ -212,7 +219,26 @@ def stored_exceedance(
     spec: AggregateSpec,
     edges: list[float],
 ) -> list[float | None]:
-    """``P(X > edge)`` at each edge, read from a cell's stored distribution fields.
+    """``P(X >= edge)`` at each edge, read from a cell's stored distribution fields.
+
+    **At or above an edge, not strictly above it**, and that is load-bearing rather than a wording
+    choice. The partition :func:`stored_histogram` builds from these tails is closed on the left --
+    a value equal to an edge belongs to the bin *above* it -- because that is ``np.histogram``'s
+    convention and the member bars are counted with it. A tail read strictly puts an atom sitting
+    exactly on an edge in the bin *below*, which displaces the whole column by one bin.
+
+    The two readings agree wherever the distribution is continuous and differ only on a point mass
+    at an edge -- but an atom at an edge is not exotic, it is what a degenerate frame *is*: the grid
+    for an all-identical sample is ``[v - 1, v + 1]`` over six bins, which puts ``v`` exactly on
+    edge 3 every time. Measured on the live store over the frames of ``visibility``,
+    ``precipitation_amount_3h`` and ``snow_depth``, the strict reading put the whole 30-member
+    column one bin low on 144 frames; this reading puts it in the member bars' own bin on 143 of
+    those, the last differing by reconstruction error rather than by convention.
+
+    The bin encoding needs no flag for this: its CDF is interpolated inside the crossing bin, so a
+    threshold exactly on an edge already yields the mass *at or above* it. Only the quantile
+    inversion has to be told which side of the threshold to read, which is
+    ``exceedance_from_quantiles``'s ``inclusive``.
 
     The fields are the container's own, sliced to the distribution by the caller, and ``spec`` is
     the variable's encoding. Both kinds go through the helpers the statistics reader uses, so this
@@ -242,6 +268,7 @@ def stored_exceedance(
                             point.reshape(spec.n_fields, 1, 1),
                             spec.quantile_levels(),
                             float(edge),
+                            inclusive=True,
                         )
                     )[0, 0]
                 )
@@ -272,28 +299,32 @@ def stored_histogram(
 ) -> list[int] | None:
     """The stored distribution's mass in each bin, as a count of members.
 
-    The mass in ``[edges[i], edges[i+1])`` is ``P(X > edges[i]) - P(X > edges[i+1])``, and the
+    The mass in ``[edges[i], edges[i + 1])`` is ``P(X >= edges[i]) - P(X >= edges[i + 1])``, and the
     count is that probability times the member count -- which is what makes the two histograms
-    comparable: both are counts of the members the container was computed from.
+    comparable: both are counts of the members the container was computed from. The intervals are
+    **closed on the left**, matching ``np.histogram`` and therefore the member bars: a value equal
+    to an edge belongs to the bin above it. That is why the tails come from
+    :func:`stored_exceedance`'s inclusive reading; taking them strictly instead shifts every column
+    down one bin, which on a frame whose members all sit on an edge moves the entire 30-member
+    column.
 
-    **The outermost bins absorb what lies beyond them, and that is not a detail either.** The
-    general form differences ``P(X > edge)`` between consecutive edges, so it counts
-    ``(edges[i], edges[i+1]]`` and drops anything outside the grid entirely: the mass at or below
-    the first edge, and the mass above the last. Both are real losses on a reconstructed
+    **The outermost bins absorb what lies beyond them.** The interior form differences the tail
+    between consecutive edges and so counts only what the grid brackets, dropping both ends: the
+    mass below the first edge and the mass above the last. Both are real on a reconstructed
     distribution. A zero-inflated field has a large atom at its minimum (measured on real GEFS
     precipitation: one cell had 30% of its members exactly at zero, so the first bin came out a
     third short), and a stored distribution built from quantile levels or from a bounded bin
-    support always puts *some* mass past the sample's maximum, because the reconstruction is
-    smooth where the sample is not -- measured over 96 sampled ``(point, lead)`` pairs on real
-    GEFS, the mass above the member grid's top edge is 1.7% of the member set at the median and
-    14.5% at the 95th percentile. The first bin is therefore ``1 - P(X > edges[1])`` and the last
-    is ``P(X > edges[-2])``: everything at or below the first edge belongs to the first bin, and
-    everything at or above the last belongs to the last.
+    support always puts *some* mass past the sample's maximum, because the reconstruction is smooth
+    where the sample is not -- measured over 96 sampled ``(point, lead)`` pairs on real GEFS, the
+    mass above the member grid's top edge is 1.7% of the member set at the median and 14.5% at the
+    95th percentile. The first bin is therefore ``1 - P(X >= edges[1])`` and the last is
+    ``P(X >= edges[-2])``: everything below the first edge belongs to the first bin, and everything
+    at or above the last belongs to the last.
 
     That form needs one property either way: the first edge must sit at or below the
-    distribution's lowest value, so that "at or below the first edge" is the same set as "in the
-    first bin". :func:`shared_edges` has it by definition (its lower edge *is* the sample minimum)
-    and :func:`stored_edges` by construction (it widens its own bounds).
+    distribution's lowest value, so that "below the first edge" is the same set as "in the first
+    bin". :func:`shared_edges` has it by definition (its lower edge *is* the sample minimum) and
+    :func:`stored_edges` by construction (it widens its own bounds).
 
     **The counts are apportioned rather than rounded independently.** Each bin's mass is a fraction
     of a member -- a ten-bin histogram of thirty members has 3 members per bin at most -- so

@@ -665,6 +665,8 @@ def exceedance_from_quantiles(
     values: npt.NDArray[np.floating],
     levels: tuple[float, ...] | npt.NDArray[np.floating],
     threshold: float,
+    *,
+    inclusive: bool = False,
 ) -> npt.NDArray[np.float32]:
     """Estimate ``P(x > threshold)`` by inverting the stored quantile function.
 
@@ -678,13 +680,24 @@ def exceedance_from_quantiles(
     for an arbitrary one. Contrast the bin encoding, whose bounded support cannot represent
     the tail at all.
 
+    ``inclusive`` reads the other side of the threshold and answers a different question:
+    ``P(x >= threshold)``, where a value equal to the threshold counts as exceeding it. The
+    two differ only on a point mass -- a continuous distribution gives the same answer either
+    way -- but a point mass is exactly what a censored or zero-inflated field has, so the
+    difference is the whole atom. A partition closed on the left needs this reading: a value on
+    a bin edge belongs to the bin *above* it, which is how ``np.histogram`` assigns it and how
+    the member histogram counts it. Measured on real GEFS, a frame whose 30 members all sat on
+    an interior edge came out one bin low under the default reading and in the right bin under
+    this one.
+
     Args:
         values: ``(n_levels, lat, lon)`` decoded quantile planes, increasing per cell.
         levels: The probability of each plane, strictly increasing.
         threshold: Threshold in the variable's units.
+        inclusive: Read ``P(x >= threshold)`` rather than ``P(x > threshold)``.
 
     Returns:
-        ``P(x > threshold)`` per cell, clipped to ``[0, 1]``.
+        The tail probability per cell, clipped to ``[0, 1]``.
 
     Raises:
         AggregateError: if fewer than two planes are supplied, if the plane count and the
@@ -706,10 +719,15 @@ def exceedance_from_quantiles(
     n_levels = level_array.size
     # Counting the levels at or below the threshold is cheaper than a search, and there are
     # only a dozen or so levels. It also keeps the axis length fixed, which a per-cell
-    # search would not.
+    # search would not. The strict reading counts the levels strictly below, so a stored value
+    # equal to the threshold is not counted as below it and the returned probability includes
+    # the atom sitting there.
     below = np.zeros(values.shape[1:], dtype=np.int32)
     for index in range(n_levels):
-        below += (values[index] <= threshold).astype(np.int32)
+        if inclusive:
+            below += (values[index] < threshold).astype(np.int32)
+        else:
+            below += (values[index] <= threshold).astype(np.int32)
 
     # The CDF is exact at a stored level and interpolated between two, so the segment is
     # ``below - 1`` clamped into range.

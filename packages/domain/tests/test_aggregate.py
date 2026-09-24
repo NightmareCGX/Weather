@@ -595,6 +595,55 @@ def test_exceedance_from_quantiles_handles_a_degenerate_segment() -> None:
     assert np.isfinite(result).all()
 
 
+def test_the_inclusive_reading_puts_an_atom_on_a_threshold_above_it() -> None:
+    """``inclusive`` answers ``P(x >= t)``, which is the side a left-closed partition needs.
+
+    A histogram closed on the left -- ``np.histogram``, and therefore the member bars the API
+    delivers -- assigns a value equal to an edge to the bin *above* it. A tail read strictly
+    ``P(x > t)`` assigns it to the bin below, so a bin mass taken as the difference between two
+    such tails places an atom exactly one bin low.
+
+    The two readings agree on everything a continuous distribution does, so the case that separates
+    them is a point mass on the threshold. The sample below is 20 members at a ceiling and 10
+    spread below it, quantised exactly as the store would quantise it, and the threshold is the
+    ceiling: the strict reading reports the atom as *not* exceeding it and the inclusive one as
+    exceeding it, which is the difference between putting 20 members in the bin above the ceiling
+    and leaving them below.
+    """
+    spec = _quantile_spec()
+    levels = spec.quantile_levels()
+    rng = np.random.default_rng(21)
+    ceiling = 20.0
+    members = np.concatenate(
+        [np.full(20, ceiling), rng.uniform(12.0, 19.0, N_MEMBERS - 20)]
+    ).astype(np.float32)
+    fields = compute_aggregate(members.reshape(N_MEMBERS, 1, 1), spec)
+    # The ceiling itself, as it comes back out of the fixed-point fields: the encoder samples the
+    # CDF, so a point mass appears as a stretch of levels at one value.
+    stored_ceiling = float(np.max(fields[:, 0, 0]))
+
+    strict = float(exceedance_from_quantiles(fields, levels, stored_ceiling)[0, 0])
+    inclusive = float(
+        exceedance_from_quantiles(fields, levels, stored_ceiling, inclusive=True)[0, 0]
+    )
+    assert inclusive > strict
+    # The atom is 20 of 30 members. The reading has to find it, to within what 19 levels can state:
+    # the levels bracketing the mass are 0.1 apart, so a tenth of the distribution -- three members
+    # -- is the resolution here, and the assertion is that the reading is inside that.
+    widest_gap = float(np.max(np.diff(np.asarray(levels, dtype=np.float64))))
+    assert inclusive == pytest.approx(20.0 / N_MEMBERS, abs=widest_gap)
+
+    # Away from the atom the two readings coincide, because the distribution is continuous there.
+    for threshold in (13.0, 15.0, 18.0):
+        assert float(
+            exceedance_from_quantiles(fields, levels, threshold)[0, 0]
+        ) == pytest.approx(
+            float(
+                exceedance_from_quantiles(fields, levels, threshold, inclusive=True)[0, 0]
+            )
+        )
+
+
 def test_exceedance_from_quantiles_rejects_bad_input() -> None:
     spec = _quantile_spec()
     values = compute_aggregate(_skewed_members(seed=10), spec)

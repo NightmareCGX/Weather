@@ -292,6 +292,42 @@ def test_an_unobserved_cell_states_no_grid() -> None:
     assert stored_edges(np.zeros(spec.n_fields - 1, dtype=np.float32), spec) == []
 
 
+def test_the_stored_bars_put_an_atom_on_an_edge_in_the_bin_above_it() -> None:
+    """The partition is closed on the left, on both sides, and an atom on an edge proves it.
+
+    ``np.histogram`` -- and therefore the member bars -- assigns a value equal to an edge to the bin
+    *above* it. A stored tail read strictly ``P(X > edge)`` assigns it to the bin below, so a bin
+    mass taken as the difference of two such tails puts the whole atom one bin low.
+
+    That is not a corner case: the grid built from a degenerate sample is ``[v - 1, v + 1]`` over
+    six bins, so ``v`` lands exactly on edge 3, and every member of the set sits on it. Measured on
+    the live store, this displaced the entire 30-member column on 144 of the frames checked and was
+    the whole of the disagreement on the degenerate ones -- the two series looked like two different
+    distributions while describing one.
+
+    The series below is the real one: 30 members at a visibility ceiling, quantised by the encoder
+    and read back out of the fields, then binned on the grid the member path uses.
+    """
+    spec = AggregateSpec(kind=KIND_QUANTILE_FUNCTION)
+    ceiling = 24.1
+    members = np.full((30, 1, 1), np.float32(ceiling), dtype=np.float32)
+    fields = compute_aggregate(members, spec, expected_members=30)[:, 0, 0]
+    flat = np.asarray(members).reshape(-1)
+    edges = shared_edges(flat, DEFAULT_BINS)
+
+    # The value sits on an interior edge -- as the float the member array holds, which is the grid
+    # bound too, since the grid is built from the same values. That is what makes this frame the one
+    # that shows which side of an edge the mass is counted on.
+    assert any(edge == float(flat[0]) for edge in edges[1:-1])
+
+    tail = stored_exceedance(fields, spec, edges)
+    counts = stored_histogram(tail, edges, len(flat))
+    member_counts = member_histogram(flat, edges)
+
+    assert counts == member_counts, (counts, member_counts)
+    assert counts[len(counts) // 2] == 30
+
+
 def test_the_two_grids_agree_about_where_the_distribution_sits() -> None:
     """The stored-line's counts are the same quantity on either grid, which is what lets the
     stored-only mode replace the comparison mode without changing what is drawn."""
