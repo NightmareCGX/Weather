@@ -120,7 +120,7 @@ def _shard_payload_size(path: Path) -> int:
     if len(data) < TRAILER_SIZE:
         return 0
     num_chunks, index_size, _ = struct.unpack("<III", data[-TRAILER_SIZE:])
-    return len(data) - TRAILER_SIZE - index_size
+    return int(len(data) - TRAILER_SIZE - int(index_size))
 
 
 def write_shadow_store(

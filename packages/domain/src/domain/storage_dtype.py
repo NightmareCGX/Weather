@@ -97,11 +97,12 @@ UINT8_DTYPE = np.dtype("u1")
 SHARDED_V1_PAYLOAD_DTYPE = np.dtype("<f4")
 
 
-def is_sharded_payload_format(format_version: str) -> bool:
+def is_sharded_payload_format(format_version: str | None) -> bool:
     """Return True for format versions whose payloads are sharded containers.
 
     ``sharded_v1`` and ``sharded_v2`` both read through the sharded-reader
-    path. ``v2_unsharded`` (the legacy unsharded fallback) does not.
+    path. ``v2_unsharded`` (the legacy unsharded fallback) does not. ``None``
+    (an absent/unresolved version) is never a sharded payload format.
     """
     return format_version in _SHARDED_PAYLOAD_FORMATS
 

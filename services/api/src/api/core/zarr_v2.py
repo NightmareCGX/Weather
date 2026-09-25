@@ -67,7 +67,7 @@ class ShardedV2Reader(ShardedV1Reader):
         fill: Any = np.nan if dtype.kind == "f" else 0
         return np.full((100, 100), fill, dtype=dtype)
 
-    def read_chunk(  # type: ignore[override]
+    def read_chunk(
         self,
         variable: str,
         *,
