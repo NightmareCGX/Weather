@@ -1,16 +1,17 @@
-"""Shadow validation for the sharded_v2 storage format.
+"""Shadow validation for the sharded_v2 storage format (storage + numerical).
 
 Re-encodes an existing canonical store's committed shards into a ``sharded_v2``
-shadow store and compares the two across storage, numerical, and serving
-dimensions. The shadow store lives in its own namespace, is never registered in
-the catalog (no ``model_runs`` row), and therefore never enters canonical
-serving selection, the reclamation queue, or the tombstone lifecycle — its
-lifetime is managed entirely by this tooling.
+shadow store and compares the two across the storage and numerical dimensions.
+The shadow store lives in its own namespace, is never registered in the catalog
+(no ``model_runs`` row), and therefore never enters canonical serving selection,
+the reclamation queue, or the tombstone lifecycle — its lifetime is managed
+entirely by this tooling.
 
-This module is *validation tooling*, not the production ingest path: the
-serving-comparison helpers lazily import the API reader layer and are only
-usable in environments where the ``api`` package is installed (the uv
-workspace root venv, CI, operator machines).
+This module intentionally depends on the ingestion package only. The
+serving-tier comparison (which needs the API reader) lives in
+``scripts/shadow_v2.py`` and the cross-package contract suite
+(``tests/contracts``), because the per-package CI environments install only
+their own package.
 
 CLI entry point: ``scripts/shadow_v2.py`` (``validate`` / ``cleanup``).
 """
@@ -270,100 +271,6 @@ def compare_stores_numerical(
                 report.notes.append("ceiling 19.99km predicate flipped")
         reports.append(report)
     return reports
-
-
-def compare_serving(
-    source_store: str | PathLike[str],
-    shadow_store: str | PathLike[str],
-    *,
-    sample_points: int = 25,
-    seed: int = 42,
-) -> dict[str, Any]:
-    """Compare point-interpolation serving output between both stores.
-
-    Lazily imports the API reader layer (tooling context only). Uses the same
-    grid sample for both readers; the reader class is chosen per store by the
-    committed manifest, exactly as production dispatch would.
-    """
-    # Lazy serving-tier import: tooling-only dependency (api has no py.typed
-    # marker, hence the explicit ignore).
-    from api.core.zarr import get_sharded_reader  # type: ignore[import-untyped]
-
-    rng = np.random.default_rng(seed)
-    source = os.fspath(source_store)
-    vars_seen = sorted(_iter_local_shards(source).keys())
-    lat_indices = rng.integers(0, 720, size=sample_points)
-    lon_indices = rng.integers(0, 1440, size=sample_points)
-    per_var: dict[str, dict[str, Any]] = {}
-    for var_name in vars_seen:
-        resolved = resolve_storage_dtype(SHARDED_V2_FORMAT_VERSION, var_name, "det")
-        member = 1 if any(
-            shard.name.startswith("shard.mem") for shard in _iter_local_shards(source)[var_name]
-        ) else None
-        v1_reader = get_sharded_reader(source)
-        v2_reader = get_sharded_reader(os.fspath(shadow_store))
-        max_diff = 0.0
-        flips = 0
-        n = 0
-        for lat_idx, lon_idx in zip(lat_indices, lon_indices):
-            a = v1_reader.read_point_value(
-                var_name, member=member, lead_time_hours=6, lat_idx=int(lat_idx), lon_idx=int(lon_idx)
-            )
-            b = v2_reader.read_point_value(
-                var_name, member=member, lead_time_hours=6, lat_idx=int(lat_idx), lon_idx=int(lon_idx)
-            )
-            if not (np.isfinite(a) and np.isfinite(b)):
-                continue
-            n += 1
-            max_diff = max(max_diff, abs(b - a))
-            if var_name == "precipitation_amount_3h":
-                flips += int((b <= _PRECIP_THRESHOLD_MM) != (a <= _PRECIP_THRESHOLD_MM))
-            if var_name == "cloud_ceiling":
-                flips += int((b >= _CEILING_THRESHOLD_KM) != (a >= _CEILING_THRESHOLD_KM))
-        per_var[var_name] = {
-            "points_compared": n,
-            "max_abs_diff": max_diff,
-            "threshold_flips": flips,
-            "storage_dtype": resolved.str,
-        }
-    return {"sample_points": sample_points, "per_variable": per_var}
-
-
-def run_shadow_validation(
-    source_store: str | PathLike[str],
-    shadow_store: str | PathLike[str] | None = None,
-    *,
-    sample_points: int = 25,
-) -> dict[str, Any]:
-    """Full shadow validation: re-encode, compare storage/numerical/serving.
-
-    Returns a JSON-serializable report. ``semantic_regression_free`` is False
-    unless every f32 exception is byte-identical and both threshold predicates
-    show zero flips.
-    """
-    shadow = os.fspath(shadow_store) if shadow_store else default_shadow_store_path(source_store)
-    storage = write_shadow_store(source_store, shadow)
-    numerical = compare_stores_numerical(source_store, shadow)
-    serving = compare_serving(source_store, shadow, sample_points=sample_points)
-
-    semantic_regression_free = True
-    for report in numerical:
-        if report.max_abs_diff > report.tolerance:
-            semantic_regression_free = False
-        if report.precip_threshold_flips or report.ceiling_threshold_flips:
-            semantic_regression_free = False
-        if report.notes:
-            semantic_regression_free = False
-    for var_report in serving["per_variable"].values():
-        if var_report["threshold_flips"]:
-            semantic_regression_free = False
-
-    return {
-        "storage": storage,
-        "numerical": [vars(r) for r in numerical],
-        "serving": serving,
-        "semantic_regression_free": semantic_regression_free,
-    }
 
 
 def cleanup_shadow_stores(

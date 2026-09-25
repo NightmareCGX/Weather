@@ -2,14 +2,16 @@
 
 Builds a real canonical v1 store through the production writer, re-encodes it
 into a shadow-v2 namespace via :func:`ingestion.core.shadow.write_shadow_store`,
-and asserts the storage/numerical/serving comparison contract:
+and asserts the storage/numerical comparison contract:
 
 * storage: shadow payload strictly smaller than the v1 payload;
 * numerical: f32 exceptions byte-identical (zero diff, zero threshold flips);
   f16 variables within the measured tolerance;
-* serving: point values from both reader classes agree within tolerance and the
-  precipitation/ceiling predicates show zero flips;
 * cleanup: namespace guard refuses non-shadow prefixes; dry-run default.
+
+The serving-tier comparison needs both the ingestion and api packages; it is
+covered by ``tests/contracts/test_sharded_v2_shadow_contract.py`` (cross-package
+CI job) and the operator CLI ``scripts/shadow_v2.py``.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from ingestion.core.shadow import (
     compare_stores_numerical,
     default_shadow_store_path,
     is_shadow_store_path,
-    run_shadow_validation,
     write_shadow_store,
 )
 from ingestion.core.zarr_writer import commit_region, prepare_run_store, read_slice
@@ -123,34 +124,34 @@ def test_cleanup_dry_run_and_age_guard(tmp_path: Path) -> None:
 
 
 def test_full_shadow_validation_end_to_end(tmp_path: Path) -> None:
-    """The executable GO/NO-GO 2 harness on a local cycle (storage+numerical+serving)."""
+    """Storage+numerical shadow harness on a local cycle (ingestion-only deps).
+
+    The serving-tier comparison needs the api package, which the per-package
+    ingestion environment does not install; it is covered by
+    ``tests/contracts/test_sharded_v2_shadow_contract.py`` (uv sync
+    --all-packages) and the operator CLI.
+    """
     store, _ = _build_canonical_v1_store(tmp_path)
     shadow = default_shadow_store_path(store)
-    report = run_shadow_validation(store, shadow, sample_points=25)
 
     # Storage: v2 payload strictly smaller than v1 for this continuous-heavy mix.
-    storage = report["storage"]
+    storage = write_shadow_store(store, shadow)
     assert storage["shards_reencoded"] > 0
     assert storage["shadow_payload_bytes"] < storage["source_payload_bytes"]
     assert 0.4 < storage["storage_ratio"] < 0.95
 
     # Numerical: f32 exceptions byte-identical; f16 within tolerance.
-    numerical = {r["variable"]: r for r in report["numerical"]}
-    precip = numerical["precipitation_amount_3h"]
-    assert precip["max_abs_diff"] == 0.0
-    assert precip["precip_threshold_flips"] == 0
-    ceiling = numerical["cloud_ceiling"]
-    assert ceiling["max_abs_diff"] == 0.0
-    assert ceiling["ceiling_threshold_flips"] == 0
-    temperature = numerical["temperature_2m"]
-    assert temperature["max_abs_diff"] <= 0.5
-    crain = numerical["crain"]
-    assert crain["max_abs_diff"] == 0.0
-
-    # Serving: zero threshold flips through the reader classes.
-    assert report["serving"]["per_variable"]["precipitation_amount_3h"]["threshold_flips"] == 0
-    assert report["serving"]["per_variable"]["cloud_ceiling"]["threshold_flips"] == 0
-    assert report["semantic_regression_free"] is True
+    reports = {r.variable: r for r in compare_stores_numerical(store, shadow)}
+    precip = reports["precipitation_amount_3h"]
+    assert precip.max_abs_diff == 0.0
+    assert precip.precip_threshold_flips == 0
+    ceiling = reports["cloud_ceiling"]
+    assert ceiling.max_abs_diff == 0.0
+    assert ceiling.ceiling_threshold_flips == 0
+    temperature = reports["temperature_2m"]
+    assert temperature.max_abs_diff <= 0.5
+    crain = reports["crain"]
+    assert crain.max_abs_diff == 0.0
 
     # The shadow store is a complete readable store with a v2 manifest, and the
     # canonical store is untouched (v1 read path unchanged).

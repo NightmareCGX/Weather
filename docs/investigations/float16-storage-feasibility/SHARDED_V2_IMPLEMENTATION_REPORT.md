@@ -76,6 +76,7 @@ det/member flags:u8、1 字节/值、值域 ⊆{0,1}(违例 raise `CategoricalDo
 - serving:40 采样点零阈值翻转,reader 工厂按 manifest 正确分派 V2;
 - 工具守卫:cleanup 拒绝非 shadow 前缀、dry-run 默认、age guard 测试通过。
 - 真实生产 shadow 命令:`python scripts/shadow_v2.py validate --store s3://weather-data/{model}/{date}/{HH}/cycle.zarr`(同 store 树内生成 `shadow-v2/`,不入 catalog)。
+- **架构注**:ingestion 包的 shadow 模块仅依赖 ingestion(storage+numerical 比较)——per-package CI 环境(ingestion 不装 api)不引入跨服务依赖;serving 比较需要 api+ingestion 双包,实现在 `scripts/shadow_v2.py`(操作员工具层),并由跨包 contract 套件 `tests/contracts/test_sharded_v2_shadow_contract.py`(`uv sync --all-packages` 的 CI job)在 CI 中执行。
 
 ## 17. Performance Results
 
