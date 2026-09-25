@@ -982,9 +982,10 @@ def _slice_field(
     """Return the 2-D ascending field and its sliced axes for the tile bounds."""
     from api.core.manifest_reader import manifest_generation, manifest_storage_format
     from api.core.zarr import get_sharded_reader
+    from domain.storage_dtype import is_sharded_payload_format
 
     format_version = manifest_storage_format(store_path) if store_path else "v2_unsharded"
-    if format_version == "sharded_v1" and store_path is not None:
+    if is_sharded_payload_format(format_version) and store_path is not None:
         reader = get_sharded_reader(store_path)
         generation = manifest_generation(store_path)
 

@@ -83,6 +83,43 @@ class MissingPredecessorLeadError(DeaccumulationError):
     """Raised when a 6-hour reset lead cannot find its required predecessor lead."""
 
 
+class F16RangeViolationError(IngestionError):
+    """Raised when a float16 shard payload would silently lose data.
+
+    Under ``sharded_v2``, continuous fields are persisted as little-endian
+    float16 (max finite 65504.0). Before any ``astype("<f2")`` the writer
+    validates the chunk: NaN is a legal missing-data marker (allowed, counted),
+    but ±Inf and finite magnitudes beyond the float16 range are rejected with
+    this error instead of being silently cast to ``inf`` (which downstream
+    ``isfinite`` masks would then treat as missing data). The error carries the
+    full diagnostic context (variable, product role, shard key, counts,
+    finite min/max) so the offending upstream file can be identified.
+    """
+
+
+class CategoricalDomainViolationError(IngestionError):
+    """Raised when a categorical shard payload leaves its legal value domain.
+
+    Deterministic/member precipitation flags must be exactly ``{0, 1}``
+    (Code table 4.222 binary indicators); ensemble-mean flag shards are
+    member-mean probabilities and must lie in ``[0, 1]``. Anything else means
+    the upstream normalization broke and persisting it would corrupt the
+    phase-support products downstream.
+    """
+
+
+class CycleFormatConflictError(IngestionError):
+    """Raised when a cycle's storage format would change mid-cycle.
+
+    A cycle store must be written end-to-end with a single
+    ``storage_format_version``: the manifest stamps the version at every
+    commit, and a mid-cycle flip would produce a half-v1/half-v2 store that no
+    reader contract describes. The first commit's version is durable in the
+    manifest; subsequent commits (and any finalization after a process
+    restart) must match it or fail loudly.
+    """
+
+
 #: Negative residual clamping bound (in mm) for precipitation de-accumulation.
 #: Residuals in [-DEACCUMULATION_CLAMP_BOUND_MM, 0.0) mm (caused by upstream GRIB
 #: simple packing quantization differences between 3h and 6h files) are clamped to 0.0 mm.

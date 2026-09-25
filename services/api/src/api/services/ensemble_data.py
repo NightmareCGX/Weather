@@ -19,6 +19,8 @@ from domain.coverage import (
     is_cell_statistically_valid,
     is_lead_servable,
 )
+from domain.storage_dtype import is_sharded_payload_format
+
 from domain.ensemble import (
     ensemble_mean,
     ensemble_median,
@@ -932,7 +934,7 @@ def _gated_member_values(
         format_version = manifest_storage_format(store_path)
         generation = manifest_generation(store_path)
 
-        if format_version == "sharded_v1":
+        if is_sharded_payload_format(format_version):
             reader = get_sharded_reader(store_path)
             if grid.rows < 2 or grid.cols < 2:
                 raise InvalidGridError(
@@ -1052,7 +1054,7 @@ def _gated_wind_member_vectors(
         format_version = manifest_storage_format(store_path)
         generation = manifest_generation(store_path)
 
-        if format_version == "sharded_v1":
+        if is_sharded_payload_format(format_version):
             reader = get_sharded_reader(store_path)
             if grid.rows < 2 or grid.cols < 2:
                 raise InvalidGridError(
@@ -1203,7 +1205,7 @@ def _gated_precipitation_member_states(
         format_version = manifest_storage_format(store_path)
         generation = manifest_generation(store_path)
 
-        if format_version == "sharded_v1":
+        if is_sharded_payload_format(format_version):
             reader = get_sharded_reader(store_path)
             if grid.rows < 2 or grid.cols < 2:
                 raise InvalidGridError(

@@ -33,6 +33,7 @@ import numpy as np
 import s3fs  # type: ignore[import-untyped]
 
 from domain.locks import sha256_hex
+from domain.storage_dtype import is_sharded_payload_format
 
 
 class InventoryError(RuntimeError):
@@ -624,8 +625,10 @@ def region_expected_object_keys(
         except Exception:
             resolved_format = "v2_unsharded"
 
-    # Sharded v1 format: 1 shard container per variable per region (14 objects total)
-    if resolved_format == "sharded_v1":
+    # Sharded formats (v1 frozen float32 bytes; v2 per-variable native dtypes):
+    # 1 shard container per variable per region. The physical object-key layout
+    # is identical for both — the version only changes payload dtypes.
+    if is_sharded_payload_format(resolved_format):
         # Resolve lead_time_hours if not provided
         lead_val = lead_time_hours
         if lead_val is None:

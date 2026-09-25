@@ -49,6 +49,7 @@ from domain.locks import (
 )
 from ingestion.core.config import settings
 from ingestion.core.base import (
+    CycleFormatConflictError,
     StoreSchemaMismatchError,
     is_retryable_storage_error,
 )
@@ -135,6 +136,38 @@ def _new_generation() -> str:
     import uuid
 
     return uuid.uuid4().hex
+
+
+def _requested_storage_format_version() -> str:
+    """Return the configured storage format for newly written cycles."""
+    return str(getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"))
+
+
+def _assert_cycle_format_freeze(
+    store_path: str,
+    requested: str,
+    existing_manifest: Mapping[str, object] | None,
+) -> None:
+    """Fail loudly when a cycle's committed storage format would change mid-cycle.
+
+    A cycle store must be written end-to-end with a single
+    ``storage_format_version``. The manifest stamps the version durably at every
+    publish/finalize, so this durable check catches a configuration flip across
+    a process restart (the in-process snapshot in ``zarr_writer`` covers flips
+    between region commits). A mismatch would otherwise produce a half-v1/half-v2
+    store that no reader contract describes.
+    """
+    if existing_manifest is None:
+        return
+    committed = existing_manifest.get("storage_format_version")
+    if committed is not None and str(committed) != requested:
+        raise CycleFormatConflictError(
+            f"Cycle store {store_path!r} was committed with storage format "
+            f"{str(committed)!r} but the current configuration requests "
+            f"{requested!r}. A cycle must be written end-to-end with a single "
+            "storage_format_version; restore the previous configuration or "
+            "start a new cycle."
+        )
 
 
 def _physical_conflict_region_ids(
@@ -973,6 +1006,8 @@ class RunCoordinator:
             observer.record_milestone("manifest_fingerprint_complete")
 
         existing_manifest = read_manifest(self.store_path)
+        requested_format = _requested_storage_format_version()
+        _assert_cycle_format_freeze(self.store_path, requested_format, existing_manifest)
         if (
             existing_manifest is not None
             and existing_manifest.get("serving_state_fingerprint") == serving_fp
@@ -984,7 +1019,7 @@ class RunCoordinator:
         payload = {
             "manifest_schema_version": 1,
             "store_protocol_mode": mode,
-            "storage_format_version": getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
+            "storage_format_version": requested_format,
             "generation": generation,
             "run_identity": run_identity,
             "canonical_store_identity_hash": _store_identity_hash(self.store_path),
@@ -1250,10 +1285,14 @@ class RunCoordinator:
             }
             store_schema_fp = _store_schema_fingerprint(self.store_path, snapshot=self._snapshot)
             generation = _new_generation()
+            requested_format = _requested_storage_format_version()
+            _assert_cycle_format_freeze(
+                self.store_path, requested_format, read_manifest(self.store_path)
+            )
             manifest_payload = {
                 "manifest_schema_version": 1,
                 "store_protocol_mode": mode,
-                "storage_format_version": getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"),
+                "storage_format_version": requested_format,
                 "generation": generation,
                 "run_identity": run_identity,
                 "canonical_store_identity_hash": _store_identity_hash(self.store_path),
@@ -1318,6 +1357,9 @@ class RunCoordinator:
             if not data_var_paths:
                 data_var_paths = _store_data_var_paths(self.store_path, snapshot=self._snapshot)
             is_sharded = any(k.endswith(".shard") for k in required + omitted)
+            # NOTE: sharded_v1 and sharded_v2 share the identical physical
+            # object-key layout (the format version changes payload dtypes
+            # only), so deriving keys with the v1 format is correct for both.
             zarray_cache = (
                 self._snapshot.zarray_by_var
                 if self._snapshot is not None and self._snapshot.store_path == self.store_path

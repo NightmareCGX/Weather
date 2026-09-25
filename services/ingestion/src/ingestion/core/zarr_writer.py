@@ -27,15 +27,37 @@ import xarray as xr
 import zarr
 from numcodecs import Zstd  # type: ignore[import-untyped]
 
+from domain.reclamation import TARGET_KIND_DET, TARGET_KIND_MEAN, TARGET_KIND_MEM
+from domain.storage_dtype import (
+    FLOAT16_LE_DTYPE,
+    FLOAT32_LE_DTYPE,
+    SHARDED_V1_FORMAT_VERSION,
+    SHARDED_V2_FORMAT_VERSION,
+    UINT8_DTYPE,
+    is_sharded_payload_format,
+    resolve_storage_dtype,
+)
+
+from ingestion.core.base import (
+    CategoricalDomainViolationError,
+    CycleFormatConflictError,
+    F16RangeViolationError,
+)
 from ingestion.core.config import IngestionSettings, settings
 from ingestion.core.s3 import resolve_s3_mapper
 
 logger = logging.getLogger(__name__)
 
-#: Canonical Weather Platform Sharded v1 (sharded_v1) binary layout constants
+#: Canonical Weather Platform sharded binary layout constants (shared by the
+#: frozen sharded_v1 bytes and the sharded_v2 per-variable-dtype payload; the
+#: container geometry is dtype-independent).
 SHARD_MAGIC: int = 0x53484152  # 'SHAR' in little-endian
 INDEX_ENTRY_SIZE: int = 16     # uint64 offset, uint64 length
 TRAILER_SIZE: int = 12         # uint32 num_chunks, uint32 index_byte_size, uint32 magic
+
+#: float16 max finite magnitude: the writer rejects finite values beyond this
+#: before any cast so overflow can never silently become ``inf`` payload.
+FLOAT16_MAX_FINITE: float = 65504.0
 
 #: Default chunks applied per dimension when none are provided.
 DEFAULT_CHUNKS: Mapping[str, int] = {
@@ -365,12 +387,25 @@ def prepare_run_store(
             min(DEFAULT_CHUNKS.get(str(d), s), s)
             for d, s in zip(dims, shape)
         )
-        fill_val = "NaN" if np.issubdtype(da.dtype, np.floating) else None
+        # v2 metadata/bytes consistency: the pre-allocated array dtype must equal
+        # the dtype the sharded_v2 encoder writes, resolved per variable and
+        # product role (the array covers the det/member axis; mean shards are
+        # separate physical objects). v1 keeps its historical behavior — the
+        # seed dataset's own dtype — because v1 byte/metadata behavior is frozen.
+        storage_format = str(getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"))
+        if storage_format == SHARDED_V2_FORMAT_VERSION:
+            product_role = TARGET_KIND_MEM if members else TARGET_KIND_DET
+            store_dtype: np.dtype[Any] = resolve_storage_dtype(
+                SHARDED_V2_FORMAT_VERSION, str(name), product_role
+            )
+        else:
+            store_dtype = da.dtype
+        fill_val = "NaN" if store_dtype.kind == "f" else None
         arr = root.create_array(
             str(name),
             shape=shape,
             chunks=chunks,
-            dtype=da.dtype,
+            dtype=store_dtype,
             compressor=Zstd(level=5),
             fill_value=fill_val,
             order="C",
@@ -467,8 +502,9 @@ def commit_region(
         elif member_value.size == 1:
             member = int(member_value.reshape(-1)[0])
 
-    format_version = getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1")
-    if format_version == "sharded_v1":
+    format_version = str(getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"))
+    if is_sharded_payload_format(format_version):
+        assert_cycle_format_allowed(store, format_version)
         coords: dict[str, object] = {"lead_time_hours": [lead_time_hours]}
         if member is not None:
             coords["member"] = [member]
@@ -479,12 +515,18 @@ def commit_region(
             target = target.expand_dims("member")
 
         try:
-            encoded_shards = encode_region_sharded_v1(
+            encoded_shards = encode_region_sharded(
                 target,
                 member=member,
                 lead_time_hours=lead_time_hours,
                 is_mean=is_mean,
+                format_version=format_version,
             )
+        except (CategoricalDomainViolationError, CycleFormatConflictError, F16RangeViolationError):
+            # Writer guards and the cycle format freeze are hard failures:
+            # falling through to the legacy path would persist v1-format bytes
+            # into a v2 store (or silently clamp/NaN data the guard rejected).
+            raise
         except Exception:
             encoded_shards = []
 
@@ -536,15 +578,21 @@ def commit_region(
         target = target.drop_vars(drop_vars)
 
     # Production storage format routing: defaults to Weather Platform Sharded v1 (sharded_v1)
-    format_version = getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1")
-    if format_version == "sharded_v1":
+    format_version = str(getattr(settings, "STORAGE_FORMAT_VERSION", "sharded_v1"))
+    if is_sharded_payload_format(format_version):
+        assert_cycle_format_allowed(store, format_version)
         try:
-            encoded_shards = encode_region_sharded_v1(
+            encoded_shards = encode_region_sharded(
                 target,
                 member=member,
                 lead_time_hours=lead_time_hours,
                 is_mean=is_mean,
+                format_version=format_version,
             )
+        except (CategoricalDomainViolationError, CycleFormatConflictError, F16RangeViolationError):
+            # See the first dispatch block: guards and the format freeze are
+            # hard failures, never a silent legacy fallback.
+            raise
         except Exception:
             encoded_shards = []
 
@@ -670,6 +718,254 @@ def encode_region_sharded_v1(
         encoded_shards.append((key, shard_payload))
 
     return encoded_shards
+
+
+#: In-process per-store storage-format snapshot: the first sharded commit of a
+#: store records the configured format, and later commits with a different
+#: format fail loudly. This covers an env flip between region commits within
+#: one process; the durable manifest check in ``coordinator`` covers flips
+#: across restarts. Keyed by absolute store path (s3:// URLs kept verbatim).
+_store_format_snapshots: dict[str, str] = {}
+_store_format_snapshot_lock = threading.Lock()
+
+
+def assert_cycle_format_allowed(store: str | PathLike[str] | Mapping[str, bytes], format_version: str) -> None:
+    """Freeze the storage format per cycle store: first sharded commit wins.
+
+    Raises:
+        CycleFormatConflictError: If a previous commit of this store (in this
+            process) used a different storage format version.
+    """
+    if isinstance(store, Mapping):
+        key = f"<mapping:{id(store)}>"
+    else:
+        path = os.fspath(store)
+        key = path if path.startswith("s3://") else os.path.abspath(path)
+    with _store_format_snapshot_lock:
+        snapshotted = _store_format_snapshots.get(key)
+        if snapshotted is None:
+            _store_format_snapshots[key] = format_version
+            return
+    if snapshotted != format_version:
+        raise CycleFormatConflictError(
+            f"Store {key!r} was already committed with storage format "
+            f"{snapshotted!r} in this process but the configuration now "
+            f"requests {format_version!r}. A cycle must be written end-to-end "
+            "with a single storage_format_version."
+        )
+
+
+def _validate_f16_block(
+    *,
+    variable: str,
+    product_role: str,
+    shard_key: str,
+    block: np.ndarray[Any, Any],
+    model: str | None,
+    cycle_time: str | None,
+) -> None:
+    """Reject non-castable values before any float16 cast.
+
+    NaN is a legal missing-data marker and is allowed (counted only). ±Inf and
+    finite magnitudes beyond the float16 range are rejected: casting them would
+    silently produce ``inf`` payload, which downstream ``isfinite`` masks treat
+    as missing data — a silent data-loss channel this guard exists to close.
+    """
+    nan_count = int(np.count_nonzero(np.isnan(block)))
+    inf_count = int(np.count_nonzero(np.isinf(block)))
+    finite = block[np.isfinite(block)]
+    overflow_count = int(np.count_nonzero(np.abs(finite) > FLOAT16_MAX_FINITE))
+    if inf_count == 0 and overflow_count == 0:
+        return
+    parts = [
+        f"variable={variable!r}",
+        f"product_role={product_role!r}",
+        f"shard_key={shard_key!r}",
+        f"offending_count={inf_count + overflow_count} (inf={inf_count}, overflow={overflow_count})",
+        f"nan_count={nan_count}",
+    ]
+    if finite.size:
+        parts.append(f"finite_min={float(np.min(finite)):.6g}")
+        parts.append(f"finite_max={float(np.max(finite)):.6g}")
+    if model is not None:
+        parts.append(f"model={model!r}")
+    if cycle_time is not None:
+        parts.append(f"cycle={cycle_time!r}")
+    raise F16RangeViolationError(
+        "float16 payload guard rejected values outside the representable range "
+        "before cast (no silent clamp, no silent NaN): " + ", ".join(parts)
+    )
+
+
+def _validate_categorical_block(
+    *,
+    variable: str,
+    product_role: str,
+    shard_key: str,
+    block: np.ndarray[Any, Any],
+    dtype: np.dtype[Any],
+) -> None:
+    """Validate categorical payload domains for the sharded_v2 dtype matrix.
+
+    Deterministic/member flags are binary Code table 4.222 indicators and must
+    be exactly ``{0, 1}``; ensemble-mean flags are member-mean probabilities and
+    must lie in ``[0, 1]``.
+    """
+    if dtype == UINT8_DTYPE:
+        if not np.isin(block, (0, 1)).all():
+            raise CategoricalDomainViolationError(
+                f"Categorical flags must be exactly 0/1 for det/member shards: "
+                f"variable={variable!r} product_role={product_role!r} "
+                f"shard_key={shard_key!r} unique_values="
+                f"{sorted(float(v) for v in np.unique(block))[:8]}"
+            )
+        return
+    # float32 ensemble-mean probability flags
+    finite = block[np.isfinite(block)]
+    if finite.size and (float(np.min(finite)) < 0.0 or float(np.max(finite)) > 1.0):
+        raise CategoricalDomainViolationError(
+            f"Ensemble-mean probability flags must lie in [0, 1]: "
+            f"variable={variable!r} product_role={product_role!r} "
+            f"shard_key={shard_key!r} finite_min={float(np.min(finite)):.6g} "
+            f"finite_max={float(np.max(finite)):.6g}"
+        )
+
+
+def encode_region_sharded_v2(
+    dataset: xr.Dataset,
+    *,
+    member: int | None,
+    lead_time_hours: int,
+    data_vars: Sequence[str] | None = None,
+    is_mean: bool = False,
+) -> list[tuple[str, bytes]]:
+    """Encode a single-region dataset into sharded_v2 container objects.
+
+    Mirrors the sharded_v1 geometry exactly (one shard container per variable
+    per region, 120 inner 100x100 chunks, Zstd level 5, identical index/trailer
+    and object keys) but persists each variable in its authoritative
+    little-endian payload dtype from
+    :func:`domain.storage_dtype.resolve_storage_dtype`: ``<f2`` continuous
+    fields, ``<f4`` for the precipitation/ceiling semantic-compatibility
+    exceptions, ``u1`` deterministic/member flags, and ``<f4`` ensemble-mean
+    probability flags. Writer guards run before any cast.
+
+    The product role participates in the dtype decision: the same variable name
+    (``crain`` etc.) is a binary indicator for deterministic/member shards but a
+    probability for the ensemble-mean product.
+    """
+    compressor = Zstd(level=5)
+    if is_mean:
+        product_role = TARGET_KIND_MEAN
+    elif member is not None:
+        product_role = TARGET_KIND_MEM
+    else:
+        product_role = TARGET_KIND_DET
+    model = dataset.attrs.get("model_id")
+    cycle_time = dataset.attrs.get("cycle_time")
+    if model is not None:
+        model = str(model)
+    if cycle_time is not None:
+        cycle_time = str(cycle_time)
+
+    encoded_shards: list[tuple[str, bytes]] = []
+    target_vars = data_vars if data_vars is not None else tuple(str(k) for k in dataset.data_vars)
+
+    for name in target_vars:
+        if name not in dataset.data_vars:
+            continue
+        var_name = str(name)
+        dtype = resolve_storage_dtype(SHARDED_V2_FORMAT_VERSION, var_name, product_role)
+        da = dataset[name]
+        arr_2d = np.squeeze(da.values)
+        if arr_2d.ndim != 2:
+            continue
+        lat_size, lon_size = arr_2d.shape
+
+        lat_chunk = min(100, lat_size) if lat_size > 0 else 100
+        lon_chunk = min(100, lon_size) if lon_size > 0 else 100
+        lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
+        lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
+
+        if is_mean:
+            key = f"{var_name}/shard.mean_L{lead_time_hours:04d}.shard"
+        elif member is not None:
+            key = f"{var_name}/shard.mem{member:03d}_L{lead_time_hours:04d}.shard"
+        else:
+            key = f"{var_name}/shard.det_L{lead_time_hours:04d}.shard"
+
+        var_chunks: list[bytes] = []
+        for r_i in range(lat_chunks):
+            lat_start = r_i * lat_chunk
+            lat_end = min((r_i + 1) * lat_chunk, lat_size)
+            sub_lat = lat_end - lat_start
+
+            for c_i in range(lon_chunks):
+                lon_start = c_i * lon_chunk
+                lon_end = min((c_i + 1) * lon_chunk, lon_size)
+                sub_lon = lon_end - lon_start
+
+                block = arr_2d[lat_start:lat_end, lon_start:lon_end]
+                # Guards run on the source values BEFORE any cast: casting first
+                # would turn overflow into inf payload silently.
+                if dtype == FLOAT16_LE_DTYPE:
+                    _validate_f16_block(
+                        variable=var_name,
+                        product_role=product_role,
+                        shard_key=key,
+                        block=block,
+                        model=model,
+                        cycle_time=cycle_time,
+                    )
+                if dtype == UINT8_DTYPE or (dtype == FLOAT32_LE_DTYPE and var_name in (
+                    "crain",
+                    "csnow",
+                    "cfrzr",
+                    "cicep",
+                )):
+                    _validate_categorical_block(
+                        variable=var_name,
+                        product_role=product_role,
+                        shard_key=key,
+                        block=block,
+                        dtype=dtype,
+                    )
+
+                fill: Any = np.nan if dtype.kind == "f" else 0
+                chunk_buf = np.full((lat_chunk, lon_chunk), fill, dtype=dtype)
+                chunk_buf[:sub_lat, :sub_lon] = block
+                comp = compressor.encode(chunk_buf.tobytes(order="C"))
+                var_chunks.append(comp)
+
+        encoded_shards.append((key, build_sharded_v1_container(var_chunks)))
+
+    return encoded_shards
+
+
+def encode_region_sharded(
+    dataset: xr.Dataset,
+    *,
+    member: int | None,
+    lead_time_hours: int,
+    is_mean: bool = False,
+    format_version: str,
+) -> list[tuple[str, bytes]]:
+    """Dispatch a sharded region encode to the format's encoder.
+
+    ``sharded_v1`` routes to the frozen legacy encoder; ``sharded_v2`` routes to
+    the per-variable-dtype encoder. Anything else fails closed.
+    """
+    if format_version == SHARDED_V1_FORMAT_VERSION:
+        return encode_region_sharded_v1(
+            dataset, member=member, lead_time_hours=lead_time_hours, is_mean=is_mean
+        )
+    if format_version == SHARDED_V2_FORMAT_VERSION:
+        return encode_region_sharded_v2(
+            dataset, member=member, lead_time_hours=lead_time_hours, is_mean=is_mean
+        )
+    raise ValueError(
+        f"Unknown storage format version {format_version!r}: no sharded encoder."
+    )
 
 
 def encode_region_chunks(
@@ -897,10 +1193,140 @@ def _parse_shard_filename(fname: str) -> tuple[int | None, int, bool]:
     return None, 0, False
 
 
+_MANIFEST_PATH = "__commit__/v1/manifest.json"
+
+
+def _store_committed_format(
+    store: str | PathLike[str] | Mapping[str, bytes],
+) -> str | None:
+    """Read a store's durable ``storage_format_version`` from its committed manifest.
+
+    Returns ``None`` when no manifest exists yet (a store that has never been
+    published): callers must then infer the payload dtype from the decoded chunk
+    byte length instead of assuming v1. Mapping stores (test fixtures) are read
+    through the mapping directly.
+    """
+    if isinstance(store, Mapping):
+        raw = store.get(_MANIFEST_PATH)
+        if raw is not None:
+            try:
+                import json
+
+                payload = json.loads(
+                    raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                )
+                version = payload.get("storage_format_version") if isinstance(payload, dict) else None
+                if version:
+                    return str(version)
+            except Exception:
+                pass
+        return None
+    try:
+        from ingestion.core.markers import read_manifest
+
+        manifest = read_manifest(os.fspath(store))
+        if manifest is not None and manifest.get("storage_format_version"):
+            return str(manifest["storage_format_version"])
+    except Exception:
+        pass
+    return None
+
+
+def _infer_payload_dtype_from_bytes(
+    var_name: str,
+    product_role: str,
+    itemsize: int,
+) -> np.dtype[Any]:
+    """Infer a shard payload dtype from its decoded byte length.
+
+    Used only when a store has no committed manifest yet (never published), so
+    no authoritative format record exists. The candidate set comes from the
+    resolver's frozen matrix (the v1 and v2 dtypes for this variable/role); the
+    decoded chunk byte length picks between them. This keeps read-back correct
+    for unpublished v2 stores — the exact hidden-path hazard the f16 migration
+    must not open — while keeping the resolver the single dtype authority.
+
+    Historical stores may carry variable names outside the v2 matrix (e.g. raw
+    GRIB shortNames in legacy fixtures); for those the v1 float32 contract plus
+    a byte-size map covers read-back. Fail-closed dtype onboarding applies to
+    *writes*, never to reading historical bytes.
+    """
+    candidates = [np.dtype("<f4")]  # the frozen v1 contract is always legal
+    try:
+        candidates.append(
+            resolve_storage_dtype(SHARDED_V2_FORMAT_VERSION, var_name, product_role)
+        )
+    except ValueError:
+        # Variable unknown to the v2 matrix: inference by byte size only.
+        pass
+    for dtype in candidates:
+        if dtype.itemsize == itemsize:
+            return dtype
+    raise ValueError(
+        f"Cannot infer shard payload dtype for {var_name!r} ({product_role!r}): "
+        f"decoded chunk byte-per-value {itemsize} matches no legal dtype "
+        f"candidate ({[d.str for d in candidates]})."
+    )
+
+
+def _shard_payload_dtype(
+    store: str | PathLike[str] | Mapping[str, bytes],
+    var_name: str,
+    *,
+    member: int | None,
+    is_mean: bool,
+) -> np.dtype[Any] | None:
+    """Resolve the payload dtype of one shard container on a store.
+
+    Authoritative source: the store's committed manifest format version fed
+    through :func:`domain.storage_dtype.resolve_storage_dtype`. Returns ``None``
+    when the store has no manifest yet — callers must then infer the dtype from
+    the decoded chunk byte length via
+    :func:`_infer_payload_dtype_from_bytes` (and should sanity-check every
+    decoded chunk with :func:`_assert_chunk_byte_length`).
+    """
+    fmt = _store_committed_format(store)
+    if fmt is None:
+        return None
+    if fmt == SHARDED_V2_FORMAT_VERSION:
+        if is_mean:
+            role = TARGET_KIND_MEAN
+        elif member is not None:
+            role = TARGET_KIND_MEM
+        else:
+            role = TARGET_KIND_DET
+        return resolve_storage_dtype(fmt, var_name, role)
+    # v1 (and any other committed format): frozen float32 contract.
+    return np.dtype("<f4")
+
+
+def _assert_chunk_byte_length(
+    raw: bytes, num_cells: int, dtype: np.dtype[Any], *, shard_key: str
+) -> None:
+    """Fail loudly when a decoded chunk's byte length disagrees with the dtype.
+
+    This is the last-line guard against byte-interpretation bugs (e.g. reading
+    an f16 payload as f32 would otherwise reinterpret garbage instead of
+    failing).
+    """
+    expected = num_cells * dtype.itemsize
+    if len(raw) != expected:
+        raise ValueError(
+            f"Shard chunk byte length {len(raw)} does not match dtype "
+            f"{dtype.str!r} expectation {expected} for {shard_key!r}: the store "
+            "payload dtype and the reader's resolved dtype disagree."
+        )
+
+
 def _populate_sharded_data(
     dataset: xr.Dataset, store: str | PathLike[str] | Mapping[str, bytes]
 ) -> xr.Dataset:
-    """Populate data variables in an opened dataset from sharded_v1 container files if present."""
+    """Populate data variables in an opened dataset from sharded container files if present.
+
+    Payload dtypes follow the store's committed format: v1 stores decode float32
+    (frozen contract); v2 stores decode each variable's authoritative native
+    dtype (which by construction matches the store's ``.zarray`` metadata).
+    """
     path = os.fspath(store) if isinstance(store, (str, PathLike)) else ""
     if not path:
         return dataset
@@ -964,13 +1390,27 @@ def _populate_sharded_data(
     if not shards_by_var:
         return dataset
 
+    # v1 stores keep the frozen float32 read-back contract; v2 stores decode
+    # each variable's authoritative native payload dtype (equal to the .zarray
+    # metadata by construction).
+    store_format = _store_committed_format(store)
     for var_name in list(dataset.data_vars):
         shard_keys = shards_by_var.get(str(var_name), [])
         if not shard_keys:
             continue
 
-        fill_val = np.nan if np.issubdtype(dataset[var_name].dtype, np.floating) else 0
-        var_arr = np.full(dataset[var_name].shape, fill_val, dtype=dataset[var_name].dtype)
+        role = TARGET_KIND_MEM if member_vals else TARGET_KIND_DET
+        if store_format == SHARDED_V2_FORMAT_VERSION:
+            payload_dtype: np.dtype[Any] | None = resolve_storage_dtype(
+                SHARDED_V2_FORMAT_VERSION, str(var_name), role
+            )
+        elif store_format is None:
+            # No manifest yet: infer from the decoded chunk byte length (below).
+            payload_dtype = None
+        else:
+            payload_dtype = np.dtype("<f4")
+
+        var_arr = np.full(dataset[var_name].shape, np.nan, dtype=dataset[var_name].dtype)
         has_member = "member" in dataset[var_name].dims
         has_lead = "lead_time_hours" in dataset[var_name].dims
 
@@ -1005,7 +1445,7 @@ def _populate_sharded_data(
             index_bytes = shard_bytes[-(TRAILER_SIZE + index_size) : -TRAILER_SIZE]
             entries = parse_sharded_v1_index(index_bytes, num_chunks)
 
-            assembled_2d = np.full((lat_size, lon_size), np.nan, dtype=np.float32)
+            assembled_2d: np.ndarray[Any, Any] | None = None
             c_idx = 0
             for r_i in range(lat_chunks):
                 lat_start = r_i * lat_chunk
@@ -1019,9 +1459,30 @@ def _populate_sharded_data(
                         off, length = entries[c_idx]
                         if length > 0:
                             raw = compressor.decode(shard_bytes[off : off + length])
-                            arr_c = np.frombuffer(raw, dtype=np.float32).reshape(1, 1, lat_chunk, lon_chunk)
+                            if payload_dtype is None:
+                                payload_dtype = _infer_payload_dtype_from_bytes(
+                                    str(var_name),
+                                    role,
+                                    len(raw) // (lat_chunk * lon_chunk),
+                                )
+                            _assert_chunk_byte_length(
+                                raw,
+                                lat_chunk * lon_chunk,
+                                payload_dtype,
+                                shard_key=rel_key,
+                            )
+                            if assembled_2d is None:
+                                assembled_2d = np.full(
+                                    (lat_size, lon_size),
+                                    np.nan if payload_dtype.kind == "f" else 0,
+                                    dtype=payload_dtype,
+                                )
+                            arr_c = np.frombuffer(raw, dtype=payload_dtype).reshape(1, 1, lat_chunk, lon_chunk)
                             assembled_2d[lat_start:lat_end, lon_start:lon_end] = arr_c[0, 0, :sub_lat, :sub_lon]
                     c_idx += 1
+
+            if assembled_2d is None:
+                continue
 
             l_idx = lead_idx_map.get(lead, 0)
             if has_member and member is not None:
@@ -1048,7 +1509,11 @@ def read_slice(
     member: int | None = None,
     is_mean: bool = False,
 ) -> np.ndarray[Any, Any] | None:
-    """Read a single 2D (latitude, longitude) float32 slice from a Zarr store.
+    """Read a single 2D (latitude, longitude) slice from a Zarr store.
+
+    The returned dtype is the store's authoritative payload dtype (v1: frozen
+    float32; v2: the variable's native dtype, e.g. f16 for ``cloud_cover_3h``).
+    Compute consumers cast to their own domain as before.
 
     For sharded_v1 stores, directly loads and decodes the single required
     .shard container without materializing the full 4D/3D store in memory.
@@ -1078,6 +1543,20 @@ def read_slice(
 
     rel_key = f"{var_name}/{shard_filename}"
     shard_bytes: bytes | None = None
+
+    # Payload dtype comes from the authoritative resolver (manifest format ->
+    # variable -> product role). v1 stores resolve to the frozen float32
+    # contract; v2 stores resolve per variable (e.g. the cloud_cover_3h f16
+    # fallback predecessor). Stores without a manifest yet infer the dtype from
+    # the decoded chunk byte length against the resolver's frozen candidates.
+    payload_dtype: np.dtype[Any] | None = _shard_payload_dtype(
+        store, var_name, member=member, is_mean=is_mean
+    )
+    product_role = (
+        TARGET_KIND_MEAN
+        if is_mean
+        else (TARGET_KIND_MEM if member is not None else TARGET_KIND_DET)
+    )
 
     if is_s3 and fs is not None:
         full_key = f"{root}/{rel_key}"
@@ -1111,8 +1590,8 @@ def read_slice(
             lat_chunks = (lat_size + lat_chunk - 1) // lat_chunk
             lon_chunks = (lon_size + lon_chunk - 1) // lon_chunk
 
-            assembled_2d = np.full((lat_size, lon_size), np.nan, dtype=np.float32)
             c_idx = 0
+            assembled_2d: np.ndarray[Any, Any] | None = None
             for r_i in range(lat_chunks):
                 lat_start = r_i * lat_chunk
                 lat_end = min((r_i + 1) * lat_chunk, lat_size)
@@ -1125,9 +1604,33 @@ def read_slice(
                         off, length = entries[c_idx]
                         if length > 0:
                             raw = compressor.decode(shard_bytes[off : off + length])
-                            arr_c = np.frombuffer(raw, dtype=np.float32).reshape(1, 1, lat_chunk, lon_chunk)
-                            assembled_2d[lat_start:lat_end, lon_start:lon_end] = arr_c[0, 0, :sub_lat, :sub_lon]
+                            if payload_dtype is None:
+                                payload_dtype = _infer_payload_dtype_from_bytes(
+                                    var_name,
+                                    product_role,
+                                    len(raw) // (lat_chunk * lon_chunk),
+                                )
+                            _assert_chunk_byte_length(
+                                raw,
+                                lat_chunk * lon_chunk,
+                                payload_dtype,
+                                shard_key=rel_key,
+                            )
+                            if assembled_2d is None:
+                                fill: Any = np.nan if payload_dtype.kind == "f" else 0
+                                assembled_2d = np.full(
+                                    (lat_size, lon_size), fill, dtype=payload_dtype
+                                )
+                            arr_c = np.frombuffer(raw, dtype=payload_dtype).reshape(
+                                1, 1, lat_chunk, lon_chunk
+                            )
+                            assembled_2d[lat_start:lat_end, lon_start:lon_end] = arr_c[
+                                0, 0, :sub_lat, :sub_lon
+                            ]
                     c_idx += 1
+            if assembled_2d is None:
+                # No decodable chunk: nothing was committed at this slice.
+                return None
             return assembled_2d
 
     # Fallback to standard xarray / Zarr slice access
@@ -1143,7 +1646,7 @@ def read_slice(
             slice_da = var.sel(lead_time_hours=lead_time_hours)
         else:
             slice_da = var
-        return np.asarray(slice_da.values, dtype=np.float32)
+        return np.asarray(slice_da.values, dtype=payload_dtype)
     except Exception:
         return None
 

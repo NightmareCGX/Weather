@@ -709,7 +709,17 @@ _readers_lock = threading.Lock()
 def get_sharded_reader(
     store: str | PathLike[str] | MutableMapping[str, bytes],
 ) -> ShardedV1Reader:
-    """Return a process-cached ShardedV1Reader for the store path.
+    """Return a process-cached sharded reader for the store path.
+
+    The reader class follows the store's committed manifest format version:
+    ``sharded_v2`` stores get a :class:`~api.core.zarr_v2.ShardedV2Reader`
+    (per-variable native dtypes, native-dtype chunk cache); every other store —
+    ``sharded_v1``, the legacy ``v2_unsharded`` fallback, or a store whose
+    manifest has not been written yet — gets the frozen
+    :class:`ShardedV1Reader`, which is byte-identical to the historical
+    behavior. The format is immutable per store (a cycle is written end-to-end
+    with one format; see the ingestion-side cycle format freeze), so keying the
+    reader LRU by store path alone is safe.
 
     The cache is a bounded LRU (``MAX_READERS``) rather than an unbounded map:
     see the note on ``MAX_READERS`` for why the difference matters on the
@@ -723,11 +733,45 @@ def get_sharded_reader(
             _readers.move_to_end(path_key)
             return reader
 
-        reader = ShardedV1Reader(store)
+        if _store_wants_v2_reader(store):
+            from api.core.zarr_v2 import ShardedV2Reader
+
+            reader = ShardedV2Reader(store)
+        else:
+            reader = ShardedV1Reader(store)
         _readers[path_key] = reader
         while len(_readers) > MAX_READERS:
             _readers.popitem(last=False)
         return reader
+
+
+def _store_wants_v2_reader(
+    store: str | PathLike[str] | MutableMapping[str, bytes],
+) -> bool:
+    """Return True only when the store's committed manifest says ``sharded_v2``.
+
+    Anything else (v1, legacy ``v2_unsharded``, absent manifest) keeps the
+    frozen V1 reader.
+    """
+    if isinstance(store, MutableMapping):
+        raw = store.get("__commit__/v1/manifest.json")
+        if raw is None:
+            return False
+        try:
+            import json
+
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else str(raw))
+        except Exception:
+            return False
+        version = payload.get("storage_format_version") if isinstance(payload, dict) else None
+        return str(version) == "sharded_v2"
+    try:
+        # Local import keeps the zarr module import graph unchanged.
+        from api.core.manifest_reader import manifest_storage_format
+
+        return manifest_storage_format(os.fspath(store)) == "sharded_v2"
+    except Exception:
+        return False
 
 
 def clear_sharded_readers() -> None:
