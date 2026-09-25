@@ -339,7 +339,7 @@ The platform employs a multi-tiered caching strategy to maximize serving through
 
 The Weather Platform is designed for native portability across standard server architectures:
 * **Officially Supported Architectures:** `native linux/amd64` (x86_64) and `native linux/arm64` (aarch64).
-* **Backing Services Multi-Arch:** PostgreSQL 18.6 with PostGIS 3.6.4 (`nickblah/postgis:18.6-trixie-postgis-3.6.4`), Redis 7 (`redis:7-alpine`), and MinIO (`minio/minio:RELEASE.2025-09-07T16-13-09Z`) publish native multi-arch manifests, eliminating architecture pinning in Compose and deployment manifests.
+* **Backing Services Multi-Arch:** PostgreSQL 18.6 with PostGIS 3.6.4 (`nickblah/postgis:18.6-trixie-postgis-3.6.4`), Redis 7 (`redis:7-alpine`), and MinIO (`alpine/minio:RELEASE.2025-10-15T17-29-55Z`, the community rebuild of official source releases after MinIO pulled its quay.io/Docker Hub community images) publish native multi-arch manifests, eliminating architecture pinning in Compose and deployment manifests.
 * **C-Extension & Wheel Baseline:** Python scientific dependencies (`numpy`, `pandas`, `psycopg2-binary`, `zarr`, and `numcodecs 0.16.5`) resolve to prebuilt manylinux aarch64 wheels under CPython 3.12, avoiding host C compiler toolchain dependencies in multi-stage Docker builds.
 * **Native ecCodes Decoding:** Ingestion images install Debian `libeccodes-dev` to provide runtime `libeccodes.so` for `cfgrib` on both x86_64 and aarch64.
 * **Production Guardrails:** Production infrastructure strictly forbids `platform: linux/amd64` overrides or QEMU emulation dependencies. Build-time cross-architecture compatibility is continuously enforced via the `arm64-builds` CI pipeline job.
