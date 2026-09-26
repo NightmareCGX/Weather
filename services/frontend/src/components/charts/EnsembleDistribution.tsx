@@ -304,7 +304,12 @@ export function EnsembleDistribution({
           className="mt-2 h-12 w-full"
         >
           <ResponsiveContainer width="100%" height="100%">
-            <ScatterChart margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+            <ScatterChart
+              // Mirror the histogram's horizontal geometry (left Y-axis width 32
+              // + right Y-axis width 38 + margins) so tick columns and member
+              // dots line up column-for-column with the chart above.
+              margin={{ top: 4, right: 38 + 8, bottom: 0, left: 32 + 0 }}
+            >
               <XAxis
                 type="number"
                 dataKey="value"
