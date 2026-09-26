@@ -369,6 +369,53 @@ export function distributionXDomain(
 }
 
 /**
+ * Evenly spaced "nice" ticks (step from the 1/2/5/10 ladder) that fall inside
+ * `[min, max]`, targeting roughly `targetCount` labels.
+ *
+ * The distribution charts pass these explicitly to both X-axes so the tick
+ * values are stable, moderately spaced, and identical between the histogram
+ * and the member rug, instead of Recharts' auto ticks which can print raw
+ * domain floats when no tickFormatter is set.
+ */
+export function niceDistributionTicks(min: number, max: number, targetCount = 4): number[] {
+  if (
+    !Number.isFinite(min) ||
+    !Number.isFinite(max) ||
+    max <= min ||
+    !Number.isFinite(targetCount) ||
+    targetCount < 1
+  ) {
+    return [];
+  }
+  const roughStep = (max - min) / targetCount;
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const residual = roughStep / magnitude;
+  const multiplier = residual <= 1 ? 1 : residual <= 2 ? 2 : residual <= 5 ? 5 : 10;
+  const step = multiplier * magnitude;
+  const firstIndex = Math.ceil(min / step - 1e-9);
+  const lastIndex = Math.floor(max / step + 1e-9);
+  const ticks: number[] = [];
+  for (let i = firstIndex; i <= lastIndex; i += 1) {
+    // Index-based products accumulate float noise (92 * 0.2 → 18.400000000000002);
+    // rounding through 10 decimals keeps the tick values clean and monotonic.
+    ticks.push(Number((i * step).toFixed(10)));
+  }
+  return ticks;
+}
+
+/** Decimal places needed so adjacent ticks render distinctly (step 0.2 → 1, 0.05 → 2). */
+export function tickDecimals(ticks: number[]): number {
+  if (ticks.length < 2) {
+    return 1;
+  }
+  const step = Math.abs(ticks[1] - ticks[0]);
+  if (!Number.isFinite(step) || step <= 0) {
+    return 1;
+  }
+  return Math.max(0, -Math.floor(Math.log10(step)));
+}
+
+/**
  * Format the ensemble statistics object for a compact readout row, ordered as
  * the API documents them.
  */
