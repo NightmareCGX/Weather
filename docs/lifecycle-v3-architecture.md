@@ -1,35 +1,35 @@
-# 数据生命周期架构说明（Lifecycle V3 · 收敛版）
+# Data Lifecycle Architecture (Lifecycle V3 · Converged)
 
-> 状态：权威设计文档。本版整合 Lifecycle V3 锁定契约与 2026-09 代码审计后的八项收敛修正。
-> 上一版中 "Whole-cycle finalizer 作为 GC 层" 的表述已被废除，统一为 canonical-necessity
-> 单一权威模型。
-> 代码映射：`packages/domain`（纯逻辑）、`services/api`（serving）、`services/ingestion`
-> （realtime 采集与 GC）。
+> Status: authoritative design document. This edition consolidates the Lifecycle V3 locked contract and the eight convergence corrections from the 2026-09 code audit.
+> The previous edition's formulation "Whole-cycle finalizer as a GC layer" has been abolished, unified into the canonical-necessity
+> single source of truth model.
+> Code map: `packages/domain` (pure logic), `services/api` (serving), `services/ingestion`
+> (realtime ingestion and GC).
 
 ---
 
-## 0. 最终收敛后的核心模型
+## 0. Core Model After Final Convergence
 
 ```text
 Realtime ingestion
-  → variable / lead / member 独立 commit 与 publish
+  → variable / lead / member independently committed and published
 
 Serving
   → variable / valid_time canonical source resolution
 
 GC
-  → variable / valid_time 独立判定必要性
-  → individual physical units 独立回收
+  → variable / valid_time necessity determined independently
+  → individual physical units reclaimed independently
 
 Cycle lifecycle
-  → 仅 derived bookkeeping
+  → derived bookkeeping only
 
 Batch ingestion finalize
   → batch-only operational concept
-  → 不参与 realtime serving / GC authority
+  → not part of realtime serving / GC authority
 ```
 
-**GC 最终 invariant（锁死）：**
+**GC final invariant (locked down):**
 
 ```text
 There is no cycle-level GC authority.
@@ -58,453 +58,453 @@ constituent units have independently become terminal.
 
 ---
 
-## 1. 核心原则
+## 1. Core Principles
 
-1. **用户面对 valid_time**。前端与 serving 语义围绕 `model + variable + valid_time`；
-   `cycle_time / lead_time` 保留在后端，作为 provenance、cache identity 与
-   ingestion / lifecycle identity，不再是用户交互模型。
-2. **三个概念正交，不得混用**：
-   - **A. UI visibility / expiration**：valid_time 何时从下拉框消失；
-   - **B. Serving eligibility**：API 对哪些 valid_time 具有 serveability guarantee；
-   - **C. Physical deletion**：物理 unit 何时可删。
-3. **Canonical source resolution 是 GC 的唯一删除权威**。删除判定始终是：
-   > 某 physical reclamation unit 是否仍被任何受保护的 variable/valid_time canonical
-   > serving 或 dependency hold 所需要。
-   `T−C`、`T−2C` 等 cutoff **不是**与 canonical resolver 平行的第二套 deletion
-   authority，而是当前 GFS/GEFS 配置下的**派生推论 / planner fast-path 优化**。
-4. **GC 完全解耦到 (variable, valid_time) 粒度**。各变量之间、各 valid_time 之间的
-   过期回收互不依赖；不存在 cycle 级 GC authority。
-5. **Realtime 的 serving/failure 单元是 variable-lead（及 GEFS member）**，不是
-   whole-run。`model_runs` 状态仅是 operational/catalog 信息，不是 serving 或 GC 的
-   一刀切 authority。
-6. **Lifecycle identity 是 `(model_id, cycle_time)`**。GFS/GEFS 独立推进。
+1. **The user faces valid_time**. Frontend and serving semantics revolve around `model + variable + valid_time`;
+   `cycle_time / lead_time` remain in the backend, as provenance, cache identity and
+   ingestion / lifecycle identity, no longer the user interaction model.
+2. **The three concepts are orthogonal and must not be conflated**:
+   - **A. UI visibility / expiration**: when a valid_time disappears from the dropdown;
+   - **B. Serving eligibility**: which valid_time the API has a serveability guarantee for;
+   - **C. Physical deletion**: when a physical unit may be deleted.
+3. **Canonical source resolution is GC's only deletion authority**. The deletion test is always:
+   > whether a physical reclamation unit is still required by any protected variable/valid_time canonical
+   > serving or dependency hold.
+   Cutoffs such as `T−C`, `T−2C` are **not** a second deletion
+   authority parallel to the canonical resolver, but a **derived corollary / planner fast-path optimization** under the current GFS/GEFS configuration.
+4. **GC is fully decoupled to (variable, valid_time) granularity**. Between variables, and between valid_times,
+   expiry reclamation is mutually independent; there is no cycle-level GC authority.
+5. **Realtime's serving/failure unit is variable-lead (and GEFS member)**, not
+   whole-run. `model_runs` status is merely operational/catalog information, not a
+   one-size-fits-all authority for serving or GC.
+6. **Lifecycle identity is `(model_id, cycle_time)`**. GFS/GEFS advance independently.
 
 ---
 
-## 2. 独立的时间元数据（互不绑定的四个概念）
+## 2. Independent Time Metadata (four concepts not bound to each other)
 
-以下数值当前恰好匹配，但架构上是**不同概念**，必须保持独立注册：
+The following values currently happen to match, but architecturally they are **distinct concepts** and must remain independently registered:
 
-| 元数据 | 当前值 | 语义 |
+| Metadata | Current value | Semantics |
 |---|---|---|
-| model/product max lead | GFS=240h、GEFS=240h | 产品的 forecast horizon |
-| model cycle cadence | GFS=6h、GEFS=6h | 相邻 cycle 的间隔 |
-| variable interval width | precipitation=3h、cloud=3h | 区间量的统计宽度 |
-| variable reset period | precipitation=6h、cloud=6h | 上游累积量的重置周期 |
+| model/product max lead | GFS=240h, GEFS=240h | the product's forecast horizon |
+| model cycle cadence | GFS=6h, GEFS=6h | the interval between adjacent cycles |
+| variable interval width | precipitation=3h, cloud=3h | the statistical width of an interval quantity |
+| variable reset period | precipitation=6h, cloud=6h | the reset period of the upstream accumulation |
 
-因此架构语义上：
+Hence, in architectural semantics:
 
 ```text
-L % 6 == 0            （错误：绑定了某个具体数字）
-L % variable.reset_period_hours == 0   （正确）
+L % 6 == 0            (wrong: bound to a specific number)
+L % variable.reset_period_hours == 0   (correct)
 ```
 
-未来引入不同 horizon 或 reset 语义的产品时，不会把 model cadence 与 variable
-accumulation/reset 语义错误耦合。代码映射：`domain/horizon.py`（max lead）、
-`domain/cadence.py`（cycle cadence）、`domain/temporal.py`（interval 语义）、
-`domain/reclamation.py` 的前驱判定应参数化为 `reset_period_hours`。
+When products with different horizon or reset semantics are introduced in the future, model cadence will not be
+incorrectly coupled with variable accumulation/reset semantics. Code map: `domain/horizon.py` (max lead),
+`domain/cadence.py` (cycle cadence), `domain/temporal.py` (interval semantics),
+the predecessor determination in `domain/reclamation.py` should be parameterized as `reset_period_hours`.
 
-valid_time 网格与 anchor：`serving_start = latest model valid_time <= now`
-（floor 到 3h 网格；07:00Z → 06Z，09:00Z → 09Z）。anchor 推进 → 前端强制刷新 →
-旧 valid_time 退出 active serving window。
+valid_time grid and anchor: `serving_start = latest model valid_time <= now`
+(floored to the 3h grid; 07:00Z → 06Z, 09:00Z → 09Z). anchor advance → frontend forced refresh →
+old valid_time exits the active serving window.
 
 ---
 
-## 3. 变量语义分类（静态契约，绝非数值判断）
+## 3. Variable Semantic Classification (static contract, never a numeric test)
 
-| 类别 | 变量 | lead 0 语义 |
+| Class | Variable | lead 0 semantics |
 |---|---|---|
-| Instantaneous | temperature_2m、wind_10m（u/v 合成）、relative_humidity_2m、visibility、snow_depth、cloud_ceiling … | 有意义，T+0 即 canonical |
-| Interval | precipitation_amount_3h、cloud_cover_3h | store 中 NaN，必须 fallback 到正 lead |
-| Precip companions | crain、csnow、cfrzr、cicep | 非独立 resolver 变量；严格跟随 precipitation_amount_3h 实际 source |
-| Wind 分量对 | wind_u_10m + wind_v_10m | **原子对**：U、V 都 commit ready 才进入 serve；GC 成对进退 |
+| Instantaneous | temperature_2m, wind_10m (u/v composite), relative_humidity_2m, visibility, snow_depth, cloud_ceiling … | meaningful; T+0 is canonical |
+| Interval | precipitation_amount_3h, cloud_cover_3h | NaN in store, must fall back to a positive lead |
+| Precip companions | crain, csnow, cfrzr, cicep | not independent resolver variables; strictly follow the actual source of precipitation_amount_3h |
+| Wind component pair | wind_u_10m + wind_v_10m | **atomic pair**: enters serve only when both U and V are commit ready; GC moves them in and out as a pair |
 
-分类只来自变量名静态集合（`domain/temporal.py`），**绝不允许** `if value == 0` 或把
-NaN 当 serving contract——0 mm 降水是真实预报。
+Classification comes only from the static set of variable names (`domain/temporal.py`); `if value == 0` or treating
+NaN as a serving contract is **absolutely not allowed**—0 mm precipitation is a real forecast.
 
-**Reset lead 重建（按 W、R 一般化）**：设 `W = variable.interval_width_hours`、
-`R = variable.reset_period_hours`（要求 `W < R`；`W == R` 时上游在 reset lead 已给出
-W 宽度，无需重建）。仅在 reset lead（`L % R == 0`）需要重建：
+**Reset lead reconstruction (generalized over W, R)**: let `W = variable.interval_width_hours`,
+`R = variable.reset_period_hours` (requires `W < R`; when `W == R` the upstream already provides
+a width of W at the reset lead, so no reconstruction is needed). Reconstruction is needed only at a reset lead (`L % R == 0`):
 
 ```text
 precipitation accumulation:
-    A_interval(L) = A_reset_accum(L) − A_reset_accum(L − W)      前驱 = L − W
+    A_interval(L) = A_reset_accum(L) − A_reset_accum(L − W)      predecessor = L − W
 
 cloud running average:
     X_W(L) = [ R·C(L) − (R−W)·C(L−W) ] / W
 ```
 
-当前配置 `W=3, R=6` 分别退化为 `f006 − f003` 与 `2·C₆ₕ − C₃ₕ(t−3)`（cloud 带
-物理范围 guardrail）——现有公式只是特例，**禁止**把 `W = R/2` 写进通用逻辑。
-差分在 **ingestion 解码层**完成，serving 读到的已是区间值；GC 前驱 hold 见 §7.1
-（reset lead L hold 同 run L−W）。
+The current configuration `W=3, R=6` degenerates to `f006 − f003` and `2·C₆ₕ − C₃ₕ(t−3)` respectively (cloud carries a
+physical-range guardrail)—the existing formulas are merely special cases; writing `W = R/2` into the general logic is **forbidden**.
+Differencing is done at the **ingestion decode layer**; what serving reads is already an interval value; for GC predecessor holds see §7.1
+(a reset lead L holds the same run's L−W).
 
 ---
 
-## 4. Serving 模型（source selection）
+## 4. Serving Model (source selection)
 
-对每个 `(model, variable, valid_time)`：
+For each `(model, variable, valid_time)`:
 
-- **R1** 所有能产生该 valid_time 的 `(cycle, lead)` 组合都是候选。
-- **R2** **newest serveable wins**：最新的安全 committed 且 serveable 的候选胜出。
-  新 partial cycle 只在它实际 committed 的 valid_time 上覆盖旧 cycle。
-- **R3 interval lead0 fallback**：仅当 winner `lead == 0` 时触发；目标为同一
-  valid_time 的 **next-newest serveable positive-lead** 候选；正 lead 永不 fallback。
-- **R4 companion 同源**：crain/csnow/cfrzr/cicep 与 precipitation_amount_3h 完全同
-  (cycle, lead, store)；当前 cycle lead0 的 categorical flags 是 ingestion 合成表示，
-  混源会 phase 错判。
-- **R5** cloud_cover_3h 独立 fallback，与 precipitation 不耦合。
-- **R6 wind 原子对**：wind_10m 要求 u、v 同候选；U、V 都 commit ready 才可 serving。
-- **R7 coverage threshold**：GEFS 每 lead ≥85% member（整数安全判定）；fallback
-  候选同样受限——fallback 是 "next-newest serveable positive-lead candidate"，
-  不是 "previous cycle"。
-  **85% 是 candidate eligibility threshold，不是 GC retention target**：它只回答
-  "这个候选够不够资格 serving"，不回答"最少需要保留多少 members"。只要某
-  (cycle, lead) 仍是 canonical ensemble source，其**已 committed 的成员全部
-  retained**——绝不能因 26/30 已满足 85% 而回收其余 4 个已 commit 的 member。
-- **R8 graceful null**：无 fallback 时 instantaneous 照常出值、interval 置 null，
-  整个请求仍成功。
-- **R9 mixed-source 是正确形态**：/v1/points 一个 entry 内不同变量可来自不同
-  source；valid_time 是统一时间轴。
-- **R10 availability 真实语义**：interval 变量只有存在有效 positive-lead source 才
-  available；instantaneous 不受此约束。
-- **R11 cache 绑定真实 source**：单变量端点 key = 实际 (cycle, lead) + valid_time +
-  该 source store 的 serving generation。/v1/points 的 provenance digest 对**每个
-  实际使用的 source** 生成条目
-  `(variable, valid_time, run_id, source cycle, source lead, 该 source store 的
-  manifest serving generation)`（无 fallback source 时 NULL 哨兵），排序后哈希。
-  generation 必须按各 source **自己的 store** 解析——不能只取 primary/anchor 的
-  generation，否则 fallback source 所在 store 重新 publish（G06 17→18）而 primary
-  未变时，缓存会命中旧 precipitation。companions 作为独立条目，但因 I10 与
-  precipitation 条目同值（更保守：耦合被破坏时 digest 如实变化）。
-- **R12 provenance 反映真实来源**：单变量端点报实际 `source_cycle`/`lead`；
-  /v1/points entry 级保留 primary/anchor 以维持 API 兼容。
+- **R1** All `(cycle, lead)` combinations capable of producing that valid_time are candidates.
+- **R2** **newest serveable wins**: the newest safely committed and serveable candidate wins.
+  A new partial cycle overwrites an old cycle only on the valid_times it actually committed.
+- **R3 interval lead0 fallback**: triggered only when the winner's `lead == 0`; the target is the **next-newest serveable positive-lead**
+  candidate for the same valid_time; a positive lead never falls back.
+- **R4 companion same-source**: crain/csnow/cfrzr/cicep are exactly the same
+  (cycle, lead, store) as precipitation_amount_3h; the current cycle's lead0 categorical flags are an ingestion-synthesized representation,
+  and mixing sources would misjudge the phase.
+- **R5** cloud_cover_3h falls back independently, uncoupled from precipitation.
+- **R6 wind atomic pair**: wind_10m requires u and v from the same candidate; serving is possible only when both U and V are commit ready.
+- **R7 coverage threshold**: GEFS requires ≥85% members per lead (integer-safe test); fallback
+  candidates are likewise bounded—fallback is the "next-newest serveable positive-lead candidate",
+  not the "previous cycle".
+  **85% is a candidate eligibility threshold, not a GC retention target**: it answers only
+  "is this candidate eligible for serving", not "how few members must be retained". As long as a
+  (cycle, lead) remains a canonical ensemble source, **all of its committed members are
+  retained**—the remaining 4 already-committed members must never be reclaimed just because 26/30 already satisfies 85%.
+- **R8 graceful null**: with no fallback, instantaneous still returns values and interval is set to null,
+  and the whole request still succeeds.
+- **R9 mixed-source is the correct shape**: within a single /v1/points entry different variables may come from different
+  sources; valid_time is the unified time axis.
+- **R10 availability true semantics**: an interval variable is
+  available only if a valid positive-lead source exists; instantaneous is not subject to this constraint.
+- **R11 cache bound to the real source**: single-variable endpoint key = actual (cycle, lead) + valid_time +
+  the serving generation of that source store. The /v1/points provenance digest generates an entry for **each
+  source actually used**
+  `(variable, valid_time, run_id, source cycle, source lead, the serving generation of that source store's
+  manifest)` (NULL sentinel when there is no fallback source), sorted and then hashed.
+  generation must be resolved per each source's **own store**—taking only the primary/anchor
+  generation is not allowed, otherwise when the store holding a fallback source republishes (G06 17→18) while the primary
+  is unchanged, the cache will hit the old precipitation. companions are separate entries, but by I10 they have the same
+  value as the precipitation entry (more conservative: when the coupling is broken the digest changes truthfully).
+- **R12 provenance reflects the real origin**: single-variable endpoints report the actual `source_cycle`/`lead`;
+  /v1/points keeps primary/anchor at the entry level to maintain API compatibility.
 
 ---
 
-## 5. Serving retention 边界与 `protected_valid_times` primitive
+## 5. Serving retention Boundary and the `protected_valid_times` primitive
 
 ```text
-UI visibility、serving eligibility 和 physical deletion 是独立状态。
+UI visibility, serving eligibility and physical deletion are independent states.
 
-API 只保证 active serving window 内 valid_time 的 serveability；
-valid_time 退出 active window 后不再具有 serving retention guarantee，
-但物理数据也不要求同步删除。
+The API guarantees serveability only for valid_times inside the active serving window;
+once a valid_time exits the active window it no longer has a serving retention guarantee,
+but physical data is likewise not required to be deleted in step.
 ```
 
-**`protected_valid_times` 是共享 domain primitive（active serving window policy 的
-唯一权威实现）**：
+**`protected_valid_times` is a shared domain primitive (the only
+authoritative implementation of the active serving window policy)**:
 
 ```text
 protected_valid_times(model, now) =
     { valid_time : valid_time >= serving_start_valid_time(now) }
-    ∩ 该 model 的 canonical horizon 网格
+    ∩ that model's canonical horizon grid
 ```
 
-- 唯一实现位于 `packages/domain`（纯函数；现有 `serving_start_valid_time` 升级为
-  其载体）。
-- 三个消费者**引用同一实现，禁止各自计算边界**：
-  1. 前端 availability——通过 API 暴露的 serving window 元数据消费，TS 侧不重复
-     实现边界数学；
-  2. API serving eligibility——resolver 的窗口左边界判定；
-  3. GC canonical protection——planner 的 `start_valid_time` 参数与 worker
-     deletion-time 复验。
-- invariant 1/7 中的 "protected valid_time" 即由此 primitive 定义。UI/API/GC 三套
-  boundary drift（"UI 认为 03Z expired、API 认为 active、GC 认为 protected"）在
-  结构上不可能发生。
+- The only implementation lives in `packages/domain` (a pure function; the existing `serving_start_valid_time` is upgraded to
+  be its carrier).
+- Three consumers **reference the same implementation and are forbidden from computing the boundary themselves**:
+  1. frontend availability—consumed via the serving window metadata exposed by the API; the TS side does not reimplement
+     the boundary math;
+  2. API serving eligibility—the resolver's window left-boundary test;
+  3. GC canonical protection—the planner's `start_valid_time` parameter and the worker's
+     deletion-time revalidation.
+- The "protected valid_time" in invariants 1/7 is defined by this primitive. The three-way
+  boundary drift across UI/API/GC ("UI thinks 03Z expired, API thinks active, GC thinks protected") is
+  structurally impossible.
 
-产品行为链：anchor 推进 → 前端强制刷新 → 旧 valid_time 退出 active serving window →
-用户不再能通过正常产品交互显式请求旧 valid_time。GC **不需要**为"用户可能继续查询
-已退出窗口的 valid_time"保留数据；同时物理删除也不要求与窗口退出同步。
+Product behavior chain: anchor advance → frontend forced refresh → old valid_time exits the active serving window →
+the user can no longer explicitly request the old valid_time through normal product interaction. GC does **not** need to retain data for "a user
+might keep querying a valid_time that has exited the window"; at the same time physical deletion is likewise not required to be in step with window exit.
 
-UI 侧机制：3h grace 窗口过滤 + 60s 心跳 + 与 cadence 边界对齐的定时刷新。
+UI-side mechanism: 3h grace window filtering + 60s heartbeat + scheduled refresh aligned to the cadence boundary.
 
 ---
 
-## 6. Realtime ingestion：variable-lead-member commit 语义
+## 6. Realtime ingestion: variable-lead-member commit semantics
 
-### 6.1 commit / publish 单元
+### 6.1 commit / publish unit
 
-serving 与 failure 的单元是 **variable-lead（及 GEFS member）**，不是 whole-run：
+The unit of serving and failure is **variable-lead (and GEFS member)**, not whole-run:
 
 ```text
 failed / uncommitted variable-lead unit
-  → 不参与 canonical serving，也不产生 serving hold；
+  → does not participate in canonical serving, nor produce a serving hold;
 
-同一 cycle 中其它已 committed / published 的 variable-lead units
-  → 不受影响。
+other already committed / published variable-lead units in the same cycle
+  → unaffected.
 ```
 
-写入时序（每次 wave）：
+Write sequence (per wave):
 
-1. **reserve_run**（物理写之前）：upsert lifecycle 行 + `model_runs('processing')`。
-   catalog 身份先行。
-2. **region commit**：EXCLUSIVE gate 下写 variable shard，region COMPLETE marker
-   最后写（store 侧最后一步）。
-3. **lead settlement / promotion**：lead 全部成员 settle 后 `publish_settled_lead`：
-   按 marker 证据写 EnsembleMember / EnsembleMemberProduct / Product 行并 bump
-   manifest serving generation。此步不标记 run ready。
-4. **batch finalize（batch-only）**：`model_runs` ready/partial 状态由 batch ingestion
-   finalize 推导，是 **operational/catalog 概念**，不是 realtime serving 或 GC 的
-   authority。
+1. **reserve_run** (before physical writes): upsert the lifecycle row + `model_runs('processing')`.
+   catalog identity comes first.
+2. **region commit**: under the EXCLUSIVE gate, write the variable shard; the region COMPLETE marker
+   is written last (the last step on the store side).
+3. **lead settlement / promotion**: after all members of a lead have settled, `publish_settled_lead`:
+   based on marker evidence, write EnsembleMember / EnsembleMemberProduct / Product rows and bump the
+   manifest serving generation. This step does not mark the run ready.
+4. **batch finalize (batch-only)**: the `model_runs` ready/partial status is derived by batch ingestion
+   finalize, and is an **operational/catalog concept**, not the authority
+   for realtime serving or GC.
 
-### 6.2 wave 调度模型
+### 6.2 wave scheduling model
 
-单 leader、wave 串行派发（GFS → GEFS，同模型永不并发）；新 wave 只在上一个 wave
-完成 finalizer 后开始；优雅停机走 non-abandoning drain；scheduler 无自有状态，
-每次 poll 从上游 snapshot + durable catalog 重建 pending，崩溃后下一轮
-reconciliation 只补缺失。**当前设计下 wave 不会被永久弃跑**；实测孤儿 store 是
-历史遗留（catalog 接线前路径 / 库重建），防复发靠 §9 对账。
+Single leader, waves dispatched serially (GFS → GEFS, the same model never runs concurrently); a new wave starts
+only after the previous wave's finalizer completes; graceful shutdown goes through a non-abandoning drain; the scheduler has no state of its own and
+rebuilds pending on each poll from the upstream snapshot + durable catalog, so after a crash the next round of
+reconciliation only fills in what is missing. **Under the current design a wave will not be permanently abandoned**; the measured orphan stores are
+historic leftovers (the pre-catalog-wiring path / database rebuilds), and prevention of recurrence relies on the §9 reconciliation.
 
 ---
 
-## 7. 物理 GC：canonical necessity 单一权威
+## 7. Physical GC: canonical necessity as the single source of truth
 
-### 7.1 删除权威与派生 fast-path
+### 7.1 Deletion authority and the derived fast-path
 
-**删除判定始终是**（§0 invariant 的 1–8 条），由与 serving 完全同一套 canonical 纯引擎
-（`select_canonical_sources_bulk`）执行。
+**The deletion test is always** (items 1–8 of the §0 invariant), executed by exactly the same canonical pure engine
+as serving (`select_canonical_sources_bulk`).
 
-在当前 GFS/GEFS 配置下，该判定的**派生结果**可以写成 cutoff 形式，作为 planner 的
-fast-path / 审计口径（T = latest ready 且已开始 serving 的 cycle，C = cycle cadence）：
+Under the current GFS/GEFS configuration, the **derived result** of that test can be written in cutoff form, as the planner's
+fast-path / audit criterion (T = the latest ready cycle that has started serving, C = cycle cadence):
 
-- instantaneous 变量 shard：`cycle_time ≤ T − C` 后即不再被 canonical 选中；
-- interval 变量 shard：T−C 仍作为 lead0 fallback 在 serving，故 `cycle_time ≤ T − 2C`
-  后才不再被选中；
-- wind：u/v 原子对，T 的 wind 开始 serving ⇒ T−C 的 u/v 均不再被选中。原子性是
-  **semantic atomicity**，不是物理事务（定义见 §7.2）。
-- predecessor：reset lead（`L % variable.reset_period_hours == 0`）的 shard 依赖
-  同 run **L − variable.interval_width_hours**（不是 L − R/2）；相关前驱未 commit 前
-  （恢复场景）被 dependency hold。
+- instantaneous variable shard: once `cycle_time ≤ T − C` it is no longer selected by canonical;
+- interval variable shard: T−C is still serving as the lead0 fallback, so only after `cycle_time ≤ T − 2C`
+  is it no longer selected;
+- wind: a u/v atomic pair; once T's wind starts serving ⇒ neither u nor v of T−C is selected any more. Atomicity is
+  **semantic atomicity**, not a physical transaction (definition in §7.2).
+- predecessor: a reset lead's shard (`L % variable.reset_period_hours == 0`) depends on
+  the same run's **L − variable.interval_width_hours** (not L − R/2); before the relevant predecessor is committed
+  (recovery scenario) it is held by a dependency hold.
 
-这些 cutoff 永远是**推论**，不是判定来源；配置变化时以 canonical 解析为准。
+These cutoffs are always a **corollary**, never the source of the test; when configuration changes, canonical resolution prevails.
 
-### 7.2 执行管线（只有这一条）
+### 7.2 Execution pipeline (the only one)
 
 ```text
 Reclamation Planner
-  → （canonical 解析 + dependency holds）→ reclamation_queue
+  → (canonical resolution + dependency holds) → reclamation_queue
 Reclamation Worker
-  → 租约领取 → SHARED store gate → deletion-time counterfactual revalidation
-  → DeleteObject（unit 级）→ unit terminal
-（循环，直到所有 constituent units terminal）
+  → lease claim → SHARED store gate → deletion-time counterfactual revalidation
+  → DeleteObject (unit level) → unit terminal
+(loop until all constituent units are terminal)
 ```
 
-- **Planner**：对每个 (model, variable, valid_time) canonical 解析；非 anchor、非
-  variable fallback source、非 wind 连带、非 predecessor、member integrity 不需要的
-  committed unit → 入 `reclamation_queue`。
-- **Worker**：租约领取批次 → SHARED store gate → 重读 lifecycle（若 cycle 已
-  tombstone 则按 bookkeeping 语义处理）→ counterfactual revalidation（本批视为
-  物理在场、其余 deleting/deleted 视为 fenced，重算必要性；仍必要者回退 queued）→
-  DeleteObject → 标记 deleted。**每个 physical unit 独立通过全部 8 条后才删除。**
+- **Planner**: canonical resolution for each (model, variable, valid_time); a committed unit that is not the anchor, not a
+  variable fallback source, not wind-coupled, not a predecessor, and not required by member integrity
+  → is enqueued into `reclamation_queue`.
+- **Worker**: lease claim of a batch → SHARED store gate → re-read lifecycle (if the cycle is already
+  tombstoned, handle it per bookkeeping semantics) → counterfactual revalidation (treat this batch as
+  physically present and the rest of deleting/deleted as fenced, recompute necessity; those still necessary fall back to queued) →
+  DeleteObject → mark deleted. **Each physical unit is deleted only after independently passing all 8 conditions.**
 
-  **Wind pair 的 semantic atomicity**（S3 DeleteObject 无跨对象事务，原子性分层
-  定义）：
-  1. **Eligibility atomic**：u 与 v 必须同时判定为 unnecessary 后，才允许任何一个
-     进入 `deleting`——任一分量仍必要，则 pair 整体不入删除批；
-  2. **Serving atomic**：pair 一旦被 fenced / reclaiming，resolver 不得再选择该
-     pair（现有 `filter_candidates_by_physical_fence` 已提供此语义：fenced 的 u 使
-     候选失去 wind_u → wind_10m 的"同候选 u+v"要求使整个 pair 不可选）；
-  3. **Physical deletion**：u 与 v 可以依次 DeleteObject，不要求同时；
-  4. **Crash between deletes**：允许短暂 one-deleted / one-present 状态——pair 已
-     整体 fenced（serving 不受影响），recovery 对仍在 deleting 租约内的剩余 member
-     继续删除直至 terminal。
-- **不存在 whole-cycle GC finalizer**：不存在"整 cycle GC → 决定是否删除整个 cycle"
-  的阶段，也不存在基于 `cycle horizon expired` 直接整 prefix 删除的独立 authority。
-  当前实现中 horizon-based 的 `run_finalizer_pass` 删除路径必须退役（见 §11）。
+  **Wind pair semantic atomicity** (S3 DeleteObject has no cross-object transaction; atomicity is defined
+  in layers):
+  1. **Eligibility atomic**: only after both u and v have been determined unnecessary may either one
+     enter `deleting`—if any component is still necessary, the pair as a whole does not enter the deletion batch;
+  2. **Serving atomic**: once the pair is fenced / reclaiming, the resolver must not select that
+     pair (the existing `filter_candidates_by_physical_fence` already provides this semantics: a fenced u makes the
+     candidate lose wind_u → wind_10m's "same candidate u+v" requirement makes the whole pair unselectable);
+  3. **Physical deletion**: u and v may be DeleteObject'd in sequence; simultaneity is not required;
+  4. **Crash between deletes**: a transient one-deleted / one-present state is permitted—the pair is already
+     fenced as a whole (serving is unaffected), and recovery continues deleting the remaining member still under the deleting lease
+     until terminal.
+- **There is no whole-cycle GC finalizer**: there is no stage of "whole-cycle GC → decide whether to delete the entire cycle",
+  nor any independent authority that deletes an entire prefix directly based on `cycle horizon expired`.
+  In the current implementation the horizon-based `run_finalizer_pass` deletion path must be retired (see §11).
 
-### 7.3 Marker / manifest cleanup：同样 dependency-driven
+### 7.3 Marker / manifest cleanup: likewise dependency-driven
 
-S3 prefix 不是实体目录，**没有** "rm 整个 cycle prefix" 的最终阶段。每种 metadata
-object 按自身依赖独立回收：
+An S3 prefix is not a real directory; there is **no** final stage of "rm the entire cycle prefix". Each metadata
+object is reclaimed independently according to its own dependencies:
 
 ```text
 variable shard
-  → 对应 canonical/dependency hold 消失后删除（worker 现行路径）
+  → deleted after the corresponding canonical/dependency hold disappears (the worker's current path)
 
 region COMPLETE marker
-  → 它所证明的全部 physical units terminal 后删除（现行 region marker 清理即是此模型）
+  → deleted after all physical units it attests to are terminal (the current region marker cleanup is exactly this model)
 
-manifest / cycle metadata object（.zattrs/.zgroup/.zmetadata 等）
-  → 所有仍依赖它的 active units terminal 后删除
+manifest / cycle metadata object (.zattrs/.zgroup/.zmetadata etc.)
+  → deleted after all active units still depending on it are terminal
 ```
 
-GC 从头到尾维持同一个 dependency-driven 模型；cycle store 前缀的"清空"是所有
-unit 独立删除后的**结果**，不是任何一步的**动作**。
+GC maintains the same dependency-driven model from start to finish; the "emptying" of a cycle store prefix is the **result** of all
+units being deleted independently, not the **action** of any single step.
 
-### 7.4 Failed / uncommitted unit 与 partial 保护
+### 7.4 Failed / uncommitted units and partial protection
 
-- failed / uncommitted variable-lead unit 不参与 serving、不产生 hold（§6.1）；
-- 比"当前 serving 的 cycle"**更古早**的孤儿/落后 unit：canonical 解析自然不再选中，
-  可回收；
-- 最新的、后面还没有 ready cycle 的 partial cycle 中已 committed 的 units：处于
-  serving 窗口内，被 canonical hold 保护，**不得仅凭时间删除**；
-- 无 arbitrary TTL（明确拒绝 48h 超时类策略）。
+- failed / uncommitted variable-lead units do not participate in serving and produce no hold (§6.1);
+- orphan/trailing units **older** than the "cycle currently serving": canonical resolution naturally no longer selects them,
+  so they can be reclaimed;
+- committed units in the newest partial cycle that has no ready cycle after it: they are inside the
+  serving window and protected by a canonical hold, and **must not be deleted on the basis of time alone**;
+- no arbitrary TTL (48h-timeout-style policies are explicitly rejected).
 
-### 7.5 删除硬前置：两类 GC 触发，"持久性"的证据不同
+### 7.5 Deletion hard prerequisites: two classes of GC trigger, with different "durability" evidence
 
-invariant 第 7 条按 unit 离开 protected set 的方式分两类：
+Invariant item 7 splits into two classes by the way a unit leaves the protected set:
 
-**A. Replacement GC（窗口内被接管）**：valid_time 仍在 active window 内，由更新的
-cycle unit 接管。硬前置 = 接替 source 的 manifest serving generation 已 bump——
-这是 serving 切换的持久证据，可被 planner/worker 验证。前端强制刷新由 API 侧
-generation 变化驱动，GC 不直接感知 UI。
+**A. Replacement GC (taken over inside the window)**: the valid_time is still inside the active window and is taken over by a newer
+cycle unit. Hard prerequisite = the replacing source's manifest serving generation has been bumped—
+this is the durable evidence of the serving switch and can be verified by planner/worker. The frontend forced refresh is driven by the API-side
+generation change; GC does not directly perceive the UI.
 
-**B. Window-exit GC（窗口退出）**：valid_time 本身退出 active window
-（`VT < serving_start`）。**不存在 replacement**——serving_start 是 UTC 的确定性
-函数、单调非降，退出即自证，不需要任何 publication。由于下一 cycle 能产生的最小
-valid_time 是 `cycle_time + cadence`，每个 cycle 的 **lead-0 / lead-3 unit（一般地：
-VT 低于下一 cycle 首个 VT 的所有 unit）以及 interval 变量的 anchor-region unit**
-永远不会被替换，只走这一类。若强制要求 replacement generation，这些 unit 将永远
-无法回收。
+**B. Window-exit GC (window exit)**: the valid_time itself exits the active window
+(`VT < serving_start`). **There is no replacement**—serving_start is a deterministic
+function of UTC and monotonically non-decreasing; the exit is self-evidencing and requires no publication. Since the smallest
+valid_time the next cycle can produce is `cycle_time + cadence`, every cycle's **lead-0 / lead-3 units (generally:
+all units whose VT is below the next cycle's first VT) as well as the anchor-region units of interval variables**
+are never replaced and go only through this class. If a replacement generation were mandatory, these units would never
+be reclaimable.
 
-安全性依据：① serving_start 单调非降，退出的 valid_time 不可能重新进入窗口；
-② 条件 8 的 deletion-time counterfactual revalidation 在删除瞬间重算 protected
-set，时钟回拨等瞬态由最后一道复验兜底；③ 可选 belt-and-braces margin（仅回收
-`VT < serving_start − margin`），非必需。
+Safety basis: ① serving_start is monotonically non-decreasing, so a valid_time that has exited can never re-enter the window;
+② condition 8's deletion-time counterfactual revalidation recomputes the protected
+set at the instant of deletion, so transients such as a clock rollback are caught by the last line of revalidation; ③ an optional belt-and-braces margin (reclaiming only
+`VT < serving_start − margin`), not required.
 
 ---
 
-## 8. Cycle lifecycle：derived bookkeeping only
+## 8. Cycle lifecycle: derived bookkeeping only
 
-`forecast_cycle_lifecycle.deleted_at` 继续永久保留，但语义明确为：
+`forecast_cycle_lifecycle.deleted_at` continues to be permanently retained, but its semantics are explicitly:
 
 ```text
-该 cycle 的所有 physical reclamation units 都已独立进入 terminal state
+all physical reclamation units of this cycle have independently entered the terminal state
 ```
 
-而不是"deleted_at / 某 finalizer 授权删除整个 cycle"。方向只能是：
+and not "deleted_at / some finalizer authorizes deletion of the entire cycle". The direction can only be:
 
 ```text
 per-variable/per-valid-time GC
-  → 所有 constituent units terminal
-  → derive cycle-level deleted_at（启动 14-day metadata retention clock）
+  → all constituent units terminal
+  → derive cycle-level deleted_at (starts the 14-day metadata retention clock)
 ```
 
-不能反过来。当前实现中承担该角色的组件应改名为
-**Lifecycle bookkeeping / metadata reconciliation**，它只允许：
+never the reverse. In the current implementation the component playing that role should be renamed to
+**Lifecycle bookkeeping / metadata reconciliation**, and it may only:
 
-- 观察所有 units 是否 terminal；
-- 写 `deleted_at`；
-- 启动 14-day metadata retention clock（sweeper 清明细 catalog：
+- observe whether all units are terminal;
+- write `deleted_at`;
+- start the 14-day metadata retention clock (the sweeper cleans the detail catalog:
   model_runs / forecast_products / ensemble_members / ensemble_member_products /
-  reclamation_queue；tombstone 永久保留）。
+  reclamation_queue; tombstones are retained permanently).
 
-它**不允许**：DeleteObject、删除整个 prefix、决定某 shard 是否回收、绕过 canonical
-planner。
+It **may not**: DeleteObject, delete an entire prefix, decide whether a given shard is reclaimed, or bypass the canonical
+planner.
 
 ---
 
-## 9. Store ↔ catalog reconciler：单调 recoverability frontier
+## 9. Store ↔ catalog reconciler: monotonic recoverability frontier
 
-系统具有单调性：**旧 cycle 不会重新被 realtime scheduler 激活**。因此对账不需要
-anti-resurrection 子系统，采用简单规则：
+The system is monotonic: **an old cycle will not be reactivated by the realtime scheduler**. Therefore reconciliation needs no
+anti-resurrection subsystem, and adopts a simple rule:
 
 ```text
-发现 store exists + catalog missing
+store exists + catalog missing detected
         ↓
-判断 cycle 是否仍位于 recoverable / active frontier 内
+determine whether the cycle still lies inside the recoverable / active frontier
 
-已越过 recoverability frontier
+recoverability frontier already crossed
         ↓
-永不恢复 catalog
+never restore catalog
         ↓
-按 orphan cleanup 处理（units 逐个走 canonical necessity 判定后回收；
-实际上此时它们全部不必要，可快速 terminal）
+handle as orphan cleanup (units go through the canonical necessity test one by one and are then reclaimed;
+in practice at this point they are all unnecessary and can be made terminal quickly)
 
-仍处于合法 recoverable region
+still inside the legitimate recoverable region
         ↓
-检查 COMPLETE marker / durable evidence
+check COMPLETE marker / durable evidence
         ↓
-允许恢复 catalog
+restoring catalog is allowed
 ```
 
-永久 lifecycle tombstone 可作为额外 sanity guard，但不围绕 resurrection 单独建立
-新机制。
+The permanent lifecycle tombstone may serve as an extra sanity guard, but no separate new mechanism is built
+around resurrection.
 
-**调度语义（已实装）：** 对账是 GC daemon 的内置低频阶段，不再是纯手动单轮命令。
-daemon 默认每 24h（`--inventory-interval-hours`，`0` 禁用，env 回退
-`GC_INVENTORY_INTERVAL_HOURS`）在某轮 pass 末尾执行一次 `run_orphan_inventory(reap=False)`，
-摘要追加进当轮 `GC pass:` 输出；`--once` 模式不触发。调度路径**只发现与上报，绝不
-reap**——物理删除 orphan 前缀仍只能通过手动一次性命令
-`weather-ingest gc --inventory --inventory-reap`（fail-closed sanity guards 不变）。
-对账结果经 `ingestion/monitoring/gc_metrics.py` 暴露为进程内指标
-（`weather_gc_inventory_orphans{beyond_frontier=...}` 等，`gc --metrics-port` 开放端点），
-frontier 内 orphan 数 > 0 触发 `gc_orphan_stores_detected` 告警。
+**Scheduling semantics (already implemented):** reconciliation is a built-in low-frequency phase of the GC daemon, no longer a purely manual one-shot command.
+By default the daemon, every 24h (`--inventory-interval-hours`, `0` disables, env fallback
+`GC_INVENTORY_INTERVAL_HOURS`), runs `run_orphan_inventory(reap=False)` once at the end of some pass, and the
+summary is appended to that round's `GC pass:` output; `--once` mode does not trigger it. The scheduling path **only discovers and reports, never
+reaps**—physical deletion of orphan prefixes is still possible only through the manual one-shot command
+`weather-ingest gc --inventory --inventory-reap` (fail-closed sanity guards unchanged).
+Reconciliation results are exposed as in-process metrics via `ingestion/monitoring/gc_metrics.py`
+(`weather_gc_inventory_orphans{beyond_frontier=...}` etc., with the `gc --metrics-port` endpoint opened),
+and an orphan count > 0 inside the frontier triggers the `gc_orphan_stores_detected` alert.
 
 ---
 
-## 10. 不变式清单
+## 10. Invariant Inventory
 
-| # | 不变式 |
+| # | Invariant |
 |---|---|
-| I1 | 用户语义仅 `model + variable + valid_time`；cycle/lead 仅存在于后端 |
-| I2 | anchor = latest model valid_time ≤ now；边界推进触发前端立即刷新 |
-| I3 | UI visibility、serving eligibility、physical deletion 三者独立；API 只保证 active window 内的 serveability |
-| I4 | lifecycle 身份为 (model_id, cycle_time)；模型间零耦合 |
-| I5 | GC 判定粒度 (variable, valid_time)；**canonical necessity 是唯一删除权威** |
-| I6 | cutoff（T−C / T−2C）是派生 fast-path，不是 deletion authority |
-| I7 | **No cycle-level GC authority**；unit 删除须通过 invariant 1–8 全部条件 |
-| I8 | wind u/v **semantic atomicity**：eligibility atomic（u/v 同时判 unnecessary 后才允许任一进入 deleting）＋ serving atomic（pair 一旦 fenced/reclaiming，resolver 不得再选择该 pair）；物理 DeleteObject 可顺序执行，crash 产生的短暂 one-deleted/one-present 由整体 fence 覆盖、recovery 删除剩余 |
-| I9 | reset lead 依赖同 run 前驱 `L − W`（W=interval width，非 R/2）；前驱未消费前被 dependency hold；适用性由 `L % R == 0` 判定 |
-| I10 | companions 与 precipitation_amount_3h 永远同源 |
-| I11 | fallback 只由语义类别 + lead==0 触发；绝不依据数值/NaN |
-| I12 | fallback 候选必须通过 coverage threshold |
-| I13 | realtime serving/failure 单元是 variable-lead-member；whole-run 状态仅是 operational/catalog 信息 |
-| I14 | unit 离开 protected set 必须持久：窗口内被替换 → replacement generation 已 bump；窗口退出 → 由单调 serving_start 自证，无需 publication |
-| I15 | 最新且无后继的 committed partial 不得仅凭时间删除；古早孤儿可回收 |
-| I16 | `deleted_at` 是 derived bookkeeping；tombstone 永久保留；明细元数据 14 天 |
-| I17 | cache identity 与 provenance 绑定实际 source 与 serving generation |
-| I18 | marker / manifest cleanup 与 shard cleanup 同为 dependency-driven；不存在整 prefix 删除阶段 |
-| I19 | max lead / cycle cadence / interval width / reset period 是独立元数据；重建公式只以 (W, R) 表达，禁止 `W = R/2` 隐式绑定 |
-| I20 | `protected_valid_times(model, now)` 是 active serving window policy 的唯一权威 primitive；前端/API/GC 引用同一实现，禁止各自计算边界 |
+| I1 | user semantics are only `model + variable + valid_time`; cycle/lead exist only in the backend |
+| I2 | anchor = latest model valid_time ≤ now; boundary advance triggers an immediate frontend refresh |
+| I3 | UI visibility, serving eligibility and physical deletion are mutually independent; the API guarantees serveability only inside the active window |
+| I4 | lifecycle identity is (model_id, cycle_time); zero coupling between models |
+| I5 | GC test granularity is (variable, valid_time); **canonical necessity is the only deletion authority** |
+| I6 | cutoff (T−C / T−2C) is a derived fast-path, not a deletion authority |
+| I7 | **No cycle-level GC authority**; a unit deletion must pass all of invariant conditions 1–8 |
+| I8 | wind u/v **semantic atomicity**: eligibility atomic (only after u/v are both determined unnecessary may either enter deleting) + serving atomic (once the pair is fenced/reclaiming, the resolver must not select that pair); physical DeleteObject may be executed in sequence, and the transient one-deleted/one-present produced by a crash is covered by the whole-pair fence, with recovery deleting the remainder |
+| I9 | a reset lead depends on the same run's predecessor `L − W` (W=interval width, not R/2); it is held by a dependency hold before the predecessor is consumed; applicability is determined by `L % R == 0` |
+| I10 | companions are always from the same source as precipitation_amount_3h |
+| I11 | fallback is triggered only by semantic class + lead==0; never based on a numeric value/NaN |
+| I12 | a fallback candidate must pass the coverage threshold |
+| I13 | the realtime serving/failure unit is variable-lead-member; whole-run status is merely operational/catalog information |
+| I14 | a unit leaving the protected set must be durable: replaced inside the window → the replacement generation has been bumped; window exit → self-evidencing via monotonic serving_start, no publication needed |
+| I15 | the newest committed partial with no successor must not be deleted on the basis of time alone; older orphans may be reclaimed |
+| I16 | `deleted_at` is derived bookkeeping; tombstones are retained permanently; detail metadata for 14 days |
+| I17 | cache identity and provenance are bound to the actual source and serving generation |
+| I18 | marker / manifest cleanup is dependency-driven just like shard cleanup; there is no whole-prefix deletion stage |
+| I19 | max lead / cycle cadence / interval width / reset period are independent metadata; the reconstruction formula is expressed only in terms of (W, R), and the implicit binding `W = R/2` is forbidden |
+| I20 | `protected_valid_times(model, now)` is the only authoritative primitive of the active serving window policy; frontend/API/GC reference the same implementation and are forbidden from computing the boundary themselves |
 
 ---
 
-## 11. 当前实现与目标态差距
+## 11. Gap Between the Current Implementation and the Target State
 
-> 2026-09-13 复核重写：原 11 项差距逐项对照代码核实后，10 项已落地（§11.1，
-> 其中第 7 项工具已建、调度与历史孤儿清理仍待办），剩余工作收敛为 §11.2 的
-> 7 条遗留。本节以代码现状为准，条目附证据位置。
+> Rewritten on 2026-09-13 after review: after verifying the original 11 gap items one by one against the code, 10 have landed (§11.1,
+> of which item 7's tool has been built while scheduling and historical orphan cleanup remain outstanding), and the remaining work converges to the
+> 7 outstanding items in §11.2. This section defers to the current state of the code, and items are annotated with evidence locations.
 
-### 11.1 已落地（原清单 → 现状）
+### 11.1 Landed (original inventory → current state)
 
-| # | 原差距项 | 现状 |
+| # | Original gap item | Current state |
 |---|---|---|
-| 1 | 退役 horizon-based whole-cycle 删除路径 | 完成。finalizer 已降级为 §8 Lifecycle bookkeeping：零物理存储操作、无 DeleteObject，`deleted_at` 是 derived 事实（`gc/finalizer.py` 模块 docstring）。 |
-| 2 | V2 reconciler 残留下线 | 完成。全仓无 reconciler 类/残留路径；store↔catalog 差异统一归 §9 inventory 处理。 |
-| 3 | Planner 快路径落地 | 完成。canonical 解析为唯一权威，cutoff 仅作批剪枝 fast-path（`gc/planner.py` 模块 docstring）；`batch_size` 分批入队（`planner.py:157,595-597`）。 |
-| 4 | worker 复验 wind 连带成对化 | 完成。u/v 按 `(run, lead, kind, member)` 成对联合评估，任一分量被反事实判定 necessary 或 counterpart 未终态则整对回队（`gc/worker.py:446-497`）。 |
-| 5 | /v1/points fallback 实现 | 完成。`/v1/points` 收敛为单一实现（`routers/points.py`）；fallback 在 resolver 内按 `(variable, valid_time)` 解析并携带 provenance digest（`api/services/resolver.py:589,709-779`），无平行第二套引擎。 |
-| 6 | ensemble_data 读后 fence 复核静默失效 | 完成。读后显式重查 fence 并以命名日志事件上报（`api/services/ensemble_data.py:376-391,643-658`），不再 `except: pass` 静默吞掉。 |
-| 8 | 时间元数据拆分（I19）与重建公式一般化 | 完成。`is_predecessor_dependent_lead` / `get_predecessor_lead` 按 `(W, R)` 参数化（`domain/reclamation.py:229-277`）；`reconstruct_running_average_interval` 实现 `[R·C(L) − (R−W)·C(L−W)] / W`（`domain/models/cloud.py:77-161`）；`(W, R)` 元数据注册表见 `domain/temporal.py:59-79`，附跨 (R, W) 组合的一般化测试。 |
-| 9 | availability legacy `initial_times` 视图 | 完成。legacy 视图对 interval 变量显式剔除 lead 0（`api/services/availability.py:387-406`）。 |
-| 10 | 测试污染生产 catalog | 完成。集成测试强制显式 `TEST_DATABASE_URL`，否则跳过（`services/*/tests/_integration_db.py`）；一次性清理工具 `scripts/cleanup_test_pollution.py`（commit `87b8207`）。 |
-| 11 | 提取 `protected_valid_times` primitive（I20） | 大部分完成。primitive 已升级为 per-model horizon 网格并提供 `is_valid_time_protected(model_id=...)` / `protected_valid_times(model, now)`（`domain/temporal.py:154-295`，PR #87）；planner 与 API 均已采纳。前端 TS 仍重复实现边界计算，见遗留项 6。 |
-| 7 | store↔catalog 对账（§9） | 部分完成。对账工具已建并接线 CLI：`gc/inventory.py` + `--inventory` / `--inventory-reap`（PR #88）；调度化与历史孤儿（gefs 2026-09-12/00、06 等 ≈57GB）清理仍待办，见遗留项 1/2。 |
-| — | GC 复验边界切换到 per-model primitive | 完成。新增 `domain.temporal.model_serving_start_valid_time(model_id, now)`（按模型注册 horizon cadence 派生边界，与 `is_valid_time_protected(model_id=...)` 的边界分量一致）；planner / worker / finalizer / inventory 已全部切换，inventory 对未注册模型保留全局 cadence 回退。 |
-| — | I14 generation 机械化校验 | 完成。方向定为"未变才可删"（fail-closed）：planner 入队时快照 store 的 committed-manifest generation（迁移 009 `reclamation_queue.store_generation`，每次 EXCLUSIVE commit 必 bump，含同集合同周期替换），worker 在 store 闸内比对——generation 变化或消失则重置基线并回队一轮，不删除；无基线的存量行在首次 claim 回填。重复被替换的 store 永远不会被删除，稳定 store 下一轮即恢复删除（无 livelock）。 |
+| 1 | Retire the horizon-based whole-cycle deletion path | Done. The finalizer has been demoted to §8 Lifecycle bookkeeping: zero physical storage operations, no DeleteObject, and `deleted_at` is a derived fact (`gc/finalizer.py` module docstring). |
+| 2 | Take down the leftover V2 reconciler | Done. No reconciler class/leftover path anywhere in the repo; store↔catalog divergence is handled centrally by the §9 inventory. |
+| 3 | Land the planner fast path | Done. canonical resolution is the only authority and cutoff serves merely as a batch-pruning fast-path (`gc/planner.py` module docstring); `batch_size` enqueues in batches (`planner.py:157,595-597`). |
+| 4 | Make the worker's revalidation of wind coupling pairwise | Done. u/v are jointly evaluated as a pair by `(run, lead, kind, member)`; if any component is counterfactually determined necessary or the counterpart is not in a terminal state, the whole pair returns to the queue (`gc/worker.py:446-497`). |
+| 5 | /v1/points fallback implementation | Done. `/v1/points` converges to a single implementation (`routers/points.py`); fallback is resolved inside the resolver by `(variable, valid_time)` and carries the provenance digest (`api/services/resolver.py:589,709-779`), with no parallel second engine. |
+| 6 | ensemble_data post-read fence recheck failing silently | Done. After the read the fence is explicitly re-queried and reported via a named log event (`api/services/ensemble_data.py:376-391,643-658`), no longer silently swallowed by `except: pass`. |
+| 8 | Split time metadata (I19) and generalize the reconstruction formula | Done. `is_predecessor_dependent_lead` / `get_predecessor_lead` are parameterized by `(W, R)` (`domain/reclamation.py:229-277`); `reconstruct_running_average_interval` implements `[R·C(L) − (R−W)·C(L−W)] / W` (`domain/models/cloud.py:77-161`); the `(W, R)` metadata registry is in `domain/temporal.py:59-79`, with generalized tests across (R, W) combinations. |
+| 9 | availability legacy `initial_times` view | Done. The legacy view explicitly evicts lead 0 for interval variables (`api/services/availability.py:387-406`). |
+| 10 | Tests polluting the production catalog | Done. Integration tests require an explicit `TEST_DATABASE_URL`, otherwise they are skipped (`services/*/tests/_integration_db.py`); one-shot cleanup tool `scripts/cleanup_test_pollution.py` (commit `87b8207`). |
+| 11 | Extract the `protected_valid_times` primitive (I20) | Mostly done. The primitive has been upgraded to a per-model horizon grid and provides `is_valid_time_protected(model_id=...)` / `protected_valid_times(model, now)` (`domain/temporal.py:154-295`, PR #87); planner and API have both adopted it. The frontend TS still reimplements the boundary computation, see outstanding item 6. |
+| 7 | store↔catalog reconciliation (§9) | Partially done. The reconciliation tool has been built and wired to the CLI: `gc/inventory.py` + `--inventory` / `--inventory-reap` (PR #88); scheduling and cleanup of historical orphans (gefs 2026-09-12/00, 06 etc. ≈57GB) remain outstanding, see outstanding items 1/2. |
+| — | Switch the GC revalidation boundary to the per-model primitive | Done. Added `domain.temporal.model_serving_start_valid_time(model_id, now)` (derives the boundary from the model's registered horizon cadence, consistent with the boundary component of `is_valid_time_protected(model_id=...)`); planner / worker / finalizer / inventory have all been switched, and inventory keeps a global cadence fallback for unregistered models. |
+| — | Mechanized verification of the I14 generation | Done. The direction is set as "only delete if unchanged" (fail-closed): on enqueue the planner snapshots the store's committed-manifest generation (migration 009 `reclamation_queue.store_generation`, bumped on every EXCLUSIVE commit, including same-set same-cycle replacement), and the worker compares inside the store gate—if the generation changed or disappeared it resets the baseline and returns the item to the queue for one round without deleting; pre-existing rows with no baseline are backfilled on first claim. A repeatedly replaced store is never deleted, and a stable store resumes deletion on the next round (no livelock). |
 
-### 11.2 仍然有效的遗留清单（按建议优先序）
+### 11.2 Outstanding items that are still valid (in recommended priority order)
 
-1. **§9 对账进入调度**：`gc --inventory` 仍是一次性手动命令（`cli.py:746-748`
-   跑完即退），daemon 循环不含对账阶段，compose/cron 均未调度。应作为 daemon
-   低频阶段（reap 保持手动）。
-2. **历史孤儿清理**：gefs 2026-09-12/00、06 等 ≈57GB 孤儿 store 需运维用
-   `gc --inventory --inventory-reap` 显式清理（工具已备，动作未执行）。
-3. **GC 管线内阶段指标**：planner/worker/sweeper 每轮结果只有 stdout 摘要
-   （`cli.py:1378`），`gc/` 内无 Prometheus 计数/耗时指标。状态级覆盖已存在
-   （`monitoring/lifecycle_collector.py:65-79` + Grafana 7/8/9 节 + webhook 告警
-   `alerts.py:456-466`），缺的是 per-pass 过程指标与对应面板。
-4. **前端 TS serving 窗口重复实现**：`frontend/src/lib/forecast/availability.ts`
-   重新实现了 `serving_start_valid_time` 的地板逻辑（I20 的"全栈单一实现"尚未
-   完全达成）；当前语义一致，属维护漂移风险。
-5. **守护进程部署载体**：`docker-compose.yml` 无 ingestion/GC 服务，仓库无
-   systemd unit/crontab；`--enable-planner` → `--enable-delete` 灰度启用仍是
-   操作动作（`RUNBOOKS.md` GC 节）。按 DEPLOYMENT.md 约定留待 Stage 8。
-6. **per-variable provenance 客户端暴露**：provenance digest 已进入缓存键
-   （`resolver.py:709-779`），但响应 schema 仅暴露 per-series `cycle_time`
-   （`api/schemas.py:287-294`），客户端仍看不到每个变量来自哪个 cycle/run。
-7. **T−2C claim 时机**：纯剪枝效率优化，正确性由 canonical necessity 覆盖；
-   tombstone/最后批 unit 最晚释放推迟 10 天。等 GC 跑稳、有存储回收曲线数据
-   后再评估。
+1. **Bring §9 reconciliation into the schedule**: `gc --inventory` is still a one-shot manual command (`cli.py:746-748`
+   exits on completion), the daemon loop contains no reconciliation phase, and neither compose nor cron schedules it. It should be a low-frequency
+   daemon phase (reap stays manual).
+2. **Historical orphan cleanup**: the ≈57GB of orphan stores such as gefs 2026-09-12/00, 06 need operations to
+   explicitly clean them with `gc --inventory --inventory-reap` (the tool is ready, the action has not been executed).
+3. **In-pipeline stage metrics**: planner/worker/sweeper per-round results are only a stdout summary
+   (`cli.py:1378`), and there are no Prometheus count/duration metrics inside `gc/`. State-level coverage already exists
+   (`monitoring/lifecycle_collector.py:65-79` + Grafana sections 7/8/9 + webhook alerts
+   `alerts.py:456-466`); what is missing is per-pass process metrics and the corresponding panels.
+4. **Frontend TS reimplementing the serving window**: `frontend/src/lib/forecast/availability.ts`
+   reimplements the floor logic of `serving_start_valid_time` (I20's "single implementation across the stack" is not yet
+   fully achieved); the semantics currently agree, but it is a maintenance-drift risk.
+5. **Daemon deployment vehicle**: `docker-compose.yml` has no ingestion/GC service, and the repo has no
+   systemd unit/crontab; the `--enable-planner` → `--enable-delete` gradual enablement is still
+   a manual operational action (`RUNBOOKS.md` GC section). Per the DEPLOYMENT.md convention this is left to Stage 8.
+6. **Per-variable provenance exposure to clients**: the provenance digest already enters the cache key
+   (`resolver.py:709-779`), but the response schema exposes only the per-series `cycle_time`
+   (`api/schemas.py:287-294`), so clients still cannot see which cycle/run each variable comes from.
+7. **T−2C claim timing**: a pure pruning-efficiency optimization; correctness is covered by canonical necessity;
+   the latest release of tombstone/last-batch units is deferred by 10 days. To be evaluated after GC
+   runs stably and there is storage reclamation curve data.
