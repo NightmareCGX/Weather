@@ -328,7 +328,7 @@ describe("HomePage", () => {
   it("renders the header, layer controls, and search after loading availability", async () => {
     renderPage();
 
-    expect(screen.getByRole("heading", { name: "Zeus Wx" })).toBeInTheDocument();
+    expect(screen.getByTestId("app-header")).toBeInTheDocument();
 
     await waitFor(() => {
       expect(screen.getByLabelText("Model")).toBeInTheDocument();
@@ -437,7 +437,7 @@ describe("HomePage", () => {
     });
     // The dashboard is present.
     await waitFor(() => {
-      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+      expect(screen.getByTestId("point-forecast-section")).toBeInTheDocument();
     });
   });
 
@@ -452,7 +452,7 @@ describe("HomePage", () => {
     fireEvent.mouseDown(option);
 
     await waitFor(() => {
-      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+      expect(screen.getByTestId("point-forecast-section")).toBeInTheDocument();
     });
     expect(lastRenderedLocation?.name).toBe("Aspen");
 
@@ -460,7 +460,7 @@ describe("HomePage", () => {
     fireEvent.click(closeBtn);
 
     await waitFor(() => {
-      expect(screen.queryByText("Hourly Forecast")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("point-forecast-section")).not.toBeInTheDocument();
     });
     expect(lastRenderedLocation).toBeNull();
   });
@@ -476,7 +476,7 @@ describe("HomePage", () => {
     fireEvent.mouseDown(option);
 
     await waitFor(() => {
-      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+      expect(screen.getByTestId("point-forecast-section")).toBeInTheDocument();
     });
     expect(lastRenderedLocation?.name).toBe("Aspen");
 
@@ -506,7 +506,7 @@ describe("HomePage", () => {
     fireEvent.mouseDown(option);
 
     await waitFor(() => {
-      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+      expect(screen.getByTestId("point-forecast-section")).toBeInTheDocument();
     });
 
     const initialPointsCalls = mockFetch.mock.calls.filter((call) =>
@@ -526,7 +526,7 @@ describe("HomePage", () => {
     fireEvent.click(expandBtn);
 
     expect(contentWrapper).not.toHaveClass("hidden");
-    expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+    expect(screen.getByTestId("point-forecast-section")).toBeInTheDocument();
     expect(lastRenderedLocation?.name).toBe("Aspen");
 
     // Verify no additional /v1/points fetch was made merely because of collapse/expand
@@ -547,7 +547,7 @@ describe("HomePage", () => {
     fireEvent.mouseDown(option);
 
     await waitFor(() => {
-      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+      expect(screen.getByTestId("point-forecast-section")).toBeInTheDocument();
     });
 
     // Collapse panel
@@ -601,7 +601,7 @@ describe("HomePage", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Hourly Forecast")).toBeInTheDocument();
+      expect(screen.getByTestId("point-forecast-section")).toBeInTheDocument();
       expect(screen.getByText("39.7392, -104.9903")).toBeInTheDocument();
     });
   });
@@ -638,7 +638,7 @@ describe("HomePage", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("Location access denied");
+      expect(screen.getByTestId("geo-notice")).toHaveAttribute("role", "alert");
     });
 
     // Strict privacy invariant: verify /v1/locate was NOT called as a fallback for Locate Me
@@ -661,6 +661,6 @@ describe("HomePage", () => {
       source: "ip",
     });
     expect(lastRenderedLocation).toBeNull();
-    expect(screen.queryByText("Hourly Forecast")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("point-forecast-section")).not.toBeInTheDocument();
   });
 });

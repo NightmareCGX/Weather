@@ -117,11 +117,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
   });
 
   const distributionLead =
-    selection?.validTime ??
-    options.validTimes?.[0] ??
-    selection?.leadTimeHours ??
-    options.leadTimes[0] ??
-    0;
+    selection?.validTime ?? options.validTimes?.[0] ?? options.leadTimes[0] ?? 0;
   const distribution = useEnsembleDistribution(location, distributionLead, ensembleVariable, {
     model: ensembleModel,
   });
@@ -129,7 +125,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
   // Canonical mapping from lead_time_hours -> valid_time (ISO string)
   const validTimesByLead = useMemo(() => {
     const map = new Map<number, string>();
-    const targetCycle = options.initialTime?.value ?? selection?.initialTime ?? null;
+    const targetCycle = options.initialTime?.value ?? null;
 
     // 1. From variable availability valid_times matching the active source cycle (authoritative V2 mapping)
     if (options.variable?.valid_times) {
@@ -166,7 +162,6 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
     options.variable?.valid_times,
     options.initialTime?.value,
     options.leadTimes,
-    selection?.initialTime,
     forecast?.forecasts,
   ]);
 
@@ -191,7 +186,11 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
         onClose={onClose}
       />
 
-      <section aria-label="Point forecast" className="border-b border-slate-800 px-4 py-4">
+      <section
+        aria-label="Point forecast"
+        className="border-b border-slate-800 px-4 py-4"
+        data-testid="point-forecast-section"
+      >
         <h3 className="mb-2 text-sm font-bold uppercase tracking-wider text-slate-100">
           Hourly Forecast
         </h3>
@@ -223,7 +222,7 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
                 />
               ))
             ) : (
-              <p className="text-sm text-slate-400">
+              <p className="text-sm text-slate-400" data-testid="point-forecast-empty">
                 No hourly forecast available for the selected variable.
               </p>
             )}
@@ -232,7 +231,11 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
       </section>
 
       {selectedModelIsEnsemble && (
-        <section aria-label="Ensemble statistics" className="border-b border-slate-800 px-4 py-4">
+        <section
+          aria-label="Ensemble statistics"
+          className="border-b border-slate-800 px-4 py-4"
+          data-testid="ensemble-section"
+        >
           <h3 className="mb-1 text-sm font-bold uppercase tracking-wider text-slate-100">
             Ensemble Statistics{selectedModel !== null ? ` (${selectedModel.toUpperCase()})` : ""}
           </h3>
@@ -248,12 +251,12 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
             </p>
           )}
           {ensemble.status === "error" && ensemble.byLead.size === 0 && (
-            <p role="alert" className="text-sm text-red-400">
+            <p role="alert" className="text-sm text-red-400" data-testid="ensemble-error">
               {ensemble.error}
             </p>
           )}
           {ensemble.status === "success" && ensemble.byLead.size === 0 && (
-            <p className="text-sm text-slate-400">
+            <p className="text-sm text-slate-400" data-testid="ensemble-empty">
               Ensemble data is not yet available for this forecast.
             </p>
           )}
@@ -278,7 +281,10 @@ export function ForecastDashboard({ location, onClose }: ForecastDashboardProps)
           />
 
           {ensembleVariable === "wind_10m" && distribution.data?.wind_rose && (
-            <div className="mt-4 rounded-lg border border-slate-800 bg-slate-800/40 p-3.5 shadow-lg">
+            <div
+              className="mt-4 rounded-lg border border-slate-800 bg-slate-800/40 p-3.5 shadow-lg"
+              data-testid="wind-rose-section"
+            >
               <h4 className="mb-1 text-center text-xs font-semibold text-slate-200">
                 10m Wind Direction & Speed Distribution (Wind Rose)
               </h4>

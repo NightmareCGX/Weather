@@ -140,9 +140,7 @@ describe("EnsemblePhaseSupport (Time-Varying)", () => {
         name: /Ensemble phase support over time/i,
       })
     ).toBeInTheDocument();
-    expect(
-      screen.getByText(/Ensemble Phase Support — time-varying support \(0–100%\)/)
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("phase-support-section")).toBeInTheDocument();
 
     // Exact percentages are hover-tooltip-only; bars carry no LabelList labels
     expect(container.querySelector(".recharts-label-list")).toBeNull();
@@ -218,7 +216,7 @@ describe("EnsemblePhaseSupport (Time-Varying)", () => {
   it("renders secondary member phase transitions", () => {
     render(<EnsemblePhaseSupport byLead={multiLeadData} validTimesByLead={validTimes} />);
 
-    expect(screen.getByText(/Member Phase Transitions/i)).toBeInTheDocument();
+    expect(screen.getByTestId("phase-transitions")).toBeInTheDocument();
     expect(screen.getByText("Rain → Snow")).toBeInTheDocument();
     expect(screen.getByText("· 27%")).toBeInTheDocument();
   });
@@ -304,7 +302,7 @@ describe("EnsemblePhaseSupport (Time-Varying)", () => {
       );
 
       expect(screen.getByText("Sep 10, 00:00 UTC")).toBeInTheDocument();
-      expect(screen.getByText(/No ensemble phase data available/i)).toBeInTheDocument();
+      expect(screen.getByTestId("phase-support-empty")).toBeInTheDocument();
     });
   });
 });

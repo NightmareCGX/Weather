@@ -223,7 +223,7 @@ describe("LocationSearch", () => {
     const input = screen.getByRole("combobox");
     typeQuery(input, "zzzznomatch");
 
-    expect(screen.getByText("No matching locations.")).toBeInTheDocument();
+    expect(screen.getByTestId("search-empty")).toBeInTheDocument();
   });
 
   it("shows an inline error state on API failure", () => {
@@ -251,7 +251,7 @@ describe("LocationSearch", () => {
     const input = screen.getByRole("combobox");
     typeQuery(input, "Aspen");
 
-    expect(screen.getByText("Searching…")).toBeInTheDocument();
+    expect(screen.getByTestId("search-loading")).toBeInTheDocument();
   });
 
   it("clears the query and closes after selection", () => {

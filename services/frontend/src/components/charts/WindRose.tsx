@@ -39,7 +39,7 @@ export function WindRose({ windRose }: WindRoseProps) {
   const maxProb = Math.max(0.2, ...windRose.sectors.map((s) => s.probability));
 
   return (
-    <div className="flex flex-col items-center">
+    <div className="flex flex-col items-center" data-testid="wind-rose-chart">
       <div className="relative h-72 w-72">
         <svg
           viewBox="0 0 280 280"

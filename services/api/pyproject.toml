@@ -75,7 +75,7 @@ module-name = "api"
 # replicate the root workspace addopts. The 50% coverage floor is enforced only
 # by the CI full-suite step (ci.yml "Run API tests") — NOT here, because a
 # coverage gate in addopts would also fail partial runs such as the CI
-# single-file openapi-export job or a developer running one test file.
+# cross-package contract suite or a developer running one test file.
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"
 

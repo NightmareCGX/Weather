@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 
 import { ForecastDashboard } from "@/components/forecast/ForecastDashboard";
 import { usePointForecast } from "@/hooks/usePointForecast";
@@ -113,8 +113,6 @@ function mockSelectionContext(overrides: Partial<ReturnType<typeof useForecastSe
       model: "gfs",
       variable: "temperature_2m",
       validTime: "2026-08-13T06:00:00Z",
-      initialTime: "2026-08-13T00:00:00Z",
-      leadTimeHours: 6,
     },
     validTime: "2026-08-13T06:00:00Z",
     options: {
@@ -130,8 +128,6 @@ function mockSelectionContext(overrides: Partial<ReturnType<typeof useForecastSe
     setModel: jest.fn(),
     setVariable: jest.fn(),
     setValidTime: jest.fn(),
-    setInitialTime: jest.fn(),
-    setLeadTimeHours: jest.fn(),
     retry: jest.fn(),
     ...overrides,
   });
@@ -159,8 +155,6 @@ function mockEnsembleModelSelected() {
     selection: {
       model: "gefs",
       variable: "temperature_2m",
-      initialTime: "2026-08-13T00:00:00Z",
-      leadTimeHours: 6,
     },
     options: {
       // Availability carries both models; the selected GEFS is present so the
@@ -203,8 +197,10 @@ describe("ForecastDashboard", () => {
 
     render(<ForecastDashboard location={location} />);
 
-    expect(screen.getByText(/Loading forecast…/)).toBeInTheDocument();
-    expect(screen.getByText(/Loading ensemble statistics…/)).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("point-forecast-section")).getByRole("status")
+    ).toBeInTheDocument();
+    expect(within(screen.getByTestId("ensemble-section")).getByRole("status")).toBeInTheDocument();
     expect(screen.getByText("Aspen")).toBeInTheDocument();
   });
 
@@ -223,7 +219,7 @@ describe("ForecastDashboard", () => {
     expect(screen.getByText("Aspen")).toBeInTheDocument();
     expect(screen.getByTestId("meteogram")).toHaveTextContent("temperature_2m");
     // Elevation with no terrain value renders "unavailable", not a bare dash.
-    expect(screen.getByText("unavailable")).toBeInTheDocument();
+    expect(screen.getByTestId("elevation-value")).toHaveAttribute("data-state", "unavailable");
   });
 
   it("degrades independently: an ensemble failure does not destroy the forecast", () => {
@@ -296,8 +292,6 @@ describe("ForecastDashboard", () => {
       selection: {
         model: "gefs",
         variable: "temperature_2m",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 6,
       },
       options: {
         models: [
@@ -338,7 +332,7 @@ describe("ForecastDashboard", () => {
     expect(screen.getByTestId("ensemble-distribution")).toHaveAttribute("data-selected-lead", "6");
   });
 
-  it("propagates non-zero selected lead time (+24h) to the ensemble distribution hook and chart", () => {
+  it("propagates the selected valid time to the ensemble distribution hook and chart", () => {
     mockUsePointForecast.mockReturnValue({ forecast, status: "success", error: null });
     mockUseEnsemble.mockReturnValue({
       byLead: new Map(),
@@ -355,8 +349,7 @@ describe("ForecastDashboard", () => {
       selection: {
         model: "gefs",
         variable: "temperature_2m",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 24,
+        validTime: "2026-08-13T06:00:00Z",
       },
       options: {
         models: [
@@ -385,10 +378,10 @@ describe("ForecastDashboard", () => {
     render(<ForecastDashboard location={location} />);
 
     // Forecast series starts at lead 0, but the distribution hook must receive
-    // the authoritative selected lead (+24h), NOT the first lead (+0h).
+    // the authoritative selected valid time, NOT the first lead (+0h).
     expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
       location,
-      24,
+      "2026-08-13T06:00:00Z",
       "temperature_2m",
       expect.objectContaining({ model: "gefs" })
     );
@@ -398,7 +391,10 @@ describe("ForecastDashboard", () => {
       expect.anything(),
       expect.anything()
     );
-    expect(screen.getByTestId("ensemble-distribution")).toHaveAttribute("data-selected-lead", "24");
+    expect(screen.getByTestId("ensemble-distribution")).toHaveAttribute(
+      "data-selected-lead",
+      "2026-08-13T06:00:00Z"
+    );
   });
 
   it("shows the point forecast error state inline", () => {
@@ -448,10 +444,8 @@ describe("ForecastDashboard", () => {
 
     render(<ForecastDashboard location={location} />);
 
-    expect(screen.getByText(/Ensemble Statistics/)).toBeInTheDocument();
-    expect(
-      screen.getByText("Ensemble data is not yet available for this forecast.")
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-section")).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-empty")).toBeInTheDocument();
   });
 
   it("never renders a metadata field (cycle_time) as a forecast chart title", () => {
@@ -574,8 +568,7 @@ describe("ForecastDashboard", () => {
       selection: {
         model: "gefs",
         variable: "temperature_2m",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 6,
+        validTime: "2026-08-13T06:00:00Z",
       },
       options: {
         models: [
@@ -638,10 +631,10 @@ describe("ForecastDashboard", () => {
       expect.anything()
     );
 
-    // Assert useEnsembleDistribution receives authoritative variable (temperature_2m) and selected lead (6)
+    // Assert useEnsembleDistribution receives authoritative variable and selected valid time
     expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
       location,
-      6,
+      "2026-08-13T06:00:00Z",
       "temperature_2m",
       expect.objectContaining({ model: "gefs" })
     );
@@ -658,8 +651,7 @@ describe("ForecastDashboard", () => {
       selection: {
         model: "gefs",
         variable: "temperature_2m",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 12,
+        validTime: "2026-08-13T06:00:00Z",
       },
       options: {
         models: [
@@ -717,7 +709,7 @@ describe("ForecastDashboard", () => {
     );
     expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
       location,
-      12,
+      "2026-08-13T06:00:00Z",
       "temperature_2m",
       expect.objectContaining({ model: "gefs" })
     );
@@ -728,8 +720,7 @@ describe("ForecastDashboard", () => {
       selection: {
         model: "gefs",
         variable: "total_precipitation",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 6,
+        validTime: "2026-08-13T06:00:00Z",
       },
       options: {
         models: [
@@ -773,7 +764,7 @@ describe("ForecastDashboard", () => {
     );
     expect(mockUseEnsembleDistribution).toHaveBeenCalledWith(
       location,
-      6,
+      "2026-08-13T06:00:00Z",
       "total_precipitation",
       expect.objectContaining({ model: "gefs" })
     );
@@ -785,8 +776,6 @@ describe("ForecastDashboard", () => {
       selection: {
         model: "gefs",
         variable: "temperature_2m",
-        initialTime: "2026-08-13T06:00:00Z",
-        leadTimeHours: 0,
       },
       options: {
         models: [
@@ -851,8 +840,7 @@ describe("ForecastDashboard", () => {
       selection: {
         model: "gefs",
         variable: "precipitation_amount_3h",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 6,
+        validTime: "2026-08-13T06:00:00Z",
       },
       options: {
         models: [
@@ -985,7 +973,10 @@ describe("ForecastDashboard", () => {
 
     // Ensemble phase support component is rendered
     expect(screen.getByTestId("ensemble-phase-support")).toBeInTheDocument();
-    expect(screen.getByTestId("ensemble-phase-support")).toHaveAttribute("data-selected-lead", "6");
+    expect(screen.getByTestId("ensemble-phase-support")).toHaveAttribute(
+      "data-selected-lead",
+      "2026-08-13T06:00:00Z"
+    );
   });
 
   it("renders dynamically resolved elevation when location has null elevation and elevation resolves", () => {
@@ -1094,9 +1085,7 @@ describe("ForecastDashboard", () => {
     rerender(<ForecastDashboard location={location} />);
 
     expect(screen.queryByTestId("meteogram")).not.toBeInTheDocument();
-    expect(
-      screen.getByText("No hourly forecast available for the selected variable.")
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("point-forecast-empty")).toBeInTheDocument();
   });
 
   describe("Ensemble valid-time provenance under Lifecycle V2", () => {
@@ -1149,8 +1138,6 @@ describe("ForecastDashboard", () => {
           model: "gefs",
           variable: "temperature_2m",
           validTime: "2026-08-13T06:00:00Z",
-          initialTime: "2026-08-13T00:00:00Z",
-          leadTimeHours: 6,
         },
         options: {
           models: [
@@ -1255,8 +1242,6 @@ describe("ForecastDashboard", () => {
           model: "gefs",
           variable: "temperature_2m",
           validTime: "2026-08-13T12:00:00Z",
-          initialTime: "2026-08-13T06:00:00Z",
-          leadTimeHours: 6,
         },
         options: {
           models: [

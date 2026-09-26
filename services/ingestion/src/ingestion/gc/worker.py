@@ -253,8 +253,6 @@ def run_reclamation_worker_pass(
     batch_size: int | None = None,
     lease_seconds: float | None = None,
     delete_enabled: bool | None = None,
-    max_retries: int | None = None,
-    base_backoff_seconds: float | None = None,
     now: datetime | None = None,
     version_string: str = "v1.0",
 ) -> ReclamationWorkerResult:
@@ -277,14 +275,6 @@ def run_reclamation_worker_pass(
     b_size = batch_size if batch_size is not None else settings.RECLAMATION_BATCH_SIZE
     l_secs = lease_seconds if lease_seconds is not None else settings.RECLAMATION_LEASE_SECONDS
     del_en = delete_enabled if delete_enabled is not None else settings.RECLAMATION_DELETE_ENABLED
-    # ``max_retries`` / ``base_backoff_seconds`` stay in the signature for API
-    # compatibility but no longer drive this path: the previous per-target
-    # retry/quarantine branch was unreachable (the single-object delete helper
-    # swallowed every error, so a failed delete was recorded as reclaimed), and
-    # DeleteObjects cannot attribute failures per key. Chunk-level failures are
-    # reported by ``_delete_physical_objects_batch`` instead. Restoring
-    # per-target retry/quarantine changes what status a row gets on failure, so
-    # it is deliberately out of scope here.
     lease_until = now_utc + timedelta(seconds=l_secs)
 
     is_postgres = bool(session.bind and session.bind.dialect.name == "postgresql")

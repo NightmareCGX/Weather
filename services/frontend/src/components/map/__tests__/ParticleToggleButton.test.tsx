@@ -6,10 +6,9 @@ describe("ParticleToggleButton", () => {
     const onToggle = jest.fn();
     render(<ParticleToggleButton enabled={true} onToggle={onToggle} />);
 
-    const button = screen.getByRole("button", { name: "Toggle wind particle animation" });
+    const button = screen.getByTestId("wind-particle-toggle");
     expect(button).toBeInTheDocument();
     expect(button).toHaveAttribute("aria-pressed", "true");
-    expect(button).toHaveAttribute("title", "Pause wind particle animation");
 
     fireEvent.click(button);
     expect(onToggle).toHaveBeenCalledTimes(1);
@@ -19,10 +18,9 @@ describe("ParticleToggleButton", () => {
     const onToggle = jest.fn();
     render(<ParticleToggleButton enabled={false} onToggle={onToggle} />);
 
-    const button = screen.getByRole("button", { name: "Toggle wind particle animation" });
+    const button = screen.getByTestId("wind-particle-toggle");
     expect(button).toBeInTheDocument();
     expect(button).toHaveAttribute("aria-pressed", "false");
-    expect(button).toHaveAttribute("title", "Enable wind particle animation");
 
     fireEvent.click(button);
     expect(onToggle).toHaveBeenCalledTimes(1);
@@ -32,7 +30,7 @@ describe("ParticleToggleButton", () => {
     const onToggle = jest.fn();
     render(<ParticleToggleButton enabled={true} onToggle={onToggle} disabled={true} />);
 
-    const button = screen.getByRole("button", { name: "Toggle wind particle animation" });
+    const button = screen.getByTestId("wind-particle-toggle");
     expect(button).toBeDisabled();
 
     fireEvent.click(button);

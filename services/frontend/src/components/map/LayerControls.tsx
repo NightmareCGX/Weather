@@ -47,6 +47,7 @@ export function LayerControls() {
         <button
           type="button"
           onClick={retry}
+          data-testid="retry-button"
           className="rounded border border-red-800 bg-red-900/40 px-2 py-0.5 text-xs font-medium text-red-200 hover:bg-red-800/50"
         >
           Retry
@@ -57,7 +58,10 @@ export function LayerControls() {
 
   if (availability.models.length === 0 || selection === null) {
     return (
-      <div className="border-b border-slate-800 bg-slate-900/90 px-4 py-2.5 text-sm text-slate-400">
+      <div
+        className="border-b border-slate-800 bg-slate-900/90 px-4 py-2.5 text-sm text-slate-400"
+        data-testid="layer-controls-empty"
+      >
         No forecast data available.
       </div>
     );
@@ -72,6 +76,7 @@ export function LayerControls() {
           value={selection.model}
           onChange={(event) => setModel(event.target.value)}
           aria-label="Model"
+          data-testid="model-select"
         >
           {options.models.map((model) => (
             <option key={model.id} value={model.id}>
@@ -88,6 +93,7 @@ export function LayerControls() {
           value={selection.variable}
           onChange={(event) => setVariable(event.target.value)}
           aria-label="Variable"
+          data-testid="variable-select"
         >
           {options.variables.map((variable) => (
             <option key={variable.id} value={variable.id}>
@@ -104,6 +110,7 @@ export function LayerControls() {
           value={selection.validTime ?? ""}
           onChange={(event) => setValidTime?.(event.target.value)}
           aria-label="Valid time"
+          data-testid="valid-time-select"
         >
           {(options.validTimes ?? []).map((vt) => (
             <option key={vt} value={vt}>

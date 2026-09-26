@@ -124,7 +124,7 @@ describe("Meteogram", () => {
     expect(screen.getByText("mm")).toBeInTheDocument();
 
     // Check phase legend elements
-    expect(screen.getByText("Phases:")).toBeInTheDocument();
+    expect(screen.getByTestId("phase-legend")).toBeInTheDocument();
     expect(screen.getByText("Rain")).toBeInTheDocument();
     expect(screen.getByText("Snow")).toBeInTheDocument();
     expect(screen.getByText("Freezing Rain")).toBeInTheDocument();

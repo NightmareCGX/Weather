@@ -3,10 +3,11 @@
 Next.js (App Router) + TypeScript + Tailwind CSS client for the Global
 Probabilistic Weather Forecasting Platform.
 
-- **Milestone 12 foundation:** a MapLibre GL JS map with base (OSM) tiles, a
+- **Map viewer (Milestone 12):** a MapLibre GL JS map with base (OSM) tiles, a
   weather raster layer configured from `/v1/maps` metadata, and a
   model/variable/lead-time control surface.
-- **Milestone 13:** location search autocomplete (`/v1/search`), map point
+- **Forecast dashboard (Milestone 13):** location search autocomplete
+  (`/v1/search`), map point
   selection, a selected-location forecast dashboard with hourly meteograms
   (`/v1/points`), ensemble statistics / spread (`/v1/ensembles`), and an
   Ensemble Distribution view (member histogram + dot plot) that renders only
@@ -14,7 +15,7 @@ Probabilistic Weather Forecasting Platform.
 
 ## Prerequisites
 
-- Node.js >= 18.17 (Next.js 14, the pinned `maplibre-gl@4.1.0`, `recharts`).
+- Node.js >= 20 (Next.js 14, the pinned `maplibre-gl@4.1.0`, `recharts`).
 - The FastAPI backend running on `127.0.0.1:8000` (uvicorn default) for live
   use. Start it from `services/api` with `uvicorn api.main:app`. Backend
   container services (PostgreSQL, Redis, MinIO) must be up via
@@ -48,11 +49,7 @@ the `API_PROXY_TARGET` environment variable if it is not on `127.0.0.1:8000`.
 
 ## Weather layer note
 
-`/v1/maps` is a metadata-only endpoint: it returns the tile template, zoom
-range, and legend, but the backend does not serve tile imagery yet. The map
-configures a weather raster source/layer from that metadata; until the backend
-serves tiles, requests for weather tiles may 404 and the base map keeps
-rendering. This graceful degradation is expected, not a blocker.
+The API serves the weather tiles itself through the `/v1/maps/{model}/{variable}/{level}/{z}/{x}/{y}.png` endpoints (available since Milestone 10), each response carrying a strong ETag with `304 Not Modified` revalidation (see `docs/API.md` §4.2). The frontend consumes those tiles via MapLibre raster sources configured from the `/v1/maps` metadata (tile template, zoom range, and legend).
 
 ## Ensemble Distribution View
 

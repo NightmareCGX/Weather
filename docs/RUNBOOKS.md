@@ -2,6 +2,17 @@
 
 This document is the authoritative operational runbook framework for deploying, operating, diagnosing, and recovering the Global Probabilistic Weather Platform.
 
+## Operator Utility Scripts (`scripts/`)
+
+| Script | Purpose | Typical invocation |
+|---|---|---|
+| `shadow_v2.py` | sharded_v2 rollout gate: validate a canonical v1 store against its shadow-v2 re-encoding (numerical equivalence verdict), or clean up shadow-namespace stores. See docs/DEPLOYMENT.md §3.2. | `uv run --no-sync python scripts/shadow_v2.py validate ...` |
+| `hydrate_city_elevations.py` | Offline batch backfill of `cities.elevation_m` from Open-Meteo (pairs with migration 006). | `uv run --no-sync python scripts/hydrate_city_elevations.py [--batch-size 100] [--limit 1000] [--dry-run]` |
+| `smoke_collectors_runtime.py` | Live smoke audit that the monitoring collectors return real values against the running PostgreSQL/MinIO. | `uv run --no-sync python scripts/smoke_collectors_runtime.py` |
+| `verify_monitoring_runtime.py` | Live verification of the alert engine, metrics, and recovery behaviors end to end. | `uv run --no-sync python scripts/verify_monitoring_runtime.py` |
+| `cleanup_test_pollution.py` | One-time cleanup of pytest pollution rows in a live catalog (see docs/lifecycle-v3-architecture.md). | `uv run --no-sync python scripts/cleanup_test_pollution.py` |
+| `check_dependency_alignment.py` | CI gate asserting shared runtime dependency alignment across workspace pyprojects (run automatically in CI; safe to run manually). | `uv run --no-sync python scripts/check_dependency_alignment.py` |
+
 ---
 
 ## 1. Parameter Placeholder Conventions
@@ -98,17 +109,21 @@ Execute these steps in strict sequence for a brand-new production deployment:
 Run Alembic migrations against the production database:
 ```bash
 cd services/api
-DATABASE_URL="<PRODUCTION_DATABASE_URL>" poetry run alembic upgrade head
+DATABASE_URL="<PRODUCTION_DATABASE_URL>" uv run --no-sync alembic upgrade head
 ```
 *Verification:* Confirm Alembic head revision:
 ```bash
-DATABASE_URL="<PRODUCTION_DATABASE_URL>" poetry run alembic current
+DATABASE_URL="<PRODUCTION_DATABASE_URL>" uv run --no-sync alembic current
 ```
 
 ### Step 2: Seed Spatial Reference Data (If Configured)
-If reference cities or stations are deployed from SQL seed dumps:
+The repository ships no SQL seed dumps — the `seeds/` directory is not part of
+the repo. Reference cities, ski resorts, and stations used by the test suites
+are provisioned from the fixtures documented in
+`services/api/tests/fixtures/README.md`. If a deployment carries a
+site-provided SQL seed file for reference locations, apply it manually:
 ```bash
-psql "<PRODUCTION_DATABASE_URL>" -f seeds/reference_locations.sql
+psql "<PRODUCTION_DATABASE_URL>" -f <SEED_FILE>.sql
 ```
 
 ### Step 3: Start Core API Serving Service
@@ -121,7 +136,7 @@ MINIO_ENDPOINT="<OBJECT_STORAGE_ENDPOINT>" \
 MINIO_ACCESS_KEY="<OBJECT_STORAGE_ACCESS_KEY>" \
 MINIO_SECRET_KEY="<OBJECT_STORAGE_SECRET_KEY>" \
 MINIO_SECURE="true" \
-poetry run uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers <API_WORKERS>
+uv run --no-sync uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers <API_WORKERS>
 ```
 
 ### Step 4: Start Frontend Service
@@ -144,7 +159,7 @@ MINIO_ACCESS_KEY="<OBJECT_STORAGE_ACCESS_KEY>" \
 MINIO_SECRET_KEY="<OBJECT_STORAGE_SECRET_KEY>" \
 MINIO_SECURE="true" \
 MINIO_BUCKET_NAME="<OBJECT_STORAGE_BUCKET>" \
-poetry run weather-ingest ingest \
+uv run --no-sync weather-ingest ingest \
   --model gfs \
   --cycle-date <LATEST_CYCLE_DATE> \
   --cycle-hour <LATEST_CYCLE_HOUR> \
@@ -162,7 +177,7 @@ MINIO_ACCESS_KEY="<OBJECT_STORAGE_ACCESS_KEY>" \
 MINIO_SECRET_KEY="<OBJECT_STORAGE_SECRET_KEY>" \
 MINIO_SECURE="true" \
 MINIO_BUCKET_NAME="<OBJECT_STORAGE_BUCKET>" \
-poetry run weather-ingest realtime
+uv run --no-sync weather-ingest realtime
 ```
 
 ### Step 7: Start Retention Garbage Collection (GC) Daemon
@@ -175,7 +190,7 @@ MINIO_ACCESS_KEY="<OBJECT_STORAGE_ACCESS_KEY>" \
 MINIO_SECRET_KEY="<OBJECT_STORAGE_SECRET_KEY>" \
 MINIO_SECURE="true" \
 MINIO_BUCKET_NAME="<OBJECT_STORAGE_BUCKET>" \
-poetry run weather-ingest gc --interval-seconds 1800
+uv run --no-sync weather-ingest gc --interval-seconds 1800
 ```
 
 ---
@@ -191,13 +206,13 @@ poetry run weather-ingest gc --interval-seconds 1800
 cd services/api
 
 # 1. Check pending revisions:
-DATABASE_URL="<PRODUCTION_DATABASE_URL>" poetry run alembic current
+DATABASE_URL="<PRODUCTION_DATABASE_URL>" uv run --no-sync alembic current
 
 # 2. Apply migrations to head:
-DATABASE_URL="<PRODUCTION_DATABASE_URL>" poetry run alembic upgrade head
+DATABASE_URL="<PRODUCTION_DATABASE_URL>" uv run --no-sync alembic upgrade head
 
 # 3. Verify schema state:
-DATABASE_URL="<PRODUCTION_DATABASE_URL>" poetry run alembic current
+DATABASE_URL="<PRODUCTION_DATABASE_URL>" uv run --no-sync alembic current
 ```
 
 ### Migration Failure Handling:
@@ -233,7 +248,7 @@ DATABASE_URL="<PRODUCTION_DATABASE_URL>" poetry run alembic current
 ### Starting the Scheduler:
 ```bash
 cd services/ingestion
-poetry run weather-ingest realtime
+uv run --no-sync weather-ingest realtime
 ```
 
 ### Operational Invariants & Leadership:
@@ -267,7 +282,7 @@ poetry run weather-ingest realtime
 ### Invocation Modes:
 1. **Continuous Daemon Mode (Recommended):**
    ```bash
-   poetry run weather-ingest gc --interval-seconds 1800 --bucket <OBJECT_STORAGE_BUCKET>
+   uv run --no-sync weather-ingest gc --interval-seconds 1800 --bucket <OBJECT_STORAGE_BUCKET>
    ```
    Each daemon pass runs the full Lifecycle V3 pipeline: bookkeeping ->
    planner -> worker -> sweeper, gated by two-level authorization flags (see
@@ -276,13 +291,13 @@ poetry run weather-ingest realtime
    GC advisory lock; no cron wiring is required.
 2. **Single-Pass Mode (Cron / Manual Execution):**
    ```bash
-   poetry run weather-ingest gc --once --bucket <OBJECT_STORAGE_BUCKET>
+   uv run --no-sync weather-ingest gc --once --bucket <OBJECT_STORAGE_BUCKET>
    ```
    Runs one full pipeline pass (with the same authorization flags) and exits.
    The scheduled inventory stage never runs in `--once` mode.
 3. **Dry-Run Inspection Mode:**
    ```bash
-   poetry run weather-ingest gc --once --dry-run
+   uv run --no-sync weather-ingest gc --once --dry-run
    ```
 
 ### Pipeline Wiring (V3 planner -> worker -> bookkeeping mainline):

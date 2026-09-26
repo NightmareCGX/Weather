@@ -1,10 +1,8 @@
 import {
   calculateNextBoundaryDelayMs,
   computeServingStartValidTime,
-  filterGraceWindowValidTimes,
   filterServableValidTimes,
   isServableValidTime,
-  isWithinGraceWindow,
 } from "@/lib/forecast/availability";
 
 describe("Serving Left-Boundary Enforcement (Lifecycle V3 Phase 1)", () => {
@@ -108,17 +106,6 @@ describe("Serving Left-Boundary Enforcement (Lifecycle V3 Phase 1)", () => {
     it("returns null when serving_start_valid_time is missing", () => {
       expect(calculateNextBoundaryDelayMs(null)).toBeNull();
       expect(calculateNextBoundaryDelayMs({ models: [] })).toBeNull();
-    });
-  });
-
-  describe("backward compatibility aliases", () => {
-    it("isWithinGraceWindow and filterGraceWindowValidTimes enforce the cadence boundary", () => {
-      const at0900 = new Date("2026-09-10T09:00:00.000Z").getTime();
-      expect(isWithinGraceWindow("2026-09-10T06:00:00.000Z", at0900)).toBe(false);
-      expect(isWithinGraceWindow("2026-09-10T09:00:00.000Z", at0900)).toBe(true);
-
-      const times = ["2026-09-10T06:00:00.000Z", "2026-09-10T09:00:00.000Z"];
-      expect(filterGraceWindowValidTimes(times, at0900)).toEqual(["2026-09-10T09:00:00.000Z"]);
     });
   });
 });

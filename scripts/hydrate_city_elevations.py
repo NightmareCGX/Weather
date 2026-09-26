@@ -1,7 +1,7 @@
 """Explicit offline utility to batch-hydrate cities.elevation_m from Open-Meteo.
 
 Usage:
-    poetry run python scripts/hydrate_city_elevations.py [--batch-size 100] [--limit 1000] [--dry-run]
+    uv run --no-sync python scripts/hydrate_city_elevations.py [--batch-size 100] [--limit 1000] [--dry-run]
 
 This script is an explicit, offline maintenance tool only:
 - It uses Open-Meteo's batch elevation endpoint (up to 100 coordinates per request);

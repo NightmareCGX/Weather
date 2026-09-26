@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 
 import { EnsembleChart, EnsembleChartTooltip } from "@/components/charts/EnsembleChart";
 import type { EnsembleStatisticsData } from "@/lib/api/types";
@@ -78,7 +78,7 @@ describe("EnsembleChart", () => {
       })
     ).toBeInTheDocument();
     expect(screen.getByText("Temperature (2 m)")).toBeInTheDocument();
-    expect(screen.getByText(/percentile range/)).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-range-note")).toBeInTheDocument();
     expect(screen.getByText("P10–P90")).toBeInTheDocument();
     expect(screen.getByText("P25–P75")).toBeInTheDocument();
     expect(screen.getByText("Median")).toBeInTheDocument();
@@ -89,7 +89,7 @@ describe("EnsembleChart", () => {
     render(
       <EnsembleChart byLead={byLeadWithValidTimes} variableLabel="Temperature (2 m)" unit="°C" />
     );
-    expect(screen.getByText("(°C)")).toBeInTheDocument();
+    expect(within(screen.getByTestId("ensemble-fan-chart")).getByText(/°C/)).toBeInTheDocument();
   });
 
   it("renders valid-time calendar timestamps in UTC on X-axis and tooltip when no timezone provided", () => {

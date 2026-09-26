@@ -1,8 +1,6 @@
 import {
   buildForecastOptions,
   buildPinnedTileUrl,
-  defaultInitialTime,
-  defaultLeadTime,
   defaultModel,
   defaultVariable,
   findInitialTime,
@@ -56,22 +54,19 @@ const mockAvailability: ForecastAvailability = {
 };
 
 describe("availability helpers", () => {
-  it("resolves default model, variable, initial time, and lead time", () => {
+  it("resolves default model, variable, and initial time", () => {
     expect(defaultModel(mockAvailability)).toBe("gfs");
     const model = findModel(mockAvailability, "gfs");
     expect(defaultVariable(model)).toBe("temperature_2m");
     const variable = findVariable(model, "temperature_2m");
-    expect(defaultInitialTime(variable)).toBe("2026-08-13T00:00:00Z");
     const initialTime = findInitialTime(variable, "2026-08-13T00:00:00Z");
-    expect(defaultLeadTime(initialTime)).toBe(0);
+    expect(initialTime?.lead_time_hours).toEqual([0, 6, 12, 18]);
   });
 
   it("builds cascading forecast options", () => {
     const options = buildForecastOptions(mockAvailability, {
       model: "gfs",
       variable: "temperature_2m",
-      initialTime: "2026-08-13T00:00:00Z",
-      leadTimeHours: 6,
     });
     expect(options.models.length).toBe(1);
     expect(options.model?.id).toBe("gfs");
@@ -259,23 +254,14 @@ describe("resolveSpatialLayer", () => {
     expect(layer?.source_cycle).toBe("2026-08-13T00:00:00Z");
   });
 
-  it("synchronously constructs authoritative SpatialLayer from availability descriptor with legacy initialTime", () => {
-    const layer = resolveSpatialLayer(mockAvailability, {
-      model: "gfs",
-      variable: "temperature_2m",
-      validTime: "",
-      initialTime: "2026-08-13T00:00:00Z",
-      leadTimeHours: 12,
-    });
-
-    expect(layer).not.toBeNull();
-    expect(layer?.tile_url_template).toBe(
-      "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=12&initial_time=2026-08-13T00%3A00%3A00Z"
-    );
-    expect(layer?.min_zoom).toBe(0);
-    expect(layer?.max_zoom).toBe(9);
-    expect(layer?.lead_time_hours).toBe(12);
-    expect(layer?.legend.unit).toBe("°C");
+  it("returns null when the selection carries no valid time (Lifecycle V2 selections always do)", () => {
+    expect(
+      resolveSpatialLayer(mockAvailability, {
+        model: "gfs",
+        variable: "temperature_2m",
+        validTime: "",
+      })
+    ).toBeNull();
   });
 
   it("returns null for incomplete, invalid, or absent selections", () => {
@@ -284,16 +270,12 @@ describe("resolveSpatialLayer", () => {
       resolveSpatialLayer(mockAvailability, {
         model: "nonexistent",
         variable: "temperature_2m",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 6,
       })
     ).toBeNull();
     expect(
       resolveSpatialLayer(mockAvailability, {
         model: "gfs",
-        variable: "temperature_2m",
-        initialTime: "2026-08-13T00:00:00Z",
-        leadTimeHours: 999,
+        variable: "nonexistent-variable",
       })
     ).toBeNull();
   });

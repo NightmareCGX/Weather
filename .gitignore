@@ -89,6 +89,6 @@ dl_real/
 accept_dl*/
 .venv-api-test/
 .zcode/
-artifacts/*.png
-artifacts/*.html
-artifacts/*.js
+.zcodeignore
+# Local acceptance/runtime output staging — never part of the deliverable.
+artifacts/

@@ -1,20 +1,33 @@
 # Global Probabilistic Weather Platform — Continuous Integration
 #
-# GitHub Actions CI pipeline protecting domain correctness, serving contracts,
-# ingestion invariants, frontend quality, and container runtime readiness.
+# CI contract (release/1.0):
+#   The pipeline gates on ARCHITECTURE INVARIANTS and OUTPUT CONSISTENCY, not
+#   on incidental surface. UI copy, labels, and cosmetic presentation are free
+#   to change without touching CI or tests; tests target stable hooks
+#   (data-testid / roles) and API/data shapes instead of visible strings.
+#   What CI does pin — deliberately, as no-drift contracts:
+#     * binary shard-container format + manifest keys  -> cross-package-contracts
+#     * OpenAPI schema (single golden, both tiers)     -> cross-package-contracts
+#     * cross-service config parity                    -> cross-package-contracts
+#     * sharded_v2 numerical equivalence vs v1         -> cross-package-contracts
+#     * lifecycle/status semantics end-to-end          -> api/ingestion pipelines
+#     * integration environment completeness (zero skipped tests) ->
+#       api-pipeline / ingestion-pipeline JUnit guards
 #
-# Architecture (Stage 7C / 7D / ARM64):
+# Architecture:
 #   1. change-detection         — dorny/paths-filter evaluates touched paths
 #   2. domain-pipeline          — Ruff + MyPy + Pytest (offline, 100% coverage gate)
 #   3. api-pipeline             — Ruff + MyPy + Pytest (PostgreSQL + Redis containers)
 #   4. ingestion-pipeline       — Ruff + MyPy + Pytest (PostgreSQL + Redis + MinIO containers)
 #   5. frontend-unit-build      — ESLint + Typecheck + Format + Jest + Next.js build
-#   6. frontend-e2e             — Playwright Chromium E2E (needs: frontend-unit-build)
-#   7. container-builds         — Multi-stage Docker image builds + runtime smoke tests (amd64)
-#   8. arm64-builds             — ARM64 container builds + dependency resolution & CLI smoke
-#   9. docs-metadata            — uv lock freshness, workspace buildability & metadata
-#  10. cross-package-contracts  — Stage 7D cross-package & OpenAPI contract suite
-#  11. ci-required              — Stable branch-protection aggregation gate (if: always())
+#      frontend-e2e             — Playwright Chromium E2E (needs: change-detection, frontend-unit-build)
+#   6. container-builds         — Multi-stage Docker image builds + runtime smoke tests (amd64)
+#   7. arm64-builds             — ARM64 container builds + dependency resolution & CLI smoke
+#   8. docs-metadata            — uv lock freshness, workspace buildability & metadata
+#   9. cross-package-contracts  — cross-package & OpenAPI contract suite
+#  10. ci-required              — Merge gate: fails if any needed job failed, was
+#                                 cancelled, or was blocked ('skipped' is the
+#                                 legitimate outcome of path filtering).
 
 name: CI
 
@@ -22,6 +35,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -37,6 +51,7 @@ jobs:
   change-detection:
     name: Change detection
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       domain: ${{ steps.filter.outputs.domain }}
       api: ${{ steps.filter.outputs.api }}
@@ -191,8 +206,28 @@ jobs:
       - name: Run API tests
         working-directory: services/api
         # Coverage floor enforced here only (not in pytest addopts) so partial
-        # runs such as the openapi-export job are not spuriously failed.
+        # runs such as the cross-package contract suite are not spuriously failed.
         run: uv run pytest --junitxml=api-junit.xml --cov=api --cov-report=term-missing --cov-fail-under=50
+
+      - name: Guard — no skipped tests (environment completeness invariant)
+        # The job provisions PostgreSQL and Redis, so every skip-when-no-service
+        # test has its condition satisfied. A skipped test here means the
+        # environment is miswired and the suite green-washed — fail loudly.
+        # Deliberately name-agnostic: tests may be renamed freely; the
+        # invariant is about the environment, not specific test identities.
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("services/api/api-junit.xml").getroot()
+          suites = root.findall("testsuite") or [root]
+          totals = {key: sum(int(s.get(key, 0)) for s in suites)
+                    for key in ("tests", "failures", "errors", "skipped")}
+          print("API suite:", totals)
+          assert totals["tests"] > 0, "JUnit report contains no tests"
+          assert totals["skipped"] == 0, "skipped tests in CI — integration environment incomplete"
+          assert totals["failures"] == 0 and totals["errors"] == 0
+          PY
 
       - name: Upload API test results on failure
         if: failure()
@@ -320,68 +355,28 @@ jobs:
       - name: Run Ingestion tests (with JUnit report)
         working-directory: services/ingestion
         # Coverage floor enforced here only (not in pytest addopts) so partial
-        # runs such as the cross-package contract tests are not spuriously failed.
+        # runs such as the cross-package contract suite are not spuriously failed.
         run: uv run pytest -W error::ResourceWarning --junitxml=ingestion-junit.xml --cov=ingestion --cov-report=term-missing --cov-fail-under=50
 
-      - name: Verify MinIO round-trip ran and passed (not skipped)
+      - name: Guard — no skipped tests (environment completeness invariant)
+        # The job provisions PostgreSQL, Redis and MinIO (WEATHER_TEST_MINIO=1),
+        # so every skip-when-no-service test has its condition satisfied —
+        # including the S3 round-trip, cross-process concurrency, and serving
+        # contract e2e suites that motivated the former per-name checks.
+        # Deliberately name-agnostic: tests may be renamed, parametrized or
+        # regrouped freely; the invariant protects the environment, not names.
         run: |
           python - <<'PY'
           import xml.etree.ElementTree as ET
-          root = ET.parse("services/ingestion/ingestion-junit.xml").getroot()
-          test = root.find(".//testcase[@name='test_s3_store_roundtrip_preserves_data']")
-          assert test is not None, "MinIO round-trip testcase not found in pytest report"
-          assert test.find("failure") is None and test.find("error") is None, "MinIO round-trip FAILED"
-          assert test.find("skipped") is None, "MinIO round-trip was SKIPPED"
-          print("MinIO round-trip verified passed")
-          PY
 
-      - name: Verify concurrency correctness and S3 lifecycle tests passed
-        run: |
-          python - <<'PY'
-          import xml.etree.ElementTree as ET
           root = ET.parse("services/ingestion/ingestion-junit.xml").getroot()
-          required = [
-              "test_exclusive_conflicts_with_shared",
-              "test_shared_shared_same_key_coexist",
-              "test_no_shared_to_exclusive_upgrade",
-              "test_minio_marker_atomic_put",
-              "test_minio_manifest_roundtrip",
-              "test_late_failed_wave_put_cannot_overwrite_newer_wave",
-              "test_required_materialized_object_deleted_invalidates",
-              "test_valid_omitted_fill_chunk_passes",
-              "test_cross_process_disjoint_deterministic_writes",
-              "test_cross_process_conflicting_ensemble_serializes",
-              "test_cross_process_four_way_conflict_no_lost_members",
-              "test_s3_fs_reset_during_active_event_loop",
-              "test_multi_wave_s3_reuse_and_cleanup",
-              "test_executor_workers_strong_registry_cleanup",
-              "test_explicit_close_and_later_finalizer_idempotent",
-              "test_close_failure_retry_semantics",
-          ]
-          for name in required:
-              test = root.find(f".//testcase[@name='{name}']")
-              assert test is not None, f"Required test {name!r} not found"
-              assert test.find("failure") is None and test.find("error") is None, f"Test {name!r} FAILED"
-              assert test.find("skipped") is None, f"Test {name!r} was SKIPPED"
-          print("All required concurrency and lifecycle tests verified passed")
-          PY
-
-      - name: Verify Serving Contract E2E tests passed
-        run: |
-          python - <<'PY'
-          import xml.etree.ElementTree as ET
-          root = ET.parse("services/ingestion/ingestion-junit.xml").getroot()
-          required = [
-              "test_serving_contract_e2e_gfs_and_gefs",
-              "test_serving_contract_legacy_v2_unsharded_compatibility",
-              "test_serving_contract_negative_assertions",
-          ]
-          for name in required:
-              test = root.find(f".//testcase[@name='{name}']")
-              assert test is not None, f"Serving contract testcase '{name}' not found"
-              assert test.find("failure") is None and test.find("error") is None, f"Test '{name}' FAILED"
-              assert test.find("skipped") is None, f"Test '{name}' was SKIPPED"
-          print("Serving contract E2E tests verified passed")
+          suites = root.findall("testsuite") or [root]
+          totals = {key: sum(int(s.get(key, 0)) for s in suites)
+                    for key in ("tests", "failures", "errors", "skipped")}
+          print("Ingestion suite:", totals)
+          assert totals["tests"] > 0, "JUnit report contains no tests"
+          assert totals["skipped"] == 0, "skipped tests in CI — integration environment incomplete"
+          assert totals["failures"] == 0 and totals["errors"] == 0
           PY
 
       - name: Upload Ingestion test results on failure
@@ -436,6 +431,8 @@ jobs:
 
   frontend-e2e:
     name: Frontend E2E (Playwright)
+    # E2E routes every /v1/** request through Playwright mocks, so API changes
+    # cannot affect this suite — it triggers on frontend and CI changes only.
     needs: [change-detection, frontend-unit-build]
     if: |
       always() &&
@@ -443,8 +440,7 @@ jobs:
       (
         github.event_name == 'push' ||
         needs.change-detection.outputs.ci == 'true' ||
-        needs.change-detection.outputs.frontend == 'true' ||
-        needs.change-detection.outputs.api == 'true'
+        needs.change-detection.outputs.frontend == 'true'
       )
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -481,8 +477,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
-          path: services/frontend/playwright-report/
+          # Playwright (reporter: line) writes failure diagnostics — traces,
+          # error contexts, screenshots — into its default test-results dir.
+          path: services/frontend/test-results/
           retention-days: 7
+          if-no-files-found: ignore
 
   # ===========================================================================
   # 6. CONTAINER BUILDS & RUNTIME SMOKE TESTS
@@ -497,7 +496,8 @@ jobs:
       needs.change-detection.outputs.domain == 'true' ||
       needs.change-detection.outputs.api == 'true' ||
       needs.change-detection.outputs.ingestion == 'true' ||
-      needs.change-detection.outputs.frontend == 'true'
+      needs.change-detection.outputs.frontend == 'true' ||
+      needs.change-detection.outputs.root_python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -713,7 +713,7 @@ jobs:
           python -c "import sys; sys.path.insert(0, 'packages/config/src'); import config; assert config.__version__ == '0.1.0'"
 
   # ===========================================================================
-  # 8. CROSS-PACKAGE CONTRACT COVERAGE (Stage 7D Gate)
+  # 9. CROSS-PACKAGE CONTRACT COVERAGE
   # ===========================================================================
   cross-package-contracts:
     name: Cross-package contract gates
@@ -775,7 +775,7 @@ jobs:
   # 10. STABLE MERGE GATE (ci-required)
   # ===========================================================================
   ci-required:
-    name: ci-required
+    name: ci-required (merge gate)
     needs:
       - change-detection
       - domain-pipeline
@@ -789,110 +789,40 @@ jobs:
       - cross-package-contracts
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Evaluate required CI gates
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          CHANGE_DETECTION_RESULT: ${{ needs.change-detection.result }}
-          DOMAIN_RESULT: ${{ needs.domain-pipeline.result }}
-          API_RESULT: ${{ needs.api-pipeline.result }}
-          INGESTION_RESULT: ${{ needs.ingestion-pipeline.result }}
-          FE_UNIT_RESULT: ${{ needs.frontend-unit-build.result }}
-          FE_E2E_RESULT: ${{ needs.frontend-e2e.result }}
-          CONTAINER_RESULT: ${{ needs.container-builds.result }}
-          ARM64_RESULT: ${{ needs.arm64-builds.result }}
-          DOCS_RESULT: ${{ needs.docs-metadata.result }}
-          CONTRACTS_RESULT: ${{ needs.cross-package-contracts.result }}
-          OUT_DOMAIN: ${{ needs.change-detection.outputs.domain }}
-          OUT_API: ${{ needs.change-detection.outputs.api }}
-          OUT_INGESTION: ${{ needs.change-detection.outputs.ingestion }}
-          OUT_FRONTEND: ${{ needs.change-detection.outputs.frontend }}
-          OUT_DOCKER: ${{ needs.change-detection.outputs.docker }}
-          OUT_DOCS: ${{ needs.change-detection.outputs.docs }}
-          OUT_CI: ${{ needs.change-detection.outputs.ci }}
-          OUT_ROOT_PY: ${{ needs.change-detection.outputs.root_python }}
+      # Single maintenance point for the merge gate: a job blocks the merge if
+      # and only if it ended 'failure', was 'cancelled', or was blocked
+      # ('action_required'). 'skipped' is the legitimate outcome of path
+      # filtering and never blocks. Adding or
+      # renaming a job only requires updating the needs list above and the
+      # loop below — no second gating table to keep in sync.
+      - name: Evaluate merge gate
         run: |
-          python - <<'PY'
-          import os, sys
-
-          event = os.environ.get("EVENT_NAME", "")
-          cd_result = os.environ.get("CHANGE_DETECTION_RESULT", "")
-
-          if cd_result != "success":
-              print(f"FATAL: change-detection job status was '{cd_result}' (expected 'success').")
-              sys.exit(1)
-
-          is_push = (event == "push")
-          out_ci = (os.environ.get("OUT_CI") == "true")
-          out_root_py = (os.environ.get("OUT_ROOT_PY") == "true")
-          out_domain = (os.environ.get("OUT_DOMAIN") == "true")
-          out_api = (os.environ.get("OUT_API") == "true")
-          out_ing = (os.environ.get("OUT_INGESTION") == "true")
-          out_fe = (os.environ.get("OUT_FRONTEND") == "true")
-          out_docker = (os.environ.get("OUT_DOCKER") == "true")
-          out_docs = (os.environ.get("OUT_DOCS") == "true")
-
-          out_contracts = (
-              is_push or out_ci or out_root_py or out_domain or out_api or out_ing or out_fe
-          )
-
-          # Determine whether each job was EXPECTED to run
-          expected = {
-              "domain-pipeline": is_push or out_ci or out_root_py or out_domain,
-              "api-pipeline": is_push or out_ci or out_root_py or out_api,
-              "ingestion-pipeline": is_push or out_ci or out_root_py or out_ing or out_api,
-              "frontend-unit-build": is_push or out_ci or out_fe,
-              "frontend-e2e": is_push or out_ci or out_fe or out_api,
-              "container-builds": is_push or out_ci or out_docker or out_domain or out_api or out_ing or out_fe,
-              "arm64-builds": is_push or out_ci or out_docker or out_domain or out_api or out_ing or out_root_py,
-              "docs-metadata": is_push or out_ci or out_docs or out_root_py,
-              "cross-package-contracts": out_contracts,
-          }
-
-          results = {
-              "domain-pipeline": os.environ.get("DOMAIN_RESULT", ""),
-              "api-pipeline": os.environ.get("API_RESULT", ""),
-              "ingestion-pipeline": os.environ.get("INGESTION_RESULT", ""),
-              "frontend-unit-build": os.environ.get("FE_UNIT_RESULT", ""),
-              "frontend-e2e": os.environ.get("FE_E2E_RESULT", ""),
-              "container-builds": os.environ.get("CONTAINER_RESULT", ""),
-              "arm64-builds": os.environ.get("ARM64_RESULT", ""),
-              "docs-metadata": os.environ.get("DOCS_RESULT", ""),
-              "cross-package-contracts": os.environ.get("CONTRACTS_RESULT", ""),
-          }
-
-          print("=== CI Gate Evaluation ===")
-          print(f"Event: {event}")
-          print("Change flags:", {
-              "ci": out_ci, "root_python": out_root_py, "domain": out_domain,
-              "api": out_api, "ingestion": out_ing, "frontend": out_fe,
-              "docker": out_docker, "docs": out_docs,
-          })
-          print("-" * 50)
-
-          failures = []
-          for job, res in results.items():
-              exp = expected[job]
-              status_label = f"result={res:<10} (expected_to_run={exp})"
-              if exp:
-                  if res == "success":
-                      print(f"[PASS] {job:<24} {status_label}")
-                  else:
-                      print(f"[FAIL] {job:<24} {status_label} - REQUIRED JOB DID NOT SUCCEED")
-                      failures.append(f"{job} (status: {res}, expected: success)")
-              else:
-                  if res in ("skipped", "success"):
-                      print(f"[PASS] {job:<24} {status_label} - legitimately skipped/succeeded")
-                  else:
-                      print(f"[FAIL] {job:<24} {status_label} - UNEXPECTED FAILURE IN OPTIONAL JOB")
-                      failures.append(f"{job} (status: {res})")
-
-          print("-" * 50)
-          if failures:
-              print(f"CI Gate FAILED with {len(failures)} failed/incomplete job(s):")
-              for f in failures:
-                  print(f"  - {f}")
-              sys.exit(1)
-
-          print("All required CI gates verified successfully. Merge gate GREEN.")
-          PY
+          set -u
+          fail=0
+          for entry in \
+            "change-detection=${{ needs.change-detection.result }}" \
+            "domain-pipeline=${{ needs.domain-pipeline.result }}" \
+            "api-pipeline=${{ needs.api-pipeline.result }}" \
+            "ingestion-pipeline=${{ needs.ingestion-pipeline.result }}" \
+            "frontend-unit-build=${{ needs.frontend-unit-build.result }}" \
+            "frontend-e2e=${{ needs.frontend-e2e.result }}" \
+            "container-builds=${{ needs.container-builds.result }}" \
+            "arm64-builds=${{ needs.arm64-builds.result }}" \
+            "docs-metadata=${{ needs.docs-metadata.result }}" \
+            "cross-package-contracts=${{ needs.cross-package-contracts.result }}"
+          do
+            job="${entry%%=*}"
+            result="${entry#*=}"
+            echo "${job}: ${result}"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ] || [ "$result" = "action_required" ]; then
+              echo "::error::CI gate '${job}' ended with status '${result}'"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Merge gate RED."
+            exit 1
+          fi
+          echo "All CI gates green. Merge gate GREEN."

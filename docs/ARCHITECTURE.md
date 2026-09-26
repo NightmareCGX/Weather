@@ -21,7 +21,7 @@ The Global Probabilistic Weather Platform is a high-throughput, cloud-native met
                                │  • Selective .idx Byte-Range GRIB2 Download  │
                                │  • Multiprocess DecodePool (cfgrib/ecCodes)  │
                                │  • Unit Normalization & Derivations          │
-                               │  • Sharded v1 Zarr Encoding                  │
+                               │  • Sharded v1/v2 Zarr Encoding               │
                                │  • Realtime Lead-Wave Scheduler & Discovery  │
                                │  • Retention Garbage Collector (GC Engine)   │
                                └──────────────┬────────────────┬──────────────┘
@@ -45,7 +45,7 @@ The Global Probabilistic Weather Platform is a high-throughput, cloud-native met
                                │        Serving Tier (services/api)           │
                                │  • FastAPI REST Framework                    │
                                │  • Distributed PostgreSQL SHARED Reader Gate │
-                               │  • Sharded v1 Byte-Range Chunk Reader        │
+                               │  • Sharded v1/v2 Byte-Range Chunk Reader     │
                                │  • Spatial Bilinear Grid Interpolation       │
                                │  • Probabilities, Percentiles & PDFs         │
                                │  • Dynamic Map Tile & Vector Field Server    │
@@ -66,12 +66,12 @@ The Global Probabilistic Weather Platform is a high-throughput, cloud-native met
 
 | Component | Repository Path | Core Technologies | Primary Responsibilities |
 | :--- | :--- | :--- | :--- |
-| **Ingestion Engine** | `services/ingestion` | Python 3.12, asyncio, `cfgrib`, `xarray`, `numcodecs`, `boto3`, `s3fs`, SQLAlchemy | Downloads GRIB2 messages, parses raw binary buffers, normalizes units, writes `sharded_v1` Zarr stores, schedules lead waves, and executes retention GC. |
+| **Ingestion Engine** | `services/ingestion` | Python 3.12, asyncio, `cfgrib`, `xarray`, `numcodecs`, `boto3`, `s3fs`, SQLAlchemy | Downloads GRIB2 messages, parses raw binary buffers, normalizes units, writes `sharded_v1` (default) or opt-in `sharded_v2` Zarr stores, schedules lead waves, and executes retention GC. |
 | **Serving Tier** | `services/api` | Python 3.12, FastAPI, Uvicorn, SQLAlchemy, GeoAlchemy2, `xarray`, `s3fs`, Redis | Exposes REST endpoints, validates requested models/coordinates, acquires `SHARED` advisory locks, performs granular Range GETs against Zarr stores, and computes domain outputs. |
 | **Frontend UI** | `services/frontend` | TypeScript, Next.js 14, React 18, MapLibre GL, Recharts, Tailwind CSS | Browser-based user interface for interactive map exploration, point meteograms, ensemble spaghetti/PDF charts, and location search. |
 | **Domain Logic** | `packages/domain` | Python 3.12, NumPy, `xarray` | Pure, dependency-free mathematical domain models: grid coordinates, bilinear interpolation, ensemble statistics, precipitation phase classification, verification metrics, and advisory lock key derivation. |
 | **Relational Database** | Infrastructure | PostgreSQL 18.6 + PostGIS 3.6.4 | Stores catalog hierarchy, progressive product availability, lifecycle fences, spatial point reference data, and coordinates distributed advisory locks. |
-| **Object Store** | Infrastructure | AWS S3 / MinIO | Primary repository for all multidimensional meteorological raster data formatted in `sharded_v1` Zarr layout. |
+| **Object Store** | Infrastructure | AWS S3 / MinIO | Primary repository for all multidimensional meteorological raster data formatted in the sharded Zarr layout (`sharded_v1` default; `sharded_v2` opt-in — see §4.4). |
 | **Response Cache** | Infrastructure | Redis 7 | Caches interpolated point forecast payloads and vector field grids by generation key to minimize repeated object storage reads. |
 
 ---
@@ -104,7 +104,9 @@ NOAA NOMADS / AWS S3
 [ Coordinator & Lock Acquisition ] ──► Acquire SHARED Store Gate & EXCLUSIVE Region Lock
        │
        ▼
-[ ShardedV1Writer ] ──► Pack 120 spatial chunks into binary shard containers
+[ Sharded Writer ] ──► Pack 120 spatial chunks into binary shard containers
+                        (encode_region_sharded dispatches on STORAGE_FORMAT_VERSION:
+                         sharded_v1 default / sharded_v2 opt-in; identical geometry)
        │
        ▼
 [ Staging Marker PUT ] ──► Upload __markers__/v1/{region_id}.json to S3
@@ -137,9 +139,14 @@ The `weather-ingest` CLI (`services/ingestion/src/ingestion/cli.py`) supports th
 
 ---
 
-## 4. Storage Architecture (`sharded_v1`)
+## 4. Storage Architecture (Sharded Container Formats)
 
-Forecast grid data is stored using the **Weather Platform Sharded v1 (`sharded_v1`)** binary layout.
+Forecast grid data is stored in the **Weather Platform Sharded** binary container layout. Two shard-container formats are supported, selected by the ingestion setting `STORAGE_FORMAT_VERSION` (`ingestion/core/config.py`):
+
+* **`sharded_v1`** — the frozen, live **default**. Every variable is stored as float32; historical byte behavior is frozen and must never change.
+* **`sharded_v2`** — implemented and **opt-in, pending rollout** (not deprecated, and not yet the default). Shares the v1 container geometry but persists each variable in its authoritative per-variable native dtype (see §4.4).
+
+Both formats share identical container geometry and store layout; only the chunk payload dtype differs.
 
 ### 4.1 Canonical Store Path Convention
 Each model run cycle is stored under a deterministic object storage prefix derived from the forecast identity:
@@ -179,12 +186,27 @@ Instead of storing tens of thousands of individual chunk files in S3, each 2D fi
   └────────────────────────────────────────────────────────────────────────┘
   ```
 
+The layout above is identical for `sharded_v1` and `sharded_v2`: the `0x53484152` ("SHAR") magic, 16-byte index entries, 12-byte trailer, Zstd level 5 compression, 120-chunk grid, and shard-key naming are all shared. In `sharded_v1` every chunk payload is float32; in `sharded_v2` the chunk dtype follows the per-variable matrix (§4.4).
+
 ### 4.3 Manifest & In-Place Overwrite Invariant
 * **Staging Markers:** As each region writes, a JSON marker is placed at `__markers__/v1/{region_id}.json`.
 * **Committed Manifest:** At finalization, `__commit__/v1/manifest.json` is written containing a unique `serving_generation` (UUID4 string), committed leads, and committed members.
+* **Format Stamp:** The manifest records the committed `storage_format_version` durably at every publish/finalize, enabling per-store reader dispatch in the API (§4.4).
 * **CRITICAL INVARIANT:**
   > **Logical generation is NOT an immutable physical generation.**  
   > Same-cycle re-ingestion overwrites the **same physical shard keys** in-place in object storage. Serving readers must hold the PostgreSQL `SHARED` advisory store gate across all chunk Range GETs to prevent reading partially overwritten containers.
+
+### 4.4 Storage Format Versioning (`sharded_v1` / `sharded_v2`)
+
+The ingestion setting `STORAGE_FORMAT_VERSION` (`ingestion/core/config.py`) selects the format for newly initialized forecast cycles: `"sharded_v1"` (default), `"sharded_v2"` (opt-in), or `"v2_unsharded"` (see below).
+
+* **Per-cycle format freeze:** the first sharded commit of a cycle snapshots the format; a mid-cycle configuration flip fails loudly with `CycleFormatConflictError` (`ingestion/core/base.py`) instead of producing a half-v1/half-v2 store. The in-process writer snapshot covers flips between region commits, and the manifest's durable `storage_format_version` stamp (§4.3) covers flips across process restarts.
+* **Per-variable native dtypes (`sharded_v2`):** resolved by the single source of truth `packages/domain/src/domain/storage_dtype.py::resolve_storage_dtype` — no module may keep its own copy of the matrix. Nine continuous variables are stored as little-endian float16 (`<f2`); `precipitation_amount_3h` and `cloud_ceiling` stay float32 (`<f4`) as *threshold-coupled semantic exceptions* (the exactly-0.10 mm dry/wet precipitation sentinel and the 19.99 km unlimited-ceiling sentinel); categorical precipitation flags (det/member roles) are uint8 (`u1`); ensemble-mean probability flags are float32. Pre-cast guards run before any cast: NaN is allowed, ±Inf and `|v| > 65504` are rejected, and flag domains are validated.
+* **Rollout gate:** the shadow-validation tool (`ingestion/core/shadow.py`, operator CLI `scripts/shadow_v2.py` with `validate` / `cleanup`) re-encodes a canonical v1 store's committed shards into a dedicated `shadow-v2` namespace (never registered in the catalog, therefore never served) and asserts that f32-exception variables are byte-identical, zero threshold-predicate flips occur, and f16 differences stay within the 0.5 tolerance bound.
+* **API reader dispatch (per store):** `api/core/zarr.py::get_sharded_reader` probes each store's committed manifest and returns a `ShardedV2Reader` (`api/core/zarr_v2.py`) when `storage_format_version == "sharded_v2"`, otherwise the frozen `ShardedV1Reader` (including for absent manifests). `ShardedV2Reader` subclasses `ShardedV1Reader` and overrides only `read_chunk` to decode and cache chunks in the native persisted dtype. Every serving call site (point forecasts, vector fields, map tiles, the ensemble-statistics readers, and the serving resolver) goes through `get_sharded_reader`.
+* **`v2_unsharded` legacy fallback:** a third value naming the LEGACY unsharded-Zarr fallback for manifest-less stores, read through the xarray path. It is named confusingly close to `sharded_v2` but is entirely unrelated to it.
+* **Rollback:** switching the setting back to `"sharded_v1"` returns new cycles to v1; already-committed v2 cycles keep serving through `ShardedV2Reader`. `sharded_v1` remains the current default; `sharded_v2` is pending rollout, not deprecated.
+* **Numerical-equality scope:** the float16/float32 payload comparisons in the rollout gate (and any future golden-value layer) are defined **within a single platform run**; cross-architecture byte identity of float payloads is explicitly not a goal — consistency across x86_64/arm64 is guaranteed only at the quantized-output boundary (tiles, Int16 vector fields). See docs/TESTING.md, "Numerical-equality scope".
 
 ---
 
@@ -216,7 +238,8 @@ HTTP Request (e.g. GET /v1/points?lat=40.0&lon=-105.0)
        ├── 5. Manifest Reader: probe __commit__/v1/manifest.json for serving_generation
        ├── 6. StoreHandleCache: retrieve or open lazy xarray.Dataset
        ├── 7. Bounded Selection: locate 2×2 neighborhood chunks (100×100) on grid
-       ├── 8. ShardedV1Reader: perform S3 Range GET for chunk byte slices
+       ├── 8. get_sharded_reader: per-store manifest dispatch (ShardedV1Reader
+       │      or ShardedV2Reader) performs S3 Range GET for chunk byte slices
        └── 9. Materialize numpy array & interpolate under the gate
        │
        ▼
@@ -232,8 +255,8 @@ HTTP Request (e.g. GET /v1/points?lat=40.0&lon=-105.0)
 ### 5.1 Endpoint Capabilities
 1. **Point Forecasts (`/v1/points`):** Returns hourly time-series interpolated bilinearly to requested latitude/longitude coordinates.
 2. **Ensemble Statistics & PDFs (`/v1/ensembles/statistics`, `/v1/ensembles/pdf`):** Calculates mean, median, standard deviation, spread, interquartile range, P10–P90 percentiles, and empirical probability density functions across 30 GEFS members.
-3. **Map Tiles (`/v1/maps/layers/{layer_id}/tiles/{z}/{x}/{y}.png`):** Generates 256×256 dynamic PNG tiles with meteorological color palettes.
-4. **Vector Wind Fields (`/v1/maps/layers/{layer_id}/vector-field`):** Serves gridded $u/v$ wind components for GPU-accelerated client particle animations.
+3. **Map Tiles (`/v1/maps/{model}/{variable}/{level}/{z}/{x}/{y}.png`):** Generates 256×256 dynamic PNG tiles with meteorological color palettes. A strong ETag over the rendered bytes enables cheap HTTP 304 revalidation (`api/routers/maps.py`).
+4. **Vector Wind Fields (`/v1/maps/{model}/wind_10m/vector-field`):** Serves gridded $u/v$ wind components for GPU-accelerated client particle animations.
 5. **System Health (`/v1/health`):** Live connectivity probes against PostgreSQL, Redis, and MinIO/S3. Returns 200 `healthy` or 503 `degraded`.
 
 ---
@@ -317,7 +340,8 @@ The platform employs a multi-tiered caching strategy to maximize serving through
    - Keyed by `(store_path, serving_generation)`.
    - Skips consolidated metadata (`.zmetadata`) re-reading for warm cycles while ensuring zero cross-generation leakage.
 3. **In-Memory Sharded Chunk & Index LRU Cache (`api.core.zarr.ShardedV1Reader`):**
-   - Caches parsed shard container index tables (up to 4096 entries) and decompressed 100×100 float32 chunks (up to 2048 chunks) per process.
+   - Caches parsed shard container index tables (up to 16,384 entries), decompressed 100×100 chunks (up to 512 chunks), and interpolated 2×2 corner values for point requests (up to 32,768 entries) per process.
+   - For `sharded_v2` stores, `ShardedV2Reader` caches chunks in their native persisted dtype (f16 chunks stay f16, u8 stay u8); readers themselves are held in a bounded per-process LRU via `get_sharded_reader` (8 entries).
 
 ---
 

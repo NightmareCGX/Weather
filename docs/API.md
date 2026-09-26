@@ -375,6 +375,11 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **Example Request**: `GET /v1/maps/gfs/temperature_2m/surface/8/51/98.png?valid_time=2026-07-21T06:00:00Z&initial_time=2026-07-21T00:00:00Z`
 - **HTTP Status Codes**: `200 OK`, `304 Not Modified` (matching `If-None-Match`), `404 Not Found` (unknown model/variable, no serving run, shard reclaimed mid-read), `422 Unprocessable Entity` (validation, out-of-range tile coordinates).
 
+#### 4.3 Wind Vector Field
+- **HTTP Method**: `GET`
+- **Endpoint**: `/v1/maps/{model}/wind_10m/vector-field`
+- **Purpose**: Quantized Int16 binary wind U/V field (`application/octet-stream`, gzip when the client sends `Accept-Encoding: gzip`) driving the frontend wind-particle animation and vector overlays. Accepts the same optional time-selection query parameters as the raster tile endpoints (`valid_time` / `lead_time_hours` / `initial_time`). The authoritative request/response schema is the exported `openapi.json` contract (`services/frontend/openapi.json`, verified in CI by both the API and frontend OpenAPI suites).
+
 ---
 
 ### DOMAIN 5: ENSEMBLE
@@ -474,8 +479,11 @@ Errors return standard HTTP status codes along with a structured machine-readabl
   }
   ```
 - **Place autocomplete** (`type=place`): delegates to the configured place
-  provider (Google Places API (New) by default, proxied server-side — the API
-  key never reaches the browser). Results are suggestions (`object: "place"`)
+  provider — `geoapify` (Geoapify Address Autocomplete, the default),
+  `locationiq` (LocationIQ Autocomplete), `google` (Places API (New)), or
+  `mapbox` (Mapbox Geocoding) — selected via the `SEARCH_PROVIDER` setting and
+  proxied server-side; the API
+  key never reaches the browser. Results are suggestions (`object: "place"`)
   that carry a `place_id` but **no resolved coordinates yet**; selecting one
   resolves the canonical place via `GET /v1/search/places/{place_id}` (name,
   lat/lon, country, region) so the client can recenter the map and update the

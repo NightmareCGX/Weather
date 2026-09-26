@@ -55,7 +55,7 @@ must always produce identical outputs.
 - **Formatting & Linting**: Code must conform to `ruff` formatting and linting rules.
 - **Docstrings**: Public functions and classes require clear Google-style docstrings.
 - **Error Handling**: Use explicit domain exceptions mapped to RFC 7807 problem details in the API layer. Never swallow exceptions silently.
-- **Configuration**: Use Pydantic `BaseSettings` for environment management. Settings live **per-service** under each service's own `core/config.py` (e.g. `services/api/src/api/core/config.py`, `services/ingestion/src/ingestion/core/config.py`) so each independently deployable service owns its configuration surface; `packages/config` is a thin shared package for versioning and cross-package constants, not the home of service settings.
+- **Configuration**: Use Pydantic `BaseSettings` for environment management. Settings live **per-service** under each service's own `core/config.py` (e.g. `services/api/src/api/core/config.py`, `services/ingestion/src/ingestion/core/config.py`) so each independently deployable service owns its configuration surface; parity of the shared infra variables across services is enforced by `tests/contracts/test_config_contract.py`. `packages/config` is an empty placeholder reserved for future extraction, not the home of service settings.
 
 ---
 
@@ -76,6 +76,9 @@ must always produce identical outputs.
 - **Integration Tests**: FastAPI endpoints and database queries require integration tests executed against Docker Compose test containers.
 - **Fixture-Based GRIB Parsing**: Ingestion tests must use sample GRIB2 fixtures stored in test directories.
 - **Network Isolation**: External weather services (NOAA NOMADS/S3) must be mocked using `respx` or `httpx` transport mocks. No live network calls during unit/integration test runs.
+- **Copy Independence**: Tests must NOT couple to incidental surface. Frontend tests locate elements via stable `data-testid` hooks (or roles) and assert API/data shapes — visible copy, labels, and cosmetic presentation may change without any test change. Where a test asserts rendered text, the text must be data passed into the component (or a domain constant), not component-internal copy.
+- **Architecture & Output Contracts**: Cross-service contracts (`tests/contracts`) deliberately pin the shard-container binary format, manifest keys, OpenAPI schema, configuration parity, and v1↔v2 numerical equivalence. Changing any of these is an architecture change and must update the contract explicitly — never loosen a contract to make a change pass silently.
+- **Zero Skips in CI**: In CI (where PostgreSQL, Redis and MinIO are provisioned), a skipped test indicates a miswired environment, not a pass. The api/ingestion pipelines fail on any skipped test; skip-when-no-service guards exist for local convenience only.
 
 ---
 

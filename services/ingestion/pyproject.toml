@@ -81,7 +81,8 @@ module-name = "ingestion"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # No coverage gate here: the 50% floor is enforced only by the CI full-suite
-# step (ci.yml "Run ingestion tests") so partial runs (single-file jobs,
+# step (ci.yml "Run Ingestion tests (with JUnit report)") so partial runs
+# (single-file jobs,
 # contract tests running from the root tests/ tree) are not spuriously failed.
 # ``domain`` is a production dependency (imported by ingestion.core.locks).
 # In the workspace dev/test environment, point pytest at the package source so

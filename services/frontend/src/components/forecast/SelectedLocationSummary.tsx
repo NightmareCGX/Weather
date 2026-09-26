@@ -26,6 +26,11 @@ export function SelectedLocationSummary({
 }: SelectedLocationSummaryProps) {
   const displayElevation = elevation_m !== undefined ? elevation_m : location.elevation_m;
   const isElevationLoading = elevationStatus === "loading" && displayElevation === null;
+  const elevationState = isElevationLoading
+    ? "loading"
+    : displayElevation !== null
+      ? "ready"
+      : "unavailable";
   return (
     <>
       <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b border-slate-800 bg-slate-900 px-4 py-2.5">
@@ -33,7 +38,9 @@ export function SelectedLocationSummary({
           <span className="shrink-0 rounded border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-xs font-mono text-cyan-400">
             {locationTypeLabel(location)}
           </span>
-          <h2 className="truncate text-sm font-bold text-slate-100">{location.name}</h2>
+          <h2 className="truncate text-sm font-bold text-slate-100" data-testid="location-name">
+            {location.name}
+          </h2>
         </div>
         {onClose && (
           <button
@@ -85,7 +92,11 @@ export function SelectedLocationSummary({
           </div>
           <div className="flex justify-between">
             <dt className="text-slate-400">Elevation</dt>
-            <dd className="font-mono tabular-nums text-cyan-400">
+            <dd
+              className="font-mono tabular-nums text-cyan-400"
+              data-testid="elevation-value"
+              data-state={elevationState}
+            >
               {isElevationLoading
                 ? "loading…"
                 : displayElevation !== null

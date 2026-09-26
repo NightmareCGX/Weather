@@ -28,6 +28,7 @@ export function LocateMeButton({
       onClick={onClick}
       disabled={disabled || isLocating}
       aria-label="Locate me"
+      data-testid="locate-me"
       aria-busy={isLocating}
       title={isLocating ? "Locating…" : "Locate me"}
       className={`flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700/80 bg-slate-900/90 text-slate-300 shadow-xl backdrop-blur-md transition-colors hover:bg-slate-800 hover:text-cyan-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500 disabled:opacity-60 sm:h-9 sm:w-9 ${className}`}

@@ -54,9 +54,6 @@ export interface ForecastSelectionContextValue {
   setModel: (model: string) => void;
   setVariable: (variable: string) => void;
   setValidTime?: (validTime: string) => void;
-  /** Legacy compatibility setters. */
-  setInitialTime?: (initialTime: string) => void;
-  setLeadTimeHours?: (leadTimeHours: number) => void;
   retry: () => void;
 }
 
@@ -252,21 +249,6 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
     });
   }, []);
 
-  // Legacy setters for backwards compatibility with any remaining callers
-  const setInitialTime = useCallback((initialTimeValue: string) => {
-    setSelection((current) => {
-      if (current === null) return current;
-      return { ...current, initialTime: initialTimeValue };
-    });
-  }, []);
-
-  const setLeadTimeHours = useCallback((leadTimeHours: number) => {
-    setSelection((current) => {
-      if (current === null) return current;
-      return { ...current, leadTimeHours };
-    });
-  }, []);
-
   // Synchronize selection with availability and grace window
   useEffect(() => {
     if (status !== "success" || availability === null) {
@@ -323,8 +305,6 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
       setModel,
       setVariable,
       setValidTime,
-      setInitialTime,
-      setLeadTimeHours,
       retry,
     }),
     [
@@ -337,8 +317,6 @@ export function ForecastSelectionProvider({ children }: { children: ReactNode })
       setModel,
       setVariable,
       setValidTime,
-      setInitialTime,
-      setLeadTimeHours,
       retry,
     ]
   );

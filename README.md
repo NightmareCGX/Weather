@@ -20,7 +20,7 @@ The platform currently ingests, normalizes, stores, and serves operational forec
        ┌────────────────────────────────────────────────────────┐
        │           services/ingestion (weather-ingest)          │
        │  Selective Byte-Range Download → Multiprocess Decode   │
-       │  Unit Normalization → Sharded v1 Zarr Encoding         │
+       │  Unit Normalization → Sharded v1/v2 Zarr Encoding      │
        └──────────────┬──────────────────────────┬──────────────┘
                       │                          │
                       ▼ (shards & manifests)     ▼ (catalog metadata & locks)
@@ -36,7 +36,7 @@ The platform currently ingests, normalizes, stores, and serves operational forec
        ┌────────────────────────────────────────────────────────┐
        │                     services/api                       │
        │  FastAPI Serving Layer + SHARED Advisory Reader Gate   │
-       │  Sharded v1 Reader + Bilinear Interpolation            │
+       │  Sharded v1/v2 Reader + Bilinear Interpolation         │
        │  Ensemble Stats/PDFs + Map Tiles + Redis Hot Cache     │
        └───────────────────────────┬────────────────────────────┘
                                    │
@@ -50,7 +50,7 @@ The platform currently ingests, normalizes, stores, and serves operational forec
 
 ### Core Pipeline Capabilities:
 1. **Selective Ingestion:** Fetches only requested meteorological fields using HTTP `.idx` byte-range GETs or direct S3 downloads, decoding GRIB2 files with multiprocessing worker pools (`cfgrib`/`ecCodes`).
-2. **Sharded v1 Storage Layout:** Stores tensor forecast data in canonical binary shard containers (120 spatial chunks of 100×100 per container) indexed at the tail, enabling granular single-cell or bounding-box Range GETs without reading entire forecast fields.
+2. **Sharded Storage Layout:** Stores tensor forecast data in canonical binary shard containers (120 spatial chunks of 100×100 per container) indexed at the tail, enabling granular single-cell or bounding-box Range GETs without reading entire forecast fields. Two format versions share the same container geometry: `sharded_v1` (float32 everywhere; the current default) and opt-in `sharded_v2` (per-variable native dtypes — float16 for most continuous fields — selected via `STORAGE_FORMAT_VERSION`, with per-cycle format freeze and per-store reader dispatch).
 3. **Progressive Availability:** Ingests forecasts in lead waves. Leads are published progressively to the PostgreSQL catalog (`partial` status) until the full canonical horizon is committed (`ready` status).
 4. **Concurrency & Serving Correctness:** Concurrency between concurrent writers and serving readers is coordinated via PostgreSQL 64-bit advisory locks (`SHARED` reader gate vs `EXCLUSIVE` finalizer/GC gate).
 5. **High-Performance Serving:** FastAPI serves point forecasts (bilinearly interpolated), ensemble summary statistics and PDF distributions, dynamic raster map tiles (PNG), and vector wind fields.
@@ -141,7 +141,7 @@ cd services/api && uv run pytest
 ---
 
 ### Step 4: Run Database Migrations
-Apply schema migrations (001–004) to PostgreSQL:
+Apply schema migrations (001–009) to PostgreSQL:
 ```bash
 cd services/api && uv run alembic upgrade head && cd ../..
 ```
@@ -234,15 +234,16 @@ cd services/frontend && npm run lint && npm run typecheck && npm run format:chec
 
 * **Implemented & Verified:**
   * NOAA GFS (0.25°) and GEFS (0.5° 30-member) operational ingestion pipelines.
-  * `sharded_v1` binary Zarr container storage and granular Range GET readers.
+  * `sharded_v1` binary Zarr container storage and granular Range GET readers, plus the implemented (opt-in, pending rollout) `sharded_v2` per-variable float16 format with shadow-validation gate.
   * Realtime lead-wave scheduler with automated discovery and progressive publication.
   * PostgreSQL advisory-lock coordination (`SHARED` reader gate vs `EXCLUSIVE` writer/GC gate).
   * FastAPI serving layer for point forecasts, ensemble statistics/PDFs, map tiles, and vector fields.
   * Next.js 14 interactive map and forecast dashboard frontend.
   * Cycle supersession lifecycle tracking and storage retention GC.
   * First-class multi-architecture container support (`native linux/amd64` and `native linux/arm64`) with automated GitHub Actions ARM64 build and CLI smoke guardrail (`arm64-builds`).
-* **Under Active Development (Stage 7):**
-  * Engineering baseline standardization, CI workflow redesign, and deployment runbooks.
+* **Under Active Development (release/1.0):**
+  * `sharded_v2` production rollout (GFS deterministic → GEFS mean → GEFS members, gated by `scripts/shadow_v2.py` validation).
+  * Monitoring stack provisioning (external Prometheus + Grafana consuming the in-process exporters).
 * **Deferred Backlog Items:**
   * Additional model expansions (HRRR, ECMWF) and upper-air isobaric variable expansion.
   * Precomputed ensemble mean fields and multi-lead request batching optimizations.
@@ -259,3 +260,7 @@ cd services/frontend && npm run lint && npm run typecheck && npm run format:chec
 * [`docs/RUNBOOKS.md`](docs/RUNBOOKS.md) — Operational runbooks, failure recovery procedures, and diagnostics.
 * [`docs/MODELS.md`](docs/MODELS.md) — Meteorological model specifications and variable mapping contracts.
 * [`docs/TESTING.md`](docs/TESTING.md) — Testing philosophy, coverage requirements, and CI matrix.
+* [`docs/MONITORING.md`](docs/MONITORING.md) — Metrics catalog, alert rules, and the Grafana dashboard.
+* [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) — Engineering workflow and quality gates.
+* [`docs/lifecycle-v3-architecture.md`](docs/lifecycle-v3-architecture.md) — Authoritative data-lifecycle (supersession, reclamation, GC) design.
+* [`docs/AI_PLAN.md`](docs/AI_PLAN.md) — Future AI downscaling plan (not yet implemented).

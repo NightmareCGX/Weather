@@ -191,7 +191,10 @@ function CenterBadge({ center }: { center: CenterHealth }) {
                     <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${modelTone.dot}`} />
                     <span className="truncate font-medium text-slate-200">{model.name}</span>
                     {model.isEnsemble && (
-                      <span className="shrink-0 rounded border border-slate-600 px-1 text-[9px] font-bold text-slate-400">
+                      <span
+                        className="shrink-0 rounded border border-slate-600 px-1 text-[9px] font-bold text-slate-400"
+                        data-testid="ensemble-flag"
+                      >
                         ENS
                       </span>
                     )}
