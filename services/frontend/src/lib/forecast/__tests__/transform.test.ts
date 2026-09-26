@@ -13,6 +13,8 @@ import {
   forecastLeadTimes,
   forecastVariableCodes,
   histogramBins,
+  niceDistributionTicks,
+  tickDecimals,
   toEnsembleChartData,
   toEnsembleFanData,
   toEnsemblePhaseSupportData,
@@ -820,6 +822,53 @@ describe("ensembleStatisticsEntries", () => {
         stdDev: 0.0,
       };
       expect(distributionXDomain(constantSummary, null)).toEqual([19.0, 21.0]);
+    });
+  });
+
+  describe("niceDistributionTicks", () => {
+    it("returns evenly spaced ticks on the 1/2/5 ladder inside the domain", () => {
+      expect(niceDistributionTicks(18.3, 19.0)).toEqual([
+        18.3, 18.4, 18.5, 18.6, 18.7, 18.8, 18.9, 19.0,
+      ]);
+      expect(niceDistributionTicks(18.732599006375922, 19.018571328203766)).toEqual([
+        18.75, 18.8, 18.85, 18.9, 18.95, 19.0,
+      ]);
+    });
+
+    it("scales the step magnitude with the domain width", () => {
+      expect(niceDistributionTicks(0, 10)).toEqual([0, 2, 4, 6, 8, 10]);
+      expect(niceDistributionTicks(120, 260)).toEqual([120, 140, 160, 180, 200, 220, 240, 260]);
+    });
+
+    it("uses the 2.5 rung so wide domains densify too", () => {
+      expect(niceDistributionTicks(10, 30)).toEqual([10, 12.5, 15, 17.5, 20, 22.5, 25, 27.5, 30]);
+    });
+
+    it("returns an empty list for degenerate domains", () => {
+      expect(niceDistributionTicks(19.0, 18.3)).toEqual([]);
+      expect(niceDistributionTicks(19.0, 19.0)).toEqual([]);
+      expect(niceDistributionTicks(Number.NaN, 19.0)).toEqual([]);
+      expect(niceDistributionTicks(18.3, Number.POSITIVE_INFINITY)).toEqual([]);
+    });
+
+    it("keeps tick values free of float noise", () => {
+      for (const tick of niceDistributionTicks(18.3, 19.0)) {
+        expect(tick).toBe(Number(tick.toFixed(2)));
+      }
+    });
+  });
+
+  describe("tickDecimals", () => {
+    it("matches the tick step precision", () => {
+      expect(tickDecimals([18.4, 18.6, 18.8, 19.0])).toBe(1);
+      expect(tickDecimals([18.75, 18.8, 18.85])).toBe(2);
+      expect(tickDecimals([10, 12.5, 15])).toBe(1);
+      expect(tickDecimals([150, 200, 250])).toBe(0);
+    });
+
+    it("defaults to one decimal for empty or single-tick input", () => {
+      expect(tickDecimals([])).toBe(1);
+      expect(tickDecimals([18.5])).toBe(1);
     });
   });
 });

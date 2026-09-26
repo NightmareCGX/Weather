@@ -369,6 +369,69 @@ export function distributionXDomain(
 }
 
 /**
+ * Evenly spaced "nice" ticks (step from the 1/2/2.5/5/10 ladder) that fall
+ * inside `[min, max]`, targeting roughly `targetCount` labels.
+ *
+ * The default `targetCount` of 8 lands on roughly half the "sparse" ladder
+ * step (1 → 0.5, 2 → 1, 5 → 2.5), which reads well for the narrow
+ * distribution panel.
+ *
+ * The distribution charts pass these explicitly to both X-axes so the tick
+ * values are stable, moderately spaced, and identical between the histogram
+ * and the member rug, instead of Recharts' auto ticks which can print raw
+ * domain floats when no tickFormatter is set.
+ */
+export function niceDistributionTicks(min: number, max: number, targetCount = 8): number[] {
+  if (
+    !Number.isFinite(min) ||
+    !Number.isFinite(max) ||
+    max <= min ||
+    !Number.isFinite(targetCount) ||
+    targetCount < 1
+  ) {
+    return [];
+  }
+  const roughStep = (max - min) / targetCount;
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const residual = roughStep / magnitude;
+  const multiplier =
+    residual <= 1 ? 1 : residual <= 2 ? 2 : residual <= 2.5 ? 2.5 : residual <= 5 ? 5 : 10;
+  const step = multiplier * magnitude;
+  const firstIndex = Math.ceil(min / step - 1e-9);
+  const lastIndex = Math.floor(max / step + 1e-9);
+  const ticks: number[] = [];
+  for (let i = firstIndex; i <= lastIndex; i += 1) {
+    // Index-based products accumulate float noise (92 * 0.2 → 18.400000000000002);
+    // rounding through 10 decimals keeps the tick values clean and monotonic.
+    ticks.push(Number((i * step).toFixed(10)));
+  }
+  return ticks;
+}
+
+/**
+ * Decimal places needed so adjacent ticks render distinctly as `toFixed(d)`
+ * labels without rounding collisions (step 0.2 → 1, 2.5 → 1, 0.05 → 2).
+ */
+export function tickDecimals(ticks: number[]): number {
+  if (ticks.length < 2) {
+    return 1;
+  }
+  const step = Math.abs(ticks[1] - ticks[0]);
+  if (!Number.isFinite(step) || step <= 0) {
+    return 1;
+  }
+  // Smallest d where step * 10^d is integral; unlike -floor(log10(step)) this
+  // also covers off-grid steps such as 2.5 (→ 1 decimal) or 0.025 (→ 3).
+  for (let d = 0; d <= 6; d += 1) {
+    const scaled = step * 10 ** d;
+    if (Math.abs(scaled - Math.round(scaled)) <= 1e-6 * Math.max(1, scaled)) {
+      return d;
+    }
+  }
+  return 6;
+}
+
+/**
  * Format the ensemble statistics object for a compact readout row, ordered as
  * the API documents them.
  */

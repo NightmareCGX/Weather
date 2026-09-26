@@ -18,6 +18,8 @@ import {
   distributionSummary,
   distributionXDomain,
   histogramBins,
+  niceDistributionTicks,
+  tickDecimals,
   toMemberDots,
   toPdfPoints,
 } from "@/lib/forecast/transform";
@@ -163,6 +165,10 @@ export function EnsembleDistribution({
   const summary = distributionSummary(members);
   const pdfPoints = toPdfPoints(data.pdf);
   const [xMin, xMax] = distributionXDomain(summary, data.pdf);
+  // Pin both stacked charts to the same fixed nice ticks so labels stay short,
+  // evenly spaced, and vertically aligned with the histogram gridlines.
+  const xTicks = niceDistributionTicks(xMin, xMax);
+  const formatXTick = (value: number) => value.toFixed(tickDecimals(xTicks));
 
   // Prepare bin data points with explicit x coordinate for numeric XAxis
   const binChartData = bins.map((bin) => ({
@@ -222,7 +228,9 @@ export function EnsembleDistribution({
                 type="number"
                 dataKey="x"
                 domain={[xMin, xMax]}
-                tickFormatter={(value: number) => value.toFixed(1)}
+                ticks={xTicks.length > 0 ? xTicks : undefined}
+                tickFormatter={formatXTick}
+                interval={0}
                 tick={{ fontSize: 10, fill: "#94a3b8" }}
                 tickLine={false}
               />
@@ -296,13 +304,21 @@ export function EnsembleDistribution({
           className="mt-2 h-12 w-full"
         >
           <ResponsiveContainer width="100%" height="100%">
-            <ScatterChart margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+            <ScatterChart
+              // Mirror the histogram's horizontal geometry (left Y-axis width 32
+              // + right Y-axis width 38 + margins) so tick columns and member
+              // dots line up column-for-column with the chart above.
+              margin={{ top: 4, right: 38 + 8, bottom: 0, left: 32 + 0 }}
+            >
               <XAxis
                 type="number"
                 dataKey="value"
+                domain={[xMin, xMax]}
+                ticks={xTicks.length > 0 ? xTicks : undefined}
+                tickFormatter={formatXTick}
+                interval={0}
                 tick={{ fontSize: 10, fill: "#94a3b8" }}
                 tickLine={false}
-                domain={[xMin, xMax]}
               />
               <YAxis hide domain={[0, 1]} />
               <Tooltip
