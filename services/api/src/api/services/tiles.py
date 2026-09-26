@@ -233,13 +233,13 @@ def _color_stops(variable_code: str) -> list[tuple[float, tuple[int, int, int]]]
             (20.0, (255, 255, 255)),
         ]
     return [
-        (-60.0, (26, 0, 64)),      # 极寒紫黑 (-60°C)
-        (-40.0, (49, 54, 149)),     # 深蓝 (-40°C)
-        (-20.0, (69, 117, 180)),    # 蔚蓝 (-20°C)
-        (0.0, (224, 243, 248)),     # 冰点极浅冰蓝/白 (0°C)
-        (20.0, (254, 217, 118)),    # 舒适温暖浅黄 (20°C)
-        (40.0, (217, 72, 1)),       # 高温橙红 (40°C)
-        (60.0, (122, 1, 119)),      # 极端酷暑深红紫 (60°C)
+        (-60.0, (26, 0, 64)),      # Extreme cold, purple-black (-60°C)
+        (-40.0, (49, 54, 149)),     # Deep blue (-40°C)
+        (-20.0, (69, 117, 180)),    # Azure blue (-20°C)
+        (0.0, (224, 243, 248)),     # Freezing point, very pale ice blue / white (0°C)
+        (20.0, (254, 217, 118)),    # Comfortably warm, pale yellow (20°C)
+        (40.0, (217, 72, 1)),       # High heat, orange-red (40°C)
+        (60.0, (122, 1, 119)),      # Extreme heat, deep red-purple (60°C)
     ]
 
 

@@ -1,292 +1,292 @@
 # Weather Platform Float16 Storage / Float32 Compute Feasibility Report
 
-**调查性质**:只调查、不实施(全仓库、全链路)。所有结论基于当前仓库实现与真实数据实测(GFS 2026-09-23/18z 0.25°、GEFS 2026-09-23/00z 成员,共 85 个真实解码字段;基准脚本与原始结果在仓库外的 `%TEMP%\f16bench\`)。
+**Nature of investigation**: investigation only, no implementation (whole repo, whole pipeline). All conclusions are based on the current repository implementation and measurement on real data (GFS 2026-09-23/18z 0.25°, GEFS 2026-09-23/00z members, 85 real decoded fields in total; the benchmark scripts and raw results are outside the repo at `%TEMP%\f16bench\`).
 
-**总体结论:conditionally safe(有条件安全)** —— 在保持 float32 计算不变的前提下,将连续量场持久化存储与 API 解压缓存迁移到 float16,把 categorical 字段迁移到 uint8,在实测精度上对所有产品语义零实质影响;但对象存储/网络的实际节省约为 **22%(而非 50%)**,且存在 5 个必须在实施前处理的边界条件(见 §21)。
+**Overall conclusion: conditionally safe** — provided float32 computation is kept unchanged, migrating the persistent storage of continuous-variable fields and the API decompression cache to float16, and migrating categorical fields to uint8, has zero substantive impact on the semantics of all products at measured precision; but the actual object storage/network saving is about **22% (not 50%)**, and there are 5 boundary conditions that must be handled before implementation (see §21).
 
 ---
 
 ## 1. Executive Summary
 
-**结论分类:technically safe 的核心子集 + conditionally safe 的整体迁移。**
+**Classification of conclusions: a technically safe core subset + a conditionally safe overall migration.**
 
-- **推荐目标架构是 Architecture B**(§24):float32 解码/归一化/派生计算,float16 连续量持久化与解压 chunk 缓存,uint8 categorical(成员/确定性 shard),float32 插值/统计/归约。**float16 计算被实测证据直接否决**(Zen 3 上 f16 算术慢 8.7 倍且 reduction 溢出,§14/§15)。
-- **精度安全(真实数据实测)**:
-  - 逐变量 float16 量化误差:温度 max 0.027°C、RH/云量 max 0.03%、风 max 0.014 m/s、阵风 0.061 km/h、能见度 max 7.8 m、雪深 max ~1 mm、降水 max 0.125 mm(仅 306 mm 极端值处)。
-  - **所有阈值翻转率为 0**:干湿边界 0.10 mm、静风 0.5 m/s、雾 1 km、95% 阴云、60 km/h 阵风、0°C 冰冻线(mean/median)。
-  - de-accumulation:生产路径(前驱在内存 float32,`wave_runner.py:1358-1375`)**零语义翻转**,误差仅为最终增量量化(max 0.0625 mm);fallback 路径(前驱读存储)在真实 lead 对上同样零翻转;对抗性 corner case(真残差恰在 −0.5 mm 钳制边界)发生率 ~1/10⁶ 格点。
-  - GEFS 30 成员统计(30 个真实成员场):mean max 0.007°C、分位数 max 0.0155°C、IQR max 0.029°C;30°C 阈值 P90 翻转 3/259,920 格点(0.001%)。
-- **收益(实测,非理论)**:
-  - 对象存储:Zstd-5 后仅省 **~22%**(payload 减半 ≠ 压缩后减半)。GFS 每报 0.83→0.64 GB,GEFS 每报 23.7→18.4 GB;活跃保留窗口(GFS ~40 报 / GEFS ~20 报)合计 ~507→394 GB,**省 ~113 GB**。
-  - Range GET 字节:point 请求 7.8→6.4 KB(−18%),GEFS 统计请求 235→191 KB(−19%);**请求数不变**。
-  - API chunk 缓存:解压 payload 精确减半(19.59→9.83 MiB/reader),但 reader 总缓存中 index/point 缓存与 dtype 无关,**reader 整体只省 ~10-15%**。
-  - ingestion RSS:**几乎无收益**(解码/归一化保持 float32 时,只有 shard 编码缓冲减半)。
-- **兼容性**:无需 DB 迁移——manifest 已携带 `storage_format_version`(`coordinator.py:987`),serving 已按 store 分支(`manifest_reader.py:171-184` + 5 个调用点),per-cycle 新旧格式共存有现成机制。
-- **不推荐做的事**:float16 计算(Architecture C)、全局 round/truncate、把 uint8 flags 转成 float16、假设压缩后省 50%。
+- **The recommended target architecture is Architecture B** (§24): float32 decode/normalize/derived computation, float16 persistence of continuous variables and decompressed chunk cache, uint8 categorical (member/deterministic shard), float32 interpolation/statistics/reduction. **float16 computation is directly rejected by measured evidence** (on Zen 3 f16 arithmetic is 8.7 times slower and reduction overflows, §14/§15).
+- **Precision safety (measured on real data)**:
+  - Per-variable float16 quantization error: temperature max 0.027°C, RH/cloud cover max 0.03%, wind max 0.014 m/s, gust 0.061 km/h, visibility max 7.8 m, snow depth max ~1 mm, precipitation max 0.125 mm (only at the 306 mm extreme).
+  - **All threshold flip rates are 0**: dry/wet boundary 0.10 mm, calm wind 0.5 m/s, fog 1 km, 95% overcast, 60 km/h gust, 0°C freezing line (mean/median).
+  - de-accumulation: the production path (predecessor in memory as float32, `wave_runner.py:1358-1375`) has **zero semantic flips**, and the error is only the final increment quantization (max 0.0625 mm); the fallback path (predecessor read from storage) likewise has zero flips on real lead pairs; the adversarial corner case (true residual exactly at the −0.5 mm clamp boundary) occurs at ~1/10⁶ grid points.
+  - GEFS 30-member statistics (30 real member fields): mean max 0.007°C, quantile max 0.0155°C, IQR max 0.029°C; at the 30°C threshold P90 flips 3/259,920 grid points (0.001%).
+- **Benefits (measured, not theoretical)**:
+  - Object storage: after Zstd-5 only **~22%** is saved (halving the payload ≠ halving after compression). GFS 0.83→0.64 GB per run, GEFS 23.7→18.4 GB per run; the active retention window (GFS ~40 runs / GEFS ~20 runs) totals ~507→394 GB, **saving ~113 GB**.
+  - Range GET bytes: point request 7.8→6.4 KB (−18%), GEFS statistics request 235→191 KB (−19%); **request count unchanged**.
+  - API chunk cache: the decompressed payload is exactly halved (19.59→9.83 MiB/reader), but the index/point caches within the reader's total cache are dtype-independent, so **the reader as a whole saves only ~10-15%**.
+  - ingestion RSS: **almost no benefit** (with decode/normalize kept at float32, only the shard encoding buffer is halved).
+- **Compatibility**: no DB migration needed — the manifest already carries `storage_format_version` (`coordinator.py:987`), serving already branches per store (`manifest_reader.py:171-184` + 5 call sites), and per-cycle coexistence of the old and new formats has a ready-made mechanism.
+- **What is not recommended**: float16 computation (Architecture C), global round/truncate, converting uint8 flags to float16, assuming a 50% saving after compression.
 
 ---
 
-## 2. Current Numerical Architecture(当前数值架构与数据流)
+## 2. Current Numerical Architecture (Numerical Architecture and Data Flow)
 
 ```text
 NOAA S3/NOMADS
   │  HTTPS byte-range GET(httpx,bytes)connector.py:562-569
   ▼
-[bytes] ── 写入本地暂存文件 ──▶ ProcessPoolExecutor(decode=2 并发,decode_worker.py:89,97)
-  │                              仅传文件路径;返回 pickle 的 xr.Dataset
+[bytes] ── write to local staging file ──▶ ProcessPoolExecutor(decode=2 concurrency, decode_worker.py:89,97)
+  │                                         only the file path is passed; returns a pickled xr.Dataset
   ▼
-cfgrib decode(parser.py:209-214)━━━━━━━━━━━ 输出 float32(test_parser.py:52 断言)
-  │                                            无任何 astype
+cfgrib decode(parser.py:209-214)━━━━━━━━━━━ outputs float32(test_parser.py:52 assertion)
+  │                                            no astype anywhere
   ▼
 raw-normalized Dataset(≈60 MB float32 / 15 vars × 721×1440)
   │  ① precipitation de-accumulation(pipeline.py:302-370)
-  │     输入显式 cast float64(331-332)→ float64 相减 → 钳制/NaN 守卫 → float32 输出
-  │     生产路径前驱 = 内存 np.copy(float32)(wave_runner.py:1358-1375)
-  │     fallback 路径前驱 = 重读已提交存储(read_predecessor_precipitation,pipeline.py:373-420)
+  │     input explicitly cast float64(331-332)→ float64 subtraction → clamp/NaN guard → float32 output
+  │     production path predecessor = in-memory np.copy(float32)(wave_runner.py:1358-1375)
+  │     fallback path predecessor = re-read from committed storage(read_predecessor_precipitation, pipeline.py:373-420)
   │  ② cloud cover reconstruction(cloud.py:103-171)
-  │     float64 计算(160-161),±5% 守卫(24),float32 还回(188-189)
-  │  ③ 单位换算(pipeline.py:251-299):K−273.15、×3600、×3.6、÷1000 —— 标量 vs float32 数组,保持 float32
-  │  ④ flags 归一化:np.asarray(array, dtype=np.uint8)(pipeline.py:292-298)
+  │     float64 computation(160-161),±5% guard(24), cast back to float32(188-189)
+  │  ③ unit conversion(pipeline.py:251-299):K−273.15, ×3600, ×3.6, ÷1000 — scalar vs float32 array, stays float32
+  │  ④ flags normalization:np.asarray(array, dtype=np.uint8)(pipeline.py:292-298)
   ▼
-normalized Dataset(float32 连续量 + uint8 flags)
+normalized Dataset(float32 continuous variables + uint8 flags)
   │  sharded_v1 encode(zarr_writer.py:615-672)
-  │  ━━ ⚠ 唯一硬编码 dtype:chunk_buf = np.full(..., np.nan, dtype=np.float32)(zarr_writer.py:658)
-  │  ━━ ⚠ uint8 flags 在此被并回 float32 缓冲(而 .zarray 元数据仍记 uint8,zarr_writer.py:373)
-  │  每 100×100 chunk 独立 Zstd level 5(zarr_writer.py:628)
+  │  ━━ ⚠ the only hard-coded dtype:chunk_buf = np.full(..., np.nan, dtype=np.float32)(zarr_writer.py:658)
+  │  ━━ ⚠ uint8 flags are merged back into the float32 buffer here (while the .zarray metadata still records uint8, zarr_writer.py:373)
+  │  each 100×100 chunk independently Zstd level 5(zarr_writer.py:628)
   ▼
-Shard 容器:payload(120 chunks)+ index(120×16B <u8)+ trailer(12B,'SHAR')
-  │  单次 PUT(zarr_writer.py:829),无 multipart;对象键 {var}/shard.{det|mean|mem%03d}_L%04d.shard
+Shard container:payload(120 chunks) + index(120×16B <u8) + trailer(12B,'SHAR')
+  │  single PUT(zarr_writer.py:829), no multipart; object key {var}/shard.{det|mean|mem%03d}_L%04d.shard
   ▼
-Object Storage(MinIO/S3)+ PostgreSQL catalog(无 format/dtype 列)
+Object Storage(MinIO/S3) + PostgreSQL catalog(no format/dtype column)
   ══════════════════════════ serving ══════════════════════════
   ▼
-ShardedV1Reader(api/core/zarr.py):tail Range GET 读 index(316-372)→ per-chunk Range GET(413)
-  │  np.frombuffer(raw, dtype=np.float32).reshape(100,100).copy()(421)━━ dtype 硬编码第二处
+ShardedV1Reader(api/core/zarr.py):tail Range GET reads index(316-372)→ per-chunk Range GET(413)
+  │  np.frombuffer(raw, dtype=np.float32).reshape(100,100).copy()(421)━━ second hard-coded dtype
   ▼
 _chunk_cache:512 × 100×100 float32 ndarray/reader(zarr.py:259;config.py:166)
-  ├─▶ point:取 4 角点值 → float() 即变 Python float(455,508-511)→ Python float 双线性(133-149)
-  │     → round(x,1)(point_forecast.py:547,581)/ 部分变量不 round(603-606)→ JSON
-  ├─▶ window:read_window float32 组装(612)→ tiles 立即升 float64(tiles.py:718-720 等)→ np.interp 上色 → uint8 RGBA PNG(769)
-  ├─▶ ensemble:per-member chunk GET(member executor 4 workers)→ domain 统计强制 float64(_validation.py:43)→ Python float
-  └─▶ vector:u/v float32 → hypot(tiles.py:1070)→ int16 scale=0.01 量化(wind.py:664-665)→ Redis 原始字节
-       flags(GEFS mean shard)= 成员均值概率 float32(0.65 等)→ round(x,4) 输出(point_forecast.py:575)
+  ├─▶ point:take the 4 corner values → float() immediately becomes a Python float(455,508-511)→ Python float bilinear(133-149)
+  │     → round(x,1)(point_forecast.py:547,581)/ some variables are not rounded(603-606)→ JSON
+  ├─▶ window:read_window float32 assembly(612)→ tiles immediately promoted to float64(tiles.py:718-720 etc.)→ np.interp color mapping → uint8 RGBA PNG(769)
+  ├─▶ ensemble:per-member chunk GET(member executor 4 workers)→ domain statistics forced float64(_validation.py:43)→ Python float
+  └─▶ vector:u/v float32 → hypot(tiles.py:1070)→ int16 scale=0.01 quantization(wind.py:664-665)→ Redis raw bytes
+       flags(GEFS mean shard)= member-mean probability float32(0.65 etc.)→ round(x,4) output(point_forecast.py:575)
 ```
 
-**dtype 转变点汇总**(每节点:输入→输出、显式/继承、是否 copy、是否压缩):
+**Summary of dtype transition points**(per node:input→output, explicit/inherited, whether copied, whether compressed):
 
-| # | 节点 | 位置 | 输入→输出 dtype | 显式? | copy/分配 | 压缩/序列化 |
+| # | Node | Location | Input→Output dtype | Explicit? | copy/allocation | Compression/serialization |
 |---|---|---|---|---|---|---|
-| 1 | 下载 | connector.py:619,668 | bytes | — | 磁盘暂存 | 否 |
-| 2 | cfgrib decode | parser.py:209-214 | GRIB→float32 | 继承(cfgrib) | Dataset 分配 | 否 |
-| 3 | 跨进程返回 | wave_runner.py:1727-1729 | float32(pickle) | 继承 | 全量 pickle 拷贝 | pickle |
-| 4 | de-accum | pipeline.py:331-339 | f32→**f64**→f32 | 显式 | 2 数组转换+diff+mask | 否 |
-| 5 | cloud 重建 | cloud.py:160-189 | f32→**f64**→f32 | 显式 | 同上 | 否 |
-| 6 | 单位换算 | pipeline.py:255-298 | f32→f32 | 继承(weak scalar) | 原地赋值 | 否 |
-| 7 | flags 归一化 | pipeline.py:292-298 | f32→**uint8** | 显式 | 新数组 | 否 |
-| 8 | shard 编码 | zarr_writer.py:658-660 | 一切→**float32** | 显式(硬编码) | chunk_buf | **Zstd-5/chunk** |
-| 9 | shard 读 | zarr.py:413,421 | f32 bytes→ndarray | 显式(硬编码) | .copy() | Zstd 解压 |
-| 10 | chunk 缓存 | zarr.py:259 | f32 ndarray | — | LRU 持有 | — |
-| 11 | point 插值 | zarr.py:455,508-511,133-149 | f32→**Python float(f64)** | 显式 float() | 标量 | JSON |
-| 12 | window→tile | tiles.py:718-720,769 | f32→**f64**→uint8 RGBA | 显式 | window 拷贝 | PNG(zlib-1) |
-| 13 | domain 统计 | _validation.py:43 | 任意→**float64** | 显式 | 数组转换 | JSON |
-| 14 | vector 量化 | wind.py:629-665 | f32→f32(hypot)→**<i2** | 显式 | 拷贝 | Redis bytes+gzip-6 |
-| 15 | Redis 响应缓存 | cache.py:199 | Python float→JSON 文本 | — | — | JSON 文本 |
+| 1 | Download | connector.py:619,668 | bytes | — | disk staging | no |
+| 2 | cfgrib decode | parser.py:209-214 | GRIB→float32 | inherited(cfgrib) | Dataset allocation | no |
+| 3 | cross-process return | wave_runner.py:1727-1729 | float32(pickle) | inherited | full pickle copy | pickle |
+| 4 | de-accum | pipeline.py:331-339 | f32→**f64**→f32 | explicit | 2 array conversions + diff + mask | no |
+| 5 | cloud reconstruction | cloud.py:160-189 | f32→**f64**→f32 | explicit | same as above | no |
+| 6 | unit conversion | pipeline.py:255-298 | f32→f32 | inherited(weak scalar) | in-place assignment | no |
+| 7 | flags normalization | pipeline.py:292-298 | f32→**uint8** | explicit | new array | no |
+| 8 | shard encode | zarr_writer.py:658-660 | everything→**float32** | explicit(hard-coded) | chunk_buf | **Zstd-5/chunk** |
+| 9 | shard read | zarr.py:413,421 | f32 bytes→ndarray | explicit(hard-coded) | .copy() | Zstd decompression |
+| 10 | chunk cache | zarr.py:259 | f32 ndarray | — | held by LRU | — |
+| 11 | point interpolation | zarr.py:455,508-511,133-149 | f32→**Python float(f64)** | explicit float() | scalar | JSON |
+| 12 | window→tile | tiles.py:718-720,769 | f32→**f64**→uint8 RGBA | explicit | window copy | PNG(zlib-1) |
+| 13 | domain statistics | _validation.py:43 | any→**float64** | explicit | array conversion | JSON |
+| 14 | vector quantization | wind.py:629-665 | f32→f32(hypot)→**<i2** | explicit | copy | Redis bytes+gzip-6 |
+| 15 | Redis response cache | cache.py:199 | Python float→JSON text | — | — | JSON text |
 
 ---
 
 ## 3. Current Storage Format(writer/reader/schema)
 
-- **布局**(writer `zarr_writer.py:575-601`,reader `zarr.py:316-372`):payload = 120 个 100×100 chunk 的 Zstd-5 压缩字节顺序拼接;index 表 120×16B(`struct.pack("<QQ")`,little-endian uint64 offset/length);trailer 12B(num_chunks, index_size, magic 0x53484152)。index 从尾部一次 Range GET 读取(`zarr.py:342`),API reader **不校验 magic**(仅 ingestion inventory 校验,`inventory.py:530`)。
-- **chunk 几何硬编码**:100×100、8×15=120 chunks(shard 覆盖 721×1440);reader `zarr.py:385-389`、writer `zarr_writer.py:642-645`、inventory `inventory.py:519` 三处独立声明。
-- **dtype 元数据:不存在**。manifest(`__commit__/v1/manifest.json`)有 `storage_format_version` 但**无 dtype 字段**;`.zarray` 的 dtype 来自预分配数据集(`zarr_writer.py:373`)——**与 shard 实际字节不一致**(flags 元数据 uint8、字节 float32)。
-- **dtype 硬编码位置**(v2 必改点):writer `zarr_writer.py:658`;reader `zarr.py:421`(唯一 payload 解码点)+ NaN fill `zarr.py:387,402,408,612,666`;ingestion 自检读回 `zarr_writer.py:1022,1128,1146`。
-- **能否新旧 dtype 共存**:可以。分派钩子已存在——`manifest_storage_format()`(`manifest_reader.py:171-184`)在 5 个 serving 调用点分支(point_forecast.py:781,1386;tiles.py:986-987;ensemble_data.py:932-935 等),ingestion 按 `STORAGE_FORMAT_VERSION`(`config.py:236`)路由写路径(`zarr_writer.py:470-471`)。引入新版本串(如 `sharded_v2`)+ per-format dtype 表即可;index/trailer 数学与 dtype 无关(offset/length 来自运行时 index,`zarr.py:406`)。
+- **Layout**(writer `zarr_writer.py:575-601`, reader `zarr.py:316-372`):payload = the Zstd-5 compressed bytes of 120 100×100 chunks concatenated in order; index table 120×16B(`struct.pack("<QQ")`, little-endian uint64 offset/length); trailer 12B(num_chunks, index_size, magic 0x53484152).index read in a single tail Range GET(`zarr.py:342`), the API reader **does not validate the magic**(only the ingestion inventory validates it,`inventory.py:530`).
+- **chunk geometry hard-coded**:100×100, 8×15=120 chunks(shard covers 721×1440); declared independently in three places:reader `zarr.py:385-389`, writer `zarr_writer.py:642-645`, inventory `inventory.py:519`.
+- **dtype metadata:does not exist**.The manifest(`__commit__/v1/manifest.json`)has `storage_format_version` but **no dtype field**; the `.zarray` dtype comes from the preallocated dataset(`zarr_writer.py:373`)—**inconsistent with the shard's actual bytes**(flags metadata uint8, bytes float32).
+- **Hard-coded dtype locations**(v2 must-change points):writer `zarr_writer.py:658`; reader `zarr.py:421`(the only payload decode point)+ NaN fill `zarr.py:387,402,408,612,666`; ingestion self-check read-back `zarr_writer.py:1022,1128,1146`.
+- **Can old and new dtype coexist**:yes.The dispatch hook already exists—`manifest_storage_format()`(`manifest_reader.py:171-184`)branches at 5 serving call sites(point_forecast.py:781,1386; tiles.py:986-987; ensemble_data.py:932-935 etc.), and ingestion routes the write path by `STORAGE_FORMAT_VERSION`(`config.py:236`)(`zarr_writer.py:470-471`).Introducing a new version string(e.g. `sharded_v2`)+ a per-format dtype table is enough; the index/trailer math is dtype-independent(offset/length come from the runtime index,`zarr.py:406`).
 
-**三个 migration option 评估**:
-- **Option A**(保留 v1 加 dtype 元数据):manifest 虽是 store 级 JSON,但 v1 读取路径的 `np.frombuffer(dtype=np.float32)` 是无元数据硬编码——保留 v1 字符串却改变其字节语义会让"manifest 说 sharded_v1 就按 float32 读"的旧 reader 读错新 store。**否决**。
-- **Option B(推荐)**:新版本串 `sharded_v2`(payload 为 per-variable native dtype:连续量 f16、flags u8、mean-shard flags 保持 f32 概率),写入 manifest 的 `storage_format_version`;reader 对 v2 按 dtype 表解码并立即统一为内部 float32(或 f16 缓存)。旧 cycle 的 manifest 仍是 `sharded_v1`,走旧路径,**零改动可读**。
-- **Option C**:per-chunk 自描述(每 chunk 前置 dtype header)——破坏现有"index 直接给 offset"的紧凑布局且浪费每 chunk 字节。**否决**。
+**Evaluation of the three migration options**:
+- **Option A**(keep v1 and add dtype metadata):although the manifest is a store-level JSON, the v1 read path's `np.frombuffer(dtype=np.float32)` is a metadata-free hard-coding—keeping the v1 string while changing its byte semantics would make an old reader that "reads as float32 whenever the manifest says sharded_v1" read the new store wrongly.**Rejected**.
+- **Option B(recommended)**:a new version string `sharded_v2`(payload in per-variable native dtype:continuous variables f16, flags u8, mean-shard flags kept at f32 probability), written into the manifest's `storage_format_version`; for v2 the reader decodes by the dtype table and immediately unifies to the internal float32(or an f16 cache).An old cycle's manifest is still `sharded_v1` and takes the old path,**readable with zero changes**.
+- **Option C**:per-chunk self-description(a dtype header prefixed to each chunk)—breaks the existing compact layout where "the index directly gives the offset" and wastes bytes per chunk.**Rejected**.
 
 ---
 
-## 4. Current Variable Inventory(真实变量清单)
+## 4. Current Variable Inventory (Real Variable List)
 
-权威定义:`DEFAULT_VARIABLES`(`wave_runner.py:79-170`,15 个)、`SURFACE_FIELD_FILTERS`(`parser.py:44-150`)、单位变换 `pipeline.py:251-299`。GEFS 成员数 30(`coverage.py:30-33`),视界 0–240h/3h = 81 leads(`horizon.py:14-16`)。
+Authoritative definitions:`DEFAULT_VARIABLES`(`wave_runner.py:79-170`,15 of them), `SURFACE_FIELD_FILTERS`(`parser.py:44-150`), unit transforms `pipeline.py:251-299`.GEFS member count 30(`coverage.py:30-33`), horizon 0–240h/3h = 81 leads(`horizon.py:14-16`).
 
-| 变量 | GRIB | 源单位→内部单位 | 范围(实测) | ingestion 派生 | lead-0 | ensemble | 类型 | 存储 dtype 现状 |
+| Variable | GRIB | Source unit→internal unit | Range(measured) | ingestion derived | lead-0 | ensemble | Type | storage dtype current state |
 |---|---|---|---|---|---|---|---|---|
-| temperature_2m | `2t` | K→°C(−273.15) | −68.2..39.2 °C | 否 | instant | 是 | 连续 | f32 |
-| relative_humidity_2m | `2r` | %→% | 5.7..100.0 %(无裁剪) | 否 | instant | 是 | 连续 | f32 |
-| precipitation_amount_3h | `tp` | kg m⁻²→mm | 0..306.4 mm | **是**(deaccum) | **NaN** | 是 | 连续 | f32 |
-| precipitation_rate | `prate` | kg m⁻² s⁻¹→mm/h(×3600) | 0..76.7 mm/h | 否(仅换算) | instant | **GEFS 不支持**(`idx_parser.py:726-732`) | 连续 | f32 |
-| wind_u_10m / wind_v_10m | `10u`/`10v` | m/s→m/s | ±61.5 m/s | 否 | instant | 是(vector) | 连续 | f32 |
-| wind_gust | `gust` | m/s→km/h(×3.6) | 0..230.8 km/h | 否 | instant | 是 | 连续 | f32 |
-| visibility | `vis` | m→km(÷1000) | 0.02..24.1 km | 否 | instant | 是 | 连续 | f32 |
-| snow_depth | `sde` | m→m | 0..2.38 m | 否 | instant | 是 | 连续 | f32 |
-| cloud_cover_3h | `tcc` | %→%(clip 0-100) | 0..100 % | **是**(reconstruction) | **NaN** | 是 | 连续 | f32 |
-| cloud_ceiling | `gh`@cloudCeiling | gpm→km(÷1000) | 0..20 km(sentinel 19.99=unlimited) | 否 | instant | 是(unlimited 概率+条件分位) | 连续+离散哨兵 | f32 |
-| crain/csnow/cfrzr/cicep | 同名 | Code 4.222→**flag(uint8)** | 0/1 | 否(lead-0 置零) | **全 0 uint8** | 是(相态伙伴) | **categorical** | f32(⚠见 §18) |
-| wind_speed | — | — | — | — | — | — | **serving 侧派生**(`point_forecast.py:844` hypot;`ensemble_data.py:301`) | 不存储 |
+| temperature_2m | `2t` | K→°C(−273.15) | −68.2..39.2 °C | no | instant | yes | continuous | f32 |
+| relative_humidity_2m | `2r` | %→% | 5.7..100.0 %(no clipping) | no | instant | yes | continuous | f32 |
+| precipitation_amount_3h | `tp` | kg m⁻²→mm | 0..306.4 mm | **yes**(deaccum) | **NaN** | yes | continuous | f32 |
+| precipitation_rate | `prate` | kg m⁻² s⁻¹→mm/h(×3600) | 0..76.7 mm/h | no(conversion only) | instant | **GEFS unsupported**(`idx_parser.py:726-732`) | continuous | f32 |
+| wind_u_10m / wind_v_10m | `10u`/`10v` | m/s→m/s | ±61.5 m/s | no | instant | yes(vector) | continuous | f32 |
+| wind_gust | `gust` | m/s→km/h(×3.6) | 0..230.8 km/h | no | instant | yes | continuous | f32 |
+| visibility | `vis` | m→km(÷1000) | 0.02..24.1 km | no | instant | yes | continuous | f32 |
+| snow_depth | `sde` | m→m | 0..2.38 m | no | instant | yes | continuous | f32 |
+| cloud_cover_3h | `tcc` | %→%(clip 0-100) | 0..100 % | **yes**(reconstruction) | **NaN** | yes | continuous | f32 |
+| cloud_ceiling | `gh`@cloudCeiling | gpm→km(÷1000) | 0..20 km(sentinel 19.99=unlimited) | no | instant | yes(unlimited probability + conditional quantile) | continuous + discrete sentinel | f32 |
+| crain/csnow/cfrzr/cicep | same name | Code 4.222→**flag(uint8)** | 0/1 | no(lead-0 zeroed) | **all 0 uint8** | yes(phase companions) | **categorical** | f32(⚠ see §18) |
+| wind_speed | — | — | — | — | — | — | **serving-side derived**(`point_forecast.py:844` hypot;`ensemble_data.py:301`) | not stored |
 
-ingestion 仅有两个派生变量(precip、cloud),无 wind speed/dew point/apparent temp 计算(已 grep 证实)。**不要假设 precipitation 是唯一 special variable——cloud_cover_3h 同为 reset/reconstruction 变量**(§7)。
+ingestion has only two derived variables(precip, cloud), with no wind speed/dew point/apparent temp computation(confirmed by grep).**Do not assume precipitation is the only special variable—cloud_cover_3h is likewise a reset/reconstruction variable**(§7).
 
 ---
 
-## 5. Float16 Numerical Error Analysis(逐变量,真实数据实测)
+## 5. Float16 Numerical Error Analysis (Per-Variable, Measured on Real Data)
 
-IEEE-754 binary16 半 ulp 解析表(实测验证):
+IEEE-754 binary16 half ulp resolution table(verified by measurement):
 
-| 值域 | spacing | 半 ulp(最大量化误差) |
+| Value range | spacing | half ulp(max quantization error) |
 |---|---|---|
 | [0.001, 0.002) | 9.5e-7 | 4.8e-7 |
-| [0.0625, 0.125)(含 0.10 阈值) | 6.1e-5 | 3.05e-5 |
+| [0.0625, 0.125)(contains the 0.10 threshold) | 6.1e-5 | 3.05e-5 |
 | [1, 2) | 9.77e-4 | 4.9e-4 |
-| [16, 32)(典型风速/降水) | 0.0156 | 0.0078 |
-| [64, 128)(大累积) | 0.0625 | 0.03125 |
+| [16, 32)(typical wind speed/precipitation) | 0.0156 | 0.0078 |
+| [64, 128)(large accumulation) | 0.0625 | 0.03125 |
 | [128, 256) | 0.125 | 0.0625 |
-| [256, 512)(306mm 极端) | 0.25 | 0.125 |
+| [256, 512)(306mm extreme) | 0.25 | 0.125 |
 
-真实字段(Canonical 单位,float32→float16→float32 往返):
+Real fields(Canonical units, float32→float16→float32 round-trip):
 
-| 变量(单位) | 实测范围 | max abs | MAE | P99 | 1dp 显示翻转 | 阈值翻转 |
+| Variable(unit) | measured range | max abs | MAE | P99 | 1dp display flip | threshold flip |
 |---|---|---|---|---|---|---|
 | temperature(GFS)°C | −68.2..39.2 | 0.0273 | 0.0031 | 0.0148 | 24.8% | — |
 | temperature(GEFS)°C | −60.3..40.2 | 0.0133 | 0.0030 | 0.0133 | 7.1% | — |
-| RH(两模型)% | 5.7..100.0 | 0.0301 | 0.0148 | 0.030 | 0% | 95%/50% 均 0 |
-| wind u/v(GFS)m/s | ±61.5 | 0.0145 | 0.0008 | 0.0036 | 0% | 静风 0.5m/s:0 |
+| RH(both models)% | 5.7..100.0 | 0.0301 | 0.0148 | 0.030 | 0% | 95%/50% both 0 |
+| wind u/v(GFS)m/s | ±61.5 | 0.0145 | 0.0008 | 0.0036 | 0% | calm wind 0.5m/s:0 |
 | wind u/v(GEFS)m/s | ±27.7 | 0.0078 | 0.0007 | 0.0037 | ≤2.2% | 0 |
 | gust km/h | 0.03..230.8 | 0.0612 | 0.0052 | 0.0263 | 7.0% | 60km/h:0 |
 | precipitation(GFS)mm | 0..306.4 | **0.125** | 1.2e-6 | **0** | 0.001% | 0.10mm:0 |
 | precipitation(GEFS)mm | 0..136.3 | 0.050 | 1.0e-4 | 0.0016 | 0% | 0 |
-| visibility km | 0.02..24.1 | 0.0078 | 0.0044 | 0.0066 | 0.40% | 1km 雾:0 |
+| visibility km | 0.02..24.1 | 0.0078 | 0.0044 | 0.0066 | 0.40% | 1km fog:0 |
 | snow_depth m | 0..2.38 | 0.00097 | 3.0e-5 | 0.00044 | 0.03% | — |
 | cloud cover(GFS)% | 0..100 | 0.0250 | 0.0040 | 0.025 | 0% | 0 |
 
-对比基准:
-- **上游 GRIB 打包精度**:GFS APCP 打包量化实测 **0.125 mm**(所有值是 0.125 的整数倍,如 306.375)。float16 在 ≤256mm 的半 ulp ≤0.0625mm,**低于上游一个打包量子**;仅在 [256,512) 区间两者相等(0.125)。
-- **显示精度**:API/前端按 1 位小数(°C、km/h、%)或 2 位(NumberFormat)渲染;float16 误差比显示粒度小 3-20 倍。
-- 唯一"可见"效应是 1dp 显示值的舍入边界翻转(温度最高 24.8% 格点差 0.1°C)——与现有 0.1 显示舍入同量级,不改变语义;不涉及 `round()` 合同的变量(如 JSON 未舍入字段,见 §19/§21)。
+Comparison baselines:
+- **Upstream GRIB packing precision**:measured GFS APCP packing quantization is **0.125 mm**(all values are integer multiples of 0.125, such as 306.375).float16's half ulp is ≤0.0625mm for ≤256mm,**below one upstream packing quantum**; the two are equal only in the [256,512) interval(0.125).
+- **Display precision**:the API/frontend renders at 1 decimal place(°C, km/h, %)or 2(NumberFormat); the float16 error is 3-20 times smaller than the display granularity.
+- The only "visible" effect is rounding-boundary flips of the 1dp display value(temperature at most 24.8% of grid points differing by 0.1°C)—the same order as the existing 0.1 display rounding, and it does not change semantics; it does not affect variables covered by the `round()` contract(e.g. unrounded JSON fields, see §19/§21).
 
 ---
 
 ## 6. Precipitation De-accumulation Analysis
 
-**实现**(`pipeline.py:302-370`):`curr−pred` 显式 float64(331-332)→ 非负保留、`[−0.50,0)` 钳 0(`DEACCUMULATION_CLAMP_BOUND_MM=0.50`,`base.py:91-92`)、`<−0.50` 置 NaN → float32 输出(339)。前驱:lead%6==0 时取 `lead−3`。
+**Implementation**(`pipeline.py:302-370`):`curr−pred` explicit float64(331-332)→ keep non-negative, clamp `[−0.50,0)` to 0(`DEACCUMULATION_CLAMP_BOUND_MM=0.50`,`base.py:91-92`), `<−0.50` set to NaN → float32 output(339).Predecessor:when lead%6==0 take `lead−3`.
 
-**前驱来源(关键事实)**:生产 wave 路径使用**内存副本** `raw_precip_for_future = np.copy(ds["tp"].values)`(`wave_runner.py:1358-1375`,float32,不经存储);`read_predecessor_precipitation`(`pipeline.py:373-420`)只是 fallback/库路径。**因此 float16 存储迁移根本不改变生产路径的减法输入**——改变的只有:① 最终增量的存储量化;② fallback 路径读回 f16 前驱。
+**Predecessor source(key fact)**:the production wave path uses an **in-memory copy** `raw_precip_for_future = np.copy(ds["tp"].values)`(`wave_runner.py:1358-1375`, float32, bypassing storage);`read_predecessor_precipitation`(`pipeline.py:373-420`)is only the fallback/library path.**Therefore the float16 storage migration does not change the production path's subtraction inputs at all**—the only things changed are:① the storage quantization of the final increment;② the fallback path reading back an f16 predecessor.
 
-**Reset 语义**:APCP 每 6h 重置,减法双方是 3h/6h **窗口**累积(非自起报总量),量级上界 = 极端 6h 雨量。实测 GFS 单报最大 306.4mm(飓风)、GEFS 136.3mm。
+**Reset semantics**:APCP resets every 6h, and both sides of the subtraction are 3h/6h **window** accumulations(not since-run totals), with an upper magnitude bound of an extreme 6h rainfall.Measured GFS maximum in a single run 306.4mm(hurricane), GEFS 136.3mm.
 
-**实验设计**(镜像实现,含真实 lead 对 + 对抗构造):
+**Experiment design**(mirrored implementation, including real lead pairs + adversarial constructions):
 
-| 场景 | 架构 | max err vs 现状 | MAE | 语义翻转 |
+| Scenario | Architecture | max err vs current state | MAE | Semantic flip |
 |---|---|---|---|---|
-| 真实 f189→f192(130→237mm) | B1: f16 前驱存储→f32 减→f16 存 | 0.0625 mm | 1.8e-7 | **0**(P99=0) |
-| 真实 f003→f006(180→306mm) | B1 | 0.0625 mm | 3.6e-7 | 0 |
-| 同上两对 | B2: f16 存储→f64 减→f16 存 | 0.0625 | 3.6e-7 | 0 |
-| 真实两对 | C: f16 直接减(反面参照) | 0.1875 | 1.4e-6 | 0(仅 14 个 1dp 显示翻转) |
-| **生产路径**:前驱内存 f32 → f64 减 → f32 结果 → **仅最终增量存 f16** | D | 0.0625 mm | 1.8e-7 | **0**(1M 格点,dry/wet、0→pos、NaN 全零) |
-| 对抗:curr=pred+0.125mm,pred∈[32,131)mm | B1 | 0.0625 | 8.0e-4 | dry/wet 1 格 / ~46 万湿格(~2e-6):f16 前驱在 [64,128) 半 ulp=0.03125 侵蚀 0.125−0.10 余量 |
-| 对抗:curr=pred(真增量 0) | B1/B2 | 0.0625 | 4.0e-4 | 0→pos 1 格(存 0.031mm,低于 trace 阈值,产品仍 dry) |
-| 对抗:残差恰 −0.5mm(钳制边界) | B1/B2 | — | — | **valid→NaN 1 格 / 1e6**:`pred_stored=pred+0.03125` 使 −0.5−δ<−0.5 |
-| 对抗:600.125−600.0 / 1100.125−1100.0 | B1/B2 | 0 | 0 | 0 |
-| 同上 | C(反面) | 0.125 | 0.125 | **100% 增量丢失**(600.125 无法被 f16 表示→差值 0) |
+| real f189→f192(130→237mm) | B1:f16 predecessor storage→f32 subtract→f16 store | 0.0625 mm | 1.8e-7 | **0**(P99=0) |
+| real f003→f006(180→306mm) | B1 | 0.0625 mm | 3.6e-7 | 0 |
+| the same two pairs | B2:f16 storage→f64 subtract→f16 store | 0.0625 | 3.6e-7 | 0 |
+| real two pairs | C:f16 direct subtraction(negative reference) | 0.1875 | 1.4e-6 | 0(only 14 1dp display flips) |
+| **production path**:predecessor in memory f32 → f64 subtract → f32 result → **only the final increment stored as f16** | D | 0.0625 mm | 1.8e-7 | **0**(1M grid points, dry/wet, 0→pos, NaN all zero) |
+| adversarial:curr=pred+0.125mm, pred∈[32,131)mm | B1 | 0.0625 | 8.0e-4 | dry/wet 1 cell / ~460k wet cells(~2e-6):the f16 predecessor at [64,128) with half ulp=0.03125 erodes the 0.125−0.10 margin |
+| adversarial:curr=pred(true increment 0) | B1/B2 | 0.0625 | 4.0e-4 | 0→pos 1 cell(stores 0.031mm, below the trace threshold, product still dry) |
+| adversarial:residual exactly −0.5mm(clamp boundary) | B1/B2 | — | — | **valid→NaN 1 cell / 1e6**:`pred_stored=pred+0.03125` makes −0.5−δ<−0.5 |
+| adversarial:600.125−600.0 / 1100.125−1100.0 | B1/B2 | 0 | 0 | 0 |
+| same as above | C(negative) | 0.125 | 0.125 | **100% increment loss**(600.125 cannot be represented by f16→difference 0) |
 
-**结论**:
-1. **float16 存储 + float32/float64 减法是安全的**。生产路径(内存前驱)零翻转;fallback 路径在真实数据上零翻转,在 10⁶ 级对抗采样中出现 2 类 ~1e-6 率的边界事件(dry/wet 边界翻转、钳制边界 NaN)。
-2. 大数相减的主导误差项是 **f16 前驱量化**(相对误差 2⁻¹¹),不是减法本身;float64→float32 的计算精度贡献(<1e-5 mm)可忽略——B1 与 B2 结果相同。
-3. **不要用 float16 做减法**(C 架构在 >512mm 时整段丢失小增量)。
-4. 钳制边界事件(真残差 = −0.50 恰好 + 前驱向上舍入)可把"钳为 0"变成"NaN 失效",率 ~1e-6 且仅影响单格;若要彻底消除,可在 v2 中把钳制界放宽一个前驱量化步长(如 −0.5−ulp_f16(pred)),这是实现期决策,不影响产品语义。
+**Conclusions**:
+1. **float16 storage + float32/float64 subtraction is safe**.The production path(in-memory predecessor)zero flips; the fallback path zero flips on real data and, in 10⁶-scale adversarial sampling, shows 2 classes of boundary events at a ~1e-6 rate(dry/wet boundary flip, clamp-boundary NaN).
+2. The dominant error term in subtracting large numbers is the **f16 predecessor quantization**(relative error 2⁻¹¹), not the subtraction itself; the computational precision contribution of float64→float32(<1e-5 mm)is negligible—B1 and B2 give identical results.
+3. **Do not do the subtraction in float16**(architecture C loses small increments wholesale above 512mm).
+4. The clamp-boundary event(true residual = −0.50 exactly + predecessor rounding upward)can turn "clamped to 0" into "NaN invalidated", at a rate of ~1e-6, affecting a single cell only; to eliminate it entirely, v2 could widen the clamp bound by one predecessor quantization step(e.g. −0.5−ulp_f16(pred)), which is an implementation-time decision and does not affect product semantics.
 
 ---
 
-## 7. Other Derived / Reset Variables(cloud 与其他 special variables)
+## 7. Other Derived / Reset Variables (cloud and Other Special Variables)
 
-**cloud_cover_3h reconstruction**(`cloud.py:103-171` + `pipeline.py:588-688`):公式 `C_3h = (R·C_R − (R−W)·C(L−W))/W`,R=6,W=3 时 `2·C6 − C3`;输入显式 float64(`cloud.py:160-161`),守卫 ±5 个百分点(`CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT=5.0`,`cloud.py:24`):[0,100] 保留、[−5,0)→0、(100,105]→100、越界 NaN;float32 还回(188-189)。前驱 = 存储读回(`read_predecessor_cloud_cover`,f32)或内存副本(`wave_runner.py:1364-1368`)。
+**cloud_cover_3h reconstruction**(`cloud.py:103-171` + `pipeline.py:588-688`):formula `C_3h = (R·C_R − (R−W)·C(L−W))/W`, with R=6, W=3 giving `2·C6 − C3`; inputs explicitly float64(`cloud.py:160-161`), guard ±5 percentage points(`CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT=5.0`,`cloud.py:24`):[0,100] kept, [−5,0)→0, (100,105]→100, out of range NaN; cast back to float32(188-189).Predecessor = read back from storage(`read_predecessor_cloud_cover`, f32)or an in-memory copy(`wave_runner.py:1364-1368`).
 
-**float16 传播分析**:误差 = |2·δ(curr)| + |δ(pred)| ≤ 2×0.031 + 0.031 ≈ **0.094 pp 最坏**(f16 在 [64,128) 的半 ulp),而守卫带是 ±5pp、显示精度 0.1%、ensemble min_valid 21——**4 个数量级的安全裕度**。lead%6==3 直接分支的 clip(0,100) 对 f16 无影响(边界值 0/100 精确表示)。**结论:cloud reconstruction 完全安全**,且前驱误差只放大一次(无递归——前驱自身是 3h 直接值)。
+**float16 propagation analysis**:error = |2·δ(curr)| + |δ(pred)| ≤ 2×0.031 + 0.031 ≈ **0.094 pp worst case**(f16's half ulp in [64,128)), while the guard band is ±5pp, display precision 0.1%, ensemble min_valid 21—**a safety margin of 4 orders of magnitude**.The clip(0,100) of the lead%6==3 direct branch is unaffected by f16(the boundary values 0/100 are exactly representable).**Conclusion:cloud reconstruction is entirely safe**, and the predecessor error is amplified only once(no recursion—the predecessor itself is a 3h direct value).
 
-**其他 reset/derived/threshold-sensitive 变量逐项**:
-- precipitation_amount_3h lead-0 NaN(f32 NaN → f16 NaN 保真,§17);flags lead-0 uint8 零——不变。
-- cloud_ceiling:哨兵 ≥19.99 km(`cloud.py:28`);f16 在 [16,32) 半 ulp=0.0078 km,19.99±0.0078 边界翻转需要真实值落在 7.8m 窄带内;实测值域 0-24km,无溢出。**建议**:v2 保持 19.99 哨兵语义不变(f16 可精确表示 19.984375/20.0,注意 19.99 本身不是 f16 精确值——比较在 float64 域进行(`point_forecast.py:589`),读回后与现状一致地比较,无风险)。
-- wind_speed:serving 派生(hypot);u/v 各自 f16 误差 ≤0.014 m/s → speed 误差 ≤~0.02 m/s(凸组合),§9 实测 mean-speed max 0.0097 km/h。
-- 相态分类(`precipitation.py:143-314`):输入 amount + uint8 flags(≥0.5 判定,`point_forecast.py:899`)+ t2m;f16 下唯一敏感点是 amount 对 TRACE 0.10mm 的比较——§6 实测翻转 ~2e-6(仅对抗构造),真实 lead 对为零。
-- 无其他 accumulated/reset 变量(grep 证实)。
+**Other reset/derived/threshold-sensitive variables, item by item**:
+- precipitation_amount_3h lead-0 NaN(f32 NaN → f16 NaN faithful,§17); flags lead-0 uint8 zero—unchanged.
+- cloud_ceiling:sentinel ≥19.99 km(`cloud.py:28`); f16's half ulp in [16,32)is 0.0078 km, so a 19.99±0.0078 boundary flip requires the true value to fall inside a 7.8m narrow band; the measured range is 0-24km, with no overflow.**Recommendation**:v2 keeps the 19.99 sentinel semantics unchanged(f16 can exactly represent 19.984375/20.0, note that 19.99 itself is not an f16-exact value—the comparison happens in the float64 domain(`point_forecast.py:589`), so after read-back it is compared consistently with the current state, no risk).
+- wind_speed:serving-derived(hypot); u/v each have f16 error ≤0.014 m/s → speed error ≤~0.02 m/s(convex combination),§9 measured mean-speed max 0.0097 km/h.
+- Phase classification(`precipitation.py:143-314`):inputs amount + uint8 flags(≥0.5 determination,`point_forecast.py:899`)+ t2m; the only sensitive point under f16 is the comparison of amount against TRACE 0.10mm—§6 measured flips ~2e-6(adversarial constructions only), and zero on real lead pairs.
+- No other accumulated/reset variables(confirmed by grep).
 
 ---
 
 ## 8. GEFS Ensemble Statistics Analysis
 
-**架构事实**:mean 是**上游官方 geavg 产品**(非平台计算,`connector.py:181-185`;member-wise nanmean 只是无调用者的 fallback,`zarr.py:651-689`)。domain 统计**强制 float64**(`_validation.py:43` `np.asarray(members, dtype=np.float64)`),std ddof=0、percentile method="linear"(`statistics.py:75,109`,测试固化 `test_ensembles.py:38-48`)。serving 每请求读 30 成员(member executor 4 workers,`zarr.py:567-581`),每成员每变量 ~1 chunk GET。
+**Architecture facts**:mean is an **upstream official geavg product**(not platform-computed,`connector.py:181-185`; member-wise nanmean is only a fallback with no callers,`zarr.py:651-689`).Domain statistics **force float64**(`_validation.py:43` `np.asarray(members, dtype=np.float64)`), std ddof=0, percentile method="linear"(`statistics.py:75,109`, fixed by tests `test_ensembles.py:38-48`).serving reads 30 members per request(member executor 4 workers,`zarr.py:567-581`),~1 chunk GET per member per variable.
 
-**实验**(30 个真实成员 t2m 场,f120;成员存储 f32 vs f16;计算 f64 与 f32 两路):
+**Experiment**(30 real member t2m fields, f120; member storage f32 vs f16; two computation paths f64 and f32):
 
-| 统计量 | f16 存储→f64 计算:max / MAE / P99(°C) | 备注 |
+| Statistic | f16 storage→f64 computation:max / MAE / P99(°C) | Note |
 |---|---|---|
 | mean | 0.00722 / 0.00053 / 0.00259 | |
 | median | 0.01529 / 0.00200 / 0.0100 | |
 | std(spread) | 0.00719 / 0.00052 / 0.00252 | |
 | P10/P25/P75/P90 | ≤0.01548 / ~0.0027 / ≤0.0123 | |
 | IQR | 0.02933 / 0.00318 / 0.0155 | |
-| **f16→f32 计算**(tile fallback 路) | 与 f64 计算差异 max 1.8e-5 | **计算精度贡献可忽略** |
+| **f16→f32 computation**(tile fallback path) | difference vs f64 computation max 1.8e-5 | **computational precision contribution negligible** |
 
-- **分类翻转**:0°C 冻结线(mean/median)**0 翻转**;P90≥30°C 3/259,920(0.001%);P10≤0°C 0;spread 1dp 显示翻转 0.5%(差 0.1°C 一档)。
-- **成员排序**:f16 量化使 100% 格点的排序序列出现并列/换位——但分位数在量化样本上自洽,误差上界=量化半 ulp(实测 ≤0.0155°C)。**无 percentile 方法偏移**。
-- **phase support / transition**:flags 为 uint8/整数判定(≥0.5),**完全不受**存储精度影响;amount 参与的 joint phase(`compute_joint_amount_phase_support`)经 §6 的阈值分析覆盖(0.10mm 翻转 ~0)。
-- **PDF**:Gaussian KDE float64、100 点网格(`pdf.py:41-119`);成员值扰动 ≤0.015°C 使密度曲线变化远小于渲染分辨率。无独立 IQR 产品(P25/P75 仅进入带宽)。
-- **结论**:float16 成员存储 + float32/64 计算下,ensemble 产品 **materially equivalent**(所有偏差 ≪ 集合离散度和显示精度)。
+- **Classification flips**:0°C freezing line(mean/median)**0 flips**; P90≥30°C 3/259,920(0.001%); P10≤0°C 0; spread 1dp display flips 0.5%(one 0.1°C step).
+- **Member ordering**:f16 quantization makes the sorted sequence have ties/transpositions at 100% of grid points—but the quantiles are self-consistent on the quantized sample, with an error upper bound = the quantization half ulp(measured ≤0.0155°C).**No percentile method shift**.
+- **phase support / transition**:flags are a uint8/integer determination(≥0.5),**entirely unaffected** by storage precision; the joint phase in which amount participates(`compute_joint_amount_phase_support`)is covered by the threshold analysis of §6(0.10mm flips ~0).
+- **PDF**:Gaussian KDE float64, 100-point grid(`pdf.py:41-119`); a member value perturbation of ≤0.015°C changes the density curve far less than the rendering resolution.There is no separate IQR product(P25/P75 only feed the bandwidth).
+- **Conclusion**:with float16 member storage + float32/64 computation, the ensemble products are **materially equivalent**(all deviations ≪ ensemble spread and display precision).
 
 ---
 
 ## 9. Point and Map Serving Analysis
 
-**Point 插值**(`zarr.py:457-532`):2×2 邻域;chunk 内 1 次 chunk-GET(+1 次 tail index GET),跨 chunk 边界最多 4 次;角点值**立即转 Python float**(`float(arr[...])`,`zarr.py:508-511`),双线性核纯 Python float(`zarr.py:133-149`)。**无需整 chunk 升 dtype——读路径天然只把 4 个标量升为 float64**;f16 chunk 的角点误差=半 ulp,双线性权重和为 1,凸组合不放大。
+**Point interpolation**(`zarr.py:457-532`):2×2 neighborhood;1 chunk-GET within a chunk(+1 tail index GET), at most 4 across chunk boundaries; corner values are **immediately converted to Python float**(`float(arr[...])`,`zarr.py:508-511`), bilinear kernel pure Python float(`zarr.py:133-149`).**No need to promote a whole chunk's dtype—the read path naturally promotes only the 4 scalars to float64**; for an f16 chunk the corner error = half ulp, the bilinear weights sum to 1, and the convex combination does not amplify.
 
-实测(真实场,200k 随机点):
+Measured(real fields,200k random points):
 
-| 场 | 插值误差 max / MAE / P99 | 1dp 显示翻转 |
+| Field | Interpolation error max / MAE / P99 | 1dp display flip |
 |---|---|---|
 | temperature(°C) | 0.0253 / 0.0021 / 0.0102 | 3.3% |
 | precip(mm) | 0.0647 / 8.7e-7 / 0 | 0 |
 | wind-u(m/s) | 0.0074 / 0.0005 / 0.0030 | — |
 
-point cache 缓存的正是 4 个 Python float(与存储 dtype 无关)。
+The point cache stores exactly those 4 Python floats(dtype-independent of storage).
 
-**Map/Window**(`tiles.py:986-1124`):`read_window` 分配 float32 window(`zarr.py:612`),per-chunk GET 并行(2 workers);tiles 边界立即升 float64(`tiles.py:718-720,1087,1101`)→ float64 `np.interp` 上色(773-783)→ uint8 RGBA。**确定性 map 全程可保持 float16 resident 直到 tiles 的 float64 升档**(色带映射需要连续域,但 0.03% 的输入误差在色带 stop 分辨率下不可见)。风 tile:float32 hypot×3.6 → float64(`tiles.py:1068-1070`)。ensemble map:官方 mean shard 直接读(f16 后同样 ≤0.03% 色带偏移);member-stack fallback `read_ensemble_mean_window` 用 float32 nanmean(§8 证明 f32 vs f64 计算差异 1.8e-5)。**结论:deterministic window 可以 f16 resident;ensemble 计算边界必须升 float32/64——正是 Architecture B 的划分。**
+**Map/Window**(`tiles.py:986-1124`):`read_window` allocates a float32 window(`zarr.py:612`), per-chunk GET in parallel(2 workers); tiles immediately promote at the boundary to float64(`tiles.py:718-720,1087,1101`)→ float64 `np.interp` color mapping(773-783)→ uint8 RGBA.**The deterministic map can stay float16-resident throughout until the float64 promotion in tiles**(color-band mapping needs a continuous domain, but a 0.03% input error is invisible at the color-band stop resolution).Wind tiles:float32 hypot×3.6 → float64(`tiles.py:1068-1070`).ensemble map:the official mean shard is read directly(after f16 likewise ≤0.03% color-band shift); member-stack fallback `read_ensemble_mean_window` uses float32 nanmean(§8 proves the f32 vs f64 computation difference is 1.8e-5).**Conclusion:deterministic windows can be f16-resident; the ensemble computation boundary must be promoted to float32/64—exactly the split of Architecture B**.
 
 ---
 
-## 10. API Memory Analysis(字节级)
+## 10. API Memory Analysis (Byte-Level)
 
-配置:`API_READER_MAX_CACHED_CHUNKS=512`、`API_READER_MAX_CACHED_INDICES=16384`、`API_READER_MAX_CACHED_POINTS=32768`(均 **per-reader**,`zarr.py:241-245`);`MAX_READERS=8`(`zarr.py:704`);uvicorn 4 workers(compose)。
+Configuration:`API_READER_MAX_CACHED_CHUNKS=512`, `API_READER_MAX_CACHED_INDICES=16384`, `API_READER_MAX_CACHED_POINTS=32768`(all **per-reader**,`zarr.py:241-245`);`MAX_READERS=8`(`zarr.py:704`); uvicorn 4 workers(compose).
 
-| 缓存 | 每 entry 内容 | 现状/reader | 候选(f16)/reader | 变化 |
+| Cache | Per-entry content | Current/reader | Candidate(f16)/reader | Change |
 |---|---|---|---|---|
-| `_chunk_cache`(512) | 100×100 ndarray:40,000B payload + ~96B 对象头 | **19.58 MiB** | **9.83 MiB**(20,096B) | **−9.77 MiB(−50%)** |
-| `_index_cache`(16384) | (120,2) uint64 = 1,920B + 头 | ~31.3 MiB | 不变 | 0 |
-| `_point_cache`(32768) | 9 元组 key + 4 Python float(~400-800B) | ~13-26 MiB | 不变(Python float) | 0 |
-| **reader 合计(估)** | | **~64-77 MiB** | ~54-67 MiB | **−10~15%** |
-| **每 worker(×8 readers)** | | **~0.5-0.6 GiB** | ~0.44-0.53 GiB | **−78~95 MiB** |
+| `_chunk_cache`(512) | 100×100 ndarray:40,000B payload + ~96B object header | **19.58 MiB** | **9.83 MiB**(20,096B) | **−9.77 MiB(−50%)** |
+| `_index_cache`(16384) | (120,2) uint64 = 1,920B + header | ~31.3 MiB | unchanged | 0 |
+| `_point_cache`(32768) | 9-tuple key + 4 Python floats(~400-800B) | ~13-26 MiB | unchanged(Python float) | 0 |
+| **reader total(est.)** | | **~64-77 MiB** | ~54-67 MiB | **−10~15%** |
+| **per worker(×8 readers)** | | **~0.5-0.6 GiB** | ~0.44-0.53 GiB | **−78~95 MiB** |
 
-- 现有注释"`~40 KB each`、~20 MB/reader"(`config.py:157-166`)仍准确;但 `~0.8 KB/entry` 的 point cache 估计(`config.py:188-207`)与 "~2 KB" 的 index 估计表明 **chunk payload 只占 reader 缓存的 ~25-30%**——"API 缓存内存减半"的说法不成立,准确说法是 **chunk-payload 减半、reader 总缓存 −10~15%、worker 总缓存 −78~95 MiB**。
-- docs/ARCHITECTURE.md:320 的"2048 chunks"是过时值(实现 512)。
-- window/tile 的 float64 组装是请求生命周期临时量,与 dtype 迁移无关(候选下输入减半,临时 float64 window 不变)。
+- The existing comment "`~40 KB each`, ~20 MB/reader"(`config.py:157-166`)is still accurate; but the `~0.8 KB/entry` point cache estimate(`config.py:188-207`)and the "~2 KB" index estimate show that **the chunk payload accounts for only ~25-30% of the reader cache**—the claim "API cache memory halved" does not hold; the accurate statement is **chunk-payload halved, reader total cache −10~15%, worker total cache −78~95 MiB**.
+- The "2048 chunks" in docs/ARCHITECTURE.md:320 is a stale value(the implementation is 512).
+- The float64 assembly of window/tile is a request-lifecycle temporary and is unrelated to the dtype migration(under the candidate the input is halved, the temporary float64 window unchanged).
 
 ---
 
 ## 11. Ingestion Memory Analysis
 
-并发结构(`config.py:133-172`、`wave_runner.py:371`):download 8 / **decode 2** / write 4,staging 上界 = 14 items;wave ≤8 leads;GEFS wave = (1 mean + 30 members)×leads,lead-major。跨进程交接是**全量 pickle Dataset**(~60 MB float32/文件,`wave_runner.py:1727-1729`)。前驱副本 tp+tcc ≈ 2×8.3MB。
+Concurrency structure(`config.py:133-172`, `wave_runner.py:371`):download 8 / **decode 2** / write 4, staging upper bound = 14 items; wave ≤8 leads; GEFS wave = (1 mean + 30 members)×leads, lead-major.Cross-process handover is a **full pickle Dataset**(~60 MB float32/file,`wave_runner.py:1727-1729`).Predecessor copies tp+tcc ≈ 2×8.3MB.
 
-**候选架构(解码/归一化保持 float32)下**:驻留大头(解码 Dataset、pickle、前驱副本)**全部不变**;变化仅 shard 编码缓冲(120×100×100:4.61MB→2.30MB/shard,f16)与 PUT 字节。**ingestion RSS 净节省 <2-3%,不值得作为迁移动机**;也不要为省内存提前把 decode/normalize float16 化(会破坏 §6 的 float64 减法合同与 §8 的 float64 统计输入)。*不要为省内存过早 f16 化*的约束在此被量化证实。
+**Under the candidate architecture(decode/normalize kept at float32)**:the big resident items(decoded Dataset, pickle, predecessor copies)are **all unchanged**; the only changes are the shard encoding buffer(120×100×100:4.61MB→2.30MB/shard, f16)and the PUT bytes.**ingestion RSS net saving <2-3%, not worth using as the migration motive**; nor should decode/normalize be turned float16 ahead of time to save memory(it would break the float64 subtraction contract of §6 and the float64 statistics inputs of §8).The constraint *do not f16-ify prematurely to save memory* is quantitatively confirmed here.
 
 ---
 
-## 12. Compression Benchmark(真实数据,Zstd level 5 = writer 同款 numcodecs 设置)
+## 12. Compression Benchmark (Real Data, Zstd level 5 = Same numcodecs Settings as the Writer)
 
-**Chunk 粒度(真实 Range GET 单元,100×100)**:
+**Chunk granularity(the real Range GET unit,100×100)**:
 
-| 字段 | f32 压缩/chunk | f16 压缩/chunk | 节省 | f32 比率 | f16 比率 |
+| Field | f32 compressed/chunk | f16 compressed/chunk | Saving | f32 ratio | f16 ratio |
 |---|---|---|---|---|---|
 | temperature | 7.8 KB | 6.4 KB | **18.7%** | 5.1× | 3.1× |
 | RH | 11.2 | 9.7 | 13.1% | 3.6× | 2.1× |
@@ -298,169 +298,169 @@ point cache 缓存的正是 4 个 Python float(与存储 dtype 无关)。
 | visibility | 8.0 | 4.4 | **45.4%** | 5.0× | 4.5× |
 | snow_depth | 5.1 | 2.7 | **46.7%** | 8.1× | 7.7× |
 
-**flags(当前被硬编码存 f32,`zarr_writer.py:658`)**:crain f32 100.3KB/shard-chunkset → **uint8 68.5KB(−31.7%)**;csnow −26.6%;cfrzr/cicep 近零(-9.0%/-5.2%);四 flag 合计 **−29.6%**。f16 化 flags 仅再省 5-11% 且语义错误——**必须 uint8**。
-(整场粒度数字同趋势:temperature 0.86→0.71MB 等;encode/decode 时间见 §14。)
+**flags(currently hard-coded as f32,`zarr_writer.py:658`)**:crain f32 100.3KB/shard-chunkset → **uint8 68.5KB(−31.7%)**; csnow −26.6%; cfrzr/cicep near zero(-9.0%/-5.2%); the four flags total **−29.6%**.Turning flags into f16 saves only a further 5-11% and is semantically wrong—**must be uint8**.
+(Whole-field granularity numbers show the same trend:temperature 0.86→0.71MB etc.; encode/decode times in §14.)
 
-**关键反直觉结论:payload 减半 ≠ 压缩后减半**。f32 本身压缩比高(4-9×),压缩后尺寸由尾数噪声熵主导;实测连续量节省 **11-47%(多数 13-24%)**,不能按 50% 做容量规划。
+**Key counter-intuitive conclusion:halving the payload ≠ halving after compression**.f32 itself compresses well(4-9×), and the compressed size is dominated by the entropy of the mantissa noise; measured continuous-variable savings are **11-47%(mostly 13-24%)**, so capacity planning must not assume 50%.
 
 ---
 
 ## 13. Object Store and Range GET Savings
 
-几何:GFS 15 vars × 81 leads × 1 det = 1,215 shards/cycle;GEFS 14 vars × 81 × (30 mem + 1 mean) = 35,154 shards/cycle;每 shard 120 chunks。实测 per-chunk 均值(bench4)加权:
+Geometry:GFS 15 vars × 81 leads × 1 det = 1,215 shards/cycle; GEFS 14 vars × 81 × (30 mem + 1 mean) = 35,154 shards/cycle;120 chunks per shard.Measured per-chunk means(bench4)weighted:
 
-| 对象 | f32 现状 | f16+u8 候选 | 节省 |
+| Object | f32 current state | f16+u8 candidate | Saving |
 |---|---|---|---|
 | GFS / cycle | 0.83 GB | 0.64 GB | −22.2% |
 | GEFS / cycle | 23.70 GB | 18.43 GB | −22.2% |
-| 活跃窗口(GFS ~40 报 + GEFS ~20 报,由 0-240h 视界 + canonical 最新选择推得,`planner.py:1-20`) | **~507 GB** | **~394 GB** | **−113 GB(−22.2%)** |
+| Active window(GFS ~40 runs + GEFS ~20 runs, derived from the 0-240h horizon + canonical latest selection,`planner.py:1-20`) | **~507 GB** | **~394 GB** | **−113 GB(−22.2%)** |
 
-**Range GET 传输**(请求数不变,字节下降):
-- point(GFS):1 chunk(7.8→6.4KB)+ index tail(1.92KB,不变)→ −18%;
-- point(GEFS 读 mean shard):同上;
-- ensemble 统计:30 chunk GET 235→191KB(−19%);precip phase:180 chunk GET(~30 成员×6 场)≈ 1.2→0.97MB;
-- map tile:z≥4 一 chunk,低 zoom 至 120 chunks;
-- **GEFS cold-serving 的债务本质是 request-count 与冷索引 RTT,不是字节**——f16 降低每请求字节 ~19% 和解压 CPU(payload 减半),但 **Range GET 次数完全不变**;不能宣称延迟 −50%。冷请求的 decode 时间(§14 frombuffer f16 反而快 2×)与传输字节的收益对 cold latency 是二阶改善。
+**Range GET transfer**(request count unchanged, bytes down):
+- point(GFS):1 chunk(7.8→6.4KB)+ index tail(1.92KB, unchanged)→ −18%;
+- point(GEFS reads the mean shard):same as above;
+- ensemble statistics:30 chunk GETs 235→191KB(−19%); precip phase:180 chunk GETs(~30 members×6 fields)≈ 1.2→0.97MB;
+- map tile:a single chunk for z≥4, up to 120 chunks at low zoom;
+- **The debt of GEFS cold-serving is fundamentally request-count and cold-index RTT, not bytes**—f16 reduces bytes per request by ~19% and the decompression CPU(payload halved), but the **Range GET count is completely unchanged**; one cannot claim latency −50%.For cold latency, the decode time(in §14 frombuffer f16 is actually 2× faster)and the transfer-byte benefit are second-order improvements.
 
 ---
 
 ## 14. CPU / x86 / ARM64 Analysis
 
-实测平台:AMD Ryzen 7 5800X(Zen 3,x86-64,AVX2,**无原生 FP16 算术**;ARM64 NEON 有原生 f16 向量但 NumPy 当前同样非向量化)。numpy 2.5.3:
+Measured platform:AMD Ryzen 7 5800X(Zen 3, x86-64, AVX2,**no native FP16 arithmetic**; ARM64 NEON has native f16 vectors but NumPy is currently likewise non-vectorized).numpy 2.5.3:
 
-| 操作(4M 元素) | f32 | f16 | f16 存储→f32 计算 | 结论 |
+| Operation(4M elements) | f32 | f16 | f16 storage→f32 computation | Conclusion |
 |---|---|---|---|---|
-| 减法 | 2.94 ms | **25.6 ms(8.7×慢)** | 3.48 ms | f16 计算不可接受 |
-| 乘法 | 2.55 | 25.0(9.8×) | — | 同上 |
-| mean | 2.38 | 6.79(2.9×)⚠**溢出** | 2.12 | f16 reduction 数值危险 |
-| std | 8.92 | **61.8(6.9×)** | — | 同上 |
-| percentile | 31.3 | 38.1(1.2×) | — | 排序主导 |
-| astype f32→f16 | — | 10.9 ms | — | writer 量化成本 ~370M elem/s |
-| astype f16→f32 | — | 8.0 ms | — | reader 升档成本 |
-| frombuffer+copy | 2.34 ms | **1.18 ms(2×快)** | — | **f16 chunk 解码更快**(字节减半) |
-| hypot | 12.8 | — | — | 保持 f32 |
+| subtraction | 2.94 ms | **25.6 ms(8.7× slower)** | 3.48 ms | f16 computation unacceptable |
+| multiplication | 2.55 | 25.0(9.8×) | — | same as above |
+| mean | 2.38 | 6.79(2.9×)⚠**overflow** | 2.12 | f16 reduction numerically dangerous |
+| std | 8.92 | **61.8(6.9×)** | — | same as above |
+| percentile | 31.3 | 38.1(1.2×) | — | sort-dominated |
+| astype f32→f16 | — | 10.9 ms | — | writer quantization cost ~370M elem/s |
+| astype f16→f32 | — | 8.0 ms | — | reader promotion cost |
+| frombuffer+copy | 2.34 ms | **1.18 ms(2× faster)** | — | **f16 chunk decode is faster**(bytes halved) |
+| hypot | 12.8 | — | — | keep f32 |
 
-- **f16 reduction 溢出实测**:4M 元素 N(10,20) 序列 `a16.mean()` 触发 `overflow encountered in reduce`(f16 累加器上溢 inf)——f16 计算不仅慢而且**数值破坏**。
-- **目标架构应明确定位 float16 为 storage/cache/bandwidth 优化格式,不是 compute format**——本基准是直接证据。ARM64 上 NumPy 2.x 的 f16 路径同样非向量化(升级到有 f16 向量化栈前,该结论跨架构成立)。
+- **Measured f16 reduction overflow**:on a 4M-element N(10,20)sequence,`a16.mean()` triggers `overflow encountered in reduce`(the f16 accumulator overflows to inf)—f16 computation is not only slow but **numerically destructive**.
+- **The target architecture should clearly position float16 as a storage/cache/bandwidth optimization format, not a compute format**—this benchmark is direct evidence.NumPy 2.x's f16 path on ARM64 is likewise non-vectorized(until an f16-vectorized stack is adopted, the conclusion holds across architectures).
 
 ---
 
 ## 15. Float64 Audit
 
-| float64 使用点 | 位置 | 分类 | 处置 |
+| float64 usage site | Location | Classification | Disposition |
 |---|---|---|---|
-| de-accumulation 减法 | `pipeline.py:331-332` | **Required**(消减合同+0.5mm 钳制边界的数值余量;§6 证明其产出是参考基准) | **保留** |
-| cloud 重建算术 | `cloud.py:160-161` | **Required**(与上同源;条件 float32 还回 188-189) | **保留** |
-| domain 统一 coerce | `_validation.py:43` | **Required**(统计合同,测试以 np.float64 精确断言,`test_serving_selection_shape.py:210`) | **保留** |
-| ensemble 统计/pdf/wind stats | `statistics.py`、`pdf.py`、`wind.py:221-506` | Required(同上合同) | 保留 |
-| tile 窗口升 f64 | `tiles.py:718-720` 等 10+ 处 | Probably unnecessary for correctness(色带映射 f32 足够)但**非本次迁移范围**,改动只增加回归面 | 保留不动 |
-| 2×2 插值窗口 | `point_forecast.py:1856`(legacy 路径) | Probably unnecessary | 保留 |
-| 坐标/几何 | `tiles.py:629-659`、grid math | Non-impacting(标量/元数据量级) | 保留 |
-| 类型注失真 | `pipeline.py:252` 注 float64 实为 float32 | 文档性错误 | 建议顺手修注释 |
-| JSON 展开 | `point_forecast.py:603` float32→float64 文本 | Non-impacting 但见 §19 | 见 §21-2 |
+| de-accumulation subtraction | `pipeline.py:331-332` | **Required**(numerical margin for the accumulation-reduction contract + the 0.5mm clamp boundary;§6 proves its output is the reference baseline) | **retain** |
+| cloud reconstruction arithmetic | `cloud.py:160-161` | **Required**(same source as above; conditionally cast back to float32 at 188-189) | **retain** |
+| domain unified coerce | `_validation.py:43` | **Required**(statistics contract, tests assert exactly with np.float64,`test_serving_selection_shape.py:210`) | **retain** |
+| ensemble statistics/pdf/wind stats | `statistics.py`, `pdf.py`, `wind.py:221-506` | Required(same contract as above) | retain |
+| tile window promoted to f64 | `tiles.py:718-720` and 10+ other places | Probably unnecessary for correctness(f32 suffices for color-band mapping)but **out of scope for this migration**, and changes would only enlarge the regression surface | retain unchanged |
+| 2×2 interpolation window | `point_forecast.py:1856`(legacy path) | Probably unnecessary | retain |
+| coordinates/geometry | `tiles.py:629-659`, grid math | Non-impacting(scalar/metadata magnitude) | retain |
+| inaccurate type annotation | `pipeline.py:252` annotates float64 but it is actually float32 | documentation error | suggest fixing the comment in passing |
+| JSON expansion | `point_forecast.py:603` float32→float64 text | Non-impacting but see §19 | see §21-2 |
 
-未发现可安全删除的 float64(删除收益≈0,回归风险>0)。
+No float64 was found that can be safely deleted(deletion benefit ≈0, regression risk >0).
 
 ---
 
-## 16. Storage Format Versioning(推荐兼容架构)
+## 16. Storage Format Versioning (Recommended Compatibility Architecture)
 
-**推荐:Option B —— `sharded_v2`,per-variable native dtype,manifest 携带版本。**
+**Recommendation:Option B — `sharded_v2`, per-variable native dtype, version carried in the manifest.**
 
-- `STORAGE_FORMAT_VERSION`(ingestion `config.py:236`,现 `"sharded_v1"`)→ 写 `"sharded_v2"` 于 manifest(`coordinator.py:987,1256`)。**无需任何 DB 迁移**(catalog 无 format 列;per-cycle store 隔离;`model_runs` 不可变 store path,`catalog.py` immutable)。
-- v2 语义:**连续量 f16(little-endian `<f2`,显式端序,修复 v1 的 native 端序含糊)、flags u8(det/mem shard)、mean-shard flags 保持 f32(成员均值概率 0..1)、NaN 哨兵不变**;index/trailer/对象键/生命周期完全不变(几何与 dtype 无关,`zarr.py:406` 运行时取 offset)。
-- reader:`manifest_storage_format()` 分支已有(5 个调用点);`ShardedV1Reader.read_chunk` 按 format 选 frombuffer dtype 并**统一物化为内部 dtype**(point/window 立即 f32/f64 域;chunk cache 可保 f16——见 §10)。建议新 reader 类 `ShardedV2Reader` 复用 `ShardedV1Reader` 的 index/cache 机制,而不是在 v1 类内加 if——v1 路径冻结,降低回归面。
-- **旧 cycle 保持 v1 可读、新 cycle 写 v2、旧数据随 lifecycle 自然淘汰——零 bulk migration**:canonical 选择只读"最新可服务 cycle",v1 cycle 在其活跃窗口内由 v1 分支服务,直到 GC 回收(`planner.py`;reclamation 队列按 `physical_key` 与 `store_generation` 基线防护,`worker.py:184-232`)。
-- 前提约束:同一 cycle 的首次写与 finalization 之间**不得切换** `STORAGE_FORMAT_VERSION`(`coordinator.py:1256` per-lead 都盖章;manifest 30s 正向缓存,`manifest_reader.py:39-43`)。
+- `STORAGE_FORMAT_VERSION`(ingestion `config.py:236`, currently `"sharded_v1"`)→ writes `"sharded_v2"` into the manifest(`coordinator.py:987,1256`).**No DB migration whatsoever**(the catalog has no format column; per-cycle store isolation;`model_runs` has an immutable store path,`catalog.py` immutable).
+- v2 semantics:**continuous variables f16(little-endian `<f2`, explicit endianness, fixing v1's native-endianness ambiguity), flags u8(det/mem shard), mean-shard flags kept f32(member-mean probability 0..1), NaN sentinel unchanged**; index/trailer/object key/lifecycle completely unchanged(geometry is dtype-independent,`zarr.py:406` takes the offset at runtime).
+- reader:the `manifest_storage_format()` branch already exists(5 call sites);`ShardedV1Reader.read_chunk` selects the frombuffer dtype by format and **uniformly materializes to the internal dtype**(point/window immediately in the f32/f64 domain; the chunk cache may keep f16—see §10).Recommended is a new reader class `ShardedV2Reader` reusing `ShardedV1Reader`'s index/cache machinery, rather than adding an if inside the v1 class—the v1 path stays frozen, reducing the regression surface.
+- **Old cycles stay readable as v1, new cycles write v2, old data is retired naturally by lifecycle—zero bulk migration**:canonical selection reads only the "latest serviceable cycle", and a v1 cycle is served by the v1 branch while inside its active window, until GC reclaims it(`planner.py`; the reclamation queue is fenced against the `physical_key` and `store_generation` baseline,`worker.py:184-232`).
+- Precondition:`STORAGE_FORMAT_VERSION` **must not be switched** between the first write of a cycle and finalization(`coordinator.py:1256` stamps every per-lead; manifest 30s forward cache,`manifest_reader.py:39-43`).
 
 ---
 
 ## 17. NaN / Inf / Fill / Missing Semantics
 
-- 平台**无 `_FillValue`**;缺失 = index length==0 → NaN fill chunk(`zarr.py:407-408`);writer NaN-fill 缓冲(`zarr_writer.py:658`);有效性一律 `np.isfinite` mask;domain 拒绝非有限输入(`_validation.py:55`);NaN→JSON null(`point_forecast.py:554`)。
-- **f16 往返实测**:NaN 保真(bytes 0x007e)、±Inf 保真、±0.0 符号保真;**70000.0 → inf(RuntimeWarning overflow in cast)、65519→65504(饱和)、<6e-8 下溢为 0、6e-6 为亚正规保真**。
-- 对当前变量清单的溢出审计:实测 max(306.4mm、230.8km/h、±61.5m/s、24.1km、2.38m、100%、39.2°C)**全部 ≪ 65504**;PRATE 83.9mm/h、ceiling 20km 安全。**但 f16 范围检查应作为 writer 侧断言**(上游异常值/单位错误时 astype 会静默产生 inf,而 `np.isfinite` 有效性检查会把 inf 当无效丢弃——语义可保,但应在 encode 处 warning,防止静默面扩大)。
-- 搜索 4-byte/byte-pattern 假设:仅 `zarr.py:421`(frombuffer f32,v2 修改点)、`png.py:63,76,99`(RGBA 4B/px,无关)、`wind.py:722`(int16 vector payload ×2,无关)、`client.ts:436-442`(vector header getFloat32,无关)。index/trailer 数学 dtype 无关。
+- The platform has **no `_FillValue`**; missing = index length==0 → NaN fill chunk(`zarr.py:407-408`); writer NaN-fill buffer(`zarr_writer.py:658`); validity is always an `np.isfinite` mask; the domain rejects non-finite inputs(`_validation.py:55`); NaN→JSON null(`point_forecast.py:554`).
+- **Measured f16 round-trip**:NaN faithful(bytes 0x007e), ±Inf faithful, ±0.0 sign faithful;**70000.0 → inf(RuntimeWarning overflow in cast), 65519→65504(saturation), <6e-8 underflows to 0,6e-6 faithful as subnormal**.
+- Overflow audit against the current variable inventory:measured max(306.4mm, 230.8km/h, ±61.5m/s, 24.1km, 2.38m, 100%, 39.2°C)are **all ≪ 65504**; PRATE 83.9mm/h and ceiling 20km are safe.**But the f16 range check should be a writer-side assertion**(on upstream outliers/unit errors astype silently produces inf, and the `np.isfinite` validity check would discard inf as invalid—semantics can be preserved, but a warning should be emitted at encode, to prevent the silent surface from growing).
+- Search for 4-byte/byte-pattern assumptions:only `zarr.py:421`(frombuffer f32, the v2 modification point), `png.py:63,76,99`(RGBA 4B/px, unaffected), `wind.py:722`(int16 vector payload ×2, unaffected), `client.ts:436-442`(vector header getFloat32, unaffected).index/trailer math is dtype-independent.
 
 ---
 
-## 18. Categorical Variables(单独分析)
+## 18. Categorical Variables (Separate Analysis)
 
-- 归一化后 uint8(`pipeline.py:292-298`);lead-0 uint8 零(`pipeline.py:488-499`);**但 sharded writer 把它们并回 f32 存储**(`zarr_writer.py:658`),而 `.zarray` 元数据记 uint8(`zarr_writer.py:373`)——**元数据与字节不一致**。
-- 还有第二条漏洞:若 GRIB units token 恰为 `"flag"`,单位换算短路的值**保持 float32**(`pipeline.py:766-767` 短路逻辑)——归一化 dtype 依赖上游属性,不稳定。
-- **量化(实测,f32→u8,Zstd-5)**:crain −31.7%、csnow −26.6%、cfrzr −9.0%、cicep −5.2%,四 shard 合计 **−29.6%**;raw 减 75%。
-- **例外——GEFS mean shard 的 flags 是成员均值概率**(0..1 float32,如 0.65,`test_precipitation_phase_companions.py:268`;相态产品消费分数 flags,`point_forecast.py:899` ≥0.5 判定)。mean shard 的 flags **必须保持 float**(f16 亦可:0..1 区间半 ulp ≤0.00049,4dp 输出取整后无差异;保守起见 v2 首版 mean-shard flags 可留 f32)。
-- serving 输出 `round(float(x), 4)`(`point_forecast.py:575`)+ 前端 `>= 0.5` 判定(`FE/lib/forecast/precipitation.ts`)——u8/det 分支存 0/1 完全保真。
+- uint8 after normalization(`pipeline.py:292-298`); lead-0 uint8 zero(`pipeline.py:488-499`);**but the sharded writer merges them back into f32 storage**(`zarr_writer.py:658`), while the `.zarray` metadata records uint8(`zarr_writer.py:373`)—**metadata and bytes are inconsistent**.
+- There is a second hole:if the GRIB units token is exactly `"flag"`, the value short-circuited by unit conversion **stays float32**(`pipeline.py:766-767` short-circuit logic)—the normalization dtype depends on an upstream attribute and is unstable.
+- **Quantization(measured, f32→u8, Zstd-5)**:crain −31.7%, csnow −26.6%, cfrzr −9.0%, cicep −5.2%, the four shards total **−29.6%**; raw reduced by 75%.
+- **Exception—the flags of the GEFS mean shard are member-mean probabilities**(0..1 float32, such as 0.65,`test_precipitation_phase_companions.py:268`; the phase products consume the fractional flags,`point_forecast.py:899` ≥0.5 determination).The mean shard's flags **must stay float**(f16 is also acceptable:in the 0..1 interval the half ulp is ≤0.00049, and after rounding to the 4dp output there is no difference; conservatively the first v2 version may keep mean-shard flags at f32).
+- serving outputs `round(float(x), 4)`(`point_forecast.py:575`)+ frontend `>= 0.5` determination(`FE/lib/forecast/precipitation.ts`)—the u8/det branch storing 0/1 is fully faithful.
 
 ---
 
 ## 19. Redis / JSON / Frontend
 
-- **Redis**(`cache.py:199`):`model_dump_json()` 的 **JSON 文本**;float16 只改变文本里的十进制字面量,缓存机制、key(sha256 of canonical JSON)、TTL、损坏检测(schema validate)全部 dtype 无关。**不存在"float16→Redis 自动减半"**。vector L2 是 int16 量化原始字节(`vector_field.py:198`),与存储 dtype 完全隔离。
-- **JSON(Pydantic)**:schemas 全部 `float | None`;转换点全是 `float(...)`(无 `.item()`)。**两类字段**:
-  1. **API 边界已舍入**(dtype 无关):direction/cloud 1dp、flags/概率/coverage 4dp、consensus 2dp 等(agent 4 §7 表);
-  2. **未舍入直通**:`point_forecast.py:603-606` 的 temperature_2m/precipitation_rate/RH/wind_gust/visibility/snow_depth/cloud_ceiling 以 float32→float64 **展开文本**输出(现状就是 `15.100000381469727` 这类噪声尾数)。f16 存储后这些字面量变为 f16 展开(如 `15.1015625`)。**JSON 语义不变、字节文本变**;对 `Number.isFinite` 门控与 Intl 渲染无影响,但任何对响应做黄金文件断言的测试/客户端会看到差异。
-- **Frontend**:fetch JSON(`client.ts:71,86`);所有小数处理是渲染期格式化(toFixed/Intl,`labels.ts:86-117`);客户端统计复刻 ddof=0/linear percentile(`transform.ts:273-301`);flags `>=0.5`、dry `<=0.05`、静风 `hypot<0.5`(int16 量化域,`windParticles.ts:14`)——**这些阈值比较发生在 JSON Number 上,与存储 dtype 无关**(§21-2 的显示舍入项除外)。vector 二进制解码(`client.ts:404-478`)与 f16 无关。**不存在"frontend 内存自动减半"。**
-- **presentation rounding 与 storage precision 已天然分离**(API round + FE Intl);本轮**不引入任何全局 round/truncate**——§21-2 是唯一需要产品决策的显示层项,且建议保持现状。
+- **Redis**(`cache.py:199`):the **JSON text** of `model_dump_json()`; float16 only changes the decimal literals in the text, while the cache mechanism, key(sha256 of canonical JSON), TTL, corruption detection(schema validate)are all dtype-independent.**There is no such thing as "float16→Redis automatically halved"**.vector L2 is int16-quantized raw bytes(`vector_field.py:198`), completely isolated from the storage dtype.
+- **JSON(Pydantic)**:all schemas are `float | None`; the conversion points are all `float(...)`(no `.item()`).**Two classes of fields**:
+  1. **API boundary already rounded**(dtype-independent):direction/cloud 1dp, flags/probability/coverage 4dp, consensus 2dp etc.(agent 4 §7 table);
+  2. **Unrounded pass-through**:the temperature_2m/precipitation_rate/RH/wind_gust/visibility/snow_depth/cloud_ceiling of `point_forecast.py:603-606` are output as float32→float64 **expanded text**(the current state already has noise tails like `15.100000381469727`).After f16 storage these literals become f16 expansions(such as `15.1015625`).**JSON semantics unchanged, byte text changed**; no impact on the `Number.isFinite` gating and Intl rendering, but any test/client that golden-file-asserts responses will see a difference.
+- **Frontend**:fetch JSON(`client.ts:71,86`); all decimal handling is render-time formatting(toFixed/Intl,`labels.ts:86-117`); the client statistics replicate ddof=0/linear percentile(`transform.ts:273-301`); flags `>=0.5`, dry `<=0.05`, calm wind `hypot<0.5`(int16 quantization domain,`windParticles.ts:14`)—**these threshold comparisons happen on JSON Numbers and are independent of the storage dtype**(except for the display-rounding item of §21-2).vector binary decoding(`client.ts:404-478`)is unrelated to f16.**There is no such thing as "frontend memory automatically halved"**.
+- **presentation rounding and storage precision are already naturally separated**(API round + FE Intl); this round **introduces no global round/truncate**—§21-2 is the only display-layer item requiring a product decision, and keeping the current state is recommended.
 
 ---
 
-## 20. Backward-Compatible Rollout Plan(只设计,不实施)
+## 20. Backward-Compatible Rollout Plan (Design Only, No Implementation)
 
-**Phase 0 — 前置硬化(1 个小 PR 量级)**
-- writer 侧 f16 范围断言 + encode 前非有限检查(§17);
-- flags 归一化短路漏洞修复(`pipeline.py:766` 强制 u8);
-- (可选)钳制边界补偿参数化(§6-4)。
+**Phase 0 — upfront hardening(1 small PR worth)**
+- writer-side f16 range assertion + pre-encode non-finite check(§17);
+- fix the flags normalization short-circuit hole(`pipeline.py:766` forced to u8);
+- (optional)parameterize the clamp-boundary compensation(§6-4).
 
-**Phase 1 — dual reader(先读)**
-- 新增 `ShardedV2Reader`(或 v1 类的 dtype 表参数),`manifest_storage_format()` 分支全覆盖 5 个调用点;v1 路径零改动;
-- chunk cache 按 manifest dtype 物化(连续量 f16 缓存);
-- 测试:v1 fixture 全绿 + v2 fixture 等价断言(§18 测试计划)。
+**Phase 1 — dual reader(read first)**
+- add `ShardedV2Reader`(or a dtype-table parameter on the v1 class), with the `manifest_storage_format()` branch fully covering the 5 call sites; the v1 path has zero changes;
+- chunk cache materialized by manifest dtype(continuous variables cached as f16);
+- tests:v1 fixtures all green + v2 fixture equivalence assertions(§18 test plan).
 
-**Phase 2 — dual writer(后写)**
-- `STORAGE_FORMAT_VERSION=sharded_v2` 灰度:先 GFS(det,风险最低)→ GEFS mean → GEFS members;
-- 同一 cycle 内禁止切换(启动时快照设置);
-- writer 集成 `zarr_writer.py:658` 的 dtype 表(f16/u8/f32-mean-flags)。
+**Phase 2 — dual writer(write later)**
+- `STORAGE_FORMAT_VERSION=sharded_v2` staged rollout:GFS first(det, lowest risk)→ GEFS mean → GEFS members;
+- switching forbidden within the same cycle(settings snapshotted at startup);
+- writer integrates the dtype table at `zarr_writer.py:658`(f16/u8/f32-mean-flags).
 
-**Phase 3 — mixed serving 验证**
-- 生产影子比对(§19):同一请求走 v1 旧 cycle 与 v2 新 cycle,逐变量 diff 阈值(§18 表的实测上界);
-- 监控:per-format shard 计数、Range GET 字节、API RSS、clamped/invalidated 计数(现有 QC 日志 `pipeline.py:355-368`)。
+**Phase 3 — mixed serving validation**
+- production shadow comparison(§19):the same request goes to a v1 old cycle and a v2 new cycle, per-variable diff thresholds(the measured upper bounds of the §18 table);
+- monitoring:per-format shard counts, Range GET bytes, API RSS, clamped/invalidated counts(existing QC logs `pipeline.py:355-368`).
 
-**Phase 4 — 自然退役**
-- v1 cycle 随 canonical 淘汰被 GC 回收(`planner.py`,reclamation `store_generation` 基线防护);无 bulk migration、无格式转换作业;
-- v1 读分支**永久保留**(历史 tombstone/cycle 可能长寿)或按团队政策在 N 个 release 后移除。
+**Phase 4 — natural retirement**
+- v1 cycles are GC-reclaimed as canonical retires them(`planner.py`, reclamation fenced against the `store_generation` baseline); no bulk migration, no format-conversion job;
+- the v1 read branch is **retained permanently**(historical tombstones/cycles may be long-lived)or removed after N releases per team policy.
 
-**回滚**:Phase 2 前零风险;Phase 2 后把 env 切回 `sharded_v1` 即停止产生 v2(已写 v2 cycle 依靠 Phase 1 reader 继续服务);无需数据回写。
-
----
-
-## 21. Required Tests / 19. Real-Data Validation(合并为验证计划)
-
-**Unit**(新增):
-- f16/u8/f32 serialize round-trip(含 NaN、±Inf 拒绝策略、±0.0、65504 饱和、下溢);v2 index/trailer 不变性;manifest `sharded_v2` 读写;mixed-dtype reader(v1+v2 同进程)。
-- **Numerical regression(逐变量,用本报告的实测上界作断言)**:对每个连续变量,f16 往返误差 ≤ §5 表 max 值 ×1.2。
-- **Precipitation**:正常 deaccum;极小增量(1 量子);大累积+小增量(64/128/256mm 三档);reset 边界(lead 3/6/9);负残差三段(≥0 / 钳制 / NaN);**前驱 f16 存储**(fallback 路径)+ **前驱内存 f32**(生产路径)两条;对抗 AC1-AC5 复现(1e-6 级事件只允许在钳制边界,且不得批量)。
-- **Cloud**:reconstruction ±5pp 三段;f16 前驱传播 ≤0.1pp;tolerance 边界值。
-- **Ensemble**:mean/median/std/P10/P25/P75/P90/IQR 对 f32 基线 max ≤0.03°C(30 成员);phase support uint8 不变性;joint amount-phase 阈值翻转率 0。
-- **Interpolation**:2×2 解析场 f32 vs f16 输入 max ≤ 半 ulp×1.2;`test_serving_selection_shape.py:210` 的 float64 精确合同**仅对 v1 保持**,v2 定义新合同。
-- **Mixed-format**:v1 cycle + v2 cycle 同 request 混合服务(cross-cycle fallback 路径 `test_cross_cycle*.py` 扩展)。
-- **合同更新(必须同步)**:float32 fixtures(`test_serving_chunk_equivalence.py:18-27` 等)、`abs=1e-9` 位等价(改为 v1-only 或 per-format)、`abs=1e-5` deaccum/插值容差(v2 放宽到量化步长 + 1e-5)。
-
-**Real-data validation(plan,用本报告管线)**:对 1 个完整 GFS + 1 个完整 GEFS cycle 逐变量/逐 lead 输出 max/MAE/P50/P95/P99 绝对误差与 max 相对误差;GEFS 产品单独输出 mean/median/std/P10/P25/P50/P75/P90/IQR/phase-support%;检查 threshold/classification/member-ordering 变化;**worst-case 样本表**(variable/cycle/lead/member/grid index/baseline/candidate/下游差)——本报告 §5/§6/§8 的实测表即该管线的首次运行结果,实施前应在目标生产硬件上复跑。
+**Rollback**:zero risk before Phase 2; after Phase 2, switching the env back to `sharded_v1` stops v2 production(already-written v2 cycles keep being served via the Phase 1 reader); no data writeback needed.
 
 ---
 
-## 20. Quantified Expected Benefits(实测支撑汇总)
+## 21. Required Tests / 19. Real-Data Validation (Merged into a Validation Plan)
 
-| 维度 | raw theoretical | post-Zstd 实测 | whole-process 实际 |
+**Unit**(new):
+- f16/u8/f32 serialize round-trip(including NaN, ±Inf rejection policy, ±0.0, 65504 saturation, underflow); v2 index/trailer invariance; manifest `sharded_v2` read/write; mixed-dtype reader(v1+v2 in the same process).
+- **Numerical regression(per-variable, asserting the measured upper bounds of this report)**:for each continuous variable, the f16 round-trip error ≤ the §5 table max value ×1.2.
+- **Precipitation**:normal deaccum; tiny increments(1 quantum); large accumulation + small increment(three levels 64/128/256mm); reset boundaries(lead 3/6/9); three negative-residual segments(≥0 / clamped / NaN);**predecessor read from f16 storage**(fallback path)+ **predecessor in memory f32**(production path)both branches; adversarial AC1-AC5 reproduction(1e-6-level events allowed only at the clamp boundary, and must not occur in batches).
+- **Cloud**:reconstruction ±5pp three segments; f16 predecessor propagation ≤0.1pp; tolerance boundary values.
+- **Ensemble**:mean/median/std/P10/P25/P75/P90/IQR against the f32 baseline max ≤0.03°C(30 members); phase support uint8 invariance; joint amount-phase threshold flip rate 0.
+- **Interpolation**:2×2 analytic field f32 vs f16 input max ≤ half ulp×1.2; the exact float64 contract of `test_serving_selection_shape.py:210` **holds for v1 only**, and v2 defines a new contract.
+- **Mixed-format**:v1 cycle + v2 cycle served mixed within the same request(extension of the cross-cycle fallback paths `test_cross_cycle*.py`).
+- **Contract updates(must be synchronized)**:float32 fixtures(`test_serving_chunk_equivalence.py:18-27` etc.), `abs=1e-9` bit equivalence(changed to v1-only or per-format), `abs=1e-5` deaccum/interpolation tolerance(v2 relaxed to the quantization step + 1e-5).
+
+**Real-data validation(plan, using this report's pipeline)**:for 1 complete GFS + 1 complete GEFS cycle, output per-variable/per-lead max/MAE/P50/P95/P99 absolute error and max relative error; for GEFS products separately output mean/median/std/P10/P25/P50/P75/P90/IQR/phase-support%; check threshold/classification/member-ordering changes;**worst-case sample table**(variable/cycle/lead/member/grid index/baseline/candidate/downstream difference)—the measured tables of §5/§6/§8 of this report are the first run results of that pipeline, and it should be re-run on the target production hardware before implementation.
+
+---
+
+## 20. Quantified Expected Benefits (Summary of Measured Evidence)
+
+| Dimension | raw theoretical | post-Zstd measured | whole-process actual |
 |---|---|---|---|
-| 对象存储 | −50%(payload) | **−22.2%**(GFS 0.83→0.64GB/cycle;GEFS 23.7→18.4GB/cycle;活跃 ~507→394GB) | 同左(对象存储即最终态) |
-| Range GET 字节 | −50% | **−18~19%**/请求;请求数 −0% | 冷延迟:二阶改善(传输+解压),非 50% |
-| API chunk 缓存 payload | −50% | −50%(19.58→9.83 MiB/reader) | reader 总缓存 **−10~15%**;每 worker −78~95 MiB(8 readers) |
-| ingestion RSS | ~0(解码 f32 保持) | 编码缓冲 −50%(2.3MB/shard) | **<2-3%** |
-| chunk 解码 CPU | — | frombuffer+copy **2× 快** | serving 热路径小增益 |
-| writer CPU | — | astype f32→f16 +10.9ms/4M(~370M/s) | ingestion 编码可忽略增量 |
-| 网络出口(MinIO→API) | −50% | ~−20% | 每天按请求量折算 |
+| Object storage | −50%(payload) | **−22.2%**(GFS 0.83→0.64GB/cycle; GEFS 23.7→18.4GB/cycle; active ~507→394GB) | same as left(object storage is the final state) |
+| Range GET bytes | −50% | **−18~19%**/request; request count −0% | cold latency:second-order improvement(transfer + decompression), not 50% |
+| API chunk cache payload | −50% | −50%(19.58→9.83 MiB/reader) | reader total cache **−10~15%**; per worker −78~95 MiB(8 readers) |
+| ingestion RSS | ~0(decode kept f32) | encoding buffer −50%(2.3MB/shard) | **<2-3%** |
+| chunk decode CPU | — | frombuffer+copy **2× faster** | small gain on the serving hot path |
+| writer CPU | — | astype f32→f16 +10.9ms/4M(~370M/s) | negligible increment for ingestion encoding |
+| Network egress(MinIO→API) | −50% | ~−20% | scales with daily request volume |
 
 ---
 
@@ -468,65 +468,65 @@ point cache 缓存的正是 4 个 Python float(与存储 dtype 无关)。
 
 ```yaml
 decode / normalize / derived (deaccum, cloud):
-  float32 存储, float64 仅在两个派生函数内部(现状保留)
+  float32 storage, float64 only inside the two derived functions(current state retained)
 continuous persistent forecast fields (v2 shards):
   float16 (little-endian <f2)
 categorical fields (det/mem shards):
-  uint8 (native; 修复现被并回 f32 的不一致)
+  uint8 (native; fix the inconsistency currently merged back into f32)
 ensemble mean-shard flags:
-  float32 (成员均值概率 0..1;可后续降 f16)
+  float32 (member-mean probability 0..1; may later be lowered to f16)
 decompressed API chunk cache:
-  float16 / uint8 (native dtype, 按 manifest)
+  float16 / uint8 (native dtype, per manifest)
 interpolation / ensemble statistics / reductions / tile color mapping:
-  float32 域起算(domain 合同实际 float64,保持)
+  float32 domain to start from(the domain contract is actually float64, retained)
 float64:
-  仅现状已证明必要处(pipeline.py:331-332, cloud.py:160-161, _validation.py:43)
+  only where the current state has proven it necessary(pipeline.py:331-332, cloud.py:160-161, _validation.py:43)
 JSON / presentation:
-  与存储 dtype 无关;不新增 round;保留现有 round 合同
+  independent of storage dtype; no new round; keep the existing round contract
 float16 arithmetic:
-  禁止(实测 8.7×慢 + reduction 溢出)
+  forbidden(measured 8.7× slower + reduction overflow)
 ```
 
 ## 23. Go / No-Go Preconditions
 
-1. 产品方接受 1dp 显示值在 f16 量化边界翻转(温度最多 ~25% 格点差 0.1°C,均方差 ≤0.027°C)与未舍入 JSON 字面量文本变化(§19)——**real blocker(产品决策)**。
-2. f16 范围/非有限 writer 断言落地(§17)——**real blocker(防静默 inf)**。
-3. flags u8 化 + mean-shard flags 例外 + `pipeline.py:766` 短路修复——**implementation detail**。
-4. 测试合同同步(float32 fixtures、1e-9 等价、1e-5 容差按 format 分离)——**implementation detail,工作量大头**。
-5. 钳制边界 −0.5 与 trace 0.10 的 1e-6 级 corner case:接受或参数化补偿——**optional optimization**。
-6. 双 reader/双 writer rollout 按 §20 分四阶段,GFS 先行——**implementation detail**。
-7. 文档修正(顺手):README GEFS "0.5°" vs 实现 pgrb2sp25 0.25°(`connector.py:186-188`);ARCHITECTURE.md:320 缓存尺寸;finalizer.py:20 "14-day" vs 实际 1 天保留;connector.py:71-72 "geavg out of scope" vs 实际摄入 geavg。
+1. The product side accepts 1dp display values flipping at f16 quantization boundaries(temperature at most ~25% of grid points differing by 0.1°C, mean square deviation ≤0.027°C)and the unrounded JSON literal text change(§19)—**real blocker(product decision)**.
+2. f16 range/non-finite writer assertions land(§17)—**real blocker(prevent silent inf)**.
+3. flags u8-ification + mean-shard flags exception + `pipeline.py:766` short-circuit fix—**implementation detail**.
+4. Test contract synchronization(float32 fixtures, 1e-9 equivalence, 1e-5 tolerance separated by format)—**implementation detail, the bulk of the work**.
+5. The 1e-6-level corner case at the clamp boundary −0.5 and trace 0.10:accept or parameterize compensation—**optional optimization**.
+6. Dual reader/dual writer rollout in four phases per §20, GFS first—**implementation detail**.
+7. Documentation fixes(in passing):README GEFS "0.5°" vs the implementation's pgrb2sp25 0.25°(`connector.py:186-188`); ARCHITECTURE.md:320 cache sizes; finalizer.py:20 "14-day" vs the actual 1-day retention; connector.py:71-72 "geavg out of scope" vs the actual ingestion of geavg.
 
 ---
 
 ## 24. Three Architectures Compared
 
-| 维度 | A 现状(f32+f32+Zstd) | **B 推荐(f32 计算 + f16/u8 存储 + f16 缓存)** | C f16 everywhere |
+| Dimension | A current state(f32+f32+Zstd) | **B recommended(f32 compute + f16/u8 storage + f16 cache)** | C f16 everywhere |
 |---|---|---|---|
-| 存储 | — | **−22.2%**(实测) | ≈B(flags 反而更差) |
-| 网络/GET | — | **−18~19% 字节**,请求数不变 | ≈B |
-| API 缓存 | — | payload −50%,reader 总 −10~15% | 同 B |
-| CPU | 基线 | 解码 2× 快,编码 +小成本,**计算不变** | **算术 8.7× 慢 + reduction 溢出(实测)** |
-| 精度 | bit 基线 | 阈值翻转 0(实测),max 0.027°C/0.0625mm | **破坏性**(600mm 处小增量 100% 丢失,实测) |
-| 复杂度 | — | 中(新 format + dtype 表 + 测试合同) | 低(看似)但需重写全部数值安全网 |
-| 兼容/风险 | — | manifest 机制现成,零 DB 迁移,可回滚 | 不可回滚的语义破坏 |
+| Storage | — | **−22.2%**(measured) | ≈B(flags actually worse) |
+| Network/GET | — | **−18~19% bytes**, request count unchanged | ≈B |
+| API cache | — | payload −50%, reader total −10~15% | same as B |
+| CPU | baseline | decode 2× faster, encode +small cost,**compute unchanged** | **arithmetic 8.7× slower + reduction overflow(measured)** |
+| Precision | bit baseline | threshold flips 0(measured), max 0.027°C/0.0625mm | **destructive**(small increments 100% lost at 600mm, measured) |
+| Complexity | — | medium(new format + dtype table + test contracts) | low(seemingly)but requires rewriting the entire numerical safety net |
+| Compatibility/risk | — | manifest mechanism ready-made, zero DB migration, rollback possible | irreversible semantic damage |
 
-**未考虑第四架构(如 bfloat16/zfp/bitshuffle)的理由**:bfloat16 精度(8 位尾数)劣于 f16 且生态支持差;zfp/有损压缩改变"逐值可解释"合同且是更大变更;bitshuffle/byte-plane 重排是正交的压缩优化,可在 v2 之上独立评估。
+**Reason for not considering a fourth architecture(such as bfloat16/zfp/bitshuffle)**:bfloat16's precision(8-bit mantissa)is worse than f16 and its ecosystem support is poor; zfp/lossy compression changes the "per-value interpretable" contract and is a larger change; bitshuffle/byte-plane reordering is an orthogonal compression optimization that can be evaluated independently on top of v2.
 
-## 25. Decision Criteria(逐条对照产品假设)
+## 25. Decision Criteria (Checked Item by Item Against the Product Assumptions)
 
-小于 1°C 温度量化 ✅(0.027°C);RH/云 ✅(0.03%);风/能见度/云底 ✅(0.014m/s / 7.8m / 0.0078km);降水存储误差 ✅(≤0.125mm 且 ≤1 上游打包量子);forecast uncertainty ≫ storage error ✅(GFS 2m 温度预报误差量级 1-3°C);不改产品语义 ✅(全部阈值翻转率 0,除 1e-6 对抗 corner);deaccum/reset 正确 ✅(§6);ensemble materially equivalent ✅(§8);吞吐/延迟无明显 regression ✅(§12/§14:编码 +小成本,解码更快,GET 字节降);backward compatible ✅(§16/§20)。
+Sub-1°C temperature quantization ✅(0.027°C); RH/cloud ✅(0.03%); wind/visibility/cloud base ✅(0.014m/s / 7.8m / 0.0078km); precipitation storage error ✅(≤0.125mm and ≤1 upstream packing quantum); forecast uncertainty ≫ storage error ✅(GFS 2m temperature forecast error magnitude 1-3°C); product semantics unchanged ✅(all threshold flip rates 0, except the 1e-6 adversarial corner); deaccum/reset correct ✅(§6); ensemble materially equivalent ✅(§8); throughput/latency no obvious regression ✅(§12/§14:encode +small cost, decode faster, GET bytes down); backward compatible ✅(§16/§20).
 
 ## 26. Risks / Blocking Questions
 
-**Real blockers**:① 未舍入 JSON 字面量变化的产品接受度(唯一面向用户的文本差异);② 上游极端值 >65504 的静默 inf(必须 writer 断言)。**Implementation details**:测试合同迁移(工作量最大)、flags 元数据/字节不一致修复、v2 reader 类边界、`STORAGE_FORMAT_VERSION` per-cycle 冻结。**Optional**:钳制边界补偿、visibility/snow 之外字段的 byte-plane 重排、mean-shard flags 降 f16。
+**Real blockers**:① product acceptance of the unrounded JSON literal change(the only user-facing text difference);② silent inf from upstream extreme values >65504(writer assertion required).**Implementation details**:test contract migration(largest workload), flags metadata/byte inconsistency fix, v2 reader class boundary, `STORAGE_FORMAT_VERSION` per-cycle freeze.**Optional**:clamp-boundary compensation, byte-plane reordering of fields other than visibility/snow, mean-shard flags lowered to f16.
 
 ---
 
-### 附:证据与可复现性
-- 代码证据:全部 file:line 由 4 个独立调查 agent 交叉核对(ingestion 链路 / 存储与 serving / 变量与 GEFS / 全仓 dtype),关键结论由主调查者直接读码复核(`pipeline.py:302-420`、`cloud.py:103-235`、`zarr_writer.py:615-672`、`zarr.py:316-532` 等)。
-- 数据与基准:85 个真实 cfgrib 解码字段(GFS 20260923/18z f003/f006/f189/f192 + GEFS 20260923/00z 全部 30 成员 f120,0.5° pgrb2a 代理 0.25° pgrb2s);基准脚本 fetch/decode/bench1-5 位于 `%TEMP%\f16bench\`,结果 JSON 在 `results\`;CPU=AMD Ryzen 7 5800X,numpy 2.5.3,numcodecs Zstd(level=5)。
-- 已知偏差:GEFS 成员基准用 0.5° 文件(0.25° 平滑度略低→压缩比估计保守);cloud_ceiling 未采样,压缩估计用 cloud 类比;活跃保留窗口由 canonical 淘汰机制推导(GFS ~40 报/GEFS ~20 报),非硬配置。
+### Appendix: Evidence and Reproducibility
+- Code evidence:all file:line references were cross-checked by 4 independent investigation agents(ingestion pipeline / storage and serving / variables and GEFS / repo-wide dtype), and key conclusions were directly re-verified by reading code by the lead investigator(`pipeline.py:302-420`, `cloud.py:103-235`, `zarr_writer.py:615-672`, `zarr.py:316-532` etc.).
+- Data and benchmarks:85 real cfgrib decoded fields(GFS 20260923/18z f003/f006/f189/f192 + GEFS 20260923/00z all 30 members f120,0.5° pgrb2a proxying 0.25° pgrb2s); the benchmark scripts fetch/decode/bench1-5 are at `%TEMP%\f16bench\`, result JSON in `results\`; CPU=AMD Ryzen 7 5800X, numpy 2.5.3, numcodecs Zstd(level=5).
+- Known deviations:the GEFS member benchmark uses 0.5° files(0.25° is slightly less smooth→ the compression-ratio estimate is conservative); cloud_ceiling was not sampled, so its compression estimate is by analogy with cloud; the active retention window is derived from the canonical retirement mechanism(GFS ~40 runs/GEFS ~20 runs), not a hard configuration.
 
 ---
 
