@@ -841,9 +841,7 @@ describe("ensembleStatisticsEntries", () => {
     });
 
     it("uses the 2.5 rung so wide domains densify too", () => {
-      expect(niceDistributionTicks(10, 30)).toEqual([
-        10, 12.5, 15, 17.5, 20, 22.5, 25, 27.5, 30,
-      ]);
+      expect(niceDistributionTicks(10, 30)).toEqual([10, 12.5, 15, 17.5, 20, 22.5, 25, 27.5, 30]);
     });
 
     it("returns an empty list for degenerate domains", () => {
