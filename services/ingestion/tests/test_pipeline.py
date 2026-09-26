@@ -1385,6 +1385,27 @@ def test_normalize_categorical_flags_preserves_flag_unit_and_uint8() -> None:
         np.testing.assert_array_equal(normalized[code].values, [[1, 0], [0, 1]])
 
 
+def test_normalize_categorical_flags_short_circuit_still_forces_uint8() -> None:
+    """A GRIB units token already equal to the canonical 'flag' must not skip the uint8 cast.
+
+    The unit short-circuit leaves values numerically untouched; cfgrib still decodes
+    these fields as float32, so without the explicit cast the canonical normalized
+    dataset would carry float32 flags depending on the upstream units attribute.
+    """
+    from ingestion.core.pipeline import _normalize_canonical_units
+
+    for code in ("crain", "csnow", "cfrzr", "cicep"):
+        dataset = _dataset_with_units(
+            code, np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32), source_unit="flag"
+        )
+        assert dataset[code].values.dtype == np.float32
+        variables = (VariableSpec(code, f"Categorical {code}", "flag", code),)
+        normalized = _normalize_canonical_units(dataset, variables)
+        assert normalized[code].attrs["units"] == "flag"
+        assert normalized[code].values.dtype == np.uint8
+        np.testing.assert_array_equal(normalized[code].values, [[1, 0], [0, 1]])
+
+
 def test_normalize_categorical_flags_lead_zero_zeros() -> None:
     """Lead 0 normalizes categorical flags to all-zero uint8 arrays."""
     import xarray as xr

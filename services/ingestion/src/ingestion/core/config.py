@@ -231,8 +231,17 @@ class IngestionSettings(BaseSettings):
     # Advisory-lock acquisition timeout for the ingestion coordinator.
     ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
 
-    #: Primary storage format version for newly initialized forecast cycles ("sharded_v1" or "v2_unsharded").
-    #: Defaults to "sharded_v1" (14 physical shard objects per region, 120 inner 100x100 chunks).
+    #: Primary storage format version for newly initialized forecast cycles
+    #: ("sharded_v1", "sharded_v2", or "v2_unsharded").
+    #: Defaults to "sharded_v1" (frozen historical bytes: float32 shard payloads).
+    #: "sharded_v2" stores per-variable native dtypes (little-endian <f2 continuous,
+    #: <f4 precipitation_amount_3h/cloud_ceiling semantic exceptions, u1 det/member
+    #: categorical flags, <f4 mean probability flags) — see
+    #: ``domain.storage_dtype.resolve_storage_dtype`` for the authoritative matrix.
+    #: The version is frozen per cycle: the first sharded commit of a store
+    #: snapshots it, and a mid-cycle change fails loudly instead of producing a
+    #: half-v1/half-v2 store. Rollback = switch back to "sharded_v1" (new cycles
+    #: return to v1; committed v2 cycles keep serving through ShardedV2Reader).
     STORAGE_FORMAT_VERSION: Any = "sharded_v1"
 
     #: Global physical object PUT concurrency for shard writes.

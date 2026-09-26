@@ -40,6 +40,7 @@ from api.services.tiles import (
     check_available,
 )
 from domain.models.wind import encode_vector_field_int16
+from domain.storage_dtype import is_sharded_payload_format
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -230,7 +231,7 @@ def _select_and_encode_vector_field(
     lon_stride = lon_raw[::stride]
 
     format_version = manifest_storage_format(store_path) if store_path else "v2_unsharded"
-    if format_version == "sharded_v1" and store_path is not None:
+    if is_sharded_payload_format(format_version) and store_path is not None:
         reader = get_sharded_reader(store_path)
         generation = manifest_generation(store_path)
         is_ensemble = "member" in dataset.coords or "member" in field_u.dims

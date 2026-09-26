@@ -29,6 +29,7 @@ from domain.exceptions import (
     PointOutsideGridError,
 )
 from domain.geo.coordinates import validate_coordinates
+from domain.storage_dtype import is_sharded_payload_format
 from domain.geo.grid import RegularGrid
 from domain.models.precipitation import classify_precipitation_phase
 from domain.models.wind import (
@@ -778,7 +779,7 @@ def _extract_single_lead_interpolations(
     out: dict[str, Any] = {}
     is_ensemble = "member" in dataset.coords or any("member" in dataset[v].dims for v in dataset.data_vars)
 
-    if format_version == "sharded_v1":
+    if is_sharded_payload_format(format_version):
 
         for var_code in var_codes:
             if var_code == "wind_10m":
@@ -1383,7 +1384,7 @@ def batch_gated_point_interpolations(
         t_row = None
         t_col = None
 
-        if format_version == "sharded_v1":
+        if is_sharded_payload_format(format_version):
             reader = get_sharded_reader(store_path)
             if grid.rows < 2 or grid.cols < 2:
                 raise InvalidGridError(

@@ -765,6 +765,13 @@ def _normalize_canonical_units(
         target_unit = variable.unit
         if source_token == _unit_token(target_unit):
             data_array.attrs["units"] = target_unit
+            if target_unit == "flag":
+                # Categorical flags must reach a stable uint8 dtype even when the
+                # GRIB units token already matches the canonical "flag" target:
+                # the short-circuit above skips the transform table, and cfgrib
+                # decodes these fields as float32. Canonical normalized datasets
+                # must not depend on the writer to guess the categorical dtype.
+                data_array.values = np.asarray(data_array.values, dtype=np.uint8)
             continue
         transforms = _SOURCE_TO_CANONICAL.get(target_unit)
         if transforms is None or source_token not in transforms:
