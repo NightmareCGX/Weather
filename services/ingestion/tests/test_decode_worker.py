@@ -23,12 +23,13 @@ Coverage (per the approved fix contract):
 
 All tests run against local disk stores + the committed GRIB fixtures and
 runtime-built GEFS member files. No MinIO/PG needed. The process pool is
-created fresh per test (Windows spawn-safe: the worker is module-top-level).
+created fresh per test (spawn-safe on every platform: the worker is module-top-level
+and the pool forces the spawn start method).
 """
 
 from __future__ import annotations
 
-import sys
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -133,13 +134,14 @@ def test_decode_worker_is_module_top_level_and_importable() -> None:
 def test_decode_worker_top_level_from_spawn_process() -> None:
     """A spawned worker process can import and execute the decode function.
 
-    This proves the Windows-spawn path: the child resolves ``ingestion`` (via
-    the editable install's .pth) and decodes the fixture without any parent
-    sys.path mutation.
+    This proves spawn semantics (the Windows multiprocessing start method, and
+    the only portable one): the child resolves ``ingestion`` (via the editable
+    install's .pth) and decodes the fixture without any parent sys.path
+    mutation. Spawn is forced explicitly so the guarantee is exercised on
+    every platform, not just where spawn happens to be the default.
     """
-    if sys.platform != "win32":
-        pytest.skip("spawn-child import probe is Windows-specific")
-    with ProcessPoolExecutor(max_workers=1) as pool:
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
         fut = pool.submit(_child_probe)
         assert fut.result() is True
 

@@ -90,7 +90,6 @@ class TestCloudCeilingClassification:
         cls = classify_cloud_ceiling(1.2)
         assert not cls.is_unlimited
         assert cls.height_km == 1.2
-        assert cls.height_m == 1.2
 
     def test_classify_zero_height(self) -> None:
         cls = classify_cloud_ceiling(0.0)
@@ -165,12 +164,8 @@ class TestCloudEnsembleSummaries:
 
         # Finite count 18 >= 10 -> conditional percentiles are computed
         assert summary.conditional_median is not None
-        assert summary.conditional_median_m == summary.conditional_median
         assert summary.conditional_percentiles is not None
-        assert summary.conditional_percentiles_m == summary.conditional_percentiles
         assert summary.conditional_mean == pytest.approx(1.085, abs=1e-3)
-        assert summary.conditional_mean_m == summary.conditional_mean
-        assert summary.conditional_spread_m == summary.conditional_spread
         assert summary.conditional_percentiles["p50"] == pytest.approx(1.085, abs=1e-3)
 
     def test_cloud_ceiling_ensemble_high_unlimited_suppression(self) -> None:

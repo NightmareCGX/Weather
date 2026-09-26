@@ -84,7 +84,7 @@ describe("SelectedLocationSummary", () => {
       />
     );
 
-    expect(screen.getByText("loading…")).toBeInTheDocument();
+    expect(screen.getByTestId("elevation-value")).toHaveAttribute("data-state", "loading");
   });
 
   it("renders unavailable when elevation resolution fails or is null", () => {
@@ -108,7 +108,7 @@ describe("SelectedLocationSummary", () => {
       />
     );
 
-    expect(screen.getByText("unavailable")).toBeInTheDocument();
+    expect(screen.getByTestId("elevation-value")).toHaveAttribute("data-state", "unavailable");
   });
 
   it("renders dynamically resolved elevation when provided via props", () => {

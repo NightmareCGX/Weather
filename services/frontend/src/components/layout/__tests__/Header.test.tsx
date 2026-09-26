@@ -112,7 +112,7 @@ describe("Header status badge", () => {
     expect(within(panel).getByText(/Ready/)).toBeInTheDocument();
     expect(within(panel).getByText(/Syncing/)).toBeInTheDocument();
     // Ensemble models are tagged; deterministic ones are not.
-    expect(within(panel).getByText("ENS")).toBeInTheDocument();
+    expect(within(panel).getByTestId("ensemble-flag")).toBeInTheDocument();
   });
 
   it("marks the trigger as an expandable control and keeps it read-only", () => {

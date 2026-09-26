@@ -2,6 +2,8 @@
 
 Implementation basis: `SHARDED_V2_IMPLEMENTATION_PLAN.md` (authoritative) + `REPORT.md` + `QUANTIZATION_BENCHMARK.md`. This round completed all Phase 0–8 code, tests, shadow tooling, config support and documentation; **no production rollout performed, nothing committed/pushed**.
 
+> 2026-09 update: the implementation has since been merged (commit 61b0ed1) and is available behind `STORAGE_FORMAT_VERSION=sharded_v2`; production rollout is still pending.
+
 ---
 
 ## 1. Summary

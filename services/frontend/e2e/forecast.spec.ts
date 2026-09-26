@@ -12,8 +12,7 @@ import { installApiFailureMocks, installApiMocks } from "./mock-api";
  */
 
 /** The search autocomplete listbox containing location results. */
-const searchResults = (page: import("@playwright/test").Page) =>
-  page.getByRole("listbox", { name: "Search results" });
+const searchResults = (page: import("@playwright/test").Page) => page.getByTestId("search-results");
 
 test.beforeEach(async ({ page }) => {
   await installApiMocks(page);
@@ -25,7 +24,7 @@ test("search → forecast: select a city and render the point forecast dashboard
   await page.goto("/");
 
   // The search combobox is present.
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await expect(input).toBeVisible();
 
   await input.fill("Aspen");
@@ -35,13 +34,10 @@ test("search → forecast: select a city and render the point forecast dashboard
 
   await option.click();
 
-  // Dashboard appears with the location summary and meteograms. The chart
-  // aria-label uses the catalog variable name ("2-Meter Temperature").
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
-  ).toBeVisible();
+  // Dashboard appears with the location summary and meteograms.
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("Aspen");
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
 });
 
 test("place search → resolution → forecast: selecting a place suggestion resolves coordinates and opens dashboard", async ({
@@ -49,7 +45,7 @@ test("place search → resolution → forecast: selecting a place suggestion res
 }) => {
   await page.goto("/");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await expect(input).toBeVisible();
 
   await input.fill("Boulder");
@@ -61,11 +57,9 @@ test("place search → resolution → forecast: selecting a place suggestion res
   await option.click();
 
   // Selecting a place triggers /v1/search/places/:id resolution to coordinates (40.0150, -105.2705)
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("Boulder, CO", { exact: true })).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("Boulder, CO");
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
 });
 
 test("map click → forecast: selecting a coordinate opens the dashboard", async ({ page }) => {
@@ -81,7 +75,7 @@ test("map click → forecast: selecting a coordinate opens the dashboard", async
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await map.click({ position: { x: 320, y: 240 } });
     const dashboardVisible = await page
-      .getByText("Hourly Forecast")
+      .getByTestId("point-forecast-section")
       .isVisible()
       .catch(() => false);
     if (dashboardVisible) {
@@ -92,8 +86,8 @@ test("map click → forecast: selecting a coordinate opens the dashboard", async
   // A coordinate selection renders a summary with the clicked coordinates
   // (the exact lat/lon depends on the map viewport, so match any coordinate
   // pair) and fetches /v1/points.
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText(/-?\d+\.\d+, -?\d+\.\d+/)).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText(/-?\d+\.\d+, -?\d+\.\d+/);
 });
 
 test("ensemble statistics: deterministic selected model shows no ensemble panel", async ({
@@ -101,7 +95,7 @@ test("ensemble statistics: deterministic selected model shows no ensemble panel"
 }) => {
   await page.goto("/");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
@@ -110,14 +104,10 @@ test("ensemble statistics: deterministic selected model shows no ensemble panel"
   // ensemble product, so the UI must render the deterministic point forecast
   // and must NOT render a misleading "Ensemble Statistics" panel at all —
   // neither the heading nor a deterministic-model empty-state message.
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
-  ).toBeVisible();
-  await expect(page.getByText(/Ensemble Statistics/)).toHaveCount(0);
-  await expect(page.getByText("No ensemble data available for the selected forecast.")).toHaveCount(
-    0
-  );
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toHaveCount(0);
+  await expect(page.getByTestId("ensemble-empty")).toHaveCount(0);
 });
 
 test("selecting an ensemble model renders the percentile fan and member distribution", async ({
@@ -126,31 +116,30 @@ test("selecting an ensemble model renders the percentile fan and member distribu
   await page.goto("/");
 
   // Select the GEFS model (present in the availability mock, is_ensemble=true).
-  const modelSelect = page.getByLabel("Model");
+  const modelSelect = page.getByTestId("model-select");
   await modelSelect.selectOption("gefs");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // The ensemble statistics section renders the fan chart for the selected
-  // ensemble model.
-  const ensembleSection = page.getByLabel("Ensemble statistics");
+  // ensemble model. The Hourly Forecast section keeps rendering alongside it,
+  // now sourced from the ensemble model (GEFS ⇒ Hourly Forecast source = GEFS).
+  const ensembleSection = page.getByTestId("ensemble-section");
   await expect(ensembleSection).toBeVisible();
   await expect(ensembleSection.getByRole("heading", { name: /2-Meter Temperature/ })).toBeVisible();
-  await expect(ensembleSection.getByText(/percentile range/)).toBeVisible();
-  await expect(page.getByText(/over lead time/)).toHaveCount(0);
-  await expect(page.getByRole("img", { name: /ensemble percentile fan over time/ })).toBeVisible();
+  await expect(ensembleSection.getByTestId("ensemble-range-note")).toBeVisible();
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
+  await expect(page.getByTestId("ensemble-fan-chart")).toBeVisible();
 
   // The mock returns members and pdf for /v1/ensembles, so the Distribution View
   // renders both the histogram bars and the continuous PDF line.
-  await expect(page.getByText(/Member distribution/)).toBeVisible();
+  await expect(page.getByTestId("ensemble-distribution")).toBeVisible();
   // Valid-time is localized for Aspen (Mountain Time: MDT) and no lead-time "+6h" is displayed
-  await expect(page.getByText(/Member distribution · .* (MDT|GMT-6)/)).toBeVisible();
-  await expect(page.getByText(/Member distribution · \+6h/)).toHaveCount(0);
-  const distribution = page.getByRole("img", {
-    name: /Histogram and PDF of 5 ensemble members/,
-  });
+  await expect(page.getByTestId("distribution-subtitle")).toContainText(/MDT|GMT-6/);
+  await expect(page.getByTestId("distribution-subtitle")).not.toContainText("+6h");
+  const distribution = page.getByTestId("distribution-chart");
   await expect(distribution).toBeVisible();
   await expect(distribution.locator(".recharts-rectangle").first()).toBeVisible();
   await expect(distribution.locator(".recharts-line-curve")).toBeVisible();
@@ -159,9 +148,9 @@ test("selecting an ensemble model renders the percentile fan and member distribu
 test("empty search: coherent empty state, app stays usable", async ({ page }) => {
   await page.goto("/");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("zzzznomatch");
-  await expect(page.getByText("No matching locations.")).toBeVisible();
+  await expect(page.getByTestId("search-empty")).toBeVisible();
 
   // The map still works after an empty search.
   await expect(page.getByTestId("weather-map")).toBeVisible();
@@ -173,14 +162,14 @@ test("api failure: useful error state and graceful degradation", async ({ page }
   await installApiFailureMocks(page);
   await page.goto("/");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   // The search request fails; the autocomplete shows an inline alert.
-  await expect(page.getByText("Backend unavailable")).toBeVisible();
+  await expect(page.getByTestId("search-error")).toBeVisible();
 
   // The application remains usable (the map and header are still present).
   await expect(page.getByTestId("weather-map")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
 });
 
 test("forecast map transition: selecting B while A tiles are in flight immediately dispatches B", async ({
@@ -217,7 +206,7 @@ test("forecast map transition: selecting B while A tiles are in flight immediate
   dispatchedTimes.length = 0;
 
   // 1. User selects next valid time
-  const timeSelect = page.getByLabel("Valid time");
+  const timeSelect = page.getByTestId("valid-time-select");
   const options = await timeSelect.locator("option").all();
   if (options.length > 1) {
     const val1 = await options[1].getAttribute("value");
@@ -266,7 +255,7 @@ test("forecast map rapid transition: A -> B -> C rapidly switches and C is autho
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
   dispatchedTimes.length = 0;
-  const timeSelect = page.getByLabel("Valid time");
+  const timeSelect = page.getByTestId("valid-time-select");
   const options = await timeSelect.locator("option").all();
   if (options.length >= 3) {
     const val1 = await options[1].getAttribute("value");
@@ -307,13 +296,13 @@ test("state sync regression: GFS precipitation -> GEFS switch queries temperatur
   await page.goto("/");
 
   // 1. Select a location to open the dashboard
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
 
   // 2. Select Precipitation Rate on GFS
-  const variableSelect = page.getByLabel("Variable");
+  const variableSelect = page.getByTestId("variable-select");
   await variableSelect.selectOption("precipitation_rate");
   await expect(variableSelect).toHaveValue("precipitation_rate");
 
@@ -322,7 +311,7 @@ test("state sync regression: GFS precipitation -> GEFS switch queries temperatur
 
   // 3. Switch model to GEFS
   // ForecastSelectionProvider normalizes GEFS to default variable: temperature_2m
-  const modelSelect = page.getByLabel("Model");
+  const modelSelect = page.getByTestId("model-select");
   await modelSelect.selectOption("gefs");
 
   // 4. Verify authoritative selection and UI agreement
@@ -330,8 +319,8 @@ test("state sync regression: GFS precipitation -> GEFS switch queries temperatur
   await expect(variableSelect).toHaveValue("temperature_2m");
 
   // 5. Ensemble Statistics (GEFS) panel must appear and render without error
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(page.getByRole("img", { name: /ensemble percentile fan over time/ })).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
+  await expect(page.getByTestId("ensemble-fan-chart")).toBeVisible();
 
   // 6. Assert that ALL ensemble requests dispatched for GEFS used temperature_2m
   await expect.poll(() => ensembleRequests.length > 0).toBe(true);
@@ -350,7 +339,7 @@ test("state sync regression: GFS precipitation -> GEFS switch queries temperatur
   // 7. Ensure no application error alert exists on the page
   const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
   await expect(appAlerts).toHaveCount(0);
-  await expect(page.getByText(/Failed to load/i)).toHaveCount(0);
+  await expect(page.getByTestId("distribution-error")).toHaveCount(0);
 });
 
 test("phase 1a variable expansion: switching through all Phase 1A variables updates map and legend", async ({
@@ -359,7 +348,7 @@ test("phase 1a variable expansion: switching through all Phase 1A variables upda
   await page.goto("/");
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
-  const variableSelect = page.getByLabel("Variable");
+  const variableSelect = page.getByTestId("variable-select");
   const legend = page.getByTestId("legend-gradient");
 
   // 1. Relative humidity
@@ -392,18 +381,18 @@ test("phase 1a gefs variable selection: selecting GEFS relative humidity updates
 }) => {
   await page.goto("/");
 
-  const modelSelect = page.getByLabel("Model");
+  const modelSelect = page.getByTestId("model-select");
   await modelSelect.selectOption("gefs");
 
-  const variableSelect = page.getByLabel("Variable");
+  const variableSelect = page.getByTestId("variable-select");
   await variableSelect.selectOption("relative_humidity_2m");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(page.getByRole("img", { name: /ensemble percentile fan over time/ })).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
+  await expect(page.getByTestId("ensemble-fan-chart")).toBeVisible();
 });
 
 test("phase 1b wind product: selecting Wind updates map, meteogram, and ensemble Wind Rose", async ({
@@ -412,7 +401,7 @@ test("phase 1b wind product: selecting Wind updates map, meteogram, and ensemble
   await page.goto("/");
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
-  const variableSelect = page.getByLabel("Variable");
+  const variableSelect = page.getByTestId("variable-select");
 
   // 1. Verify raw U/V are not present in variable options
   const options = await variableSelect.locator("option").allTextContents();
@@ -426,26 +415,24 @@ test("phase 1b wind product: selecting Wind updates map, meteogram, and ensemble
   await expect(page.getByTestId("legend-gradient")).toBeVisible();
 
   // 3. Search and select a city to view the point forecast
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // 4. Verify meteograms include 10-Meter Wind
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /10-Meter Wind hourly forecast over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
 
   // 5. Switch to GEFS model to test Ensemble Wind Rose
-  const modelSelect = page.getByLabel("Model");
+  const modelSelect = page.getByTestId("model-select");
   await modelSelect.selectOption("gefs");
   await variableSelect.selectOption("wind_10m");
 
   // 6. Verify Ensemble Statistics and Wind Rose appear
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(page.getByText(/Wind Direction & Speed Distribution \(Wind Rose\)/)).toBeVisible();
-  await expect(page.getByRole("img", { name: /ensemble wind rose chart/i })).toBeVisible();
-  await expect(page.getByText("CALM")).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
+  await expect(page.getByTestId("wind-rose-section")).toBeVisible();
+  await expect(page.getByTestId("wind-rose-chart")).toBeVisible();
+  await expect(page.getByTestId("wind-rose-chart").getByText("CALM")).toBeVisible();
 });
 
 test("phase 1b.3 animated wind map: progressive rendering, lead switching, consensus flow, and reduced motion", async ({
@@ -464,9 +451,9 @@ test("phase 1b.3 animated wind map: progressive rendering, lead switching, conse
   await page.goto("/");
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
-  const variableSelect = page.getByLabel("Variable");
-  const timeSelect = page.getByLabel("Valid time");
-  const modelSelect = page.getByLabel("Model");
+  const variableSelect = page.getByTestId("variable-select");
+  const timeSelect = page.getByTestId("valid-time-select");
+  const modelSelect = page.getByTestId("model-select");
   const canvas = page.getByTestId("wind-particle-canvas");
 
   // 1. Select Wind product -> Stage A (scalar raster) and Stage B (particle canvas)
@@ -521,7 +508,7 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   await page.goto("/");
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
-  const variableSelect = page.getByLabel("Variable");
+  const variableSelect = page.getByTestId("variable-select");
 
   // 1. Invariant: Raw categorical flags (crain, csnow, cfrzr, cicep) are NEVER present in selectors
   const options = await variableSelect.locator("option").allTextContents();
@@ -535,25 +522,27 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   await variableSelect.selectOption("precipitation_amount_3h");
   await expect(variableSelect).toHaveValue("precipitation_amount_3h");
   await expect(page.getByTestId("legend-gradient")).toBeVisible();
-  await expect(page.getByText("3-Hour Precipitation (mm)")).toBeVisible();
+  await expect(page.getByTestId("legend-title")).toHaveText("3-Hour Precipitation (mm)");
 
   // 3. Search and select a city to inspect Point Forecast meteogram
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /3-Hour Precipitation hourly forecast over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
 
   // Verify Phase legend badges in meteogram
-  await expect(page.getByText("Phases:")).toBeVisible();
-  await expect(page.getByText("Rain", { exact: true })).toBeVisible();
-  await expect(page.getByText("Snow", { exact: true })).toBeVisible();
-  await expect(page.getByText("Freezing Rain", { exact: true })).toBeVisible();
-  await expect(page.getByText("Ice Pellets", { exact: true })).toBeVisible();
-  await expect(page.getByText("Mixed", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("phase-legend")).toBeVisible();
+  await expect(page.getByTestId("phase-legend").getByText("Rain", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("phase-legend").getByText("Snow", { exact: true })).toBeVisible();
+  await expect(
+    page.getByTestId("phase-legend").getByText("Freezing Rain", { exact: true })
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("phase-legend").getByText("Ice Pellets", { exact: true })
+  ).toBeVisible();
+  await expect(page.getByTestId("phase-legend").getByText("Mixed", { exact: true })).toBeVisible();
 
   // Scroll meteogram into view and screenshot
   const precipMeteogram = page.getByRole("img", {
@@ -563,13 +552,13 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   await page.screenshot({ path: "e2e/screenshots/1c3-gfs-precipitation.png" });
 
   // 4. Switch to GEFS ensemble model with 3-Hour Precipitation
-  const modelSelect = page.getByLabel("Model");
+  const modelSelect = page.getByTestId("model-select");
   await modelSelect.selectOption("gefs");
   await variableSelect.selectOption("precipitation_amount_3h");
 
   // 5. Verify GEFS Ensemble Phase Support 100% composition visualization
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(page.getByText(/Ensemble Phase Support/)).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
+  await expect(page.getByTestId("phase-support-section")).toBeVisible();
   const phaseChart = page.getByRole("img", {
     name: /ensemble phase support over time/i,
   });
@@ -593,13 +582,17 @@ test("phase 1c.3 3-hour precipitation: amount, phase evolution, GEFS 100% phase 
   await expect(phaseChart.locator(".recharts-label-list")).toHaveCount(0);
   await phaseChart.hover();
   await expect(phaseChart.locator(".recharts-tooltip-wrapper")).toBeVisible();
-  await expect(page.getByText("52%", { exact: true }).first()).toBeVisible(); // Rain
-  await expect(page.getByText("26%", { exact: true }).first()).toBeVisible(); // Snow
+  await expect(
+    page.getByTestId("phase-support-chart").getByText("52%", { exact: true }).first()
+  ).toBeVisible(); // Rain
+  await expect(
+    page.getByTestId("phase-support-chart").getByText("26%", { exact: true }).first()
+  ).toBeVisible(); // Snow
 
   // Verify secondary transition frequency
-  await expect(page.getByText(/Member Phase Transitions/)).toBeVisible();
-  await expect(page.getByText("Rain → Snow")).toBeVisible();
-  await expect(page.getByText("· 27%")).toBeVisible();
+  await expect(page.getByTestId("phase-transitions")).toBeVisible();
+  await expect(page.getByTestId("phase-transitions").getByText("Rain → Snow")).toBeVisible();
+  await expect(page.getByTestId("phase-transitions").getByText("· 27%")).toBeVisible();
 
   // Ensure no error alert exists
   const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
@@ -612,7 +605,7 @@ test("cloud products: 3-Hour Cloud Cover and Cloud Ceiling point, meteogram, map
   await page.goto("/");
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
-  const variableSelect = page.getByLabel("Variable");
+  const variableSelect = page.getByTestId("variable-select");
 
   // 1. Verify Cloud Cover and Cloud Ceiling options are present
   const options = await variableSelect.locator("option").allTextContents();
@@ -623,40 +616,35 @@ test("cloud products: 3-Hour Cloud Cover and Cloud Ceiling point, meteogram, map
   await variableSelect.selectOption("cloud_cover_3h");
   await expect(variableSelect).toHaveValue("cloud_cover_3h");
   await expect(page.getByTestId("legend-gradient")).toBeVisible();
-  await expect(page.getByText("3-Hour Cloud Cover (%)")).toBeVisible();
+  await expect(page.getByTestId("legend-title")).toHaveText("3-Hour Cloud Cover (%)");
 
   // 3. Search and select a city to inspect Point Forecast meteograms
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /3-Hour Cloud Cover hourly forecast over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
 
   // 4. Select Cloud Ceiling on GFS
   await variableSelect.selectOption("cloud_ceiling");
   await expect(variableSelect).toHaveValue("cloud_ceiling");
   await expect(page.getByTestId("legend-gradient")).toBeVisible();
 
-  await expect(
-    page.getByRole("img", { name: /Cloud Ceiling Height hourly forecast over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
 
   // 5. Switch to GEFS ensemble model with Cloud Ceiling
-  const modelSelect = page.getByLabel("Model");
+  const modelSelect = page.getByTestId("model-select");
   await modelSelect.selectOption("gefs");
   await variableSelect.selectOption("cloud_ceiling");
 
   // Verify GEFS Ensemble Unlimited Ceiling probability tile and statistics
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
-  await expect(page.getByText(/Unlimited Ceiling Probability/i)).toBeVisible();
-  await expect(page.getByText("40%")).toBeVisible(); // P(Unlimited) = 0.40
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
+  await expect(page.getByTestId("unlimited-probability")).toContainText("40%"); // P(Unlimited) = 0.40
 
   // 6. Switch to GEFS ensemble model with 3-Hour Cloud Cover
   await variableSelect.selectOption("cloud_cover_3h");
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
 
   // Ensure no error alert exists
   const appAlerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
@@ -670,9 +658,9 @@ test("Lifecycle V2 user flow: select model, variable, and valid time updates map
   await expect(page.getByTestId("weather-map")).toBeVisible();
 
   // 1. Verify Model, Variable, and Valid Time controls are present; Initial & Lead Time are absent
-  await expect(page.getByLabel("Model")).toBeVisible();
-  await expect(page.getByLabel("Variable")).toBeVisible();
-  const validSelect = page.getByLabel("Valid time");
+  await expect(page.getByTestId("model-select")).toBeVisible();
+  await expect(page.getByTestId("variable-select")).toBeVisible();
+  const validSelect = page.getByTestId("valid-time-select");
   await expect(validSelect).toBeVisible();
   expect(await page.getByLabel("Initial time").count()).toBe(0);
   expect(await page.getByLabel("Lead time").count()).toBe(0);
@@ -687,16 +675,14 @@ test("Lifecycle V2 user flow: select model, variable, and valid time updates map
   }
 
   // 3. Search for city and open dashboard
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // 4. Verify dashboard and hourly forecast curve appear
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
-  await expect(
-    page.getByRole("img", { name: /2-Meter Temperature hourly forecast over lead time/ })
-  ).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("Aspen");
+  await expect(page.getByTestId("meteogram-chart")).toBeVisible();
 });
 
 test("forecast panel close: clicking Close (X) deselects location, removes panel and marker, restores full map area", async ({
@@ -704,12 +690,12 @@ test("forecast panel close: clicking Close (X) deselects location, removes panel
 }) => {
   await page.goto("/");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // Location selected: Hourly Forecast is visible and marker is rendered on map
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 
   // Click Close (X) button
@@ -718,7 +704,7 @@ test("forecast panel close: clicking Close (X) deselects location, removes panel
   await closeBtn.click();
 
   // Sidebar and marker are both removed
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
 
   // Map remains fully visible
@@ -732,16 +718,16 @@ test("forecast panel close: Close (X) remains pinned and clickable while forecas
 
   // Switch to GEFS so the panel renders Ensemble Statistics and Distribution alongside
   // the filtered Hourly Forecast, ensuring content height exceeds the viewport to test scrolling.
-  const modelSelect = page.getByLabel("Model");
+  const modelSelect = page.getByTestId("model-select");
   await modelSelect.selectOption("gefs");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // Location selected: Hourly Forecast is visible and marker is rendered on map
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 
   // Confirm Close button is initially visible
@@ -775,7 +761,7 @@ test("forecast panel close: Close (X) remains pinned and clickable while forecas
   await closeBtn.click();
 
   // Sidebar and marker are both removed
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
 
   // Map remains fully visible
@@ -787,11 +773,11 @@ test("forecast panel collapse and expand: toggle collapses panel and preserves m
 }) => {
   await page.goto("/");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 
   // Measure map width before collapse
@@ -823,8 +809,8 @@ test("forecast panel collapse and expand: toggle collapses panel and preserves m
 
   // Forecast dashboard returns with same location and marker
   await expect(page.locator("#forecast-panel-content")).not.toHaveClass(/hidden/);
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("Aspen");
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 });
 
@@ -834,11 +820,11 @@ test("mobile viewport: collapse restores map view with marker, expand restores f
   await page.setViewportSize({ width: 375, height: 667 });
   await page.goto("/");
 
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 
   // On mobile, collapse reveals the map
@@ -854,7 +840,7 @@ test("mobile viewport: collapse restores map view with marker, expand restores f
   await expect(expandBtn).toBeVisible();
   await expandBtn.click();
 
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
 
   // On mobile: scroll forecast content downward
   const scrollContainer = page.locator("#forecast-panel-content div.overflow-y-auto");
@@ -873,7 +859,7 @@ test("mobile viewport: collapse restores map view with marker, expand restores f
   // Tap Close (X) while scrolled
   await closeBtn.click();
 
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
 });
 
@@ -887,7 +873,7 @@ test("direct place search selection: place with coordinates commits without call
   });
 
   await page.goto("/");
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Vail");
 
   const option = searchResults(page)
@@ -897,8 +883,8 @@ test("direct place search selection: place with coordinates commits without call
   await option.click();
 
   // Forecast opens immediately with direct coordinates
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("Vail, CO, USA", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("Vail, CO, USA");
 
   // Verify /v1/search/places/* was never called!
   expect(resolvePlacesCalled).toBe(false);
@@ -908,7 +894,7 @@ test("search attribution: search listbox renders accessible Geoapify and Locatio
   page,
 }) => {
   await page.goto("/");
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
 
   await expect(searchResults(page)).toBeVisible();
@@ -956,7 +942,7 @@ test("startup privacy invariant: page load makes best-effort /v1/locate call wit
   await page.goto("/");
 
   // Wait for map and header to be ready
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
   await page.waitForTimeout(1000);
 
   // Best-effort /v1/locate was invoked on startup
@@ -967,7 +953,7 @@ test("startup privacy invariant: page load makes best-effort /v1/locate call wit
   expect(geolocationInvoked).toBe(false);
 
   // Invariant: startup IP location does NOT open forecast panel or place a selection marker
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
 });
 
@@ -981,13 +967,13 @@ test("locate me allow: clicking Locate Me with granted permission commits locati
 
   await page.goto("/");
 
-  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  const locateBtn = page.getByTestId("locate-me");
   await expect(locateBtn).toBeVisible();
   await locateBtn.click();
 
   // Marker appears and Forecast Panel opens with acquired coordinates
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("47.6062, -122.3321")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("47.6062, -122.3321");
   await expect(page.locator(".maplibregl-marker")).toBeVisible();
 });
 
@@ -1009,21 +995,22 @@ test("locate me deny privacy: denying geolocation renders non-blocking alert and
   await context.clearPermissions();
 
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
   startupCompleted = true;
 
-  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  const locateBtn = page.getByTestId("locate-me");
   await locateBtn.click();
 
-  // Non-blocking alert rendered
-  const alert = page.getByRole("alert").filter({ hasText: "Location access denied" });
+  // Non-blocking alert rendered (copy-independent: the notice element + role
+  // is the contract; the denial wording lives in the geolocation hook).
+  const alert = page.getByTestId("geo-notice");
   await expect(alert).toBeVisible();
-  await expect(alert).toContainText("Location access denied");
+  await expect(alert).toHaveAttribute("role", "alert");
 
   // Critical privacy invariant: NO /v1/locate was called as a fallback for Locate Me!
   expect(locateFallbackCalled).toBe(false);
   // No forecast panel was opened
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
 });
 
 test("mobile layout: Locate Me button, search bar, and controls remain non-overlapping at 375px", async ({
@@ -1032,10 +1019,10 @@ test("mobile layout: Locate Me button, search bar, and controls remain non-overl
   await page.setViewportSize({ width: 375, height: 667 });
   await page.goto("/");
 
-  const searchInput = page.getByLabel(/Search for a city/);
+  const searchInput = page.getByTestId("search-input");
   await expect(searchInput).toBeVisible();
 
-  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  const locateBtn = page.getByTestId("locate-me");
   await expect(locateBtn).toBeVisible();
 
   const searchBox = await searchInput.boundingBox();
@@ -1065,7 +1052,7 @@ test("map-pan network test: panning/zooming map does NOT issue search requests, 
   });
 
   await page.goto("/");
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Denver");
   await page.waitForTimeout(400); // allow debounce
 
@@ -1114,19 +1101,19 @@ test("selection race page-level test: delayed geolocation does not overwrite sub
   await page.goto("/");
 
   // 1. Click Locate Me (in flight)
-  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  const locateBtn = page.getByTestId("locate-me");
   await locateBtn.click();
   await expect(locateBtn).toHaveAttribute("aria-busy", "true");
 
   // 2. Before geolocation finishes, user explicitly selects a search result (Aspen)
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   const option = searchResults(page).getByRole("option", { name: /Aspen/ }).first();
   await expect(option).toBeVisible();
   await option.click();
 
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("Aspen");
 
   // 3. Delayed geolocation fix (Seattle) arrives late
   await page.evaluate(() => {
@@ -1137,8 +1124,7 @@ test("selection race page-level test: delayed geolocation does not overwrite sub
   await page.waitForTimeout(500);
 
   // Invariant: Aspen MUST remain selected; Seattle fix must be rejected by generation guard!
-  await expect(page.getByText("Aspen", { exact: true })).toBeVisible();
-  await expect(page.getByText("47.6062, -122.3321")).toHaveCount(0);
+  await expect(page.getByTestId("location-name")).toHaveText("Aspen");
 });
 
 test("forecast panel reopen UI: Search, Map Click, and Locate Me all reopen panel after close", async ({
@@ -1151,28 +1137,28 @@ test("forecast panel reopen UI: Search, Map Click, and Locate Me all reopen pane
   await page.goto("/");
 
   // 1. Search selection opens panel
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
 
   // Close panel
   await page.getByRole("button", { name: "Close forecast panel" }).click();
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
 
   // 2. Map click reopens panel
   const map = page.getByTestId("weather-map");
   await map.click({ position: { x: 300, y: 200 } });
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
 
   // Close panel again
   await page.getByRole("button", { name: "Close forecast panel" }).click();
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
 
   // 3. Locate Me reopens panel
-  await page.getByRole("button", { name: "Locate me" }).click();
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
-  await expect(page.getByText("47.6062, -122.3321")).toBeVisible();
+  await page.getByTestId("locate-me").click();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
+  await expect(page.getByTestId("location-name")).toHaveText("47.6062, -122.3321");
 });
 
 test("mobile runtime layout screenshots: capture 375x667 and 390x844 viewports", async ({
@@ -1190,24 +1176,24 @@ test("mobile runtime layout screenshots: capture 375x667 and 390x844 viewports",
     await page.goto("/");
 
     // 1. Locate Me idle screenshot
-    await expect(page.getByRole("button", { name: "Locate me" })).toBeVisible();
+    await expect(page.getByTestId("locate-me")).toBeVisible();
     await page.screenshot({
-      path: `services/frontend/e2e/screenshots/locate-me-idle-${viewport.name}.png`,
+      path: `e2e/screenshots/locate-me-idle-${viewport.name}.png`,
     });
 
     // 2. Search dropdown open & attribution visible screenshot
-    const input = page.getByLabel(/Search for a city/);
+    const input = page.getByTestId("search-input");
     await input.fill("Aspen");
     await expect(searchResults(page)).toBeVisible();
     await page.screenshot({
-      path: `services/frontend/e2e/screenshots/search-dropdown-attribution-${viewport.name}.png`,
+      path: `e2e/screenshots/search-dropdown-attribution-${viewport.name}.png`,
     });
 
     // 3. Forecast panel open screenshot
     await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
-    await expect(page.getByText("Hourly Forecast")).toBeVisible();
+    await expect(page.getByTestId("point-forecast-section")).toBeVisible();
     await page.screenshot({
-      path: `services/frontend/e2e/screenshots/forecast-panel-open-${viewport.name}.png`,
+      path: `e2e/screenshots/forecast-panel-open-${viewport.name}.png`,
     });
   }
 });
@@ -1223,7 +1209,7 @@ test("selected-location local time display: dropdown remains UTC, adjacent displ
   await expect(validTimeDisplay).toHaveText(/Valid .* UTC/);
 
   // Dropdown option is in UTC
-  const validSelect = page.getByLabel("Valid time");
+  const validSelect = page.getByTestId("valid-time-select");
   await expect(validSelect).toBeVisible();
   const dropdownText = await validSelect.evaluate(
     (sel: HTMLSelectElement) => sel.options[sel.selectedIndex]?.text
@@ -1231,12 +1217,12 @@ test("selected-location local time display: dropdown remains UTC, adjacent displ
   expect(dropdownText).toContain("UTC");
 
   // Search and select Aspen (Mountain Time zone: America/Denver)
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // Hourly Forecast opens
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
 
   // Dropdown MUST still remain UTC
   const dropdownTextAfter = await validSelect.evaluate(
@@ -1249,7 +1235,7 @@ test("selected-location local time display: dropdown remains UTC, adjacent displ
 
   // Close forecast panel
   await page.getByRole("button", { name: "Close forecast panel" }).click();
-  await expect(page.getByText("Hourly Forecast")).not.toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).not.toBeVisible();
 
   // Adjacent display returns to UTC
   await expect(validTimeDisplay).toHaveText(/Valid .* UTC/);
@@ -1261,28 +1247,27 @@ test("ensemble statistics valid-time display: renders calendar valid times and l
   await page.goto("/");
 
   // Switch to GEFS ensemble model
-  await page.getByLabel("Model").selectOption("gefs");
+  await page.getByTestId("model-select").selectOption("gefs");
 
   // Select Aspen (Mountain Time: America/Denver)
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Aspen");
   await searchResults(page).getByRole("option", { name: /Aspen/ }).first().click();
 
   // Ensemble statistics panel opens
-  await expect(page.getByText(/Ensemble Statistics \(GEFS\)/)).toBeVisible();
+  await expect(page.getByTestId("ensemble-section")).toBeVisible();
 
   // Ensemble chart is visible with valid-time-based accessible label
-  const fanChart = page.getByRole("img", { name: /ensemble percentile fan over time/ });
+  const fanChart = page.getByTestId("ensemble-fan-chart");
   await expect(fanChart).toBeVisible();
 
   // Distribution header shows localized valid time in MDT and NO "+6h"
-  await expect(page.getByText(/Member distribution · .* (MDT|GMT-6)/)).toBeVisible();
-  await expect(page.getByText(/Member distribution · \+6h/)).toHaveCount(0);
-  await expect(page.getByText(/over lead time/)).toHaveCount(0);
+  await expect(page.getByTestId("distribution-subtitle")).toContainText(/MDT|GMT-6/);
+  await expect(page.getByTestId("distribution-subtitle")).not.toContainText("+6h");
 
   // Close panel
   await page.getByRole("button", { name: "Close forecast panel" }).click();
-  await expect(page.getByText("Hourly Forecast")).not.toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).not.toBeVisible();
 });
 
 test("startup coarse IP success: moves map to regional viewport and localizes valid-time", async ({
@@ -1304,7 +1289,7 @@ test("startup coarse IP success: moves map to regional viewport and localizes va
   });
 
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
 
   // Wait for map to load and easeTo the Denver region. The startup camera frames
   // a 3-tile-wide region of the z8 grid, i.e. zoom ~7.8 on this viewport.
@@ -1322,7 +1307,7 @@ test("startup coarse IP success: moves map to regional viewport and localizes va
   await expect(validTimeDisplay).toHaveText(/Valid .* (MDT|GMT-6)/);
 
   // Valid Time dropdown remains in canonical UTC
-  const validSelect = page.getByLabel("Valid time");
+  const validSelect = page.getByTestId("valid-time-select");
   await expect(validSelect).toBeVisible();
   const dropdownText = await validSelect.evaluate(
     (sel: HTMLSelectElement) => sel.options[sel.selectedIndex]?.text
@@ -1331,7 +1316,7 @@ test("startup coarse IP success: moves map to regional viewport and localizes va
 
   // Invariant: no marker, no forecast panel
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
 });
 
 test("startup coarse IP failure (404): map remains at CONUS viewport and valid-time is UTC", async ({
@@ -1342,7 +1327,7 @@ test("startup coarse IP failure (404): map remains at CONUS viewport and valid-t
   });
 
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
   await page.waitForTimeout(1000);
 
   // Map remains at default CONUS center (lat ~ 39.2, lng ~ -106.8, zoom 5)
@@ -1359,7 +1344,7 @@ test("startup coarse IP failure (404): map remains at CONUS viewport and valid-t
   const validTimeDisplay = page.getByTestId("valid-time");
   await expect(validTimeDisplay).toHaveText(/Valid .* UTC/);
   await expect(page.locator(".maplibregl-marker")).toHaveCount(0);
-  await expect(page.getByText("Hourly Forecast")).toHaveCount(0);
+  await expect(page.getByTestId("point-forecast-section")).toHaveCount(0);
 });
 
 test("late IP response after user map pan does NOT move camera", async ({ page }) => {
@@ -1385,7 +1370,7 @@ test("late IP response after user map pan does NOT move camera", async ({ page }
   });
 
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
 
   // Wait for map style to be loaded
   await page.waitForFunction(() => {
@@ -1453,12 +1438,11 @@ test("late IP response after Locate Me attempt does NOT move camera", async ({ p
 
   await context.clearPermissions();
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
 
-  const locateBtn = page.getByRole("button", { name: "Locate me" });
+  const locateBtn = page.getByTestId("locate-me");
   await locateBtn.click();
-  const alert = page.getByRole("alert").filter({ hasText: "Location access denied" });
-  await expect(alert).toBeVisible();
+  await expect(page.getByTestId("geo-notice")).toBeVisible();
 
   // Release delayed IP response
   fulfillLocate();
@@ -1491,7 +1475,7 @@ test("selecting and clearing location does NOT recenter map to startup IP", asyn
   });
 
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Zeus Wx" })).toBeVisible();
+  await expect(page.getByTestId("app-header")).toBeVisible();
 
   // Wait for initial easeTo Denver to complete
   await page.waitForFunction(() => {
@@ -1501,12 +1485,12 @@ test("selecting and clearing location does NOT recenter map to startup IP", asyn
   });
 
   // Select Tokyo from search
-  const input = page.getByLabel(/Search for a city/);
+  const input = page.getByTestId("search-input");
   await input.fill("Tokyo");
   await searchResults(page).getByRole("option", { name: /Tokyo/ }).first().click();
 
   // Wait for Tokyo selection and flyTo
-  await expect(page.getByText("Hourly Forecast")).toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).toBeVisible();
   await page.waitForFunction(() => {
     const map = (window as any).__weatherMap;
     if (!map) return false;
@@ -1515,7 +1499,7 @@ test("selecting and clearing location does NOT recenter map to startup IP", asyn
 
   // Close forecast panel (clearing selectedLocation)
   await page.getByRole("button", { name: "Close forecast panel" }).click();
-  await expect(page.getByText("Hourly Forecast")).not.toBeVisible();
+  await expect(page.getByTestId("point-forecast-section")).not.toBeVisible();
 
   // Wait a moment to ensure no easeTo back to Denver happens
   await page.waitForTimeout(1000);

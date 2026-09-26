@@ -142,7 +142,11 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
 | `weather_ingestion_items_failed_total` | Counter | Failed target regions | `model`, `phase` | Fast |
 | `weather_ingestion_stuck_warning` | Gauge | 1 if pipeline has zero progress beyond timeout, 0 otherwise | `model` | Fast |
 | `weather_ingestion_lag_cycles` | Gauge | Lag in 6-hour cycles relative to available upstream data | `model` | Medium |
-| `weather_ingestion_lag_hours` | Gauge | Lag in hours relative to available upstream data | `model` | Medium |
+| `weather_ingestion_lag_hours` | Gauge | Lag in hours relative to the newest cycle that should be complete | `model` | Medium |
+| `weather_ingestion_lag_known` | Gauge | 1 if the lag is a real measurement, 0 if it could not be computed | `model` | Medium |
+| `weather_ingestion_data_missing_cycles` | Gauge | Due cycles with no servable data at all (distinct from a status that has not been promoted) | `model` | Medium |
+| `weather_ingestion_cycles_complete_not_ready` | Gauge | Cycles whose catalog contents are complete while their run status is not `ready` | `model` | Medium |
+| `weather_ingestion_backlog_quarantined_cycles` | Gauge | Backlog catch-up candidates currently quarantined after repeated failures | - | Medium |
 | `weather_model_committed_leads_count` | Gauge | Number of committed distinct leads for latest active cycle | `model` | Medium |
 | `weather_model_expected_leads_count` | Gauge | Authoritative expected distinct leads count for model and version | `model` | Medium |
 | `weather_model_max_lead_hours` | Gauge | Authoritative maximum lead time in hours for model and version | `model` | Medium |
@@ -319,11 +323,16 @@ Alerts are classified as `INFO`, `WARNING`, or `CRITICAL`. Every alert links dir
 | `ingestion_pipeline_stuck` | CRITICAL | Active/queued work present with zero progress for $> 10\text{ minutes}$ | `#ingestion-stuck` |
 | `ingestion_lag_warning` | WARNING | 1 cycle behind available NOAA upstream | `#ingestion-lag` |
 | `ingestion_lag_critical` | CRITICAL | 2+ cycles behind available NOAA upstream | `#ingestion-lag` |
+| `model_ready_not_promoted` | WARNING | Newest cycle that should already be complete is still not `ready` more than one fill budget (`INGESTION_FILL_IN_GRACE_SECONDS`, default 2.5 h) past its fill deadline (f000 ingest anchor) | `#model-ready-not-promoted` |
+| `cycles_complete_not_ready` | WARNING | $\ge 1$ cycle holds every expected lead (and, for GEFS, every expected member) in the catalog while its run status is not `ready`, the oldest $\ge 1$ fill budget past its deadline | `#cycles-complete-not-ready` |
 | `finalizer_claim_stuck_warning`| WARNING | Physical deletion claim age $> 1\text{ hour}$ | `#stuck-deletion-claim` |
 | `finalizer_claim_stuck_critical`| CRITICAL | Physical deletion claim age $> 4\text{ hours}$ | `#stuck-deletion-claim` |
 | `metadata_sweeper_backlog_overdue`| WARNING| Tombstones older than 14 days retain metadata for $> 1\text{ day}$ overdue | `#sweeper-backlog` |
 | `reclamation_failed_shards` | WARNING | Any records in `reclamation_queue` with `status='failed'` | `#reclamation-failures` |
 | `reclamation_deleting_stuck` | WARNING | Reclaimed target in `deleting` status for $> 600\text{s}$ | `#reclamation-stuck` |
+| `gc_worker_failed_shards` | WARNING | GC reclamation worker moved $\ge 1$ shard targets into failed quarantine during its latest pass | `#gc-worker-failures` |
+| `gc_sweeper_failed_cycles` | WARNING | Metadata retention sweeper failed $\ge 1$ cycles during its latest pass (cycles stay tombstoned with detailed metadata retained; next pass retries) | `#gc-sweeper-failures` |
+| `gc_orphan_stores_detected` | WARNING | Store↔catalog reconciliation found $\ge 1$ orphan physical cycle store (no catalog identity) whose serving horizon has not expired (recoverability frontier) | `#orphan-inventory` |
 | `invariant_invalid_lifecycle_transition` | CRITICAL | Cycle has `deleted_at` set without prior `deletion_started_at` | `#anti-resurrection-violation` |
 | `invariant_anti_resurrection_violation` | CRITICAL | Run recreated or active under permanent `deleted_at` tombstone | `#anti-resurrection-violation` |
 

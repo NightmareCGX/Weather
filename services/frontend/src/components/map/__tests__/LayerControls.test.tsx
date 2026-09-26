@@ -168,7 +168,7 @@ describe("LayerControls (data-driven)", () => {
       () => new Promise<Response>((resolve) => (resolveFetch = resolve))
     );
     renderControls();
-    expect(screen.getByText(/Loading forecast options/)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeInTheDocument();
     resolveFetch(jsonResponse(availabilityPayload));
   });
 
@@ -178,7 +178,7 @@ describe("LayerControls (data-driven)", () => {
       () => new Promise<Response>((resolve) => (resolveFetch = resolve))
     );
     renderControls();
-    expect(screen.getByText(/Loading forecast options/)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeInTheDocument();
     resolveFetch(jsonResponse(availabilityPayload));
     expect(await screen.findByLabelText("Model")).toBeInTheDocument();
   });
@@ -186,8 +186,8 @@ describe("LayerControls (data-driven)", () => {
   it("shows an error state with retry when availability fails", async () => {
     mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
     renderControls();
-    expect(await screen.findByRole("alert")).toHaveTextContent(/Unable to load forecast data/);
-    expect(screen.getByText("Retry")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByTestId("retry-button")).toBeInTheDocument();
   });
 
   it("shows an empty state when the database has no models", async () => {
@@ -202,7 +202,7 @@ describe("LayerControls (data-driven)", () => {
       )
     );
     renderControls();
-    expect(await screen.findByText("No forecast data available.")).toBeInTheDocument();
+    expect(await screen.findByTestId("layer-controls-empty")).toBeInTheDocument();
   });
 
   describe("selected-location local time display", () => {

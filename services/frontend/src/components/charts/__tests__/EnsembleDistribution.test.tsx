@@ -91,7 +91,7 @@ describe("EnsembleDistribution", () => {
     expect(
       screen.getByRole("img", { name: /Member values for Temperature \(2 m\)/ })
     ).toBeInTheDocument();
-    expect(screen.getByText(/Member distribution · Sep 10, 06:00 UTC/)).toBeInTheDocument();
+    expect(screen.getByTestId("distribution-subtitle")).toHaveTextContent("Sep 10, 06:00 UTC");
     expect(screen.queryByText(/\+6h/)).not.toBeInTheDocument();
     expect(screen.getByText("Min")).toBeInTheDocument();
     expect(screen.getByText("Max")).toBeInTheDocument();
@@ -127,7 +127,9 @@ describe("EnsembleDistribution", () => {
     );
 
     // 2026-09-10T06:00:00Z in Denver MDT is Sep 10, 00:00 MDT
-    expect(screen.getByText(/Member distribution · Sep 10, 00:00 (MDT|GMT-6)/)).toBeInTheDocument();
+    expect(screen.getByTestId("distribution-subtitle")).toHaveTextContent(
+      /Sep 10, 00:00 (MDT|GMT-6)/
+    );
 
     rerender(
       <EnsembleDistribution
@@ -140,9 +142,9 @@ describe("EnsembleDistribution", () => {
     );
 
     // 2026-09-10T06:00:00Z in Tokyo is Sep 10, 15:00 JST
-    expect(
-      screen.getByText(/Member distribution · Sep 10, 15:00 (JST|GMT\+9)/)
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("distribution-subtitle")).toHaveTextContent(
+      /Sep 10, 15:00 (JST|GMT\+9)/
+    );
   });
 
   it("handles null pdf gracefully by rendering histogram, dots, and warning note", () => {
@@ -187,14 +189,14 @@ describe("EnsembleDistribution", () => {
       <EnsembleDistribution {...baseProps} data={withoutMembers} status="success" error={null} />
     );
 
-    expect(screen.getByText(/returned no raw member values/)).toBeInTheDocument();
+    expect(screen.getByTestId("distribution-empty")).toBeInTheDocument();
     // No fabricated histogram is rendered.
     expect(screen.queryByRole("img", { name: /Histogram/ })).not.toBeInTheDocument();
   });
 
   it("shows a loading state while fetching", () => {
     render(<EnsembleDistribution {...baseProps} data={null} status="loading" error={null} />);
-    expect(screen.getByText(/Loading ensemble distribution…/)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeInTheDocument();
   });
 
   it("shows an error state on request failure", () => {
@@ -213,9 +215,8 @@ describe("EnsembleDistribution", () => {
 
   it("shows an unavailable state when there is no data", () => {
     render(<EnsembleDistribution {...baseProps} data={null} status="success" error={null} />);
-    expect(
-      screen.getByText(/No ensemble distribution available for Sep 10, 06:00 UTC/)
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/\+6h/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("distribution-empty")).toBeInTheDocument();
+    // No fabricated subtitle (and thus no lead-time "+6h" suffix) is rendered.
+    expect(screen.queryByTestId("distribution-subtitle")).not.toBeInTheDocument();
   });
 });

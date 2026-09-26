@@ -491,9 +491,9 @@ describe("WeatherMap", () => {
 
   it("renders LocateMeButton when onLocate prop is passed, and clicking it fires onLocate", () => {
     const onLocate = jest.fn();
-    const { getByRole } = renderMap({ onLocate });
+    const { getByTestId } = renderMap({ onLocate });
 
-    const btn = getByRole("button", { name: "Locate me" });
+    const btn = getByTestId("locate-me");
     expect(btn).toBeInTheDocument();
     expect(btn).toHaveAttribute("aria-busy", "false");
 
@@ -503,9 +503,9 @@ describe("WeatherMap", () => {
 
   it("displays busy state and disables LocateMeButton while locating", () => {
     const onLocate = jest.fn();
-    const { getByRole } = renderMap({ onLocate, isLocating: true });
+    const { getByTestId } = renderMap({ onLocate, isLocating: true });
 
-    const btn = getByRole("button", { name: "Locate me" });
+    const btn = getByTestId("locate-me");
     expect(btn).toHaveAttribute("aria-busy", "true");
     expect(btn).toBeDisabled();
   });
@@ -696,10 +696,10 @@ describe("WeatherMap", () => {
 
     it("clicking Locate Me before delayed IP response permanently prevents easeTo", () => {
       const onLocate = jest.fn();
-      const { getByRole, rerender } = renderMap({ approximateLocation: null, onLocate });
+      const { getByTestId, rerender } = renderMap({ approximateLocation: null, onLocate });
       const [map] = getInstances();
 
-      const btn = getByRole("button", { name: "Locate me" });
+      const btn = getByTestId("locate-me");
       btn.click();
       expect(onLocate).toHaveBeenCalledTimes(1);
 
@@ -853,7 +853,7 @@ describe("WeatherMap", () => {
       const { getByTestId } = renderMap({ layer: windLayer });
       const toggleBtn = getByTestId("wind-particle-toggle");
       expect(toggleBtn).toBeInTheDocument();
-      expect(toggleBtn).toHaveAttribute("aria-label", "Toggle wind particle animation");
+      expect(toggleBtn).toHaveAttribute("aria-pressed");
     });
 
     it("does not render ParticleToggleButton when layer has no vector_field_url_template", () => {

@@ -45,7 +45,7 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 * `cities.elevation_m`: Adds nullable `DOUBLE PRECISION` column for authoritative persistent terrain elevation in meters. Allows known cities to resolve elevation without runtime API queries. Schema-only migration; no external network calls.
 
 ### Migration 007: Reclamation Queue (`007_reclamation_queue.py`)
-* `reclamation_queue`: Adds dependency-aware granular physical variable shard reclamation table for `sharded_v1` Zarr stores. Tracks shard lifecycle: `queued` (physically available), `deleting` (leased and fenced), `deleted` (physically removed from object storage), `failed` (quarantined after retries).
+* `reclamation_queue`: Adds dependency-aware granular physical variable shard reclamation table for `sharded_v1` / `sharded_v2` Zarr stores. Tracks shard lifecycle: `queued` (physically available), `deleting` (leased and fenced), `deleted` (physically removed from object storage), `failed` (quarantined after retries).
 
 ### Migration 008: Schema Contraction (`008_drop_retired_fields.py`)
 * `forecast_cycle_lifecycle`: Drops legacy columns `retired_at` and `retired_by_cycle_time`, and drops index `idx_cycle_lifecycle_retired`. Lifecycle authority is fully transitioned to physical fences (`deletion_started_at`, `deleted_at`) and granular reclamation (`reclamation_queue`).
@@ -104,7 +104,7 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 
 ### 4.2 Same-Cycle Re-Ingestion (PATCH Semantics)
 * Ingestion of a lead or member wave acts as a **PATCH** on the cycle store.
-* Writing a lead updates the corresponding region in the `sharded_v1` Zarr store and upserts `forecast_products` / `ensemble_member_products`.
+* Writing a lead updates the corresponding region in the `sharded_v1` / `sharded_v2` Zarr store and upserts `forecast_products` / `ensemble_member_products`.
 * Other leads and members in the store are preserved.
 * After writing, the catalog reconciles with committed Zarr markers.
 

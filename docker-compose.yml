@@ -83,7 +83,6 @@ services:
       default:
         aliases:
           - minio
-          - weather-minio
 
   weather_minio_init:
     # quay.io/minio/mc is gone with the same registry change. The official

@@ -95,6 +95,7 @@ export default function HomePage() {
                   : "border-sky-500/40 bg-slate-900/90 text-sky-300"
               }`}
               role={notice.type === "alert" ? "alert" : "status"}
+              data-testid="geo-notice"
             >
               <span>{notice.message}</span>
               <button

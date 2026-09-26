@@ -159,12 +159,14 @@ export function EnsembleChart({
   });
 
   return (
-    <div className="mb-4">
+    <div className="mb-4" data-testid="ensemble-fan-chart">
       <div className="mb-1.5 space-y-1">
         <div className="flex items-baseline gap-1.5">
           <h4 className="text-sm font-semibold text-slate-100">{variableLabel}</h4>
           {unit && <span className="text-xs font-normal text-slate-400">({unit})</span>}
-          <span className="text-xs font-mono text-cyan-400">· percentile range</span>
+          <span className="text-xs font-mono text-cyan-400" data-testid="ensemble-range-note">
+            · percentile range
+          </span>
         </div>
         <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1 text-xs">
           <div className="inline-flex items-center gap-1.5">

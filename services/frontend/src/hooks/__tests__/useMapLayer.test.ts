@@ -76,6 +76,17 @@ const mockAvailability: ForecastAvailability = {
               lead_time_hours: [0, 6, 12],
             },
           ],
+          valid_times: [
+            {
+              valid_time: "2026-08-13T06:00:00Z",
+              source_cycle: "2026-08-13T00:00:00Z",
+              lead_time_hours: 6,
+              servable: true,
+              available_members: 1,
+              expected_members: 1,
+              coverage_ratio: 1,
+            },
+          ],
           layer: {
             tile_url_template:
               "/v1/maps/gfs/precipitation_rate/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
@@ -107,6 +118,17 @@ const mockAvailability: ForecastAvailability = {
               lead_time_hours: [0, 6, 12, 18, 24],
             },
           ],
+          valid_times: [
+            {
+              valid_time: "2026-08-13T06:00:00Z",
+              source_cycle: "2026-08-13T00:00:00Z",
+              lead_time_hours: 6,
+              servable: true,
+              available_members: 30,
+              expected_members: 30,
+              coverage_ratio: 1,
+            },
+          ],
           layer: {
             tile_url_template:
               "/v1/maps/gefs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours={lead_time_hours}&initial_time={initial_time}",
@@ -129,36 +151,25 @@ const mockAvailability: ForecastAvailability = {
 const selectionLead6: ForecastSelection = {
   model: "gfs",
   variable: "temperature_2m",
-  initialTime: "2026-08-13T00:00:00Z",
-  leadTimeHours: 6,
+  validTime: "2026-08-13T06:00:00Z",
 };
 
 const selectionLead12: ForecastSelection = {
   model: "gfs",
   variable: "temperature_2m",
-  initialTime: "2026-08-13T00:00:00Z",
-  leadTimeHours: 12,
+  validTime: "2026-08-13T12:00:00Z",
 };
 
 const selectionPrecip: ForecastSelection = {
   model: "gfs",
   variable: "precipitation_rate",
-  initialTime: "2026-08-13T00:00:00Z",
-  leadTimeHours: 6,
-};
-
-const selection06Z: ForecastSelection = {
-  model: "gfs",
-  variable: "temperature_2m",
-  initialTime: "2026-08-13T06:00:00Z",
-  leadTimeHours: 6,
+  validTime: "2026-08-13T06:00:00Z",
 };
 
 const selectionGefs: ForecastSelection = {
   model: "gefs",
   variable: "temperature_2m",
-  initialTime: "2026-08-13T00:00:00Z",
-  leadTimeHours: 12,
+  validTime: "2026-08-13T06:00:00Z",
 };
 
 function mockContextValue(
@@ -186,8 +197,7 @@ function mockContextValue(
     },
     setModel: jest.fn(),
     setVariable: jest.fn(),
-    setInitialTime: jest.fn(),
-    setLeadTimeHours: jest.fn(),
+    setValidTime: jest.fn(),
     retry: jest.fn(),
   };
 }
@@ -245,7 +255,7 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
     );
   });
 
-  it("synchronously resolves authoritative SpatialLayer for initial selection", () => {
+  it("synchronously resolves the cycle-pinned SpatialLayer for a valid-time selection", () => {
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
     const { result } = renderHook(() => useMapLayer());
 
@@ -253,10 +263,10 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
     expect(result.current.error).toBeNull();
     expect(result.current.layer).toEqual<SpatialLayer>({
       tile_url_template:
-        "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?lead_time_hours=6&initial_time=2026-08-13T00%3A00%3A00Z",
+        "/v1/maps/gfs/temperature_2m/surface/{z}/{x}/{y}.png?valid_time=2026-08-13T06%3A00%3A00Z&initial_time=2026-08-13T00%3A00%3A00Z",
       min_zoom: 0,
       max_zoom: 9,
-      lead_time_hours: 6,
+      lead_time_hours: 0,
       legend: {
         unit: "°C",
         stops: [
@@ -264,22 +274,26 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
           [40, "#ff0000"],
         ],
       },
+      valid_time: "2026-08-13T06:00:00Z",
+      source_cycle: "2026-08-13T00:00:00Z",
     });
   });
 
-  it("synchronously transitions on lead time change (+6h -> +12h) without metadata network delay", () => {
+  it("synchronously transitions on valid time change (+6h -> +12h) without metadata network delay", () => {
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
     const { result, rerender } = renderHook(() => useMapLayer());
 
-    expect(result.current.layer?.lead_time_hours).toBe(6);
+    expect(result.current.layer?.valid_time).toBe("2026-08-13T06:00:00Z");
 
-    // Transition to lead 12h
+    // Transition to the 12h valid time
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead12));
     rerender();
 
     // Immediately authoritative without waiting for an HTTP roundtrip
-    expect(result.current.layer?.lead_time_hours).toBe(12);
-    expect(result.current.layer?.tile_url_template).toContain("lead_time_hours=12");
+    expect(result.current.layer?.valid_time).toBe("2026-08-13T12:00:00Z");
+    expect(result.current.layer?.tile_url_template).toContain(
+      "valid_time=2026-08-13T12%3A00%3A00Z"
+    );
   });
 
   it("synchronously transitions on variable change (temperature_2m -> precipitation_rate)", () => {
@@ -296,19 +310,6 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
     expect(result.current.layer?.tile_url_template).toContain("precipitation_rate");
   });
 
-  it("synchronously transitions on initial time change (00Z -> 06Z)", () => {
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
-    const { result, rerender } = renderHook(() => useMapLayer());
-
-    expect(result.current.layer?.tile_url_template).toContain("2026-08-13T00%3A00%3A00Z");
-
-    // Transition to 06Z cycle
-    mockUseForecastSelection.mockReturnValue(mockContextValue(selection06Z));
-    rerender();
-
-    expect(result.current.layer?.tile_url_template).toContain("2026-08-13T06%3A00%3A00Z");
-  });
-
   it("synchronously transitions on model change (GFS -> GEFS)", () => {
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
     const { result, rerender } = renderHook(() => useMapLayer());
@@ -320,33 +321,31 @@ describe("useMapLayer (synchronous authoritative layer resolution)", () => {
     rerender();
 
     expect(result.current.layer?.tile_url_template).toContain("/v1/maps/gefs/");
-    expect(result.current.layer?.lead_time_hours).toBe(12);
   });
 
   it("leaves only C authoritative in rapid A -> B -> C transitions with zero lag", () => {
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead6));
     const { result, rerender } = renderHook(() => useMapLayer());
 
-    expect(result.current.layer?.lead_time_hours).toBe(6);
+    expect(result.current.layer?.valid_time).toBe("2026-08-13T06:00:00Z");
 
     // Rapid switch B
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionLead12));
     rerender();
-    expect(result.current.layer?.lead_time_hours).toBe(12);
+    expect(result.current.layer?.valid_time).toBe("2026-08-13T12:00:00Z");
 
     // Rapid switch C
     mockUseForecastSelection.mockReturnValue(mockContextValue(selectionGefs));
     rerender();
-    expect(result.current.layer?.lead_time_hours).toBe(12);
+    expect(result.current.layer?.valid_time).toBe("2026-08-13T06:00:00Z");
     expect(result.current.layer?.tile_url_template).toContain("/v1/maps/gefs/");
   });
 
-  it("returns null when selection refers to an unavailable lead time", () => {
+  it("returns null when the selected valid time is not offered by availability", () => {
     const invalidSelection: ForecastSelection = {
       model: "gfs",
       variable: "temperature_2m",
-      initialTime: "2026-08-13T00:00:00Z",
-      leadTimeHours: 999, // not in availability
+      validTime: "2026-08-13T09:00:00Z", // not in valid_times or synthesizable from initial_times
     };
     mockUseForecastSelection.mockReturnValue(mockContextValue(invalidSelection));
     const { result } = renderHook(() => useMapLayer());

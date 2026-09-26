@@ -355,10 +355,6 @@ class PopularityDecayingElevationCache(ElevationProvider):
             return val
 
 
-# Alias for backward compatibility with existing tests
-RoundedElevationCache = PopularityDecayingElevationCache
-
-
 @dataclass
 class ElevationMetrics:
     """Lightweight in-memory observability metrics for elevation resolution."""

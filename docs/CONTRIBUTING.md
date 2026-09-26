@@ -5,7 +5,7 @@ Thank you for contributing to the Global Probabilistic Weather Platform.
 ---
 
 ## 1. Code Standards & Style
-- **Python**: Follow PEP 8. Use `ruff` for linting and formatting. Type hints (`mypy`) are strictly required across all backend services (`services/ingestion`, `services/processing`, `services/api`).
+- **Python**: Follow PEP 8. Use `ruff` for linting and formatting. Type hints (`mypy`) are strictly required across all backend services (`services/ingestion`, `services/api`).
 - **TypeScript / React**: Use TypeScript with strict mode enabled. Follow Tailwind CSS conventions and Next.js App Router patterns.
 
 ---

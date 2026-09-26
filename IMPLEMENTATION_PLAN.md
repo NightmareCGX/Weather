@@ -1,5 +1,7 @@
 # Master Implementation Plan (IMPLEMENTATION_PLAN.md)
 
+> **Status:** Planning artifact — Milestones M1–M14 are complete; see the README's Status section for the current state of the platform. Milestones M15–M18 (ECMWF/ECCC ingestion, MME calibration, AI downscaling, commercial hardening) are future work and are not scheduled.
+
 This document is the master execution roadmap for the Global Probabilistic Weather Forecasting Platform. Implementation proceeds strictly one milestone at a time, following vertical slices from initial project bootstrap through commercial readiness and multi-model expansion.
 
 ---
@@ -9,7 +11,7 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 - **Scope**: Root workspace files, `pyproject.toml`, shared package directories (`packages/domain`, `packages/contracts`, `packages/config`), and basic service stubs.
 - **Out of Scope**: Database migrations, API routers, ingestion workers, and frontend code.
 - **Deliverables**: 
-  - Monorepo directory structure matching REPOSITORY.md.
+  - Monorepo directory structure (`packages/`, `services/`, `docker/`, `docs/`).
   - Root `pyproject.toml` with uv workspace configuration (single root `uv.lock`).
   - Initial stub packages and modules.
 - **Dependencies**: None.
@@ -20,7 +22,7 @@ This document is the master execution roadmap for the Global Probabilistic Weath
 ---
 
 ## Milestone 2: Development Environment & Infrastructure
-- **Goal**: Spin up local containerized infrastructure (PostgreSQL 16 + PostGIS, Redis, MinIO S3 object storage) via Docker Compose.
+- **Goal**: Spin up local containerized infrastructure (PostgreSQL 18 + PostGIS 3.6, Redis, MinIO S3 object storage) via Docker Compose.
 - **Scope**: `docker-compose.yml`, health checks, persistent volume mounts, and environment configuration templates (`.env.example`).
 - **Out of Scope**: Kubernetes manifests and Terraform cloud deployment scripts.
 - **Deliverables**:

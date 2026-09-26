@@ -78,7 +78,7 @@ export function EnsembleDistribution({
 
   if (status === "error") {
     return (
-      <p role="alert" className="text-sm text-red-700">
+      <p role="alert" className="text-sm text-red-700" data-testid="distribution-error">
         {error ?? "Failed to load the ensemble distribution."}
       </p>
     );
@@ -91,7 +91,10 @@ export function EnsembleDistribution({
 
   if (data === null) {
     return (
-      <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
+      <div
+        className="rounded border border-slate-200 bg-slate-50 px-3 py-3"
+        data-testid="distribution-empty"
+      >
         <p className="text-xs text-slate-600">
           No ensemble distribution available{timeLabel ? ` for ${timeLabel}` : ""}.
         </p>
@@ -105,7 +108,10 @@ export function EnsembleDistribution({
 
   if (rawMembers === undefined || rawMembers.length === 0) {
     return (
-      <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
+      <div
+        className="rounded border border-slate-200 bg-slate-50 px-3 py-3"
+        data-testid="distribution-empty"
+      >
         <p className="text-xs text-slate-600">
           Ensemble distribution for {variableLabel}
           {timeLabel ? ` at ${timeLabel}` : ""} is not yet available: the API returned no raw member
@@ -121,8 +127,11 @@ export function EnsembleDistribution({
 
   if (isCeiling && finiteCount < 10) {
     return (
-      <div className="mt-4 space-y-3">
-        <div className="flex items-center justify-between rounded-lg border border-sky-200 bg-sky-50 px-4 py-3">
+      <div className="mt-4 space-y-3" data-testid="ensemble-distribution">
+        <div
+          className="flex items-center justify-between rounded-lg border border-sky-200 bg-sky-50 px-4 py-3"
+          data-testid="unlimited-probability"
+        >
           <div>
             <div className="text-xs font-semibold text-sky-800">Unlimited Ceiling Probability</div>
             <div className="text-xl font-bold text-sky-950">
@@ -136,7 +145,10 @@ export function EnsembleDistribution({
             {data.valid_member_count ?? memberCount} members
           </div>
         </div>
-        <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3">
+        <div
+          className="rounded border border-slate-200 bg-slate-50 px-3 py-3"
+          data-testid="distribution-empty"
+        >
           <p className="text-xs text-slate-600">
             Only {finiteCount} members predict a finite ceiling (minimum 10 required for continuous
             distribution).
@@ -161,9 +173,12 @@ export function EnsembleDistribution({
   }));
 
   return (
-    <div className="mt-4 space-y-3">
+    <div className="mt-4 space-y-3" data-testid="ensemble-distribution">
       {isCeiling && unlimitedProb !== undefined && unlimitedProb !== null && (
-        <div className="flex items-center justify-between rounded-lg border border-sky-200 bg-sky-50 px-4 py-3">
+        <div
+          className="flex items-center justify-between rounded-lg border border-sky-200 bg-sky-50 px-4 py-3"
+          data-testid="unlimited-probability"
+        >
           <div>
             <div className="text-xs font-semibold text-sky-800">Unlimited Ceiling Probability</div>
             <div className="text-xl font-bold text-sky-950">{formatPercent(unlimitedProb)}</div>
@@ -177,7 +192,7 @@ export function EnsembleDistribution({
 
       <div>
         <div className="mb-1 flex items-baseline justify-between">
-          <h4 className="text-sm font-semibold text-slate-200">
+          <h4 className="text-sm font-semibold text-slate-200" data-testid="distribution-subtitle">
             {isCeiling
               ? `Conditional finite distribution · ${timeLabel}`
               : `Member distribution · ${timeLabel}`}
@@ -198,6 +213,7 @@ export function EnsembleDistribution({
           role="img"
           aria-label={`Histogram and PDF of ${members.length} ensemble members for ${variableLabel}`}
           className="h-44 w-full"
+          data-testid="distribution-chart"
         >
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={binChartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>

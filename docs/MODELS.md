@@ -11,7 +11,7 @@ The Weather Platform ingests, processes, and serves global numerical weather pre
 * **Grid Resolution:** 0.25° (~25 km) global regular rectilinear grid ($721 \times 1440$).
 * **Cycle Cadence:** 4 times daily (00Z, 06Z, 12Z, 18Z).
 * **Canonical Horizon:** 0 to 240 hours at 3-hour cadence (`domain.horizon`). Upstream extends to 384 hours.
-* **Storage Layout:** `sharded_v1` single-lead binary shard containers (120 chunks of $100 \times 100$ per variable).
+* **Storage Layout:** sharded shard-container format with single-lead binary shard containers (120 chunks of $100 \times 100$ per variable); `sharded_v1` is the current default, and `sharded_v2` (per-variable float16) is available via `STORAGE_FORMAT_VERSION=sharded_v2`.
 * **Upstream Sources:** AWS Open Data S3 (`noaa-gfs-bdp-pds`) with automated fallback to NOAA NOMADS HTTP.
 * **Supported Variables:**
   * `temperature_2m` (2-Meter Temperature, °C)
@@ -27,7 +27,7 @@ The Weather Platform ingests, processes, and serves global numerical weather pre
 * **Cycle Cadence:** 4 times daily (00Z, 06Z, 12Z, 18Z).
 * **Canonical Horizon:** 0 to 240 hours at 3-hour cadence (`domain.horizon`).
 * **Ensemble Size:** 30 perturbation members (`gep01`–`gep30`).
-* **Storage Layout:** `sharded_v1` per-member/per-lead binary shard containers (`{variable}/shard.mem{member:03d}_L{lead:04d}.shard`).
+* **Storage Layout:** sharded shard-container format with per-member/per-lead binary shard containers (`{variable}/shard.mem{member:03d}_L{lead:04d}.shard`); `sharded_v1` is the current default, and `sharded_v2` (per-variable float16) is available via `STORAGE_FORMAT_VERSION=sharded_v2`.
 * **Upstream Sources:** AWS Open Data S3 (`noaa-gefs-pds`) with automated fallback to NOAA NOMADS HTTP (`pgrb2sp25`).
 * **Ensemble Calculations:** Real-time calculation of ensemble mean, median, standard deviation, spread, interquartile range, percentiles (P10..P90), and empirical probability density functions (PDFs).
 
@@ -45,4 +45,4 @@ The following models are prospective roadmap targets and are **not currently imp
 
 ## 3. Data Ingestion & Normalization Standard
 
-All incoming GRIB2 datasets are decoded via `cfgrib` and `ecCodes`, normalized into platform canonical units (temperature in °C, precipitation rate in mm/h, wind speed in km/h), and written into `sharded_v1` Zarr stores. Variable mappings are defined in `ingestion.core.wave_runner.DEFAULT_VARIABLES`.
+All incoming GRIB2 datasets are decoded via `cfgrib` and `ecCodes`, normalized into platform canonical units (temperature in °C, precipitation rate in mm/h, wind speed in km/h), and written into sharded Zarr shard-container stores (`sharded_v1` is the current default; `sharded_v2` per-variable float16 is selected via `STORAGE_FORMAT_VERSION`). Variable mappings are defined in `ingestion.core.wave_runner.DEFAULT_VARIABLES`.

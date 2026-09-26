@@ -27,9 +27,6 @@ CLOUD_COVER_RECONSTRUCTION_TOLERANCE_PERCENT: float = 5.0
 #: In NCEP GRIB2 encoding, clear sky / no qualifying ceiling is encoded near 20,000 gpm (20 km).
 CLOUD_CEILING_UNLIMITED_THRESHOLD_KM: float = 19.99
 CLOUD_CEILING_UNLIMITED_SENTINEL_KM: float = 20.0
-# Backward-compatibility aliases
-CLOUD_CEILING_UNLIMITED_THRESHOLD_M: float = CLOUD_CEILING_UNLIMITED_THRESHOLD_KM
-CLOUD_CEILING_UNLIMITED_SENTINEL_M: float = CLOUD_CEILING_UNLIMITED_SENTINEL_KM
 
 #: Minimum valid ensemble members required out of 30 for ensemble statistics.
 #: If invalid_count >= 10 (N_valid <= 20), the ensemble result is marked invalid.
@@ -39,11 +36,6 @@ CLOUD_COVER_MIN_VALID_MEMBERS: int = 21
 #: If N_finite < 10, conditional percentiles are suppressed (None) while P(Unlimited) is retained.
 CLOUD_CEILING_MIN_FINITE_MEMBERS: int = 10
 
-#: Standard conversion factor from meters to feet.
-METERS_TO_FEET: float = 3.28084
-#: Standard conversion factor from kilometers to feet.
-KM_TO_FEET: float = 3280.84
-
 
 @dataclass(frozen=True, slots=True)
 class CloudCeilingClassification:
@@ -51,11 +43,6 @@ class CloudCeilingClassification:
 
     is_unlimited: bool
     height_km: float | None
-
-    @property
-    def height_m(self) -> float | None:
-        """Backward compatibility property returning height."""
-        return self.height_km
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,22 +69,6 @@ class CloudCeilingEnsembleSummary:
     conditional_median: float | None
     conditional_spread: float | None
     conditional_percentiles: dict[str, float] | None
-
-    @property
-    def conditional_mean_m(self) -> float | None:
-        return self.conditional_mean
-
-    @property
-    def conditional_median_m(self) -> float | None:
-        return self.conditional_median
-
-    @property
-    def conditional_spread_m(self) -> float | None:
-        return self.conditional_spread
-
-    @property
-    def conditional_percentiles_m(self) -> dict[str, float] | None:
-        return self.conditional_percentiles
 
 
 def reconstruct_running_average_interval(

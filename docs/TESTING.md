@@ -2,6 +2,10 @@
 
 This document outlines the testing strategy, layers, and fixtures for the Global Probabilistic Weather Platform.
 
+**Testing philosophy.** CI gates on architecture invariants and computational-output consistency rather than copy-level assertions: frontend tests target stable `data-testid` hooks (not visible copy), so changing copy or labels must not require test changes. Cross-service contract suites (`tests/contracts`) pin the binary shard storage format, the exported OpenAPI schema, configuration parity across services, and v1↔v2 numerical equivalence. CI additionally asserts **zero skipped tests** in the api/ingestion suites — a skip in CI means the environment is miswired and counts as a failure (locally, integration suites still skip gracefully when backing containers are absent; see §1.2).
+
+**Numerical-equality scope (cross-architecture stance).** Tolerance-free numerical equality — the round-trip tests, the f32-exception variables of the shadow v1↔v2 comparison (its float16 variables are tolerance-based, ≤ 0.5), and the binary-format constants — is asserted only **within a single CI platform run** (ubuntu x86_64). Cross-architecture byte identity of floating-point output is explicitly **not a goal**: x86_64 and arm64 floating-point paths are not guaranteed bit-identical. Where cross-architecture consistency matters in practice, it is guaranteed at the **quantized-output boundary** — PNG map tiles and the Int16-quantized wind vector field — not at the float32/float16 shard-payload level; shard payloads are written by a single writer tier per cycle, so cross-architecture writer determinism is not a requirement. If a committed-fixture golden-value layer is introduced later, its comparisons must either run per-platform or use quantized/tolerance-based comparison — never raw byte equality across architectures.
+
 ---
 
 ## 1. Testing Pillars
@@ -86,7 +90,7 @@ docker exec weather_postgres psql -U weather_user -d weather_db \
 cd services/api
 DATABASE_URL="postgresql://weather_user:weather_password@localhost:5432/weather_test_db" \
 TEST_DATABASE_URL="postgresql://weather_user:weather_password@localhost:5432/weather_test_db" \
-poetry run pytest
+uv run --no-sync pytest
 ```
 
 Running with `TEST_DATABASE_URL` alone is NOT sufficient for the serving-tier

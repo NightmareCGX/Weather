@@ -78,15 +78,19 @@ Grounding the general matrix in the actual CI (`.github/workflows/ci.yml`, all j
 
 | CI job | What CI runs | Reproducible on Windows | Linux/CI-equivalent reproduction |
 |---|---|---|---|
-| `python-quality` | `uv sync --project <pkg>` + `ruff check` + `mypy` per package (domain/api/ingestion) + contracts/config import | yes (`ruff`/`mypy` from the synced uv venv, `uv 0.12.13`) | Docker `python:3.12-slim` / WSL |
-| `domain-tests` | `pytest` offline, **100% coverage gate** | yes | Docker / WSL |
-| `api-tests` | `pytest` + PostgreSQL (PostGIS 3.6 / PG 18) + Redis service containers | only if local services run | Docker Compose / CI-like service containers |
-| `ingestion-tests` | `pytest` + PostgreSQL + Redis + MinIO, `WEATHER_TEST_MINIO=1`, real S3 Zarr round-trip (JUnit-verified not-skipped), `libeccodes-dev` | partial — Windows `eccodes` wheel bundles the native lib; services still required | Docker / WSL with `libeccodes-dev` + service containers |
-| `frontend-unit` | `npm ci` + Jest | yes | Docker `node:20` |
-| `frontend-lint-build` | `npm run lint`, `typecheck`, `format:check`, `build` (`output: standalone`) | yes | Docker `node:20` |
-| `frontend-e2e` | Playwright Chromium, `npm run e2e` | yes, where supported | Docker / WSL |
-| `container-builds` | `docker build` of api/ingestion/frontend images + runtime smoke tests | **not reproducible on the Windows host itself** — Linux artifacts | Docker Linux build + runtime smoke |
+| `change-detection` | `dorny/paths-filter` over touched paths; jobs run only when their area (or CI itself) changed | n/a (GitHub-side) | n/a |
+| `domain-pipeline` | `uv sync --project packages/domain` + `ruff check` + `mypy` + `pytest` offline, **100% coverage gate** | yes (`ruff`/`mypy` from the synced uv venv, `uv 0.12.13`) | Docker `python:3.12-slim` / WSL |
+| `api-pipeline` | `ruff` + `mypy` + `pytest` + PostgreSQL (PostGIS 3.6.4 / PG 18.6) + Redis service containers; JUnit guard asserts **zero skipped tests** | only if local services run | Docker Compose / CI-like service containers |
+| `ingestion-pipeline` | `ruff` + `mypy` + `pytest` + PostgreSQL + Redis + MinIO, `WEATHER_TEST_MINIO=1`, real S3 Zarr round-trip, `libeccodes-dev`; JUnit guard asserts **zero skipped tests** (environment-completeness invariant — a skip in CI means the environment is miswired) | partial — Windows `eccodes` wheel bundles the native lib; services still required | Docker / WSL with `libeccodes-dev` + service containers |
+| `frontend-unit-build` | `npm ci` + `lint` + `typecheck` + `format:check` + Jest + standalone `build` | yes | Docker `node:20` |
+| `frontend-e2e` | Playwright Chromium, `npm run e2e` (all `/v1/**` mocked; triggers on frontend/CI changes only) | yes, where supported | Docker / WSL |
+| `container-builds` | `docker compose config` + buildx builds of api/ingestion/frontend + runtime smoke tests | **not reproducible on the Windows host itself** — Linux artifacts | Docker Linux build + runtime smoke |
 | `arm64-builds` | `docker buildx build --platform linux/arm64` of API & Ingestion + platform check + startup/CLI smoke | yes (via Docker Desktop Buildx/QEMU) | Docker Buildx `linux/arm64` |
+| `docs-metadata` | `uv lock --check`, `uv build --all-packages`, `scripts/check_dependency_alignment.py` | yes | Docker / WSL |
+| `cross-package-contracts` | `uv sync --all-packages` + OpenAPI export test + `tests/contracts` (binary format, lifecycle, config parity, v1↔v2 shadow numerics) + frontend OpenAPI contract suite | only the frontend OpenAPI suite fully | Docker / WSL |
+| `ci-required` | merge gate: fails if any needed job ended `failure`, `cancelled` or was blocked (`action_required`); `skipped` is legitimate path filtering | n/a | n/a |
+
+**CI testing philosophy (binding):** CI gates on architecture invariants and computational-output consistency, not on incidental surface. UI copy, labels, and cosmetic presentation are free to change without touching tests — frontend tests target stable `data-testid` hooks (plus roles) and API/data shapes, never visible strings. What CI pins deliberately as no-drift contracts: the shard-container binary format and manifest keys, the OpenAPI schema (single golden shared by both tiers), cross-service configuration parity, and v1↔v2 numerical equivalence. Renaming, parametrizing, or regrouping tests must not require CI changes; changing the architecture or the computed outputs must.
 
 ### 6. No green Windows + Linux validation, no commit
 

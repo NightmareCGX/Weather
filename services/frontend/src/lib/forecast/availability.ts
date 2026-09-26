@@ -24,9 +24,6 @@ export interface ForecastSelection {
   model: string;
   variable: string;
   validTime?: string;
-  // Legacy optional fields for backward compatibility during transition
-  initialTime?: string;
-  leadTimeHours?: number;
 }
 
 /** The options currently available at each level of the selection. */
@@ -136,24 +133,6 @@ export function filterServableValidTimes(
   return validTimes.filter((vt) => isServableValidTime(vt, servingStartOrNow, fallbackNow));
 }
 
-/**
- * Backward compatibility alias for isServableValidTime.
- * Removes the old `now - 3h` grace window and enforces the floored cadence boundary.
- */
-export function isWithinGraceWindow(validTime: string | null, nowMs: number = Date.now()): boolean {
-  return isServableValidTime(validTime, nowMs);
-}
-
-/**
- * Backward compatibility alias for filterServableValidTimes.
- */
-export function filterGraceWindowValidTimes(
-  validTimes: string[],
-  nowMs: number = Date.now()
-): string[] {
-  return filterServableValidTimes(validTimes, nowMs);
-}
-
 /** Pick the first model in availability (or null when empty). */
 export function defaultModel(availability: ForecastAvailability | null): string | null {
   const models = availability?.models ?? [];
@@ -258,15 +237,7 @@ export function defaultValidTime(
   return filtered.length > 0 ? filtered[0] : validTimes.length > 0 ? validTimes[0] : null;
 }
 
-/** Legacy helper: default initial time */
-export function defaultInitialTime(variable: VariableAvailability | null): string | null {
-  if (variable === null || variable.initial_times.length === 0) {
-    return null;
-  }
-  return variable.initial_times[0].value;
-}
-
-/** Legacy helper: find initial time */
+/** Resolve an initial-time entry by value within a variable (or null). */
 export function findInitialTime(
   variable: VariableAvailability | null,
   initialTime: string | null
@@ -275,12 +246,6 @@ export function findInitialTime(
     return null;
   }
   return variable.initial_times.find((entry) => entry.value === initialTime) ?? null;
-}
-
-/** Legacy helper: default lead time */
-export function defaultLeadTime(initialTime: InitialTimeAvailability | null): number | null {
-  const leads = initialTime?.lead_time_hours ?? [];
-  return leads.length > 0 ? leads[0] : null;
 }
 
 /**
@@ -303,10 +268,7 @@ export function buildForecastOptions(
   const servingStart = availability.serving_start_valid_time ?? computeServingStartValidTime(nowMs);
   const selectableValidTimes = filterServableValidTimes(allValidTimes, servingStart, nowMs);
 
-  const initialTime =
-    variable !== null && selection !== null && selection.initialTime
-      ? findInitialTime(variable, selection.initialTime)
-      : (variable?.initial_times[0] ?? null);
+  const initialTime = variable?.initial_times[0] ?? null;
 
   return {
     models: availability.models,
@@ -394,10 +356,16 @@ export function resolveSpatialLayer(
     return null;
   }
 
-  // Validate availability before constructing layer
+  // Validate availability before constructing layer: a selection without a
+  // valid time is not constructible under Lifecycle V2 (the selection
+  // provider always carries one, so this only rejects hand-built objects).
+  const validTime = selection.validTime;
+  if (!validTime) {
+    return null;
+  }
   let sourceCycle: string | null = null;
-  if (selection.validTime) {
-    const selMs = new Date(selection.validTime).getTime();
+  {
+    const selMs = new Date(validTime).getTime();
     const validTimeEntries = variable.valid_times ?? [];
     const servingEntry = validTimeEntries.find((vt) => new Date(vt.valid_time).getTime() === selMs);
     if (servingEntry) {
@@ -409,13 +377,6 @@ export function resolveSpatialLayer(
         return null;
       }
     }
-  } else if (selection.initialTime && selection.leadTimeHours !== undefined) {
-    const initial = findInitialTime(variable, selection.initialTime);
-    if (initial === null || !initial.lead_time_hours.includes(selection.leadTimeHours)) {
-      return null;
-    }
-  } else {
-    return null;
   }
 
   const {
@@ -431,45 +392,31 @@ export function resolveSpatialLayer(
   let tileUrl: string;
   let vectorFieldUrl: string | null = null;
 
-  if (selection.validTime) {
-    const encodedVt = encodeURIComponent(selection.validTime);
-    if (valid_time_tile_url_template) {
-      tileUrl = buildPinnedTileUrl(valid_time_tile_url_template, encodedVt, sourceCycle);
-    } else if (tile_url_template.includes("{valid_time}")) {
-      tileUrl = buildPinnedTileUrl(tile_url_template, encodedVt, sourceCycle);
-    } else {
-      tileUrl = `/v1/maps/${selection.model}/${selection.variable}/surface/{z}/{x}/{y}.png?valid_time=${encodedVt}`;
-      if (sourceCycle !== null) {
-        tileUrl += `&initial_time=${encodeURIComponent(sourceCycle)}`;
-      }
-    }
-    if (valid_time_vector_field_url_template) {
-      vectorFieldUrl = valid_time_vector_field_url_template.replace("{valid_time}", encodedVt);
-    } else if (vector_field_url_template) {
-      vectorFieldUrl = `/v1/maps/${selection.model}/wind_10m/vector-field?valid_time=${encodedVt}`;
-    }
+  const encodedVt = encodeURIComponent(validTime);
+  if (valid_time_tile_url_template) {
+    tileUrl = buildPinnedTileUrl(valid_time_tile_url_template, encodedVt, sourceCycle);
+  } else if (tile_url_template.includes("{valid_time}")) {
+    tileUrl = buildPinnedTileUrl(tile_url_template, encodedVt, sourceCycle);
   } else {
-    // Legacy fallback
-    tileUrl = tile_url_template
-      .replace("{lead_time_hours}", String(selection.leadTimeHours ?? 0))
-      .replace("{initial_time}", encodeURIComponent(selection.initialTime ?? ""));
-    if (vector_field_url_template) {
-      vectorFieldUrl = vector_field_url_template
-        .replace("{lead_time_hours}", String(selection.leadTimeHours ?? 0))
-        .replace("{initial_time}", encodeURIComponent(selection.initialTime ?? ""));
+    tileUrl = `/v1/maps/${selection.model}/${selection.variable}/surface/{z}/{x}/{y}.png?valid_time=${encodedVt}`;
+    if (sourceCycle !== null) {
+      tileUrl += `&initial_time=${encodeURIComponent(sourceCycle)}`;
     }
+  }
+  if (valid_time_vector_field_url_template) {
+    vectorFieldUrl = valid_time_vector_field_url_template.replace("{valid_time}", encodedVt);
+  } else if (vector_field_url_template) {
+    vectorFieldUrl = `/v1/maps/${selection.model}/wind_10m/vector-field?valid_time=${encodedVt}`;
   }
 
   const layerResult: SpatialLayer = {
     tile_url_template: tileUrl,
     min_zoom,
     max_zoom,
-    lead_time_hours: selection.leadTimeHours ?? 0,
+    lead_time_hours: 0,
     legend,
+    valid_time: validTime,
   };
-  if (selection.validTime) {
-    layerResult.valid_time = selection.validTime;
-  }
   if (sourceCycle !== null) {
     layerResult.source_cycle = sourceCycle;
   }

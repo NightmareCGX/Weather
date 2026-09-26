@@ -38,7 +38,10 @@ export function EnsemblePhaseSupportTooltip({ active, payload, label, timezone }
 
   if (!point || !point.has_data) {
     return (
-      <div className="rounded-lg border border-slate-700 bg-slate-900/95 p-2.5 shadow-2xl text-xs backdrop-blur-md">
+      <div
+        className="rounded-lg border border-slate-700 bg-slate-900/95 p-2.5 shadow-2xl text-xs backdrop-blur-md"
+        data-testid="phase-support-empty"
+      >
         <p className="font-semibold text-slate-100">{formattedTime}</p>
         <p className="text-slate-400 mt-1">No ensemble phase data available</p>
       </div>
@@ -162,7 +165,10 @@ export function EnsemblePhaseSupport({
   }, [transitionFrequency, effectiveByLead]);
 
   return (
-    <div className="mt-4 rounded-lg border border-slate-800 bg-slate-800/40 p-4 shadow-xl">
+    <div
+      className="mt-4 rounded-lg border border-slate-800 bg-slate-800/40 p-4 shadow-xl"
+      data-testid="phase-support-section"
+    >
       <div className="mb-1 flex items-baseline justify-between">
         <h4 className="text-xs font-semibold text-slate-200">
           Ensemble Phase Support — time-varying support (0–100%)
@@ -198,7 +204,12 @@ export function EnsemblePhaseSupport({
       </div>
 
       {/* 100% Stacked Bar Chart across Valid Times */}
-      <div role="img" aria-label="Ensemble phase support over time" className="h-56 w-full">
+      <div
+        role="img"
+        aria-label="Ensemble phase support over time"
+        className="h-56 w-full"
+        data-testid="phase-support-chart"
+      >
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
@@ -234,7 +245,7 @@ export function EnsemblePhaseSupport({
 
       {/* Secondary Transition Frequency */}
       {transitions.length > 0 && (
-        <div className="mt-3.5 border-t border-slate-200 pt-2.5">
+        <div className="mt-3.5 border-t border-slate-200 pt-2.5" data-testid="phase-transitions">
           <h5 className="text-[11px] font-medium text-slate-700 mb-1.5">
             Member Phase Transitions
           </h5>

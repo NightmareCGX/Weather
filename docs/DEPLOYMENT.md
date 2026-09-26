@@ -21,11 +21,12 @@ For local development and integration testing, backing services run via Docker C
 * **Redis 7 (`redis:7-alpine`):**
   * Port: `6379`
   * In-memory cache for API point forecast JSON envelopes and vector field grids.
-* **MinIO (`minio/minio:latest`):**
+* **MinIO (`alpine/minio:RELEASE.2025-10-15T17-29-55Z`):**
   * S3 API: `http://localhost:9000`
   * Console: `http://localhost:9001`
   * Credentials: `minio_admin` / `minio_password`
   * S3-compatible object storage bucket: `weather-data`
+  * Image note: `alpine/minio` is the MinIO community rebuild, used because `quay.io/minio` requires authentication and the Docker Hub `minio/minio` repositories were removed.
 
 To launch:
 ```bash
@@ -117,12 +118,14 @@ The platform enforces a deterministic configuration precedence hierarchy across 
 * `REALTIME_ENABLED`: `true` to enable realtime polling daemon.
 * `REALTIME_ACTIVE_POLL_SECONDS`: Cadence for active cycle tracking (default `600.0` seconds).
 * `REALTIME_WAVE_MAX_LEADS`: Number of accumulated leads before dispatching a wave (default `8`).
+* `STORAGE_FORMAT_VERSION`: Storage format for newly initialized forecast cycles — `sharded_v1` (default, frozen float32 shard bytes) or `sharded_v2` (per-variable native dtypes: little-endian `<f2` for the 9 continuous variables, `<f4` kept for the `precipitation_amount_3h` / `cloud_ceiling` compatibility exceptions, `u1` for categorical flags). The version is frozen per cycle (first commit wins; a mid-cycle change fails loudly) and stamped in the committed manifest, which the API uses to dispatch the matching reader — so rolling back to `sharded_v1` affects only new cycles while committed v2 cycles keep serving. Rollout gate order is GFS deterministic → GEFS mean → GEFS members, running `scripts/shadow_v2.py validate` against the target cycle before each cutover.
 
 ### 3.3 API-Specific Settings
 * `API_READER_LOCK_POOL_SIZE`: Dedicated connection pool size for PostgreSQL reader advisory locks (default `16`).
 * `API_READER_LOCK_MAX_OVERFLOW`: Overflow connections for reader locks (default `8`).
 * `API_READER_GATE_TIMEOUT_SECONDS`: Maximum wait time to acquire `SHARED` store gate (default `30.0` seconds).
-* `SEARCH_PROVIDER`: `google` (Google Places API) or `mapbox` (Mapbox Geocoding).
+* `SEARCH_PROVIDER`: `geoapify` (default), `locationiq`, `google` (Places API (New)), or `mapbox`.
+* `GEOAPIFY_API_KEY` / `LOCATIONIQ_API_KEY`: Server-side API keys for the Geoapify / LocationIQ autocomplete providers (required when those providers are selected).
 * `GOOGLE_PLACES_API_KEY`: Server-side API key for Google Places (New).
 * `ELEVATION_PROVIDER`: `none` (default, elevation unavailable) or `open_meteo` (Open-Meteo Elevation API).
 * `ELEVATION_BASE_URL`: Base elevation URL (default `https://api.open-meteo.com/v1/elevation`).
@@ -134,6 +137,20 @@ The platform enforces a deterministic configuration precedence hierarchy across 
 * `LOCATE_GEOIP_DB_PATH`: GeoLite2-City database path inside the container (default `/data/geoip/GeoLite2-City.mmdb`).
 * `LOCATE_PROXY_MODE`: `auto` (default: trust the gateway's `X-Real-IP` only when the socket peer is not routable), `always`, or `never`.
 * `GEOIP_DATA_DIR`: Host directory bind-mounted read-only at `/data/geoip` (default `./data/geoip`).
+* `API_TILE_PREWARM_ENABLED`: Background low-zoom map tile cache prewarm (default `true`) — a lifespan-owned task pre-renders low-zoom tiles of the newest cycle so first page loads never hit cold compute latency; multi-worker execution is deduplicated via an atomic Redis claim.
+* `API_TILE_PREWARM_INTERVAL_SECONDS`: Tile-prewarm pass cadence (default `60.0` seconds).
+* `API_TILE_PREWARM_THROTTLE_SECONDS`: Sleep between tile renders within a pass (default `0.02` seconds).
+* `API_TILE_PREWARM_MODELS`: Models to prewarm (default `gfs`).
+* `API_TILE_PREWARM_VARIABLES`: Variables to prewarm (default `temperature_2m`).
+* `API_TILE_PREWARM_MAX_ZOOM`: Highest zoom level prewarmed (default `2`; zooms 0–2 cover 21 tiles).
+* `API_TILE_PREWARM_GATEWAY_URL`: Optional gateway base URL; when set, the prewarm pass fetches tiles through the edge gateway (warming its cache) instead of rendering in-process.
+* `API_VECTOR_PREWARM_ENABLED`: Background wind vector-field cache prewarm (default `true`) — a lifespan-owned task periodically computes cache-missing vector fields for the serving window so real users never hit the expensive cold path after a new cycle publishes.
+* `API_VECTOR_PREWARM_INTERVAL_SECONDS`: Vector-prewarm pass cadence (default `300.0` seconds).
+* `API_VECTOR_PREWARM_HORIZON_HOURS`: Serving-window horizon resolved per pass (default `48` hours).
+* `API_VECTOR_PREWARM_MODELS`: Models to prewarm (default `gfs`, `gefs`).
+* `API_VECTOR_PREWARM_MAX_COMPUTES_PER_PASS`: Bound on vector-field computes per pass (default `6`).
+* `API_VECTOR_PREWARM_COMPUTE_THROTTLE_SECONDS`: Sleep between computes within a pass (default `2.0` seconds).
+* `API_VECTOR_CACHE_REDIS_ENABLED`: Shared Redis L2 for the wind vector-field cache (default `true`) — lets every worker and the prewarm loop see one another's computed payloads so each valid time is computed once fleet-wide; the small per-process L1 keeps serving fast when Redis is unavailable.
 
 ---
 
@@ -256,7 +273,7 @@ Production deployments must NOT specify `platform: linux/amd64` in runtime Compo
   * Persistence layout: Image volume root mounted at `/var/lib/postgresql`, effective `PGDATA` versioned under `/var/lib/postgresql/18/docker`.
   * Volume isolation: Uses the isolated `postgres18_data` named volume. Legacy PostgreSQL 16 volumes (`postgres_data`) must never be attached directly to PostgreSQL 18.
 * **Redis 7 (`redis:7-alpine`):** Native multi-arch support (`linux/amd64` + `linux/arm64`).
-* **MinIO (`minio/minio:RELEASE.2025-09-07T16-13-09Z`):** Native multi-arch support (`linux/amd64` + `linux/arm64`).
+* **MinIO (`alpine/minio:RELEASE.2025-10-15T17-29-55Z`):** Native multi-arch support (`linux/amd64` + `linux/arm64`). `alpine/minio` is the MinIO community rebuild, used because `quay.io/minio` requires authentication and the Docker Hub `minio/minio` repositories were removed.
 
 ### 6.3 Application Container Multi-Arch Support
 * **API Image (`docker/Dockerfile.api`):**

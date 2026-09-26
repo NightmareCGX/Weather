@@ -38,7 +38,10 @@ export function Legend({ layer, variableName, variableCode }: LegendProps) {
 
   return (
     <div className="pointer-events-none absolute bottom-4 left-4 z-10 rounded-lg border border-slate-800 bg-slate-900/90 px-3.5 py-2.5 shadow-2xl backdrop-blur-md">
-      <div className="mb-1.5 text-xs font-bold uppercase tracking-wider text-slate-300">
+      <div
+        className="mb-1.5 text-xs font-bold uppercase tracking-wider text-slate-300"
+        data-testid="legend-title"
+      >
         {label}
       </div>
       <div

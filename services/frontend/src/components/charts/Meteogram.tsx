@@ -257,14 +257,17 @@ export function Meteogram({ forecasts, variableCode, meta, timezone }: Meteogram
   }
 
   return (
-    <div className="mb-4">
+    <div className="mb-4" data-testid="meteogram-chart">
       <div className="mb-1 flex items-baseline justify-between">
         <h4 className="text-sm font-semibold text-slate-200">{meta.name}</h4>
         <span className="text-xs font-mono text-cyan-400">{meta.unit}</span>
       </div>
 
       {isPrecipAmount3h && (
-        <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600">
+        <div
+          className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600"
+          data-testid="phase-legend"
+        >
           <span className="font-medium text-slate-500">Phases:</span>
           <span className="inline-flex items-center gap-1">
             <span

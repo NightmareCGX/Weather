@@ -160,6 +160,7 @@ export function LocationSearch({
         aria-autocomplete="list"
         aria-activedescendant={highlighted >= 0 ? optionId(highlighted) : undefined}
         aria-label="Search for a city, ski resort, or station"
+        data-testid="search-input"
         placeholder={placeholder ?? "Search cities, ski resorts, stations…"}
         className="w-full rounded-lg border border-slate-700/80 bg-slate-900/90 px-3 py-2 text-sm text-slate-100 placeholder-slate-500 shadow-xl backdrop-blur-md outline-none transition focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 disabled:opacity-60"
         onChange={(event) => {
@@ -176,6 +177,7 @@ export function LocationSearch({
           id={listboxId}
           role="listbox"
           aria-label="Search results"
+          data-testid="search-results"
           className="absolute z-30 mt-1.5 max-h-72 w-full overflow-auto rounded-lg border border-slate-800 bg-slate-900/95 shadow-2xl backdrop-blur-md"
         >
           {status === "loading" && (
@@ -184,17 +186,20 @@ export function LocationSearch({
               aria-disabled
               aria-selected="false"
               className="px-3 py-2 text-sm text-slate-400"
+              data-testid="search-loading"
             >
               Searching…
             </li>
           )}
           {error !== null && (
-            <li role="alert" className="px-3 py-2 text-sm text-red-400">
+            <li role="alert" className="px-3 py-2 text-sm text-red-400" data-testid="search-error">
               {error}
             </li>
           )}
           {status === "success" && results.length === 0 && (
-            <li className="px-3 py-2 text-sm text-slate-400">No matching locations.</li>
+            <li className="px-3 py-2 text-sm text-slate-400" data-testid="search-empty">
+              No matching locations.
+            </li>
           )}
           {results.map((result, index) => (
             <li
