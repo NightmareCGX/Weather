@@ -16,7 +16,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
+from ingestion.monitoring.metrics import REGISTRY
+
 logger = logging.getLogger(__name__)
+
+#: Cumulative count of webhook deliveries that failed after all retries.
+#: Process-local (like every registry metric): exposed on the exporter and
+#: daemon metrics surfaces (MONITORING.md section 2.9) so "alerts are being
+#: lost" is itself observable, and surfaced as the ``alert_delivery_failed``
+#: self-alert through the surviving sinks.
+ALERT_DELIVERY_FAILURES_TOTAL = REGISTRY.counter(
+    "weather_alert_delivery_failures_total",
+    "Alert webhook deliveries that failed after all retries (fail-open)",
+)
 
 
 class AlertSeverity(str, Enum):
@@ -121,36 +133,80 @@ class MemoryAlertSink:
 
 
 class WebhookAlertSink:
-    """Optional HTTP webhook alert delivery (e.g. Slack, Discord, Alertmanager). Fail-open."""
+    """Optional HTTP webhook alert delivery (e.g. Slack, Discord, Alertmanager).
 
-    def __init__(self, webhook_url: str, timeout_seconds: float = 2.0) -> None:
+    Delivery is retried with exponential backoff (``retry_attempts`` total
+    attempts, ``retry_backoff_seconds`` base delay, per-attempt
+    ``timeout_seconds``). The sink still fails open: after the final failed
+    attempt it records the failure on ``last_delivery_ok``, increments
+    ``weather_alert_delivery_failures_total``, and returns without raising.
+    The owning engine turns the failure into the ``alert_delivery_failed``
+    self-alert through the surviving sinks (MONITORING.md section 5.2).
+    """
+
+    def __init__(
+        self,
+        webhook_url: str,
+        timeout_seconds: float = 2.0,
+        retry_attempts: int = 3,
+        retry_backoff_seconds: float = 0.5,
+    ) -> None:
+        if retry_attempts < 1:
+            raise ValueError("retry_attempts must be >= 1")
         self.webhook_url = webhook_url
         self.timeout_seconds = timeout_seconds
+        self.retry_attempts = retry_attempts
+        self.retry_backoff_seconds = retry_backoff_seconds
+        #: Result of the most recent delivery: True = delivered (2xx),
+        #: False = failed after all retries, None = never attempted.
+        self.last_delivery_ok: bool | None = None
+        self.last_delivery_error: str = ""
 
     def emit(self, event: AlertEvent) -> None:
         if not self.webhook_url:
             return
-        try:
-            import httpx
+        payload = {
+            "event_type": event.event_type,
+            "name": event.alert.name,
+            "severity": event.alert.severity.value,
+            "summary": event.alert.summary,
+            "description": event.alert.description,
+            "scope": event.alert.scope,
+            "value": event.alert.value,
+            "threshold": event.alert.threshold,
+            "timestamp": event.timestamp,
+            "runbook": event.alert.runbook_anchor,
+        }
+        last_error: Exception | None = None
+        for attempt in range(self.retry_attempts):
+            try:
+                import httpx
 
-            payload = {
-                "event_type": event.event_type,
-                "name": event.alert.name,
-                "severity": event.alert.severity.value,
-                "summary": event.alert.summary,
-                "description": event.alert.description,
-                "scope": event.alert.scope,
-                "value": event.alert.value,
-                "threshold": event.alert.threshold,
-                "timestamp": event.timestamp,
-                "runbook": event.alert.runbook_anchor,
-            }
-            # Asynchronous or short-timeout post
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                client.post(self.webhook_url, json=payload)
-        except Exception as exc:  # noqa: BLE001
-            # Never raise or break production execution
-            logger.debug("Failed to dispatch alert webhook to %s: %s", self.webhook_url, exc)
+                with httpx.Client(timeout=self.timeout_seconds) as client:
+                    response = client.post(self.webhook_url, json=payload)
+                if response.is_success:
+                    self.last_delivery_ok = True
+                    self.last_delivery_error = ""
+                    return
+                # Non-2xx is a failed delivery (rate limits, gateway 5xx) and
+                # is retried like a transport error.
+                last_error = RuntimeError(f"webhook responded HTTP {response.status_code}")
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+            if attempt < self.retry_attempts - 1:
+                time.sleep(self.retry_backoff_seconds * (2**attempt))
+        self.last_delivery_ok = False
+        self.last_delivery_error = str(last_error) if last_error else "unknown error"
+        try:
+            ALERT_DELIVERY_FAILURES_TOTAL.inc()
+        except Exception:  # noqa: BLE001 - metrics must never break alerting
+            pass
+        logger.warning(
+            "Failed to dispatch alert webhook to %s after %d attempt(s): %s",
+            self.webhook_url,
+            self.retry_attempts,
+            self.last_delivery_error,
+        )
 
 
 class AlertDeduplicator:
@@ -249,19 +305,57 @@ class AlertDeduplicator:
             return list(self._active_alerts.values())
 
 
+def _resolve_default_delivery_settings() -> tuple[str, float, int]:
+    """Resolve the alert delivery defaults from the ingestion settings.
+
+    Returns ``(webhook_url, timeout_seconds, retry_attempts)``. Deliberately
+    fail-open: an unavailable settings module degrades to the hardcoded
+    defaults (empty webhook URL = delivery disabled).
+    """
+    try:
+        from ingestion.core.config import settings
+
+        return (
+            str(getattr(settings, "ALERT_WEBHOOK_URL", "") or ""),
+            float(getattr(settings, "ALERT_WEBHOOK_TIMEOUT_SECONDS", 2.0)),
+            int(getattr(settings, "ALERT_WEBHOOK_RETRY_ATTEMPTS", 3)),
+        )
+    except Exception:  # noqa: BLE001 - defaults must never break construction
+        return ("", 2.0, 3)
+
+
 class AlertEngine:
     """Coordinates rules evaluation, deduplication, and multi-sink dispatching."""
 
     def __init__(
         self,
         cooldown_seconds: float = 3600.0,
-        webhook_url: str = "",
+        webhook_url: str | None = None,
+        webhook_timeout_seconds: float | None = None,
+        webhook_retry_attempts: int | None = None,
     ) -> None:
+        default_url, default_timeout, default_retries = _resolve_default_delivery_settings()
         self.deduplicator = AlertDeduplicator(default_cooldown_seconds=cooldown_seconds)
         self.log_sink = LogAlertSink()
         self.memory_sink = MemoryAlertSink()
-        self.webhook_sink = WebhookAlertSink(webhook_url=webhook_url)
+        self.webhook_sink = WebhookAlertSink(
+            # An explicitly passed empty URL disables delivery; None defers to
+            # the ALERT_WEBHOOK_URL setting.
+            webhook_url=webhook_url if webhook_url is not None else default_url,
+            timeout_seconds=(
+                webhook_timeout_seconds
+                if webhook_timeout_seconds is not None
+                else default_timeout
+            ),
+            retry_attempts=(
+                webhook_retry_attempts
+                if webhook_retry_attempts is not None
+                else default_retries
+            ),
+        )
         self._sinks: list[AlertSink] = [self.log_sink, self.memory_sink, self.webhook_sink]
+        self._delivery_failure_lock = threading.Lock()
+        self._last_delivery_failure_ts = 0.0
 
     def add_sink(self, sink: AlertSink) -> None:
         self._sinks.append(sink)
@@ -684,6 +778,74 @@ class AlertEngine:
 
         return alerts
 
+    def _dispatch_events(self, events: list[AlertEvent]) -> None:
+        """Dispatch events to every sink and watch for webhook delivery loss."""
+        for event in events:
+            for sink in self._sinks:
+                try:
+                    sink.emit(event)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Alert sink %s failed: %s", sink, exc)
+            if (
+                self.webhook_sink.webhook_url
+                and self.webhook_sink.last_delivery_ok is False
+            ):
+                self._notify_delivery_failure()
+
+    def _notify_delivery_failure(self) -> None:
+        """Raise the ``alert_delivery_failed`` self-alert (alert-on-alert).
+
+        Dispatched through the surviving sinks only (structured log + memory
+        ledger) — re-posting to a failing webhook would be pointless
+        recursion. Cooldown-tracked so a dead webhook produces one warning
+        per cooldown window instead of one per alert event.
+        """
+        now = time.time()
+        with self._delivery_failure_lock:
+            if (
+                now - self._last_delivery_failure_ts
+                < self.deduplicator.default_cooldown_seconds
+            ):
+                return
+            self._last_delivery_failure_ts = now
+        alert = Alert(
+            name="alert_delivery_failed",
+            severity=AlertSeverity.WARNING,
+            summary="Alert webhook delivery is failing",
+            description=(
+                f"Webhook delivery to {self.webhook_sink.webhook_url} failed after "
+                f"{self.webhook_sink.retry_attempts} attempt(s): "
+                f"{self.webhook_sink.last_delivery_error}. Alerts are still recorded "
+                "in structured logs and the diagnostics ledger."
+            ),
+            scope="alerting",
+            value=self.webhook_sink.last_delivery_error,
+            threshold=0,
+            runbook_anchor="#alert-delivery-failure",
+        )
+        event = AlertEvent(event_type="triggered", alert=alert)
+        for sink in (self.log_sink, self.memory_sink):
+            try:
+                sink.emit(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Alert sink %s failed: %s", sink, exc)
+
+    def dispatch_alerts(self, current_alerts: list[Alert]) -> list[AlertEvent]:
+        """Deduplicate and dispatch an externally built alert list.
+
+        Used by callers that derive alerts outside :meth:`evaluate_rules`
+        (e.g. the scrape-time exporter's sustained collector-failure monitor).
+        Dedup, cooldown, escalation, and recovery semantics are identical to
+        the regular evaluation path.
+
+        Returns:
+            The alert events dispatched during this call (may be empty when
+            everything is suppressed by cooldown).
+        """
+        events = self.deduplicator.process_alerts(current_alerts)
+        self._dispatch_events(events)
+        return events
+
     def evaluate_and_dispatch(
         self,
         resource_data: dict[str, Any] | None = None,
@@ -705,12 +867,7 @@ class AlertEngine:
             gc_data=gc_data,
         )
         events = self.deduplicator.process_alerts(current_alerts)
-        for event in events:
-            for sink in self._sinks:
-                try:
-                    sink.emit(event)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Alert sink %s failed: %s", sink, exc)
+        self._dispatch_events(events)
         return events
 
 

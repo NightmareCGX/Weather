@@ -14,13 +14,14 @@ The monitoring system provides continuous, non-intrusive observability across th
 ├──────────────────────────────┬──────────────────────────────────────────────┤
 │      services/ingestion      │                 services/api                 │
 │  • SystemResourceCollector   │  • Process Memory & CPU Probes               │
-│  • CycleResourceLeakDetector │  • ReaderLockPool Metrics                    │
-│  • PostgresHealthCollector   │  • Database / Redis / S3 Connectivity        │
-│  • StorageHealthCollector    │  • /v1/metrics (Prometheus Format)           │
-│  • LifecycleHealthCollector  │  • /v1/health & /v1/health/detailed          │
-│  • IngestionHealthCollector  │                                              │
-│  • AlertEngine & Deduplicator│                                              │
-└──────────────┬───────────────┴──────────────────────┬───────────────────────┘
+│  • CycleResourceLeakDetector │  • HTTP Request Metrics (RED, §2.7)          │
+│  • PostgresHealthCollector   │  • Client Telemetry Counter (§2.8)           │
+│  • StorageHealthCollector    │  • ReaderLockPool Metrics                    │
+│  • LifecycleHealthCollector  │  • Database / Redis / S3 Connectivity        │
+│  • IngestionHealthCollector  │  • /v1/metrics (Prometheus Format)           │
+│  • CollectorAlertMonitor     │  • /v1/health & /v1/health/detailed          │
+│  • AlertEngine & Deduplicator│  • /v1/telemetry/client (Beacon Sink, §8.2)  │
+└──────────────┬───────────────┴──────────────────────────────────────────────┘
                │                                      │
                ▼                                      ▼
 ┌──────────────────────────────┐       ┌──────────────────────────────────────┐
@@ -33,9 +34,10 @@ The monitoring system provides continuous, non-intrusive observability across th
                │                       ┌──────────────────────────────────────┐
                ▼                       │          GRAFANA DASHBOARD           │
 ┌──────────────────────────────┐       │  (Platform Overview, Resources,      │
-│   ALERT DISPATCH SINKS       │       │   Ingestion, Postgres, MinIO,        │
-│  • Structured Python Logging │       │   Lifecycle, Sweeper, Reclamation)   │
-│  • Webhook (Slack / Discord) │       └──────────────────────────────────────┘
+│   ALERT DISPATCH SINKS       │       │   Serving/HTTP, Ingestion, Postgres, │
+│  • Structured JSON Logging   │       │   MinIO, Lifecycle, Sweeper,         │
+│  • Webhook (Slack / Discord, │       │   Reclamation, Gateway, Client)      │
+│    retried + self-alerting)  │       └──────────────────────────────────────┘
 │  • In-Memory Event Ledger    │
 └──────────────────────────────┘
 ```
@@ -177,7 +179,7 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
 
 ### 2.6 Exporter Self-Observability Metrics (Ingestion Exporter)
 
-Because the ingestion exporter collects at scrape time, its own health must be distinguishable from the platform values it reports. `metric = 0` means "the exporter answered and the system is at 0"; `weather_exporter_collector_success = 0` means "the exporter never managed to observe the system at all." These two states must never be conflated in dashboards.
+Because the ingestion exporter collects at scrape time, its own health must be distinguishable from the platform values it reports. `metric = 0` means "the exporter answered and the system is at 0"; `weather_exporter_collector_success = 0` means "the exporter never managed to observe the system at all". These two states must never be conflated in dashboards.
 
 | Metric Name | Type | Description | Labels | Cost Class |
 | :--- | :--- | :--- | :--- | :--- |
@@ -188,6 +190,33 @@ Guarantees per scrape:
 * Each collector runs independently — one failing collector never blocks its siblings.
 * A failing collector never terminates the exporter process nor turns `/metrics` into an HTTP 5xx response.
 * Collector failures are logged (warning level, with traceback) and surfaced via the two metrics above.
+* **Sustained failures alert (§7.4):** when one collector fails `EXPORTER_COLLECTOR_ALERT_THRESHOLD` (default 3) consecutive scrapes — 45s at the default 15s interval — the `exporter_collector_failed` WARNING fires through the platform alert sinks with automatic recovery. The Prometheus rule on the same gauge (§7.4) remains the belt-and-braces backstop for deployments that run Alertmanager.
+
+### 2.7 API Serving HTTP Request Metrics (RED)
+
+Every served request is measured by the outermost ASGI middleware with strictly bounded label cardinality: `route` is the FastAPI route template (never the raw path; unmatched requests collapse to `unmatched`), `method` collapses to the common verb set (`OTHER` otherwise), and `status_class` is the response class. `/v1/metrics` itself is excluded from collection so scrapes generate no self-referential datapoints. Values are process-local per Uvicorn worker (aggregated by Prometheus via the `instance` label).
+
+| Metric Name | Type | Description | Labels | Cost Class |
+| :--- | :--- | :--- | :--- | :--- |
+| `weather_api_http_requests_total` | Counter | HTTP requests processed by the API serving layer | `route`, `method`, `status_class` (`2xx`–`5xx`) | Fast |
+| `weather_api_http_request_duration_seconds` | Histogram | Request latency; buckets 0.005 → 30s + `+Inf` | `route`, `method` | Fast |
+| `weather_api_http_requests_in_flight` | Gauge | Requests currently being served by this process | - | Fast |
+
+### 2.8 Client Telemetry Metrics
+
+| Metric Name | Type | Description | Labels | Cost Class |
+| :--- | :--- | :--- | :--- | :--- |
+| `weather_client_telemetry_events_total` | Counter | Client telemetry events accepted by `POST /v1/telemetry/client` (§8.2): JavaScript errors, unhandled rejections, and Web Vitals | `event_type` (`error`, `web_vital`) | Fast |
+
+Free-form event details (name, message, stack, page URL, session ID) are routed exclusively to structured JSON logs (§8.1) — never to metric labels — so hostile payloads cannot grow the exposition cardinality.
+
+### 2.9 Alert Delivery Metrics
+
+| Metric Name | Type | Description | Labels | Cost Class |
+| :--- | :--- | :--- | :--- | :--- |
+| `weather_alert_delivery_failures_total` | Gauge/Counter | Webhook deliveries that failed after all retries (fail-open; process-local to the alerting process) | - | Fast |
+
+"Alerts are being lost" is itself observable: every failed delivery increments this counter and raises the `alert_delivery_failed` self-alert (§5.2) through the surviving sinks.
 
 ---
 
@@ -333,6 +362,8 @@ Alerts are classified as `INFO`, `WARNING`, or `CRITICAL`. Every alert links dir
 | `gc_worker_failed_shards` | WARNING | GC reclamation worker moved $\ge 1$ shard targets into failed quarantine during its latest pass | `#gc-worker-failures` |
 | `gc_sweeper_failed_cycles` | WARNING | Metadata retention sweeper failed $\ge 1$ cycles during its latest pass (cycles stay tombstoned with detailed metadata retained; next pass retries) | `#gc-sweeper-failures` |
 | `gc_orphan_stores_detected` | WARNING | Store↔catalog reconciliation found $\ge 1$ orphan physical cycle store (no catalog identity) whose serving horizon has not expired (recoverability frontier) | `#orphan-inventory` |
+| `exporter_collector_failed` | WARNING | One exporter collector failed $\ge$ `EXPORTER_COLLECTOR_ALERT_THRESHOLD` (default 3) consecutive scrapes | `#exporter-collector-failure` |
+| `alert_delivery_failed` | WARNING | Webhook delivery failed after all retries (self-alert raised through the surviving sinks; cooldown-suppressed) | `#alert-delivery-failure` |
 | `invariant_invalid_lifecycle_transition` | CRITICAL | Cycle has `deleted_at` set without prior `deletion_started_at` | `#anti-resurrection-violation` |
 | `invariant_anti_resurrection_violation` | CRITICAL | Run recreated or active under permanent `deleted_at` tombstone | `#anti-resurrection-violation` |
 
@@ -363,6 +394,15 @@ Monitoring state is deliberately designed with clean, process-local restart sema
    - Process memory (RSS/VMS) is strictly local to an individual operating system process lifetime.
    - On worker restart, PID and address space reset; the leak detector reinitializes and requires 5 newly completed cycles in the new process before evaluating sustained leak trends. This prevents false positive leak alarms caused by comparing memory across distinct OS processes.
 
+### 5.2 Alert-on-Alert: Delivery Reliability
+
+A monitoring system that can silently lose its own notifications is not trustworthy, so delivery loss is itself an alertable condition:
+
+1. **Retry with backoff:** each webhook delivery makes up to `ALERT_WEBHOOK_RETRY_ATTEMPTS` attempts (default 3) with exponential backoff (0.5s base: 0.5s → 1s → 2s) and a per-attempt timeout of `ALERT_WEBHOOK_TIMEOUT_SECONDS` (default 2s). A non-2xx response counts as a failed attempt.
+2. **Failure accounting:** after the final failed attempt, the sink increments `weather_alert_delivery_failures_total` (§2.9) and logs a warning — the dispatch still never raises into production execution (fail-open guarantee preserved).
+3. **Self-alert:** the engine raises `alert_delivery_failed` (WARNING) through the *surviving* sinks only (structured log + in-memory ledger). Re-posting to a dead webhook would be pointless recursion.
+4. **Cooldown:** the self-alert is cooldown-suppressed like every other rule, so a dead webhook produces one warning per cooldown window instead of one per alert event.
+
 ---
 
 ## 6. Alert Delivery Channels
@@ -377,7 +417,7 @@ Monitoring state is deliberately designed with clean, process-local restart sema
    ```bash
    ALERT_WEBHOOK_URL="https://alerts.example.com/webhook"
    ```
-   Dispatches JSON payloads containing event type, severity, summary, value, threshold, and runbook URL. The webhook sink executes with a 2-second timeout and fails open on any connection or transport error.
+   Dispatches JSON payloads containing event type, severity, summary, value, threshold, and runbook URL. Each delivery is retried with exponential backoff (`ALERT_WEBHOOK_RETRY_ATTEMPTS`, default 3 attempts; `ALERT_WEBHOOK_TIMEOUT_SECONDS` per attempt, default 2s; non-2xx counts as a failure). After the final failure the dispatch fails open: the loss is counted on `weather_alert_delivery_failures_total` and raised as the `alert_delivery_failed` self-alert (§5.2).
 3. **In-Memory Event Ledger:**
    Stores the last 100 alert events for immediate inspection via `weather-ingest diagnostics`.
 
@@ -401,6 +441,7 @@ Grafana never talks to the Weather Platform directly, and never reaches a remote
 | Ingestion metrics exporter | `9112` | Actual ingestion exporter (serves `GET /metrics`) |
 | Realtime daemon pipeline metrics | `9113` | Optional in-process metrics of `weather-ingest realtime --metrics-port 9113` (live stage latencies, throughput, storage operations) |
 | GC daemon pipeline metrics | `9114` | Optional in-process metrics of `weather-ingest gc --metrics-port 9114` (GC stage durations, pass success, planner/worker/sweeper/inventory counters) |
+| Nginx gateway exporter | `9115` | `weather_nginx_exporter` (compose `monitoring`/`full` profile) exposing gateway stub_status metrics scraped from the gateway's `/nginx_status` |
 | SSH forwarded remote API | `18000` | Local listener tunneling to remote `127.0.0.1:8000` |
 | SSH forwarded remote ingestion | `18112` | Local listener tunneling to remote `127.0.0.1:9112` |
 | Prometheus | `9090` | Local Prometheus UI/API |
@@ -460,9 +501,139 @@ The platform integrates `google/cadvisor` via the `weather_cadvisor` service in 
 - **Working Set & OOM Prevention:** Exposes `container_memory_working_set_bytes` reflecting Linux kernel OOM-killer criteria.
 - **tmpfs Filesystem Usage:** Exposes `container_fs_usage_bytes{name="weather_gateway", device=~".*tmpfs.*"}` tracking the Nginx tile cache memory footprint (`/var/cache/nginx/tiles`).
 
+#### Gateway Telemetry (nginx stub_status + Exporter)
+The edge gateway exposes Prometheus `stub_status` on the plain-HTTP server at `/nginx_status` (rendered into `docker/nginx/gateway.conf.template`), restricted to loopback and private networks (`allow 127.0.0.1` / RFC1918 ranges, `deny all`) so public visitors receive 403. The `weather_nginx_exporter` service (`nginx/nginx-prometheus-exporter`, profiles `monitoring`/`full`, host port 9115) scrapes it inside the compose network and exposes:
+- `nginx_connections_active` / `nginx_connections_reading` / `nginx_connections_waiting` — live connection pressure;
+- `nginx_http_requests_total` — gateway request rate (the tile path included);
+- `nginx_connections_accepted` / `nginx_connections_handled` — accept-rate and throttling deltas.
+
+Tile **cache hit ratio** is not part of `stub_status`; the gateway adds `X-Cache-Status` response headers, and the cache footprint is tracked through cAdvisor tmpfs metrics. Log-based hit-ratio analytics (JSON access logs + Loki) are the documented follow-up if hit-ratio alerting becomes necessary.
+
 #### Authoritative Dashboard Conventions (`weather_platform_dashboard.json`)
 - **Panel 9 (Platform & Container Memory Breakdown):** Stacks all container physical RSS usages along with the Gateway tile cache tmpfs. Falls back to in-process `weather_component_memory_rss_bytes` when running outside Docker.
 - **Panel 11 (Platform Storage Breakdown):** Enforces `min: 0` on the Y-axis to provide a true baseline scale and avoid visual exaggeration of normal storage variations.
 - **Panel 29 (Reclamation Queue Depth by State):** Focuses strictly on active queue backlog (`queued`, `deleting`, `failed`), omitting historical monotonically increasing `deleted` counts. Deletion throughput is monitored as a rate in the GC progress panel.
 - **Current & Peak Visibility:** All numeric timeseries panels configure legend tables displaying both **Current (`lastNotNull`)** and **Peak (`max`)** metrics simultaneously.
 
+
+### 7.4 External Prometheus / Alertmanager Alert Rules (Belt-and-Braces)
+
+The platform's in-process AlertEngine covers ingestion-side conditions; the following conditions are only visible to the collection layer and therefore belong in the external Prometheus/Alertmanager stack (production infrastructure, or the `monitoring-local/` stack). These expressions are the authoritative contract for that stack:
+
+```yaml
+# Target down: Prometheus cannot scrape the endpoint at all. This is the ONLY
+# signal for a dead exporter process — never mask it with `or vector(0)`
+# fallbacks in dashboards (§7.2 hygiene rule).
+- alert: WeatherScrapeTargetDown
+  expr: up{job=~"weather-.*"} == 0
+  for: 5m
+  labels: {severity: critical}
+  annotations:
+    runbook: https://<docs-host>/RUNBOOKS.md#scrape-target-down
+
+# Exporter collector failing (backstop for the in-process
+# exporter_collector_failed self-alert, §2.6):
+- alert: WeatherExporterCollectorFailing
+  expr: weather_exporter_collector_success == 0
+  for: 15m
+  labels: {severity: warning}
+  annotations:
+    runbook: https://<docs-host>/RUNBOOKS.md#exporter-collector-failure
+
+# API serving error rate (RED error dimension, §2.7):
+- alert: WeatherApiErrorRateHigh
+  expr: |
+    sum(rate(weather_api_http_requests_total{status_class="5xx"}[5m]))
+      / sum(rate(weather_api_http_requests_total[5m])) > 0.02
+  for: 10m
+  labels: {severity: critical}
+  annotations:
+    runbook: https://<docs-host>/RUNBOOKS.md#api-error-rate
+
+# API serving latency (RED duration dimension, §2.7):
+- alert: WeatherApiLatencyHigh
+  expr: |
+    histogram_quantile(0.95,
+      sum by (le) (rate(weather_api_http_request_duration_seconds_bucket[5m]))) > 2
+  for: 15m
+  labels: {severity: warning}
+  annotations:
+    runbook: https://<docs-host>/RUNBOOKS.md#api-latency
+
+# Client-error spike (§2.8): a sudden rise in reported browser errors that no
+# server-side signal explains is a frontend regression.
+- alert: WeatherClientErrorSpike
+  expr: sum(rate(weather_client_telemetry_events_total{event_type="error"}[15m])) > 1
+  for: 15m
+  labels: {severity: warning}
+  annotations:
+    runbook: https://<docs-host>/RUNBOOKS.md#client-error-spike
+```
+
+---
+
+## 8. Structured Logging & Client Telemetry
+
+### 8.1 API JSON Logging Contract
+
+The API serving tier emits one JSON object per log line (no regex parsing required for shippers). Contract fields:
+
+| Field | Content |
+| :--- | :--- |
+| `timestamp` | ISO 8601 UTC with milliseconds and `Z` suffix |
+| `level` | Standard Python level name (`INFO`, `WARNING`, ...) |
+| `logger` | Logger name |
+| `message` | Rendered log message |
+| `request_id` | Present for any log emitted while a request is being served; matches the `X-Request-Id` response header (API.md §2.7) and the `request_id` of RFC 7807 error bodies |
+| `exc_info` | Rendered traceback string when the record carries an exception |
+
+Additional namespaced fields are whitelisted (e.g. `telemetry_*` from the client telemetry sink, §8.2) so `logger.info(..., extra={...})` cannot inject arbitrary keys. The format applies to the root logger and the three Uvicorn loggers (`uvicorn`, `uvicorn.error`, `uvicorn.access`), so access logs carry the same `request_id` correlation.
+
+- Configuration: `API_LOG_FORMAT=json` (default) or `API_LOG_FORMAT=text` (plain console output for local debugging).
+- The request ID is bound to a context variable at middleware entry and deliberately never reset: Uvicorn runs each HTTP request cycle in its own asyncio task with a fresh context copy, so the value cannot leak into a later request.
+
+### 8.2 Client Telemetry Beacon (`POST /v1/telemetry/client`)
+
+The frontend beacon (`services/frontend/src/lib/telemetry/telemetry.ts`) batches JavaScript errors, unhandled rejections, and Web Vitals (`web-vitals` package: LCP, INP, CLS, FCP, TTFB) and POSTs them to the same-origin endpoint defined in API.md §8.2. Behavioral contract:
+
+- **Fail-open end to end:** a failing backend, a rejected send, or `navigator.sendBeacon` unavailability never surfaces an error to the application; the batch is dropped.
+- **Batching:** events are flushed at 20 events (the server-side cap) or every 5 seconds; page-exit flushes use `navigator.sendBeacon` with a fetch-keepalive fallback.
+- **Bounded payloads:** at most 20 events per batch; field lengths capped (`name` 64, `message` 512, `stack` 2048, `page_url` 512, `session_id` 64) by the API schema.
+- **Cardinality safety:** only the bounded `event_type` label reaches the metric (§2.8); free-form details go to structured JSON logs (§8.1).
+- **Privacy:** the beacon sends error metadata (message/stack), page URL, a random per-tab session id, and the User-Agent header. No cookies, no form inputs, no geolocation beyond what the page URL already reveals.
+- **Server response:** `202` with the documented receipt envelope; invalid payloads are rejected as RFC 7807 `422` (API.md §2.4). The endpoint is open — layer rate limiting at the edge gateway in production.
+
+### 8.3 Disabling Client Telemetry
+
+Set `NEXT_PUBLIC_CLIENT_TELEMETRY_ENABLED=0` at build time (the variable is inlined into the client bundle) to disable the beacon entirely: no listeners are registered, no Web Vitals are observed, and no requests are sent.
+
+---
+
+## 9. Synthetic Probing (`scripts/synthetic_probe.py`)
+
+Internal metrics can be green while the product is broken (bad gateway routing, expired certificates, miswired upstreams). The synthetic probe drives real HTTP requests against the deployed serving surface from the outside and closes that gap. It is deliberately stdlib-only with no dependency on the platform packages, so it can run from any host (cron, systemd timer, or `--interval` loop mode).
+
+```bash
+# Single pass (cron mode) against local services; exit 0/1/2:
+uv run --no-sync python scripts/synthetic_probe.py \
+    --url http://127.0.0.1:8000/v1/health \
+    --url http://127.0.0.1:8000/v1/forecast/availability --expect-json
+
+# TLS gateway with self-signed certs, webhook alerting, 60s loop:
+uv run --no-sync python scripts/synthetic_probe.py \
+    --url https://weather.example.com/v1/health --insecure \
+    --interval 60 --webhook https://alerts.example.com/webhook
+```
+
+Per target the probe classifies:
+
+| Outcome | Severity | Condition |
+| :--- | :--- | :--- |
+| Reachable within budget | ok | 2xx/3xx and latency ≤ `--max-latency-seconds` |
+| Degraded | WARNING | 4xx, latency over budget, JSON body invalid (`--expect-json`), certificate expiring within `--tls-expiry-warn-days` (default 14) |
+| Failed | CRITICAL | 5xx, network failure, or an already-expired TLS certificate |
+
+- **Output:** one JSON result line per target on stdout (machine-indexable), matching the platform's structured-logging direction.
+- **Exit codes** mirror `weather-ingest alert-check`: `0` all ok, `1` warnings present, `2` any critical.
+- **Webhook alerts** reuse the platform alert payload shape (§6) with runbook anchor `#synthetic-probe-failure`, so operators see one uniform alert stream.
+- TLS expiry inspection uses the standard `ssl` stack only (peer certificate fetch + `notAfter` decode) — no extra dependencies.

@@ -294,6 +294,11 @@ class Settings(BaseSettings):
     # fast and unaffected when Redis is unavailable.
     API_VECTOR_CACHE_REDIS_ENABLED: bool = True
 
+    # Structured logging format for API and Uvicorn log records (MONITORING.md
+    # section 8). "json" (default) emits one JSON object per line with
+    # request-ID correlation; "text" restores plain console formatting.
+    API_LOG_FORMAT: str = "json"
+
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
         env_file_encoding="utf-8",

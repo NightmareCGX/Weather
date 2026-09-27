@@ -23,6 +23,8 @@ from fastapi import APIRouter, Response
 from sqlalchemy import create_engine, text
 
 from api.core.config import settings
+from api.monitoring.client_telemetry_metrics import CLIENT_TELEMETRY_EVENTS_TOTAL
+from api.monitoring.http_metrics import HTTP_METRICS
 from api.schemas import HealthCheckData, HealthCheckEnvelope
 
 router = APIRouter()
@@ -379,6 +381,11 @@ def get_api_metrics() -> Response:
         "# TYPE weather_component_memory_rss_bytes gauge",
         f'weather_component_memory_rss_bytes{{component="api"}} {float(rss)}',
     ]
+    # Bounded-cardinality serving-layer telemetry: per-route HTTP request
+    # rates, latency histogram, in-flight gauge (MONITORING.md section 2.7),
+    # and accepted client telemetry events (section 2.8).
+    lines.extend(HTTP_METRICS.render_lines())
+    lines.extend(CLIENT_TELEMETRY_EVENTS_TOTAL.render_lines())
     content = "\n".join(lines) + "\n"
     return Response(
         content=content,

@@ -342,6 +342,23 @@ class IngestionSettings(BaseSettings):
     #: Detailed metadata retention window in days before sweeping (default: 1 day).
     METADATA_RETENTION_DAYS: int = DEFAULT_METADATA_RETENTION_DAYS
 
+    # --- Alert delivery (MONITORING.md sections 5.2 and 6) -------------------
+    #: Optional HTTP webhook for alert dispatch (Slack/Discord/Alertmanager).
+    #: Empty string disables webhook delivery (structured logging only).
+    ALERT_WEBHOOK_URL: str = ""
+    #: Per-attempt webhook POST timeout in seconds.
+    ALERT_WEBHOOK_TIMEOUT_SECONDS: float = 2.0
+    #: Total webhook delivery attempts per event (1 = no retry); retried with
+    #: exponential backoff. After the final failure the
+    #: ``alert_delivery_failed`` self-alert fires through the surviving sinks.
+    ALERT_WEBHOOK_RETRY_ATTEMPTS: int = 3
+
+    # --- Exporter self-observability (MONITORING.md section 2.6) -------------
+    #: Consecutive failed scrapes of one exporter collector before the
+    #: ``exporter_collector_failed`` WARNING self-alert fires (3 scrapes at the
+    #: default 15s Prometheus interval = 45s of sustained blindness).
+    EXPORTER_COLLECTOR_ALERT_THRESHOLD: int = 3
+
     @model_validator(mode="after")
     def _validate_pool_and_concurrency_invariants(self) -> "IngestionSettings":
         pool_size = int(self.DB_POOL_SIZE)
