@@ -837,3 +837,77 @@ Verify that JSON serialization, Redis caching, and coordinate projections execut
   - Do **not** hand-edit `model_runs.status`; the status is derived, and a manual value would be overwritten by the next derivation while hiding the underlying divergence.
 
 
+
+### 19.12 Exporter Collector Failure (`#exporter-collector-failure`)
+* **Symptom:** Alert `exporter_collector_failed` (WARNING) triggers: one exporter collector failed $\ge$ `EXPORTER_COLLECTOR_ALERT_THRESHOLD` (default 3) consecutive scrapes. The exporter process still answers `/metrics`, but the failing collector's metric family is stale (its `weather_exporter_collector_success{collector=...}` gauge reads 0).
+* **Diagnostic Procedure:**
+  1. Identify the failing collector from the alert scope (`resources`, `postgres`, `storage`, `lifecycle`, or `ingestion`).
+  2. Grep the exporter process logs for `exporter collector '<name>' failed` — each failure logs the full traceback.
+  3. Map the collector to its dependency: `postgres`/`lifecycle`/`ingestion` → PostgreSQL reachability (`weather-ingest status`); `storage` → MinIO reachability; `resources` → host `psutil` health.
+* **Remediation:**
+  - Fix the underlying dependency outage using the corresponding runbook (§19.4, §19.5).
+  - The alert self-recovers on the first successful scrape; no exporter restart is required. Restart the exporter only if the traceback indicates an exporter-process defect.
+  - A Prometheus/Alertmanager rule on the same gauge (MONITORING.md §7.4) is the belt-and-braces backstop and fires with a 15-minute sustain.
+
+### 19.13 Alert Delivery Failure (`#alert-delivery-failure`)
+* **Symptom:** Alert `alert_delivery_failed` (WARNING) appears in logs and the diagnostics ledger but *not* through the webhook — webhook delivery failed after all retries. `weather_alert_delivery_failures_total` increments on the alerting process.
+* **Diagnostic Procedure:**
+  1. Read the self-alert description: it names the webhook URL and the last error (timeout, connection refused, or non-2xx status).
+  2. From the alerting host, `curl -v -X POST <webhook-url>` with a minimal JSON body to reproduce the failure.
+  3. Check `weather-ingest diagnostics` — the in-memory ledger still holds all alert events, so nothing was lost.
+* **Remediation:**
+  - Restore webhook reachability (DNS, proxy, firewall) or fix the receiver's 5xx.
+  - While delivery is down, monitor via the structured `[ALERT:...]` log stream; alerts keep flowing there unconditionally.
+  - The self-alert auto-recovers on the next successful delivery.
+
+### 19.14 API Serving Error Rate High (`#api-error-rate`)
+* **Symptom:** External Prometheus alert `WeatherApiErrorRateHigh`: `sum(rate(weather_api_http_requests_total{status_class="5xx"}[5m])) / sum(rate(weather_api_http_requests_total[5m])) > 0.02` sustained 10 minutes (MONITORING.md §2.7).
+* **Diagnostic Procedure:**
+  1. In Grafana, open the Serving (HTTP) row: identify which `route` and `method` label carries the 5xx rate.
+  2. Correlate with API JSON logs by `request_id` (grep the structured logs for level `ERROR` in the same window).
+  3. Check `/v1/health/detailed`: a degraded dependency (database/redis/storage) explains systematic 5xx.
+* **Remediation:**
+  - Dependency outage → the corresponding runbook (§11, §19.4, §19.5).
+  - Route-specific regression → roll back the most recent API deployment (§15) and capture incident evidence (§14).
+
+### 19.15 API Serving Latency High (`#api-latency`)
+* **Symptom:** External Prometheus alert `WeatherApiLatencyHigh`: p95 of `weather_api_http_request_duration_seconds` over 5m exceeds 2s for 15 minutes (MONITORING.md §2.7).
+* **Diagnostic Procedure:**
+  1. In Grafana, compare p95 per `route`: ensemble fan-outs (`/v1/ensembles`, slow by design, gateway allows 300s) are expected to dominate; tile routes (`/v1/maps/*.png`) must stay milliseconds-fast.
+  2. Check `weather_api_reader_pool_checked_out` vs `weather_api_reader_pool_size` for pool exhaustion, and cAdvisor container memory for pressure.
+  3. Check whether a new ingestion cycle publication coincides with the latency rise (cold caches) — the tile/vector prewarm loops should absorb this within one interval.
+* **Remediation:**
+  - Pool exhaustion: raise `API_READER_LOCK_POOL_SIZE` within the database connection budget, or reduce concurrent gated reads (`API_MAX_CONCURRENT_GATED_READS`).
+  - Sustained regression: profile the offending route and compare against the Phase 1/4 serving baselines before rolling back (§15).
+
+### 19.16 Client Error Spike (`#client-error-spike`)
+* **Symptom:** External Prometheus alert `WeatherClientErrorSpike`: reported browser errors (`weather_client_telemetry_events_total{event_type="error"}`) exceed 1/s over 15 minutes (MONITORING.md §2.8).
+* **Diagnostic Procedure:**
+  1. Grep the API structured logs for `client telemetry event` records in the window; the JSON fields carry `telemetry_name`, `telemetry_message`, `telemetry_stack`, and `telemetry_page_url`.
+  2. Cluster by `telemetry_name` + `telemetry_page_url`: a single page/error type points at a frontend regression; a spread across pages with network failures points at serving or gateway problems (cross-check §19.14 and gateway logs).
+  3. Confirm the spike is not a single stuck client session by grouping on `telemetry_session_id`.
+* **Remediation:**
+  - Frontend regression: roll back the most recent frontend deployment (§15).
+  - Bad data driving client-side exceptions (e.g. malformed tile/vector payloads): check the ingestion quality gates for the newest cycle (§19.1).
+
+### 19.17 Scrape Target Down (`#scrape-target-down`)
+* **Symptom:** External Prometheus alert `WeatherScrapeTargetDown`: `up{job=~"weather-.*"} == 0` for 5 minutes — Prometheus cannot reach a metrics endpoint at all. This is the only signal for a dead exporter process and must never be masked by `or vector(0)` dashboard fallbacks (MONITORING.md §7.2).
+* **Diagnostic Procedure:**
+  1. Identify the down target from the `job`/`instance` labels (API `:8000`, ingestion exporter `:9112`, realtime `:9113`, gc `:9114`, nginx exporter `:9115`).
+  2. Verify the process is running and its port is bound: `weather-ingest metrics` (exporter), API service status, `weather_nginx_exporter` container state.
+  3. In remote mode (§7.2), confirm the SSH tunnel is alive (`18000`/`18112` listeners) before blaming the remote service.
+* **Remediation:**
+  - Restart the dead exporter/service; investigate its logs for the crash cause.
+  - Renew a dead SSH tunnel (remote mode).
+  - Note: `up == 0` on `weather_nginx_exporter` with a healthy gateway means the exporter cannot reach `/nginx_status` — check that the gateway container was rebuilt after the template change.
+
+### 19.18 Synthetic Probe Failure (`#synthetic-probe-failure`)
+* **Symptom:** The external synthetic probe (`scripts/synthetic_probe.py`, MONITORING.md §9) reports WARNING/CRITICAL outcomes, or its webhook alert `synthetic_probe_failed` / `synthetic_probe_degraded` fires, while internal metrics may still look healthy.
+* **Diagnostic Procedure:**
+  1. Read the probe's JSON output line: `detail` states the failure class (network, HTTP status, latency budget, JSON sanity, TLS expiry).
+  2. TLS-expiry detail: the gateway's self-signed certificate is regenerated at container start — inspect the certificate dates (`--insecure` probing bypasses verification but still reports expiry) and restart the gateway if the entrypoint failed.
+  3. Network/HTTP failures with healthy internal metrics point at the edge: gateway routing, DNS, load balancer, or firewall.
+* **Remediation:**
+  - Edge-path failure: restart/rebuild `weather_gateway`, verify upstream configuration (`GATEWAY_API_UPSTREAM` / `GATEWAY_FRONTEND_UPSTREAM`).
+  - Certificate expiry: restart the gateway container to regenerate the self-signed certificate, or mount renewed production certificates.
+  - Latency-budget warnings: cross-check §19.15 and gateway/cAdvisor telemetry before resizing the budget.

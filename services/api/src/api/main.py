@@ -19,6 +19,8 @@ from api.core.reader_gate import (
 from api.core.zarr import shutdown_chunk_executor, shutdown_member_executor
 from api.errors import install_exception_handlers
 from api.middleware import RequestIDMiddleware
+from api.monitoring.http_metrics import HTTPMetricsMiddleware
+from api.monitoring.logging import configure_logging
 from api.routers.admin import router as admin_router
 from api.routers.availability import router as availability_router
 from api.routers.catalog import router as catalog_router
@@ -29,6 +31,7 @@ from api.routers.maps import router as maps_router
 from api.routers.points import router as points_router
 from api.routers.probabilities import router as probabilities_router
 from api.routers.search import router as search_router
+from api.routers.telemetry import router as telemetry_router
 from api.routers.verifications import router as verifications_router
 from api.services.tiles import shutdown_wind_executor
 
@@ -88,6 +91,7 @@ def _log_model_registration_audit() -> None:
 
 def create_app() -> FastAPI:
     """Build the FastAPI application with middleware, error handling, and routes."""
+    configure_logging(settings.API_LOG_FORMAT)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> "AsyncIterator[None]":
@@ -146,6 +150,10 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
     app.add_middleware(RequestIDMiddleware)
+    # Added after RequestIDMiddleware so it wraps it (outermost user
+    # middleware): request durations include all middleware overhead and
+    # requests failing in inner middlewares are still counted as 5xx.
+    app.add_middleware(HTTPMetricsMiddleware)
     install_exception_handlers(app)
     app.include_router(catalog_router, prefix="/v1")
     app.include_router(availability_router, prefix="/v1")
@@ -157,6 +165,7 @@ def create_app() -> FastAPI:
     app.include_router(maps_router, prefix="/v1")
     app.include_router(ensembles_router, prefix="/v1")
     app.include_router(verifications_router, prefix="/v1")
+    app.include_router(telemetry_router, prefix="/v1")
     app.include_router(admin_router, prefix="/v1")
     return app
 

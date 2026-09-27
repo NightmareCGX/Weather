@@ -1,6 +1,7 @@
 """Production runtime health, resource, ingestion, lifecycle, and alert monitoring."""
 
 from ingestion.monitoring.alerts import (
+    ALERT_DELIVERY_FAILURES_TOTAL,
     ALERT_ENGINE,
     Alert,
     AlertDeduplicator,
@@ -15,6 +16,7 @@ from ingestion.monitoring.database import (
     PostgresHealthCollector,
     PostgresHealthReport,
 )
+from ingestion.monitoring.exporter import CollectorAlertMonitor
 from ingestion.monitoring.ingestion_collector import (
     INGESTION_COLLECTOR,
     IngestionHealthCollector,
@@ -56,12 +58,14 @@ from ingestion.monitoring.summary import (
 )
 
 __all__ = [
+    "ALERT_DELIVERY_FAILURES_TOTAL",
     "ALERT_ENGINE",
     "Alert",
     "AlertDeduplicator",
     "AlertEngine",
     "AlertEvent",
     "AlertSeverity",
+    "CollectorAlertMonitor",
     "Counter",
     "CycleResourceLeakDetector",
     "DiskInfo",
