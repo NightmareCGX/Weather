@@ -551,6 +551,52 @@ Errors return standard HTTP status codes along with a structured machine-readabl
 - **HTTP Status Codes**: `200 OK`, `503 Service Unavailable`.
 - **Cache Policy**: `no-store`.
 
+#### 8.2 Record Client Telemetry
+- **HTTP Method**: `POST`
+- **Endpoint**: `/v1/telemetry/client`
+- **Purpose**: Ingest batched browser telemetry (JavaScript errors, unhandled rejections, Web Vitals) from the frontend beacon (MONITORING.md section 8.2). Events are counted on the bounded `weather_client_telemetry_events_total` metric and logged with their free-form details via structured JSON logging.
+- **Request Body**:
+  ```json
+  {
+    "events": [
+      {
+        "type": "error",
+        "name": "TypeError",
+        "timestamp": 1730000000.0,
+        "message": "x is undefined",
+        "stack": "at render (app.js:1)",
+        "page_url": "https://weather.example.test/",
+        "session_id": "sess_abc123"
+      },
+      {
+        "type": "web_vital",
+        "name": "LCP",
+        "timestamp": 1730000001.0,
+        "value": 1234.5,
+        "rating": "good"
+      }
+    ]
+  }
+  ```
+- **Field Constraints** (enforced by request validation):
+  - `type`: `error` | `web_vital` (required).
+  - `name`: 1-64 characters (required). `rating`: `good` | `needs-improvement` | `poor`.
+  - `timestamp`: Unix epoch seconds (required); `value`: float (Web Vitals).
+  - `message` <= 512 chars; `stack` <= 2048; `page_url` <= 512; `session_id` <= 64.
+  - `events`: 1-20 events per batch.
+- **Example Response** (`202 Accepted`):
+  ```json
+  {
+    "object": "client_telemetry_receipt",
+    "data": { "accepted": 2 },
+    "has_more": false,
+    "next_cursor": null
+  }
+  ```
+- **HTTP Status Codes**: `202 Accepted`, `422 Unprocessable Entity` (RFC 7807 envelope, section 2.4).
+- **Cache Policy**: `no-store`.
+- **Operational Notes**: The endpoint is open (no authentication) and side-effect-free: it never touches databases or caches, and it cannot return 5xx. Production deployments should layer rate limiting at the edge gateway. Free-form fields are never used as metric labels (cardinality safety, MONITORING.md section 1).
+
 ---
 
 ### DOMAIN 9: ELEVATION
@@ -595,6 +641,10 @@ When backend endpoint models or parameters are modified, update the committed Op
 ```bash
 cd services/api
 uv run --no-sync python -c "import json, sys; sys.path.insert(0, 'src'); from api.main import app; open('../../services/frontend/openapi.json', 'w', encoding='utf-8').write(json.dumps(app.openapi(), indent=2) + '\n')"
+# The committed artifact is Prettier-formatted (short arrays stay inline);
+# re-format after dumping so diffs stay minimal:
+cd ../frontend
+npx prettier --write openapi.json
 ```
 
 ### Contract Verification:

@@ -225,6 +225,23 @@ services:
     ports:
       - "${CADVISOR_PORT:-8080}:8080"
 
+  # Gateway telemetry (nginx-prometheus-exporter)
+  # Scrapes the gateway's stub_status endpoint (/nginx_status on the plain
+  # HTTP server, restricted to private networks) and exposes connection and
+  # request-rate metrics for Prometheus. MONITORING.md section 7.3.
+  weather_nginx_exporter:
+    image: nginx/nginx-prometheus-exporter:v1.4.2
+    container_name: weather_nginx_exporter
+    restart: unless-stopped
+    profiles:
+      - monitoring
+      - full
+    command:
+      - "--nginx.scrape-uri=http://weather_gateway/nginx_status"
+      - "--web.listen-address=:9111"
+    ports:
+      - "${NGINX_EXPORTER_PORT:-9115}:9111"
+
 volumes:
   postgres18_data:
   redis_data:

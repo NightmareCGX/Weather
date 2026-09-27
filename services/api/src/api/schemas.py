@@ -669,3 +669,44 @@ class HealthCheckEnvelope(BaseModel):
     data: HealthCheckData
     has_more: bool = False
     next_cursor: str | None = None
+
+
+class ClientTelemetryEvent(BaseModel):
+    """A single client-side telemetry event (API.md section 8.2).
+
+    Field lengths are strictly capped so the open endpoint cannot be used to
+    store arbitrarily large payloads. Free-form values (``name``, ``message``,
+    ``stack``) are logged, never used as metric labels, keeping the telemetry
+    metric cardinality bounded to the ``type`` label (MONITORING.md section 1).
+    """
+
+    type: Literal["error", "web_vital"]
+    name: str = Field(min_length=1, max_length=64)
+    timestamp: float
+    message: str | None = Field(default=None, max_length=512)
+    stack: str | None = Field(default=None, max_length=2048)
+    page_url: str | None = Field(default=None, max_length=512)
+    session_id: str | None = Field(default=None, max_length=64)
+    value: float | None = None
+    rating: Literal["good", "needs-improvement", "poor"] | None = None
+
+
+class ClientTelemetryBatch(BaseModel):
+    """A batch of client telemetry events (API.md section 8.2)."""
+
+    events: list[ClientTelemetryEvent] = Field(min_length=1, max_length=20)
+
+
+class ClientTelemetryReceipt(BaseModel):
+    """The number of telemetry events accepted (API.md section 8.2)."""
+
+    accepted: int
+
+
+class ClientTelemetryEnvelope(BaseModel):
+    """The client telemetry response envelope (API.md sections 8.2 and 2.3)."""
+
+    object: Literal["client_telemetry_receipt"] = "client_telemetry_receipt"
+    data: ClientTelemetryReceipt
+    has_more: bool = False
+    next_cursor: str | None = None

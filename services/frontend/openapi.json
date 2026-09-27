@@ -874,8 +874,8 @@
     },
     "/v1/locate": {
       "get": {
-        "summary": "Get coarse approximate location from infrastructure IP headers",
-        "description": "Resolve coarse approximate location from trusted Cloudflare headers.\n\nSafety:\n- Disabled by default (TRUST_CLOUDFLARE_LOCATION_HEADERS=False). In this\n  mode, externally supplied headers are never trusted and 404 is returned.\n- When enabled, headers are parsed, validated for finite range (lat in [-90, 90],\n  lon in [-180, 180]), and normalized.\n- If headers are missing, malformed, or out of range, returns HTTP 404\n  (location unavailable).",
+        "summary": "Get coarse approximate location from the visitor's IP address",
+        "description": "Resolve a coarse approximate location for the requesting visitor.\n\nSafety:\n- Both sources are disabled by default (``TRUST_CLOUDFLARE_LOCATION_HEADERS``\n  False, ``LOCATE_PROVIDER`` ``none``): externally supplied headers are never\n  trusted and no lookup is performed unless explicitly enabled.\n- Cloudflare values are validated for finite range (lat in [-90, 90], lon in\n  [-180, 180]) and normalized.\n- The database source only accepts routable addresses, so loopback, private\n  and same-host requests are treated as unavailable rather than resolving to\n  whatever the database records for that range.",
         "operationId": "locate_v1_locate_get",
         "responses": {
           "200": {
@@ -1667,6 +1667,45 @@
         }
       }
     },
+    "/v1/telemetry/client": {
+      "post": {
+        "summary": "Record client telemetry events (JS errors, Web Vitals)",
+        "description": "Accept a batch of client telemetry events.\n\nEach event increments the bounded ``type`` metric and is logged with its\nfree-form details. The response reports the number of accepted events.",
+        "operationId": "record_client_telemetry_v1_telemetry_client_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientTelemetryBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientTelemetryEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "summary": "Get system health",
@@ -1794,6 +1833,162 @@
         "required": ["id", "name", "country"],
         "title": "CenterOut",
         "description": "A forecast center resource (API.md section 1.1)."
+      },
+      "ClientTelemetryBatch": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ClientTelemetryEvent"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Events"
+          }
+        },
+        "type": "object",
+        "required": ["events"],
+        "title": "ClientTelemetryBatch",
+        "description": "A batch of client telemetry events (API.md section 8.2)."
+      },
+      "ClientTelemetryEnvelope": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "client_telemetry_receipt",
+            "title": "Object",
+            "default": "client_telemetry_receipt"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ClientTelemetryReceipt"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ClientTelemetryEnvelope",
+        "description": "The client telemetry response envelope (API.md sections 8.2 and 2.3)."
+      },
+      "ClientTelemetryEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["error", "web_vital"],
+            "title": "Type"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "timestamp": {
+            "type": "number",
+            "title": "Timestamp"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "stack": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stack"
+          },
+          "page_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page Url"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          },
+          "rating": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["good", "needs-improvement", "poor"]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rating"
+          }
+        },
+        "type": "object",
+        "required": ["type", "name", "timestamp"],
+        "title": "ClientTelemetryEvent",
+        "description": "A single client-side telemetry event (API.md section 8.2).\n\nField lengths are strictly capped so the open endpoint cannot be used to\nstore arbitrarily large payloads. Free-form values (``name``, ``message``,\n``stack``) are logged, never used as metric labels, keeping the telemetry\nmetric cardinality bounded to the ``type`` label (MONITORING.md section 1)."
+      },
+      "ClientTelemetryReceipt": {
+        "properties": {
+          "accepted": {
+            "type": "integer",
+            "title": "Accepted"
+          }
+        },
+        "type": "object",
+        "required": ["accepted"],
+        "title": "ClientTelemetryReceipt",
+        "description": "The number of telemetry events accepted (API.md section 8.2)."
       },
       "ElevationOut": {
         "properties": {
@@ -3029,7 +3224,7 @@
         "type": "object",
         "required": ["id", "name", "unit", "initial_times"],
         "title": "VariableAvailability",
-        "description": "A forecast variable and the initial times / valid times available for it.\n\nAttributes:\n    id: The ``forecast_variables.variable_code`` (e.g.\n        ``temperature_2m``).\n    name: Human-readable variable name.\n    unit: The registered SI unit string (e.g. ``\u00b0C``).\n    initial_times: The initial times with data for this\n        model/variable, newest first (legacy compatibility).\n    valid_times: The unified, cross-cycle valid times available for this\n        model/variable under Lifecycle V2, ascending.\n    layer: Authoritative map layer descriptor for rendering tiles and\n        legends without an extra metadata roundtrip."
+        "description": "A forecast variable and the initial times / valid times available for it.\n\nAttributes:\n    id: The ``forecast_variables.variable_code`` (e.g.\n        ``temperature_2m``).\n    name: Human-readable variable name.\n    unit: The registered SI unit string (e.g. ``°C``).\n    initial_times: The initial times with data for this\n        model/variable, newest first (legacy compatibility).\n    valid_times: The unified, cross-cycle valid times available for this\n        model/variable under Lifecycle V2, ascending.\n    layer: Authoritative map layer descriptor for rendering tiles and\n        legends without an extra metadata roundtrip."
       },
       "VariableOut": {
         "properties": {

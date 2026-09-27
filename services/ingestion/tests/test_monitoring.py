@@ -905,7 +905,7 @@ def test_alert_deduplication_cooldown_and_recovery():
 
 
 def test_webhook_alert_sink_fail_open():
-    sink = WebhookAlertSink("http://localhost:9999/nonexistent", timeout_seconds=0.1)
+    sink = WebhookAlertSink("http://localhost:9999/nonexistent", timeout_seconds=0.1, retry_attempts=1)
     event = AlertEvent(
         event_type="triggered",
         alert=Alert(name="test", severity=AlertSeverity.WARNING, summary="s", description="d"),

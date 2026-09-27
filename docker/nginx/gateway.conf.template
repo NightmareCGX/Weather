@@ -36,6 +36,21 @@ proxy_cache_path /var/cache/nginx/tiles levels=1:2 keys_zone=tile_cache:32m max_
 server {
     listen 80;
     server_name _;
+
+    # Gateway telemetry (MONITORING.md section 7.3): Prometheus stub_status
+    # for the nginx-prometheus-exporter in the monitoring profile. Served on
+    # the plain-HTTP server so the exporter needs no TLS trust; restricted to
+    # loopback and private networks so public visitors get 403.
+    location = /nginx_status {
+        stub_status;
+        access_log off;
+        allow 127.0.0.1;
+        allow 10.0.0.0/8;
+        allow 172.16.0.0/12;
+        allow 192.168.0.0/16;
+        deny all;
+    }
+
     return 301 https://$host$request_uri;
 }
 
