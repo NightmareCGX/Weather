@@ -157,5 +157,24 @@ jobs:
 
           # --- Advance, fast-forward only ---
           echo "== fast-forward =="
-          git push "${REMOTE}" "${target_sha}:refs/heads/${BRANCH}"
+          # The push is the one step the remote can still refuse after every local
+          # check has passed, and its refusal is the only place a locked branch or a
+          # linear-history rule announces itself. Capture the output, name the
+          # cause, and repeat git's own words so the annotation is authoritative.
+          if ! push_out="$(git push "${REMOTE}" "${target_sha}:refs/heads/${BRANCH}" 2>&1)"; then
+            printf '%s\n' "${push_out}"
+            reason="$(printf '%s\n' "${push_out}" \
+              | grep -iE 'protected|denied|rejected|refus|GH[0-9]{3}|permission|merge commits|locked' \
+              | head -n4 | tr -d '\r' | tr '\n' ' ' | sed 's/%/%25/g')"
+            if grep -qF 'Cannot change this locked branch' <<<"${push_out}"; then
+              echo "::error::${BRANCH} is locked, so nothing can update it — not this workflow, and not a pull-request merge either. Uncheck 'Lock branch' for ${BRANCH} under Settings > Branches."
+            elif grep -qF 'must not contain merge commits' <<<"${push_out}"; then
+              echo "::error::${BRANCH} requires linear history, but following main imports main's merge commits by construction: every pull request merged into main is a merge commit. Either uncheck 'Require linear history' for ${BRANCH}, or stop fast-forwarding and mirror main's content as one linear commit per sync."
+            else
+              echo "::error::the remote refused the fast-forward of ${BRANCH} to ${target_sha}. Protection that does not exempt the bot is the usual cause: allow direct pushes for this branch, or move the rule to a ruleset that lists the GitHub Actions app as a bypass actor. If the token is the cause, set Settings > Actions > General > Workflow permissions to read and write."
+            fi
+            echo "::error::git said: ${reason}"
+            exit 1
+          fi
+          printf '%s\n' "${push_out}"
           echo "::notice::${BRANCH} advanced to ${target_sha}"

@@ -38,4 +38,6 @@ What makes this safe to run unattended:
 * To take one specific `main` fix into a frozen release, `git cherry-pick <sha>` onto a branch cut from `release/1.0` and open a PR. Do not merge `main` into a frozen release branch.
 * A manual run may pass `sync_to` to advance the branch only as far as a given commit; it is rejected if that commit is past the cutoff.
 * Deleting the cutoff file resumes following `main`, but only while the release branch is still a fast-forward of it.
-* If the release branch is covered by a ruleset, the Actions app must be a **bypass actor**, or the sync push will be rejected.
+* The release branch must accept direct fast-forward pushes, which rules out two protections: **Lock branch** (a locked branch rejects every update, pull-request merges included, so nothing at all can move it) and **Require linear history** (following `main` imports `main`'s merge commits by construction, because every pull request merged into `main` is one). Direct pushes must also be allowed for the bot — legacy branch protection cannot exempt the Actions app, so either drop the rule that blocks it, or move the rule to a ruleset that lists the GitHub Actions app as a **bypass actor**.
+* If the release branch has to stay pull-request-only, drive the sync through a pull request instead of a push.
+* When a push is refused, the run names the cause in an error annotation — a locked branch, a linear-history requirement, or any other protection refusal, each followed by git's own words. Read that annotation first.
