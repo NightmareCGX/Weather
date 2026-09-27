@@ -1,0 +1,161 @@
+# Release Branch Sync — keep a release branch moving with main, then freeze it.
+#
+# Contract:
+#   * While a release is open, its branch follows main: every push to main
+#     fast-forwards the release branch to that same commit, so the two cannot
+#     drift while development is still landing on the release.
+#   * Freezing is one file: .github/release-sync/<branch slug>.cutoff. Its first
+#     non-comment line names the last main commit allowed to reach the release
+#     branch. Once the release branch contains that commit, this workflow stops
+#     advancing it — permanently, with no further configuration.
+#   * The cutoff is a hard ceiling. No run, including a manual dispatch, can move
+#     the release branch past it.
+#   * The push is fast-forward only. This workflow never force-pushes and never
+#     rewrites the release branch, so release-only commits (hotfixes) are safe —
+#     and by their mere existence they switch the automatic sync off.
+#
+# Operating notes:
+#   * Adding another release branch: append it to the matrix below and add its
+#     own cutoff file.
+#   * Pushes made with GITHUB_TOKEN do not trigger other workflows. If CI must
+#     report on the release branch, drive the sync through a pull request
+#     instead, or push with a GitHub App / PAT token.
+#   * A branch protection rule on the release branch will reject this push
+#     unless the Actions app is a bypass actor for it.
+
+name: Release Sync
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sync_to:
+        description: "Optional commit to sync up to, instead of the default target (never past the cutoff)"
+        required: false
+        type: string
+
+# Serialize per release branch: two runs racing to advance the same branch would
+# both read the same starting point and the slower one would push a stale target.
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Job level, not workflow level: `matrix` is not an available context in
+    # workflow-level concurrency.
+    concurrency:
+      group: release-sync-${{ matrix.branch }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - release/1.0
+    env:
+      RELEASE_BRANCH: ${{ matrix.branch }}
+      SYNC_TO: ${{ github.event.inputs.sync_to }}
+    steps:
+      - name: Checkout main with full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history is required: the cutoff and fast-forward guards below are
+          # ancestry tests, which a shallow clone cannot answer.
+          fetch-depth: 0
+
+      - name: Sync release branch
+        run: |
+          set -euo pipefail
+
+          REMOTE="${REMOTE:-origin}"
+          BRANCH="${RELEASE_BRANCH:?RELEASE_BRANCH must be set}"
+          CUTOFF_FILE="${CUTOFF_FILE:-.github/release-sync/${BRANCH//\//-}.cutoff}"
+          SYNC_TO="${SYNC_TO:-}"
+
+          main_ref="refs/remotes/${REMOTE}/main"
+          release_ref="refs/remotes/${REMOTE}/${BRANCH}"
+
+          echo "== refs =="
+          git fetch --no-tags "${REMOTE}" "+refs/heads/main:${main_ref}"
+          main_sha="$(git rev-parse "${main_ref}")"
+          echo "main                = ${main_sha}"
+
+          # --- Target: follow main, or stop at the cutoff once one is declared ---
+          target_sha="${main_sha}"
+          cutoff_active=""
+          if [[ -f "${CUTOFF_FILE}" ]]; then
+            cutoff="$(grep -vE '^[[:space:]]*(#|$)' "${CUTOFF_FILE}" | head -n1 | tr -d '[:space:]' || true)"
+            if [[ -n "${cutoff}" ]]; then
+              if ! git cat-file -e "${cutoff}^{commit}" 2>/dev/null; then
+                echo "::error::cutoff '${cutoff}' is not a commit known to this clone — fix ${CUTOFF_FILE}"
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "${cutoff}" "${main_sha}"; then
+                echo "::error::cutoff '${cutoff}' is not an ancestor of main — fix ${CUTOFF_FILE}"
+                exit 1
+              fi
+              target_sha="$(git rev-parse "${cutoff}^{commit}")"
+              cutoff_active="yes"
+              echo "cutoff              = ${target_sha} (from ${CUTOFF_FILE})"
+            else
+              echo "cutoff              = none (${CUTOFF_FILE} has no commit line: following main)"
+            fi
+          else
+            echo "cutoff              = none (${CUTOFF_FILE} absent: following main)"
+          fi
+
+          # A manual dispatch may only move the pointer backwards, never past the cutoff.
+          if [[ -n "${SYNC_TO}" ]]; then
+            if ! git cat-file -e "${SYNC_TO}^{commit}" 2>/dev/null; then
+              echo "::error::sync_to '${SYNC_TO}' is not a commit known to this clone"
+              exit 1
+            fi
+            sync_sha="$(git rev-parse "${SYNC_TO}^{commit}")"
+            if ! git merge-base --is-ancestor "${sync_sha}" "${target_sha}"; then
+              echo "::error::sync_to ${sync_sha} is past the cutoff ${target_sha} — refusing to sync"
+              exit 1
+            fi
+            target_sha="${sync_sha}"
+            echo "sync_to override    = ${target_sha}"
+          fi
+
+          # --- Where the release branch stands right now ---
+          echo "== release branch =="
+          release_sha=""
+          if git ls-remote --exit-code --heads "${REMOTE}" "${BRANCH}" >/dev/null 2>&1; then
+            git fetch --no-tags "${REMOTE}" "+refs/heads/${BRANCH}:${release_ref}"
+            release_sha="$(git rev-parse "${release_ref}")"
+            echo "${BRANCH} = ${release_sha}"
+          else
+            echo "${BRANCH} = (absent; will be created)"
+          fi
+
+          # --- Decision ---
+          echo "== decision =="
+          if [[ -n "${release_sha}" ]]; then
+            if [[ "${release_sha}" == "${target_sha}" ]]; then
+              if [[ -n "${cutoff_active}" ]]; then
+                echo "::notice::${BRANCH} is parked at the cutoff ${target_sha}; frozen"
+              else
+                echo "::notice::${BRANCH} is already at ${target_sha}; nothing to do"
+              fi
+              exit 0
+            fi
+            if git merge-base --is-ancestor "${target_sha}" "${release_sha}"; then
+              echo "::notice::${BRANCH} already contains ${target_sha}; sync complete, this branch is frozen"
+              exit 0
+            fi
+            if ! git merge-base --is-ancestor "${release_sha}" "${target_sha}"; then
+              echo "::notice::${BRANCH} carries commits of its own (${release_sha}); not a fast-forward, auto-sync stops here"
+              exit 0
+            fi
+          fi
+
+          # --- Advance, fast-forward only ---
+          echo "== fast-forward =="
+          git push "${REMOTE}" "${target_sha}:refs/heads/${BRANCH}"
+          echo "::notice::${BRANCH} advanced to ${target_sha}"
