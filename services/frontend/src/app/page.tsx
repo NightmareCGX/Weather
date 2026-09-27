@@ -149,8 +149,10 @@ export default function HomePage() {
             aria-label="Forecast panel"
             className={
               isPanelCollapsed
-                ? "relative w-0 shrink-0 bg-slate-900"
-                : "relative w-96 max-w-[calc(100%-2rem)] shrink-0 border-l border-slate-800 bg-slate-900/95 shadow-2xl backdrop-blur-md lg:w-[28rem]"
+                ? "relative z-20 w-0 shrink-0 bg-slate-900"
+                : // z-20 keeps the overlaying (mobile) panel above the map
+                  // overlays inside <main> (legend z-10, search z-20 but DOM-earlier).
+                  "relative z-20 w-96 max-w-[calc(100%-2rem)] shrink-0 border-l border-slate-800 bg-slate-900/95 shadow-2xl backdrop-blur-md lg:w-[28rem]"
             }
           >
             <button
