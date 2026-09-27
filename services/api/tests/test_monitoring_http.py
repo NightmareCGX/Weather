@@ -32,6 +32,7 @@ from api.monitoring.logging import (
     get_request_id,
     set_request_id,
 )
+from api.routers import admin as admin_router
 
 
 def _parse_exposition(text: str) -> dict[str, float]:
@@ -108,7 +109,15 @@ def metrics_client_fixture():
 
 
 class TestHTTPMetricsMiddleware:
-    def test_known_route_uses_template_and_status_class(self, metrics_client):
+    def test_known_route_uses_template_and_status_class(self, metrics_client, monkeypatch):
+        # Pin the health probes so the endpoint returns 200 regardless of the
+        # environment's object-storage availability (the CI api-pipeline job
+        # provisions PostgreSQL + Redis but no MinIO, which would otherwise
+        # degrade the response to a 503 / 5xx status class).
+        monkeypatch.setattr(admin_router, "_database_connected", lambda: True)
+        monkeypatch.setattr(admin_router, "_redis_connected", lambda: True)
+        monkeypatch.setattr(admin_router, "_object_storage_connected", lambda: True)
+
         before = _parse_exposition(metrics_client.get("/v1/metrics").text)
         key = 'weather_api_http_requests_total{method="GET",route="/v1/health",status_class="2xx"}'
         before_count = before.get(key, 0.0)
