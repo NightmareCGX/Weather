@@ -1489,6 +1489,7 @@
       },
       "id": 39,
       "title": "GC Planner / Worker Progress (rate)",
+      "description": "All series are per-second rates of per-pass increments. Reclaimable shards is deliberately absent: it is an absolute per-pass state, not an increment, so it is plotted on panel 59 instead of being rate()d here.",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -1499,10 +1500,6 @@
         {
           "expr": "rate(weather_gc_planner_enqueued_total[$__rate_interval])",
           "legendFormat": "planner enqueued/s"
-        },
-        {
-          "expr": "rate(weather_gc_planner_reclaimable_total[$__rate_interval])",
-          "legendFormat": "planner reclaimable/s"
         },
         {
           "expr": "rate(weather_gc_worker_claimed_total[$__rate_interval])",
@@ -1585,7 +1582,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 84
       },
@@ -1634,8 +1631,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 84
       },
       "id": 42,
@@ -1654,6 +1651,86 @@
         {
           "expr": "(time() - weather_gc_inventory_last_success_timestamp) / 3600",
           "legendFormat": "inventory hours since last success"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 84
+      },
+      "id": 59,
+      "title": "GC Queue State & Capacity Maintenance",
+      "description": "Reclaimable shards is an ABSOLUTE per-pass state (the planner recomputes the whole reclaimable set every pass), so it is plotted raw and never rate()d. The purge series track the scheduled terminal-row capacity stage: if purge throughput drops to zero while terminal rows keep being produced, the queue (and its serving-fence scan cost) grows without bound.",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "purge deleted rows/s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "rows/s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "oldest terminal row age (days)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "d"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "weather_gc_planner_reclaimable_shards",
+          "legendFormat": "reclaimable shards (absolute)"
+        },
+        {
+          "expr": "rate(weather_gc_purge_deleted_rows_total[$__rate_interval])",
+          "legendFormat": "purge deleted rows/s"
+        },
+        {
+          "expr": "weather_gc_purge_oldest_remaining_age_seconds / 86400",
+          "legendFormat": "oldest terminal row age (days)"
         }
       ],
       "options": {
