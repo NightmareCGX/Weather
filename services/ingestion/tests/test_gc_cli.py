@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,6 +12,10 @@ from alembic import command
 from alembic.config import Config
 from ingestion.cli import _build_parser, _gc_pipeline_pass, main
 from tests._integration_db import integration_db_url
+
+
+def _utc(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
 
 
 def test_gc_subcommand_parser_defaults():
@@ -140,6 +145,8 @@ def test_gc_subcommand_parser_pipeline_flags():
     assert args.enable_planner is False
     assert args.enable_delete is False
     assert args.enable_sweeper is False
+    assert args.enable_purge is False
+    assert args.purge_retention_days is None
     assert args.models == "gfs,gefs"
 
     args2 = parser.parse_args([
@@ -147,12 +154,16 @@ def test_gc_subcommand_parser_pipeline_flags():
         "--enable-planner",
         "--enable-delete",
         "--enable-sweeper",
+        "--enable-purge",
+        "--purge-retention-days", "1",
         "--metadata-retention-days", "3",
         "--models", "gfs",
     ])
     assert args2.enable_planner is True
     assert args2.enable_delete is True
     assert args2.enable_sweeper is True
+    assert args2.enable_purge is True
+    assert args2.purge_retention_days == 1.0
     assert args2.metadata_retention_days == 3
     assert args2.models == "gfs"
 
@@ -196,8 +207,18 @@ def _sweeper_result():
     )
 
 
-def _patch_pipeline_stages(monkeypatch, *, bk=None, plan=None, worker=None, sweeper=None):
-    """Patch the four pipeline stages plus SessionLocal (planner/worker DB)."""
+def _purge_result():
+    return SimpleNamespace(
+        deleted_rows=11,
+        batches=2,
+        oldest_remaining=_utc(2026, 9, 26, 18, 30),
+    )
+
+
+def _patch_pipeline_stages(
+    monkeypatch, *, bk=None, plan=None, worker=None, sweeper=None, purge=None
+):
+    """Patch the five pipeline stages plus SessionLocal (planner/worker/purge DB)."""
     import contextlib
 
     from ingestion.core import db as db_mod
@@ -210,6 +231,11 @@ def _patch_pipeline_stages(monkeypatch, *, bk=None, plan=None, worker=None, swee
     monkeypatch.setattr(plan_mod, "plan_reclamation_pass", plan or MagicMock(return_value=_plan_result()))
     monkeypatch.setattr(worker_mod, "run_reclamation_worker_pass", worker or MagicMock(return_value=_worker_result()))
     monkeypatch.setattr(sweep_mod, "run_metadata_sweeper_pass", sweeper or MagicMock(return_value=_sweeper_result()))
+    monkeypatch.setattr(
+        worker_mod,
+        "purge_reclaimed_queue_rows",
+        purge or MagicMock(return_value=_purge_result()),
+    )
 
     fake_session = MagicMock()
     fake_ctx = contextlib.nullcontext(fake_session)
@@ -363,7 +389,82 @@ def test_gc_pipeline_pass_dry_run_never_touches_worker(monkeypatch):
 
     assert "planner enqueued=" in summary
     assert "worker" not in summary
+    assert "purge" not in summary
     worker_mock.assert_not_called()
+
+
+def test_gc_pipeline_pass_purge_stage_records_and_reports(monkeypatch):
+    """The capacity purge stage runs with the configured retention window."""
+    purge_mock = MagicMock(return_value=_purge_result())
+    _patch_pipeline_stages(monkeypatch, purge=purge_mock)
+
+    summary = _gc_pipeline_pass(
+        "engine://fake",
+        models=["gfs"],
+        enable_planner=False,
+        enable_delete=False,
+        enable_sweeper=False,
+        batch_size=50,
+        enable_purge=True,
+        purge_retention_days=1.0,
+    )
+
+    assert "purge deleted=11 batches=2" in summary
+    assert purge_mock.call_args.kwargs["older_than_days"] == 1.0
+
+    from ingestion.monitoring.metrics import REGISTRY
+
+    # The gauge is the age of the oldest surviving terminal row, so it must be
+    # a positive duration rather than the raw timestamp.
+    oldest_age = _gauge_value("weather_gc_purge_oldest_remaining_age_seconds")
+    assert oldest_age is not None and oldest_age > 0
+    assert _counter_value("weather_gc_purge_deleted_rows_total") >= 11
+    assert _gauge_value("weather_gc_pass_success", stage="purge") == 1.0
+
+    exposition = REGISTRY.generate_latest()
+    assert "weather_gc_purge_deleted_rows_total" in exposition
+
+
+def test_gc_pipeline_pass_purge_is_opt_in(monkeypatch):
+    """Without enable_purge the capacity stage never runs (default is unchanged)."""
+    purge_mock = MagicMock(return_value=_purge_result())
+    _patch_pipeline_stages(monkeypatch, purge=purge_mock)
+
+    summary = _gc_pipeline_pass(
+        "engine://fake",
+        models=["gfs"],
+        enable_planner=True,
+        enable_delete=True,
+        enable_sweeper=True,
+        batch_size=50,
+    )
+
+    assert "purge" not in summary
+    purge_mock.assert_not_called()
+
+
+def test_gc_pipeline_pass_purge_failure_is_isolated(monkeypatch):
+    """A failing purge stage is reported, not raised, and other stages still ran."""
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("deadlock detected")
+
+    _patch_pipeline_stages(monkeypatch, purge=_boom)
+
+    summary = _gc_pipeline_pass(
+        "engine://fake",
+        models=["gfs"],
+        enable_planner=True,
+        enable_delete=True,
+        enable_sweeper=True,
+        batch_size=50,
+        enable_purge=True,
+    )
+
+    assert "purge=ERROR(RuntimeError)" in summary
+    assert "planner enqueued=7" in summary
+    assert "worker claimed=7" in summary
+    assert _gauge_value("weather_gc_pass_success", stage="purge") == 0.0
 
 
 # ===========================================================================
@@ -396,6 +497,7 @@ def _gauge_value(name: str, **labels: str) -> float | None:
 def test_gc_pipeline_pass_records_stage_metrics(monkeypatch):
     """One pass increments stage counters matching the mocked result fields."""
     from ingestion.monitoring.gc_metrics import snapshot_alert_state
+    from ingestion.monitoring.metrics import REGISTRY
 
     worker_mock = MagicMock(return_value=_worker_result())
     _patch_pipeline_stages(monkeypatch, worker=worker_mock)
@@ -420,7 +522,12 @@ def test_gc_pipeline_pass_records_stage_metrics(monkeypatch):
     assert "sweeper swept=1" in summary
 
     assert _counter_value("weather_gc_planner_enqueued_total") == enq_before + 7
-    assert _counter_value("weather_gc_planner_reclaimable_total") >= 9
+    # Reclaimable is an absolute per-pass state, published as a gauge: the
+    # planner recomputes the whole set every pass, so summing it (the retired
+    # weather_gc_planner_reclaimable_total counter) measured the poll rate
+    # rather than any reclaim pressure.
+    assert _gauge_value("weather_gc_planner_reclaimable_shards") == 9.0
+    assert REGISTRY.get("weather_gc_planner_reclaimable_total") is None
     assert _counter_value("weather_gc_worker_deleted_total") == del_before + 5
     assert _counter_value("weather_gc_worker_claimed_total") >= 7
     assert _counter_value("weather_gc_worker_markers_cleaned_total") >= 1
@@ -510,11 +617,16 @@ def test_gc_pipeline_pass_duration_histogram_has_stage_series(monkeypatch):
 
 def test_gc_metrics_exposed_in_registry_exposition(monkeypatch):
     """REGISTRY.generate_latest() exposes every gc metric family name."""
-    from ingestion.monitoring.gc_metrics import record_planner_pass, record_sweeper_pass
+    from ingestion.monitoring.gc_metrics import (
+        record_planner_pass,
+        record_purge_pass,
+        record_sweeper_pass,
+    )
     from ingestion.monitoring.metrics import REGISTRY
 
     record_planner_pass(enqueued_count=1, reclaimable_shards=1)
     record_sweeper_pass(swept_cycles=1, failed_cycles=0)
+    record_purge_pass(deleted_rows=1, oldest_remaining=None)
 
     exposition = REGISTRY.generate_latest()
     for name in (
@@ -522,13 +634,15 @@ def test_gc_metrics_exposed_in_registry_exposition(monkeypatch):
         "weather_gc_pass_success",
         "weather_gc_pass_last_success_timestamp",
         "weather_gc_planner_enqueued_total",
-        "weather_gc_planner_reclaimable_total",
+        "weather_gc_planner_reclaimable_shards",
         "weather_gc_worker_claimed_total",
         "weather_gc_worker_deleted_total",
         "weather_gc_worker_failed_total",
         "weather_gc_worker_markers_cleaned_total",
         "weather_gc_sweeper_swept_total",
         "weather_gc_sweeper_failed_total",
+        "weather_gc_purge_deleted_rows_total",
+        "weather_gc_purge_oldest_remaining_age_seconds",
         "weather_gc_inventory_orphans",
         "weather_gc_inventory_last_success_timestamp",
         "weather_gc_inventory_errors_total",
