@@ -381,6 +381,19 @@ class ReclamationQueue(Base):  # type: ignore[misc]  # declarative_base() is Any
             "status",
         ),
         Index("idx_reclamation_model_cycle", "model_id", "cycle_time", "lead_time_hours"),
+        # Serving physical-fence filter (resolver / availability): correlated
+        # NOT EXISTS on (run_id, lead_time_hours, variable_code, target_kind,
+        # status). No other index covers that combination, so without it every
+        # serving query sequentially scanned the (append-mostly, unbounded)
+        # queue. See migration 010.
+        Index(
+            "idx_reclamation_serving_fence",
+            "run_id",
+            "lead_time_hours",
+            "variable_code",
+            "target_kind",
+            "status",
+        ),
     )
 
 
