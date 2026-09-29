@@ -185,14 +185,11 @@ cd services/ingestion
 uv run --no-sync weather-ingest gc --once
 
 # Continuous daemon mode (includes the scheduled store<->catalog orphan
-# inventory stage, default every 24h; 0 disables; never reaps automatically).
-# --enable-purge adds the terminal-row queue purge (see 4.4.1) because the
-# reclamation_queue is otherwise never trimmed on a platform younger than one
-# 240h forecast horizon.
-uv run --no-sync weather-ingest gc --interval-seconds 1800 --enable-planner --enable-sweeper --enable-purge
+# inventory stage, default every 24h; 0 disables; never reaps automatically):
+uv run --no-sync weather-ingest gc --interval-seconds 1800 --enable-planner --enable-sweeper
 
 # Daemon with an in-process GC metrics endpoint (stage durations, pass
-# success, planner/worker/sweeper/purge/inventory counters) for Prometheus:
+# success, planner/worker/sweeper/inventory counters) for Prometheus:
 uv run --no-sync weather-ingest gc --metrics-host 127.0.0.1 --metrics-port 9114
 ```
 The scheduled orphan inventory (`--inventory-interval-hours`, env fallback
@@ -202,48 +199,33 @@ one-shot command. See `docs/RUNBOOKS.md` section 8 for the operational runbook.
 
 #### 4.4.1 `reclamation_queue` capacity maintenance
 
-The queue is append-mostly: the planner enqueues shard targets and the worker
-marks them `deleted`, but nothing removes the rows afterwards. Terminal
-(`deleted`) rows were previously deleted only as a side effect of the per-cycle
-metadata sweeper — and that path requires the cycle to be tombstoned first,
-which requires its whole 240 h horizon to have expired. On a platform younger
-than that horizon no cycle is ever tombstoned, so terminal rows accumulate
-without bound and every serving query's physical-fence filter has to scan a
-table that keeps growing.
-
-**Steady state:** run the purge as a GC stage, not by hand:
+The queue is append-mostly: the planner enqueues shard targets faster than the
+worker deletes them, and terminal (`deleted`) rows were previously removed only
+as a side effect of the per-cycle metadata sweeper. Left alone the table grows
+without bound, and its dead tuples are what the store-gate and claim scans then
+have to fight. Two operator actions keep it bounded:
 
 ```bash
 cd services/ingestion
-# Added to the daemon command (see 4.4). Retention defaults to 1 day; override
-# with --purge-retention-days N or RECLAMATION_PURGE_RETENTION_DAYS.
-uv run --no-sync weather-ingest gc --interval-seconds 1800 \
-  --enable-planner --enable-sweeper --enable-purge
-```
-
-A terminal row older than the window is audit residue: the physical object is
-already gone. Bounded batches (`RECLAMATION_PURGE_BATCH_SIZE`, default 5000) keep
-every transaction short so autovacuum can absorb the dead tuples.
-
-**One-shot operator actions:**
-
-```bash
-cd services/ingestion
-uv run --no-sync weather-ingest reclamation purge --older-than-days 1
+# Delete terminal rows whose physical deletion succeeded more than N days ago.
+# Bounded batches (RECLAMATION_PURGE_BATCH_SIZE, default 5000) keep every
+# transaction short so autovacuum can absorb the dead tuples.
+uv run --no-sync weather-ingest reclamation purge --older-than-days 14
 
 # Add --vacuum to run VACUUM (ANALYZE) reclamation_queue on an autocommit
-# connection immediately afterwards.
-uv run --no-sync weather-ingest reclamation purge --older-than-days 1 --vacuum
+# connection immediately afterwards. Prefer this over relying on autovacuum:
+# this is exactly the table whose autovacuum a long-lived open transaction
+# blocks.
+uv run --no-sync weather-ingest reclamation purge --older-than-days 14 --vacuum
 
 # Bound a single run when the backlog is large.
-uv run --no-sync weather-ingest reclamation purge --older-than-days 1 --max-batches 20
+uv run --no-sync weather-ingest reclamation purge --older-than-days 14 --max-batches 20
 ```
 
 `failed` rows are never purged (they are operator-visible quarantine evidence —
 use `weather-ingest reclamation requeue`), and `queued`/`deleting` rows are live
-work. Watch `weather_gc_purge_oldest_remaining_age_seconds`: it must stay near
-the configured window. If it climbs, terminal rows are being produced faster
-than the purge removes them (or the stage is not enabled).
+work. Watch `weather_reclamation_queue_count{status="deleted"}`: it must fall
+after the first maintenance run and stay flat once a schedule is in place.
 
 **VACUUM must not run inside a transaction.** `--vacuum` opens a fresh autocommit
 connection for exactly this reason; running
@@ -251,26 +233,6 @@ connection for exactly this reason; running
 by hand is equally fine. Partitioning the queue (by `cycle_time`) is
 deliberately *not* implemented: it is a schema change and the observed growth
 does not require it once terminal rows are purged.
-
-**VACUUM reclaims the heap, not the indexes.** Every queue row transitions
-`queued → deleting → deleted`, and `status` is the trailing column of five
-indexes, so none of those updates can be HOT. Dead index entries are reused but
-never returned to the filesystem: in production `idx_reclamation_physical_fence`
-had grown to 87 MB holding 29% live data. When
-`weather_postgres_table_size_bytes{table_name="reclamation_queue"}` stays high
-after the purge, reindex:
-
-```sql
-REINDEX INDEX CONCURRENTLY idx_reclamation_physical_fence;
--- repeat per index, then: VACUUM (ANALYZE) reclamation_queue;
-```
-
-**Serving-fence index.** The serving paths (`api.services.resolver`,
-`api.services.availability`) filter shards with a correlated `NOT EXISTS` on
-`(run_id, lead_time_hours, variable_code, target_kind, status)`. Migration
-`010_reclamation_fence_idx` adds `idx_reclamation_serving_fence` for exactly that
-predicate; without it the filter was a sequential scan of the whole queue on
-every serving query.
 
 If autovacuum still makes no progress, check `pg_stat_activity` for
 `idle in transaction` sessions holding the xmin horizon. Each ingestion daemon

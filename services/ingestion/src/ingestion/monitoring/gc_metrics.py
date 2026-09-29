@@ -20,15 +20,9 @@ results carry no per-model split, so no ``model`` label is exposed):
 - ``weather_gc_pass_last_success_timestamp`` (gauge, stage): Unix time of the
   stage's last successful execution.
 - ``weather_gc_planner_enqueued_total`` (counter): cumulative shard targets
-  enqueued (``ReclamationPlanResult.enqueued_count``) — a true per-pass
-  increment, so it sums.
-- ``weather_gc_planner_reclaimable_shards`` (gauge): the LATEST pass's
-  reclaimable shard count (``ReclamationPlanResult.reclaimable_shards``). The
-  planner recomputes this absolute set every pass, so it is a state reading and
-  is deliberately not a counter: the retired
-  ``weather_gc_planner_reclaimable_total`` counter added the whole queue size on
-  every pass and was read in Grafana as a rising "reclaim pressure" line that
-  measured only the poll rate.
+  enqueued (``ReclamationPlanResult.enqueued_count``).
+- ``weather_gc_planner_reclaimable_total`` (counter): cumulative reclaimable
+  shards reported (``ReclamationPlanResult.reclaimable_shards``).
 - ``weather_gc_worker_claimed_total`` / ``weather_gc_worker_deleted_total`` /
   ``weather_gc_worker_failed_total`` (counters): worker pass outcomes
   (``ReclamationWorkerResult.claimed_count`` / ``deleted_count`` /
@@ -38,10 +32,6 @@ results carry no per-model split, so no ``model`` label is exposed):
 - ``weather_gc_sweeper_swept_total`` / ``weather_gc_sweeper_failed_total``
   (counters): sweeper pass outcomes (``SweeperPassResult.swept_cycles`` /
   ``failed_cycles``).
-- ``weather_gc_purge_deleted_rows_total`` (counter) and
-  ``weather_gc_purge_oldest_remaining_age_seconds`` (gauge): scheduled
-  terminal-row purge outcomes (``QueuePurgeResult.deleted_rows`` and the age of
-  the oldest surviving terminal row; -1 when none remains).
 - ``weather_gc_inventory_orphans`` (gauge, beyond_frontier): orphan store
   count from the latest orphan inventory pass (store <-> catalog
   reconciliation, architecture doc section 9).
@@ -59,7 +49,6 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import Iterator
 
 from ingestion.monitoring.metrics import REGISTRY, Counter, Gauge, Histogram
@@ -97,13 +86,10 @@ GC_PLANNER_ENQUEUED_TOTAL: Counter = REGISTRY.counter(
     "(ReclamationPlanResult.enqueued_count)",
 )
 
-GC_PLANNER_RECLAIMABLE_SHARDS: Gauge = REGISTRY.gauge(
-    "weather_gc_planner_reclaimable_shards",
-    "Reclaimable shards in the latest planner pass "
-    "(ReclamationPlanResult.reclaimable_shards). This is an absolute queue "
-    "state, not a per-pass increment: the planner recomputes the full "
-    "reclaimable set every pass, so it cannot be summed and must not be "
-    "exposed as a counter.",
+GC_PLANNER_RECLAIMABLE_TOTAL: Counter = REGISTRY.counter(
+    "weather_gc_planner_reclaimable_total",
+    "Cumulative reclaimable shards reported by the planner stage "
+    "(ReclamationPlanResult.reclaimable_shards)",
 )
 
 GC_WORKER_CLAIMED_TOTAL: Counter = REGISTRY.counter(
@@ -140,19 +126,6 @@ GC_SWEEPER_FAILED_TOTAL: Counter = REGISTRY.counter(
     "weather_gc_sweeper_failed_total",
     "Cumulative cycles that failed the metadata sweeper pass "
     "(SweeperPassResult.failed_cycles)",
-)
-
-GC_PURGE_DELETED_TOTAL: Counter = REGISTRY.counter(
-    "weather_gc_purge_deleted_rows_total",
-    "Cumulative terminal (deleted) reclamation_queue rows removed by the "
-    "scheduled queue-purge stage (QueuePurgeResult.deleted_rows)",
-)
-
-GC_PURGE_OLDEST_REMAINING_AGE_SECONDS: Gauge = REGISTRY.gauge(
-    "weather_gc_purge_oldest_remaining_age_seconds",
-    "Age of the oldest terminal reclamation_queue row still present after the "
-    "latest queue-purge pass; -1 when no terminal row remains. A rising value "
-    "means the purge is not keeping up with terminal-row production.",
 )
 
 # ---------------------------------------------------------------------------
@@ -202,17 +175,9 @@ def gc_stage_timer(stage: str) -> Iterator[None]:
 
 
 def record_planner_pass(*, enqueued_count: int, reclaimable_shards: int) -> None:
-    """Record one planner pass: a cumulative enqueue counter and a state gauge.
-
-    ``enqueued_count`` is a genuine per-pass increment (rows the planner newly
-    queued), so it accumulates. ``reclaimable_shards`` is the pass's absolute
-    reclaimable set, recomputed from scratch every pass, so it is published as
-    a gauge — summing it (the previous ``weather_gc_planner_reclaimable_total``
-    counter) made the series grow by the entire queue size every pass and
-    measured nothing.
-    """
+    """Increment planner-stage counters from one ``ReclamationPlanResult``."""
     GC_PLANNER_ENQUEUED_TOTAL.inc(max(0, int(enqueued_count)))
-    GC_PLANNER_RECLAIMABLE_SHARDS.set(max(0, int(reclaimable_shards)))
+    GC_PLANNER_RECLAIMABLE_TOTAL.inc(max(0, int(reclaimable_shards)))
 
 
 def record_worker_pass(
@@ -237,29 +202,6 @@ def record_sweeper_pass(*, swept_cycles: int, failed_cycles: int) -> None:
     GC_SWEEPER_SWEPT_TOTAL.inc(max(0, int(swept_cycles)))
     GC_SWEEPER_FAILED_TOTAL.inc(max(0, int(failed_cycles)))
     _set_alert_state("sweeper_failed_total", max(0, int(failed_cycles)))
-
-
-def record_purge_pass(
-    *,
-    deleted_rows: int,
-    oldest_remaining: datetime | None,
-    now: datetime | None = None,
-) -> None:
-    """Record one scheduled queue-purge pass.
-
-    ``oldest_remaining`` is aged against the wall clock rather than reported as
-    a raw timestamp so the gauge is directly comparable to the configured
-    retention window: a value far above ``RECLAMATION_PURGE_RETENTION_DAYS``
-    means terminal rows are accumulating faster than the stage removes them.
-    """
-    GC_PURGE_DELETED_TOTAL.inc(max(0, int(deleted_rows)))
-    if oldest_remaining is None:
-        GC_PURGE_OLDEST_REMAINING_AGE_SECONDS.set(-1.0)
-        return
-    reference = now if now is not None else datetime.now(timezone.utc)
-    GC_PURGE_OLDEST_REMAINING_AGE_SECONDS.set(
-        max(0.0, (reference - oldest_remaining).total_seconds())
-    )
 
 
 def record_inventory_pass(

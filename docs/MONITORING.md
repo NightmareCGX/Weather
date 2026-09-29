@@ -48,7 +48,7 @@ The monitoring system provides continuous, non-intrusive observability across th
 3. **Cardinality Safety (TASK 26):** Metric labels are strictly bounded to small enums (e.g. `model="gfs"|"gefs"`, `phase="download"|"decode"|"write"|"finalize"`, `status="queued"|"deleting"|"deleted"|"failed"`). Unbounded dimensions (cycle timestamps, run IDs, S3 paths) are excluded from Prometheus metric labels and routed exclusively to diagnostic snapshots and structured logs.
 4. **Cost-Class Separation (TASK 25):**
    - **Fast Metrics (15–60s):** Process CPU, RSS, threads, tasks, connection pool checked-out counts, in-flight pipeline progress counters.
-   - **Medium Health Checks (2–5m):** Ingestion lag, stuck pipeline detectors, database table sizes and dead tuples, deletion claim ages, retention sweeper backlogs, reclamation-queue terminal-row age.
+   - **Medium Health Checks (2–5m):** Ingestion lag, stuck pipeline detectors, database table sizes and dead tuples, deletion claim ages, retention sweeper backlogs.
    - **Deep Audits (15–30m or on-demand):** Anti-resurrection cross-catalog audits, invariant checks, store consistency validation.
 
 ### 1.1 Process-Local Prometheus Scraping Topology
@@ -174,9 +174,6 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
 | `weather_reclamation_oldest_queued_age_seconds` | Gauge | Age in seconds of oldest queued reclamation target | - | Medium |
 | `weather_reclamation_oldest_deleting_age_seconds` | Gauge | Age in seconds of oldest leased deleting target | - | Medium |
 | `weather_reclamation_oldest_failed_age_seconds` | Gauge | Age in seconds of oldest quarantined failed target | - | Medium |
-| `weather_gc_planner_reclaimable_shards` | Gauge | Reclaimable shards in the **latest** planner pass. This is an absolute queue state — the planner recomputes the whole reclaimable set every pass — so it is a gauge and must never be `rate()`d or summed. The retired `weather_gc_planner_reclaimable_total` counter added the entire queue size on every pass (every 5 min at production cadence), which rendered in Grafana as a steady rising "reclaim pressure" line that measured only the poll rate. | - | Fast |
-| `weather_gc_purge_deleted_rows_total` | Counter | Cumulative terminal (`deleted`) `reclamation_queue` rows removed by the scheduled queue-purge stage | - | Fast |
-| `weather_gc_purge_oldest_remaining_age_seconds` | Gauge | Age of the oldest terminal queue row still present after the latest purge pass; `-1` when none remains. Compare against `RECLAMATION_PURGE_RETENTION_DAYS`: a persistent value far above the window means terminal rows are produced faster than the purge removes them. | - | Fast |
 | `weather_lifecycle_invariant_violations_count` | Gauge | Number of detected lifecycle state transition violations | - | Deep |
 | `weather_anti_resurrection_violations_count` | Gauge | Number of active or recreated runs under permanent tombstones | - | Deep |
 
@@ -443,7 +440,7 @@ Grafana never talks to the Weather Platform directly, and never reaches a remote
 | Weather API | `8000` | Actual API service (serves `GET /v1/metrics`) |
 | Ingestion metrics exporter | `9112` | Actual ingestion exporter (serves `GET /metrics`) |
 | Realtime daemon pipeline metrics | `9113` | Optional in-process metrics of `weather-ingest realtime --metrics-port 9113` (live stage latencies, throughput, storage operations) |
-| GC daemon pipeline metrics | `9114` | Optional in-process metrics of `weather-ingest gc --metrics-port 9114` (GC stage durations, pass success, planner/worker/sweeper/purge/inventory counters) |
+| GC daemon pipeline metrics | `9114` | Optional in-process metrics of `weather-ingest gc --metrics-port 9114` (GC stage durations, pass success, planner/worker/sweeper/inventory counters) |
 | Nginx gateway exporter | `9115` | `weather_nginx_exporter` (compose `monitoring`/`full` profile) exposing gateway stub_status metrics scraped from the gateway's `/nginx_status` |
 | SSH forwarded remote API | `18000` | Local listener tunneling to remote `127.0.0.1:8000` |
 | SSH forwarded remote ingestion | `18112` | Local listener tunneling to remote `127.0.0.1:9112` |
@@ -454,9 +451,7 @@ The former `19100` convention is deprecated and must not appear in new documenta
 
 **Ingestion pipeline metrics topology:** stage-latency, throughput, storage-operation, and member-completeness counters are strictly **process-local to the ingestion worker that executes the waves**. The standalone exporter (9112) is a separate probe process and never holds them. To make pipeline metrics scrapable, the long-running `weather-ingest realtime` daemon can serve its own live registry via `--metrics-port` (bound to `--metrics-host`, loopback by default); Prometheus then scrapes this process directly (target `:9113`). Short-lived `weather-ingest ingest` batch processes cannot be scraped this way — their counters live and die with the process.
 
-**GC pipeline metrics topology (same pattern):** the GC pass metrics (`weather_gc_pass_duration_seconds`, `weather_gc_pass_success`, `weather_gc_planner_*`, `weather_gc_worker_*`, `weather_gc_sweeper_*`, `weather_gc_purge_*`, `weather_gc_inventory_*` — defined in `ingestion/monitoring/gc_metrics.py`) are strictly **process-local to the GC daemon**. The standalone exporter (9112) never holds them. Serve them with `weather-ingest gc --metrics-port 9114` (daemon mode only) so Prometheus can scrape the GC process directly (target `:9114`).
-
-**Counter vs. gauge in the GC pass metrics:** every stage counter here tracks a genuine per-pass increment except `weather_gc_planner_reclaimable_shards`, which is the pass's absolute reclaimable set and is therefore a gauge. When adding a stage metric, ask whether the value is "how much did this pass do" (counter) or "what is the state after this pass" (gauge); publishing an absolute state as a counter makes the series advance by the whole state every pass, which reads as runaway growth while measuring nothing.
+**GC pipeline metrics topology (same pattern):** the GC pass metrics (`weather_gc_pass_duration_seconds`, `weather_gc_pass_success`, `weather_gc_planner_*`, `weather_gc_worker_*`, `weather_gc_sweeper_*`, `weather_gc_inventory_*` — defined in `ingestion/monitoring/gc_metrics.py`) are strictly **process-local to the GC daemon**. The standalone exporter (9112) never holds them. Serve them with `weather-ingest gc --metrics-port 9114` (daemon mode only) so Prometheus can scrape the GC process directly (target `:9114`).
 
 ### 7.2 Local vs Remote Mode
 
