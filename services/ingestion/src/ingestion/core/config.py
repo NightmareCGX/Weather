@@ -337,16 +337,6 @@ class IngestionSettings(BaseSettings):
     #: small so every purge transaction stays short and autovacuum can absorb
     #: the dead tuples instead of one long row-locking DELETE.
     RECLAMATION_PURGE_BATCH_SIZE: int = 5000
-    #: Automatic purge wiring for the gc daemon: delete terminal (``deleted``)
-    #: reclamation_queue rows older than ``RECLAMATION_PURGE_RETENTION_DAYS``
-    #: after each pass. The queue is append-mostly, so without a scheduled purge
-    #: the table grows without bound until the 14-day metadata sweeper happens to
-    #: touch a cycle (which requires the cycle to be tombstoned first).
-    RECLAMATION_PURGE_ENABLED: bool = False
-    #: Retention window (days) for terminal queue rows. A ``deleted`` row older
-    #: than this is audit residue: the physical object is gone and the cycle
-    #: metadata is either still needed or owned by the metadata sweeper.
-    RECLAMATION_PURGE_RETENTION_DAYS: float = 1.0
     #: Base exponential backoff (seconds) for failed reclamation attempts.
     RECLAMATION_BASE_BACKOFF_SECONDS: float = 2.0
     #: Detailed metadata retention window in days before sweeping (default: 1 day).
@@ -589,12 +579,6 @@ class IngestionSettings(BaseSettings):
         if purge_batch < 1:
             raise ValueError(
                 f"RECLAMATION_PURGE_BATCH_SIZE must be >= 1, got {purge_batch}"
-            )
-        purge_days = float(self.RECLAMATION_PURGE_RETENTION_DAYS)
-        if purge_days < 0.0:
-            raise ValueError(
-                "RECLAMATION_PURGE_RETENTION_DAYS must be >= 0.0, got "
-                f"{purge_days}"
             )
         retention_days = int(self.METADATA_RETENTION_DAYS)
         if retention_days < 0:

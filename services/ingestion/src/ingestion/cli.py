@@ -733,24 +733,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "bookkeeping pass (daemon mode). Also enabled via RECLAMATION_SWEEPER_ENABLED=true.",
     )
     gc.add_argument(
-        "--enable-purge",
-        action="store_true",
-        help="Run the terminal-row reclamation_queue purge after each pass "
-        "(capacity maintenance: the queue is append-mostly and its terminal "
-        "rows are never removed otherwise until the metadata sweeper reaches the "
-        "cycle). Database-only — no object storage is touched. Also enabled via "
-        "RECLAMATION_PURGE_ENABLED=true.",
-    )
-    gc.add_argument(
-        "--purge-retention-days",
-        type=float,
-        default=None,
-        help="Retention window in days for terminal ('deleted') queue rows removed "
-        "by the purge stage (default 1.0 or $RECLAMATION_PURGE_RETENTION_DAYS). "
-        "A terminal row past this window is audit residue: the physical object is "
-        "already gone.",
-    )
-    gc.add_argument(
         "--sweep-metadata",
         action="store_true",
         help="Execute M3 14-day detailed metadata retention sweeper pass.",
@@ -1243,11 +1225,9 @@ def _gc_pipeline_pass(
     enable_sweeper: bool,
     batch_size: int,
     retention_days: int | None = None,
-    enable_purge: bool = False,
-    purge_retention_days: float | None = None,
     dry_run: bool = False,
 ) -> str:
-    """Execute one full V3 GC pipeline pass: bookkeeping -> planner -> worker -> sweeper -> purge.
+    """Execute one full V3 GC pipeline pass: bookkeeping -> planner -> worker -> sweeper.
 
     This is the automated wiring of the ``planner -> worker -> bookkeeping``
     mainline: the gc daemon (or a cron-invoked ``--once`` run) drives every
@@ -1259,12 +1239,6 @@ def _gc_pipeline_pass(
       staging mode.
     * ``enable_delete`` — authorizes the worker stage to physically delete
       enqueued shard targets.
-
-    ``enable_purge`` adds a final capacity stage: terminal ``deleted`` queue rows
-    past ``purge_retention_days`` are removed (see :func:`_gc_purge_stage`). It
-    is a database-only action — no object storage is touched — so it does not
-    participate in the deletion authorization above, but it is still opt-in so
-    the daemon's default behavior stays non-destructive.
 
     Each stage is failure-isolated: a stage error is logged and the pass
     continues with the next stage so a transient DB/S3 fault cannot kill the
@@ -1363,70 +1337,7 @@ def _gc_pipeline_pass(
             logger.exception("GC sweeper stage failed")
             parts.append(f"sweeper=ERROR({type(exc).__name__})")
 
-    if enable_purge and not dry_run:
-        try:
-            parts.append(
-                _gc_purge_stage(
-                    retention_days=(
-                        float(purge_retention_days)
-                        if purge_retention_days is not None
-                        else float(settings.RECLAMATION_PURGE_RETENTION_DAYS)
-                    ),
-                    batch_size=int(settings.RECLAMATION_PURGE_BATCH_SIZE),
-                )
-            )
-        except Exception as exc:
-            logger.exception("GC purge stage failed")
-            parts.append(f"purge=ERROR({type(exc).__name__})")
-
     return "; ".join(parts)
-
-
-def _gc_purge_stage(
-    *,
-    retention_days: float,
-    batch_size: int,
-) -> str:
-    """Run one scheduled terminal-row purge and return its summary fragment.
-
-    The queue is append-mostly: the planner enqueues shard targets and the worker
-    marks them ``deleted``, but nothing removes the rows afterwards. The
-    per-cycle metadata sweeper only deletes them as a side effect of purging a
-    cycle's metadata, and that requires the cycle to be tombstoned first —
-    which requires its whole 240h horizon to have expired. On a young platform
-    that never happens, so terminal rows accumulate forever and the table's
-    indexes are what the store-gate and claim scans then have to fight.
-
-    Only terminal ``deleted`` rows past ``retention_days`` are removed: ``failed``
-    rows are operator-visible quarantine evidence (``reclamation requeue``), and
-    ``queued``/``deleting`` rows are live work. Bounded batches keep every
-    transaction short so autovacuum can absorb the dead tuples.
-    """
-    from ingestion.core.db import SessionLocal
-    from ingestion.gc.worker import purge_reclaimed_queue_rows
-    from ingestion.monitoring.gc_metrics import (
-        gc_stage_timer,
-        record_purge_pass,
-    )
-
-    with gc_stage_timer("purge"):
-        with SessionLocal() as session:
-            res = purge_reclaimed_queue_rows(
-                session,
-                older_than_days=retention_days,
-                batch_size=batch_size,
-            )
-    record_purge_pass(
-        deleted_rows=res.deleted_rows,
-        oldest_remaining=res.oldest_remaining,
-    )
-    oldest = (
-        res.oldest_remaining.isoformat() if res.oldest_remaining is not None else "none"
-    )
-    return (
-        f"purge deleted={res.deleted_rows} batches={res.batches} "
-        f"oldest_remaining={oldest}"
-    )
 
 
 def _gc_inventory_stage(
@@ -1643,14 +1554,6 @@ def _run_gc(args: argparse.Namespace) -> int:
     enable_planner = bool(args.enable_planner) or bool(ingest_settings.RECLAMATION_PLANNER_ENABLED)
     enable_delete = bool(args.enable_delete) or bool(ingest_settings.RECLAMATION_DELETE_ENABLED)
     enable_sweeper = bool(args.enable_sweeper) or bool(ingest_settings.RECLAMATION_SWEEPER_ENABLED)
-    enable_purge = bool(getattr(args, "enable_purge", False)) or bool(
-        ingest_settings.RECLAMATION_PURGE_ENABLED
-    )
-    purge_retention_days = (
-        float(args.purge_retention_days)
-        if getattr(args, "purge_retention_days", None) is not None
-        else float(ingest_settings.RECLAMATION_PURGE_RETENTION_DAYS)
-    )
     retention_days = (
         int(args.metadata_retention_days)
         if getattr(args, "metadata_retention_days", None) is not None
@@ -1684,14 +1587,11 @@ def _run_gc(args: argparse.Namespace) -> int:
         return 0
 
     logger.info(
-        "GC daemon mode: planner=%s delete=%s sweeper=%s purge=%s "
-        "(purge_retention_days=%s) interval=%ss models=%s "
+        "GC daemon mode: planner=%s delete=%s sweeper=%s interval=%ss models=%s "
         "inventory_interval_hours=%s retention_days=%d",
         enable_planner,
         enable_delete,
         enable_sweeper,
-        enable_purge,
-        purge_retention_days,
         interval,
         models,
         inventory_hours,
@@ -1740,8 +1640,6 @@ def _run_gc(args: argparse.Namespace) -> int:
                 enable_sweeper=enable_sweeper,
                 batch_size=int(getattr(args, "batch_size", 50)),
                 retention_days=retention_days,
-                enable_purge=enable_purge,
-                purge_retention_days=purge_retention_days,
                 dry_run=False,
             )
             # Scheduled orphan inventory: appended to the pass summary at the

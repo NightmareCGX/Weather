@@ -418,18 +418,6 @@ class ReclamationQueueRecord(CatalogBase):  # type: ignore[misc]  # untyped base
             "status",
         ),
         Index("idx_reclamation_model_cycle", "model_id", "cycle_time", "lead_time_hours"),
-        # Serving physical-fence filter (api.services.resolver /
-        # api.services.availability): correlated NOT EXISTS on
-        # (run_id, lead_time_hours, variable_code, target_kind, status). Mirrors
-        # migration 010 so the catalogue schema and the migrated schema agree.
-        Index(
-            "idx_reclamation_serving_fence",
-            "run_id",
-            "lead_time_hours",
-            "variable_code",
-            "target_kind",
-            "status",
-        ),
     )
 
 

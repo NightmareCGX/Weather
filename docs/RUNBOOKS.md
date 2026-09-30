@@ -310,22 +310,12 @@ levels so deletion is always an explicit operator decision:
 | Planner | `--enable-planner` | `RECLAMATION_PLANNER_ENABLED=true` | Enqueue reclaimable shard targets into `reclamation_queue` each pass (queue writes only, no physical side effects). |
 | Worker | `--enable-delete` | `RECLAMATION_DELETE_ENABLED=true` | Physically delete enqueued shard targets each pass. **DANGEROUS.** |
 | Sweeper | `--enable-sweeper` | `RECLAMATION_SWEEPER_ENABLED=true` | Include the M3 14-day metadata retention pass each pass. |
-| Purge | `--enable-purge` | `RECLAMATION_PURGE_ENABLED=true` | Remove terminal (`deleted`) queue rows past `--purge-retention-days` (env `RECLAMATION_PURGE_RETENTION_DAYS`, default 1.0). Database-only capacity maintenance — no object storage is touched. |
 
 Recommended rollout: enable planner only, observe
 `GC pass: ... planner enqueued=N ...` summaries for at least one full
 interval, then enable `--enable-delete`. Each pass prints a structured
-summary (`bookkeeping ...; planner ...; worker ...; sweeper ...; purge ...`);
-stages are failure-isolated so a transient DB/S3 fault never kills the daemon.
-
-**Why the purge stage exists:** `reclamation_queue` is append-mostly. The only
-other path that ever removed a row was the metadata sweeper deleting a cycle's
-child records, and it can only reach a cycle after that cycle is tombstoned —
-which requires the cycle's entire 240 h horizon to have expired. On a platform
-younger than that horizon, *no* cycle is tombstoned, so terminal rows
-accumulate forever: every serving query's physical-fence filter then has to scan
-a table that never stops growing. `--enable-purge` is the steady-state fix; the
-one-shot `reclamation purge` command below remains the manual remedy.
+summary (`bookkeeping ...; planner ...; worker ...; sweeper ...`); stages are
+failure-isolated so a transient DB/S3 fault never kills the daemon.
 
 ### Scheduled Orphan Inventory (store <-> catalog reconciliation, architecture doc §9):
 In daemon mode the GC automatically runs one orphan inventory pass every
@@ -921,62 +911,3 @@ Verify that JSON serialization, Redis caching, and coordinate projections execut
   - Edge-path failure: restart/rebuild `weather_gateway`, verify upstream configuration (`GATEWAY_API_UPSTREAM` / `GATEWAY_FRONTEND_UPSTREAM`).
   - Certificate expiry: restart the gateway container to regenerate the self-signed certificate, or mount renewed production certificates.
   - Latency-budget warnings: cross-check §19.15 and gateway/cAdvisor telemetry before resizing the budget.
-
-### 19.19 Reclamation Queue Growth & Index Bloat (`#reclamation-queue-bloat`)
-* **Symptom:** `weather_postgres_table_size_bytes{table_name="reclamation_queue"}`
-  climbs without bound while `weather_gc_purge_deleted_rows_total` stays flat,
-  `weather_gc_purge_oldest_remaining_age_seconds` rises far past the configured
-  retention window, and serving latency degrades with
-  `weather_api_http_request_duration_seconds` on the forecast routes.
-* **Why it happens:** the queue is append-mostly. Rows are only removed by (a)
-  the scheduled purge stage (`--enable-purge`) or (b) the metadata sweeper
-  deleting a cycle's child records — and (b) only runs once the cycle is
-  tombstoned, which requires its entire 240 h horizon to have expired. On a
-  platform younger than that horizon nothing removes a terminal row, and every
-  serving query's physical-fence filter scans the growing table.
-* **Diagnostic Procedure:**
-  1. Confirm terminal rows are accumulating and that the purge stage is even on:
-     ```sql
-     SELECT status, count(*), min(reclaimed_at) FROM reclamation_queue GROUP BY status;
-     ```
-     and check the daemon log line for `... purge deleted=N ...`; a missing
-     `purge` fragment means `--enable-purge` / `RECLAMATION_PURGE_ENABLED` is off.
-  2. Compare the heap against the indexes — a purge frees the heap, but index
-     bloat only clears with a reindex:
-     ```sql
-     SELECT pg_size_pretty(pg_relation_size('reclamation_queue')) heap,
-            pg_size_pretty(pg_indexes_size('reclamation_queue')) idx;
-     SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) FROM
-       pg_stat_user_indexes WHERE relname = 'reclamation_queue' ORDER BY 2 DESC;
-     ```
-     `idx_reclamation_physical_fence` and `uq_reclamation_queue_target` are the
-     usual offenders because `status` is the trailing column of every index the
-     `queued→deleting→deleted` transition touches, which blocks HOT updates.
-  3. Verify the serving-fence index exists (migration `010_reclamation_fence_idx`):
-     ```sql
-     SELECT indexname FROM pg_indexes WHERE tablename = 'reclamation_queue'
-       AND indexname = 'idx_reclamation_serving_fence';
-     ```
-     Without it the serving filter is a sequential scan of the whole queue:
-     `EXPLAIN (ANALYZE, BUFFERS)` on a resolver query shows `Seq Scan on
-     reclamation_queue` with the full table in `Rows Removed by Filter`.
-* **Remediation:**
-  - Steady state — enable the purge stage (see `runbooks §Pipeline Wiring` and
-    `DEPLOYMENT.md §4.4.1`): `RECLAMATION_PURGE_ENABLED=true` or
-    `--enable-purge --purge-retention-days 1`.
-  - One-shot catch-up on a large backlog:
-    ```bash
-    weather-ingest reclamation purge --older-than-days 1 --vacuum
-    ```
-  - Index bloat (VACUUM does **not** return it to the filesystem):
-    ```sql
-    REINDEX INDEX CONCURRENTLY idx_reclamation_physical_fence;
-    -- repeat for the other affected indexes, then:
-    VACUUM (ANALYZE) reclamation_queue;
-    ```
-  - Apply any pending migration before assuming the index is missing.
-  - Do **not** interpret `weather_gc_planner_reclaimable_shards` as a growth
-    signal: it is the latest pass's absolute reclaimable set (a gauge), and it
-    is expected to track the catalog size. The retired
-    `weather_gc_planner_reclaimable_total` counter was read as a rising line
-    that only ever measured the poll rate.
