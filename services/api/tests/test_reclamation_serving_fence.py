@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from api.models.entities import (
     ForecastCenter,
+    ForecastGrid,
     ForecastProduct,
     ForecastVariable,
     Model,
@@ -33,6 +34,23 @@ from api.models.entities import (
 )
 from domain.reclamation import TARGET_KIND_DET, make_shard_relative_key
 from tests._zarr_writer import write_dataset
+
+
+def _ensure_grid(session) -> None:
+    """Seed the shared global_025deg grid row if absent (FK for forecast_products)."""
+    existing = session.execute(
+        select(ForecastGrid).where(ForecastGrid.grid_code == "global_025deg")
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(
+            ForecastGrid(
+                id="grid_global_025deg",
+                grid_code="global_025deg",
+                name="Global 0.25deg",
+                resolution_km=25.0,
+            )
+        )
+        session.flush()
 
 
 def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -498,3 +516,133 @@ def test_point_forecast_post_read_validation_cross_cycle_no_false_positive(
 
 
 
+
+
+def test_ledger_recorded_shard_is_fenced(migrated_db):
+    """A ledger-recorded (terminal) shard fences serving exactly like a queue row.
+
+    The worker sheds terminal queue rows into ``reclamation_ledger`` in the same
+    transaction; the serving fence must treat the ledger as the durable
+    "this unit is gone" record (docs/investigations/early-cycle-retirement/DESIGN.md
+    §B4).
+    """
+    from api.models.entities import ReclamationLedger
+    from api.services.resolver import check_physical_targets_fenced
+
+    # Distinct cycle time: migrated_db is module-scoped and other tests in
+    # this module already occupy 2026-09-04 06:00.
+    c = _dt(2026, 9, 4, 18)
+    p_key = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 0)
+
+    with Session(migrated_db) as session:
+        _ensure_grid(session)
+        run = _seed_gfs_run(session, c, "/store/dummy_ledger")
+        r_id = run.id
+
+        # No queue row at all — the ledger is the only terminal record.
+        session.add(
+            ReclamationLedger(
+                run_id=r_id,
+                lead_time_hours=0,
+                variable_code="temperature_2m",
+                target_kind="det",
+                deleted_members_mask=0,
+                store_path="/store/dummy_ledger",
+                reclaimed_at=_dt(2026, 9, 4, 20),
+                created_at=_dt(2026, 9, 4, 20),
+                updated_at=_dt(2026, 9, 4, 20),
+            )
+        )
+        session.commit()
+
+        # The det fence (check_physical_targets_fenced) reads the union.
+        fenced = check_physical_targets_fenced(session, [(r_id, p_key)])
+        assert (r_id, p_key) in fenced
+
+        # Without a ledger row the shard is servable (control).
+        session.execute(
+            ReclamationLedger.__table__.delete().where(
+                ReclamationLedger.run_id == r_id
+            )
+        )
+        session.commit()
+        assert check_physical_targets_fenced(session, [(r_id, p_key)]) == set()
+
+
+def test_ledger_member_mask_fences_ensemble_members(migrated_db):
+    """An aggregated ``mem`` ledger row fences exactly its masked members."""
+    from api.models.entities import (
+        EnsembleMemberProduct,
+        ReclamationLedger,
+        ReclamationQueue,
+    )
+    from sqlalchemy import func
+
+    # Distinct cycle time: migrated_db is module-scoped, so run ids must not
+    # collide with the other tests in this module.
+    c = _dt(2026, 9, 4, 12)
+    with Session(migrated_db) as session:
+        _ensure_grid(session)
+        run = _seed_gfs_run(session, c, "/store/dummy_mem")
+        # Surface the run as GEFS with a committed member matrix.
+        session.add(
+            EnsembleMemberProduct(
+                id=f"emp_{run.id}_m1", run_id=run.id, member_index=1, lead_time_hours=6
+            )
+        )
+        session.add(
+            EnsembleMemberProduct(
+                id=f"emp_{run.id}_m2", run_id=run.id, member_index=2, lead_time_hours=6
+            )
+        )
+        # Members 1 and 2 reclaimed → mask bits 1|2; member 3 untouched.
+        mask = (1 << 1) | (1 << 2)
+        session.add(
+            ReclamationLedger(
+                run_id=run.id,
+                lead_time_hours=6,
+                variable_code="temperature_2m",
+                target_kind="mem",
+                deleted_members_mask=mask,
+                store_path="/store/dummy_mem",
+                reclaimed_at=_dt(2026, 9, 4, 20),
+                created_at=_dt(2026, 9, 4, 20),
+                updated_at=_dt(2026, 9, 4, 20),
+            )
+        )
+        session.commit()
+
+        # In-flight queue rows fence through the queue branch (coexistence);
+        # the module-scoped schema may hold rows from sibling tests, so only
+        # assert on OUR run's rows.
+        in_flight = session.execute(
+            select(func.count()).select_from(ReclamationQueue).where(
+                ReclamationQueue.run_id == run.id
+            )
+        ).scalar_one()
+        assert in_flight == 0
+
+        # The availability member pre-query excludes exactly masked members:
+        # member 1 fenced, member 2 fenced, member 3 would remain servable.
+        fenced_members = {
+            m
+            for m in (1, 2, 3)
+            if session.execute(
+                select(ReclamationLedger.deleted_members_mask).where(
+                    ReclamationLedger.run_id == run.id,
+                    ReclamationLedger.lead_time_hours == 6,
+                    ReclamationLedger.target_kind == "mem",
+                )
+            ).scalar_one_or_none()
+            and int(
+                session.execute(
+                    select(ReclamationLedger.deleted_members_mask).where(
+                        ReclamationLedger.run_id == run.id,
+                        ReclamationLedger.lead_time_hours == 6,
+                        ReclamationLedger.target_kind == "mem",
+                    )
+                ).scalar_one()
+            )
+            & (1 << m)
+        }
+        assert fenced_members == {1, 2}

@@ -44,11 +44,13 @@ from sqlalchemy.orm import Session
 from domain.coverage import get_expected_members
 from domain.horizon import model_max_lead_hours
 from domain.lifecycle import is_cycle_horizon_expired
+from domain.reclamation import expand_ledger_units
 from domain.temporal import model_serving_start_valid_time
 from ingestion.core.catalog import (
     ForecastCycleLifecycleRecord,
     ModelRunRecord,
     ModelVersionRecord,
+    ReclamationLedgerRecord,
     ReclamationQueueRecord,
     _ensure_utc_datetime,
     _utcnow,
@@ -180,8 +182,9 @@ def claim_fresh_candidate(
     *,
     serving_start: datetime,
     claim_time: datetime | None = None,
+    allow_terminal: bool = False,
 ) -> bool:
-    """Atomically evaluate fresh horizon eligibility and commit deletion_started_at claim.
+    """Atomically evaluate fresh eligibility and commit deletion_started_at claim.
 
     The claim is the serving & mutation fence (Guarantee B): once committed, the
     API stops selecting the cycle, the planner treats its remaining units as
@@ -189,11 +192,23 @@ def claim_fresh_candidate(
     conservative derived fast-path (architecture doc §7.1) — it never
     authorizes physical deletion by itself.
 
+    Two eligibility paths (first match wins):
+
+    1. **Legacy horizon expiry**: ``cycle_time + max(leads) < serving_start`` —
+       the conservative derived fast-path, unchanged.
+    2. **Terminal-state retirement** (``allow_terminal``): every run of the
+       cycle is promoted (``ready``) and every committed reclamation unit is
+       physically gone. At a 6h cadence a cycle stops being a serving source
+       when the next cycle is ready, so the horizon wait stores bookkeeping
+       rows that serving can no longer read; see
+       docs/investigations/early-cycle-retirement/DESIGN.md.
+
     1. Ensures lifecycle row exists via race-safe upsert.
     2. Locks row with SELECT ... FOR UPDATE.
     3. Resolves all distinct model versions attached to ModelRuns for this cycle.
-    4. Evaluates conservative horizon: cycle_time + max(leads) < serving_start.
-    5. Stamps deletion_started_at and commits.
+    4. Evaluates conservative multi-version max lead.
+    5. Evaluates eligibility (horizon expiry, or terminal-state retirement).
+    6. Stamps deletion_started_at and commits.
 
     Returns True if claimed, False if ineligible or fail-closed.
     """
@@ -251,10 +266,22 @@ def claim_fresh_candidate(
         )
         return False
 
-    # 5. Strict horizon expiry check (strict < serving_start; == is NOT expired)
-    if not is_cycle_horizon_expired(
+    # 5. Eligibility. Strict horizon expiry (strict < serving_start; == is NOT
+    #    expired), or — flag-gated — terminal-state retirement. The E2 readiness
+    #    gate is what makes E3 safe: a cycle whose waves have not committed yet
+    #    has zero committed units and would read as *vacuously* terminal; a
+    #    promoted run means the committed-unit enumeration is complete. Both
+    #    checks run inside the row lock so the claim and its evidence agree.
+    claim_reason = "horizon_expired"
+    if is_cycle_horizon_expired(
         c_utc, max_lead_hours=max_lead, serving_start=serving_start
     ):
+        pass
+    elif allow_terminal and _all_cycle_runs_ready(
+        session, m_id, c_utc
+    ) and cycle_reclamation_units_terminal(session, m_id, c_utc):
+        claim_reason = "units_terminal"
+    else:
         return False
 
     # 6. Stamp claim
@@ -263,20 +290,48 @@ def claim_fresh_candidate(
     setattr(lc, "updated_at", now_utc)
     session.commit()
     logger.info(
-        "bookkeeping_cycle_claimed: model=%s cycle_time=%s versions=%s max_lead=%dh",
+        "bookkeeping_cycle_claimed: model=%s cycle_time=%s versions=%s "
+        "max_lead=%dh reason=%s",
         m_id,
         c_utc.isoformat(),
         versions,
         max_lead,
+        claim_reason,
         extra={
             "event": "bookkeeping_cycle_claimed",
             "model": m_id,
             "cycle_time": c_utc.isoformat(),
             "versions": versions,
             "max_lead_hours": max_lead,
+            "reason": claim_reason,
         },
     )
     return True
+
+
+def _all_cycle_runs_ready(session: Session, model_id: str, cycle_time: datetime) -> bool:
+    """Early-retirement E2: every run of the cycle is fully promoted.
+
+    Guards the trivially-terminal trap: a cycle whose run exists but whose
+    waves have not committed yet has zero committed units and would read as
+    vacuously terminal in ``cycle_reclamation_units_terminal``; readiness means
+    the committed-unit enumeration is complete, so "every committed unit is
+    reclaimed" is a meaningful statement.
+    """
+    not_ready = session.execute(
+        select(ModelRunRecord.id)
+        .join(
+            ModelVersionRecord,
+            ModelRunRecord.model_version_id == ModelVersionRecord.id,
+        )
+        .where(
+            ModelVersionRecord.model_id == model_id,
+            ModelRunRecord.cycle_time == cycle_time,
+            ModelRunRecord.status != "ready",
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    return not_ready is None
 
 
 def enumerate_cycle_store_paths(
@@ -328,8 +383,10 @@ def cycle_reclamation_units_terminal(
 
     Terminal means (architecture doc §0 invariant, I7/I16):
     - every committed unit (from forecast_products / ensemble_member_products,
-      enumerated with the same construction the planner uses) has a
-      ``reclamation_queue`` row in status ``deleted``;
+      enumerated with the same construction the planner uses) is recorded as
+      physically reclaimed — a ``reclamation_queue`` row in status ``deleted``
+      (pre-ledger rows, coexistence) or a ``reclamation_ledger`` row covering
+      it;
     - no queue row for the cycle remains in a non-terminal status
       (queued / deleting / failed).
 
@@ -378,9 +435,28 @@ def cycle_reclamation_units_terminal(
     units = enumerate_committed_unit_tuples(
         session, run_ids=run_ids, is_ensemble=is_ensemble
     )
+    # Units recorded in the reclamation ledger are physically gone — the
+    # ledger is the post-migration terminal record; queue ``deleted`` rows are
+    # the pre-ledger coexistence record. Either satisfies I7/I16.
+    ledger_rows = session.execute(
+        select(
+            ReclamationLedgerRecord.run_id,
+            ReclamationLedgerRecord.lead_time_hours,
+            ReclamationLedgerRecord.variable_code,
+            ReclamationLedgerRecord.target_kind,
+            ReclamationLedgerRecord.deleted_members_mask,
+        ).where(ReclamationLedgerRecord.run_id.in_(run_ids))
+    ).all()
+    ledger_units = expand_ledger_units(
+        (str(r), int(ld), str(v), str(k), int(mask))
+        for r, ld, v, k, mask in ledger_rows
+    )
     for unit in units:
-        if status_by_unit.get(unit) != "deleted":
-            return False
+        if status_by_unit.get(unit) == "deleted":
+            continue
+        if unit in ledger_units:
+            continue
+        return False
     return True
 
 
@@ -484,6 +560,8 @@ def finalize_cycle_bookkeeping(
 
     # Step 1: Fresh eligibility claim (skipped for recovery candidates)
     if not is_recovery:
+        from ingestion.core.config import settings
+
         with Session(engine) as session:
             claimed = claim_fresh_candidate(
                 session,
@@ -491,6 +569,9 @@ def finalize_cycle_bookkeeping(
                 c_utc,
                 serving_start=serving_start,
                 claim_time=now_utc,
+                allow_terminal=bool(
+                    getattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", False)
+                ),
             )
             if not claimed:
                 return False

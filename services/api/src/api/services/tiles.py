@@ -562,7 +562,13 @@ def render_tile_png(
 
         t_kind = "mean" if context.expected_members > 1 else "det"
         rel_key = make_shard_relative_key(variable, t_kind, context.lead_time_hours)
-        _verify_fencing_with_single_flight(context.store_path, rel_key)
+        _verify_fencing_with_single_flight(
+            context.store_path,
+            rel_key,
+            variable_code=variable,
+            target_kind=t_kind,
+            lead_time_hours=context.lead_time_hours,
+        )
     except HTTPException:
         raise
     except Exception:
@@ -923,15 +929,28 @@ def _fencing_mark_verified(store_path: str, rel_key: str) -> None:
                 pass
 
 
-def _verify_fencing_with_single_flight(store_path: str, rel_key: str) -> None:
+def _verify_fencing_with_single_flight(
+    store_path: str,
+    rel_key: str,
+    *,
+    variable_code: str,
+    target_kind: str,
+    lead_time_hours: int,
+) -> None:
     """Verify that a physical shard is not currently being reclaimed, using Single-Flight.
 
     Ensures that concurrent tile requests for the exact same shard
     collapse into a single database query to reclamation_queue, preventing
     database connection pool stampedes during viewport cold loads.
+
+    Fenced means the shard is gone or going: a ``reclamation_queue`` row in a
+    non-ready state (in-flight; the queue no longer retains terminal rows) or a
+    ``reclamation_ledger`` row for the same (store, variable, kind, lead) — the
+    worker's durable terminal record. ``det``/``mean`` shard identity is the
+    ledger row itself; the tile path never addresses ``mem`` shards.
     """
     from api.core.database import SessionLocal
-    from api.models.entities import ReclamationQueue
+    from api.models.entities import ReclamationLedger, ReclamationQueue
 
     # Fast path: check in-memory TTL cache without allocating a flight lock
     if _fencing_recently_verified(store_path, rel_key):
@@ -958,6 +977,27 @@ def _verify_fencing_with_single_flight(store_path: str, rel_key: str) -> None:
                         ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
                     )
                 ).scalars().all()
+                if not fenced_shards:
+                    has_ledger = True
+                    try:
+                        bind = check_session.get_bind()
+                        if bind.dialect.name == "sqlite":
+                            from sqlalchemy import inspect
+
+                            has_ledger = inspect(bind).has_table("reclamation_ledger")
+                    except Exception:
+                        has_ledger = False
+                    if has_ledger:
+                        ledger_hit = check_session.execute(
+                            select(ReclamationLedger.variable_code).where(
+                                ReclamationLedger.store_path == store_path,
+                                ReclamationLedger.variable_code == variable_code,
+                                ReclamationLedger.target_kind == target_kind,
+                                ReclamationLedger.lead_time_hours == lead_time_hours,
+                            )
+                        ).scalar_one_or_none()
+                        if ledger_hit is not None:
+                            fenced_shards = [ledger_hit]
                 if fenced_shards:
                     raise HTTPException(
                         status_code=404,
@@ -1487,7 +1527,7 @@ def _resolve_run_store_path(
 
     fenced_vars: set[tuple[str, str, int]] = set()
     try:
-        from api.models.entities import ReclamationQueue
+        from api.models.entities import ReclamationLedger, ReclamationQueue
 
         q_rows = db.execute(
             select(
@@ -1501,6 +1541,29 @@ def _resolve_run_store_path(
             )
         ).all()
         fenced_vars = {(str(r), str(v), int(m)) for r, v, m in q_rows}
+        # Terminal record: det/mean ledger rows fence their member directly
+        # (0 / -1); a mem row fences each member whose mask bit is set.
+        l_rows = db.execute(
+            select(
+                ReclamationLedger.run_id,
+                ReclamationLedger.variable_code,
+                ReclamationLedger.target_kind,
+                ReclamationLedger.deleted_members_mask,
+            ).where(
+                ReclamationLedger.run_id.in_([r.id for r in candidates]),
+                ReclamationLedger.lead_time_hours == lead_time_hours,
+            )
+        ).all()
+        for r_id, var_code, t_kind, mask in l_rows:
+            mask = int(mask or 0)
+            if t_kind == "mem":
+                for member in range(1, 31):
+                    if mask & (1 << member):
+                        fenced_vars.add((str(r_id), str(var_code), member))
+            elif t_kind == "mean":
+                fenced_vars.add((str(r_id), str(var_code), -1))
+            else:
+                fenced_vars.add((str(r_id), str(var_code), 0))
     except Exception:
         fenced_vars = set()
 

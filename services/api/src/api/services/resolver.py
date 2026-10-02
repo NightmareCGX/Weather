@@ -70,7 +70,7 @@ from domain.temporal import (
     serving_start_valid_time,
 )
 from fastapi import HTTPException
-from sqlalchemy import and_, event, or_, select
+from sqlalchemy import BigInteger, and_, event, literal, or_, select
 from sqlalchemy.orm import Session
 
 from api.core.time import get_current_time
@@ -81,6 +81,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationLedger,
     ReclamationQueue,
 )
 from api.services.lifecycle import filter_fenced_runs, parse_cycle_time
@@ -118,6 +119,7 @@ _RESOLUTION_ENTITIES: tuple[type[Any], ...] = (
     EnsembleMemberProduct,
     ForecastCycleLifecycle,
     ReclamationQueue,
+    ReclamationLedger,
 )
 
 
@@ -281,13 +283,16 @@ def _discover_candidates_bulk(
 
     # 1. Main catalog query: model_runs ⋈ forecast_products with physical fence filter
     has_reclamation_queue = True
+    has_reclamation_ledger = True
     try:
         bind = db.get_bind()
         if bind.dialect.name == "sqlite":
             from sqlalchemy import inspect
             has_reclamation_queue = inspect(bind).has_table("reclamation_queue")
+            has_reclamation_ledger = inspect(bind).has_table("reclamation_ledger")
     except Exception:
         has_reclamation_queue = False
+        has_reclamation_ledger = False
 
     stmt = (
         select(
@@ -322,6 +327,23 @@ def _discover_candidates_bulk(
             )
         )
         stmt = stmt.where(~reclaim_subq.exists())
+    if has_reclamation_ledger:
+        # Terminal record: the worker sheds terminal queue rows into the
+        # ledger, so a reclaimed unit fences through the ledger row instead.
+        ledger_subq = (
+            select(1)
+            .select_from(ReclamationLedger)
+            .where(
+                ReclamationLedger.run_id == ForecastProduct.run_id,
+                ReclamationLedger.lead_time_hours == ForecastProduct.lead_time_hours,
+                ReclamationLedger.variable_code == ForecastProduct.variable_id,
+                or_(
+                    and_(ForecastProduct.product_type == "ensemble_mean", ReclamationLedger.target_kind == "mean"),
+                    and_(ForecastProduct.product_type != "ensemble_mean", ReclamationLedger.target_kind == "det"),
+                ),
+            )
+        )
+        stmt = stmt.where(~ledger_subq.exists())
 
     stmt = filter_fenced_runs(stmt, model_id=m_id)
     rows = db.execute(stmt).all()
@@ -353,6 +375,24 @@ def _discover_candidates_bulk(
                 )
             )
             emp_stmt = emp_stmt.where(~emp_reclaim_subq.exists())
+        if has_reclamation_ledger:
+            # Terminal member record: bit *m* set ⇔ member m reclaimed. The
+            # queue's member fence is variable-agnostic (any variable's row
+            # fences the member for the lead), so the ledger test mirrors that.
+            emp_ledger_subq = (
+                select(1)
+                .select_from(ReclamationLedger)
+                .where(
+                    ReclamationLedger.run_id == EnsembleMemberProduct.run_id,
+                    ReclamationLedger.lead_time_hours == EnsembleMemberProduct.lead_time_hours,
+                    ReclamationLedger.target_kind == "mem",
+                    ReclamationLedger.deleted_members_mask.bitwise_and(
+                        literal(1, BigInteger).op("<<")(EnsembleMemberProduct.member_index)
+                    )
+                    != 0,
+                )
+            )
+            emp_stmt = emp_stmt.where(~emp_ledger_subq.exists())
 
         emp_rows = db.execute(emp_stmt).all()
         for r_id, lead, mem_idx in emp_rows:
@@ -990,11 +1030,56 @@ def check_physical_targets_fenced(
 
     rows = db.execute(stmt).all()
     target_set = set(target_list)
-    return {
+    fenced = {
         (str(r_id), str(p_key))
         for r_id, p_key in rows
         if (str(r_id), str(p_key)) in target_set
     }
+
+    # Ledger union: the worker sheds terminal queue rows into the ledger, so a
+    # target that transitioned after ``resolved_at`` may only be visible there.
+    # Ledger rows are keyed by unit identity; the physical_key is reconstructed
+    # with the same deterministic function that generated the target keys.
+    try:
+        bind = db.get_bind()
+        has_ledger = True
+        if bind.dialect.name == "sqlite":
+            from sqlalchemy import inspect
+
+            has_ledger = inspect(bind).has_table("reclamation_ledger")
+        if has_ledger:
+            from domain.reclamation import (
+                expand_ledger_units,
+                make_shard_relative_key,
+            )
+
+            ledger_rows = db.execute(
+                select(
+                    ReclamationLedger.run_id,
+                    ReclamationLedger.lead_time_hours,
+                    ReclamationLedger.variable_code,
+                    ReclamationLedger.target_kind,
+                    ReclamationLedger.deleted_members_mask,
+                    ReclamationLedger.reclaimed_at,
+                ).where(ReclamationLedger.run_id.in_(run_ids))
+            ).all()
+            ledger_cutoff = (
+                _ensure_utc(resolved_at) if resolved_at is not None else None
+            )
+            for r_id, lead, var, kind, mask, reclaimed in ledger_rows:
+                for unit in expand_ledger_units(
+                    [(str(r_id), int(lead), str(var), str(kind), int(mask or 0))]
+                ):
+                    _, _, _, _, member = unit
+                    p_key = make_shard_relative_key(str(var), str(kind), int(lead), member)
+                    if (str(r_id), p_key) not in target_set:
+                        continue
+                    if ledger_cutoff is None or _ensure_utc(reclaimed) >= ledger_cutoff:
+                        fenced.add((str(r_id), p_key))
+    except Exception:
+        pass
+
+    return fenced
 
 
 def build_canonical_provenance_digest(

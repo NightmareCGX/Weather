@@ -58,6 +58,7 @@ from ingestion.core.catalog import (
     ModelRunRecord,
     ModelVersionRecord,
     ProductRecord,
+    ReclamationLedgerRecord,
     ReclamationQueueRecord,
     _ensure_utc_datetime,
     _utcnow,
@@ -248,6 +249,19 @@ def purge_cycle_metadata(
                 )
                 q_cnt = _get_deleted_count(session.execute(del_q_stmt))
 
+                # Step 2b: Delete reclamation_ledger. The FK cascade from
+                # model_runs would remove these rows at Step 6 anyway; the
+                # explicit delete keeps the child-first order and logs counts.
+                l_cnt = 0
+                if run_ids:
+                    l_cnt = _get_deleted_count(
+                        session.execute(
+                            delete(ReclamationLedgerRecord).where(
+                                ReclamationLedgerRecord.run_id.in_(run_ids)
+                            )
+                        )
+                    )
+
                 emp_cnt = 0
                 em_cnt = 0
                 prod_cnt = 0
@@ -293,7 +307,7 @@ def purge_cycle_metadata(
             # Committed automatically on exit of with session.begin()
             logger.info(
                 "sweeper_cycle_purged: model=%s cycle_time=%s model_runs=%d "
-                "products=%d members=%d member_products=%d queue=%d",
+                "products=%d members=%d member_products=%d queue=%d ledger=%d",
                 m_id,
                 c_utc.isoformat(),
                 mr_cnt,
@@ -301,6 +315,7 @@ def purge_cycle_metadata(
                 em_cnt,
                 emp_cnt,
                 q_cnt,
+                l_cnt,
                 extra={
                     "event": "sweeper_cycle_purged",
                     "model": m_id,
@@ -310,6 +325,7 @@ def purge_cycle_metadata(
                     "members_deleted": em_cnt,
                     "member_products_deleted": emp_cnt,
                     "queue_deleted": q_cnt,
+                    "ledger_deleted": l_cnt,
                 },
             )
             return CyclePurgeResult(

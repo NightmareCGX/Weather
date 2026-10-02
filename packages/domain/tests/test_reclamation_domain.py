@@ -13,15 +13,18 @@ from domain.reclamation import (
     PhysicalShardTarget,
     _ensure_utc,
     can_delete_region_marker,
+    expand_ledger_units,
     get_expected_region_variables,
     get_predecessor_lead,
     is_predecessor_dependent_lead,
     is_predecessor_variable,
+    ledger_member_bit,
     make_region_marker_physical_key,
     make_region_marker_relative_key,
     make_shard_physical_key,
     make_shard_relative_key,
     normalize_member_index,
+    parse_shard_relative_key,
     register_expected_region_variables,
 )
 
@@ -241,3 +244,51 @@ def test_authoritative_expected_region_variables():
     assert len(get_expected_region_variables("gfs", "det", version_string="v1.0")) == 15
 
 
+
+
+# ===========================================================================
+# Reclamation ledger: mask aggregation, unit expansion, key round-trip
+# ===========================================================================
+def test_ledger_member_bit_bounds() -> None:
+    assert ledger_member_bit(1) == 1 << 1
+    assert ledger_member_bit(30) == 1 << 30
+    with pytest.raises(ValueError):
+        ledger_member_bit(0)  # member 0 belongs to det rows, not the mask
+    with pytest.raises(ValueError):
+        ledger_member_bit(31)
+
+
+def test_expand_ledger_units_det_mean_mem() -> None:
+    rows = [
+        ("run_a", 6, "temperature_2m", "det", 0),
+        ("run_a", 6, "temperature_2m", "mean", 0),
+        ("run_b", 3, "temperature_2m", "mem", (1 << 3) | (1 << 7)),
+    ]
+    units = expand_ledger_units(rows)
+    assert ("run_a", 6, "temperature_2m", "det", 0) in units
+    assert ("run_a", 6, "temperature_2m", "mean", -1) in units
+    assert ("run_b", 3, "temperature_2m", "mem", 3) in units
+    assert ("run_b", 3, "temperature_2m", "mem", 7) in units
+    assert ("run_b", 3, "temperature_2m", "mem", 1) not in units
+    # Aggregated: 3 rows expand to exactly 4 units
+    assert len(units) == 4
+
+
+def test_expand_ledger_units_empty_mask_yields_no_member_units() -> None:
+    assert expand_ledger_units([("run_a", 0, "t2m", "mem", 0)]) == set()
+
+
+def test_parse_shard_relative_key_round_trip() -> None:
+    for var, kind, lead, member in [
+        ("temperature_2m", "det", 0, 0),
+        ("wind_u_10m", "mean", 6, 0),
+        ("temperature_2m", "mem", 240, 30),
+    ]:
+        rel = make_shard_relative_key(var, kind, lead, member)
+        assert parse_shard_relative_key(rel) == (var, kind, lead, member)
+
+
+def test_parse_shard_relative_key_rejects_non_shard_keys() -> None:
+    assert parse_shard_relative_key("__commit__/v1/regions/det_L0000.json") is None
+    assert parse_shard_relative_key("latitude/.zarray") is None
+    assert parse_shard_relative_key("") is None

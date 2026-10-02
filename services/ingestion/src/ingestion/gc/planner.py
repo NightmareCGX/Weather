@@ -38,6 +38,7 @@ from domain.reclamation import (
     TARGET_KIND_DET,
     TARGET_KIND_MEAN,
     TARGET_KIND_MEM,
+    expand_ledger_units,
     get_predecessor_lead,
     make_shard_relative_key,
 )
@@ -54,6 +55,7 @@ from ingestion.core.catalog import (
     ModelRunRecord,
     ModelVersionRecord,
     ProductRecord,
+    ReclamationLedgerRecord,
     ReclamationQueueRecord,
     _ensure_utc_datetime,
     _utcnow,
@@ -299,6 +301,25 @@ def plan_reclamation_pass(
             (str(r_id), int(lead), str(var), str(kind), int(mem)): str(status)
             for r_id, lead, var, kind, mem, status in queue_rows
         }
+
+        # 5b. Bulk query 5: ledger-covered targets. The ledger is the durable
+        # "this unit is physically gone" record written by the worker when it
+        # sheds the terminal queue row, so absence of a queue row no longer
+        # implies "never enqueued" — treating it so would re-enqueue reclaimed
+        # units every pass (the 2026-09 purge↔planner churn loop). Covered
+        # units are neither enqueued nor counted as held.
+        ledger_units = expand_ledger_units(
+            (str(r), int(ld), str(v), str(k), int(mask))
+            for r, ld, v, k, mask in session.execute(
+                select(
+                    ReclamationLedgerRecord.run_id,
+                    ReclamationLedgerRecord.lead_time_hours,
+                    ReclamationLedgerRecord.variable_code,
+                    ReclamationLedgerRecord.target_kind,
+                    ReclamationLedgerRecord.deleted_members_mask,
+                ).where(ReclamationLedgerRecord.run_id.in_(catalog_run_ids))
+            ).all()
+        )
 
         # Build candidate structures for canonical reachability evaluation
         by_run_lead: dict[tuple[str, int], dict[str, Any]] = {}
@@ -573,8 +594,12 @@ def plan_reclamation_pass(
                 total_held += 1
             else:
                 total_reclaimable += 1
-                # Check if already in queue
-                if t_tuple not in existing_queue_targets:
+                # Check if already handled: a queue row (in-flight) or a ledger
+                # row (physically reclaimed — the durable post-purge record).
+                if (
+                    t_tuple not in existing_queue_targets
+                    and t_tuple not in ledger_units
+                ):
                     all_would_enqueue.append(shard_target)
 
         # 10. Claimed (retired) runs: every committed unit is directly reclaimable.
@@ -597,7 +622,7 @@ def plan_reclamation_pass(
 
             for t_tuple in sorted(retired_units):
                 total_committed += 1
-                if t_tuple in existing_queue_targets:
+                if t_tuple in existing_queue_targets or t_tuple in ledger_units:
                     continue
                 total_reclaimable += 1
                 r_str, lead_num, v_code, kind, mem = t_tuple

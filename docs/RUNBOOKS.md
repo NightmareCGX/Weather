@@ -309,7 +309,8 @@ levels so deletion is always an explicit operator decision:
 |---|---|---|---|
 | Planner | `--enable-planner` | `RECLAMATION_PLANNER_ENABLED=true` | Enqueue reclaimable shard targets into `reclamation_queue` each pass (queue writes only, no physical side effects). |
 | Worker | `--enable-delete` | `RECLAMATION_DELETE_ENABLED=true` | Physically delete enqueued shard targets each pass. **DANGEROUS.** |
-| Sweeper | `--enable-sweeper` | `RECLAMATION_SWEEPER_ENABLED=true` | Include the M3 14-day metadata retention pass each pass. |
+| Sweeper | `--enable-sweeper` | `RECLAMATION_SWEEPER_ENABLED=true` | Include the M3 metadata retention pass each pass (retention `METADATA_RETENTION_DAYS`, default 1 day). |
+| Early retirement | — | `LIFECYCLE_EARLY_RETIREMENT_ENABLED=true` | Terminal-state retirement: a cycle whose every run is `ready` and whose every committed unit is physically gone is claimed and tombstoned without waiting for the 240h horizon (`gc/finalizer.py`; see `docs/investigations/early-cycle-retirement/DESIGN.md`). Off by default. |
 
 Recommended rollout: enable planner only, observe
 `GC pass: ... planner enqueued=N ...` summaries for at least one full
@@ -737,6 +738,7 @@ Verify that JSON serialization, Redis caching, and coordinate projections execut
     weather-ingest gc --once
     ```
   - The finalizer will detect existing `deletion_started_at` claims, resume store deletion without re-evaluating horizon eligibility, and commit `deleted_at`.
+  - With `LIFECYCLE_EARLY_RETIREMENT_ENABLED=true`, fully-reclaimed cycles claim and tombstone in the same pass (reason `units_terminal` in the claim log); a stuck claim under this flag means a unit is NOT terminal — check `reclamation_queue` for `queued`/`deleting`/`failed` rows and the ledger coverage, not the calendar.
 
 ### 19.7 14-Day Metadata Sweeper Backlog Overdue (`#sweeper-backlog`)
 * **Symptom:** Alert `metadata_sweeper_backlog_overdue` triggers (`WARNING`). Tombstones older than 14 days retain detailed `model_runs` metadata.
@@ -772,8 +774,10 @@ Verify that JSON serialization, Redis caching, and coordinate projections execut
     weather-ingest reclamation requeue
     ```
     Rows holding an active worker lease are skipped automatically; rows whose
-    physical object is confirmed absent are promoted to terminal `deleted`,
-    rows still present are reset to `queued` for worker retry.
+    physical object is confirmed absent are promoted into `reclamation_ledger`
+    and their queue row is shed (the queue is a pure in-flight work list — a
+    promoted row never appears as a stranded terminal `deleted` row), rows
+    still present are reset to `queued` for worker retry.
   - Re-run the reclamation worker pass:
     ```bash
     weather-ingest reclamation work --delete --batch-size 100

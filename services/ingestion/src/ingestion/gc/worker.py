@@ -11,9 +11,10 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Sequence
+from itertools import chain
+from typing import Any, Iterator, Sequence
 
-from sqlalchemy import or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -35,8 +36,10 @@ from domain.reclamation import (
     TARGET_KIND_MEAN,
     TARGET_KIND_MEM,
     can_delete_region_marker,
+    expand_ledger_units,
     get_expected_region_variables,
     get_predecessor_lead,
+    ledger_member_bit,
     make_region_marker_relative_key,
 )
 from domain.temporal import (
@@ -51,6 +54,7 @@ from ingestion.core.catalog import (
     ModelRunRecord,
     ModelVersionRecord,
     ProductRecord,
+    ReclamationLedgerRecord,
     ReclamationQueueRecord,
     _ensure_utc_datetime,
     _utcnow,
@@ -179,6 +183,126 @@ def _physical_object_exists(store_path: str, physical_key: str) -> bool:
     base = store_path[len("file://") :] if store_path.startswith("file://") else store_path
     full_path = os.path.join(base, physical_key)
     return os.path.exists(full_path)
+
+
+def _ledger_upsert_groups(
+    session: Session,
+    groups: dict[tuple[str, int, str, str], tuple[int, str]],
+    now_utc: datetime,
+) -> None:
+    """Merge reclaimed units into ``reclamation_ledger``, aggregated and idempotent.
+
+    ``groups`` maps ``(run_id, lead_time_hours, variable_code, target_kind)`` to
+    ``(member_mask_bits, store_path)``. PostgreSQL merges in one statement
+    (``mask | excluded.mask``, earliest ``reclaimed_at``); the sqlite fallback
+    used by tests read-merges row by row. Called in the same transaction that
+    removes the terminal queue rows, so a crash cannot lose the "unit is gone"
+    record or double-serve a deleted shard.
+    """
+    if not groups:
+        return
+    is_postgres = bool(session.bind and session.bind.dialect.name == "postgresql")
+    if is_postgres:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        values = [
+            {
+                "run_id": run_id,
+                "lead_time_hours": lead,
+                "variable_code": variable_code,
+                "target_kind": kind,
+                "deleted_members_mask": mask,
+                "store_path": store_path,
+                "reclaimed_at": now_utc,
+                "created_at": now_utc,
+                "updated_at": now_utc,
+            }
+            for (run_id, lead, variable_code, kind), (mask, store_path) in groups.items()
+        ]
+        stmt = pg_insert(ReclamationLedgerRecord).values(values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                "run_id",
+                "lead_time_hours",
+                "variable_code",
+                "target_kind",
+            ],
+            set_={
+                "deleted_members_mask": ReclamationLedgerRecord.deleted_members_mask.op("|")(
+                    stmt.excluded.deleted_members_mask
+                ),
+                "reclaimed_at": func.least(
+                    ReclamationLedgerRecord.reclaimed_at, stmt.excluded.reclaimed_at
+                ),
+                "updated_at": now_utc,
+            },
+        )
+        session.execute(stmt)
+        return
+
+    for (run_id, lead, variable_code, kind), (mask, store_path) in groups.items():
+        row = session.execute(
+            select(ReclamationLedgerRecord).where(
+                ReclamationLedgerRecord.run_id == run_id,
+                ReclamationLedgerRecord.lead_time_hours == lead,
+                ReclamationLedgerRecord.variable_code == variable_code,
+                ReclamationLedgerRecord.target_kind == kind,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            session.add(
+                ReclamationLedgerRecord(
+                    run_id=run_id,
+                    lead_time_hours=lead,
+                    variable_code=variable_code,
+                    target_kind=kind,
+                    deleted_members_mask=mask,
+                    store_path=store_path,
+                    reclaimed_at=now_utc,
+                    created_at=now_utc,
+                    updated_at=now_utc,
+                )
+            )
+        else:
+            row.deleted_members_mask = int(row.deleted_members_mask or 0) | mask  # type: ignore[assignment]
+            row.reclaimed_at = min(row.reclaimed_at, now_utc)  # type: ignore[arg-type,assignment]
+            row.updated_at = now_utc  # type: ignore[assignment]
+
+
+def _ledger_unit_covered(
+    session: Session,
+    run_id: str,
+    lead_time_hours: int,
+    variable_code: str,
+    target_kind: str,
+    member_index: int,
+) -> bool:
+    """Return True if the ledger records this unit as physically reclaimed."""
+    kind = str(target_kind).lower().strip()
+    if kind == TARGET_KIND_MEM:
+        mask = session.execute(
+            select(ReclamationLedgerRecord.deleted_members_mask).where(
+                ReclamationLedgerRecord.run_id == run_id,
+                ReclamationLedgerRecord.lead_time_hours == lead_time_hours,
+                ReclamationLedgerRecord.variable_code == variable_code,
+                ReclamationLedgerRecord.target_kind == kind,
+            )
+        ).scalar_one_or_none()
+        if mask is None:
+            return False
+        try:
+            return bool(int(mask) & ledger_member_bit(int(member_index)))
+        except ValueError:
+            return False
+    covered = session.execute(
+        select(ReclamationLedgerRecord.run_id).where(
+            ReclamationLedgerRecord.run_id == run_id,
+            ReclamationLedgerRecord.lead_time_hours == lead_time_hours,
+            ReclamationLedgerRecord.variable_code == variable_code,
+            ReclamationLedgerRecord.target_kind == kind,
+        )
+    ).scalar_one_or_none()
+    return covered is not None
 
 
 def _apply_generation_evidence_gate(
@@ -412,14 +536,58 @@ def run_reclamation_worker_pass(
                 ),
                 ReclamationQueueRecord.id.not_in(claimed_ids),
             )
+            # The counterfactual treats the claimed batch as physically present;
+            # ledger-covered units whose tuples coincide with the claimed batch
+            # (a re-enqueued evidence-gap unit re-deleting over its own ledger
+            # bits) must therefore be excluded from the fence stream too.
+            claimed_unit_keys = {
+                (
+                    str(t.run_id),
+                    int(t.lead_time_hours),
+                    str(t.variable_code),
+                    str(t.target_kind),
+                    int(t.member_index),
+                )
+                for t in claimed_rows
+            }
+
+            def _ledger_fence_stream() -> Iterator[tuple[str, int, str, str, int]]:
+                """Ledger-covered units, expanded per member, as fence keys.
+
+                Without this stream the counterfactual would read ledger-covered
+                units as *present* the moment their queue rows are shed, judge
+                them canonically necessary, and re-queue them — re-creating the
+                delete/re-enqueue loop inside the worker itself.
+                """
+                ledger_rows = session.execute(
+                    select(
+                        ReclamationLedgerRecord.run_id,
+                        ReclamationLedgerRecord.lead_time_hours,
+                        ReclamationLedgerRecord.variable_code,
+                        ReclamationLedgerRecord.target_kind,
+                        ReclamationLedgerRecord.deleted_members_mask,
+                    )
+                ).yield_per(FENCE_FETCH_SIZE)
+                for row in ledger_rows:
+                    for unit in expand_ledger_units(
+                        [(str(r), int(ld), str(v), str(k), int(mask)) for r, ld, v, k, mask in [row]]
+                    ):
+                        if unit not in claimed_unit_keys:
+                            yield unit
+
             # Streamed straight into the projection: the fence never materialises
             # the row set, and the index is sized by distinct fence units rather
             # than by rows in the queue. The cursor is fully consumed inside
             # build_fence_index, before this store's next write.
             fence_index = build_fence_index(
-                (str(r), int(ld), str(v), str(k), int(m))
-                for r, ld, v, k, m in session.execute(fenced_query).yield_per(
-                    FENCE_FETCH_SIZE
+                chain(
+                    (
+                        (str(r), int(ld), str(v), str(k), int(m))
+                        for r, ld, v, k, m in session.execute(
+                            fenced_query
+                        ).yield_per(FENCE_FETCH_SIZE)
+                    ),
+                    _ledger_fence_stream(),
                 )
             )
 
@@ -632,7 +800,9 @@ def run_reclamation_worker_pass(
                             ReclamationQueueRecord.member_index == mem,
                         )
                     ).scalar_one_or_none()
-                    if other_status != RECLAMATION_STATUS_DELETED:
+                    if other_status != RECLAMATION_STATUS_DELETED and not _ledger_unit_covered(
+                        session, str(r_id), int(lead), other_var, str(kind), int(mem)
+                    ):
                         # Counterpart not terminal → pair not jointly evaluated yet.
                         deferred_pair_ids.add(target.id)
 
@@ -692,14 +862,44 @@ def run_reclamation_worker_pass(
                 store_path, [t.physical_key for t in authorized_targets]
             )
 
+            # 5b. Record the reclamation in the ledger and shed the terminal
+            # queue rows in the SAME transaction: the ledger becomes the durable
+            # "unit is gone" record consumed by the fence, the planner, the
+            # counterfactual revalidation, and cycle terminality, while the
+            # queue stays a pure in-flight work list. The ledger merge is
+            # idempotent — a re-enqueued evidence-gap unit re-merges the same
+            # bits it already wrote.
+            ledger_groups: dict[tuple[str, int, str, str], tuple[int, str]] = {}
             for target in authorized_targets:
-                target.status = RECLAMATION_STATUS_DELETED
-                target.reclaimed_at = now_utc
-                target.lease_expires_at = None
-                target.last_error = None
-                target.updated_at = now_utc
+                bits = (
+                    ledger_member_bit(int(target.member_index))
+                    if str(target.target_kind) == TARGET_KIND_MEM
+                    else 0
+                )
+                key = (
+                    str(target.run_id),
+                    int(target.lead_time_hours),
+                    str(target.variable_code),
+                    str(target.target_kind),
+                )
+                prev_mask, prev_store = ledger_groups.get(key, (0, ""))
+                ledger_groups[key] = (
+                    prev_mask | bits,
+                    prev_store or str(target.store_path),
+                )
+            _ledger_upsert_groups(session, ledger_groups, now_utc)
+            session.execute(
+                delete(ReclamationQueueRecord).where(
+                    ReclamationQueueRecord.id.in_([t.id for t in authorized_targets])
+                )
+            )
+            for target in authorized_targets:
+                # Detach before the bulk delete commits: the marker-cleanup step
+                # below reads only loaded attributes, and a stale identity-map
+                # entry for a deleted row must not survive the commit.
+                session.expunge(target)
                 deleted_targets_for_store.append(target)
-                total_deleted += 1
+            total_deleted += len(authorized_targets)
 
             session.commit()
 
@@ -729,7 +929,9 @@ def run_reclamation_worker_pass(
                     except ValueError:
                         continue
 
-                    # Query deleted variables in reclamation_queue for this region
+                    # Variables of the region whose shards are confirmed gone:
+                    # queue rows in status deleted (pre-ledger coexistence) plus
+                    # ledger coverage (the post-ledger terminal record).
                     deleted_vars = set(
                         session.execute(
                             select(ReclamationQueueRecord.variable_code).where(
@@ -741,6 +943,33 @@ def run_reclamation_worker_pass(
                             )
                         ).scalars().all()
                     )
+                    if t_kind == TARGET_KIND_MEM:
+                        bit = ledger_member_bit(int(mem_idx))
+                        ledger_rows = session.execute(
+                            select(
+                                ReclamationLedgerRecord.variable_code,
+                                ReclamationLedgerRecord.deleted_members_mask,
+                            ).where(
+                                ReclamationLedgerRecord.run_id == r_id,
+                                ReclamationLedgerRecord.lead_time_hours == lead_h,
+                                ReclamationLedgerRecord.target_kind == t_kind,
+                            )
+                        ).all()
+                        deleted_vars.update(
+                            str(var)
+                            for var, mask in ledger_rows
+                            if int(mask or 0) & bit
+                        )
+                    else:
+                        deleted_vars.update(
+                            session.execute(
+                                select(ReclamationLedgerRecord.variable_code).where(
+                                    ReclamationLedgerRecord.run_id == r_id,
+                                    ReclamationLedgerRecord.lead_time_hours == lead_h,
+                                    ReclamationLedgerRecord.target_kind == t_kind,
+                                )
+                            ).scalars().all()
+                        )
 
                     if can_delete_region_marker(expected_vars, deleted_vars):
                         marker_key = make_region_marker_relative_key(t_kind, lead_h, mem_idx)
@@ -822,15 +1051,31 @@ def requeue_failed_reclamation_targets(
         stmt = stmt.where(ReclamationQueueRecord.run_id == run_id)
 
     rows = list(session.execute(stmt).scalars().all())
+    ledger_groups: dict[tuple[str, int, str, str], tuple[int, str]] = {}
+    promoted_ids: list[str] = []
     for row in rows:
         if not _physical_object_exists(str(row.store_path), str(row.physical_key)):
-            # Object already absent on storage: finalize as deleted
-            row.status = RECLAMATION_STATUS_DELETED
-            row.reclaimed_at = now_utc
-            row.lease_expires_at = None
-            row.next_retry_at = None
-            row.last_error = None
-            row.updated_at = now_utc
+            # Object already absent on storage: the unit is physically gone.
+            # Record it in the ledger and shed the queue row (the queue is a
+            # pure in-flight work list); a queue 'deleted' status would leave a
+            # terminal row stranded in a table that no longer carries them.
+            bits = (
+                ledger_member_bit(int(row.member_index))
+                if str(row.target_kind) == TARGET_KIND_MEM
+                else 0
+            )
+            key = (
+                str(row.run_id),
+                int(row.lead_time_hours),
+                str(row.variable_code),
+                str(row.target_kind),
+            )
+            prev_mask, prev_store = ledger_groups.get(key, (0, ""))
+            ledger_groups[key] = (
+                prev_mask | bits,
+                prev_store or str(row.store_path),
+            )
+            promoted_ids.append(row.id)
         else:
             # Positively confirmed present: safe to reset for worker retry
             row.status = RECLAMATION_STATUS_QUEUED
@@ -839,6 +1084,13 @@ def requeue_failed_reclamation_targets(
             row.next_retry_at = None
             row.last_error = None
             row.updated_at = now_utc
+    _ledger_upsert_groups(session, ledger_groups, now_utc)
+    if promoted_ids:
+        session.execute(
+            delete(ReclamationQueueRecord).where(
+                ReclamationQueueRecord.id.in_(promoted_ids)
+            )
+        )
     session.commit()
     return len(rows)
 

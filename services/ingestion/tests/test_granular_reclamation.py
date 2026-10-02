@@ -39,11 +39,13 @@ from ingestion.core.catalog import (
     ModelRunRecord,
     ModelVersionRecord,
     ProductRecord,
+    ReclamationLedgerRecord,
     ReclamationQueueRecord,
     _reconcile_catalog_to_store,
 )
 from ingestion.core.db import CatalogBase
 from ingestion.gc import worker as worker_mod
+from ingestion.gc.finalizer import cycle_reclamation_units_terminal
 from ingestion.gc.planner import plan_reclamation_pass
 from ingestion.gc.worker import (
     requeue_failed_reclamation_targets,
@@ -508,11 +510,18 @@ def test_18_19_20_worker_idempotency_crash_recovery_and_batching(catalog_engine,
         session.commit()
 
         # Object is absent on disk (already deleted before crash)
-        # Worker re-claims expired row: DeleteObject is idempotent, row reaches 'deleted'!
+        # Worker re-claims expired row: DeleteObject is idempotent, the unit is
+        # recorded in the ledger and the queue row is shed.
         w_recover = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
         assert w_recover.deleted_count >= 1
-        recovered = session.get(ReclamationQueueRecord, "crash_recovery_test")
-        assert recovered.status == RECLAMATION_STATUS_DELETED
+        assert session.get(ReclamationQueueRecord, "crash_recovery_test") is None
+        ledger_row = session.execute(
+            select(ReclamationLedgerRecord).where(
+                ReclamationLedgerRecord.run_id == r0,
+                ReclamationLedgerRecord.lead_time_hours == 18,
+            )
+        ).scalar_one_or_none()
+        assert ledger_row is not None
 
 
 # ===========================================================================
@@ -762,11 +771,16 @@ def test_30_claimed_cycle_is_serving_fence_only_granular_reclamation_proceeds(
         plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
         assert plan.reclaimable_shards > 0
 
-        # V3 granular worker deletes the claimed cycle's units normally.
+        # V3 granular worker deletes the claimed cycle's units normally: the
+        # terminal record moves to the ledger and the queue row is shed.
         w_res = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
         assert w_res.deleted_count > 0
         rec = session.execute(select(ReclamationQueueRecord)).scalars().first()
-        assert rec.status == RECLAMATION_STATUS_DELETED
+        assert rec is None
+        ledger_row = session.execute(
+            select(ReclamationLedgerRecord)
+        ).scalars().first()
+        assert ledger_row is not None
 
 
 # ===========================================================================
@@ -961,11 +975,18 @@ def test_acceptance_3_ambiguous_delete_failed_state_fenced_and_safe_requeue(cata
         rec.attempt_count = 5
         session.commit()
 
-        # Requeue detects object is absent -> promotes directly to 'deleted' (prevents serving resurrection)!
+        # Requeue detects object is absent -> promotes into the ledger (queue
+        # row shed; prevents serving resurrection and unblocks terminality)!
         requeue_failed_reclamation_targets(session, model_id="gfs")
-        session.refresh(rec)
-        assert rec.status == RECLAMATION_STATUS_DELETED
-        assert rec.reclaimed_at is not None
+        rec_after = session.get(ReclamationQueueRecord, rec.id)
+        assert rec_after is None
+        ledger_row = session.execute(
+            select(ReclamationLedgerRecord).where(
+                ReclamationLedgerRecord.run_id == r0,
+                ReclamationLedgerRecord.lead_time_hours == rec.lead_time_hours,
+            )
+        ).scalar_one_or_none()
+        assert ledger_row is not None
 
 
 # ===========================================================================
@@ -1032,15 +1053,21 @@ def test_requeue_recovers_stuck_queued_and_stale_deleting_rows(catalog_engine, t
         # 3 recovered; the active-lease row is skipped and not counted
         assert recovered == 3
 
-        stuck_absent = session.get(ReclamationQueueRecord, "stuck_queued_absent")
-        assert stuck_absent.status == RECLAMATION_STATUS_DELETED
-        assert stuck_absent.reclaimed_at is not None
-        assert stuck_absent.last_error is None
-
-        stale = session.get(ReclamationQueueRecord, "stale_deleting_absent")
-        assert stale.status == RECLAMATION_STATUS_DELETED
-        assert stale.reclaimed_at is not None
-        assert stale.lease_expires_at is None
+        # Promoted rows are shed from the queue into the ledger: the queue is a
+        # pure in-flight work list, so a promoted row must not remain as a
+        # stranded terminal row.
+        assert session.get(ReclamationQueueRecord, "stuck_queued_absent") is None
+        assert session.get(ReclamationQueueRecord, "stale_deleting_absent") is None
+        ledger_keys = {
+            (row.lead_time_hours, row.target_kind)
+            for row in session.execute(
+                select(ReclamationLedgerRecord).where(
+                    ReclamationLedgerRecord.run_id == r0
+                )
+            ).scalars().all()
+        }
+        assert (12, TARGET_KIND_DET) in ledger_keys
+        assert (18, TARGET_KIND_DET) in ledger_keys
 
         active = session.get(ReclamationQueueRecord, "active_deleting_absent")
         assert active.status == RECLAMATION_STATUS_DELETING
@@ -1055,7 +1082,8 @@ def test_requeue_recovers_stuck_queued_and_stale_deleting_rows(catalog_engine, t
 
         # Terminality unblocked: the only non-terminal rows left are the
         # actively-leased claim (still owned by a live worker) and the
-        # present-object row (reset to queued for normal worker retry).
+        # present-object row (reset to queued for normal worker retry). The
+        # promoted rows left the queue entirely (ledger carries them).
         remaining = set(
             session.execute(
                 select(ReclamationQueueRecord.status).where(
@@ -1423,8 +1451,11 @@ def test_i14_worker_defers_on_generation_bump_then_proceeds_when_stable(
             session, batch_size=10, lease_seconds=60, delete_enabled=True, now=now
         )
         assert w2.deleted_count >= 2
+        # Terminal units leave the queue into the ledger.
         rows = session.execute(select(ReclamationQueueRecord)).scalars().all()
-        assert all(r.status == RECLAMATION_STATUS_DELETED for r in rows)
+        assert rows == []
+        ledger_rows = session.execute(select(ReclamationLedgerRecord)).scalars().all()
+        assert len(ledger_rows) >= 2
         for lead in (6, 12):
             rel = make_shard_relative_key("temperature_2m", TARGET_KIND_DET, lead, 0)
             assert not (store / rel).exists()
@@ -1502,9 +1533,18 @@ def test_i14_worker_backfills_baseline_for_pre_migration_row(catalog_engine, tmp
             session, batch_size=10, lease_seconds=60, delete_enabled=True, now=now
         )
         assert w.deleted_count == 1
+        # The terminal row is shed into the ledger; the I14 baseline lives on
+        # the queue row only until the unit is reclaimed (the ledger carries
+        # the store path, not the per-observation baseline).
         row = session.get(ReclamationQueueRecord, "legacy_row")
-        assert row.status == RECLAMATION_STATUS_DELETED
-        assert row.store_generation == "gen-legacy-9"
+        assert row is None
+        ledger_row = session.execute(
+            select(ReclamationLedgerRecord).where(
+                ReclamationLedgerRecord.run_id == r0
+            )
+        ).scalar_one_or_none()
+        assert ledger_row is not None
+        assert ledger_row.store_path == str(store)
 
 
 # ===========================================================================
@@ -1998,3 +2038,168 @@ def test_fence_stream_is_fully_drained_before_the_next_commit(
         assert abandoned.drained is False
         assert abandoned.rows_seen == 1
 
+
+
+# ===========================================================================
+# 47. Reclamation ledger — the durable terminal record
+#
+# The worker sheds terminal queue rows into reclamation_ledger in the same
+# transaction, so the queue stays a pure in-flight work list. The ledger then
+# satisfies planner idempotency, cycle terminality, and the fence union.
+# ===========================================================================
+def test_47_worker_delete_writes_ledger_and_sheds_queue_rows(catalog_engine, tmp_path):
+    """A worker delete lands in the ledger; the terminal queue row is gone."""
+    c0 = _dt(2026, 9, 2, 0)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    _seed_gfs_products(catalog_engine, r0, [3], variables=["temperature_2m"], store_dir=tmp_path / "c0")
+
+    now = _dt(2026, 9, 2, 8)
+    with Session(catalog_engine) as session:
+        plan = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        assert plan.enqueued_count > 0
+
+        w_res = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+        assert w_res.deleted_count > 0
+
+        # Queue rows for the finalized units are shed...
+        remaining_q = session.execute(
+            select(ReclamationQueueRecord).where(ReclamationQueueRecord.run_id == r0)
+        ).scalars().all()
+        assert remaining_q == []
+
+        # ...and the ledger carries the terminal record.
+        ledger_rows = session.execute(
+            select(ReclamationLedgerRecord).where(ReclamationLedgerRecord.run_id == r0)
+        ).scalars().all()
+        ledger_keys = {
+            (row.lead_time_hours, row.variable_code, row.target_kind)
+            for row in ledger_rows
+        }
+        assert (3, "temperature_2m", TARGET_KIND_DET) in ledger_keys
+        for row in ledger_rows:
+            assert row.store_path.startswith(str(tmp_path / "c0"))
+            assert row.reclaimed_at is not None
+
+
+def test_47_worker_delete_aggregates_gefs_members_into_one_mask_row(catalog_engine, tmp_path):
+    """30 member units of one (run, lead, variable) collapse into one ledger row."""
+    c0 = _dt(2026, 9, 2, 0)
+    c1 = _dt(2026, 9, 2, 6)
+    r0 = _seed_run(catalog_engine, "gefs", c0, "ready", tmp_path / "c0")
+    _seed_gefs_products(catalog_engine, r0, [6], member_count=30, variables=["temperature_2m"], store_dir=tmp_path / "c0")
+    # c1 supersedes c0's lead-6 valid time, making c0's units reclaimable.
+    r1 = _seed_run(catalog_engine, "gefs", c1, "ready", tmp_path / "c1")
+    _seed_gefs_products(catalog_engine, r1, [0], member_count=30, variables=["temperature_2m"], store_dir=tmp_path / "c1")
+
+    now = _dt(2026, 9, 2, 8)
+    with Session(catalog_engine) as session:
+        plan = plan_reclamation_pass(session, models=("gefs",), dry_run=False, now=now)
+        mem_units = [t for t in plan.would_enqueue if t.target_kind == TARGET_KIND_MEM and t.run_id == r0]
+        assert len(mem_units) >= 30
+
+        w_res = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+        assert w_res.deleted_count >= 30
+
+        ledger_rows = session.execute(
+            select(ReclamationLedgerRecord).where(
+                ReclamationLedgerRecord.run_id == r0,
+                ReclamationLedgerRecord.target_kind == TARGET_KIND_MEM,
+            )
+        ).scalars().all()
+        mem_rows = [row for row in ledger_rows if row.lead_time_hours == 6]
+        assert len(mem_rows) == 1
+        mask = int(mem_rows[0].deleted_members_mask)
+        for member in range(1, 31):
+            assert mask & (1 << member), f"member {member} missing from mask"
+
+
+def test_47_ledger_satisfies_terminality_and_planner_idempotency(catalog_engine, tmp_path):
+    """A ledger-recorded cycle is terminal and never re-enqueued."""
+    c0 = _dt(2026, 9, 2, 0)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    _seed_gfs_products(catalog_engine, r0, [3], variables=["temperature_2m"], store_dir=tmp_path / "c0")
+
+    now = _dt(2026, 9, 2, 8)
+    with Session(catalog_engine) as session:
+        plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+
+        # Terminality reads the ledger (queue rows are already shed).
+        assert cycle_reclamation_units_terminal(session, "gfs", c0) is True
+
+        # The planner must not re-enqueue ledger-covered units: absence of a
+        # queue row no longer implies "never enqueued".
+        plan2 = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        assert all(t.run_id != r0 for t in plan2.would_enqueue)
+
+
+def test_47_requeue_promotes_missing_object_into_ledger(catalog_engine, tmp_path):
+    """Requeue of a failed row over a missing object lands in the ledger."""
+    c0 = _dt(2026, 9, 2, 0)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    # No store_dir: the shard file is never written, so the object is absent.
+    _seed_gfs_products(catalog_engine, r0, [3], variables=["temperature_2m"])
+
+    now = _dt(2026, 9, 2, 8)
+    with Session(catalog_engine) as session:
+        session.add(
+            ReclamationQueueRecord(
+                id="q_failed_gap",
+                run_id=r0,
+                model_id="gfs",
+                cycle_time=c0,
+                lead_time_hours=3,
+                variable_code="temperature_2m",
+                target_kind=TARGET_KIND_DET,
+                member_index=0,
+                valid_time=c0 + timedelta(hours=3),
+                store_path=str(tmp_path / "c0"),
+                physical_key=make_shard_relative_key("temperature_2m", TARGET_KIND_DET, 3),
+                status=RECLAMATION_STATUS_FAILED,
+                attempt_count=5,
+                last_error="repeated_failure",
+                created_at=c0,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+        recovered = requeue_failed_reclamation_targets(session, run_id=r0, now=now)
+        assert recovered == 1
+
+        # The queue row is shed; the ledger carries the terminal record.
+        remaining = session.execute(
+            select(ReclamationQueueRecord).where(ReclamationQueueRecord.id == "q_failed_gap")
+        ).scalar_one_or_none()
+        assert remaining is None
+        ledger_row = session.execute(
+            select(ReclamationLedgerRecord).where(
+                ReclamationLedgerRecord.run_id == r0,
+                ReclamationLedgerRecord.lead_time_hours == 3,
+                ReclamationLedgerRecord.variable_code == "temperature_2m",
+                ReclamationLedgerRecord.target_kind == TARGET_KIND_DET,
+            )
+        ).scalar_one_or_none()
+        assert ledger_row is not None
+
+
+def test_47_ledger_units_do_not_reform_the_churn_loop(catalog_engine, tmp_path):
+    """Pass N deletes to the ledger; pass N+1 must not re-enqueue the same units.
+
+    Regression for the 2026-09 purge↔planner loop: a planner that reads only
+    the queue's *current* rows re-enqueues everything whose row was shed.
+    """
+    c0 = _dt(2026, 9, 2, 0)
+    r0 = _seed_run(catalog_engine, "gfs", c0, "ready", tmp_path / "c0")
+    _seed_gfs_products(catalog_engine, r0, [3], variables=["temperature_2m"], store_dir=tmp_path / "c0")
+
+    now = _dt(2026, 9, 2, 8)
+    with Session(catalog_engine) as session:
+        plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+        run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+
+        for _ in range(3):
+            plan3 = plan_reclamation_pass(session, models=("gfs",), dry_run=False, now=now)
+            assert plan3.enqueued_count == 0
+            worker3 = run_reclamation_worker_pass(session, delete_enabled=True, now=now)
+            assert worker3.deleted_count == 0

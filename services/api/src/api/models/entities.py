@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from geoalchemy2 import Geometry
 from sqlalchemy import (
+    BigInteger,
     Column,
     String,
     Float,
@@ -381,6 +382,51 @@ class ReclamationQueue(Base):  # type: ignore[misc]  # declarative_base() is Any
             "status",
         ),
         Index("idx_reclamation_model_cycle", "model_id", "cycle_time", "lead_time_hours"),
+    )
+
+
+class ReclamationLedger(Base):  # type: ignore[misc]  # declarative_base() is Any (see mypy note in pyproject)
+    """Durable record that a reclamation unit is physically gone (read side).
+
+    One row per ``(run_id, lead_time_hours, variable_code, target_kind)``; the
+    ensemble-member kind aggregates its members into ``deleted_members_mask``
+    (bit *m* ⇔ member *m*, members 1..30). Written by the ingestion GC worker
+    in the same transaction that removes the terminal ``reclamation_queue``
+    row; consumed by the serving physical-fence readers (union with the
+    queue's in-flight rows) and shed automatically with the cycle's catalog at
+    the tombstone+retention sweep via the FK cascade. The writer lives in
+    ``ingestion.core.catalog.ReclamationLedgerRecord``.
+    """
+
+    __tablename__ = "reclamation_ledger"
+
+    run_id = Column(
+        String, ForeignKey("model_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    lead_time_hours = Column(Integer, primary_key=True)
+    variable_code = Column(String, primary_key=True)
+    target_kind = Column(String(length=16), primary_key=True)
+    deleted_members_mask = Column(BigInteger, nullable=False, default=0)
+    store_path = Column(String, nullable=False)
+    reclaimed_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "target_kind IN ('det', 'mean', 'mem')",
+            name="ck_reclamation_ledger_target_kind",
+        ),
+        Index("idx_reclamation_ledger_store", "store_path"),
     )
 
 

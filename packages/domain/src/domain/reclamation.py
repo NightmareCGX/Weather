@@ -11,6 +11,7 @@ It defines:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,6 +29,13 @@ RECLAMATION_STATUS_QUEUED = "queued"
 RECLAMATION_STATUS_DELETING = "deleting"
 RECLAMATION_STATUS_DELETED = "deleted"
 RECLAMATION_STATUS_FAILED = "failed"
+
+#: Inverse matcher for :func:`make_shard_relative_key` (``mem`` captures its
+#: zero-padded member number; ``det``/``mean`` leave the group absent).
+_SHARD_RELATIVE_KEY_RE = re.compile(
+    r"(?P<variable>.+)/shard\.(?P<kind>det|mean|mem(?P<member>\d{3}))_L"
+    r"(?P<lead>\d+)\.shard"
+)
 VALID_RECLAMATION_STATUSES: frozenset[str] = frozenset(
     {
         RECLAMATION_STATUS_QUEUED,
@@ -146,6 +154,46 @@ class IngestionRegionIdentity:
         object.__setattr__(self, "member_index", normalized_mem)
 
 
+#: The reclamation ledger aggregates ensemble-member units into one row per
+#: (run, lead, variable, kind) with a bitmask; bit *m* ⇔ member *m* reclaimed.
+#: Members are 1..30, so the mask fits a signed 64-bit integer comfortably.
+LEDGER_MEMBER_MASK_BITS: tuple[int, ...] = tuple(range(1, 31))
+
+
+def ledger_member_bit(member_index: int) -> int:
+    """Return the ledger mask bit for an ensemble member index (1..30)."""
+    if member_index not in LEDGER_MEMBER_MASK_BITS:
+        raise ValueError(
+            f"Ledger member mask covers members 1..30, got {member_index!r}"
+        )
+    return 1 << member_index
+
+
+def expand_ledger_units(
+    rows: Iterable[tuple[str, int, str, str, int]],
+) -> set[tuple[str, int, str, str, int]]:
+    """Expand aggregated ledger rows into per-unit ``(run, lead, var, kind, member)`` tuples.
+
+    A ``mem`` row contributes one tuple per set mask bit (bit *m* ⇔ member *m*,
+    across members 1..30); ``det`` and ``mean`` rows contribute their single
+    unit (member 0 / −1 respectively; their mask is ignored). Pure function over
+    plain tuples so the planner, the finalizer, and the worker's fence stream
+    can share one expansion without touching the ORM.
+    """
+    units: set[tuple[str, int, str, str, int]] = set()
+    for run_id, lead, variable_code, kind, mask in rows:
+        normalized = kind.lower().strip()
+        if normalized == TARGET_KIND_MEM:
+            for member_index in LEDGER_MEMBER_MASK_BITS:
+                if mask & (1 << member_index):
+                    units.add((run_id, lead, variable_code, normalized, member_index))
+        elif normalized == TARGET_KIND_MEAN:
+            units.add((run_id, lead, variable_code, normalized, -1))
+        elif normalized == TARGET_KIND_DET:
+            units.add((run_id, lead, variable_code, normalized, 0))
+    return units
+
+
 def make_shard_relative_key(
     variable_code: str,
     target_kind: str,
@@ -186,6 +234,36 @@ def make_shard_physical_key(
     )
     clean_store = store_path.rstrip("/")
     return f"{clean_store}/{rel}"
+
+
+def parse_shard_relative_key(
+    rel_key: str,
+) -> tuple[str, str, int, int] | None:
+    """Parse a sharded_v1 shard relative key back into its identity components.
+
+    Exact inverse of :func:`make_shard_relative_key`:
+
+        parse_shard_relative_key('temperature_2m/shard.mem003_L0006.shard')
+        -> ('temperature_2m', 'mem', 6, 3)
+
+    Returns None for keys that are not a variable shard (region markers,
+    metadata objects, foreign layouts) — callers treat None as "not a
+    reclaimable shard" rather than an error.
+    """
+    match = _SHARD_RELATIVE_KEY_RE.fullmatch(rel_key.strip())
+    if match is None:
+        return None
+    member_text = match.group("member")
+    member_index = int(member_text) if member_text else 0
+    kind = TARGET_KIND_MEM if member_text else (
+        TARGET_KIND_MEAN if match.group("kind") == "mean" else TARGET_KIND_DET
+    )
+    return (
+        match.group("variable"),
+        kind,
+        int(match.group("lead")),
+        member_index,
+    )
 
 
 def make_region_marker_relative_key(

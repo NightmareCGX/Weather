@@ -61,6 +61,7 @@ def test_postgres_alembic_migration_smoke(postgres_engine):
         "point_query_fallback_audit",
         "forecast_cycle_lifecycle",
         "reclamation_queue",
+        "reclamation_ledger",
     ]
 
     for table in expected_tables:

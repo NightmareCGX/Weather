@@ -337,6 +337,12 @@ class IngestionSettings(BaseSettings):
     #: small so every purge transaction stays short and autovacuum can absorb
     #: the dead tuples instead of one long row-locking DELETE.
     RECLAMATION_PURGE_BATCH_SIZE: int = 5000
+    #: Early cycle retirement ("terminal-state retirement"): a cycle whose every
+    #: run is promoted (``ready``) and whose every committed reclamation unit is
+    #: physically gone may be claimed and tombstoned without waiting for the
+    #: 240h horizon gate. See docs/investigations/early-cycle-retirement/DESIGN.md.
+    #: Default false; enable via LIFECYCLE_EARLY_RETIREMENT_ENABLED=true.
+    LIFECYCLE_EARLY_RETIREMENT_ENABLED: bool = False
     #: Base exponential backoff (seconds) for failed reclamation attempts.
     RECLAMATION_BASE_BACKOFF_SECONDS: float = 2.0
     #: Detailed metadata retention window in days before sweeping (default: 1 day).

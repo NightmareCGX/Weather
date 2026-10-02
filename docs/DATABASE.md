@@ -54,6 +54,9 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 ### Migration 009: Reclamation Generation Evidence (`009_reclamation_queue_store_generation.py`)
 * `reclamation_queue.store_generation`: Adds nullable `String` column snapshotting the cycle store's committed-manifest generation at enqueue time (I14 replacement-evidence gate). The worker refuses physical deletion while this baseline disagrees with the store's current generation — every EXCLUSIVE finalizer commit bumps the generation, including same-set same-cycle replacements. Rows enqueued before this migration carry no baseline and are backfilled by the worker at first claim. Schema-only migration; no data backfill.
 
+### Migration 011: Reclamation Ledger (`011_reclamation_ledger.py`)
+* `reclamation_ledger`: Adds the durable per-target-group record that a reclamation unit is physically gone. One row per `(run_id, lead_time_hours, variable_code, target_kind)`; the `mem` kind aggregates its members into `deleted_members_mask` (bit *m* ⇔ member *m*, members 1..30). The GC worker writes it in the same transaction that removes the terminal `reclamation_queue` row, so the queue stays a pure in-flight work list (`queued`/`deleting`/`failed`). Consumed by planner enqueue idempotency, finalizer cycle terminality, the serving physical fence (union with the queue's in-flight rows), and the store gate's counterfactual revalidation. FK cascades away with `model_runs` at the tombstone+retention sweep. No backfill: pre-existing `deleted` queue rows keep fencing and satisfying terminality through union reads, and drain within ~a day of early retirement's first tombstones. See `docs/investigations/early-cycle-retirement/DESIGN.md`.
+
 ---
 
 ## 3. Table Ownership & Mutability Matrix
@@ -72,6 +75,7 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 | `forecast_grids` | Ingestion catalog init | API catalog router | `id` PK, `UNIQUE (grid_code)` | Static |
 | `stations`, `cities`, `ski_resorts` | Seed scripts | API search & places | `id` PK, PostGIS `GIST` on `geom` | Static reference |
 | `point_query_fallback_audit` | API response cache | API response cache | `cache_key` PK, `BTREE (expires_at)` | Ephemeral |
+| `reclamation_ledger` | Ingestion GC worker | Ingestion GC, API serving fence | Composite PK `(run_id, lead_time_hours, variable_code, target_kind)`, FK cascade | Insert + mask merge on reclaim; cascade-deleted at metadata sweep |
 
 ---
 
@@ -90,7 +94,7 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
                                                    ▼ (physical stores deleted sequentially)
                                               [deleted_at]      (anti-resurrection tombstone)
                                                    │
-                                                   ▼ (14-day retention window)
+                                                   ▼ (retention window, default 1 day)
                                             [metadata purged]   (tombstone survives indefinitely)
 ```
 
@@ -100,7 +104,8 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
 * `failed`: Wave unrecoverably failed or aborted.
 * `deletion_started_at`: Established by GC finalizer before acquiring exclusive store gates. Serves as a durable physical deletion claim and serving/mutation fence. Stale writers and public requests are rejected with 404/CycleTombstonedError.
 * `deleted_at`: Committed atomically after all physical stores for the cycle are deleted. Serves as a permanent anti-resurrection tombstone.
-* `Detailed Metadata Retention`: Child records (`model_runs`, `forecast_products`, `ensemble_members`, `ensemble_member_products`, `reclamation_queue`) are retained intact for a configurable retention window (default 1 day, `METADATA_RETENTION_DAYS = 1`) after `deleted_at`, after which the metadata sweeper purges child records while preserving the `forecast_cycle_lifecycle` tombstone row.
+* **Claim eligibility (early cycle retirement)**: besides horizon expiry, a cycle is claimable when `LIFECYCLE_EARLY_RETIREMENT_ENABLED=true` and **every run of the cycle is `ready`** and **every committed reclamation unit is physically gone** (recorded in `reclamation_ledger`, or a legacy `deleted` queue row). Rationale: at a 6h cadence a cycle stops being a serving source when the next cycle is ready, so the horizon wait would only store bookkeeping rows that serving can no longer read. See `docs/investigations/early-cycle-retirement/DESIGN.md`.
+* `Detailed Metadata Retention`: Child records (`model_runs`, `forecast_products`, `ensemble_members`, `ensemble_member_products`, `reclamation_queue`, `reclamation_ledger`) are retained intact for a configurable retention window (default 1 day, `METADATA_RETENTION_DAYS = 1`) after `deleted_at`, after which the metadata sweeper purges child records while preserving the `forecast_cycle_lifecycle` tombstone row.
 
 ### 4.2 Same-Cycle Re-Ingestion (PATCH Semantics)
 * Ingestion of a lead or member wave acts as a **PATCH** on the cycle store.
@@ -142,6 +147,13 @@ Schema migrations are managed by Alembic (`services/api/alembic/versions/`):
   ├── cycle_time, lead_time_hours, variable_code, target_kind, member_index
   ├── status (queued | deleting | deleted | failed)
   └── store_path, physical_key, lease_expires_at, next_retry_at
+
+[reclamation_ledger]
+  ├── run_id (PK, FK -> model_runs.id ON DELETE CASCADE)
+  ├── lead_time_hours (PK), variable_code (PK), target_kind (PK: det | mean | mem)
+  ├── deleted_members_mask (BIGINT: bit m ⇔ member m reclaimed, members 1..30)
+  ├── store_path (INDEX)
+  └── reclaimed_at, created_at, updated_at
 
 [cities], [stations], [ski_resorts] (PostGIS geometry tables)
 ```

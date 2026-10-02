@@ -869,3 +869,203 @@ def test_finalizer_discovers_and_tombstones_legacy_cycle_without_lifecycle_row(
         assert legacy_run is not None
         assert legacy_run.status == "ready"
         assert legacy_run.zarr_store_path == str(legacy_store)
+
+
+# ===========================================================================
+# Early cycle retirement ("terminal-state retirement") — Part A
+# docs/investigations/early-cycle-retirement/DESIGN.md
+# ===========================================================================
+def _seed_ready_cycle_with_reclaimed_unit(
+    catalog_engine,
+    c_time: datetime,
+) -> tuple[str, str]:
+    """A ready run with one committed unit, recorded as reclaimed in the ledger.
+
+    Returns (run_id, store_path).
+    """
+    spec = _make_spec(cycle_time=c_time)
+    with Session(catalog_engine) as session:
+        reserve_run(session, spec)
+        session.commit()
+        run = session.execute(
+            select(ModelRunRecord).where(ModelRunRecord.cycle_time == c_time)
+        ).scalar_one()
+        run.status = "ready"
+        session.add(
+            ProductRecord(
+                id=f"prod_{run.id}_0_temperature_2m",
+                run_id=run.id,
+                lead_time_hours=0,
+                variable_id="temperature_2m",
+                grid_id="global_025deg",
+                product_type="surface",
+                zarr_chunk_path="/fake",
+            )
+        )
+        from ingestion.core.catalog import ReclamationLedgerRecord
+
+        session.add(
+            ReclamationLedgerRecord(
+                run_id=run.id,
+                lead_time_hours=0,
+                variable_code="temperature_2m",
+                target_kind="det",
+                deleted_members_mask=0,
+                store_path=spec.zarr_store_path,
+                reclaimed_at=c_time + timedelta(hours=1),
+                created_at=c_time + timedelta(hours=1),
+                updated_at=c_time + timedelta(hours=1),
+            )
+        )
+        session.commit()
+        return str(run.id), str(spec.zarr_store_path)
+
+
+def test_early_retirement_tombstones_terminal_cycle_without_horizon_expiry(
+    catalog_engine, monkeypatch
+) -> None:
+    """T1: ready + all units in the ledger → tombstone without horizon expiry."""
+    from ingestion.core.config import settings
+
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    _seed_ready_cycle_with_reclaimed_unit(catalog_engine, c_time)
+    # now = T0+1h: the horizon is nowhere near expired — only the early path
+    # can retire this cycle.
+    now_utc = c_time + timedelta(hours=1)
+    serving_start = serving_start_valid_time(now_utc)
+
+    with Session(catalog_engine) as session:
+        assert cycle_reclamation_units_terminal(session, "gfs", c_time) is True
+
+    monkeypatch.setattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", True)
+    ok = finalize_cycle_bookkeeping(
+        catalog_engine,
+        "gfs",
+        c_time,
+        is_recovery=False,
+        serving_start=serving_start,
+        now=now_utc,
+    )
+    assert ok is True
+
+    with Session(catalog_engine) as session:
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
+        assert lc is not None
+        assert lc.deletion_started_at is not None
+        assert lc.deleted_at is not None
+
+
+def test_early_retirement_blocked_when_run_is_not_ready(
+    catalog_engine, monkeypatch
+) -> None:
+    """T2: a partial run blocks the early path even when its units are terminal."""
+    from ingestion.core.config import settings
+
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    run_id, _ = _seed_ready_cycle_with_reclaimed_unit(catalog_engine, c_time)
+    # Re-ingest fence: ready → partial (same-cycle wave) must block retirement.
+    with Session(catalog_engine) as session:
+        run = session.get(ModelRunRecord, run_id)
+        run.status = "partial"
+        session.commit()
+
+    now_utc = c_time + timedelta(hours=1)
+    monkeypatch.setattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", True)
+    ok = finalize_cycle_bookkeeping(
+        catalog_engine,
+        "gfs",
+        c_time,
+        is_recovery=False,
+        serving_start=serving_start_valid_time(now_utc),
+        now=now_utc,
+    )
+    assert ok is False
+
+    with Session(catalog_engine) as session:
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
+        assert lc is None or lc.deleted_at is None
+
+
+def test_early_retirement_does_not_claim_vacuously_terminal_new_cycle(
+    catalog_engine,
+) -> None:
+    """T3: a run with zero committed units is never 'terminal' for retirement."""
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    spec = _make_spec(cycle_time=c_time)
+    with Session(catalog_engine) as session:
+        reserve_run(session, spec)  # status 'processing', zero products
+        session.commit()
+
+    now_utc = c_time + timedelta(minutes=5)
+    with Session(catalog_engine) as session:
+        claimed = claim_fresh_candidate(
+            session,
+            "gfs",
+            c_time,
+            serving_start=serving_start_valid_time(now_utc),
+            claim_time=now_utc,
+            allow_terminal=True,  # the gate is ON — readiness is what protects
+        )
+        assert claimed is False
+
+
+def test_early_retirement_flag_off_preserves_legacy_behavior(
+    catalog_engine, monkeypatch
+) -> None:
+    """T5: flag off → a non-expired cycle is blocked exactly as today."""
+    from ingestion.core.config import settings
+
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    _seed_ready_cycle_with_reclaimed_unit(catalog_engine, c_time)
+    now_utc = c_time + timedelta(hours=1)
+
+    monkeypatch.setattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", False)
+    ok = finalize_cycle_bookkeeping(
+        catalog_engine,
+        "gfs",
+        c_time,
+        is_recovery=False,
+        serving_start=serving_start_valid_time(now_utc),
+        now=now_utc,
+    )
+    assert ok is False
+
+    with Session(catalog_engine) as session:
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
+        assert lc is None or lc.deleted_at is None
+
+
+def test_early_retired_cycle_is_mutation_fenced(catalog_engine, monkeypatch) -> None:
+    """T8: an early-claimed cycle refuses ingestion writes (Guarantee B)."""
+    from ingestion.core.config import settings
+
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    _seed_ready_cycle_with_reclaimed_unit(catalog_engine, c_time)
+    now_utc = c_time + timedelta(hours=1)
+
+    monkeypatch.setattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", True)
+    with Session(catalog_engine) as session:
+        claimed = claim_fresh_candidate(
+            session,
+            "gfs",
+            c_time,
+            serving_start=serving_start_valid_time(now_utc),
+            claim_time=now_utc,
+            allow_terminal=True,
+        )
+        assert claimed is True
+
+        spec = _make_spec(cycle_time=c_time)
+        with pytest.raises(CycleTombstonedError):
+            reserve_run(session, spec)
+
+
+def test_ledger_satisfies_cycle_terminality(catalog_engine) -> None:
+    """T4: terminality reads the ledger when queue rows are shed."""
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    _seed_ready_cycle_with_reclaimed_unit(catalog_engine, c_time)
+    with Session(catalog_engine) as session:
+        # No queue rows at all — the ledger is the only terminal record.
+        queue_rows = session.execute(select(ReclamationQueueRecord)).scalars().all()
+        assert queue_rows == []
+        assert cycle_reclamation_units_terminal(session, "gfs", c_time) is True

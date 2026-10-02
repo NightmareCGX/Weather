@@ -23,7 +23,7 @@ from domain.coverage import (
     is_lead_servable,
 )
 from domain.temporal import requires_lead0_display_fallback, serving_start_valid_time
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import BigInteger, and_, func, literal, or_, select
 from sqlalchemy.orm import Session
 
 from api.core.time import get_current_time
@@ -36,6 +36,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationLedger,
     ReclamationQueue,
 )
 from api.services.lifecycle import filter_visible_runs
@@ -134,14 +135,17 @@ def build_forecast_availability(
     serving_start = serving_start_valid_time(now_utc)
 
     has_reclamation_queue = True
+    has_reclamation_ledger = True
     try:
         bind = db.get_bind()
         if bind.dialect.name == "sqlite":
             from sqlalchemy import inspect
 
             has_reclamation_queue = inspect(bind).has_table("reclamation_queue")
+            has_reclamation_ledger = inspect(bind).has_table("reclamation_ledger")
     except Exception:
         has_reclamation_queue = False
+        has_reclamation_ledger = False
 
     stmt = (
         select(
@@ -194,11 +198,33 @@ def build_forecast_availability(
             )
         )
         stmt = stmt.where(~reclaim_subq.exists())
+    if has_reclamation_ledger:
+        ledger_subq = (
+            select(1)
+            .select_from(ReclamationLedger)
+            .where(
+                ReclamationLedger.run_id == ForecastProduct.run_id,
+                ReclamationLedger.lead_time_hours == ForecastProduct.lead_time_hours,
+                ReclamationLedger.variable_code == ForecastProduct.variable_id,
+                or_(
+                    and_(
+                        ForecastProduct.product_type == "ensemble_mean",
+                        ReclamationLedger.target_kind == "mean",
+                    ),
+                    and_(
+                        ForecastProduct.product_type != "ensemble_mean",
+                        ReclamationLedger.target_kind == "det",
+                    ),
+                ),
+            )
+        )
+        stmt = stmt.where(~ledger_subq.exists())
 
     rows = db.execute(filter_visible_runs(stmt)).all()
 
     # Pre-query committed ensemble member counts per (run_id, lead_time_hours)
-    # excluding member shards fenced in reclamation_queue with status in ('deleting', 'deleted', 'failed').
+    # excluding member shards fenced in reclamation_queue (in-flight) or recorded
+    # in the reclamation ledger (terminal).
     emp_stmt = select(
         EnsembleMemberProduct.run_id,
         EnsembleMemberProduct.lead_time_hours,
@@ -217,6 +243,21 @@ def build_forecast_availability(
             )
         )
         emp_stmt = emp_stmt.where(~emp_reclaim_subq.exists())
+    if has_reclamation_ledger:
+        emp_ledger_subq = (
+            select(1)
+            .select_from(ReclamationLedger)
+            .where(
+                ReclamationLedger.run_id == EnsembleMemberProduct.run_id,
+                ReclamationLedger.lead_time_hours == EnsembleMemberProduct.lead_time_hours,
+                ReclamationLedger.target_kind == "mem",
+                ReclamationLedger.deleted_members_mask.bitwise_and(
+                    literal(1, BigInteger).op("<<")(EnsembleMemberProduct.member_index)
+                )
+                != 0,
+            )
+        )
+        emp_stmt = emp_stmt.where(~emp_ledger_subq.exists())
 
     emp_stmt = emp_stmt.group_by(
         EnsembleMemberProduct.run_id,

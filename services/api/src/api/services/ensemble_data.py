@@ -175,9 +175,13 @@ def _resolve_eligible_ensemble_run_and_members(
             except Exception:
                 continue
 
-        # Filter out physically fenced members from reclamation_queue
+        # Filter out physically fenced members: reclamation_queue rows
+        # (in-flight deleting/failed) plus ledger mask bits (terminal — the
+        # worker sheds terminal queue rows into the ledger). The queue's fence
+        # here is variable-agnostic, so any variable's ledger bit fences the
+        # member for this lead.
         try:
-            from api.models.entities import ReclamationQueue
+            from api.models.entities import ReclamationLedger, ReclamationQueue
 
             fenced_rows = db.execute(
                 select(ReclamationQueue.member_index).where(
@@ -188,6 +192,19 @@ def _resolve_eligible_ensemble_run_and_members(
                 )
             ).scalars().all()
             fenced_set = {int(m) for m in fenced_rows}
+            ledger_rows = db.execute(
+                select(
+                    ReclamationLedger.deleted_members_mask,
+                ).where(
+                    ReclamationLedger.run_id == run.id,
+                    ReclamationLedger.lead_time_hours == lead_time_hours,
+                    ReclamationLedger.target_kind == "mem",
+                )
+            ).scalars().all()
+            for mask in ledger_rows:
+                for member in range(1, 31):
+                    if int(mask or 0) & (1 << member):
+                        fenced_set.add(member)
             if fenced_set:
                 avail_members = tuple(m for m in avail_members if m not in fenced_set)
         except Exception:

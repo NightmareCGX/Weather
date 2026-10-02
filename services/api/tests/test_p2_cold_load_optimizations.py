@@ -44,6 +44,7 @@ from api.services.tiles import (
     _fencing_recently_verified,
     _verify_fencing_with_single_flight,
 )
+from domain.reclamation import TARGET_KIND_DET, make_shard_relative_key
 from tests._integration_db import integration_db_url_or_skip_module
 from tests._zarr_writer import write_dataset
 
@@ -190,7 +191,10 @@ def test_shared_gate_leasing_failure_propagation(migrated_db, tmp_path):
 def test_fencing_single_flight_collapses_db_queries(migrated_db, monkeypatch):
     """20 concurrent checks on the same shard must execute exactly 1 DB query."""
     store_path = "s3://weather-data/p2_fence_test.zarr"
-    rel_key = "temperature_2m/det/0"
+    variable = "temperature_2m"
+    target_kind = TARGET_KIND_DET
+    lead_time_hours = 0
+    rel_key = make_shard_relative_key(variable, target_kind, lead_time_hours)
 
     from api.core import database
 
@@ -218,7 +222,13 @@ def test_fencing_single_flight_collapses_db_queries(migrated_db, monkeypatch):
     monkeypatch.setattr(database, "SessionLocal", CountingSession)
 
     def run_check():
-        _verify_fencing_with_single_flight(store_path, rel_key)
+        _verify_fencing_with_single_flight(
+            store_path,
+            rel_key,
+            variable_code=variable,
+            target_kind=target_kind,
+            lead_time_hours=lead_time_hours,
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         futures = [executor.submit(run_check) for _ in range(20)]
@@ -232,7 +242,10 @@ def test_fencing_single_flight_collapses_db_queries(migrated_db, monkeypatch):
 def test_fencing_single_flight_detects_fenced_shard(migrated_db):
     """If a shard is in reclamation_queue with status='deleting', 404 is raised."""
     store_path = "s3://weather-data/p2_fence_deleting.zarr"
-    rel_key = "temperature_2m/det/6"
+    variable = "temperature_2m"
+    target_kind = TARGET_KIND_DET
+    lead_time_hours = 6
+    rel_key = make_shard_relative_key(variable, target_kind, lead_time_hours)
     now = datetime.now(timezone.utc)
 
     with Session(migrated_db) as db:
@@ -252,9 +265,9 @@ def test_fencing_single_flight_detects_fenced_shard(migrated_db):
             run_id="run_p2_fenced",
             model_id="p2",
             cycle_time=now,
-            lead_time_hours=6,
-            variable_code="temperature_2m",
-            target_kind="det",
+            lead_time_hours=lead_time_hours,
+            variable_code=variable,
+            target_kind=target_kind,
             member_index=0,
             valid_time=now,
             store_path=store_path,
@@ -266,7 +279,13 @@ def test_fencing_single_flight_detects_fenced_shard(migrated_db):
         db.commit()
 
     with pytest.raises(HTTPException) as exc_info:
-        _verify_fencing_with_single_flight(store_path, rel_key)
+        _verify_fencing_with_single_flight(
+            store_path,
+            rel_key,
+            variable_code=variable,
+            target_kind=target_kind,
+            lead_time_hours=lead_time_hours,
+        )
 
     assert exc_info.value.status_code == 404
     # Fenced shards must NEVER be marked verified

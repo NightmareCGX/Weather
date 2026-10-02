@@ -34,6 +34,7 @@ from typing import Any, cast
 import numpy as np
 import xarray as xr
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     ColumnElement,
@@ -421,6 +422,51 @@ class ReclamationQueueRecord(CatalogBase):  # type: ignore[misc]  # untyped base
     )
 
 
+class ReclamationLedgerRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
+    """Durable per-target-group record that a reclamation unit is physically gone.
+
+    One row per ``(run_id, lead_time_hours, variable_code, target_kind)``. For
+    the ensemble-member kind the row carries a bitmask of the reclaimed member
+    indices (bit *m* ⇔ member *m*, members 1..30), so a 30-member group occupies
+    one row instead of 30; ``det``/``mean`` rows carry mask 0 and row existence
+    is the record. Consumed by the planner (enqueue idempotency), the finalizer
+    (cycle terminality), the serving physical-fence readers, and the store
+    gate's counterfactual revalidation — the roles that previously required a
+    ``reclamation_queue`` row to exist, which is why the queue can now shed its
+    terminal rows in the same transaction that writes this ledger.
+
+    Rows cascade away with the cycle's catalog: the FK mirrors
+    ``reclamation_queue``'s, so the metadata sweeper's ``model_runs`` delete
+    removes the cycle's ledger rows automatically.
+    """
+
+    __tablename__ = "reclamation_ledger"
+
+    run_id = Column(
+        String,
+        ForeignKey("model_runs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    lead_time_hours = Column(Integer, primary_key=True)
+    variable_code = Column(String, primary_key=True)
+    target_kind = Column(String(16), primary_key=True)
+    deleted_members_mask = Column(
+        BigInteger, nullable=False, server_default="0"
+    )
+    store_path = Column(String, nullable=False)
+    reclaimed_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "target_kind IN ('det', 'mean', 'mem')",
+            name="ck_reclamation_ledger_target_kind",
+        ),
+        Index("idx_reclamation_ledger_store", "store_path"),
+    )
+
+
 
 class VariableRecord(CatalogBase):  # type: ignore[misc]  # untyped base (see mypy note in pyproject)
     __tablename__ = "forecast_variables"
@@ -636,14 +682,39 @@ def _reclaimed_targets(db: Session, run_id: str) -> ReclaimedTargets:
             ReclamationQueueRecord.status.in_(["deleting", "deleted", "failed"]),
         )
     ).all()
+    leads = {int(lead) for lead, _var, _kind, _member in rows}
+    pairs = {
+        (int(member), int(lead))
+        for lead, _var, kind, member in rows
+        if kind == "mem"
+    }
+    variables = {str(var) for _lead, var, _kind, _member in rows}
+
+    # Ledger union: the worker sheds terminal queue rows into the ledger in the
+    # same transaction, so a reclaimed unit's evidence lives there from the
+    # moment the queue row is shed. ``mem`` rows expand per set mask bit.
+    ledger_rows = db.execute(
+        select(
+            ReclamationLedgerRecord.lead_time_hours,
+            ReclamationLedgerRecord.variable_code,
+            ReclamationLedgerRecord.target_kind,
+            ReclamationLedgerRecord.deleted_members_mask,
+        ).where(ReclamationLedgerRecord.run_id == run_id)
+    ).all()
+    for lead, var, kind, mask in ledger_rows:
+        lead = int(lead)
+        mask = int(mask or 0)
+        variables.add(str(var))
+        leads.add(lead)
+        if kind == "mem":
+            for member in range(1, 31):
+                if mask & (1 << member):
+                    pairs.add((member, lead))
+
     return ReclaimedTargets(
-        leads=frozenset(int(lead) for lead, _var, _kind, _member in rows),
-        pairs=frozenset(
-            (int(member), int(lead))
-            for lead, _var, kind, member in rows
-            if kind == "mem"
-        ),
-        variables=frozenset(str(var) for _lead, var, _kind, _member in rows),
+        leads=frozenset(leads),
+        pairs=frozenset(pairs),
+        variables=frozenset(variables),
     )
 
 

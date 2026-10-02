@@ -170,7 +170,7 @@ Prometheus metrics are organized into two distinct physical exposition surfaces 
 | `weather_metadata_sweeper_eligible_tombstones` | Gauge | Tombstones older than 14-day retention window | - | Medium |
 | `weather_metadata_sweeper_unpurged_metadata_count`| Gauge | Tombstones older than 14 days still retaining detailed child metadata | - | Medium |
 | `weather_metadata_sweeper_oldest_overdue_seconds` | Gauge | Age in seconds of oldest metadata overdue past 14-day deadline | - | Medium |
-| `weather_reclamation_queue_count` | Gauge | Shard reclamation queue row counts | `status` (`queued`, `deleting`, `deleted`, `failed`) | Fast |
+| `weather_reclamation_queue_count` | Gauge | Shard reclamation queue row counts. Under the reclamation ledger (migration 011) the queue is a pure in-flight work list: `deleted` sits at ~0 permanently (terminal rows are shed into `reclamation_ledger` on reclaim), so a persistently non-zero `deleted` means ledger writes are failing — investigate, do not ignore. | `status` (`queued`, `deleting`, `deleted`, `failed`) | Fast |
 | `weather_reclamation_oldest_queued_age_seconds` | Gauge | Age in seconds of oldest queued reclamation target | - | Medium |
 | `weather_reclamation_oldest_deleting_age_seconds` | Gauge | Age in seconds of oldest leased deleting target | - | Medium |
 | `weather_reclamation_oldest_failed_age_seconds` | Gauge | Age in seconds of oldest quarantined failed target | - | Medium |

@@ -485,7 +485,7 @@ def render_vector_field_binary(
 
     # Post-read validation: verify wind components did not transition to deleting/deleted during read
     try:
-        from api.models.entities import ReclamationQueue
+        from api.models.entities import ReclamationLedger, ReclamationQueue
         from domain.reclamation import make_shard_relative_key
 
         t_kind = "mean" if model == "gefs" else "det"
@@ -499,6 +499,30 @@ def render_vector_field_binary(
                     ReclamationQueue.status.in_(("deleting", "deleted", "failed")),
                 )
             ).scalars().all()
+            if not fenced_shards:
+                # Terminal record: the worker sheds terminal queue rows into
+                # the ledger; a ledger row for this (store, variable, kind,
+                # lead) means the shard is gone.
+                has_ledger = True
+                try:
+                    bind = check_session.get_bind()
+                    if bind.dialect.name == "sqlite":
+                        from sqlalchemy import inspect
+
+                        has_ledger = inspect(bind).has_table("reclamation_ledger")
+                except Exception:
+                    has_ledger = False
+                if has_ledger:
+                    fenced_shards = check_session.execute(
+                        select(ReclamationLedger.variable_code).where(
+                            ReclamationLedger.store_path == current_store_path,
+                            ReclamationLedger.target_kind == t_kind,
+                            ReclamationLedger.lead_time_hours == resolved_lead,
+                            ReclamationLedger.variable_code.in_(
+                                ["wind_u_10m", "wind_v_10m"]
+                            ),
+                        )
+                    ).scalars().all()
             if fenced_shards:
                 raise HTTPException(status_code=404, detail="Wind component shards became unavailable during read.")
     except HTTPException:
