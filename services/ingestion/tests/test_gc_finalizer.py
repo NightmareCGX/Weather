@@ -1069,3 +1069,123 @@ def test_ledger_satisfies_cycle_terminality(catalog_engine) -> None:
         queue_rows = session.execute(select(ReclamationQueueRecord)).scalars().all()
         assert queue_rows == []
         assert cycle_reclamation_units_terminal(session, "gfs", c_time) is True
+
+
+def test_early_retirement_blocked_while_units_are_held(catalog_engine, monkeypatch) -> None:
+    """T7: canonical holds keep the cycle non-terminal; the flag cannot fire.
+
+    E-9 of the design: the early path must not shorten the interval T−2C
+    fallback window. A ready cycle whose committed units are NOT yet reclaimed
+    (held as canonical sources) stays in service even with the flag on — only
+    the worker's reclamation can make a cycle early-retirable.
+    """
+    from ingestion.core.config import settings
+
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    spec = _make_spec(cycle_time=c_time)
+    with Session(catalog_engine) as session:
+        reserve_run(session, spec)
+        session.commit()
+        run = session.execute(
+            select(ModelRunRecord).where(ModelRunRecord.cycle_time == c_time)
+        ).scalar_one()
+        run.status = "ready"
+        session.add(
+            ProductRecord(
+                id=f"prod_{run.id}_0_temperature_2m",
+                run_id=run.id,
+                lead_time_hours=0,
+                variable_id="temperature_2m",
+                grid_id="global_025deg",
+                product_type="surface",
+                zarr_chunk_path="/fake",
+            )
+        )
+        # A committed unit still HELD by canonical: its queue row is live
+        # ('queued') and no ledger row exists. E3 must be false.
+        session.add(
+            ReclamationQueueRecord(
+                id="q_held_unit",
+                run_id=run.id,
+                model_id="gfs",
+                cycle_time=c_time,
+                lead_time_hours=0,
+                variable_code="temperature_2m",
+                target_kind="det",
+                member_index=0,
+                valid_time=c_time,
+                store_path=spec.zarr_store_path,
+                physical_key="temperature_2m/shard.det_L0000.shard",
+                status="queued",
+                attempt_count=0,
+                created_at=c_time,
+                updated_at=c_time,
+            )
+        )
+        session.commit()
+
+        assert cycle_reclamation_units_terminal(session, "gfs", c_time) is False
+
+    monkeypatch.setattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", True)
+    now_utc = c_time + timedelta(hours=1)
+    ok = finalize_cycle_bookkeeping(
+        catalog_engine,
+        "gfs",
+        c_time,
+        is_recovery=False,
+        serving_start=serving_start_valid_time(now_utc),
+        now=now_utc,
+    )
+    assert ok is False
+
+    with Session(catalog_engine) as session:
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
+        assert lc is None or lc.deleted_at is None
+
+
+def test_early_claim_crash_completes_via_recovery_pass(catalog_engine, monkeypatch) -> None:
+    """T6: a crash between the early claim and the tombstone self-heals.
+
+    The early path claims and tombstones in one pass, but they are separate
+    transactions: a crash after the claim commits leaves a claimed cycle whose
+    next bookkeeping pass must complete the tombstone via the existing
+    recovery-candidate flow, without re-evaluating horizon eligibility.
+    """
+    from ingestion.core.config import settings
+
+    c_time = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+    _seed_ready_cycle_with_reclaimed_unit(catalog_engine, c_time)
+    now_utc = c_time + timedelta(hours=1)
+
+    monkeypatch.setattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", True)
+    with Session(catalog_engine) as session:
+        claimed = claim_fresh_candidate(
+            session,
+            "gfs",
+            c_time,
+            serving_start=serving_start_valid_time(now_utc),
+            claim_time=now_utc,
+            allow_terminal=True,
+        )
+        assert claimed is True
+    # "Crash": the process dies here — deletion_started_at is committed,
+    # deleted_at is not.
+
+    # Next pass: the claimed cycle is a recovery candidate (is_recovery=True
+    # skips claim eligibility entirely, including the flag).
+    monkeypatch.setattr(settings, "LIFECYCLE_EARLY_RETIREMENT_ENABLED", False)
+    ok = finalize_cycle_bookkeeping(
+        catalog_engine,
+        "gfs",
+        c_time,
+        is_recovery=True,
+        serving_start=serving_start_valid_time(now_utc + timedelta(minutes=5)),
+        now=now_utc + timedelta(minutes=5),
+    )
+    assert ok is True
+
+    with Session(catalog_engine) as session:
+        lc = session.get(ForecastCycleLifecycleRecord, ("gfs", c_time))
+        assert lc is not None
+        assert lc.deleted_at is not None
+        assert lc.deletion_started_at is not None

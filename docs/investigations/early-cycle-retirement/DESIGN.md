@@ -1,6 +1,6 @@
 # Early Cycle Retirement + Reclamation Ledger ("terminal-state retirement") — Design
 
-**Status:** Approved design, implementation in progress
+**Status:** Implemented (branch `feat/early-retirement-and-reclamation-ledger`)
 **Date:** 2026-10-02 (combined plan approved same day)
 **Scope:** `services/ingestion` (finalizer, planner, worker, sweeper, config), `services/api` (fence read paths), one Alembic migration.
 **Decision record:** Permanent retirement moves from `cycle_time + 240h` to *the moment the cycle is fully and physically reclaimed* (~T0+14h). Upstream late corrections arriving after that moment are refused. Accepted by the owner (2026-10-02), on the following rationale: at a 6 h cycle cadence, a cycle's serving relevance ends when the next cycle is ready (~T0+6h; the interval T−2C fallback window closes ~T0+12h). A correction applied to an older cycle is therefore **never selected by serving** — every valid_time it covers has a newer winner — so the legacy 10-day acceptance window stored data that serving could no longer read. The same holds for manual re-ingest after a hypothetical wrongful deletion: the only units worth restoring are ones still canonically held, and held units keep the cycle non-terminal (no tombstone) regardless of the gate. The window's residual value was a low-probability stacked-bug last resort; its cost (1.9 GB queue, 2g GC, doubled serving latency) was certain and continuous.
@@ -113,7 +113,7 @@ Tests (extend `services/ingestion/tests/test_gc_finalizer.py`):
 - **T4b**: a damaged cycle whose run is never `ready` does not early-tombstone; the legacy 240h path retires it at expiry.
 - **T5**: flag off → legacy behavior identical (claim only at horizon expiry).
 - **T6**: crash between claim and tombstone → next pass completes the tombstone via the recovery path (existing pattern, extend).
-- **T7**: interval sequencing: N ready → N−1 **not** terminal (interval units held by T−2C) → N+1 ready → N−1 tombstones. Proves E-9.
+- **T7**: interval sequencing: N ready → N−1 **not** terminal (interval units held by T−2C) → N+1 ready → N−1 tombstones. Proves E-9. (Implemented as: the flag cannot fire while any committed unit is still held — the holds are the planner's existing coverage.)
 - **T8**: a claimed (early-retired) cycle refuses `record_run` — Guarantee B applies to early claims equally (existing fence test, parameterized).
 
 Implementation-time assertions: `finalizer_claim_stuck` alert semantics unchanged (claims now clear in minutes); `weather_lifecycle_*` gauges documented.

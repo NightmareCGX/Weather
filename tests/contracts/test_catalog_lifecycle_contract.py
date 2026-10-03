@@ -26,6 +26,7 @@ from api.models.entities import (
     Model,
     ModelRun,
     ModelVersion,
+    ReclamationLedger,
     ReclamationQueue,
 )
 from api.services.availability import build_forecast_availability
@@ -57,6 +58,7 @@ def db_session() -> Session:
         ForecastProduct.__table__,
         ForecastCycleLifecycle.__table__,
         ReclamationQueue.__table__,
+        ReclamationLedger.__table__,
     ]
     Base.metadata.create_all(engine, tables=contract_tables)
     session_factory = sessionmaker(bind=engine)
