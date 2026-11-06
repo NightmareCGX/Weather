@@ -42,7 +42,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import xarray as xr
@@ -65,6 +65,9 @@ from ingestion.core.pipeline import (
     _validate_requested_member,
 )
 from ingestion.providers.noaa.connector import NOAAConnector
+
+if TYPE_CHECKING:
+    from ingestion.core.decode_worker import DecodePool
 
 #: Module-level logger for helpers that run outside ``_run_wave_impl`` (which
 #: binds its own local ``logger``).
@@ -858,9 +861,17 @@ async def _run_wave_impl(
     predecessor_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=plan.write_concurrency)
     # The persistent decode pool: up to ``plan.decode_concurrency`` reusable worker
-    # processes each holding independent cfgrib/ecCodes native state.
+    # processes each holding independent cfgrib/ecCodes native state. The pool
+    # pins the spawn start method internally; the bounded decode timeout (from
+    # settings, read lazily to match this module's settings-access pattern)
+    # converts a wedged worker into the existing BrokenProcessPool failure
+    # path instead of freezing the wave forever (2026-10-28 incident).
+    from ingestion.core.config import settings as _wave_settings
+
+    decode_timeout = float(_wave_settings.DECODE_TIMEOUT_SECONDS) or None
     decode_pool = DecodePool(
-        max_workers=min(len(items), max(1, plan.decode_concurrency))
+        max_workers=min(len(items), max(1, plan.decode_concurrency)),
+        decode_timeout_seconds=decode_timeout,
     )
     engine = _catalog_session_factory()
 
@@ -935,6 +946,7 @@ async def _run_wave_impl(
                     cand_future = decode_pool.submit(cand_dest)
                     cand_dataset = await await_blocking_settled(
                         _decode_and_normalize,
+                        decode_pool,
                         cand_future,
                         catalog_spec,
                         store_path=store_path,
@@ -1333,6 +1345,7 @@ async def _run_wave_impl(
                             try:
                                 ds = await await_blocking_settled(
                                     _decode_and_normalize,
+                                    decode_pool,
                                     decode_fut,
                                     catalog_spec,
                                     store_path=store_path,
@@ -1710,6 +1723,7 @@ async def _repair_cycle_status(
 
 
 def _decode_and_normalize(
+    decode_pool: DecodePool,
     future: "concurrent.futures.Future[xr.Dataset]",
     catalog_spec: RunCatalogSpec,
     *,
@@ -1730,9 +1744,15 @@ def _decode_and_normalize(
     died during decode (a native ecCodes abort) surfaces here as
     ``concurrent.futures.process.BrokenProcessPool`` (its ``result()`` raises),
     which the caller records as a per-file failure — the parent stays alive and
-    the region is never committed.
+    the region is never committed. The pool await is bounded: a worker that
+    *stalls* past ``DECODE_TIMEOUT_SECONDS`` is terminated by the pool and
+    raises the same ``BrokenProcessPool`` (2026-10-28 hang remediation), so a
+    wedged decode degrades to a per-file failure instead of freezing the wave
+    and the realtime scheduler behind it.
 
     Args:
+        decode_pool: The wave's decode pool; supplies the bounded
+            ``future.result()`` await (timeout + terminate + rebuild).
         future: The decode-pool future for the staged GRIB2 file.
         catalog_spec: The run's catalog metadata (variable specs + model id).
         store_path: Optional store path for predecessor lookup at 6h leads.
@@ -1746,10 +1766,10 @@ def _decode_and_normalize(
 
     Raises:
         BaseException: The decode worker's exception (or ``BrokenProcessPool``
-            when a worker process died), propagated to the caller's failure
-            accounting.
+            when a worker process died or the decode exceeded the pool's
+            timeout), propagated to the caller's failure accounting.
     """
-    ds = future.result()
+    ds = decode_pool.result(future)
     ds = _normalize_precipitation_increments(
         ds,
         catalog_spec.variables,

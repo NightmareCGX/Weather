@@ -2387,3 +2387,106 @@ def test_cancellation_propagates_as_cancelled_error(
             await task
 
     asyncio.run(_test_cancel_flow())
+
+
+# ---------------------------------------------------------------------------
+# Daemon hygiene (2026-10-28 remediation): logging configuration and the
+# realtime liveness watchdog lifecycle.
+# ---------------------------------------------------------------------------
+
+
+def test_configure_logging_sets_level_and_stderr(monkeypatch) -> None:
+    """``main`` configures root logging from WEATHER_INGEST_LOG_LEVEL.
+
+    Before the fix no entrypoint configured logging: every ``logger.info``
+    (including the per-poll ``realtime_poll`` diagnostics) was dropped by
+    Python's lastResort handler, so a 9-day hang produced zero evidence.
+    """
+    import logging as logging_module
+    import sys
+
+    from ingestion.cli import _configure_logging
+    from ingestion.core.config import IngestionSettings
+
+    recorded: dict[str, object] = {}
+
+    def _fake_basic_config(**kwargs: object) -> None:
+        recorded.update(kwargs)
+
+    monkeypatch.setattr(logging_module, "basicConfig", _fake_basic_config)
+
+    # _configure_logging reads the cli module's settings binding.
+    monkeypatch.setattr(
+        "ingestion.cli.settings", IngestionSettings(LOG_LEVEL="warning")
+    )
+    _configure_logging()
+    assert recorded["level"] == logging_module.WARNING
+    assert recorded["stream"] is sys.stderr
+    assert "%(asctime)s" in str(recorded["format"])
+
+    # An invalid level name falls back to INFO instead of crashing the daemon.
+    monkeypatch.setattr(
+        "ingestion.cli.settings", IngestionSettings(LOG_LEVEL="not-a-level")
+    )
+    _configure_logging()
+    assert recorded["level"] == logging_module.INFO
+
+
+def test_run_realtime_starts_and_stops_watchdog(monkeypatch, tmp_path) -> None:
+    """The realtime daemon wires the watchdog to the scheduler lifecycle."""
+    from ingestion.cli import main
+
+    class _FakeScheduler:
+        instances: list["_FakeScheduler"] = []
+
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.run_calls: list[dict[str, object]] = []
+            _FakeScheduler.instances.append(self)
+
+        def run(self, *, once: bool = False, dry_run: bool = False) -> int:
+            self.run_calls.append({"once": once, "dry_run": dry_run})
+            return 0
+
+        def request_stop(self) -> None:
+            return None
+
+    class _FakeWatchdog:
+        instances: list["_FakeWatchdog"] = []
+
+        def __init__(self, scheduler: object) -> None:
+            self.scheduler = scheduler
+            self.started = False
+            self.stopped = False
+            _FakeWatchdog.instances.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    monkeypatch.setattr(
+        "ingestion.realtime.scheduler.RealtimeScheduler", _FakeScheduler
+    )
+    monkeypatch.setattr(
+        "ingestion.realtime.watchdog.RealtimeWatchdog", _FakeWatchdog
+    )
+    monkeypatch.setattr("ingestion.cli.settings", _settings_with(REALTIME_ENABLED=True))
+
+    code = main(["realtime", "--once", "--download-dir", str(tmp_path / "dl")])
+
+    assert code == 0
+    assert len(_FakeWatchdog.instances) == 1
+    watchdog = _FakeWatchdog.instances[0]
+    assert watchdog.started and watchdog.stopped
+    # The watchdog must watch the same scheduler instance that runs the loop.
+    assert watchdog.scheduler is _FakeScheduler.instances[-1]
+    assert _FakeScheduler.instances[-1].run_calls == [{"once": True, "dry_run": False}]
+
+
+def _settings_with(**overrides: object) -> object:
+    """An IngestionSettings with selected overrides (CLI module binding)."""
+    from ingestion.core.config import IngestionSettings
+
+    return IngestionSettings(**overrides)

@@ -269,6 +269,19 @@ class RealtimeScheduler:
         self._active_cycle = cycle
 
     @property
+    def last_poll_success_at(self) -> float | None:
+        """Clock reading of the last completed poll iteration.
+
+        ``None`` until the first poll completes. The realtime watchdog reads
+        this from its own thread: the scheduler loop blocks inside
+        ``poll_once`` for as long as a wave dispatch takes, so a frozen
+        ``last_poll_success_at`` is the process-level "the loop is wedged"
+        signal (2026-10-28 incident: frozen for 9 days with no other
+        evidence).
+        """
+        return self._last_poll_success_at
+
+    @property
     def _first_seen_complete_at(self) -> dict[int, float]:
         """Backward-compatible alias for active cycle wait timers."""
         return self._active_first_seen_complete_at

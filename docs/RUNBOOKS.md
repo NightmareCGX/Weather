@@ -275,6 +275,55 @@ uv run --no-sync weather-ingest realtime
 * The scheduler sets its stop event, allows any in-flight wave to complete its finalizer commit, releases the advisory lock cleanly, and exits.
 * *Cold Backlog Catch-Up Note:* If the scheduler was down for several hours, it will sequentially discover and dispatch pending backlogged leads upon restart.
 
+### Liveness Watchdog & Auto-Recovery (2026-10-28 remediation):
+A daemon thread (`realtime-watchdog`) runs independently of the scheduler's
+event loop and checks liveness every `REALTIME_WATCHDOG_INTERVAL_SECONDS`
+(default 60 s). In the 2026-10-28 incident one wedged decode froze the loop
+for 9 days while the container stayed `Up` with zero error logs; the
+decode-level protection is now a bounded decode timeout (a stalled decode
+terminates the pool and fails the file as `BrokenProcessPool`), and the
+watchdog is the catch-all for any other wedge:
+
+* **`realtime_scheduler_stalled` (CRITICAL)** — the loop has not completed a
+  poll for `REALTIME_POLL_STALL_WARN_SECONDS` (default 30 min). Healthy polls
+  complete in seconds. **Auto-recovery:** past
+  `REALTIME_POLL_STALL_EXIT_SECONDS` (default 6 h) the watchdog exits the
+  process (`os._exit`), the container's `restart: unless-stopped` policy
+  restarts it, and the scheduler rebuilds all state from the durable catalog
+  and catches up. Set the exit threshold to `0` to disable the escalation
+  (alert-only).
+* **`realtime_ingestion_stale` (WARNING)** — no successful wave completion
+  for any realtime model for `REALTIME_DATA_STALE_WARN_SECONDS`
+  (default 12 h). **Alert-only by design:** upstream (NOAA) publication
+  delays stall data legitimately (healthy worst-case gap between
+  consecutive successes is cycle interval + first-publication delay ≈ 9.5 h),
+  so this signal must never auto-restart a healthy process.
+
+#### <a id="realtime-scheduler-stalled"></a>Runbook: `realtime_scheduler_stalled`
+1. Confirm the wedge from the container logs (`docker logs weather_ingestion_realtime --since 1h`):
+   with INFO logging enabled (default since the fix) the `realtime_poll`
+   JSON lines stop while a wave dispatch is in flight; a decode timeout logs
+   `decode worker stalled ... terminating the decode pool` and the wave
+   continues.
+2. If auto-recovery is enabled, the process exits itself past the exit
+   threshold — verify the container restarted
+   (`docker inspect weather_ingestion_realtime --format '{{.RestartCount}} {{.State.StartedAt}}'`)
+   and that new `realtime_poll` lines appear.
+3. If auto-recovery is disabled (`REALTIME_POLL_STALL_EXIT_SECONDS=0`),
+   restart manually: `docker restart weather_ingestion_realtime`.
+4. After recovery, check backlog catch-up progress and disk headroom
+   (catch-up downloads staging data); investigate the wedged wave's target
+   cycle via §13 diagnostic queries if the stall recurs on the same cycle.
+
+#### <a id="realtime-ingestion-stale"></a>Runbook: `realtime_ingestion_stale`
+1. First check upstream availability (NOAA S3 publication for the newest
+   cycles) — this alert alone does not indicate a local defect.
+2. If upstream is publishing normally, check `model_runs` freshness (§13)
+   and the scheduler logs for per-cycle failures; quarantine/backoff of a
+   broken backlog candidate surfaces as repeated warnings.
+3. No process restart is required for this alert; follow the failure
+   evidence before intervening.
+
 ---
 
 ## 8. Retention Garbage Collection (GC) Runbook

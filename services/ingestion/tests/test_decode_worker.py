@@ -606,14 +606,14 @@ def test_cli_broken_decode_pool_no_false_ready(tmp_path, monkeypatch) -> None:
 
     calls = {"n": 0}
 
-    def _flaky_decode_and_normalize(future, catalog_spec):
+    def _flaky_decode_and_normalize(decode_pool, future, catalog_spec, **kwargs):
         # Parent-side seam: the 2nd region's decode worker "died".
         calls["n"] += 1
         if calls["n"] == 2:
             raise BrokenProcessPool("decode worker process died")
         from ingestion.cli import _decode_and_normalize as real
 
-        return real(future, catalog_spec)
+        return real(decode_pool, future, catalog_spec, **kwargs)
 
     monkeypatch.setattr(
         "ingestion.core.wave_runner._decode_and_normalize", _flaky_decode_and_normalize
@@ -646,3 +646,101 @@ def test_cli_broken_decode_pool_no_false_ready(tmp_path, monkeypatch) -> None:
 
         runs = db.query(ModelRunRecord).all()
         assert all(run.status != "ready" for run in runs)
+
+# ---------------------------------------------------------------------------
+# 11-13. Hang protection (2026-10-28 remediation): spawn pinning, bounded
+# decode timeout with terminate + lazy rebuild, bounded shutdown.
+# ---------------------------------------------------------------------------
+
+
+def test_decode_pool_pins_spawn_start_method() -> None:
+    """The pool must pin the spawn start method on every platform.
+
+    The Linux default (fork) copies the whole multi-threaded parent — locks,
+    sockets, asyncio state — into the child, which is the documented recipe
+    for the inherited-lock deadlock behind the 2026-10-28 outage.
+    """
+    pool = DecodePool(max_workers=1)
+    try:
+        assert pool.start_method == "spawn"
+        # The created executor must use the pinned context too (first submit
+        # constructs it; submit of a nonexistent file fails inside the worker,
+        # but the pool still materializes).
+        try:
+            pool.submit(str(FIXTURES / "does_not_exist.grib2")).result(timeout=60)
+        except Exception:  # noqa: BLE001 - decode failure is irrelevant here
+            pass
+        assert pool._executor is not None
+        assert pool._executor._mp_context is pool._mp_context
+    finally:
+        pool.shutdown()
+
+
+def test_decode_timeout_terminates_stalled_worker_and_rebuilds_pool(
+    tmp_path, monkeypatch
+) -> None:
+    """A decode past the timeout => BrokenProcessPool, then a working pool.
+
+    The env hook makes the spawned worker sleep (spawned children inherit the
+    parent environment; monkeypatched state cannot cross the spawn boundary).
+    The timed-out call must raise BrokenProcessPool (the same signal a worker
+    crash produces), the staged file must survive (failure accounting owns
+    cleanup, matching the existing broken-pool contract), and the next submit
+    must succeed on a lazily rebuilt pool.
+    """
+    import time as _time
+    from concurrent.futures.process import BrokenProcessPool
+
+    monkeypatch.setenv("WEATHER_INGEST_TEST_DECODE_DELAY_SECONDS", "60")
+    pool = DecodePool(max_workers=1, decode_timeout_seconds=2.0)
+    try:
+        stalled_path = str(GFS_FIXTURE)
+        t0 = _time.monotonic()
+        with pytest.raises(BrokenProcessPool, match="decode_timeout_seconds"):
+            pool.result(pool.submit(stalled_path))
+        elapsed = _time.monotonic() - t0
+        # Bounded: the timeout (2s) plus spawn overhead, never the 60s stall.
+        assert elapsed < 30.0
+        # The terminated pool is discarded; nothing is left running.
+        assert pool._executor is None
+        # Staged file untouched: failures never delete sources (cleanup is
+        # committed-region-only, mirroring the broken-pool contract).
+        assert GFS_FIXTURE.exists()
+    finally:
+        pool.shutdown()
+
+    # Healthy decode on the rebuilt pool: clearing the hook and submitting
+    # again must produce a decoded dataset (lazy executor reconstruction).
+    monkeypatch.delenv("WEATHER_INGEST_TEST_DECODE_DELAY_SECONDS")
+    fresh = DecodePool(max_workers=1, decode_timeout_seconds=120.0)
+    try:
+        ds = fresh.result(fresh.submit(str(GFS_FIXTURE)))
+        assert "t2m" in ds.data_vars
+    finally:
+        fresh.shutdown()
+
+
+def test_shutdown_is_bounded_with_stalled_worker(monkeypatch) -> None:
+    """shutdown() must return promptly even when a worker is mid-stall.
+
+    The pre-remediation shutdown was an unbounded ``wait=True`` join: a hung
+    decode would have blocked the wave's ``finally`` — and with it the whole
+    realtime scheduler — forever. The bounded variant terminates survivors.
+    """
+    import time as _time
+
+    monkeypatch.setenv("WEATHER_INGEST_TEST_DECODE_DELAY_SECONDS", "120")
+    pool = DecodePool(max_workers=1, decode_timeout_seconds=None)
+    try:
+        pool.submit(str(GFS_FIXTURE))
+        # Give the spawned worker time to pick the task up and enter the
+        # simulated stall, so shutdown must actively terminate it.
+        _time.sleep(3.0)
+        t0 = _time.monotonic()
+        pool.shutdown()
+        elapsed = _time.monotonic() - t0
+        # Grace (5s) + terminate/join overhead — never the 120s stall.
+        assert elapsed < 30.0
+        assert pool._executor is None
+    finally:
+        monkeypatch.delenv("WEATHER_INGEST_TEST_DECODE_DELAY_SECONDS")

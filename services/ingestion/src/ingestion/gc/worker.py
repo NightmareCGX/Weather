@@ -265,7 +265,7 @@ def _ledger_upsert_groups(
             )
         else:
             row.deleted_members_mask = int(row.deleted_members_mask or 0) | mask  # type: ignore[assignment]
-            row.reclaimed_at = min(row.reclaimed_at, now_utc)  # type: ignore[arg-type,assignment]
+            row.reclaimed_at = min(row.reclaimed_at, now_utc)  # type: ignore[arg-type]
             row.updated_at = now_utc  # type: ignore[assignment]
 
 

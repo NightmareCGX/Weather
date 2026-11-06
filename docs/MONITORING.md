@@ -350,6 +350,8 @@ Alerts are classified as `INFO`, `WARNING`, or `CRITICAL`. Every alert links dir
 | `postgres_deadlocks_detected` | WARNING | New deadlocks occurred during collection interval (delta $> 0$) | `#database-deadlocks` |
 | `minio_unreachable` | CRITICAL | Object storage health probe fails | `#minio-unreachable` |
 | `ingestion_pipeline_stuck` | CRITICAL | Active/queued work present with zero progress for $> 10\text{ minutes}$ | `#ingestion-stuck` |
+| `realtime_scheduler_stalled` | CRITICAL | Realtime watchdog (daemon thread, independent of the event loop): scheduler has not completed a poll for $> $ `REALTIME_POLL_STALL_WARN_SECONDS` (default 30 min). Past `REALTIME_POLL_STALL_EXIT_SECONDS` (default 6 h) the watchdog exits the process so the container restart policy recovers it (disable with `0`) | `#realtime-scheduler-stalled` |
+| `realtime_ingestion_stale` | WARNING | Realtime watchdog: no successful wave completion for any realtime model for $> $ `REALTIME_DATA_STALE_WARN_SECONDS` (default 12 h). Alert-only: upstream (NOAA) publication delays stall data legitimately (healthy worst-case gap ≈ 9.5 h) | `#realtime-ingestion-stale` |
 | `ingestion_lag_warning` | WARNING | 1 cycle behind available NOAA upstream | `#ingestion-lag` |
 | `ingestion_lag_critical` | CRITICAL | 2+ cycles behind available NOAA upstream | `#ingestion-lag` |
 | `model_ready_not_promoted` | WARNING | Newest cycle that should already be complete is still not `ready` more than one fill budget (`INGESTION_FILL_IN_GRACE_SECONDS`, default 2.5 h) past its fill deadline (f000 ingest anchor) | `#model-ready-not-promoted` |

@@ -231,6 +231,23 @@ class IngestionSettings(BaseSettings):
     # Advisory-lock acquisition timeout for the ingestion coordinator.
     ADVISORY_LOCK_TIMEOUT_SECONDS: Any = 30.0
 
+    #: Wall-clock budget (seconds) for one GRIB2 decode in the process pool.
+    #: A decode that exceeds it is treated exactly like a worker crash: the
+    #: pool's workers are terminated, the file fails as
+    #: ``BrokenProcessPool`` (per-file on the pipeline path, wave-fatal on the
+    #: seed path), and the pool is rebuilt lazily on the next submit — a hung
+    #: worker can no longer freeze the scheduler forever (the 2026-10-28
+    #: incident: one wedged decode stalled realtime ingestion for 9 days).
+    #: ``0`` disables the timeout entirely (not recommended).
+    DECODE_TIMEOUT_SECONDS: float = 600.0
+
+    #: Log level for all ``weather-ingest`` daemon entrypoints. Before the
+    #: 2026-10-28 incident fix no entrypoint configured logging at all, so
+    #: every ``logger.info`` (including the per-poll ``realtime_poll``
+    #: diagnostics) was dropped and a 9-day hang produced zero scheduler
+    #: evidence. Levels: DEBUG / INFO (default) / WARNING / ERROR.
+    LOG_LEVEL: str = "INFO"
+
     #: Primary storage format version for newly initialized forecast cycles
     #: ("sharded_v1", "sharded_v2", or "v2_unsharded").
     #: Defaults to "sharded_v1" (frozen historical bytes: float32 shard payloads).
@@ -313,6 +330,34 @@ class IngestionSettings(BaseSettings):
     REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS: float = 60.0
     #: Maximum retry backoff (seconds) for active wave failures.
     REALTIME_ACTIVE_MAX_BACKOFF_SECONDS: float = 300.0
+
+    # --- Realtime watchdog (2026-10-28 hang remediation) ---
+    #: The watchdog is a daemon thread that is deliberately independent of the
+    #: scheduler's event loop (in the 2026-10-28 incident the metrics HTTP
+    #: thread kept serving while the loop was frozen for 9 days, so a
+    #: thread-level liveness check is reliable exactly when it matters).
+    #: Whether the watchdog thread runs at all for `weather-ingest realtime`.
+    REALTIME_WATCHDOG_ENABLED: bool = True
+    #: Seconds without a completed scheduler poll before the watchdog raises a
+    #: CRITICAL ``realtime_scheduler_stalled`` alert. Healthy polls complete in
+    #: seconds; even the longest bounded wave is minutes, so this fires early.
+    REALTIME_POLL_STALL_WARN_SECONDS: float = 1800.0
+    #: Seconds without a completed scheduler poll before the watchdog exits the
+    #: process so the container's restart policy can recover it. The scheduler
+    #: rebuilds all state from the durable catalog (design invariant), so a
+    #: restart only costs idle time. Sized past the GFS/GEFS 6h publication
+    #: cadence so no legitimate wave or publication lull can reach it.
+    #: ``0`` disables the process-exit escalation (alert-only mode).
+    REALTIME_POLL_STALL_EXIT_SECONDS: float = 21600.0
+    #: Seconds since the last successful wave completion (any model) before the
+    #: watchdog raises a WARNING ``realtime_ingestion_stale`` alert.
+    #: Alert-only by design: upstream (NOAA) publication delays stall data
+    #: legitimately — the healthy worst-case gap between consecutive successes
+    #: is cycle interval + first-publication delay ≈ 9.5h — so this signal must
+    #: never auto-restart a healthy process. 12h avoids those false positives.
+    REALTIME_DATA_STALE_WARN_SECONDS: float = 43200.0
+    #: Watchdog check interval (seconds).
+    REALTIME_WATCHDOG_INTERVAL_SECONDS: float = 60.0
 
     # --- Granular physical reclamation (Lifecycle V3 Phase 4) ---
     #: Master switch for granular reclamation.
@@ -546,6 +591,41 @@ class IngestionSettings(BaseSettings):
             raise ValueError(
                 f"REALTIME_ACTIVE_MAX_BACKOFF_SECONDS ({active_max}) must be >= "
                 f"REALTIME_ACTIVE_FAILURE_BACKOFF_SECONDS ({active_retry})"
+            )
+        decode_timeout = float(self.DECODE_TIMEOUT_SECONDS)
+        if decode_timeout < 0.0:
+            raise ValueError(
+                f"DECODE_TIMEOUT_SECONDS must be >= 0.0 (0 disables), got {decode_timeout}"
+            )
+        poll_stall_warn = float(self.REALTIME_POLL_STALL_WARN_SECONDS)
+        if poll_stall_warn <= 0.0:
+            raise ValueError(
+                "REALTIME_POLL_STALL_WARN_SECONDS must be > 0.0, got "
+                f"{poll_stall_warn}"
+            )
+        poll_stall_exit = float(self.REALTIME_POLL_STALL_EXIT_SECONDS)
+        if poll_stall_exit < 0.0:
+            raise ValueError(
+                "REALTIME_POLL_STALL_EXIT_SECONDS must be >= 0.0 (0 disables "
+                f"the exit escalation), got {poll_stall_exit}"
+            )
+        if 0.0 < poll_stall_exit <= poll_stall_warn:
+            raise ValueError(
+                f"REALTIME_POLL_STALL_EXIT_SECONDS ({poll_stall_exit}) must be "
+                f"> REALTIME_POLL_STALL_WARN_SECONDS ({poll_stall_warn}) so the "
+                "alert always precedes the process-exit escalation"
+            )
+        data_stale_warn = float(self.REALTIME_DATA_STALE_WARN_SECONDS)
+        if data_stale_warn <= 0.0:
+            raise ValueError(
+                "REALTIME_DATA_STALE_WARN_SECONDS must be > 0.0, got "
+                f"{data_stale_warn}"
+            )
+        watchdog_interval = float(self.REALTIME_WATCHDOG_INTERVAL_SECONDS)
+        if watchdog_interval <= 0.0:
+            raise ValueError(
+                "REALTIME_WATCHDOG_INTERVAL_SECONDS must be > 0.0, got "
+                f"{watchdog_interval}"
             )
         quarantine_threshold = int(
             self.REALTIME_BACKLOG_FAILURE_QUARANTINE_THRESHOLD

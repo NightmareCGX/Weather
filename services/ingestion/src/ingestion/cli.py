@@ -1159,6 +1159,7 @@ def _run_realtime(args: argparse.Namespace) -> int:
     from ingestion.core.db import engine as catalog_engine
     from ingestion.realtime.leadership import SchedulerLeadership
     from ingestion.realtime.scheduler import CycleIdentity, RealtimeScheduler
+    from ingestion.realtime.watchdog import RealtimeWatchdog
 
     cycle_override = None
     if args.cycle_date is not None and args.cycle_hour is not None:
@@ -1193,6 +1194,16 @@ def _run_realtime(args: argparse.Namespace) -> int:
             except (ValueError, OSError):  # not the main thread / unsupported
                 pass
 
+    # Liveness watchdog: a daemon thread independent of the scheduler's event
+    # loop, alerting on (and, past the exit threshold, recovering from) a
+    # wedged loop. The 2026-10-28 incident froze the loop for 9 days with the
+    # container Up and zero log evidence; this thread is the observer that
+    # survives exactly that failure mode.
+    watchdog: RealtimeWatchdog | None = None
+    if settings.REALTIME_WATCHDOG_ENABLED:
+        watchdog = RealtimeWatchdog(scheduler)
+        watchdog.start()
+
     metrics_port = getattr(args, "metrics_port", None)
     if metrics_port:
         # Serve THIS process's live pipeline counters (stage latencies,
@@ -1213,7 +1224,10 @@ def _run_realtime(args: argparse.Namespace) -> int:
             daemon=True,
         ).start()
 
-    return scheduler.run(once=args.once, dry_run=args.dry_run)
+    return_code = scheduler.run(once=args.once, dry_run=args.dry_run)
+    if watchdog is not None:
+        watchdog.stop()
+    return return_code
 
 
 def _gc_pipeline_pass(
@@ -2079,9 +2093,36 @@ def _run_metrics(args: argparse.Namespace) -> int:
     return serve_metrics(host=args.host, port=args.port)
 
 
+def _configure_logging() -> None:
+    """Configure root logging for every ``weather-ingest`` daemon entrypoint.
+
+    Before the 2026-10-28 incident fix no entrypoint configured logging at
+    all: Python's lastResort handler dropped everything below WARNING, so the
+    realtime scheduler's per-poll diagnostics (``realtime_poll`` JSON lines,
+    ``realtime sleeping`` cadence) were silently discarded and a 9-day hang
+    produced zero scheduler evidence. The level comes from
+    ``settings.LOG_LEVEL`` (env ``WEATHER_INGEST_LOG_LEVEL``); output goes to
+    stderr so ``docker logs`` picks it up.
+    """
+    import sys
+
+    level_name = str(getattr(settings, "LOG_LEVEL", "INFO")).upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    logging.basicConfig(
+        level=level,
+        stream=sys.stderr,
+        format="%(asctime)sZ %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        force=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return the process exit code."""
     args = _build_parser().parse_args(argv)
+    _configure_logging()
     if args.command == "ingest":
         return _run_ingest(args)
     if args.command == "realtime":

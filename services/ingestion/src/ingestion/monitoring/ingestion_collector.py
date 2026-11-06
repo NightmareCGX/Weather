@@ -425,6 +425,27 @@ class IngestionHealthCollector:
         else:
             INGESTION_ITEMS_FAILED_TOTAL.labels(model=m, phase=stage).inc(1.0)
 
+    def last_success_age_seconds(self, model: str) -> float | None:
+        """Seconds since the model's last successful run finish.
+
+        A thread-safe read of the same state that feeds
+        ``weather_ingestion_last_success_timestamp_seconds``; ``None`` when the
+        model has never completed a successful run in this process. The
+        realtime watchdog uses this as its data-staleness signal.
+
+        Args:
+            model: Model identifier (case-insensitive, e.g. ``"gfs"``).
+
+        Returns:
+            Age in seconds, or ``None`` when no success has been recorded.
+        """
+        m = model.lower()
+        with self._lock:
+            state = self._states.get(m)
+            if state is None or state.last_success_ts is None:
+                return None
+            return max(0.0, time.time() - state.last_success_ts)
+
     def register_run_finish(
         self,
         model: str,
